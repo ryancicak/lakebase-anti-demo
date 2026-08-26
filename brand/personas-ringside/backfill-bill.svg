@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Backfill Bill — Data Engineer ringside portrait</title><desc id="desc">An original 8-bit broad ringside operator with pixel rows flowing through his collar.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#101733" stroke="#4A83E8" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#EE452D" stroke-width="6"/>
+  <!-- arena and ring -->
+  <g fill="#F8D83B"><rect x="67" y="62" width="46" height="18"/><rect x="233" y="50" width="46" height="18"/><rect x="399" y="62" width="46" height="18"/></g>
+  <path d="M42 272H470M42 326H470M42 380H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 280H470M42 334H470M42 388H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- broad seated silhouette -->
+  <path d="M88 430V330L135 277H377L424 330V430Z" fill="#EE452D"/><path d="M134 430V322L181 284H331L378 322V430Z" fill="#1B2758"/>
+  <path d="M168 148H194V119H318V148H344V244L318 274H194L168 244Z" fill="#B96F45"/><path d="M169 151L192 112H320L343 151L306 137L256 151L209 135Z" fill="#2A201D"/>
+  <rect x="202" y="176" width="28" height="20" fill="#070B22"/><rect x="282" y="176" width="28" height="20" fill="#070B22"/><rect x="224" y="234" width="64" height="17" fill="#4A2A22"/>
+  <!-- source-to-app row stream integrated into collar -->
+  <path d="M151 300L207 351H305L362 300" fill="none" stroke="#F8D83B" stroke-width="18"/>
+  <g fill="#43D17A"><rect x="166" y="297" width="30" height="12"/><rect x="203" y="318" width="42" height="12"/><rect x="252" y="339" width="28" height="12"/><rect x="287" y="318" width="56" height="12"/></g>
+  <!-- bare forearms planted on apron -->
+  <path d="M112 354H200L225 390H120Z" fill="#B96F45"/><path d="M400 354H312L287 390H392Z" fill="#B96F45"/><rect x="70" y="402" width="372" height="70" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect x="206" y="422" width="100" height="18" fill="#43D17A"/>
+</svg>

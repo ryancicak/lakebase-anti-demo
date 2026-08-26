@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --no-sync, deliberately, on every subcommand. Plain `uv run` re-resolves
+# whenever the tree has drifted, and it does that at the moment the operator is
+# reaching for this tool -- which in practice means seconds before a demo. A
+# stray .python-version pinning 3.12 was enough once: uv deleted the provisioned
+# 3.14 environment and began rebuilding it from scratch, and from the outside
+# that is indistinguishable from a hang. Nothing in this repository may install
+# anything as a side effect of being run. `uv sync` is the one command that
+# provisions the environment, and it is always explicit.
+ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-.venv}"
+case "$ENVIRONMENT" in
+  /*) ;;
+  # uv reads a relative UV_PROJECT_ENVIRONMENT relative to the project, not to
+  # wherever this was invoked from.
+  *) ENVIRONMENT="$SCRIPT_DIR/$ENVIRONMENT" ;;
+esac
+
+# Checked by hand because --no-sync will not check it for us: on a tree with no
+# environment, `uv run --no-sync` creates an empty one and then fails with
+# "No module named ...", which reads as a bug in this repository rather than as
+# a missing install step.
+if [[ ! -x "$ENVIRONMENT/bin/python" ]]; then
+  cat >&2 <<EOF
+ERROR No Python environment at $ENVIRONMENT, so there is nothing to run.
+      This tool never installs anything as a side effect of being run, because a
+      dependency resolve triggered by './antidemo serve' stalls the demo it is about
+      to start. Provision it explicitly, once:
+
+        uv sync
+
+      Then re-run this command.
+EOF
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# The one-time setup file, carried forward to run time
+# ---------------------------------------------------------------------------
+#
+# The gap this closes. `bootstrap.sh` asks for five values once, reads them from
+# .env.bootstrap, and provisions with them. Nothing else in the tree ever read
+# that file again -- so a stranger who followed the script's own closing advice
+# and ran './antidemo serve' arrived at a process with no AWS credentials at
+# all. The manifest cannot help: `apply_manifest_environment` seals
+# AWS_AUTH_MODE=environment and holds no secret to go with it, correctly.
+#
+# Here rather than in Python, for two reasons. This is the one path every local
+# subcommand goes through, so nothing can be added later that forgets it. And
+# the deployed Databricks App does not run this file at all -- app.yaml execs
+# uvicorn directly and gets its keys from injected secret resources -- so a
+# credential file in the working directory can never become something the
+# deployed runtime depends on. That separation is the point; a loader inside
+# server/ would have had to grow a "not when deployed" branch, and that branch
+# is exactly the kind of thing that is wrong once and then wrong in production.
+#
+# PRECEDENCE: THE ENVIRONMENT WINS, ALWAYS. Only a variable that is unset or
+# empty right now is filled from the file. Two things fall out of that, and both
+# are requirements rather than side effects:
+#
+#   * A deliberate export is never overridden. Someone who exported a credential
+#     on purpose -- to provision as a broader principal, or to run `doctor`,
+#     which needs reads the app runtime key does not hold -- gets the one they
+#     asked for. THE COST OF THAT RULE IS WORTH KNOWING: on an installation
+#     sealed to the key in this file, a shell carrying exported SSO session
+#     credentials wins silently, the server authenticates as the SSO role, and
+#     Round 5's control role does not trust it. The launch says so on stderr and
+#     serves the other five; see `round5_principal_notice` in server/cli.py.
+#   * An EMPTY value in the file cannot clobber a good one in the environment.
+#     That matters wherever both AWS key fields are deliberately left blank --
+#     a supported configuration, and the way to run `--deploy-only` without
+#     republishing whatever credential the shell happens to carry into the app.
+#     `set -a; . file` -- the obvious one-liner, and the one this deliberately is
+#     not -- assigns the empty string over the live value and breaks exactly that
+#     setup.
+#
+# Nothing is echoed. The file holds secrets, and a launcher that prints which
+# credential it picked up has published it into every terminal scrollback.
+ENV_FILE="${ANTI_DEMO_ENV_FILE:-$SCRIPT_DIR/.env.bootstrap}"
+
+# Only these. The file also carries Databricks and installation settings, and
+# those are the manifest's business at run time, not this file's -- a launcher
+# that exported ROUND4_CATALOG or ANTI_DEMO_MANIFEST could silently point a
+# serve at another generation. Credentials are the one thing the manifest is
+# right not to hold and therefore the one thing that has to come from here.
+ANTI_DEMO_CARRIED=(
+  AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY
+  AWS_SESSION_TOKEN
+  AWS_DEFAULT_REGION
+  AWS_REGION
+)
+
+if [[ -f "$ENV_FILE" ]]; then
+  # Sourced in a subshell and read back one variable at a time, so that a
+  # `rm -rf` or a `curl` in the file cannot run against this shell's state, and
+  # so that nothing outside the list above can leak in. `set -a` stays off for
+  # the same reason bootstrap.sh keeps it off.
+  for _name in "${ANTI_DEMO_CARRIED[@]}"; do
+    # Already set to something non-empty? Then the environment has spoken.
+    [[ -n "${!_name:-}" ]] && continue
+    _value="$(
+      set +u
+      # shellcheck disable=SC1090
+      . "$ENV_FILE" >/dev/null 2>&1 || true
+      printf '%s' "${!_name:-}"
+    )"
+    [[ -n "$_value" ]] && export "$_name=$_value"
+  done
+  unset _name _value
+fi
+
+# AWS_REGION and AWS_DEFAULT_REGION are the same fact under two names -- boto3
+# and Terraform read either, server/cli.py reads the first. Bind the one to the
+# other so no layer can disagree, which is the same thing bootstrap.sh does.
+[[ -z "${AWS_REGION:-}" && -n "${AWS_DEFAULT_REGION:-}" ]] && export AWS_REGION="$AWS_DEFAULT_REGION"
+[[ -z "${AWS_DEFAULT_REGION:-}" && -n "${AWS_REGION:-}" ]] && export AWS_DEFAULT_REGION="$AWS_REGION"
+
+# ---------------------------------------------------------------------------
+# Say so when there is nothing to serve the AWS rounds with
+# ---------------------------------------------------------------------------
+#
+# THIS IS THE HALF THAT MATTERS. Sourcing the file is plumbing; a serve that
+# ends up with no credential anyway is the actual defect, because it does not
+# announce itself. `validate_runtime_auth` does raise -- and the credential
+# probe catches that raise and turns it into the verdict `absent`, which
+# degrades /readyz to 200 "degraded" and takes the four AWS-backed rounds off
+# the card. The server answers on the port, the UI renders, and a stranger sees
+# a working app that is quietly missing two thirds of its content. This project
+# has a named recurring pattern -- a surface that reports health without saying
+# what it checked -- and that is another instance of it.
+#
+# So the launch says it, at the one moment somebody is looking at the terminal.
+# Not fatal: Rounds 4 and 6 reach Lakebase and no AWS at all, they genuinely
+# work, and refusing to start would take a working demo away to punish a missing
+# credential. The bug was never the degrade. The bug was the silence.
+if [[ "${1:-}" == "serve" ]] \
+  && [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" ]] \
+  && [[ -z "${AWS_PROFILE:-}" && -z "${AWS_DEFAULT_PROFILE:-}" ]]; then
+  cat >&2 <<EOF
+
+!! THIS SERVER IS STARTING WITH NO AWS CREDENTIALS, AND FOUR OF THE SIX ROUNDS
+!! WILL NOT BE ON THE CARD. It will still answer on its port and still render
+!! the UI, so nothing about the running app will tell you this happened --
+!! which is why it is being said here instead.
+!!
+!! Lost:   Round 1 (wake idle app), Round 2 (safe schema change),
+!!         Round 3 (recover deleted order), Round 5 (connection spike).
+!!         Each races a live Aurora or RDS opponent and cannot arm without AWS.
+!! Kept:   Round 4 and Round 6. Both reach Lakebase and no AWS at all.
+!!
+!! What is missing: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY. This launcher
+!! reads them from
+!!
+!!     $ENV_FILE
+!!
+!! filling only variables that are unset or empty in this shell -- so an empty
+!! line in that file never overrides a credential you exported yourself. Both
+!! of the following therefore fix it, and neither needs 'aws sso login':
+!!
+!!     1. Fill AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in that file with a
+!!        permanent IAM key pair, then re-run this command.
+!!     2. Or export the two variables in this shell before running it.
+!!
+!! Confirm either worked by asking the server, not by re-reading this:
+!!
+!!     curl -s localhost:8000/readyz | jq .credentials_state    # want "ok"
+!!
+EOF
+fi
+
+exec uv run --no-sync --directory "$SCRIPT_DIR" python -m server.cli "$@"

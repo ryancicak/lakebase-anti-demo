@@ -1,0 +1,574 @@
+/* ============================================================================
+   The fight card, drawn as a ring.
+
+   Ported from the approved `A2-the-ring-final.html`. The 16/9 cabinet is gone
+   on this scene and that is the price of legibility: six titles, six lane
+   states, the round's stake and the staging disclosure are all on screen at
+   once, at a size a room can read, and they do not fit inside a 16/9 box
+   without shrinking the ring.
+
+   What is deliberately NOT here is a standing dollar-per-day figure. Almost
+   none of that number is the thing this screen is selling, so printing it
+   beside our own corner invites the room to read it as the price of the
+   product. It is operator information and it belongs where the operator reads.
+   ========================================================================= */
+
+/* One declared scale. This screen is driven live in front of a room. */
+.card-scene {
+  --t-label: clamp(6px, .52vw, 11px);
+  --t-state: clamp(7px, .58vw, 12px);
+  --t-body: clamp(9px, .72vw, 14px);
+  --t-sub: clamp(8px, .6vw, 12px);
+  --t-index: clamp(8px, .62vw, 12px);
+  --t-meta: clamp(6px, .46vw, 10px);
+}
+
+/* SPECIFICITY, AND WHY EVERY RULE BELOW CARRIES AN EXTRA CLASS.
+   `main.tsx` imports `App` before `./styles.css`, and `App` imports this file,
+   so ring.css is emitted BEFORE styles.css in the bundle. At equal specificity
+   styles.css therefore wins, and the old `.card-scene` three-column grid
+   silently kept ownership of the layout -- the ring was being placed into a
+   14% column. Anything here that has to beat that grid is written as
+   `.game-scene.card-scene` or scoped under `.game-screen[data-scene="card"]`.
+
+   The card scene stops being a fixed five-row grid inside a 16/9 cartridge and
+   becomes an ordinary document-flow column, so the ring can keep its height.
+   Every other scene keeps the cartridge exactly as it was. */
+.game-screen[data-scene="card"] {
+  /* border-box, or the cartridge's own 11px frame is added OUTSIDE a 100vh
+     minimum and the card overflows the viewport by exactly the border. */
+  box-sizing: border-box;
+  width: min(100vw, 1280px);
+  height: auto;
+  min-height: 100vh;
+  overflow: visible;
+}
+/* The chrome is absolutely positioned against a 16/9 box and its offsets are
+   percentages, which resolve against `auto` height to nothing. On this scene it
+   joins the flow instead, so nothing can slide underneath it. */
+.game-screen[data-scene="card"] .game-topbar { position: static; height: auto; }
+/* The status pill rides in the header beside the 4 / 4 counter instead of
+   owning a full band of its own beneath it. Absolute, so it costs no height and
+   the title moves up into the reclaimed space. `right` clears the counter. */
+.game-screen[data-scene="card"] .game-mode,
+.game-screen[data-scene="card"] .api-indicator-wrap {
+  position: absolute;
+  z-index: 9;
+  top: clamp(15px, 1.9vw, 32px);
+  right: clamp(100px, 10.5vw, 150px);
+  width: max-content;
+  margin: 0;
+}
+.game-screen[data-scene="card"] .game-scene {
+  position: static;
+  padding: clamp(8px, 1vw, 15px) clamp(12px, 1.8vw, 30px) clamp(9px, 1.2vw, 18px);
+}
+.game-viewport:has(.game-screen[data-scene="card"]) { position: static; place-items: start center; overflow: visible; }
+/* `html, body, #root` are pinned to the viewport with `overflow: hidden`, which
+   is right for a 16/9 cartridge and wrong for a column taller than the screen:
+   it does not clip visibly, it makes the overflow UNREACHABLE. The apron, the
+   corner-man line and the PREPARE FIGHT CARD button all sat below the fold with
+   no way to scroll to them. Only this scene is released. */
+html:has(.game-screen[data-scene="card"]),
+html:has(.game-screen[data-scene="card"]) body,
+html:has(.game-screen[data-scene="card"]) #root {
+  height: auto;
+  min-height: 100%;
+  overflow-y: auto;
+}
+/* Because the column now scrolls, the primary action is pinned so it is never
+   the thing you have to go looking for. */
+.game-scene.card-scene .card-actions {
+  position: sticky;
+  z-index: 8;
+  bottom: 0;
+  margin: 0 calc(-1 * clamp(12px, 1.8vw, 30px)) calc(-1 * clamp(14px, 1.9vw, 28px));
+  padding: clamp(8px, 1vw, 14px) clamp(12px, 1.8vw, 30px);
+  border-top: 3px solid #131c44;
+  background: #050817f2;
+}
+
+.game-scene.card-scene { display: flex; flex-direction: column; gap: clamp(5px, .65vw, 11px); }
+/* The old grid gave these children a column and a chrome of their own. In the
+   flow column the placement is inert, but the borders and the scroll box are
+   not, so they are unwound here. */
+.game-scene.card-scene .scorecard-copy {
+  min-height: 0; padding: 0; border: 0; background: none; overflow: visible; align-content: start;
+}
+.game-scene.card-scene .scorecard-copy div { padding: 0; border-bottom: 0; }
+.game-scene.card-scene .persona-dialogue { min-width: 0; }
+.game-scene.card-scene .game-override { align-self: stretch; min-width: 0; }
+
+/* The marquee: one per screen. */
+.ring-card { min-width: 0; }
+.ring-rnum { margin: 0 0 .7em; color: var(--yellow); font-size: var(--t-label); letter-spacing: .34em; text-transform: uppercase; }
+.ring-rnum u { text-decoration: none; color: #4f5d90; letter-spacing: .18em; }
+.ring-rtitle {
+  margin: 0; font-size: clamp(14px, 1.7vw, 30px); line-height: 1.25;
+  text-transform: uppercase; letter-spacing: -.015em; overflow-wrap: break-word;
+}
+
+/* ============================== the ring ============================== */
+.ring { display: grid; grid-template-rows: auto auto; }
+
+.ring-bezel { display: flex; justify-content: flex-end; padding: clamp(6px, .8vw, 13px) 0 clamp(4px, .5vw, 9px); }
+/* A limitation, not a virtue, and limitations are always safe to state. */
+.ring-bezel span { color: #54628f; font-size: var(--t-meta); letter-spacing: .2em; text-transform: uppercase; }
+
+/* The stage is bounded by its column and the artwork scales inside it. The SVG
+   uses `meet`, never `slice`: `slice` crops to fill, which is what sheared the
+   blue corner off the right-hand edge. */
+/* The ring carries the most slack on this screen, so it is what gives way to
+   fit the card into one viewport. Bounded in `vh` as well as `vw`: on a short
+   window the stage, not the tiles, is what shrinks. */
+/* Shrink-to-fit around the stage: the SVG is `meet`-fitted, so a stage wider
+   than 1000:460 letterboxes and pushes the corner plates away from the fighters
+   they name. Giving the stage the artwork's own ratio removes the dead bands. */
+/* The arena is still shrink-to-fit, so the ring is NOT full bleed: it stops at
+   the red/blue rule under it -- the top edge of the two nameplates -- which is
+   the width the owner marked. The stage then takes all of that width, closing
+   the ~107px the plates used to overhang the drawn floor by. */
+.ring-arena { width: fit-content; max-width: 100%; margin-inline: auto; }
+/* The stage takes the full content width at an UNCHANGED height: the drawing
+   lengthens to fill it rather than scaling into it, so the figures keep their
+   size and this costs no vertical space. The viewBox width is measured to match
+   this box, so `meet` stays height-driven and never shrinks the fighters. */
+.ring-stage {
+  position: relative; overflow: hidden;
+  height: clamp(120px, min(14vw, 21vh), 210px);
+  width: 100%;
+}
+.ring-stage svg { display: block; width: 100%; height: 100%; }
+.ring-stage .px { shape-rendering: crispEdges; }
+
+/* The corner light and the post report the CLOCK, not the body. A corner that
+   is standing there untimed keeps its fighter and loses its light. */
+.ring-stage .pool { transition: opacity .4s steps(4); }
+.ring-stage[data-far="untimed"] .pool-far,
+.ring-stage[data-far="none"] .pool-far {
+  opacity: .12;
+  /* A corner that never lies down never had to move, so its light stays where
+     its standing figure is. This has to beat `.act-wake .pool` below, which it
+     does on specificity rather than on order. */
+  animation: none;
+}
+
+/* Round 1 only: the light travels with the body. The ellipse rests over the
+   bed -- see LIE_DOWN_SHIFT -- and this walks it back over the standing spot
+   as the figure comes up, on `ring-getup`'s own keyframes and step count so
+   the two stay in lockstep and the light is never on a patch of floor the
+   fighter is not on. Under reduced motion the loop dies and the light stays
+   over the bed, which is the same still the figures hold. */
+@keyframes ring-poolup {
+  0%, 44%  { transform: translateX(0) }
+  56%, 66% { transform: translateX(29px) }
+  78%, 94% { transform: translateX(57px) }
+  100%     { transform: translateX(0) }
+}
+.act-wake .pool { animation: ring-poolup 6.6s steps(3) infinite; }
+.ring-stage .post-far { fill: var(--blue); transition: fill .3s steps(3); }
+.ring-stage .cap-far { fill: #74a5ff; transition: fill .3s steps(3); }
+.ring-stage[data-far="untimed"] .post-far, .ring-stage[data-far="none"] .post-far { fill: #2b376c; }
+.ring-stage[data-far="untimed"] .cap-far, .ring-stage[data-far="none"] .cap-far { fill: #3b4680; }
+
+.ring-stage .g-bob { animation: ring-bob 1.15s steps(2) infinite; }
+@keyframes ring-bob { 0%, 100% { transform: translateY(0) } 50% { transform: translateY(-3px) } }
+.ring-stage g[class*="g-"] { transform-box: fill-box; transform-origin: bottom center; }
+
+/* Fighter identity, in DOM text, legible DURING animation and not only at
+   rest: the badge and the full name sit still on the apron rail while the
+   sprite moves behind them. */
+/* Below the ring, in the flow, not floated over its lower edge: overlaying it
+   put the blue corner's name on top of the ropes. */
+.ring-identity {
+  margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 0; padding: 0;
+  list-style: none; border-top: 3px solid #131c44;
+}
+.ring-identity li {
+  display: flex; align-items: center; justify-content: center; gap: .7em;
+  padding: clamp(4px, .5vw, 9px);
+  background: rgba(7, 11, 34, .82);
+  font-size: var(--t-state); letter-spacing: .1em; text-transform: uppercase;
+}
+/* The two plates are peers. The picker is centred in the blue half exactly as
+   LAKEBASE is centred in the red half, so it sits under the blue corner of the
+   ring and well inside the frame instead of stretching to the edge. Every part
+   of it hugs its text: nothing here flexes to fill. */
+.ring-identity li[data-corner="blue"] { justify-content: center; padding: clamp(3px, .4vw, 7px) clamp(6px, .8vw, 13px); }
+.ring-identity li[data-corner="blue"] > b { align-self: center; flex: 0 0 auto; }
+.ring-identity li[data-corner="red"] { box-shadow: inset 0 3px var(--red); }
+.ring-identity li[data-corner="blue"] { box-shadow: inset 0 3px var(--blue); }
+/* DIRECT CHILDREN ONLY. The corner badge is `li > b`; the opponent's name
+   inside the picker is also a `<b>`, and an unscoped rule painted it with the
+   badge's solid blue fill. */
+.ring-identity > li > b { padding: .25em .5em; font-weight: 400; }
+.ring-identity li[data-corner="red"] > b { background: var(--red); color: var(--cream); }
+.ring-identity li[data-corner="blue"] > b { background: var(--blue); color: var(--cream); }
+.ring-identity > li > span { color: var(--cream); }
+/* Dimmed, never struck through: the plate marks an empty corner, and nothing
+   on these rounds carries a time, a margin or a result. */
+.ring-identity li[data-empty="true"] > span { color: #55608c; }
+.ring-identity li[data-empty="true"] > b { background: #3b4680; color: #9fadd6; }
+
+/* Round 1 — engines park themselves and have to get back up, so a fighter who
+   never lies down is a false drawing. Who sleeps is decided by the pairing.
+
+   `wake-even`     both flat out on the same beat. NO corner is drawn quicker
+                   than the other: a depicted difference in pace needs a
+                   recorded race behind it, and this screen holds no receipt.
+   `wake-standing` the far engine cannot pause at all, so it has no bed and is
+                   awake for the whole round. That is not a head start: it is
+                   awake because it cannot stop, and it carries no clock here.
+   `wake-solo`     nobody opposite at all, so ours wakes alone. */
+@keyframes ring-getup {
+  0%, 44%  { transform: translate(0, -26px) rotate(-90deg) }
+  56%, 66% { transform: translate(4px, -14px) rotate(-42deg) }
+  78%, 94% { transform: translate(0, 0) rotate(0deg) }
+  100%     { transform: translate(0, -26px) rotate(-90deg) }
+}
+.wake-even #ring-home, .wake-even #ring-away .g-bob,
+.wake-standing #ring-home,
+.wake-solo #ring-home { animation: ring-getup 6.6s steps(3) infinite; }
+
+@keyframes ring-snore { 0%, 42% { opacity: .9 } 46%, 100% { opacity: 0 } }
+.ring-stage .zzz-near, .ring-stage .zzz-far { opacity: 0; }
+.wake-even .zzz-near, .wake-even .zzz-far,
+.wake-standing .zzz-near,
+.wake-solo .zzz-near { animation: ring-snore 6.6s steps(2) infinite; }
+
+/* One blanket drawing, humped over a body. There is no "made bed" state: the
+   corner that never sleeps has no bed at all. */
+.ring-stage .bl-sleep { display: none; }
+.wake-even .bl-sleep,
+.wake-standing .bl-sleep.bl-near,
+.wake-solo .bl-sleep.bl-near { display: block; }
+@keyframes ring-throwoff { 0%, 44% { opacity: 1 } 50%, 100% { opacity: 0 } }
+.wake-even .bl-sleep,
+.wake-standing .bl-sleep.bl-near,
+.wake-solo .bl-sleep.bl-near { animation: ring-throwoff 6.6s steps(1) infinite; }
+
+/* A corner with no clock gets no bed either way: empty because nobody is
+   there, or standing because that engine cannot lie down. */
+.ring-stage[data-far="none"] .bed-far,
+.ring-stage[data-far="none"] .bl-far,
+.ring-stage[data-far="none"] .zzz-far,
+.ring-stage[data-far="untimed"] .bed-far,
+.ring-stage[data-far="untimed"] .bl-far,
+.ring-stage[data-far="untimed"] .zzz-far { display: none; }
+
+/* Round 3 — the order is destroyed, then picked up off the canvas one piece at
+   a time. The slowness is the point: a real restore takes the minutes it takes. */
+.ring-stage .shard { transform-box: fill-box; transform-origin: center; }
+.act-recover .s1 { animation: ring-s1 9s steps(1) infinite }
+.act-recover .s2 { animation: ring-s2 9s steps(1) infinite }
+.act-recover .s3 { animation: ring-s3 9s steps(1) infinite }
+.act-recover .s4 { animation: ring-s4 9s steps(1) infinite }
+.act-recover .s5 { animation: ring-s5 9s steps(1) infinite }
+@keyframes ring-s1 { 0% { transform: none } 6% { transform: translate(-74px, 52px) rotate(18deg) } 30%, 100% { transform: none } }
+@keyframes ring-s2 { 0% { transform: none } 6% { transform: translate(-32px, 66px) rotate(-24deg) } 38%, 100% { transform: none } }
+@keyframes ring-s3 { 0% { transform: none } 6% { transform: translate(14px, 72px) rotate(9deg) } 46%, 100% { transform: none } }
+@keyframes ring-s4 { 0% { transform: none } 6% { transform: translate(58px, 60px) rotate(-14deg) } 54%, 100% { transform: none } }
+@keyframes ring-s5 { 0% { transform: none } 6% { transform: translate(92px, 44px) rotate(26deg) } 62%, 100% { transform: none } }
+.act-recover .ghost { animation: ring-ghost 9s steps(1) infinite; }
+@keyframes ring-ghost { 0%, 5% { opacity: 0 } 6%, 61% { opacity: .22 } 62%, 100% { opacity: 0 } }
+/* The recovered order holds for a third of the loop rather than flashing past. */
+.act-recover .whole { animation: ring-whole 9s steps(1) infinite; }
+@keyframes ring-whole { 0%, 61% { opacity: 0 } 62%, 96% { opacity: 1 } 97%, 100% { opacity: 0 } }
+.act-recover .g-bob { animation: ring-reach 9s steps(2) infinite; }
+@keyframes ring-reach {
+  0%, 6% { transform: translateY(0) }
+  10%, 60% { transform: translateY(6px) scaleY(.94) }
+  64%, 100% { transform: translateY(0) }
+}
+
+/* Round 5 — the crowd surges the gate. One side already has a gate. The other
+   builds one out of nine separate pieces before it can take a single client. */
+.ring-stage .pip, .ring-stage .pip-far { transform-box: fill-box; transform-origin: center; }
+.act-spike .pip { animation: ring-pip 1.9s linear infinite; }
+@keyframes ring-pip { 0% { transform: translateY(0); opacity: 0 } 12%, 88% { opacity: 1 } 100% { transform: translateY(-104px); opacity: 0 } }
+.act-spike .pip-far { animation: ring-pipfar 1.9s linear infinite; }
+@keyframes ring-pipfar { 0%, 62% { transform: translateY(0); opacity: 0 } 68%, 96% { opacity: 1 } 100% { transform: translateY(-104px); opacity: 0 } }
+.ring-stage .bolt { transform-box: fill-box; transform-origin: center; animation: ring-bolt 7.6s steps(1) infinite; }
+@keyframes ring-bolt { 0% { opacity: 0; transform: translate(0, -40px) } 8%, 100% { opacity: 1; transform: none } }
+.act-spike .gate-far { animation: ring-gateon 7.6s steps(1) infinite; }
+@keyframes ring-gateon { 0%, 52% { opacity: .18 } 53%, 100% { opacity: 1 } }
+
+/* Round 2 — both corners are handed the same work on their own copy, and both
+   do it. The original stands between them on a plinth: never touched, never
+   marked, and the only thing in the act with no animation on it at all. Not
+   moving is its entire job.
+
+   Both copies arrive on the same beat and both punches land on the same beat:
+   both corners take the identical migration, so there is nothing in the act
+   itself for a difference in pace to depict. */
+.ring-stage .copy, .ring-stage .whack, .ring-stage .new-row { transform-box: fill-box; transform-origin: center; }
+@keyframes ring-takenear {
+  0%, 10% { opacity: 0; transform: translate(0, -9px) }
+  18%, 50% { opacity: 1; transform: translate(0, 0) }
+  54% { opacity: 1; transform: translate(7px, 0) }
+  60%, 96% { opacity: 1; transform: translate(0, 0) }
+  100% { opacity: 0; transform: translate(0, -9px) }
+}
+@keyframes ring-takefar {
+  0%, 10% { opacity: 0; transform: translate(0, -9px) }
+  18%, 50% { opacity: 1; transform: translate(0, 0) }
+  54% { opacity: 1; transform: translate(-7px, 0) }
+  60%, 96% { opacity: 1; transform: translate(0, 0) }
+  100% { opacity: 0; transform: translate(0, -9px) }
+}
+.act-branch .copy-near { animation: ring-takenear 4.6s steps(2) infinite; }
+.act-branch .copy-far { animation: ring-takefar 4.6s steps(2) infinite; }
+/* The identical punch, mirrored. Same distance on both sides — any difference
+   in the punch itself would be a claim, and the migration is the same one. */
+@keyframes ring-jabr { 0%, 40% { transform: translateX(0) } 52%, 64% { transform: translateX(18px) } 76%, 100% { transform: translateX(0) } }
+@keyframes ring-jabl { 0%, 40% { transform: translateX(0) } 52%, 64% { transform: translateX(-18px) } 76%, 100% { transform: translateX(0) } }
+.act-branch .jab-r { animation: ring-jabr 4.6s steps(2) infinite; }
+.act-branch .jab-l { animation: ring-jabl 4.6s steps(2) infinite; }
+.act-branch .whack { animation: ring-whack 4.6s steps(1) infinite; opacity: 0; }
+@keyframes ring-whack { 0%, 50% { opacity: 0 } 52%, 58% { opacity: 1 } 60%, 100% { opacity: 0 } }
+.act-branch .new-row { animation: ring-newrow 4.6s steps(1) infinite; opacity: 0; }
+@keyframes ring-newrow { 0%, 53% { opacity: 0 } 54%, 100% { opacity: 1 } }
+
+/* Round 4 — the middleman with nothing to carry. He reaches for the box, the
+   box goes over his head by itself, his trolley stays empty, he gives up. */
+.ring-stage .courier, .ring-stage .arm-l, .ring-stage .arm-r,
+.ring-stage .flyby, .ring-stage .huh { transform-box: fill-box; }
+.act-inbound .flyby { animation: ring-flyby 6.4s steps(7) infinite; }
+@keyframes ring-flyby { 0%, 18% { transform: translate(0, 0) } 46%, 92% { transform: translate(-186px, 112px) } 100% { transform: translate(0, 0) } }
+/* pivot at the shoulder, not the middle of the limb, or the arms fly off */
+.act-inbound .arm-l { animation: ring-arml 6.4s steps(2) infinite; transform-origin: right top; }
+@keyframes ring-arml { 0%, 10% { transform: none } 18%, 32% { transform: rotate(-46deg) } 58%, 88% { transform: rotate(126deg) } 94%, 100% { transform: none } }
+.act-inbound .arm-r { animation: ring-armr 6.4s steps(2) infinite; transform-origin: left top; }
+@keyframes ring-armr { 0%, 10% { transform: none } 18%, 32% { transform: rotate(-62deg) } 58%, 88% { transform: rotate(-126deg) } 94%, 100% { transform: none } }
+.act-inbound .courier { animation: ring-shrug 6.4s steps(2) infinite; }
+@keyframes ring-shrug { 0%, 54% { transform: none } 58%, 88% { transform: translateY(-5px) } 92%, 100% { transform: none } }
+.act-inbound .huh { animation: ring-huh 6.4s steps(1) infinite; opacity: 0; }
+@keyframes ring-huh { 0%, 57% { opacity: 0 } 58%, 88% { opacity: 1 } 89%, 100% { opacity: 0 } }
+
+/* Round 6 — a queue on a metronome. The clerk's arm sweeps across the counter
+   on every beat and the line never once waits for him. The beat bar is the
+   proof: four lamps, one per beat, and not one is ever skipped. It is DRAWN,
+   not measured, and the apron says so. */
+.ring-stage .q, .ring-stage .sweep-arm, .ring-stage .sweep-hand, .ring-stage .beat { transform-box: fill-box; }
+.act-outbound .q { animation: ring-queue 4.4s steps(1) infinite; }
+@keyframes ring-queue {
+  0% { transform: translateX(0); opacity: 0 }
+  2% { transform: translateX(0); opacity: 1 }
+  25% { transform: translateX(30px) } 50% { transform: translateX(60px) }
+  75% { transform: translateX(90px) }
+  98% { transform: translateX(120px); opacity: 1 }
+  100% { transform: translateX(120px); opacity: 0 }
+}
+.act-outbound .q2 { animation-delay: -1.1s }
+.act-outbound .q3 { animation-delay: -2.2s }
+.act-outbound .q4 { animation-delay: -3.3s }
+/* the arm stretches from the shoulder rather than sliding, so it never detaches */
+.act-outbound .sweep-arm { animation: ring-reachout 1.1s steps(2) infinite; transform-origin: right center; }
+@keyframes ring-reachout { 0%, 26% { transform: none } 50% { transform: scaleX(1.62) } 74%, 100% { transform: none } }
+.act-outbound .sweep-hand { animation: ring-reachhand 1.1s steps(2) infinite; }
+@keyframes ring-reachhand { 0%, 26% { transform: none } 50% { transform: translateX(-52px) } 74%, 100% { transform: none } }
+.act-outbound .beat { animation: ring-beat 4.4s steps(1) infinite; }
+@keyframes ring-beat { 0% { fill: #f8d83b } 25%, 100% { fill: #3b4680 } }
+.act-outbound .b2 { animation-delay: 1.1s }
+.act-outbound .b3 { animation-delay: 2.2s }
+.act-outbound .b4 { animation-delay: 3.3s }
+
+/* ============================= the apron =============================
+   Four permanent zones hold everything the corner has to say at once, off the
+   moving surface, at a size that reads from the back of the room. */
+.ring-apron {
+  border-top: clamp(3px, .34vw, 6px) solid var(--yellow); background: #0a1030;
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.ring-cell { min-width: 0; padding: clamp(9px, 1vw, 17px) clamp(10px, 1.1vw, 19px); border-left: 2px solid #131c44; }
+.ring-cell:first-child { border-left: 0; }
+.ring-cell h2 {
+  margin: 0 0 1em; color: var(--yellow); font-size: var(--t-label); letter-spacing: .2em;
+  text-transform: uppercase; font-weight: 400; line-height: 1.6;
+}
+.ring-cell p { margin: 0; color: var(--cream); font-size: var(--t-body); line-height: 1.8; }
+.ring-cell p + p { margin-top: .85em; }
+.ring-cell p.sub { color: #9fadd6; font-size: var(--t-sub); line-height: 1.85; }
+
+/* The blue corner's lane state, at the top of its own zone. */
+.ring-state { margin: 0 0 1em; font-size: var(--t-state); letter-spacing: .14em; text-transform: uppercase; line-height: 1.7; }
+.ring-state[data-lane="race"] { color: var(--blue-light); }
+.ring-state[data-lane="untimed"], .ring-state[data-lane="none"] { color: var(--yellow); }
+
+/* ORPHANED. The staging paragraph these rules dressed was removed from the
+   fight card by the owner -- nothing renders `.ring-staging` any more. Left in
+   place rather than swept out, the same way `.ring-bezel` above was, so the
+   next person to reach for a full-width strip under the apron finds the
+   measure and the divider already reasoned about. */
+.ring-staging { grid-column: 1 / -1; border-top: 2px solid #131c44; padding: clamp(9px, 1vw, 17px) clamp(10px, 1.1vw, 19px); background: #0d1330; }
+/* The divider separates the strip from the cells above it. On a round that can
+   arm there are no cells, so it would land directly under the apron's own
+   yellow rule and read as a doubled edge. Same reason as `.ring-cell:first-child`. */
+.ring-staging:first-child { border-top: 0; }
+.ring-staging p { margin: 0; color: #9fadd6; font-size: var(--t-sub); line-height: 1.85; max-width: 126ch; }
+
+/* The apron's own definition list keeps the fight card's existing wording. */
+.ring-apron .scorecard-copy { display: grid; gap: .85em; margin: .85em 0 0; }
+.ring-apron .scorecard-copy div { display: grid; gap: .3em; }
+.ring-apron .scorecard-copy dt { color: #6b78a8; font-size: var(--t-label); letter-spacing: .16em; text-transform: uppercase; }
+.ring-apron .scorecard-copy dd { margin: 0; color: var(--cream); font-size: var(--t-sub); line-height: 1.8; }
+
+/* ============================== the deck ============================== */
+/* Six keys carrying the title and the canonical lane wording as ordinary
+   visible text, so all six rounds and all six lane states are legible without
+   pressing anything. Still six across, left to right. */
+/* THREE ACROSS, NOT SIX. The mockup ran six across a 1420px full-bleed page
+   with no surrounding chrome. In this column six tiles are ~150px wide and
+   "Move live application data into the lakehouse" breaks mid-word and spills
+   over its neighbour. Two rows of three keeps every title whole and keeps the
+   reading order the lamps always had. Six only returns when there is room. */
+.ring-keys { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(5px, .7vw, 11px); padding-top: clamp(9px, 1vw, 16px); }
+/* Six across is gone rather than moved to a higher breakpoint. It was gated on
+   the VIEWPORT being wide enough, but the ring column is capped, so a sixth of
+   it measures ~123px at 1800, 1920, 2560 and 3000 alike while the title font
+   caps at 12px. "APPLICATIONS" needs 144px at that size. The condition the old
+   rule was waiting for -- "six only returns when there is room" -- is therefore
+   never satisfiable, and at 1920 it sheared three of the six titles
+   ("APPLICATIO / N"), which is the exact fault the rule above forbids.
+   Deleting it makes every width behave like 1720px, which reads correctly. */
+.ring-key {
+  position: relative; min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr);
+  gap: .3em .65em; align-content: start; text-align: left;
+  padding: clamp(7px, .85vw, 13px) clamp(7px, .9vw, 14px) clamp(9px, 1vw, 16px);
+  color: #8f9dcb; background: #111a3d; border: 3px solid #2c3868; border-bottom: 9px solid #070c22;
+  font: inherit; cursor: pointer;
+}
+.ring-key:hover { color: var(--cream); background: #182356; border-color: var(--blue); }
+.ring-key:focus-visible { outline: 4px solid var(--yellow); outline-offset: 3px; }
+.ring-key-n { grid-row: 1 / 3; align-self: start; color: var(--cream); font-size: clamp(12px, 1.2vw, 22px); line-height: 1.05; }
+/* Titles wrap at word boundaries and never mid-word; a sheared word reads as a
+   rendering fault rather than as a label. */
+.ring-key-t {
+  align-self: start; min-width: 0; font-size: var(--t-index); line-height: 1.55;
+  text-transform: uppercase; color: var(--cream); overflow-wrap: break-word; hyphens: none;
+  text-wrap: balance;
+}
+.ring-key-l { display: flex; align-items: flex-start; gap: .5em; min-width: 0; font-size: var(--t-meta); letter-spacing: .12em; text-transform: uppercase; line-height: 1.5; overflow-wrap: break-word; }
+.ring-key-l > span { min-width: 0; }
+.ring-key-l i { margin-top: .35em; }
+.ring-key-l i { flex: 0 0 auto; width: 8px; height: 8px; font-style: normal; display: inline-block; }
+/* Cream, not blue: "blue" names the opponent's corner in the copy, so a blue
+   lamp meaning "both corners timed" would be a second sense of the colour. */
+.ring-key[data-lane="race"] i { background: var(--cream); }
+.ring-key[data-lane="untimed"] i { background: var(--yellow); }
+.ring-key[data-lane="none"] i { border: 2px solid var(--yellow); background: none; }
+.ring-key[data-lane="untimed"] .ring-key-l, .ring-key[data-lane="none"] .ring-key-l { color: var(--yellow); }
+/* Availability is the backend's answer and it outranks the artwork. A round
+   the ring says is not ready must never read as ready. */
+.ring-key-a { grid-column: 2; justify-self: start; padding: .2em .5em; background: var(--red); color: var(--cream); font-size: var(--t-meta); letter-spacing: .14em; text-transform: uppercase; }
+/* SELECTION: A YELLOW EDGE, NOT A YELLOW BLOCK.
+   The previous rule filled the tile with `--yellow` and set the text to
+   `var(--deep)` -- a custom property that is defined nowhere in this codebase.
+   An invalid `var()` resolves to inherit at computed-value time, so the title
+   inherited a pale colour and the selected round was the one tile on the strip
+   you could not read. The chosen round is now the most legible of the six:
+   cream title on the same dark fill as its neighbours, ringed in yellow so the
+   selection still carries across a room. */
+.ring-key[aria-current="true"] {
+  color: var(--cream);
+  background: #16204c;
+  border-color: var(--yellow);
+  border-bottom-color: var(--yellow);
+  box-shadow: 0 0 0 3px var(--yellow);
+}
+.ring-key[aria-current="true"] .ring-key-n { color: var(--yellow); }
+.ring-key[aria-current="true"] .ring-key-t { color: var(--cream); }
+.ring-key[aria-current="true"] .ring-key-l { color: var(--yellow); }
+.ring-key[aria-current="true"] i { background: var(--yellow); }
+.ring-key[aria-current="true"][data-lane="none"] i { border-color: var(--yellow); background: none; }
+
+/* THE LAMP GOES LIVE WHILE THE WORDS DO. The lamp reports the LANE, and a tile
+   showing BOUT IN PROGRESS is not reporting a lane, so leaving it on its lane
+   colour would light a fact the line beside it has stopped stating. Red is the
+   on-air light and nothing else on this strip uses it.
+
+   The words themselves stay in the tile's own yellow rather than going red.
+   They are 6px of a pixel font read across a room: yellow on this fill measures
+   about 11:1, red about 4:1, and legibility outranks the colour cue on text.
+   The lamp is an 8px block with no glyphs, so it can carry the cue for free.
+
+   BOTH SELECTORS, and neither is redundant. A busy tile is always the selected
+   one, so the rule has to beat `[aria-current="true"][data-lane="none"] i`
+   above -- which carries one more attribute than a lone `[data-busy]` would. */
+.ring-key[data-busy="true"] i,
+.ring-key[aria-current="true"][data-busy="true"] i { border-color: var(--red); background: var(--red); }
+
+.ring-refusal { grid-column: 1 / -1; padding: clamp(8px, 1vw, 14px) 0; }
+
+
+/* Lives inside the blue corner's plate now, so it claims no row of its own. */
+.ring-pick { flex: 0 0 auto; min-width: 0; display: grid; gap: .25em; justify-items: center; }
+.ring-pick p { margin: 0; color: #4f5d90; font-size: var(--t-meta); letter-spacing: .24em; text-transform: uppercase; }
+.ring-picker { display: flex; align-items: stretch; gap: .3em; }
+.ring-nudge { width: clamp(17px, 1.6vw, 26px); border: 3px solid var(--rule, #242f5c); background: #0c1330; color: #8b99cb; font: inherit; font-size: clamp(6px, .5vw, 11px); cursor: pointer; line-height: 1; }
+.ring-nudge:hover { border-color: var(--blue); color: var(--cream); }
+.ring-nudge:focus-visible { outline: 4px solid var(--yellow); outline-offset: 2px; }
+.ring-who { flex: 0 0 auto; min-width: 0; display: grid; align-content: center; gap: .25em; padding: .35em .8em; border: 3px solid var(--rule, #242f5c); background: #0c1330; text-align: center; }
+.ring-who b { font-weight: 400; color: var(--cream); font-size: var(--t-state); letter-spacing: .06em; text-transform: uppercase; line-height: 1.4; }
+.ring-who em { font-style: normal; color: #4f5d90; font-size: var(--t-meta); letter-spacing: .16em; text-transform: uppercase; }
+
+@media (max-width: 1100px) {
+  .ring-apron { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .ring-cell:nth-child(3) { grid-column: 1 / -1; border-left: 0; border-top: 2px solid #131c44; }
+}
+/* TWO ACROSS COSTS A WHOLE ROW, so it starts later than the apron's own
+   breakpoint did. Six tiles two-across is three rows, and at 1024x660 -- the
+   size this is presented at -- that third row is what put PREPARE FIGHT CARD
+   below the fold. Three across holds every title whole down to here: the
+   longest word on the strip is "APPLICATIONS", and a third of the column at
+   960px is still wider than it needs at the size the title font caps to. */
+@media (max-width: 960px) {
+  .ring-keys { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .ring-apron { grid-template-columns: minmax(0, 1fr); }
+  .ring-cell { border-left: 0; }
+  .ring-cell + .ring-cell { border-top: 2px solid #131c44; }
+  .ring-keys { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ========================== reduced motion ==========================
+   ONE RULE, AND IT IS DELIBERATELY THE BLUNT INSTRUMENT. Naming the animated
+   classes individually does not work: every one of them is reached through an
+   act selector (`.act-recover .s1`) that carries more specificity than the
+   bare class does, and a media query adds none, so a hand-written list
+   silently loses the cascade on exactly the elements it was written to switch
+   off. This cannot be best-effort -- it is the difference between honouring
+   the setting and appearing to. */
+@media (prefers-reduced-motion: reduce) {
+  .card-scene, .card-scene *, .card-scene *::before, .card-scene *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  /* With every loop dead, each act still has to be a coherent still, and the
+     still should be the most informative frame rather than the first. */
+  .wake-even #ring-home, .wake-even #ring-away .g-bob,
+  .wake-standing #ring-home, .wake-solo #ring-home { transform: translate(0, -26px) rotate(-90deg); }
+  .ring-stage .zzz-near, .ring-stage .zzz-far { opacity: 0; }
+  .wake-even .zzz-near, .wake-even .zzz-far,
+  .wake-standing .zzz-near, .wake-solo .zzz-near { opacity: .9; }
+  /* Both copies present and both already marked: the still shows the work done
+     on both sides rather than on neither. */
+  .act-branch .new-row { opacity: 1; }
+  .act-branch .copy { opacity: 1; }
+  /* The recovered order is the whole point of that round. */
+  .act-recover .whole { opacity: 1; }
+  .act-recover .ghost { opacity: 0; }
+  /* Four bodies phase-shifted on a loop become one body when the loop stops. */
+  .act-outbound .q1 { transform: translateX(0); opacity: 1; }
+  .act-outbound .q2 { transform: translateX(30px); opacity: 1; }
+  .act-outbound .q3 { transform: translateX(60px); opacity: 1; }
+  .act-outbound .q4 { transform: translateX(90px); opacity: 1; }
+  .act-outbound .b1 { fill: #f8d83b; }
+  /* the gate is built rather than building, and the box has not arrived */
+  .act-spike .gate-far { opacity: 1; }
+  .ring-stage .bolt { opacity: 1; transform: none; }
+  .ring-stage .pip, .ring-stage .pip-far { opacity: 0; }
+  .act-inbound .huh { opacity: 1; }
+}

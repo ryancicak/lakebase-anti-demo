@@ -1,0 +1,217 @@
+/* The installation banner.
+ *
+ * Fixed to the top of the viewport rather than placed inside a screen: this is
+ * an installation-level fact, and it is true on the title screen, mid-bout and
+ * on the scorecard alike. It is also the one thing on screen that must not be
+ * scrolled past on a projector.
+ */
+
+.installation-banner {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 900;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 0.9rem 1.1rem;
+  font-family: inherit;
+  font-size: 0.72rem;
+  line-height: 1.7;
+  color: #0b0b0b;
+  border-bottom: 4px solid #0b0b0b;
+  box-shadow: 0 6px 0 rgba(0, 0, 0, 0.35);
+}
+
+/* Three tones, three colours, because three different things are being said.
+   Nothing here is green: none of the states this banner renders is good news. */
+.installation-banner[data-tone='gone'] { background: #ff5f56; }
+.installation-banner[data-tone='blind'] { background: #ffd166; }
+.installation-banner[data-tone='unasked'] { background: #cfd8dc; }
+.installation-banner[data-tone='working'] { background: #8fd3f4; }
+
+/* The deployed app's operator note. Recovery is physically impossible there, so
+   nothing in it is one click from being acted on -- and it sits above a title
+   card that gets projected. Muted rather than alarm-coloured, and no taller than
+   the two lines it needs, with the diagnosis itself folded into <details>. */
+.installation-banner[data-quiet='true'] {
+  max-height: none;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.62rem;
+  color: #e6e6e6;
+  background: #22262b;
+  border-bottom: 2px solid #4b525b;
+  box-shadow: none;
+}
+
+.installation-banner[data-quiet='true'] .installation-lede {
+  font-weight: 400;
+  opacity: 0.9;
+}
+
+/* The inset panels and the control invert with the strip. Both default to a
+   near-white fill under near-black text, which on this background would be a
+   light block and, worse, an invisible button. */
+.installation-banner[data-quiet='true'] .installation-transitional,
+.installation-banner[data-quiet='true'] .installation-holder,
+.installation-banner[data-quiet='true'] .installation-progress {
+  background: rgba(255, 255, 255, 0.08);
+  border-left-color: #6f7680;
+}
+
+.installation-banner[data-quiet='true'] button {
+  color: #0b0b0b;
+  background: #d7dbe0;
+}
+
+.installation-diagnosis > summary {
+  cursor: pointer;
+  opacity: 0.8;
+}
+
+/* Only once opened does it need room, and only then may it scroll. */
+.installation-diagnosis[open] {
+  max-height: 60vh;
+  margin-top: 0.5rem;
+  overflow-y: auto;
+}
+
+.installation-banner h2 {
+  margin: 0 0 0.5rem;
+  font-size: 0.86rem;
+  letter-spacing: 0.04em;
+}
+
+.installation-banner[data-quiet='true'] h2 {
+  margin: 0 0 0.25rem;
+  font-size: 0.66rem;
+  opacity: 0.75;
+}
+
+.installation-lede {
+  margin: 0 0 0.6rem;
+  font-weight: 700;
+}
+
+/* The remediation text carries real shell commands, so it keeps its newlines. */
+.installation-instead,
+.installation-transitional,
+.installation-holder {
+  margin: 0 0 0.6rem;
+  white-space: pre-wrap;
+}
+
+.installation-transitional,
+.installation-holder {
+  padding: 0.5rem 0.6rem;
+  background: rgba(255, 255, 255, 0.55);
+  border-left: 4px solid #0b0b0b;
+}
+
+.installation-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+  margin-top: 0.4rem;
+}
+
+.installation-banner button {
+  padding: 0.45rem 0.8rem;
+  font: inherit;
+  color: #f7f7f7;
+  cursor: pointer;
+  background: #0b0b0b;
+  border: 0;
+}
+
+.installation-banner button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.installation-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.7rem;
+  margin-top: 0.6rem;
+  background: rgba(255, 255, 255, 0.7);
+  border: 3px solid #0b0b0b;
+}
+
+.installation-plan {
+  margin: 0;
+  font-weight: 700;
+}
+
+.installation-cost {
+  margin: 0;
+}
+
+.installation-cost small {
+  display: block;
+  font-size: 0.62rem;
+  opacity: 0.8;
+}
+
+.installation-budget {
+  margin: 0;
+  font-size: 0.66rem;
+}
+
+.installation-confirm code {
+  padding: 0.1rem 0.3rem;
+  background: #0b0b0b;
+  color: #f7f7f7;
+}
+
+.installation-confirm input {
+  padding: 0.45rem;
+  font: inherit;
+  border: 3px solid #0b0b0b;
+}
+
+.installation-actions {
+  display: flex;
+  gap: 0.6rem;
+}
+
+.installation-failure {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.installation-progress {
+  padding: 0.5rem 0.6rem;
+  margin: 0.6rem 0;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.installation-phase {
+  margin: 0 0 0.3rem;
+  font-weight: 700;
+}
+
+.installation-detail {
+  margin: 0 0 0.4rem;
+}
+
+.installation-log {
+  max-height: 12rem;
+  padding: 0.5rem;
+  margin: 0;
+  overflow: auto;
+  font-size: 0.62rem;
+  color: #e6e6e6;
+  background: #0b0b0b;
+}
+
+.installation-age {
+  margin: 0.5rem 0 0;
+  font-size: 0.62rem;
+  opacity: 0.85;
+}
+
+.installation-reveal {
+  white-space: nowrap;
+}

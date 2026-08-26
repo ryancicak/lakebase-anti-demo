@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lockjaw Lucy — DBA ringside portrait</title><desc id="desc">An original 8-bit ringside timekeeper with shoulder-length asymmetric hair, a geometric jaw, enormous collar, and padlock clasp.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#202633" stroke="#8A95A8" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#EE452D" stroke-width="6"/>
+  <g fill="#F8D83B"><rect x="63" y="58" width="48" height="18"/><rect x="232" y="46" width="48" height="18"/><rect x="401" y="58" width="48" height="18"/></g>
+  <path d="M42 278H470M42 333H470M42 388H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 286H470M42 341H470M42 396H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- low broad timekeeper -->
+  <path d="M91 432V335L146 282H366L421 335V432Z" fill="#4C5668"/><path d="M135 432L188 292L256 358L324 292L379 432Z" fill="#7B2636"/>
+  <!-- shoulder-length asymmetric pixel bob, behind the face and collar -->
+  <path d="M137 139H184V252H198V312H158V290H137ZM328 139H375V274H395V326H351V302H328Z" fill="#211A20"/>
+  <path d="M145 160H158V272H174V296H153V279H145ZM354 158H367V286H382V311H360V291H354Z" fill="#6B3A32"/>
+  <path d="M160 151H190V119H322V151H352V242L322 279H190L160 242Z" fill="#8F5A3C"/>
+  <path d="M161 155L185 111L221 121L256 96L291 121L327 111L351 155L314 138L279 150L244 136L207 150Z" fill="#211A20"/>
+  <rect x="198" y="177" width="31" height="21" fill="#070B22"/><rect x="283" y="177" width="31" height="21" fill="#070B22"/>
+  <!-- absurdly square jaw, still clearly a face -->
+  <path d="M205 224H307V262L286 282H226L205 262Z" fill="#B96F45"/><rect x="224" y="239" width="64" height="16" fill="#4A2A22"/>
+  <!-- enormous triangular collar and padlock clasp -->
+  <path d="M147 294L256 384L365 294L325 432H187Z" fill="#D7D9D4"/><path d="M196 306L256 360L316 306" fill="none" stroke="#10152F" stroke-width="14"/>
+  <rect x="223" y="353" width="66" height="55" fill="#F8D83B"/><path d="M238 353V333H274V353" fill="none" stroke="#F8D83B" stroke-width="13"/><rect x="251" y="371" width="11" height="22" fill="#10152F"/>
+  <rect x="69" y="406" width="374" height="67" fill="#111938" stroke="#8A95A8" stroke-width="8"/>
+  <!-- high-contrast database stack and restore mark -->
+  <ellipse cx="139" cy="427" rx="46" ry="12" fill="#F8D83B"/><rect x="93" y="427" width="92" height="28" fill="#F8D83B"/><ellipse cx="139" cy="455" rx="46" ry="12" fill="#F8D83B"/><path d="M94 436C94 448 184 448 184 436M94 449C94 461 184 461 184 449" fill="none" stroke="#7B2636" stroke-width="6"/>
+  <path d="M289 459A35 35 0 1 1 337 427" fill="none" stroke="#43D17A" stroke-width="10"/><path d="M332 411L347 433L320 435Z" fill="#43D17A"/>
+</svg>

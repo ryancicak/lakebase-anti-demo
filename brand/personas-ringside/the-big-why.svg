@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">The Big Why — Executive ringside portrait</title><desc id="desc">An original 8-bit fight promoter leaning forward in the VIP row with an oversized question-mark tie.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#1F1D31" stroke="#F8D83B" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#EE452D" stroke-width="6"/>
+  <g fill="#F8D83B"><rect x="60" y="58" width="55" height="18"/><rect x="228" y="46" width="55" height="18"/><rect x="397" y="58" width="55" height="18"/></g>
+  <path d="M42 278H470M42 333H470M42 388H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 286H470M42 341H470M42 396H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- broad inverted-triangle VIP silhouette -->
+  <path d="M66 432L117 299L190 269H322L395 299L446 432Z" fill="#171923"/>
+  <g stroke="#D7D9D4" stroke-width="5"><path d="M132 310L101 432M175 288L157 432M337 288L355 432M380 310L411 432"/></g>
+  <path d="M168 146H195V118H317V146H344V247L317 279H195L168 247Z" fill="#8F5A3C"/><path d="M169 150L193 111H319L343 150L309 137L256 151L205 135Z" fill="#27201F"/>
+  <rect x="204" y="176" width="29" height="20" fill="#070B22"/><rect x="279" y="176" width="29" height="20" fill="#070B22"/><rect x="224" y="238" width="64" height="16" fill="#34211B"/>
+  <path d="M160 294L256 368L352 294" fill="none" stroke="#FFF4C2" stroke-width="18"/>
+  <!-- painfully oversized question-mark tie -->
+  <path d="M232 314H280L289 351L267 376L283 432H229L245 376L223 351Z" fill="#F8D83B"/><text x="256" y="370" font-family="Arial Black,Arial,sans-serif" font-size="57" font-weight="900" fill="#10152F" text-anchor="middle">?</text>
+  <rect x="66" y="408" width="380" height="66" fill="#111938" stroke="#F8D83B" stroke-width="8"/><rect x="188" y="425" width="136" height="30" fill="#A36B00"/>
+</svg>

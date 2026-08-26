@@ -1,0 +1,13 @@
+{
+  "fetched_at": null,
+  "source": "seed",
+  "repo": "ryancicak/lakebase-anti-demo",
+  "note": "Seeded, not fetched: github.com/ryancicak/lakebase-anti-demo does not exist yet and the working tree is not a git repository, so there is no history to read. This one entry is the project's actual author, named on the roll's own finale card and in the repo URL -- not a placeholder and not a stand-in. fetch-contributors.py replaces this wholesale the day the repo is pushed; until then it keeps it.",
+  "contributors": [
+    {
+      "login": "ryancicak",
+      "name": "Ryan Cicak",
+      "html_url": "https://github.com/ryancicak"
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CreateAndHardenTheStateBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketTagging",
+        "s3:PutBucketVersioning",
+        "s3:PutEncryptionConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::<STATE_BUCKET>"
+    },
+    {
+      "Sid": "ListTheStatePrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<STATE_BUCKET>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": "anti-demo/*"
+        }
+      }
+    },
+    {
+      "Sid": "ReadAndWriteTheStateObjectAndItsLock",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::<STATE_BUCKET>/anti-demo/*/terraform.tfstate",
+        "arn:aws:s3:::<STATE_BUCKET>/anti-demo/*/terraform.tfstate.tflock"
+      ]
+    },
+    {
+      "Sid": "DeleteOnlyTheLock",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::<STATE_BUCKET>/anti-demo/*/terraform.tfstate.tflock"
+    },
+    {
+      "Sid": "DiscoverBucketsForThePreflightProbe",
+      "Effect": "Allow",
+      "Action": "s3:ListAllMyBuckets",
+      "Resource": "*"
+    }
+  ]
+}

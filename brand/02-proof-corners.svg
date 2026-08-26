@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase: The Anti-Demo — Proof Corners logo concept</title>
+  <desc id="desc">A symmetrical overhead boxing ring with opposing corners and a verified check at center, paired with a compact wordmark.</desc>
+  <rect width="1600" height="600" rx="28" fill="#101214"/>
+
+  <!-- A fair, overhead ring: deliberately symmetric. -->
+  <g transform="translate(96 94)" fill="none" stroke-linejoin="round">
+    <rect x="18" y="18" width="360" height="360" rx="16" stroke="#F7F3EA" stroke-width="13"/>
+    <rect x="50" y="50" width="296" height="296" rx="12" stroke="#767B80" stroke-width="10"/>
+    <rect x="82" y="82" width="232" height="232" rx="8" stroke="#F7F3EA" stroke-width="8"/>
+
+    <!-- Opposing red corners make the matchup visible without a VS badge. -->
+    <path d="M17 106V18H105" stroke="#FF3621" stroke-width="28"/>
+    <path d="M379 290V378H291" stroke="#FF3621" stroke-width="28"/>
+    <path d="M291 18H379V106" stroke="#F7F3EA" stroke-width="22"/>
+    <path d="M105 378H17V290" stroke="#F7F3EA" stroke-width="22"/>
+
+    <!-- Verified application outcome. -->
+    <path d="M132 202L178 248L272 146" stroke="#FF3621" stroke-width="32" stroke-linecap="square"/>
+  </g>
+
+  <g font-family="Arial Black, Helvetica Neue, Arial, sans-serif">
+    <text x="595" y="252" fill="#F7F3EA" font-size="128" font-weight="900" letter-spacing="-6">LAKEBASE</text>
+    <text x="599" y="356" fill="#FF3621" font-size="61" font-weight="900" letter-spacing="5">THE ANTI-DEMO</text>
+  </g>
+  <text x="602" y="420" fill="#B8BCBF" font-family="Helvetica Neue, Arial, sans-serif" font-size="27" font-weight="700" letter-spacing="2.8">ONE RING. TWO CORNERS. VERIFIED LIVE.</text>
+</svg>

@@ -1,0 +1,532 @@
+/* The credits roll's stylesheet. Hand-authored -- edit it here, directly.
+ *
+ * TWO SHEETS DRESS THE ROLL, and which one owns what is the only thing you
+ * need to know before adding a rule. THIS sheet owns the scene and everything
+ * that scrolls through it: the arena, the ring, the crowd, the crawl and each
+ * beat inside it, the in-scene skip and back buttons, and the staging of the
+ * outro layer. credits-entry.css owns the authorship card
+ * (.production-credit), the pieces of the held mark that follows the crawl
+ * (.credits-outro-ring / -title / -tagline), and the footer control that opens
+ * the roll from a round screen. credits.tsx imports both. A rule for a block
+ * that scrolls past the viewer belongs here; a rule for the card or the held
+ * mark belongs there.
+ *
+ * Arena colors are declared locally on .credits-arena so :root in
+ * styles.css stays untouched. Every value is a :root token or a navy
+ * shade already present in styles.css.
+ */
+
+.credits-arena {
+  /* Every value below is either a :root token or one of the navy shades
+     already used in styles.css (#050817, #080b1f, #0a1130, #10183e). */
+  --arena: var(--navy);
+  --arena-deep: #050817;
+  --arena-mat: #10183e;
+  --crowd-far: var(--panel);
+  --crowd-near: var(--ink);
+  --rope: var(--cream);
+  --keyline: var(--ink);
+  --sink: #050817;
+  --label: #aeb9df;
+  background: var(--arena);
+}
+
+/* ---- Crowd: two ranks of tiny procedural pixel heads on the arena wall.
+ * Dark navy silhouettes against navy -- the far rank is lifted to --panel and
+ * the near rank drops to --ink, so depth comes from value, not from a hue
+ * shift. ---- */
+.credits-crowd {
+  position: absolute;
+  z-index: 0;
+  inset: 0 0 62% 0;
+  overflow: hidden;
+  background: var(--arena-deep);
+}
+.credits-crowd::before,
+.credits-crowd::after {
+  content: "";
+  position: absolute;
+  inset: -10px 0;
+  background-repeat: repeat;
+  animation: credits-crowd-bob 1.7s steps(2, end) infinite alternate;
+}
+.credits-crowd::before {
+  background-image: radial-gradient(circle at 9px 11px, var(--crowd-far) 0 4px, transparent 4.5px);
+  background-size: 22px 20px;
+}
+.credits-crowd::after {
+  background-image: radial-gradient(circle at 15px 17px, var(--crowd-near) 0 5px, transparent 5.5px);
+  background-size: 31px 28px;
+  animation-duration: 2.4s;
+}
+.credits-crowd[data-still="true"]::before,
+.credits-crowd[data-still="true"]::after { animation: none; }
+
+@keyframes credits-crowd-bob {
+  from { transform: translateY(0); }
+  to { transform: translateY(-4px); }
+}
+
+/* ---- Ring floor. ----
+ * The apron starts in the crowd's own color and lifts downward through the
+ * app's navy panel shades, so the horizon is the point where the crowd dot
+ * texture stops rather than a hard color step. A hard-stop gradient here drew
+ * a bright band straight through whatever line of the roll was passing it. */
+.credits-apron {
+  position: absolute;
+  z-index: 0;
+  inset: 38% 0 0 0;
+  background: linear-gradient(180deg, var(--arena-deep) 0, #080b1f 24%, #0a1130 62%, var(--arena-mat) 100%);
+}
+
+/* ---- Ropes and turnbuckle posts. ---- */
+.credits-ropes {
+  position: absolute;
+  z-index: 4;
+  left: 0;
+  right: 0;
+  display: grid;
+  gap: clamp(9px, 1.15vh, 18px);
+  pointer-events: none;
+}
+.credits-ropes-top { top: clamp(34px, 4.4vh, 70px); }
+.credits-ropes-bottom { bottom: clamp(92px, 11.5vh, 148px); }
+.credits-ropes span {
+  height: clamp(5px, .55vh, 9px);
+  background: var(--rope);
+  box-shadow: 0 clamp(2px, .26vh, 4px) 0 #00000066;
+}
+
+.credits-post {
+  position: absolute;
+  z-index: 4;
+  top: clamp(22px, 3vh, 50px);
+  bottom: clamp(74px, 9.4vh, 122px);
+  display: grid;
+  align-content: space-between;
+  width: clamp(20px, 1.6vw, 34px);
+  padding: clamp(26px, 3.4vh, 54px) 0;
+  background: var(--rope);
+  box-shadow: inset 0 0 0 4px var(--ink), .35em .35em 0 #00000047;
+}
+.credits-post-left { left: clamp(30px, 2.8vw, 62px); }
+.credits-post-right { right: clamp(30px, 2.8vw, 62px); }
+.credits-post i { display: block; height: clamp(13px, 1.6vh, 25px); }
+/* Corner pads keep the app's own red / yellow / blue. */
+.credits-post i:nth-child(1) { background: var(--red); }
+.credits-post i:nth-child(2) { background: var(--yellow); }
+.credits-post i:nth-child(3) { background: var(--blue); }
+
+/* ---- Corner fighters and the center-stage referee. ---- */
+.credits-figure { image-rendering: pixelated; }
+.credits-fighter-red,
+.credits-fighter-blue {
+  position: absolute;
+  z-index: 4;
+  bottom: clamp(80px, 10vh, 132px);
+  width: clamp(62px, 5.2vw, 100px);
+  height: auto;
+}
+.credits-fighter-red { left: clamp(62px, 5.6vw, 118px); }
+.credits-fighter-blue { right: clamp(62px, 5.6vw, 118px); transform: scaleX(-1); }
+/* Enlarged so the official reads as center-stage rather than an incidental prop. */
+.credits-figure-ref { width: clamp(78px, 6.6vw, 128px); height: auto; }
+
+/* ---- Scrolling roll. ---- */
+.credits-frame {
+  position: absolute;
+  z-index: 3;
+  top: clamp(66px, 8.4vh, 124px);
+  bottom: clamp(108px, 13.5vh, 172px);
+  left: 50%;
+  width: min(1060px, 64vw);
+  overflow: hidden;
+  transform: translateX(-50%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 8%, #000 92%, transparent 100%);
+}
+.credits-frame[data-rolled="true"] { opacity: 0; pointer-events: none; transition: opacity .4s steps(4, end); }
+/* Reduced motion starts in the rolled state, but the static list is the whole
+   point of that variant -- it must not be faded out with the roll. */
+.credits-frame[data-static="true"] {
+  overflow-y: auto;
+  mask-image: none;
+  opacity: 1;
+  pointer-events: auto;
+  scrollbar-color: #46527c var(--arena-deep);
+}
+
+.credits-roll {
+  display: grid;
+  gap: clamp(46px, 6vh, 88px);
+  padding: clamp(20px, 2.6vh, 40px) 0 clamp(44px, 6.5vh, 96px);
+  will-change: transform;
+}
+/* The roll is driven by rAF in JS so play/pause, speed and seek are exact.
+   --credits-lead is the frame height: travel is (frame + roll) at 40 px/s,
+   with no dead lead-in. Starting from translateY(100%) instead would make the
+   travel 2x the roll height while the duration only covers (roll + frame), so
+   the roll ran at double speed after a long empty gap. */
+@keyframes credits-roll {
+  from { transform: translateY(var(--credits-lead, 100%)); }
+  to { transform: translateY(-100%); }
+}
+.credits-frame[data-static="true"] .credits-roll { transform: none !important; }
+
+/* ---- Every grid on the roll pins its track. ----
+ * Load-bearing at phone width, not tidiness.
+ *
+ * The roll is a stack of single-column grids nested inside one another, and an
+ * implicit `auto` track takes its MINIMUM from the largest min-content
+ * contribution of its items. So one long run of text anywhere inside -- the
+ * repo URL on the invitation card is the one that actually did it -- pushes
+ * that track wider than the box it sits in. Because every block stretches to
+ * the track, the whole roll then inherits the offending width and scrolls
+ * sideways: at a 390px viewport the frame is 250px and the track had grown to
+ * 332px, so all eight blocks measured 332px and the roll overflowed by 82px.
+ * The author credit's name and the invitation link were simply the widest
+ * things in it, which is why they were what visibly clipped.
+ *
+ * minmax(0, 1fr) pins each track to its own box, so long content wraps instead
+ * of widening the column. Nothing else changes: these are all one-column
+ * stacks, and their own justify-items keeps the content centered inside the
+ * track exactly as before. Desktop measures identically either way.
+ *
+ * This is not a phone-only concern. The roll bills DATA -- competitor
+ * short_names from the catalog and contributor names from
+ * credits-contributors.json -- so the next name nobody has typed yet would
+ * reintroduce this at any width. Do not drop the pin from a selector here
+ * because its content happens to be short today. */
+.credits-roll,
+.credits-title,
+.credits-block,
+.credits-name,
+.credits-crew,
+.credits-crew li,
+.credits-rules,
+.credits-rules ul,
+.credits-invite,
+.credits-invite > div { grid-template-columns: minmax(0, 1fr); }
+/* The authorship card's own track is pinned alongside its other rules, in
+   ENTRY_CSS / credits-entry.css -- it is the one block on the roll this sheet
+   does not dress. The pin is not optional there either: its name is the widest
+   string on the roll. */
+
+/* ---- Title card. ---- */
+.credits-title { display: grid; justify-items: center; gap: clamp(10px, 1.3vh, 18px); }
+.credits-ring { width: clamp(70px, 6vw, 116px); height: auto; image-rendering: pixelated; }
+.credits-title strong {
+  color: var(--cream);
+  font-size: clamp(24px, 2.8vw, 54px);
+  line-height: 1.1;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  text-shadow: 6px 6px var(--sink);
+}
+.credits-title em {
+  color: var(--yellow);
+  font-size: clamp(9px, .95vw, 18px);
+  font-style: normal;
+  letter-spacing: .22em;
+  text-transform: uppercase;
+}
+.credits-title p {
+  margin: 0;
+  padding: .9em 1.2em;
+  border: 4px solid var(--cream);
+  color: var(--cream);
+  background: var(--panel);
+  font-size: clamp(7px, .62vw, 12px);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+/* ---- "Role then name" card rhythm. ---- */
+.credits-block { display: grid; justify-items: center; gap: clamp(14px, 1.8vh, 26px); }
+.credits-block > .pixel-kicker { margin: 0; letter-spacing: .26em; }
+
+.credits-name { display: grid; justify-items: center; gap: .7em; max-width: 100%; }
+.credits-name span {
+  max-width: 100%;
+  color: var(--label);
+  font-size: clamp(6px, .52vw, 10px);
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  overflow-wrap: break-word;
+}
+.credits-name strong {
+  max-width: 100%;
+  color: var(--cream);
+  font-size: clamp(13px, 1.35vw, 26px);
+  line-height: 1.3;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  text-shadow: 4px 4px var(--sink);
+  overflow-wrap: break-word;
+}
+.credits-name small {
+  color: var(--yellow);
+  font-size: clamp(5px, .46vw, 9px);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+/* ---- The crew. ----
+ * This is the centerpiece of the roll and it sits second, right under the title
+ * card. It replaced the STARRING / FEATURING persona billing outright: those
+ * were the demo's cast, and a cast list is not what credits are for.
+ *
+ * The hard requirement is that it look deliberate at ONE name and still work at
+ * fifty, so the type scale is bucketed on data-scale (see crew_scale()):
+ *
+ *   solo  (1)     a framed title card at display size -- the same bordered
+ *                 --panel / inset accent / hard shadow construction the rules
+ *                 and invitation cards use, so one name reads as "directed by"
+ *                 rather than as a list that lost its other rows.
+ *   few   (2-6)   no frame: a row of bordered boxes would read as a leaderboard.
+ *                 Still large, one step down.
+ *   many  (7-16)  smaller, handles wrap onto further rows.
+ *   crowd (17+)   smallest, so sixty names still clear the roll mask.
+ *
+ * Flex-wrap rather than CSS multi-column: column boxes fill from the left, so a
+ * single contributor would sit in column one instead of centered.
+ *
+ * Order is alphabetical by login, decided in fetch-contributors.py -- never by
+ * commit count. A leaderboard in a credits roll creates a hierarchy people
+ * measure themselves against, which is the opposite of a thank-you. */
+.credits-crew { display: grid; justify-items: center; gap: clamp(14px, 1.8vh, 26px); }
+.credits-crew ul {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: clamp(10px, 1.2vh, 18px) clamp(18px, 2.2vw, 38px);
+  width: min(1080px, 92%);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.credits-crew li {
+  display: grid;
+  justify-items: center;
+  gap: .5em;
+  min-width: 0;
+  max-width: 100%;
+}
+.credits-crew strong {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--cream);
+  font-size: clamp(9px, .82vw, 16px);
+  line-height: 1.35;
+  letter-spacing: .1em;
+  text-align: center;
+  text-transform: uppercase;
+  text-shadow: 3px 3px var(--sink);
+  overflow-wrap: break-word;
+}
+/* The GitHub handle. Not uppercased and not letter-spaced: a handle is a thing
+   you retype, and it is the identity people actually recognize. Only rendered
+   when a display name exists, so it never simply repeats the line above it. */
+.credits-crew small {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--yellow);
+  font-size: clamp(6px, .5vw, 10px);
+  line-height: 1.4;
+  text-align: center;
+  overflow-wrap: break-word;
+}
+
+/* solo -- one name, billed as a card. */
+.credits-crew[data-scale="solo"] li {
+  gap: clamp(10px, 1.2vh, 18px);
+  padding: clamp(18px, 2.2vw, 34px) clamp(22px, 2.8vw, 44px);
+  border: clamp(5px, .55vw, 10px) solid var(--cream);
+  background: var(--panel);
+  box-shadow: inset 0 clamp(6px, .6vw, 12px) var(--yellow), .7em .7em 0 var(--sink);
+}
+.credits-crew[data-scale="solo"] strong {
+  font-size: clamp(15px, 1.5vw, 29px);
+  letter-spacing: .12em;
+  text-shadow: 4px 4px var(--sink);
+}
+.credits-crew[data-scale="solo"] small { font-size: clamp(7px, .6vw, 12px); }
+
+.credits-crew[data-scale="few"] strong { font-size: clamp(11px, 1.05vw, 21px); }
+
+/* Past six names the handle is dropped rather than shrunk into illegibility:
+   two lines per person is what makes a long list read as a wall. */
+.credits-crew[data-scale="many"] strong { font-size: clamp(8px, .74vw, 14px); }
+.credits-crew[data-scale="many"] small,
+.credits-crew[data-scale="crowd"] small { display: none; }
+.credits-crew[data-scale="crowd"] strong { font-size: clamp(7px, .62vw, 12px); }
+.credits-crew[data-scale="crowd"] ul { gap: clamp(8px, .9vh, 14px) clamp(16px, 2vw, 34px); }
+
+/* THE ACT LIST IS GONE. `.credits-card-list` used to bill the six rounds as a
+   left-aligned numbered act list between the crew and the corners. It credited
+   nobody -- it restated the running order of the thing the audience had just
+   watched -- so the block, its rules and its data were all removed. Nothing
+   should reintroduce the class; the roll's remaining blocks all name someone or
+   state a rule the demo held itself to. */
+
+/* ---- Fairness punchline. ---- */
+.credits-rules { display: grid; justify-items: center; gap: clamp(12px, 1.6vh, 20px); }
+.credits-rules ul {
+  display: grid;
+  gap: 1em;
+  width: min(760px, 88%);
+  margin: 0;
+  padding: clamp(18px, 2.2vw, 34px);
+  border: clamp(5px, .55vw, 10px) solid var(--cream);
+  background: var(--panel);
+  box-shadow: inset 0 clamp(6px, .6vw, 12px) var(--red), .7em .7em 0 var(--sink);
+  list-style: none;
+}
+.credits-rules li {
+  color: var(--cream);
+  font-size: clamp(6px, .58vw, 11px);
+  line-height: 1.6;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+/* ---- The invitation. ----
+ * Deliberately the same construction as the fairness card -- bordered --panel
+ * box, inset accent, hard shadow -- so it reads as a scripted part of the roll
+ * rather than a footer bolted on. The accent is --blue where the rules card is
+ * --red, which is the only thing distinguishing them.
+ * The URL is not uppercased: a URL is a thing you retype, and Press Start 2P
+ * loses the ascender/descender cues that make one legible.
+ *
+ * THE REPO IS A REAL LINK, and it is the one thing on the whole roll a viewer
+ * is meant to act on, so it is billed as a plate rather than as a line of copy:
+ * a yellow keyline on the deep navy --sink at rest, inverting to navy-on-yellow
+ * on hover and on focus. It keeps an underline at rest so it does not read as
+ * the dead text it used to be, and it takes a cream focus ring -- the app's
+ * global button:focus-visible ring is yellow, which would vanish against the
+ * yellow hover fill. No new hues: --yellow, --cream, --ink and --sink are all
+ * app tokens already on this screen. */
+.credits-invite { display: grid; justify-items: center; gap: clamp(12px, 1.6vh, 20px); }
+.credits-invite > div {
+  display: grid;
+  justify-items: center;
+  gap: clamp(12px, 1.6vh, 22px);
+  width: min(880px, 90%);
+  padding: clamp(20px, 2.4vw, 38px) clamp(18px, 2.2vw, 34px);
+  border: clamp(5px, .55vw, 10px) solid var(--cream);
+  background: var(--panel);
+  box-shadow: inset 0 clamp(6px, .6vw, 12px) var(--blue), .7em .7em 0 var(--sink);
+}
+/* The break points are NOT set here. The repo is one long word, and no CSS
+   property can say "prefer the slashes" -- word-break: break-word and
+   break-all were both measured at 390px and produce the identical mid-handle
+   break. So the markup carries a <wbr> after every `/` and `-` (see
+   CONTRIBUTE_SEGMENTS in credits.tsx and REPO_TEXT in build.py), and the
+   overflow-wrap below is only the fallback for a card narrower than the
+   longest segment. Do not "simplify" this by deleting the <wbr>s. */
+.credits-invite-link {
+  max-width: 100%;
+  padding: clamp(10px, 1.15vw, 19px) clamp(14px, 1.6vw, 27px);
+  border: clamp(4px, .42vw, 8px) solid var(--yellow);
+  color: var(--yellow);
+  background: var(--sink);
+  font-size: clamp(8px, .92vw, 18px);
+  line-height: 1.4;
+  letter-spacing: .04em;
+  text-decoration: underline;
+  text-underline-offset: .35em;
+  overflow-wrap: break-word;
+}
+.credits-invite-link:hover,
+.credits-invite-link:focus-visible {
+  border-color: var(--cream);
+  color: var(--ink);
+  background: var(--yellow);
+}
+.credits-invite-link:focus-visible {
+  outline: clamp(4px, .4vw, 6px) solid var(--cream);
+  outline-offset: clamp(3px, .3vw, 5px);
+}
+/* Matches the app's other pixel chrome, which nudges down on press. */
+.credits-invite-link:active { transform: translateY(2px); }
+.credits-invite small {
+  max-width: 100%;
+  color: var(--cream);
+  font-size: clamp(6px, .58vw, 11px);
+  line-height: 1.6;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+/* ---- `.credits-finale` IS GONE. ----
+ * It was the roll's uncontained author credit: a portrait beside a name, with
+ * no border, no panel and no shadow -- the only major beat on the roll with no
+ * container at all, which is what made it read as body copy next to the crew,
+ * fairness and invitation cards. It was never a font problem; this sheet
+ * declares no font-family anywhere and every beat inherits "Press Start 2P"
+ * from .retro-screen.
+ *
+ * Its replacement is `.production-credit`, a framed card built like its
+ * neighbours, and it is dressed in ENTRY_CSS / credits-entry.css rather than
+ * here. The reasoning the old rules carried survives with it: the portrait sits
+ * BESIDE the name because a picture stacked on a caption reads as a logo where
+ * a portrait paired with a name reads as a billing; the pair stacks below 640px
+ * because two columns squeeze the name onto four lines; and the name must WRAP
+ * rather than truncate, because a clipped author credit is worse than a
+ * two-line one.
+ *
+ * The rules were retained here for a while after the app stopped rendering them
+ * because this build still did. It no longer does, so they are dead in both
+ * consumers and have been removed rather than left to rot. */
+
+.credits-outro {
+  position: absolute;
+  z-index: 6;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: clamp(16px, 2vh, 28px);
+  animation: credits-outro-in .5s steps(5, end) both;
+}
+/* THE HELD CARD HOLDS THE GAME, NOT THE AUTHOR. It used to print "A Ryan Cicak
+   Production" a second time, seconds after the card inside the roll had already
+   said it -- and counting the crew card and the handle inside the repo URL, the
+   roll named its author four times, two of them the same claim seconds apart.
+   It now names him twice: once as a contributor, once as the author. The roll's
+   own copy is the one that had to stay, because the roll must be complete on its
+   own -- under reduced motion the crawl never runs and this card is not shown at
+   all. The last image is the game's own mark, which is also what an arcade
+   ending actually held before the attract loop came back round.
+   The layer, the centring and the step-in live here; the mark's own pieces
+   (.credits-outro-ring / -title / -tagline) are in ENTRY_CSS, matching the split
+   the app makes between credits.css and credits-entry.css. */
+@keyframes credits-outro-in { from { opacity: 0; } to { opacity: 1; } }
+
+/* ---- In-scene buttons. ---- */
+.credits-skip {
+  position: absolute;
+  z-index: 7;
+  right: clamp(28px, 3vw, 56px);
+  bottom: clamp(26px, 3vh, 50px);
+  padding: 1em 1.2em;
+  border: 3px solid var(--cream);
+  color: var(--ink);
+  background: var(--yellow);
+  font-size: clamp(6px, .5vw, 10px);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.credits-back {
+  position: absolute;
+  z-index: 7;
+  left: clamp(28px, 3vw, 56px);
+  bottom: clamp(26px, 3vh, 50px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .credits-crowd::before,
+  .credits-crowd::after { animation: none; }
+  .credits-outro { animation: none; }
+  .credits-frame[data-rolled="true"] { transition: none; }
+  .credits-invite-link:active { transform: none; }
+}

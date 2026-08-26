@@ -1,0 +1,2161 @@
+:root {
+  color: #f1ebd7;
+  background: #02040e;
+  font-family: "Press Start 2P", ui-monospace, monospace;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  --red: #ee452d;
+  --red-light: #ff735e;
+  --blue: #4a83e8;
+  --blue-light: #74a5ff;
+  --yellow: #f8d83b;
+  --cream: #f1ebd7;
+  --navy: #070b22;
+  --panel: #151e48;
+  --ink: #101214;
+  --steel: #767b80;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: #02040e; }
+button, select { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+.home-logo-lockup {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(6px, .55vw, 11px);
+  width: 100%;
+  min-width: 0;
+  padding: .35em .45em;
+  border: 0;
+  color: var(--cream);
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+  text-transform: uppercase;
+}
+.home-logo-lockup:hover { background: #151e48; }
+.home-logo-lockup:active { transform: translateY(2px); }
+.home-logo-ring { width: clamp(34px, 2.7vw, 52px); height: clamp(28px, 2.25vw, 44px); object-fit: contain; image-rendering: pixelated; }
+.home-logo-copy { display: grid; gap: .45em; min-width: 0; }
+.home-logo-copy strong { color: var(--cream); font-size: clamp(7px, .68vw, 13px); line-height: 1; letter-spacing: -.02em; }
+.home-logo-copy small { color: var(--yellow); font-size: clamp(4px, .36vw, 7px); line-height: 1.2; white-space: nowrap; }
+.home-logo-lockup.home-logo-compact { grid-template-columns: 1fr; justify-items: center; width: clamp(50px, 4vw, 72px); padding: 0; }
+.home-logo-compact .home-logo-copy { display: none; }
+button:focus-visible, select:focus-visible, summary:focus-visible {
+  outline: 5px solid var(--yellow);
+  outline-offset: 4px;
+}
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+/* Cartridge shell and attract screen. */
+.game-viewport { position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden; background: #02040e; }
+.game-screen, .title-cartridge {
+  position: relative;
+  width: min(100vw, calc(100vh * 16 / 9));
+  height: min(100vh, calc(100vw * 9 / 16));
+  overflow: hidden;
+  color: var(--cream);
+  background: var(--navy);
+  border: clamp(5px, .8vw, 14px) solid var(--blue);
+  box-shadow: inset 0 0 0 clamp(4px, .45vw, 9px) var(--red), inset 0 0 0 clamp(9px, 1vw, 20px) var(--navy);
+  image-rendering: pixelated;
+}
+.title-cartridge { display: grid; grid-template-rows: 1fr auto; }
+/* The stacking context is not optional: .title-art is an absolutely positioned
+   full-bleed image, so anything in the cartridge that is not itself positioned
+   is painted under it. This uses the same layer as .press-start and
+   .title-music-toggle. */
+/* OFFSET IN PERCENT, NOT PIXELS, AND THIS IS THE WHOLE BUG THAT WAS HERE.
+   The "SAME TASK · SAME DATA · ONE HONEST RESULT" line is not DOM text -- it is
+   drawn inside .title-art, at y1002 of that SVG's 1080 viewBox, so it sits at a
+   fixed PERCENTAGE of the cartridge and moves with every resize. This control
+   used to be a centred grid item held off the bottom by clamp(46px, 4.7vh, 64px),
+   a pixel offset, so the two only cleared each other near a 900px-tall
+   cartridge. At 1024x634 the cartridge is 576px tall, the artwork's line lands
+   7.2-8.5% up (41-49px) and the 46px floor put this control's box straight
+   through it: the reported overstrike. Percentages track the artwork instead, so
+   the relationship holds at every viewport. */
+/* IN THE FRAME GUTTER, NOT IN THE FIELD -- the empty navy band between the
+   cartridge's two blue rules, the way a cabinet stencils text on the bezel.
+   WHAT DRAWS THE TWO BLUE RULES, measured off a pixel scanline rather than
+   assumed, because the frame is built from two different systems:
+     outer blue  -- the CSS `border` on .game-screen, .title-cartridge
+     GUTTER      -- plain navy, ~2.3% of the cartridge
+     inner blue  -- ARTWORK: the SVG's own <rect stroke="#4A83E8"> at y32/1080
+     inner red   -- ARTWORK: the SVG's <rect stroke="#E8482E"> at y52/1080
+   Note what is NOT in that list: the two inset box-shadows on the shared
+   cartridge rule paint no visible ring at all, because .title-art is an opaque
+   child filling the padding box and covers them. That is what makes the gutter
+   usable -- it is clean navy edge to edge, not blue-then-red.
+   `bottom` here is measured from the PADDING box, whose bottom edge is exactly
+   the inner edge of the CSS border, i.e. exactly the floor of the gutter. So
+   these are small percentages by construction, not fudge factors. Scanned:
+   gutter 13px at 1024x634, 18px at 1440x900, against a control 8-9px tall.
+   Being outside the field is the whole point: the fairness line, PRESS START
+   and MUSIC OFF are all inside it, so there is nothing here to collide with,
+   and the previous slot's 1.65px clearance problem does not exist. */
+.title-cartridge > .title-credits { position: absolute; z-index: 4; left: 50%; bottom: .45%; transform: translateX(-50%); display: inline-flex; align-items: baseline; gap: .7em; padding: 1px 6px; border: 0; background: none; color: #c7d2f6; font-size: clamp(6px, .5vw, 10px); letter-spacing: .14em; text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 1px; }
+.title-cartridge > .title-credits:hover, .title-cartridge > .title-credits:focus-visible { color: var(--yellow); border-color: transparent; }
+/* THE ONE THING THE GUTTER GENUINELY FORCES. The global ring is 5px at 4px
+   offset, which needs 26px of vertical room around an 8px control; the gutter
+   has 13px. It is also the only sheet-wide ring that would be clipped here at
+   all, because the cartridge is overflow:hidden and clips at the padding box --
+   which is the gutter floor. 2px hard against the box fits inside the bezel at
+   every size the gutter is usable at, and is proportionate to 6px type in a way
+   the full-size ring never was. Type size, label, blink and cursor untouched. */
+.title-cartridge > .title-credits:focus-visible { outline: 2px solid var(--yellow); outline-offset: 0; }
+/* The shared :active nudge would push this into the outer blue rule, so the
+   title instance answers a press with colour instead of movement -- but it must
+   keep the centring transform, or pressing it would fling the control half its
+   width to the right. */
+.title-cartridge > .title-credits:active { transform: translateX(-50%); color: var(--yellow); }
+/* SMALL CARTRIDGES HAVE NO USABLE GUTTER, so on those the control returns to the
+   clear left end of the fairness line rather than overlapping a blue rule.
+   The gutter is a fixed ~2.3% of cartridge height, but this control's type has a
+   6px floor and stops shrinking with it: at 390px wide the cartridge is 219px
+   tall, the scanned gutter is 5px and the control is 8px, so it cannot be put
+   there at all. Measured breakpoints, both needed because the cartridge is
+   min(100vw, 100vh * 16/9) and either axis can be the binding one. The fairness
+   line is centred and 30% wide, so its left end is always clear. */
+@media (max-width: 900px), (max-height: 560px) {
+  .title-cartridge > .title-credits { left: 5%; bottom: 7.2%; transform: none; }
+  .title-cartridge > .title-credits:active { transform: none; }
+}
+.title-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; }
+.press-start {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 10.9%;
+  width: 31%;
+  min-width: 260px;
+  height: 8.8%;
+  transform: translateX(-50%);
+  border: clamp(5px, .7vw, 14px) solid var(--red);
+  color: #10152f;
+  background: var(--yellow);
+  font-size: clamp(11px, 1.45vw, 27px);
+  line-height: 1;
+  text-transform: uppercase;
+  box-shadow: none;
+  animation: press-blink 1s steps(2, end) infinite;
+}
+.title-music-toggle {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 21%;
+  width: 19%;
+  min-width: 164px;
+  height: 5.2%;
+  transform: translateX(-50%);
+  border: clamp(2px, .24vw, 4px) solid var(--blue);
+  color: var(--cream);
+  background: #070b22e8;
+  font-size: clamp(8px, .78vw, 15px);
+  line-height: 1;
+  text-transform: uppercase;
+  box-shadow: none;
+}
+.title-music-toggle[aria-pressed="true"] {
+  color: #58dd8b;
+  border-color: #58dd8b;
+}
+@keyframes press-blink { 50% { color: transparent; } }
+.cartridge-status {
+  position: absolute;
+  z-index: 5;
+  top: 5.7%;
+  right: 4.2%;
+  margin: 0;
+  padding: .55em .75em;
+  color: var(--yellow);
+  background: #070b22e8;
+  border: 3px solid var(--yellow);
+  font-size: clamp(6px, .55vw, 11px);
+  line-height: 1.5;
+}
+.cartridge-status[data-status="online"] { color: #58dd8b; border-color: #58dd8b; }
+.cartridge-status[data-status="offline"] { color: #ff806d; border-color: #ff806d; }
+.blink { animation: blink 1s steps(2, end) infinite; }
+@keyframes blink { 50% { opacity: .35; } }
+
+/* Shared game chrome. */
+.game-topbar {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 13.2%;
+  display: grid;
+  grid-template-columns: 17% 1fr auto;
+  align-items: center;
+  gap: 2.2%;
+  padding: 1.5% 3%;
+  border-bottom: clamp(4px, .45vw, 9px) solid var(--yellow);
+  background: #050817;
+}
+.game-topbar img {
+  width: auto;
+  max-width: 100%;
+  height: clamp(40px, 3.4vw, 66px);
+  max-height: 80%;
+  object-fit: contain;
+  object-position: left center;
+}
+.game-topbar div { display: flex; align-items: baseline; gap: 1.2em; min-width: 0; text-transform: uppercase; }
+.game-topbar div span { color: var(--yellow); font-size: clamp(6px, .58vw, 11px); }
+.game-topbar div strong { overflow: hidden; color: var(--cream); font-size: clamp(11px, 1.2vw, 23px); text-overflow: ellipsis; white-space: nowrap; }
+.game-topbar > p { margin: 0; padding: .75em 1em; color: var(--yellow); border: 3px solid var(--yellow); font-size: clamp(7px, .72vw, 14px); }
+.game-mode, .api-indicator-wrap {
+  position: absolute;
+  z-index: 6;
+  top: 15.1%;
+  right: 3.2%;
+  margin: 0;
+}
+.api-indicator-wrap[data-placement="title"] { z-index: 7; top: 5.7%; right: 4.2%; }
+.game-mode, .api-indicator {
+  padding: .7em .85em;
+  border: 3px solid currentColor;
+  color: var(--yellow);
+  background: #070b22eb;
+  font-size: clamp(5px, .48vw, 9px);
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+.api-indicator { display: flex; align-items: center; gap: .7em; color: #e6b73f; }
+.api-status-dot { width: .8em; height: .8em; background: currentColor; }
+.api-info-mark {
+  display: grid;
+  place-items: center;
+  width: 1.45em;
+  height: 1.45em;
+  border: 2px solid currentColor;
+  border-radius: 50%;
+  font-size: .9em;
+}
+.api-indicator[data-status="online"] { color: #58dd8b; }
+.api-indicator[data-status="offline"] { color: #ff806d; }
+.api-context {
+  position: absolute;
+  top: calc(100% + .75em);
+  right: 0;
+  width: clamp(280px, 34vw, 470px);
+  max-width: calc(100vw - 24px);
+  padding: clamp(12px, 1.3vw, 22px);
+  border: 3px solid var(--yellow);
+  color: var(--cream);
+  background: #070b22;
+  box-shadow: .6em .6em 0 #000;
+  font-size: clamp(7px, .6vw, 11px);
+  line-height: 1.7;
+  text-transform: none;
+}
+.api-context header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1em; }
+.api-context header div { display: grid; gap: .65em; }
+.api-context header p, .api-context h2, .api-context > p { margin: 0; }
+.api-context header p { color: var(--yellow); font-size: .8em; text-transform: uppercase; }
+.api-context h2 { color: var(--cream); font-size: 1.15em; line-height: 1.45; text-transform: uppercase; }
+.api-context header button {
+  flex: 0 0 auto;
+  width: 2.4em;
+  height: 2.4em;
+  padding: 0;
+  border: 2px solid var(--cream);
+  color: var(--cream);
+  background: transparent;
+  line-height: 1;
+}
+.api-context > p { margin-top: 1.4em; color: #c7d2f6; }
+.api-context ul { display: grid; gap: .8em; margin: 1.1em 0 0; padding-left: 1.5em; }
+.api-context li::marker { color: var(--yellow); }
+.api-context strong { color: var(--yellow); }
+.game-scene {
+  position: absolute;
+  z-index: 2;
+  top: 13.2%;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2.2% 3.4% 2.6%;
+  background: var(--navy);
+}
+.game-scanlines {
+  position: absolute;
+  z-index: 20;
+  inset: 0;
+  pointer-events: none;
+  opacity: .12;
+  background: repeating-linear-gradient(to bottom, transparent 0 3px, #000 3px 5px);
+}
+.scene-heading { text-align: center; text-transform: uppercase; }
+.scene-heading p { margin: 0 0 .75em; color: var(--yellow); font-size: clamp(7px, .62vw, 12px); letter-spacing: .08em; }
+.scene-heading h1 { margin: 0; color: var(--cream); font-size: clamp(18px, 2.15vw, 41px); line-height: 1.15; text-shadow: .12em .12em 0 var(--red); }
+.scene-heading small { display: block; margin-top: 1.2em; color: #a9b8e9; font-size: clamp(6px, .55vw, 10px); line-height: 1.5; }
+.game-nav, .card-actions { display: flex; justify-content: space-between; align-items: center; gap: 2%; }
+.game-nav button, .card-actions button { min-height: clamp(42px, 4.5vw, 78px); padding: 0 2em; border-radius: 0; text-transform: uppercase; }
+.game-primary { border: clamp(4px, .45vw, 8px) solid var(--red); color: #10152f; background: var(--yellow); font-size: clamp(7px, .72vw, 14px); box-shadow: .45em .45em 0 #000; }
+.game-primary:hover:not(:disabled) { color: #10152f; border-color: var(--cream); background: #ffe66a; }
+.game-primary:disabled { color: #6f7390; border-color: #394266; background: #1c254c; box-shadow: none; }
+.game-back { border: 3px solid #5e6c9b; color: #b6c1e6; background: #0d1432; font-size: clamp(6px, .62vw, 12px); }
+
+/* Opponent select. */
+.opponent-scene { display: grid; grid-template-columns: 1fr .37fr; grid-template-rows: auto 1fr auto; column-gap: 3%; row-gap: 2.3%; }
+.opponent-scene .scene-heading { grid-column: 1 / -1; }
+.opponent-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3%; min-height: 0; }
+.opponent-card {
+  position: relative;
+  min-width: 0;
+  padding: 2.5% 4% 3%;
+  border: clamp(5px, .55vw, 10px) solid var(--cream);
+  color: var(--cream);
+  background: var(--panel);
+  box-shadow: inset 0 0 0 clamp(4px, .4vw, 8px) #101734;
+  text-align: center;
+  text-transform: uppercase;
+}
+.opponent-card[data-selected="true"] { border-color: var(--yellow); box-shadow: inset 0 0 0 clamp(4px, .4vw, 8px) var(--blue), .55em .55em 0 var(--red); }
+.opponent-card strong { display: block; min-height: 2.6em; margin-top: .7em; font-size: clamp(9px, .92vw, 17px); line-height: 1.35; }
+.opponent-card small { display: block; margin-top: .9em; color: var(--yellow); font-size: clamp(5px, .48vw, 9px); line-height: 1.4; }
+/* Flavour line. Press Start 2P is illegible below ~9px, so this drops to the
+   readable monospace the corner picker already uses for its prose. 9.2:1. */
+.opponent-card em { display: block; margin-top: .85em; color: #b9c6ec; font-family: ui-monospace, monospace; font-size: clamp(8px, .72vw, 13px); font-style: normal; font-weight: 700; line-height: 1.45; text-transform: none; }
+.select-cursor, .roster-cursor { display: none; position: absolute; color: var(--yellow); }
+.opponent-card[data-selected="true"] .select-cursor { display: block; top: 5%; left: 4%; font-size: clamp(10px, 1.1vw, 20px); }
+.corner-picker { align-self: stretch; display: flex; flex-direction: column; justify-content: center; padding: 6.5%; border: clamp(4px, .45vw, 8px) solid var(--blue); background: #0f173b; }
+.corner-picker > p { margin: 0; color: var(--cream); font-size: clamp(8px, .82vw, 15px); line-height: 1.55; text-align: center; text-transform: uppercase; }
+.corner-picker > span { margin: .8em 0 1.35em; color: var(--yellow); font-size: clamp(5px, .43vw, 8px); text-align: center; text-transform: uppercase; }
+.corner-picker > div { display: grid; gap: .65em; }
+.corner-picker button { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: .5em .8em; min-height: clamp(56px, 4.7vw, 88px); padding: .85em 1em; border: 3px solid #5a6793; color: #bbc5e7; background: #111a40; text-align: left; text-transform: uppercase; }
+.corner-picker button > b { grid-row: 1 / 3; display: grid; place-items: center; width: 2.1em; height: 2.1em; border: 2px solid currentColor; color: var(--yellow); font-size: clamp(6px, .54vw, 10px); }
+.corner-picker button > strong { font-size: clamp(6px, .58vw, 11px); }
+.corner-picker button > small { color: #8fa0d3; font-family: ui-monospace, monospace; font-size: clamp(6px, .52vw, 10px); font-weight: 800; line-height: 1.25; text-transform: none; }
+.corner-picker button[data-selected="true"] { border-color: var(--yellow); color: var(--cream); background: #192653; box-shadow: inset .45em 0 0 var(--yellow), .3em .3em 0 var(--red); }
+.corner-picker button[data-selected="true"] > small { color: #d8e0f7; }
+.corner-picker > small { display: block; margin-top: 1.5em; color: #8391c2; font-size: clamp(5px, .42vw, 8px); line-height: 1.7; text-align: center; }
+.opponent-scene .game-nav { grid-column: 1 / -1; }
+
+/* Original database fighters, built from hard pixel blocks. */
+.database-fighter { --corner: var(--blue); --corner-light: var(--blue-light); position: relative; width: clamp(95px, 8.7vw, 168px); height: clamp(115px, 10.6vw, 204px); margin: 0 auto; }
+.database-fighter[data-corner="red"] { --corner: var(--red); --corner-light: var(--red-light); }
+.fighter-crown { position: absolute; z-index: 3; top: 5%; left: 23%; width: 54%; height: 26%; border: clamp(5px, .45vw, 9px) solid #080b1f; background: #d7d9d4; }
+.fighter-crown i { display: block; height: 18%; margin: 9% 10% 0; background: var(--corner); }
+.fighter-face { position: absolute; z-index: 4; top: 30%; left: 29%; width: 42%; height: 23%; background: #d7d9d4; box-shadow: -.55em 0 0 #080b1f, .55em 0 0 #080b1f; }
+.fighter-face i { position: absolute; top: 24%; width: 23%; height: 24%; background: #080b1f; }
+.fighter-face i:first-child { left: 10%; }
+.fighter-face i:last-child { right: 10%; }
+.fighter-body { position: absolute; z-index: 2; left: 20%; bottom: 3%; width: 60%; height: 48%; border: clamp(6px, .55vw, 11px) solid #080b1f; background: var(--corner); }
+.fighter-body span { position: absolute; left: 24%; right: 24%; bottom: 12%; display: grid; place-items: center; height: 32%; color: #080b1f; background: var(--yellow); font-size: clamp(7px, .7vw, 13px); }
+.fighter-glove { position: absolute; z-index: 5; bottom: 9%; width: 27%; height: 28%; border: clamp(5px, .45vw, 9px) solid #080b1f; background: var(--corner); }
+.fighter-glove.left { left: 1%; }
+.fighter-glove.right { right: 1%; }
+
+/* Persona select. */
+.roster-scene { display: grid; grid-template-columns: 1fr 18%; grid-template-rows: auto 1fr auto; column-gap: 2.2%; row-gap: 2.2%; }
+.roster-scene .scene-heading { grid-column: 1 / -1; }
+.persona-roster { display: grid; grid-template-columns: repeat(5, 1fr); grid-template-rows: repeat(2, minmax(0, 1fr)); gap: clamp(5px, .55vw, 11px); min-height: 0; }
+.persona-card { position: relative; min-width: 0; min-height: 0; padding: 4% 4% 3%; overflow: hidden; border: clamp(3px, .32vw, 6px) solid #4c5b8a; color: var(--cream); background: #11183a; text-align: center; text-transform: uppercase; }
+.persona-card:hover:not(:disabled) { border-color: var(--blue-light); }
+.persona-card[data-selected="true"] { border-color: var(--yellow); box-shadow: inset 0 0 0 clamp(3px, .3vw, 6px) var(--red); }
+.persona-card[data-selected="true"] .roster-cursor { display: block; top: 4%; left: 4%; font-size: clamp(7px, .7vw, 13px); }
+.persona-card:disabled { opacity: .34; }
+.persona-card[data-lead="true"]:disabled { opacity: 1; border-color: var(--red); }
+.persona-card img { display: block; width: clamp(62px, 5.8vw, 112px); height: clamp(62px, 5.8vw, 112px); margin: 0 auto 6%; border: clamp(2px, .22vw, 4px) solid #26345f; object-fit: cover; image-rendering: pixelated; }
+.persona-card strong, .persona-card small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.persona-card strong { font-size: clamp(6px, .55vw, 10px); line-height: 1.5; }
+.persona-card small { margin-top: .65em; color: #aab7df; font-size: clamp(4px, .38vw, 7px); line-height: 1.5; }
+/* Sentence case on purpose: the roster labels are shouted, the pain line is spoken. */
+.persona-card .persona-pain { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; margin-top: .9em; overflow: hidden; color: #dfe6fb; font-size: clamp(4px, .34vw, 7px); line-height: 1.4; text-transform: none; }
+.persona-card b { position: absolute; top: 3%; right: 3%; padding: .55em .6em; color: #10152f; background: var(--yellow); font-size: clamp(4px, .38vw, 7px); }
+.persona-card em { position: absolute; right: 4%; bottom: 4%; color: #ff8a76; font-size: clamp(4px, .33vw, 6px); font-style: normal; }
+.roster-confirm, .lens-score { align-self: stretch; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 0; padding: 9%; border: clamp(4px, .45vw, 8px) solid var(--red); background: #121a40; text-align: center; text-transform: uppercase; }
+.roster-confirm > span, .lens-score > span { color: var(--yellow); font-size: clamp(5px, .48vw, 9px); }
+.roster-confirm img { width: 76%; aspect-ratio: 1; margin: 10% 0; border: clamp(4px, .4vw, 8px) solid var(--yellow); image-rendering: pixelated; }
+.roster-confirm strong, .lens-score strong { font-size: clamp(7px, .68vw, 13px); line-height: 1.45; }
+.roster-confirm small, .lens-score small { margin-top: 1em; color: #aab7df; font-size: clamp(4px, .4vw, 8px); line-height: 1.8; }
+.lens-score { position: relative; border-color: var(--blue); }
+.lens-score strong { margin-top: 2.5em; color: var(--cream); }
+.lens-score b { display: grid; place-items: center; width: 4.4em; height: 4.4em; margin-top: 3em; color: #10152f; background: var(--yellow); font-size: clamp(7px, .62vw, 12px); }
+.roster-scene .game-nav { grid-column: 1 / -1; }
+
+/* Fight-card reveal. */
+.card-scene { display: grid; grid-template-columns: 14% 38% 1fr; grid-template-rows: auto 1fr auto auto auto; column-gap: 2.2%; row-gap: 1.7%; }
+.round-burst { grid-column: 1; grid-row: 1; display: grid; place-items: center; align-content: center; padding: 8%; border: clamp(4px, .42vw, 8px) solid var(--yellow); background: var(--red); text-align: center; text-transform: uppercase; box-shadow: .5em .5em 0 #000; }
+.round-burst span, .round-burst small { font-size: clamp(5px, .48vw, 9px); }
+.round-burst strong { margin: .18em 0; color: var(--yellow); font-size: clamp(22px, 2.8vw, 54px); text-shadow: .1em .1em #10152f; }
+.round-burst small { color: var(--cream); }
+.card-title { grid-column: 2 / -1; align-self: center; min-width: 0; text-transform: uppercase; }
+.card-title p { margin: 0 0 .8em; color: var(--yellow); font-size: clamp(6px, .56vw, 11px); }
+.card-title h1 { margin: 0; font-size: clamp(18px, 2.25vw, 43px); line-height: 1.3; text-shadow: .12em .12em var(--red); }
+.card-matchup { grid-column: 1 / 3; grid-row: 2; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; min-height: 0; border: clamp(4px, .45vw, 8px) solid var(--cream); background: #10183e; }
+.card-matchup > div { align-self: stretch; display: flex; flex-direction: column; align-items: center; justify-content: center; min-width: 0; padding: 4%; }
+.card-matchup > div[data-corner="red"] { box-shadow: inset 0 clamp(6px, .7vw, 13px) var(--red); }
+.card-matchup > div[data-corner="blue"] { box-shadow: inset 0 clamp(6px, .7vw, 13px) var(--blue); }
+.card-matchup > div > strong { margin-top: .8em; max-width: 100%; overflow: hidden; font-size: clamp(7px, .68vw, 13px); line-height: 1.5; text-align: center; text-overflow: ellipsis; text-transform: uppercase; white-space: nowrap; }
+.card-matchup > b { z-index: 2; display: grid; place-items: center; width: clamp(55px, 5.5vw, 105px); height: clamp(55px, 5.5vw, 105px); color: var(--cream); background: var(--red); border: clamp(4px, .45vw, 8px) solid var(--yellow); font-size: clamp(13px, 1.3vw, 25px); transform: rotate(45deg); box-shadow: .4em .4em #000; }
+.card-matchup > b span { transform: rotate(-45deg); }
+.scorecard-copy { grid-column: 3; grid-row: 2; display: grid; align-content: center; min-height: 0; overflow-y: auto; margin: 0; padding: 3% 5%; border: clamp(4px, .4vw, 8px) solid var(--blue); background: #0e1638; }
+.scorecard-copy div { padding: 4% 0; border-bottom: 3px solid #303c6b; }
+.scorecard-copy div:last-child { border-bottom: 0; }
+.scorecard-copy dt { margin-bottom: .85em; color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.scorecard-copy dd { margin: 0; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(8px, .72vw, 14px); font-weight: 800; line-height: 1.45; }
+/* The operator's full account of a refusal: kept, and kept out of the room's
+   way. Closed by default because the fight card is the screen most likely to be
+   on a projector, and one click away because this is the text that tells the
+   one person who can act what to act on. */
+.round-why-detail { margin-top: 1em; font-family: "Press Start 2P", ui-monospace, monospace; }
+.round-why-detail > summary { padding: .9em 1em; border: 3px solid #4c5b8a; color: var(--yellow); background: #0a1130; cursor: pointer; font-size: clamp(5px, .43vw, 8px); line-height: 1.6; text-transform: uppercase; }
+.round-why-detail > p { margin: .9em 0 0; padding: 1em; border-left: 3px solid #4c5b8a; color: #c3cdee; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 700; line-height: 1.55; }
+.persona-dialogue { grid-column: 1 / 3; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 2.2%; min-width: 0; padding: 1.2% 2%; border: 3px solid var(--cream); background: #050817; }
+.dialogue-team { display: flex; }
+.persona-dialogue img { width: clamp(44px, 3.8vw, 74px); height: clamp(44px, 3.8vw, 74px); margin-right: -.35em; border: 3px solid var(--yellow); background: var(--navy); image-rendering: pixelated; }
+.persona-dialogue p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(8px, .72vw, 14px); font-weight: 800; line-height: 1.45; }
+.persona-dialogue span { display: block; margin-bottom: .45em; color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: .65em; text-transform: uppercase; }
+.game-override { grid-column: 3; align-self: center; min-width: 0; color: #aab7df; font-size: clamp(5px, .45vw, 9px); }
+.game-override summary { padding: 1.2em; border: 3px solid #4c5b8a; background: #0e1638; cursor: pointer; }
+.game-override label { display: block; margin: 1em 0 .6em; }
+.game-override select { width: 100%; min-height: 3.6em; padding: 0 1em; border: 3px solid var(--yellow); border-radius: 0; color: var(--cream); background: #10183e; font-family: ui-monospace, monospace; font-weight: 800; }
+.game-error { grid-column: 1 / -1; margin: 0; color: #ff9888; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 800; text-align: center; }
+.card-actions { grid-column: 1 / -1; }
+/* WHY THIS RULE CARRIES A LINE-HEIGHT AND A MAX-WIDTH, WHEN A ONE-LINE STATUS
+   TOKEN NEEDS NEITHER. It is 5-8px of "Press Start 2P", whose reported line box
+   is shorter than the glyphs it draws, so at the initial `normal` any second
+   line lands *on top of* the first. Every other multi-line rule in this sheet
+   sets a line-height explicitly for that reason; this one did not, because
+   every string routed here was a token like "LIVE UPDATES OFFLINE".
+   Then the round-refusal branch handed it a 900-character operator paragraph
+   and it rendered full-bleed as a smear of overstruck lines under the buttons.
+   The wording is fixed at the source, but the strip is fed from five different
+   places -- one of them a `maintenance_detail` written elsewhere -- so it has
+   to be unable to overstrike whatever it is given. */
+.game-lock-note {
+  grid-column: 1 / -1;
+  max-width: 82%;
+  margin: 0 auto;
+  color: var(--yellow);
+  font-size: clamp(5px, .43vw, 8px);
+  line-height: 1.7;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+/* Matchup and armed ritual. */
+.retro-screen { position: fixed; inset: 0; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--cream); background: var(--navy); text-align: center; font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(7px, 1vw, 20px) var(--blue), inset 0 0 0 clamp(12px, 1.5vw, 30px) var(--navy), inset 0 0 0 clamp(16px, 2vw, 40px) var(--red); }
+.retro-screen::before { content: ""; position: absolute; z-index: 5; inset: 0; pointer-events: none; opacity: .13; background: repeating-linear-gradient(to bottom, transparent 0 3px, #000 3px 5px); }
+.retro-review { position: absolute; z-index: 6; top: 4.5%; margin: 0; padding: 1em 1.2em; border: 4px solid var(--yellow); color: var(--yellow); background: var(--navy); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; text-transform: uppercase; }
+.pixel-kicker { position: relative; color: var(--yellow); font-size: clamp(7px, .7vw, 13px); text-transform: uppercase; letter-spacing: .12em; }
+.matchup-lockup { position: relative; width: min(1260px, 84vw); margin: 4.5vh auto; display: grid; grid-template-columns: 1fr 150px 1fr; align-items: center; }
+.matchup-lockup > div { min-width: 0; min-height: min(42vh, 430px); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; border: clamp(6px, .6vw, 12px) solid var(--cream); box-shadow: 12px 12px 0 #000; }
+.matchup-lockup > div:first-child { color: white; background: #151e48; box-shadow: inset 0 clamp(8px, .8vw, 15px) var(--red), 12px 12px 0 #000; }
+.matchup-lockup > div:last-child { color: white; background: #151e48; box-shadow: inset 0 clamp(8px, .8vw, 15px) var(--blue), 12px 12px 0 #000; }
+.matchup-lockup strong { display: block; max-width: 100%; font-size: clamp(20px, 2.3vw, 44px); line-height: 1.2; overflow-wrap: normal; word-break: normal; text-transform: uppercase; text-shadow: 5px 5px #000; }
+.matchup-lockup span { display: block; margin-top: 22px; font-size: clamp(6px, .55vw, 11px); text-transform: uppercase; }
+.matchup-lockup b { z-index: 2; margin: 0 -25px; color: var(--yellow); font-size: clamp(30px, 3vw, 58px); text-shadow: 5px 5px #000; }
+.ringside-strip { position: relative; display: flex; align-items: center; gap: 24px; margin-bottom: clamp(12px, 1.4vh, 20px); }
+.ringside-strip p { color: var(--yellow); font-size: clamp(7px, .65vw, 12px); text-transform: uppercase; }
+.ringside-strip img { width: clamp(60px, 4vw, 78px); height: clamp(60px, 4vw, 78px); margin: 0 4px; border: 4px solid var(--cream); background: #e8e1d4; image-rendering: pixelated; }
+.matchup-wait { position: relative; display: grid; gap: 1.1em; max-width: min(1000px, 82vw); font-size: clamp(7px, .62vw, 12px); line-height: 1.55; text-transform: uppercase; }
+.matchup-wait strong { color: var(--cream); }
+.matchup-wait span { color: var(--yellow); font-family: ui-monospace, monospace; font-weight: 900; }
+.bout-wait-actions { display: flex; justify-content: center; gap: 1.2em; }
+.bout-wait-actions button { padding: 1em 1.25em; border: 3px solid var(--cream); color: var(--cream); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .5vw, 10px); line-height: 1.2; text-transform: uppercase; }
+.bout-wait-actions button:last-child { color: var(--yellow); border-color: var(--yellow); }
+.bout-owner-overlay { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 6vw; background: #02040edb; }
+.bout-owner-card { width: min(680px, 84vw); padding: clamp(24px, 3.5vw, 60px); border: clamp(6px, .65vw, 12px) solid var(--yellow); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
+.bout-owner-card > p { margin: 0 0 1.5em; color: var(--yellow); font-size: clamp(6px, .55vw, 11px); text-transform: uppercase; }
+.bout-owner-card h2 { margin: 0; color: var(--cream); font-size: clamp(18px, 2.25vw, 42px); line-height: 1.35; overflow-wrap: anywhere; text-shadow: .13em .13em #000; text-transform: uppercase; }
+.bout-owner-card > strong { display: block; margin-top: 1em; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(9px, .8vw, 15px); overflow-wrap: anywhere; text-transform: none; }
+.bout-owner-card dl { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2em; margin: 2em 0; }
+.bout-owner-card dl div { padding: 1.2em; border: 3px solid #46527c; background: #050817; }
+.bout-owner-card dt { margin-bottom: .8em; color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.bout-owner-card dd { margin: 0; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(8px, .72vw, 14px); font-weight: 900; line-height: 1.4; overflow-wrap: anywhere; text-transform: uppercase; }
+.bout-owner-card > button { width: 100%; padding: 1.1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
+
+.ready-screen { background: #0a0e24; }
+.ready-screen::after { content: ""; position: absolute; z-index: 0; left: 7%; right: 7%; top: 56%; height: 23%; border-top: clamp(7px, .7vw, 14px) solid var(--cream); border-bottom: clamp(7px, .7vw, 14px) solid var(--blue); background: #1c2b60; box-shadow: inset 0 clamp(13px, 1.5vw, 29px) 0 var(--red); }
+.ready-home-logo { position: relative; z-index: 2; width: min(260px, 17vw); }
+.ready-screen h1 { position: relative; z-index: 2; max-width: 76vw; margin: 2.2vh 0 1.8vh; font-size: clamp(22px, 3vw, 56px); line-height: 1.25; text-transform: uppercase; text-shadow: 5px 5px #000; }
+.ready-match { position: relative; z-index: 2; display: flex; align-items: center; gap: 22px; font-size: clamp(7px, .82vw, 15px); text-transform: uppercase; }
+.ready-match b { color: var(--yellow); font-size: clamp(18px, 2vw, 36px); }
+.ready-ringside { position: relative; z-index: 2; display: flex; gap: 12px; margin: 2.4vh 0 1.8vh; }
+.ready-ringside div { display: grid; grid-template-columns: 52px auto; align-items: center; gap: 8px; padding-right: 12px; color: var(--navy); background: var(--cream); text-align: left; font-size: clamp(5px, .43vw, 8px); line-height: 1.45; text-transform: uppercase; }
+.ready-ringside img { width: 52px; height: 52px; image-rendering: pixelated; }
+.armed-window { position: relative; z-index: 2; margin: 0 0 1.5vh; padding: .8em 1em; border: 3px solid #6bf39a; color: #6bf39a; background: #081a10; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; text-transform: uppercase; }
+/* Amber rather than the resting green, so a presenter facing the room catches
+   it peripherally. Deliberately not the bell's red: the window closing is not a
+   failure, and dressing it as one would read as the round having already died. */
+.armed-window[data-closing] { border-color: var(--yellow); color: var(--yellow); background: #1d1705; }
+.bell-button { position: relative; z-index: 2; min-width: min(430px, 34vw); padding: 1.4em 1.8em; border: clamp(5px, .55vw, 10px) solid var(--red); color: #10152f; background: var(--yellow); box-shadow: 8px 8px 0 #000; font-size: clamp(11px, 1.2vw, 23px); line-height: 1; text-transform: uppercase; }
+.bell-button:disabled { color: #8991ae; border-color: #424d79; background: #1b244d; box-shadow: none; }
+.sound-button { position: relative; z-index: 2; margin-top: 2.2vh; padding: .9em 1.2em; border: 3px solid #89919a; color: #d1d5d9; background: var(--navy); font-size: clamp(5px, .48vw, 9px); text-transform: uppercase; }
+/* The arena cut of the same control: same border, colour and type, but a
+   header row has no vertical stack to space it against, and the grey is
+   deliberately kept so it stays the quietest thing in a header whose other
+   items are the status badge and the round title. */
+.sound-button-arena { align-self: center; justify-self: end; margin-top: 0; padding: .85em 1em; white-space: nowrap; }
+/* The failure notice, and it carries its own ground for the same reason
+   .bell-notice below does -- it is the element that tells the presenter what
+   went wrong, so it is the last thing on this screen allowed to be unreadable.
+   This slot sits on the ring band drawn by .ready-screen::after. Measured in
+   Chromium at 1024x634, 1440x900 and 1728x995, a two-line error lands on the
+   band's #1c2b60 field at 6.46:1, and a three-line one -- the shape a server
+   message actually arrives in -- rises far enough that its first line sits on
+   the band's var(--red) inset at 1.83:1. Which of the band's colours the text
+   overlaps therefore moves with both the viewport and the length of the string,
+   which is why the answer is a ground of its own rather than a recoloured
+   foreground. On #050817 the same #ff9888 is 9.59:1 at every width.
+   max-width is min(560px, 100%) rather than a bare 560px so the chip cannot
+   outgrow the column it is laid out in. Padding is in em so it tracks the type,
+   matching .bell-notice, and costs the slot 16px. */
+.retro-error { position: relative; z-index: 3; max-width: min(560px, 100%); padding: .5em .9em; color: #ff9888; background: #050817; font-family: ui-monospace, monospace; font-weight: 800; }
+/* A bell in flight, which is what a double-tapper is reading when their second
+   press lands on the disabled button. Same slot in the column as .retro-error
+   above, which it never renders alongside, and the same reading voice. Yellow
+   rather than red because nothing failed and nothing was refused.
+
+   It carries its own ground for the reason set out above. Yellow on the band's
+   red is 2.69:1 and cream is 3.19:1, both under AA for text this size; on
+   #050817 the same yellow is 14.12:1 wherever the band lands. Padding is in em
+   so the chip tracks the type, and it costs the screen ~44px against the ~34px
+   the slot already budgeted for an error string several times longer than this
+   one. */
+.bell-notice { position: relative; z-index: 3; max-width: min(560px, 100%); padding: .5em .9em; color: var(--yellow); background: #050817; font-family: ui-monospace, monospace; font-weight: 800; }
+
+/* The proof remains inside the game: one ring, two clocks, one verdict. */
+.proof-screen { position: fixed; inset: 0; overflow: hidden; display: grid; grid-template-rows: 17vh 59vh 24vh; color: var(--cream); background: var(--navy); font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(6px, .7vw, 14px) var(--blue), inset 0 0 0 clamp(11px, 1.2vw, 24px) var(--navy), inset 0 0 0 clamp(15px, 1.65vw, 32px) var(--red); }
+.proof-screen[data-session-state="verified"], .proof-screen[data-session-state="towelled"] { grid-template-rows: 15vh 52vh 33vh; }
+.proof-header { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(64px, 5vw) 1fr auto auto; align-items: center; gap: 1.4vw; padding: 2.2vh 4.2vw 1.7vh; border-bottom: clamp(5px, .55vw, 10px) solid var(--yellow); background: #050817; box-shadow: inset 0 -.55vh 0 var(--red); }
+.proof-header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; letter-spacing: .08em; text-transform: uppercase; }
+.proof-header h1 { margin: 0; font-size: clamp(18px, 2.35vw, 46px); line-height: 1.2; text-transform: uppercase; text-shadow: .13em .13em #000; }
+.proof-state { padding: 1.25em 1.4em; border: clamp(3px, .3vw, 6px) solid var(--cream); color: var(--cream); background: #10183e; font-size: clamp(6px, .55vw, 11px); line-height: 1.2; text-transform: uppercase; box-shadow: .45em .45em #000; }
+.proof-state[data-state="running"] { color: var(--yellow); border-color: var(--yellow); }
+.proof-state[data-state="offline"] { color: #ff9888; border-color: #ff806d; background: #3a0d12; }
+.proof-state[data-state="verified"] { color: #6bf39a; border-color: #6bf39a; }
+.proof-state[data-state="towelled"] { color: var(--yellow); border-color: var(--yellow); }
+.proof-state[data-state="failed"] { color: #ff806d; border-color: #ff806d; }
+.proof-lanes { position: relative; z-index: 2; display: grid; grid-template-columns: 1fr clamp(5px, .45vw, 9px) 1fr; align-items: stretch; min-height: 0; margin: 1.6vh 3.4vw; overflow: hidden; border: clamp(6px, .62vw, 12px) solid var(--cream); background: #111a40; box-shadow: .7em .7em #000; }
+.proof-lanes::before { content: ""; position: absolute; z-index: 0; top: 23%; left: 0; right: 0; height: clamp(5px, .45vw, 9px); background: var(--cream); box-shadow: 0 clamp(24px, 2.2vw, 44px) var(--red), 0 clamp(48px, 4.4vw, 88px) var(--blue); opacity: .2; }
+.proof-lanes::after { content: ""; position: absolute; z-index: 0; left: 0; right: 0; bottom: 0; height: 29%; background: repeating-linear-gradient(135deg, #182654 0 18px, #111a40 18px 36px); border-top: clamp(5px, .45vw, 9px) solid #344477; }
+.lane-rule { position: relative; z-index: 3; background: var(--cream); box-shadow: -.2em 0 var(--red), .2em 0 var(--blue); }
+.lane-rule span { position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: clamp(55px, 5vw, 96px); height: clamp(55px, 5vw, 96px); transform: translate(-50%, -50%); color: var(--cream); font-size: clamp(9px, .9vw, 17px); }
+.lane-rule span::before { content: ""; position: absolute; inset: 0; z-index: -1; transform: rotate(45deg); border: clamp(4px, .4vw, 8px) solid var(--yellow); background: var(--red); box-shadow: .45em .45em #000; }
+.proof-lane { --corner: var(--blue); position: relative; z-index: 1; display: grid; grid-template-rows: auto 1fr auto auto; place-items: center; min-width: 0; min-height: 0; padding: 2.2vh 3vw 3vh; background: #0b1230e8; box-shadow: inset 0 clamp(8px, .7vw, 14px) var(--corner); }
+.proof-lane[data-corner="red"] { --corner: var(--red); }
+.proof-lane[data-state="not_supported"] { background: #171830ed; }
+.proof-lane[data-state="towelled"] { background: #171830ed; }
+.lane-intro { display: flex; align-items: center; justify-content: center; gap: clamp(12px, 1.4vw, 28px); min-width: 0; text-align: left; text-transform: uppercase; }
+.proof-fighter, .proof-fighter .database-fighter { width: clamp(58px, 4.8vw, 96px); height: clamp(68px, 5.7vw, 114px); }
+.proof-fighter .fighter-crown { border-width: clamp(3px, .27vw, 5px); }
+.proof-fighter .fighter-body { border-width: clamp(3px, .3vw, 6px); }
+.proof-fighter .fighter-glove { border-width: clamp(3px, .27vw, 5px); }
+.proof-fighter .fighter-body span { font-size: clamp(4px, .36vw, 7px); }
+.lane-corner { margin: 0 0 .8em; color: var(--corner); font-size: clamp(5px, .46vw, 9px); }
+.lane-name { max-width: 36vw; margin: 0; overflow-wrap: anywhere; color: var(--cream); font-size: clamp(11px, 1.2vw, 23px); line-height: 1.35; text-shadow: .15em .15em #000; }
+.lane-time { align-self: center; min-width: 72%; max-width: 94%; padding: .27em .34em .2em; border: clamp(5px, .55vw, 10px) solid var(--cream); color: var(--yellow); background: #02040e; box-shadow: .12em .12em 0 var(--corner), .22em .22em 0 #000; font-size: clamp(58px, 7.3vw, 142px); font-variant-numeric: tabular-nums; line-height: 1; text-align: center; text-shadow: .07em .07em #000; white-space: nowrap; }
+.timer-readout { display: inline-block; }
+.timer-readout[data-width="medium"] { font-size: .78em; }
+.timer-readout[data-width="long"] { font-size: .62em; }
+.lane-time .timer-unit { margin-left: .08em; color: var(--cream); font-size: .25em; }
+.lane-time[data-live="true"] { animation: timer-live .7s steps(2, end) infinite; }
+@keyframes timer-live { 50% { border-color: var(--yellow); } }
+.lane-time[data-failed="true"] { color: #ff806d; font-size: clamp(24px, 3.1vw, 60px); line-height: 1.25; white-space: normal; }
+.lane-time[data-unsupported="true"] { color: var(--yellow); font-size: clamp(21px, 2.35vw, 46px); line-height: 1.35; text-transform: uppercase; white-space: normal; }
+.lane-time[data-untimed="true"] { color: var(--yellow); font-size: clamp(21px, 2.35vw, 46px); line-height: 1.35; text-transform: uppercase; white-space: normal; }
+.lane-time[data-censored="true"] { color: var(--yellow); }
+.lane-status { align-self: end; min-height: 2.4em; margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(9px, .82vw, 16px); font-weight: 900; line-height: 1.35; text-align: center; }
+.lane-status span { display: inline-grid; place-items: center; width: 2em; height: 2em; margin-right: .7em; border: 2px solid currentColor; color: var(--cream); background: #46527c; font-family: "Press Start 2P", monospace; font-size: .68em; }
+.proof-lane[data-state="verified"] .lane-status span { color: #081a10; border-color: #6bf39a; background: #6bf39a; }
+.proof-lane[data-state="failed"] .lane-status span { color: #240905; border-color: #ff806d; background: #ff806d; }
+.proof-lane[data-state="not_supported"] .lane-status span { color: #241d03; border-color: var(--yellow); background: var(--yellow); }
+.lane-error { display: -webkit-box; max-width: min(34vw, 560px); margin: .7em 0 0; overflow: hidden; color: #ffb1a5; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 800; line-height: 1.35; text-align: center; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.proof-footer { position: relative; z-index: 2; display: grid; place-items: center; align-content: center; min-height: 0; padding: 1.6vh 4vw 2vh; border-top: clamp(5px, .52vw, 10px) solid var(--blue); color: var(--cream); background: #050817; text-align: center; box-shadow: inset 0 .55vh var(--red); }
+.proof-footer[data-capability="true"] { padding-top: 1.2vh; padding-bottom: 1.3vh; }
+.fairness { display: flex; align-items: center; gap: 1.6em; color: #b7c2e7; font-size: clamp(7px, .65vw, 12px); line-height: 1.6; text-transform: uppercase; }
+.fairness span { color: var(--yellow); font-size: .7em; }
+.remembered span { display: block; margin-bottom: 1em; color: var(--yellow); font-size: clamp(6px, .5vw, 10px); line-height: 1; letter-spacing: .08em; text-transform: uppercase; }
+.remembered strong { display: block; max-width: 92vw; color: var(--cream); font-size: clamp(22px, 2.65vw, 52px); line-height: 1.3; text-transform: uppercase; text-shadow: .11em .11em var(--red); }
+.proof-footer[data-capability="true"] .remembered span { margin-bottom: .7em; }
+.proof-footer[data-capability="true"] .remembered strong { font-size: clamp(20px, 2.35vw, 46px); }
+/* Who is at ringside, read as a scoreboard strip. This was a column grid of
+   prose cards -- a sentence per persona plus a sentence per selected corner,
+   up to six of them stacking down the footer. The prose moved to the "Explain
+   to the room" overlay, which always had it, so what is left is the roster:
+   portrait plus name and role.
+   A wrapping flex row rather than a 1/2/3-column grid, because the chips are
+   now sized by their own label instead of by a share of the width. That is
+   what keeps one lead and three personas both looking deliberate, and it
+   collapses to stacked rows at narrow widths without a media query.
+   Modelled on .ready-ringside, which pairs a pixel portrait with a short
+   uppercase label the same way. */
+.ringside-meanings { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: .5vh .65vw; width: min(1180px, 88vw); margin-top: .8vh; }
+.ringside-meanings > header { flex: 1 0 100%; display: flex; align-items: center; justify-content: center; gap: 1.2em; color: #aeb9df; font-size: clamp(5px, .42vw, 8px); text-transform: uppercase; }
+.ringside-meanings > header span { color: var(--yellow); }
+.ringside-meanings > header small { font-size: inherit; }
+.ringside-meanings article { display: grid; grid-template-columns: clamp(38px, 2.9vw, 52px) auto; align-items: center; gap: .7em; min-width: 0; max-width: 100%; padding: .35em .85em .35em .35em; border: 2px solid #46527c; border-left: .45em solid var(--yellow); color: var(--cream); background: #0a1130; text-align: left; }
+.ringside-meanings img { width: clamp(38px, 2.9vw, 52px); height: clamp(38px, 2.9vw, 52px); image-rendering: pixelated; }
+.ringside-meanings strong { display: block; min-width: 0; color: var(--yellow); font-size: clamp(6px, .5vw, 9px); line-height: 1.35; text-transform: uppercase; overflow-wrap: anywhere; }
+/* Only rendered while `.proof-actions` is suppressed, so it is the one route to
+   the overlay in that window. Sized and coloured as the strip's own chip rather
+   than as a member of the actions row it is standing in for. */
+.ringside-meanings-explain { padding: .75em 1em; border: 2px solid var(--yellow); color: var(--yellow); background: #10183e; font-size: clamp(6px, .5vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.proof-footer:has(.ringside-meanings) { padding-top: .7vh; padding-bottom: .9vh; }
+.proof-footer:has(.ringside-meanings) .remembered span { position: relative; top: .55vh; margin-bottom: .5em; }
+.proof-footer:has(.ringside-meanings) .remembered strong { font-size: clamp(18px, 2.1vw, 41px); }
+.proof-footer:has(.ringside-meanings) .final-fairness { margin-top: .65em; }
+.proof-footer:has(.ringside-meanings) .proof-actions { margin-top: .65em; }
+.final-fairness { margin: 1.4em 0 0; color: #a9b5d9; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 800; }
+.proof-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.2em; margin-top: 1.3em; }
+.starred-redo-action { display: grid; justify-items: center; gap: .55em; }
+.starred-redo-action > small { max-width: 28em; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.4; text-transform: uppercase; }
+.proof-next, .proof-redo, .proof-replay, .proof-ringside, .proof-cost, .proof-share, .proof-towel, .proof-towel-retry { padding: .9em 1.2em; border: 3px solid var(--yellow); color: var(--yellow); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .55vw, 11px); line-height: 1; text-transform: uppercase; }
+.proof-redo { color: var(--cream); border-color: var(--cream); }
+.proof-replay { color: var(--blue-light); border-color: var(--blue-light); }
+.proof-ringside { color: var(--navy); background: var(--yellow); }
+.proof-share { color: #081a10; border-color: #6bf39a; background: #6bf39a; }
+.towel-call { display: flex; align-items: center; justify-content: center; gap: 1.2em; margin-top: 1em; }
+.towel-call p { margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-weight: 900; }
+.proof-towel { color: #081a10; border-color: var(--yellow); background: var(--yellow); }
+.proof-towel:disabled { cursor: wait; opacity: .72; }
+.towel-lane-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(8px, .8vw, 14px); width: min(850px, 88vw); margin: clamp(12px, 1.5vh, 22px) auto 0; }
+.towel-lane-results article { display: grid; gap: .65em; min-width: 0; padding: .9em 1.1em; border: 3px solid var(--blue-light); background: #050817; box-shadow: inset 0 .35em var(--blue); text-align: center; }
+.towel-lane-results article[data-corner="red"] { border-color: var(--red); box-shadow: inset 0 .35em var(--red); }
+.towel-lane-results span, .towel-lane-results small { color: #b7c2e7; font-size: clamp(6px, .5vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.towel-lane-results strong { color: var(--yellow); font-size: clamp(14px, 1.5vw, 28px); line-height: 1.2; }
+.towel-lane-results small { font-family: ui-monospace, monospace; font-weight: 900; }
+/* `.cleanup-abandoned` shares every rule rather than copying them. A towel and
+   a bout that ended on its own report the same abandoned tidy-up, and two rule
+   sets is how they would end up looking like two different problems. */
+.towel-progress, .cleanup-abandoned { display: grid; justify-items: center; gap: .65em; max-width: 92vw; margin-top: .9em; }
+.towel-progress strong, .cleanup-abandoned strong { color: var(--yellow); font-size: clamp(10px, 1vw, 19px); text-transform: uppercase; }
+.towel-progress span, .towel-progress em, .cleanup-abandoned span { font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-style: normal; font-weight: 900; line-height: 1.35; }
+.towel-progress span, .cleanup-abandoned span { color: #c5cdea; }
+.towel-progress em { padding: .55em .75em; border: 2px solid #ffb95c; color: #ffcf87; background: #2a1704; }
+.towel-progress[data-state="failed"] strong, .towel-progress[data-state="failed"] span,
+.cleanup-abandoned[data-state="failed"] strong, .cleanup-abandoned[data-state="failed"] span { color: #ff9888; }
+.proof-towel-retry { margin-top: .2em; color: var(--cream); border-color: #ff806d; background: #3a0d12; }
+.proof-error { margin: 0; color: #ff806d; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; }
+.proof-failure strong, .proof-failure span { display: block; }
+.proof-failure strong { color: #ff806d; font-size: clamp(24px, 3.1vw, 60px); line-height: 1.2; text-shadow: .11em .11em #000; text-transform: uppercase; }
+.proof-failure span { max-width: 760px; margin: 1.2em auto 0; color: #c5cdea; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 900; line-height: 1.45; }
+.capability-note strong, .capability-note span { display: block; }
+.capability-note strong { color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(9px, .8vw, 15px); font-weight: 900; }
+.capability-note span { margin-top: .9em; color: var(--yellow); font-size: clamp(6px, .5vw, 10px); line-height: 1; text-transform: uppercase; }
+.capability-note[data-compact="true"] { margin-top: 1.1em; }
+.capability-note[data-compact="true"] strong { font-size: clamp(7px, .62vw, 12px); }
+.capability-note[data-compact="true"] span { margin-top: .7em; font-size: clamp(5px, .45vw, 9px); }
+.proof-review strong, .proof-review span { display: block; }
+.proof-review strong { color: var(--cream); font-size: clamp(20px, 2.4vw, 46px); line-height: 1.25; text-shadow: .11em .11em var(--red); text-transform: uppercase; }
+.proof-review span { margin-top: 1.2em; color: var(--yellow); font-size: clamp(6px, .52vw, 10px); line-height: 1.4; text-transform: uppercase; }
+.proof-scanlines { position: absolute; z-index: 20; inset: 0; pointer-events: none; opacity: .12; background: repeating-linear-gradient(to bottom, transparent 0 3px, #000 3px 5px); }
+
+/* Round 5 keeps the scored setup race visually separate from downstream burst validation. */
+.round5-screen { position: fixed; inset: 0; display: grid; grid-template-rows: 11vh 77vh 12vh; overflow: hidden; color: var(--cream); background: var(--navy); font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(6px, .7vw, 14px) var(--blue), inset 0 0 0 clamp(11px, 1.2vw, 24px) var(--navy), inset 0 0 0 clamp(15px, 1.65vw, 32px) var(--red); }
+.round5-header { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(64px, 5vw) minmax(0, 1fr) auto auto; align-items: center; gap: 1.3vw; padding: 1.2vh 4vw 1vh; border-bottom: clamp(5px, .55vw, 10px) solid var(--yellow); background: #050817; box-shadow: inset 0 -.45vh var(--red); }
+.round5-header p { margin: 0 0 .7em; color: var(--yellow); font-size: clamp(6px, .5vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round5-header h1 { margin: 0; font-size: clamp(15px, 1.8vw, 34px); line-height: 1.18; text-transform: uppercase; text-shadow: .13em .13em #000; }
+.round5-header .round5-matchup { display: flex; align-items: baseline; gap: .8em; margin: .65em 0 0; color: var(--cream); font-size: clamp(5px, .44vw, 9px); line-height: 1.25; }
+.round5-matchup strong:first-child { color: var(--red-light); }
+.round5-matchup strong:last-child { color: var(--blue-light); }
+.round5-matchup span { color: var(--yellow); }
+.round5-header > strong { padding: 1em 1.2em; border: 3px solid var(--yellow); color: var(--yellow); background: #10183e; font-size: clamp(6px, .52vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round5-screen[data-session-state="verified"] .round5-header > strong { color: #6bf39a; border-color: #6bf39a; }
+.round5-screen[data-session-state="failed"] .round5-header > strong { color: #ff806d; border-color: #ff806d; }
+.round5-body { position: relative; z-index: 2; display: grid; grid-template-rows: minmax(0, .9fr) minmax(0, 1.15fr) auto auto; gap: .65vh; min-height: 0; padding: .8vh 4vw; overflow: hidden; }
+.round5-phase { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: .4vh; min-height: 0; }
+.round5-phase > header { display: flex; align-items: center; justify-content: space-between; color: var(--yellow); font-size: clamp(5px, .43vw, 8px); line-height: 1.3; text-transform: uppercase; }
+.round5-phase > header span { color: #aeb9df; font-family: ui-monospace, monospace; font-weight: 900; }
+.round5-lanes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(14px, 1.5vw, 28px); align-items: stretch; min-height: 0; }
+.round5-setup-lane { --corner: var(--red); display: grid; grid-template-columns: 1.4fr 1fr; grid-template-rows: auto minmax(0, 1fr); gap: .6vh .8vw; min-width: 0; padding: .8vh .9vw; border: clamp(4px, .4vw, 8px) solid var(--corner); background: #10183e; box-shadow: inset 0 .5vh var(--corner), .4em .4em #000; }
+.round5-setup-lane[data-corner="blue"] { --corner: var(--blue-light); }
+.round5-setup-lane header { grid-column: 1 / -1; display: flex; align-items: baseline; justify-content: space-between; gap: 1vw; padding-bottom: .5vh; border-bottom: 2px solid #46527c; }
+.round5-setup-lane header strong { color: var(--corner); font-size: clamp(9px, .85vw, 16px); text-transform: uppercase; }
+.round5-setup-lane header span { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(6px, .5vw, 9px); font-weight: 900; text-transform: uppercase; }
+.round5-setup-time { display: grid; align-content: center; min-width: 0; padding: .6vh .7vw; border: 3px solid var(--yellow); background: #050817; }
+.round5-setup-time span { color: var(--yellow); font-size: clamp(5px, .42vw, 8px); text-transform: uppercase; }
+.round5-setup-time strong { margin-top: .35em; color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(24px, 2.6vw, 50px); font-variant-numeric: tabular-nums; line-height: 1; text-shadow: .08em .08em var(--red); }
+.round5-setup-time small { margin-top: .45em; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(6px, .48vw, 9px); font-weight: 900; }
+.round5-setup-lane dl { display: grid; gap: .5vh; margin: 0; }
+.round5-setup-lane dl > div { min-width: 0; padding: .55vh .6vw; border: 2px solid #46527c; background: #050817; }
+.round5-setup-lane dt { color: #aeb9df; font-size: clamp(5px, .4vw, 7px); text-transform: uppercase; }
+.round5-setup-lane dd { margin: .4em 0 0; font-family: ui-monospace, monospace; font-size: clamp(9px, .78vw, 14px); font-weight: 900; overflow-wrap: anywhere; }
+.round5-lane { --corner: var(--red); min-width: 0; padding: 1.1vh 1vw; border: clamp(4px, .4vw, 8px) solid var(--corner); background: #10183e; box-shadow: inset 0 .55vh var(--corner), .45em .45em #000; }
+.round5-lane[data-corner="blue"] { --corner: var(--blue-light); }
+.round5-lane header { display: flex; align-items: baseline; justify-content: space-between; gap: 1vw; padding-bottom: .8vh; border-bottom: 3px solid #46527c; }
+.round5-lane header strong { color: var(--corner); font-size: clamp(10px, 1vw, 19px); text-transform: uppercase; }
+.round5-lane header span { color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; line-height: 1.3; text-align: right; }
+.round5-lane dl { display: grid; grid-template-columns: repeat(4, 1fr); gap: .45vh .45vw; margin: .55vh 0 0; }
+.round5-lane dl > div { min-width: 0; padding: .45vh .55vw; border: 2px solid #46527c; background: #050817; }
+.round5-lane dt { color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.3; text-transform: uppercase; }
+.round5-lane dd { margin: .4em 0 0; font-family: ui-monospace, monospace; font-size: clamp(11px, 1.1vw, 21px); font-weight: 900; line-height: 1.05; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.round5-lane small { display: block; margin-top: .55em; color: #9da9d1; font-family: ui-monospace, monospace; font-size: clamp(6px, .48vw, 9px); font-weight: 900; line-height: 1.25; }
+.round5-lane .round5-p99 { grid-column: span 2; border-color: var(--yellow); }
+.round5-lane .round5-p99 dd { color: var(--yellow); font-size: clamp(14px, 1.35vw, 26px); }
+.round5-lane > p { margin: .8vh 0 0; color: #ff9888; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; }
+.round5-fairness { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: .55em 1.25em; padding: .8vh 1vw; border: 3px solid #46527c; background: #050817; font-family: ui-monospace, monospace; font-size: clamp(6px, .55vw, 10px); font-weight: 900; line-height: 1.3; }
+.round5-fairness strong { color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: .9em; }
+.round5-fairness span + span::before { content: "◆ "; color: var(--red-light); }
+.round5-components { display: grid; grid-template-columns: auto repeat(4, minmax(0, 1fr)); align-items: center; gap: .7vw; padding: .55vh .8vw; border: 3px solid var(--blue-light); background: #11152d; }
+.round5-components strong { color: var(--blue-light); font-size: clamp(5px, .45vw, 9px); line-height: 1.4; }
+.round5-components p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(6px, .52vw, 10px); font-weight: 900; line-height: 1.3; }
+.round5-components p[aria-label="Round 5 final receipt"] { grid-column: 2 / -1; padding-top: .35vh; border-top: 1px solid #46527c; color: #c7d2f5; }
+.round5-footer { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 1.5vw; min-height: 0; padding: 1vh 4vw; border-top: clamp(5px, .52vw, 10px) solid var(--blue); background: #050817; box-shadow: inset 0 .5vh var(--red); }
+.round5-error { grid-column: 1 / -1; margin: 0; color: #ff9888; font-family: ui-monospace, monospace; font-size: clamp(7px, .58vw, 11px); font-weight: 900; }
+.round5-verdict { display: grid; gap: .5em; min-width: 0; }
+.round5-verdict span { color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.round5-verdict strong { color: #ff806d; font-size: clamp(9px, .9vw, 17px); line-height: 1.35; overflow-wrap: anywhere; text-transform: uppercase; }
+.round5-verdict[data-comparison="true"] strong { color: #6bf39a; }
+.round5-actions { display: flex; gap: 1vw; }
+.round5-actions button { min-height: clamp(40px, 3.6vw, 64px); padding: 0 1.3em; text-transform: uppercase; }
+.round5-retry-cleanup { border: clamp(4px, .4vw, 7px) solid #ff9888; color: var(--cream); background: #3a0d12; box-shadow: .38em .38em #000; font-size: clamp(7px, .62vw, 12px); }
+.round5-retry-cleanup:disabled { cursor: wait; opacity: .72; }
+.round5-next { border: 3px solid #8996c1; color: #c0c8e3; background: #10183e; font-size: clamp(6px, .52vw, 10px); }
+.round5-compact-body { position: relative; z-index: 2; display: grid; place-items: center; min-height: 0; padding: clamp(24px, 4vh, 56px) 5vw; background: radial-gradient(circle at 50% 45%, #18234a 0, var(--navy) 52%, #050817 100%); }
+.round5-result-card { width: min(850px, 88vw); padding: clamp(24px, 4vh, 52px) clamp(24px, 4vw, 58px); border: clamp(4px, .4vw, 7px) solid #ff806d; background: #0a0f28; box-shadow: .65em .65em #000, inset 0 .55vh var(--red); text-align: center; }
+.round5-result-card > p:first-child { margin: 0; color: var(--yellow); font-size: clamp(6px, .55vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round5-result-card h2 { margin: .75em 0 0; color: #ff806d; font-size: clamp(20px, 2.6vw, 46px); line-height: 1.2; text-shadow: .12em .12em #000; }
+.round5-screen[data-session-state="running"] .round5-result-card { border-color: var(--yellow); }
+.round5-screen[data-session-state="running"] .round5-result-card h2 { color: var(--yellow); }
+.round5-result-reason { max-width: 680px; margin: 1.7em auto 0; color: #d2daf4; font-family: ui-monospace, monospace; font-size: clamp(10px, .85vw, 15px); font-weight: 900; line-height: 1.55; }
+.round5-technical-details { max-width: 680px; margin: clamp(20px, 3vh, 34px) auto 0; border: 2px solid #46527c; background: #050817; text-align: left; }
+.round5-technical-details summary { padding: 1.15em 1.35em; color: #aeb9df; cursor: pointer; font-size: clamp(6px, .52vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round5-technical-details[open] summary { border-bottom: 2px solid #46527c; color: var(--yellow); }
+.round5-technical-details dl { display: grid; gap: .8em; margin: 0; padding: 1.2em 1.35em .7em; }
+.round5-technical-details dl > div { display: grid; grid-template-columns: minmax(120px, .8fr) minmax(0, 1.5fr); gap: 1em; }
+.round5-technical-details dt { color: #aeb9df; font-size: clamp(6px, .5vw, 9px); text-transform: uppercase; }
+.round5-technical-details dd { margin: 0; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(8px, .66vw, 12px); font-weight: 900; overflow-wrap: anywhere; }
+.round5-technical-details > p { margin: 0; padding: .7em 1.35em 1.3em; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; line-height: 1.45; }
+.round5-compact-actions { display: flex; justify-content: center; gap: clamp(14px, 1.5vw, 24px); margin-top: clamp(24px, 3.5vh, 42px); }
+.round5-compact-actions button { min-height: clamp(44px, 4vw, 64px); padding: 0 1.8em; text-transform: uppercase; }
+/* The compact layout's footer held the production credit and nothing else, so
+   removing that credit removed the footer with it. .round5-screen's rows are
+   fixed heights rather than a 1fr, so the vacated 12vh would have stayed on
+   screen as an empty band under the result card; the body takes it instead. */
+.round5-screen[data-layout="compact"] { grid-template-rows: 11vh 89vh; }
+.round5-arena-footer { gap: .45vh; padding-top: .7vh; padding-bottom: 1vh; }
+.round5-arena-footer > .ringside-commentator,
+.round5-arena-footer > .final-fairness,
+.round5-arena-footer > .proof-actions,
+.round5-arena-footer > .towel-call { margin-top: 0; }
+.round5-arena-footer > .remembered span { margin-bottom: .55em; }
+.round5-arena-footer > .remembered strong { font-size: clamp(18px, 2vw, 38px); }
+.round5-explain-proof { display: grid; gap: 1.2vh; padding: 1.2vh 1vw; border: 3px solid var(--blue-light); background: #070b22; }
+.round5-explain-proof > header { display: flex; align-items: baseline; justify-content: space-between; gap: 1vw; padding-bottom: .8vh; border-bottom: 2px solid #46527c; text-transform: uppercase; }
+.round5-explain-proof > header span { color: var(--yellow); font-size: clamp(6px, .5vw, 10px); }
+.round5-explain-proof > header strong { color: var(--cream); font-size: clamp(7px, .58vw, 11px); line-height: 1.35; text-align: right; }
+.round5-explain-phase { display: grid; gap: .7vh; }
+.round5-explain-phase h3 { margin: 0; color: #b7c2e7; font-size: clamp(6px, .5vw, 10px); line-height: 1.4; text-transform: uppercase; }
+.round5-explain-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1vw; }
+.round5-explain-components { display: grid; gap: .65em; padding: .9em 1em; border: 2px solid #46527c; background: #10183e; }
+.round5-explain-components strong { color: var(--blue-light); font-size: clamp(6px, .5vw, 10px); text-transform: uppercase; }
+.round5-explain-components p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(7px, .58vw, 11px); font-weight: 900; line-height: 1.4; }
+
+/* Round 4 tells one OLAP-to-OLTP story; timings and row identity are supporting proof. */
+.round4-screen { position: fixed; inset: 0; display: grid; grid-template-rows: 12vh 75vh 13vh; overflow: hidden; color: var(--cream); background: radial-gradient(circle at 50% 42%, #17234c 0, var(--navy) 54%, #050817 100%); font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(6px, .7vw, 14px) var(--blue), inset 0 0 0 clamp(11px, 1.2vw, 24px) var(--navy), inset 0 0 0 clamp(15px, 1.65vw, 32px) var(--red); }
+.round4-screen[data-presentation$="verified"], .round4-screen[data-presentation$="failed"] { grid-template-rows: 12vh 75vh 13vh; }
+.round4-header { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(64px, 5vw) minmax(0, 1fr) auto auto; align-items: center; gap: 1.2vw; padding: 1vh 4vw; border-bottom: clamp(5px, .55vw, 10px) solid var(--yellow); background: #050817; box-shadow: inset 0 -.45vh var(--red); }
+.round4-header p { margin: 0 0 .65em; color: var(--yellow); font-size: clamp(6px, .5vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round4-header h1 { margin: 0; font-size: clamp(14px, 1.65vw, 32px); line-height: 1.2; text-transform: uppercase; text-shadow: .13em .13em #000; }
+.round4-header > strong { padding: .9em 1.1em; border: 3px solid var(--yellow); color: var(--yellow); background: #10183e; font-size: clamp(6px, .52vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round4-screen[data-presentation$="verified"] .round4-header > strong { color: #6bf39a; border-color: #6bf39a; }
+.round4-screen[data-presentation$="failed"] .round4-header > strong { color: #ff806d; border-color: #ff806d; }
+.round4-live-region { position: absolute; z-index: 3; top: 12.6vh; left: 50%; max-width: 88vw; transform: translateX(-50%); overflow: hidden; color: transparent; font-size: 1px; white-space: nowrap; }
+.round4-body { position: relative; z-index: 2; display: grid; place-items: center; align-content: center; gap: .8vh; min-height: 0; padding: .8vh 4vw; overflow: hidden; }
+.round4-story { display: grid; gap: .7vh; width: min(1520px, 91vw); padding: .75vh .8vw; border: 3px solid var(--cream); background: #10183e; box-shadow: inset 0 .4vh var(--red), .32em .32em #000; }
+.round4-story[data-verified="true"] { border-color: #6bf39a; box-shadow: inset 0 .55vh #6bf39a, .55em .55em #000; }
+.round4-story-header { display: flex; align-items: center; justify-content: space-between; gap: 1.4vw; padding: .4vh .25vw .2vh; }
+.round4-story-header > div { min-width: 0; }
+.round4-story-header span { display: block; color: var(--yellow); font-size: clamp(5px, .43vw, 8px); line-height: 1.3; text-transform: uppercase; }
+.round4-story-header strong { display: block; margin-top: .6em; font-size: clamp(10px, 1.05vw, 20px); line-height: 1.3; text-transform: uppercase; }
+.round4-story-header > b { flex: none; padding: .75em .9em; border: 2px solid var(--yellow); color: var(--yellow); background: #050817; font-size: clamp(5px, .44vw, 9px); line-height: 1.3; text-transform: uppercase; }
+.round4-story[data-verified="true"] .round4-story-header > b { border-color: #6bf39a; color: #6bf39a; }
+.round4-flow { display: grid; grid-template-columns: minmax(0, 1fr) minmax(44px, 4.5vw) minmax(150px, .66fr) minmax(44px, 4.5vw) minmax(0, 1.12fr); align-items: stretch; min-height: clamp(170px, 23vh, 260px); }
+.round4-flow-node { display: grid; align-content: center; min-width: 0; padding: 1.2vh 1.2vw; border: 3px solid #46527c; background: #050817; }
+.round4-flow-node > span { color: var(--yellow); font-size: clamp(5px, .45vw, 9px); line-height: 1.35; text-transform: uppercase; }
+.round4-source { box-shadow: inset .55em 0 var(--red); }
+.round4-source > strong { margin-top: .8em; font-size: clamp(13px, 1.35vw, 26px); line-height: 1.2; text-transform: uppercase; }
+.round4-flow-node dl { display: grid; gap: .5vh; margin: 1vh 0 0; }
+.round4-flow-node dl > div { min-width: 0; padding: .55vh .6vw; border: 1px solid #46527c; background: #0e1535; }
+.round4-flow-node dt { color: #aeb9df; font-size: clamp(5px, .38vw, 7px); line-height: 1.3; text-transform: uppercase; }
+.round4-flow-node dd { margin: .4em 0 0; font-family: ui-monospace, monospace; font-size: clamp(9px, .78vw, 15px); font-weight: 900; line-height: 1.2; overflow-wrap: anywhere; }
+.round4-flow-arrow { display: grid; place-items: center; align-content: center; gap: .7vh; color: var(--yellow); }
+.round4-flow-arrow span { font-size: clamp(4px, .34vw, 7px); line-height: 1.35; text-align: center; text-transform: uppercase; }
+.round4-flow-arrow b { font-family: ui-monospace, monospace; font-size: clamp(36px, 4vw, 76px); line-height: .75; text-shadow: .08em .08em var(--red); }
+.round4-sync { justify-items: center; overflow: hidden; border-color: var(--yellow); text-align: center; box-shadow: inset 0 .45em var(--yellow); }
+.round4-sync > .timer-readout, .round4-sync > strong { display: block; max-width: 100%; margin-top: 1.2vh; padding: 0 .15em; overflow: hidden; color: var(--yellow); font-size: clamp(20px, 2vw, 38px); line-height: 1; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.round4-sync .timer-unit { margin-left: .1em; color: var(--cream); font-size: .27em; }
+.round4-sync > .round4-no-measurement { min-width: 0; padding: 0; border: 0; background: transparent; }
+.round4-sync > p { margin: 1.2vh 0 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .57vw, 11px); font-weight: 900; line-height: 1.4; }
+.round4-timing-breakdown { display: grid; width: 100%; gap: .65vh; margin-top: 1vh; font-family: ui-monospace, monospace; text-align: left; }
+.round4-timing-breakdown > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .6vw; align-items: center; }
+.round4-timing-breakdown span { color: #b7c2e7; font-size: clamp(5px, .43vw, 8px); font-weight: 900; line-height: 1.3; text-transform: uppercase; }
+.round4-timing-breakdown strong { color: var(--cream); font-size: clamp(8px, .72vw, 14px); font-variant-numeric: tabular-nums; line-height: 1; white-space: nowrap; }
+.round4-timing-breakdown small { grid-column: 1 / -1; color: #7f8ab2; font-size: clamp(4px, .34vw, 7px); font-weight: 900; line-height: 1.25; text-transform: uppercase; }
+.round4-timing-breakdown > .round4-timing-total { margin-top: .2vh; padding-top: .7vh; border-top: 2px solid var(--yellow); }
+.round4-timing-breakdown > .round4-timing-total span, .round4-timing-breakdown > .round4-timing-total strong { color: var(--yellow); }
+.round4-target { border-color: var(--blue-light); box-shadow: inset 0 .55em var(--blue-light); }
+.round4-target > small { margin-top: .5em; color: #9da9d1; font-family: ui-monospace, monospace; font-size: clamp(6px, .45vw, 9px); font-weight: 900; line-height: 1.3; }
+.round4-customer-card { margin-top: 1vh; border: 3px solid #46527c; background: #111a40; box-shadow: .3em .3em #000; }
+.round4-customer-card > header { display: flex; align-items: center; justify-content: space-between; gap: .7vw; padding: .65vh .65vw; border-bottom: 2px solid #46527c; }
+.round4-customer-card > header strong { font-size: clamp(7px, .65vw, 12px); text-transform: uppercase; }
+.round4-customer-card > header b { color: #aeb9df; font-size: clamp(4px, .35vw, 7px); line-height: 1.3; text-align: right; text-transform: uppercase; }
+.round4-story[data-verified="true"] .round4-customer-card { border-color: #6bf39a; }
+.round4-story[data-verified="true"] .round4-customer-card > header b { color: #6bf39a; }
+.round4-customer-card dl { grid-template-columns: 1.4fr .8fr 1fr; margin: 0; padding: .6vh .55vw; }
+.round4-aws-disclosure { display: grid; grid-template-columns: minmax(0, 1fr) clamp(48px, 5vw, 78px) minmax(0, 1fr); align-items: stretch; gap: .55vh .7vw; width: min(1520px, 91vw); padding: .65vh .8vw .75vh; border: 3px solid var(--blue-light); color: #b7c2e7; background: #090d21; box-shadow: .34em .34em #000; }
+.round4-aws-disclosure > header { grid-column: 1 / -1; padding: 0 .2vw .4vh; border-bottom: 1px solid #46527c; }
+.round4-aws-disclosure > header strong { color: var(--yellow); font-size: clamp(9px, .8vw, 16px); line-height: 1.35; text-transform: uppercase; }
+.round4-platform-path, .round4-added-stack { display: grid; align-content: center; min-width: 0; padding: .65vh .75vw; border: 2px solid #46527c; background: #10172f; }
+.round4-platform-path { grid-column: 1; border-color: #6bf39a; box-shadow: inset .45em 0 #6bf39a; }
+.round4-added-stack { grid-column: 3; border-color: var(--blue-light); box-shadow: inset -.45em 0 var(--blue-light); }
+.round4-versus { grid-column: 2; display: grid; place-items: center; align-self: center; justify-self: center; width: clamp(42px, 4.2vw, 66px); height: clamp(42px, 4.2vw, 66px); border: 3px solid var(--yellow); color: var(--cream); background: var(--red); box-shadow: .25em .25em #000; font-size: clamp(9px, .8vw, 15px); transform: rotate(45deg); }
+.round4-versus > span { transform: rotate(-45deg); }
+.round4-platform-path > span, .round4-added-stack > span { display: block; color: #6bf39a; font-size: clamp(5px, .38vw, 7px); line-height: 1.3; text-transform: uppercase; }
+.round4-platform-path > strong, .round4-added-stack > strong { display: block; margin-top: .55em; color: #6bf39a; font-size: clamp(10px, .85vw, 17px); line-height: 1.3; text-transform: uppercase; }
+.round4-added-stack > span, .round4-added-stack > strong { color: var(--blue-light); }
+.round4-platform-path p, .round4-added-stack p { margin: .65em 0 0; font-family: ui-monospace, monospace; font-size: clamp(7px, .52vw, 10px); font-weight: 900; line-height: 1.35; }
+.round4-platform-path > b, .round4-added-stack > b { display: block; margin-top: .55em; color: #6bf39a; font-size: clamp(6px, .5vw, 10px); line-height: 1.3; text-transform: uppercase; }
+.round4-added-stack > b { color: var(--yellow); font-family: ui-monospace, monospace; font-weight: 900; }
+.round4-body > .ringside-commentator { width: min(1520px, 91vw); margin-top: 0; border-width: 2px; border-color: #46527c; background: #050817; box-shadow: none; }
+.round4-body > .ringside-commentator > header { min-width: 165px; padding-top: .1em; padding-bottom: .1em; }
+.round4-body > .ringside-commentator > header { grid-template-rows: auto; border-right-width: 1px; }
+.round4-body > .ringside-commentator .ringside-announcer { grid-row: auto; }
+.round4-body > .ringside-commentator .ringside-commentary { padding-top: .35em; padding-bottom: .35em; color: #aeb9df; font-size: clamp(7px, .54vw, 10px); }
+.round4-body > .ringside-commentator > button { min-width: 165px; border-left-width: 1px; color: #aeb9df; background: #090d21; }
+.round4-body > .ringside-commentator .ringside-announcer-tag { color: #aeb9df; }
+.round4-same-pk { width: min(1520px, 91vw); margin: 0; padding: .45em 1em; border-top: 1px solid var(--yellow); color: var(--yellow); background: #090d21; font-size: clamp(6px, .5vw, 9px); line-height: 1.35; text-align: center; text-transform: uppercase; }
+.round4-v1-ribbon { display: grid; grid-template-columns: auto auto auto auto minmax(0, 1fr); align-items: center; gap: .8vw; width: min(1520px, 91vw); min-width: 0; padding: .4vh .75vw; border: 1px solid #437a5a; color: #b8c6c0; background: #07130c; font-family: ui-monospace, monospace; font-size: clamp(5px, .45vw, 9px); font-weight: 900; line-height: 1.25; }
+.round4-v1-ribbon strong, .round4-v1-ribbon b { color: #6bf39a; font-family: "Press Start 2P", monospace; font-size: .7em; }
+.round4-v1-ribbon b { justify-self: end; }
+.round4-failure { display: grid; align-content: center; justify-items: center; gap: 2vh; width: min(1120px, 82vw); min-height: 28vh; padding: 3vh 4vw; border: clamp(6px, .6vw, 12px) solid #ff806d; background: #2a1017; box-shadow: .7em .7em #000; text-align: center; }
+.round4-failure strong { color: #ff806d; font-size: clamp(22px, 2.6vw, 50px); line-height: 1.25; }
+.round4-failure p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(10px, .9vw, 17px); font-weight: 900; line-height: 1.5; overflow-wrap: anywhere; }
+.round4-failure small { color: #6bf39a; font-size: clamp(6px, .52vw, 10px); line-height: 1.4; text-transform: uppercase; }
+.round4-redo-failure { min-height: 23vh; }
+.round4-footer { position: relative; z-index: 2; display: grid; place-items: center; align-content: center; gap: .8vh; min-height: 0; padding: .8vh 4vw; border-top: clamp(5px, .52vw, 10px) solid var(--blue); background: #050817; box-shadow: inset 0 .5vh var(--red); }
+.round4-footer > p { margin: 0; color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(7px, .58vw, 11px); font-weight: 900; line-height: 1.3; text-align: center; }
+.round4-actions { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: .75vh .8vw; }
+.round4-actions button { min-height: clamp(38px, 3.2vw, 58px); padding: 0 1.4em; text-transform: uppercase; }
+.round4-redo { border: clamp(4px, .4vw, 7px) solid var(--yellow); color: #10152f; background: var(--yellow); box-shadow: .36em .36em var(--red), .58em .58em #000; font-size: clamp(6px, .58vw, 11px); }
+.round4-redo:disabled { cursor: wait; filter: saturate(.4); opacity: .7; }
+.round4-ringside, .round4-share { border: 3px solid var(--blue-light); color: var(--cream); background: #13214b; font-size: clamp(6px, .52vw, 10px); }
+.round4-share { border-color: #6bf39a; color: #6bf39a; background: #081a10; }
+.round4-next { border: 3px solid #8996c1; color: #c0c8e3; background: #10183e; font-size: clamp(6px, .52vw, 10px); }
+.round-legend { margin: .8em 0 0; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.4; text-transform: uppercase; }
+
+@media (max-height: 940px) {
+  .round4-screen { grid-template-rows: 11vh 76vh 13vh; }
+  .round4-screen[data-presentation$="verified"], .round4-screen[data-presentation$="failed"] { grid-template-rows: 11vh 76vh 13vh; }
+  .round4-header { padding-top: .7vh; padding-bottom: .6vh; }
+  .round4-body { gap: .65vh; padding-top: .6vh; padding-bottom: .6vh; }
+  .round4-story { gap: .65vh; padding-top: .7vh; padding-bottom: .7vh; }
+  .round4-flow { min-height: clamp(160px, 22vh, 225px); }
+  .round4-flow-node { padding-top: .75vh; padding-bottom: .75vh; }
+  .round4-v1-ribbon, .round4-aws-disclosure { padding-top: .4vh; padding-bottom: .4vh; }
+}
+.ringside-commentator { position: relative; z-index: 21; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: stretch; width: min(1240px, 92vw); margin-top: 1vh; border: 3px solid var(--blue-light); color: var(--cream); background: #02040e; box-shadow: .35em .35em #000; text-align: left; }
+.ringside-commentator > header { display: grid; grid-template-columns: 68px minmax(0, 1fr); grid-template-rows: auto auto; align-content: center; align-items: center; gap: .28em .7em; min-width: 185px; padding: .08em .9em; border-right: 3px solid #46527c; text-transform: uppercase; }
+.ringside-announcer { position: relative; grid-row: 1 / 3; display: block; width: 66px; height: 62px; color: transparent; image-rendering: pixelated; }
+/* The yellow keyline and its red/black offset shadows STAY. They are not
+   containment -- containment does not need a drop shadow. They are the same
+   badge chrome this app puts on every callout (.proof-state, .round4-header >
+   strong, .lane-rule span::before), the announcer is the one figure on screen
+   who should be badged like a broadcast caption, and the 66x62 box in the
+   header row is sized for the keyline plus the shadows.
+   The background fill is gone. That one WAS containment: a navy tile whose only
+   job was to sit behind a picture, invisible for as long as the sprite was
+   opaque. Now that the sprite's field is keyed out it would have started
+   painting a navy square inside the badge -- the exact tell the sprite was
+   drawn to remove -- so the bar's own #02040e shows through instead. */
+.ringside-announcer > img { position: absolute; top: 0; left: 0; width: 54px; height: 54px; border: 3px solid var(--yellow); box-shadow: 3px 3px 0 var(--red), 5px 5px 0 #000; image-rendering: pixelated; }
+.ringside-commentator > header strong { font-size: clamp(6px, .52vw, 10px); line-height: 1.35; }
+.ringside-announcer-tag { display: block; margin-top: .32em; color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(5px, .38vw, 7px); font-style: normal; font-weight: 900; line-height: 1.15; text-transform: uppercase; white-space: nowrap; }
+.ringside-commentator > header small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .55vw, 10px); font-weight: 900; line-height: 1.25; }
+.ringside-commentary { display: grid; align-content: center; gap: .45em; min-width: 0; padding: .65em 1em; font-family: ui-monospace, monospace; font-size: clamp(8px, .64vw, 12px); font-weight: 900; line-height: 1.3; }
+.ringside-commentary ul { display: grid; gap: .22em; margin: 0; padding: 0; list-style: none; }
+.ringside-commentary li::before { content: "> "; color: var(--yellow); }
+.ringside-commentary p { margin: 0; color: var(--yellow); }
+.ringside-commentary code { color: #6bf39a; font: inherit; overflow-wrap: anywhere; }
+/* Not an error and not styled like one: the calls below are still exact, some of
+   them just never arrived. Amber reads as "read this", which is the whole job. */
+.ringside-commentary code.ringside-missed-calls { color: var(--yellow); opacity: .82; }
+.ringside-commentator > button { min-width: 190px; min-height: 44px; padding: .8em 1em; border: 0; border-left: 3px solid var(--yellow); color: var(--yellow); background: #10183e; font-size: clamp(6px, .5vw, 10px); line-height: 1.35; text-transform: uppercase; }
+.ringside-commentator[data-open="false"],
+.round4-body > .ringside-commentator[data-open="false"],
+.between-screen .ringside-commentator[data-open="false"] { display: flex; width: fit-content; margin-right: auto; margin-left: auto; border-width: 2px; box-shadow: none; }
+.ringside-hidden-status { display: flex; align-items: center; padding: .7em 1em; border-right: 2px solid #46527c; color: #aeb9df; background: #050817; font-size: clamp(6px, .5vw, 10px); line-height: 1.35; text-transform: uppercase; white-space: nowrap; }
+.ringside-commentator[data-open="false"] > button { min-width: 0; min-height: 38px; padding: .7em 1em; border-left: 0; color: var(--yellow); background: #10183e; white-space: nowrap; }
+/* Narrow viewports cannot sit the announcer, the play-by-play and the toggle in
+   one row. The two outer tracks are `auto` carrying hard pixel floors -- 185px
+   on the header and 190px on the button, 165px each in the Round 4 cut -- so the
+   row asks for 375px of the 338px .between-screen has to give at 390px. The
+   screen is overflow: hidden, so the excess is clipped rather than scrolled and
+   the toggle becomes unreachable.
+   minmax(0, 1fr) on the middle track is NOT the fix here and was already
+   present: it had done its job, collapsing the play-by-play to 0px, and a
+   flexible track cannot absorb a sibling's pixel floor. Releasing the floors and
+   stacking is the answer .cooldown-match already gives at this breakpoint, and
+   700px is its breakpoint -- both live in .between-screen, so the screen's
+   narrow layout stays coherent. The dividers rotate with the axis rather than
+   disappearing, so the three parts still read as three parts.
+   Stacking a row usually costs height, and here it does not: releasing the two
+   pixel floors lets the play-by-play use the full 338px instead of ~0px, so the
+   bar measures 175px tall at 390x844 against the 230px the clipped row took. */
+@media (max-width: 700px) {
+  .ringside-commentator,
+  .round4-body > .ringside-commentator { grid-template-columns: minmax(0, 1fr); }
+  .ringside-commentator > header,
+  .round4-body > .ringside-commentator > header { min-width: 0; border-right: 0; border-bottom: 3px solid #46527c; }
+  .ringside-commentator > button,
+  .round4-body > .ringside-commentator > button { min-width: 0; border-top: 3px solid var(--yellow); border-left: 0; }
+  /* The collapsed pill is deliberately left alone. It is the same element on a
+     different display type -- display: flex, width: fit-content -- and it was
+     measured here too, in case two nowrap labels made a second overflow: with
+     the pixel font loaded, "Play-by-play hidden" plus "Select · Show
+     commentator" comes to 202px of the same 338px at 390px, and nothing is
+     clipped. Stacking it would only make a 42px pill 71px tall for no reason. */
+}
+
+/* Detail lives in the replay booth so the ring itself stays radically simple. */
+.replay-overlay { position: fixed; z-index: 42; inset: 0; display: grid; place-items: center; padding: 4vh 5vw; background: #02040ef2; }
+.replay-modal { display: grid; gap: 1.6vh; width: min(1260px, 92vw); max-height: 92vh; padding: 3vh 3vw; overflow: auto; border: clamp(6px, .65vw, 12px) solid var(--blue-light); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
+.replay-modal > header { display: flex; align-items: start; justify-content: space-between; gap: 2vw; }
+.replay-modal > header p { margin: 0 0 1em; color: var(--blue-light); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.replay-modal > header h2 { margin: 0; font-size: clamp(20px, 2.5vw, 48px); line-height: 1.2; text-shadow: .12em .12em #000; text-transform: uppercase; }
+.replay-modal > header > span { flex: none; padding: 1em; border: 3px solid #6bf39a; color: #6bf39a; font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.replay-lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2vw; }
+.replay-lanes article { --corner: var(--blue); position: relative; min-width: 0; padding: 1.2em 1.4em; border: 3px solid #46527c; background: #050817; box-shadow: inset .65em 0 var(--corner); }
+.replay-lanes article[data-corner="red"] { --corner: var(--red); }
+.replay-lanes article strong, .replay-lanes article b, .replay-lanes article span { display: block; }
+.replay-lanes article strong { color: var(--corner); font-size: clamp(7px, .65vw, 12px); text-transform: uppercase; }
+.replay-lanes article b { margin-top: .7em; color: var(--cream); font-size: clamp(18px, 2.1vw, 40px); }
+.replay-lanes article span, .replay-lanes article p { margin: .9em 0 0; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 900; line-height: 1.4; }
+.replay-lanes article p { padding-top: .8em; border-top: 2px solid #46527c; color: #ff9888; }
+.replay-steps { display: grid; gap: .65em; margin: 0; padding: 0; list-style: none; counter-reset: none; }
+.replay-steps > li { min-width: 0; border-left: .5em solid var(--yellow); color: var(--cream); background: #0a1130; }
+.replay-steps > li > button { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 1.2em; width: 100%; padding: .85em 1em; border: 0; color: inherit; background: transparent; text-align: left; }
+.replay-steps > li > button:hover, .replay-steps > li > button[aria-expanded="true"] { background: #151f4f; }
+.replay-steps > li > button > span { color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: clamp(6px, .52vw, 10px); }
+.replay-steps > li > button > strong { font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 14px); font-weight: 900; line-height: 1.4; }
+.replay-steps > li > button > small { color: var(--blue-light); font-size: clamp(5px, .42vw, 8px); text-transform: uppercase; white-space: nowrap; }
+.replay-call-panel { padding: .9em 1em 1em; border-top: 3px solid #46527c; background: #050817; }
+.replay-call-panel > header { display: flex; justify-content: space-between; gap: 1em; margin-bottom: .8em; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); text-transform: uppercase; }
+.replay-call-panel > header span { color: #aeb9df; }
+.replay-call-panel > div { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: .75em; align-items: start; }
+.replay-call-group { --corner: var(--blue); min-width: 0; padding: .8em; border: 2px solid #46527c; border-top: .45em solid var(--corner); background: #0a1130; }
+.replay-call-group[data-corner="red"] { --corner: var(--red); }
+.replay-call-group[data-corner="shared"] { --corner: var(--yellow); }
+.replay-call-group h3 { margin: 0 0 .8em; color: var(--corner); font-size: clamp(6px, .52vw, 10px); text-transform: uppercase; }
+.replay-call-group > div + div { margin-top: .75em; padding-top: .75em; border-top: 1px solid #46527c; }
+.replay-call-group span, .replay-call-group code, .replay-call-group p { display: block; }
+.replay-call-group span { color: #aeb9df; font-size: clamp(5px, .4vw, 8px); text-transform: uppercase; }
+.replay-call-group code { margin-top: .5em; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(7px, .58vw, 11px); font-weight: 900; line-height: 1.4; overflow-wrap: anywhere; white-space: pre-wrap; }
+.replay-call-group p { margin: .55em 0 0; color: #6bf39a; font-family: ui-monospace, monospace; font-size: clamp(6px, .5vw, 9px); font-weight: 800; line-height: 1.35; }
+.replay-facts { display: grid; grid-template-columns: 1.4fr .55fr 1fr; gap: 1vw; margin: 0; }
+.replay-facts div { min-width: 0; padding: 1em; border: 3px solid #46527c; background: #050817; }
+.replay-facts dt { color: var(--yellow); font-size: clamp(5px, .43vw, 8px); text-transform: uppercase; }
+.replay-facts dd { margin: .8em 0 0; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
+.replay-facts dd small { display: block; margin-top: .5em; color: #aeb9df; font-size: .82em; font-weight: 800; }
+.replay-close { padding: 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
+.cooldown-detail-lanes article span { color: #aeb9df; }
+.cooldown-detail-lanes article code { color: var(--cream); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+.cooldown-detail-lanes article p { color: #6bf39a; }
+
+/* Persona selection changes the AE's words, never the recorded proof. */
+.ringside-overlay { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 4vh 5vw; background: #02040eef; }
+.ringside-take { display: grid; grid-template-rows: auto auto auto 1fr auto; gap: 2vh; width: min(1320px, 90vw); max-height: 92vh; padding: 3vh 3vw; overflow: auto; border: clamp(6px, .65vw, 12px) solid var(--yellow); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
+.ringside-take > header { display: flex; align-items: start; justify-content: space-between; gap: 2vw; }
+.ringside-take > header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.ringside-take > header h2 { margin: 0; font-size: clamp(20px, 2.5vw, 48px); line-height: 1.2; text-shadow: .12em .12em #000; text-transform: uppercase; }
+.ringside-take > header > span { flex: none; padding: 1em; border: 3px solid #6bf39a; color: #6bf39a; font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.ringside-take nav { display: flex; gap: 1vw; }
+.ringside-take nav button { display: grid; grid-template-columns: clamp(40px, 3.8vw, 70px) auto; grid-template-rows: auto auto; align-items: center; min-width: 0; padding: .7em 1em; border: 3px solid #46527c; color: #aeb9df; background: #050817; text-align: left; text-transform: uppercase; }
+.ringside-take nav button[aria-pressed="true"] { border-color: var(--yellow); color: var(--cream); box-shadow: inset .55em 0 var(--red); }
+.ringside-take nav img { grid-row: 1 / 3; width: clamp(40px, 3.8vw, 70px); height: clamp(40px, 3.8vw, 70px); margin-right: 1em; image-rendering: pixelated; }
+.ringside-take nav span { color: var(--yellow); font-size: clamp(4px, .38vw, 7px); line-height: 1.35; }
+.ringside-take nav strong { font-size: clamp(6px, .55vw, 11px); line-height: 1.4; }
+.ringside-result { margin: 0; padding: 1.1em 1.3em; border-left: .7em solid var(--red); color: var(--cream); background: #050817; }
+.ringside-result span { color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.ringside-result p { margin: .8em 0 0; font-family: ui-monospace, monospace; font-size: clamp(9px, .85vw, 16px); font-weight: 900; line-height: 1.5; }
+.ringside-script { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2vw; }
+.ringside-script > div { min-width: 0; padding: 1.2em; border: 3px solid #46527c; background: #0a1130; }
+.ringside-script > div:first-child { grid-column: 1 / -1; }
+.ringside-script span { color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.ringside-script p { margin: .9em 0 0; font-family: ui-monospace, monospace; font-size: clamp(8px, .72vw, 14px); font-weight: 900; line-height: 1.45; }
+.ringside-script small { display: block; margin-top: 1em; padding-top: 1em; border-top: 2px solid #46527c; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; line-height: 1.45; }
+.ringside-script ul { display: grid; gap: .6em; margin: .9em 0 0; padding: 0; list-style: none; }
+.ringside-script li { font-family: ui-monospace, monospace; font-size: clamp(7px, .64vw, 12px); font-weight: 900; line-height: 1.4; }
+.ringside-script li strong { margin-right: .7em; color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: .72em; text-transform: uppercase; }
+.ringside-close { padding: 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
+
+/* The cost view behind "What it cost".
+   The panels inside it are the same disclosure components <RingsideTake>
+   carries, so this block styles only the frame and the idle strip above them.
+   Square corners and 3px keylines, like every other panel behind a click.
+   The strip's own subject is the lane that has no idle floor to descend into,
+   so the RDS article takes this app's amber warning keyline -- the same pair
+   (#ffb95c on #2a1704, #ffcf87 for the figure) that .towel-progress em and the
+   unavailable state already use, rather than a fifth palette. */
+.cost-room-overlay { position: fixed; z-index: 41; inset: 0; display: grid; place-items: center; padding: 3vh 4vw; background: #02040eef; }
+.cost-room { display: grid; gap: 1.6vh; width: min(1180px, 92vw); max-height: 94vh; padding: 2.4vh 2.6vw; overflow: auto; border: clamp(6px, .65vw, 12px) solid var(--yellow); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
+.cost-room > header { display: flex; align-items: start; justify-content: space-between; gap: 2vw; }
+.cost-room > header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.cost-room > header h2 { margin: 0; font-size: clamp(15px, 1.9vw, 34px); line-height: 1.2; text-shadow: .12em .12em #000; text-transform: uppercase; }
+.cost-room > header > span { flex: none; padding: 1em; border: 3px solid var(--blue-light); color: var(--cream); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.cost-room-idle { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1vw; }
+.cost-room-idle article { display: grid; align-content: start; gap: .7em; min-width: 0; padding: 1.1em; border: 3px solid #46527c; background: #050817; }
+.cost-room-idle strong { color: var(--cream); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; text-transform: uppercase; }
+.cost-room-idle span { color: #c5cdea; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 12px); font-weight: 900; line-height: 1.4; }
+.cost-room-idle b { color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(9px, .85vw, 16px); font-weight: 900; line-height: 1.35; }
+.cost-room-idle small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(6px, .52vw, 10px); font-weight: 900; line-height: 1.35; text-transform: uppercase; }
+.cost-room-idle article[data-lane="rds"] { border-color: #ffb95c; box-shadow: inset .55em 0 var(--red); }
+.cost-room-idle article[data-lane="rds"] b { color: #ffcf87; }
+.cost-room-unavailable { margin: 0; padding: 1em; border: 3px solid #ffb95c; color: #ffcf87; background: #2a1704; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; line-height: 1.45; }
+.cost-room-close { padding: 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
+.proof-cost, .round4-cost { border: 3px solid #ffb95c; color: #2a1704; background: #ffb95c; }
+.round4-cost { font-size: clamp(6px, .52vw, 10px); }
+
+/* A verified social receipt: exact run facts, never a manufactured benchmark claim. */
+.receipt-overlay { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 2vh 2vw; background: #02040ef5; }
+.receipt-modal { display: grid; grid-template-rows: auto minmax(0, 1fr) auto auto; gap: 1.3vh; width: min(1260px, 94vw); max-height: 96vh; padding: 2.2vh 2vw; overflow: auto; border: clamp(6px, .65vw, 12px) solid #6bf39a; color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
+.receipt-modal > header { display: flex; align-items: center; min-height: 3vh; }
+.receipt-modal > header h2 { margin: 0; font-size: clamp(15px, 1.45vw, 27px); line-height: 1.2; text-transform: uppercase; text-shadow: .12em .12em #000; }
+.receipt-poster { position: relative; display: grid; grid-template-rows: 17% 11% 34% 18% 20%; width: 100%; aspect-ratio: 1200 / 627; overflow: hidden; border: .9cqw solid var(--yellow); color: var(--cream); background: repeating-linear-gradient(90deg, #070b22 0 2.5cqw, #0a1030 2.5cqw 3.8cqw); box-shadow: inset 0 0 0 .4cqw var(--red), .75cqw .75cqw #000; container-type: inline-size; text-transform: uppercase; }
+.receipt-ticket-top { display: grid; grid-template-columns: minmax(0, 1fr) 26cqw; align-items: center; gap: 2cqw; padding: 1.1cqw 2cqw .6cqw; }
+.receipt-ticket-brand { display: flex; align-items: center; min-width: 0; text-transform: uppercase; }
+.receipt-ticket-brand > div strong, .receipt-ticket-brand > div span { display: block; }
+.receipt-ticket-brand > div strong { color: var(--cream); font-size: 2.35cqw; line-height: 1; text-shadow: .24cqw .24cqw var(--red); }
+.receipt-ticket-brand > div span { margin-top: 1cqw; color: var(--yellow); font-size: 1.05cqw; line-height: 1; }
+.receipt-verified-stamp { padding: 1.1cqw 1cqw; border: .4cqw solid #6bf39a; color: #6bf39a; background: #0a2c22; text-align: center; }
+.receipt-verified-stamp strong, .receipt-verified-stamp span { display: block; }
+.receipt-verified-stamp strong { font-size: 1.25cqw; }
+.receipt-verified-stamp span { margin-top: .8cqw; color: var(--cream); font-size: .66cqw; }
+.receipt-round-strip { display: grid; grid-template-columns: 13cqw 1fr auto; align-items: center; gap: 1.6cqw; padding: 0 2cqw; border-top: .35cqw solid var(--red); border-bottom: .35cqw solid var(--blue); background: #050817; }
+.receipt-round-strip strong { padding: .85cqw 1cqw; color: var(--cream); background: var(--red); font-size: 1.05cqw; text-align: center; }
+.receipt-round-strip span { min-width: 0; overflow: hidden; color: var(--cream); font-size: 1.55cqw; line-height: 1.15; text-overflow: ellipsis; white-space: nowrap; }
+.receipt-round-strip small { color: var(--yellow); font-size: .68cqw; }
+.receipt-preview-match { position: relative; display: grid; grid-template-columns: 1fr 1fr; min-height: 0; background: linear-gradient(90deg, #27132c 0 50%, #111e48 50% 100%); }
+.receipt-preview-match::before { content: ""; position: absolute; z-index: 0; inset: 21% 0 auto; height: .4cqw; background: var(--cream); box-shadow: 0 2.4cqw var(--yellow), 0 4.8cqw var(--blue); opacity: .14; }
+.receipt-preview-lane { --corner: var(--blue); position: relative; z-index: 1; display: grid; grid-template-columns: 8.5cqw minmax(0, 1fr); align-items: center; gap: 1.4cqw; min-width: 0; padding: 1.3cqw 2.1cqw 1cqw; border-top: .7cqw solid var(--corner); }
+.receipt-preview-lane[data-corner="red"] { --corner: var(--red); }
+.receipt-preview-lane[data-corner="blue"] { border-left: .3cqw solid var(--cream); }
+.receipt-preview-lane[data-winner="true"] { box-shadow: inset 0 0 0 .35cqw var(--yellow); }
+.receipt-preview-lane .database-fighter { width: 7.8cqw; height: 9.3cqw; margin: 0; }
+.receipt-preview-lane .fighter-crown, .receipt-preview-lane .fighter-glove { border-width: .35cqw; }
+.receipt-preview-lane .fighter-body { border-width: .4cqw; }
+.receipt-preview-lane .fighter-body span { font-size: .52cqw; }
+.receipt-preview-lane div { min-width: 0; }
+.receipt-preview-lane div strong, .receipt-preview-lane div b, .receipt-preview-lane div span { display: block; }
+.receipt-preview-lane div strong { max-width: 27cqw; color: var(--corner); font-size: 1.4cqw; line-height: 1.25; }
+.receipt-preview-lane div b { margin-top: 1.1cqw; color: var(--cream); font-size: 3.9cqw; line-height: 1; text-shadow: .25cqw .25cqw #000; white-space: nowrap; }
+.receipt-preview-lane[data-capability="true"] div b { font-size: 1.55cqw; line-height: 1.35; white-space: normal; }
+.receipt-preview-lane div span { margin-top: 1cqw; color: #aeb9df; font-family: ui-monospace, monospace; font-size: .72cqw; font-weight: 900; line-height: 1.3; }
+.receipt-preview-lane > em { position: absolute; top: .8cqw; right: 1cqw; padding: .65cqw .75cqw; color: var(--navy); background: var(--yellow); font-size: .65cqw; font-style: normal; }
+.receipt-preview-vs { position: absolute; z-index: 3; top: 50%; left: 50%; width: 5.4cqw; height: 5.4cqw; transform: translate(-50%, -50%) rotate(45deg); border: .5cqw solid var(--yellow); color: transparent; background: var(--red); box-shadow: .5cqw .5cqw #000; font-size: 0; }
+.receipt-preview-vs::after { content: "VS"; position: absolute; inset: 0; display: grid; place-items: center; transform: rotate(-45deg); transform-origin: center; color: var(--cream); font-size: 1.15cqw; line-height: 1; }
+.receipt-verdict { align-content: center; padding: 1.3cqw 2cqw; color: var(--navy); background: var(--yellow); box-shadow: inset -.75cqw -.75cqw var(--red); }
+.receipt-verdict span, .receipt-verdict strong, .receipt-verdict small { display: block; }
+.receipt-verdict span { font-size: .75cqw; }
+.receipt-verdict strong { margin-top: .9cqw; font-size: 2.05cqw; line-height: 1.2; }
+.receipt-verdict[data-width="medium"] strong { font-size: 1.75cqw; }
+.receipt-verdict[data-width="long"] strong { font-size: 1.42cqw; line-height: 1.3; }
+.receipt-verdict small { margin-top: .65cqw; font-family: ui-monospace, monospace; font-size: .58cqw; font-weight: 900; line-height: 1.25; overflow-wrap: anywhere; }
+.receipt-stub { display: grid; grid-template-columns: 1fr 27cqw; align-items: center; gap: 2cqw; min-height: 0; padding: 1.5cqw 2cqw 1.1cqw; border-top: .5cqw dotted var(--navy); color: var(--navy); background: var(--cream); }
+.receipt-stub > div { min-width: 0; }
+.receipt-stub > div strong { font-size: .65cqw; }
+.receipt-stub p { margin: .75cqw 0; font-size: .82cqw; line-height: 1.35; }
+.receipt-stub small { display: block; font-family: ui-monospace, monospace; font-size: .65cqw; font-weight: 900; overflow-wrap: anywhere; }
+.receipt-stub > b { padding: 1.2cqw .8cqw; border: .42cqw solid var(--red); color: var(--red); font-size: 1.05cqw; line-height: 1.3; text-align: center; }
+.receipt-stub > b span { display: block; margin-top: .75cqw; color: var(--navy); font-size: .75cqw; }
+.receipt-share-note { margin: 0; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .58vw, 11px); font-weight: 900; }
+.receipt-status { margin: 0; color: #6bf39a; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; }
+.receipt-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 1vw; }
+.receipt-actions button { min-height: clamp(44px, 4vw, 70px); padding: 0 1.4em; text-transform: uppercase; }
+.receipt-actions button:disabled { cursor: wait; filter: saturate(.45); opacity: .72; }
+.receipt-download { border: 4px solid var(--cream); color: var(--cream); background: #10183e; box-shadow: .4em .4em #000; }
+.receipt-linkedin { border: 4px solid #6bf39a; color: #081a10; background: #6bf39a; box-shadow: .4em .4em #000; }
+
+@media (max-width: 1000px) {
+  .receipt-modal { display: block; }
+  .receipt-modal > header, .receipt-poster, .receipt-actions { margin-bottom: 1.5vh; }
+}
+
+/* Between Rounds turns the scale-down wait into one defensible proof. */
+/* The frame is three stacked inset box-shadows on .retro-screen, so it occupies
+   no layout space at all: anything that reaches the edge paints straight over
+   the red and blue rules rather than being pushed off them. This screen used to
+   do exactly that. Its column asked for ~1110px at 1728x995 -- a 16" laptop, and
+   the viewport the reported screenshot was taken at -- so the SELECT row landed
+   inside the 34.56px outer rule and both primary buttons were clipped away
+   entirely by .retro-screen's overflow: hidden.
+   --frame-band restates the outermost rule's own thickness so the padding here
+   can reserve it, and the rhythm below is tuned to fit inside that reserve. The
+   space comes out of dead margins and generous padding first, so the type sizes,
+   3px-and-up keylines and colour voice all stay exactly as they were.
+   The vertical costs that had to become height-aware are the ones sized off
+   viewport WIDTH -- the clock, the sprite, the button heights. On a wide-short
+   viewport those grow while the height budget shrinks, which is the whole reason
+   this screen fit nowhere: it overran at 1024x634, 1440x900 and 1728x995 alike. */
+.between-screen { --frame-band: clamp(16px, 2vw, 40px); justify-content: flex-start; padding: max(6vh, calc(var(--frame-band) + 1vh)) max(6vw, calc(var(--frame-band) + 10px)) max(4vh, calc(var(--frame-band) + 8px)); }
+.between-screen > .pixel-kicker { margin: 0 0 .4vh; }
+.between-screen h1 { position: relative; z-index: 2; margin: .5vh 0 .5vh; color: var(--cream); font-size: clamp(25px, 3.1vw, 60px); line-height: 1.2; text-transform: uppercase; text-shadow: .12em .12em #000; }
+.between-rule { position: relative; z-index: 2; margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; }
+/* minmax(0, 1fr) rather than 1fr on the two lane tracks: a bare 1fr floors at
+   min-content, and the clock is one unbreakable 5-glyph token, so the widest
+   reading ("~7:06" at the 48px clamp floor) used to push the whole grid wider
+   than the screen and slide the left lane under the frame. */
+/* Widths are min(cap, 100%) rather than min(cap, 88vw): 88vw was measured against
+   the viewport while the column is laid out inside this screen's padding, so once
+   that padding reserves the frame band the two disagree and the row lands
+   off-centre -- at 390px it hung 5px from the right rule and 10px from the left.
+   100% is the same number as 88vw wherever the old 6vw padding still wins. */
+.cooldown-match { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr) clamp(70px, 8vw, 150px) minmax(0, 1fr); align-items: stretch; width: min(1400px, 100%); flex: 1 1 auto; margin: 3.2vh auto 2vh; }
+.cooldown-match > b { display: grid; place-items: center; color: var(--yellow); font-size: clamp(28px, 3vw, 58px); text-shadow: .13em .13em #000; }
+.cooldown-lane { --corner: var(--blue); display: grid; grid-template-rows: auto 1fr auto; place-items: center; min-width: 0; padding: 1.5vh 3vw; border: clamp(6px, .62vw, 12px) solid var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--corner), .65em .65em #000; }
+.cooldown-lane[data-corner="red"] { --corner: var(--red); }
+.cooldown-lane[data-state="confirmed_zero"] { border-color: #6bf39a; }
+.cooldown-name { display: flex; align-items: center; justify-content: center; gap: 1.5vw; text-transform: uppercase; }
+.cooldown-name .database-fighter { width: clamp(55px, 4.6vw, 90px); height: clamp(48px, min(5.5vw, 9vh), 108px); }
+.cooldown-name strong { max-width: 28vw; font-size: clamp(11px, 1.25vw, 24px); line-height: 1.35; overflow-wrap: anywhere; }
+/* The clock stays the hero and keeps its width-driven scale; min() only adds a
+   height ceiling so a short viewport cannot be handed a clock taller than the
+   room left for it. It is still the largest thing on the screen at every size. */
+.cooldown-time { align-self: center; min-width: 72%; padding: .28em .35em .22em; border: clamp(5px, .5vw, 10px) solid var(--cream); color: var(--yellow); background: #02040e; box-shadow: .16em .16em var(--corner), .28em .28em #000; font-size: clamp(48px, min(6.5vw, 8vh), 126px); font-variant-numeric: tabular-nums; line-height: 1; }
+.cooldown-time > span { display: block; }
+.cooldown-lag { display: block; margin-top: .8em; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-weight: 900; line-height: 1.4; white-space: normal; }
+.cooldown-lane[data-state="not_supported"] .cooldown-time { font-size: clamp(18px, 2vw, 38px); line-height: 1.35; }
+.cooldown-lane > p { align-self: end; min-height: 2.2em; margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; line-height: 1.4; }
+.between-policy-floor { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr); gap: .5vh; width: min(1160px, 100%); margin: .7vh auto 0; padding: .8vh 1.2vw; border-left: clamp(4px, .4vw, 7px) solid var(--yellow); color: #b7c2e7; background: rgba(16, 24, 62, .72); font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 12px); font-weight: 900; text-align: left; }
+.between-policy-floor span { color: var(--yellow); font-size: clamp(6px, .5vw, 10px); text-transform: uppercase; }
+/* The billed-floor line sits directly under the policy-floor line and shares its
+   metrics, so the two read as one disclosure in two beats: the gap is a vendor
+   floor, and that floor is charged. Cream keyline rather than yellow so the
+   second beat supports the first instead of competing with it. */
+.between-floor-cost { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr); gap: .5vh; width: min(1160px, 100%); margin: .5vh auto 0; padding: .8vh 1.2vw; border-left: clamp(4px, .4vw, 7px) solid var(--cream); color: #b7c2e7; background: rgba(16, 24, 62, .72); font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 12px); font-weight: 900; text-align: left; }
+.between-floor-cost span { color: var(--cream); font-size: clamp(6px, .5vw, 10px); text-transform: uppercase; }
+.between-status { position: relative; z-index: 2; margin: 0; color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 900; }
+.between-status[data-ready="true"] { color: #6bf39a; }
+/* Why a press did nothing. Carries an explicit line-height and max-width for the
+   reason set out above .card-actions: this slot is fed an operator sentence, not
+   a status token, and at the initial `normal` the second line lands on the first. */
+.between-refusal { position: relative; z-index: 2; max-width: min(900px, 92vw); margin: .9em auto 0; color: #ff9888; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 800; line-height: 1.45; text-align: center; overflow-wrap: anywhere; }
+.between-screen .ringside-commentator { flex: none; width: min(1400px, 100%); margin: .8vh auto 0; }
+/* The match is the one elastic item in the column, so it absorbs whatever the
+   fixed chrome above and below leaves instead of holding a min-height the
+   viewport cannot honour -- the old 42vh/50vh floors were what forced the tail of
+   the column onto the bottom rule. Its own floor is its content height, which is
+   deliberate: collapsing further would spill the two lanes over the commentator
+   rather than keeping the overflow honest. */
+.between-screen:has(.ringside-commentator) .cooldown-match { margin-top: 1.2vh; margin-bottom: .8vh; }
+.between-actions { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1vh; width: min(1160px, 100%); margin: 1.4vh auto 0; }
+.between-tools, .between-main-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.2vw; }
+.between-tools button { min-height: clamp(34px, min(3.3vw, 5.2vh), 58px); padding: 0 1.6em; font-size: clamp(6px, .55vw, 11px); }
+.between-main-actions button { min-width: min(330px, 38vw); min-height: clamp(38px, min(3.8vw, 6vh), 66px); padding: 0 2em; }
+/* Narrow viewports cannot sit the two lanes side by side. The clock is one
+   unbreakable 5-glyph token held at a 48px floor, so a half-width lane offers
+   ~99px of content box for ~250px of clock, and the left lane used to slide out
+   under the frame's side rules. Stacking is the same answer .capacity-lanes and
+   .standing-cost-lanes already give at this breakpoint. */
+@media (max-width: 700px) {
+  .cooldown-match { grid-template-columns: minmax(0, 1fr); }
+  .cooldown-match > b { padding: .5vh 0; font-size: clamp(20px, 6vw, 34px); }
+}
+.between-scorecard { border: 4px solid var(--cream); color: var(--cream); background: #10183e; box-shadow: .4em .4em #000; text-transform: uppercase; }
+.between-details { border: 4px solid var(--blue-light); color: var(--blue-light); background: #10183e; box-shadow: .4em .4em #000; text-transform: uppercase; }
+.between-share { border: 4px solid #6bf39a; color: #081a10; background: #6bf39a; box-shadow: .4em .4em #000; text-transform: uppercase; }
+
+/* Final scorecard. The screen's other classes carry no rules of their own and
+   ride on .retro-screen; this row exists so the credits entry sits beside the
+   exit instead of stacking under it.
+   .scorecard-back carries no padding rule and renders at the user agent's default
+   button metrics. The credits entry is sized down to match it, rather than both
+   being scaled up to match the entry: that keeps an existing, already-reviewed
+   control pixel-identical to what it was before this change. */
+.scorecard-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: .9vw; }
+.scorecard-actions > .credits-entry { padding: 1px 6px; font-size: clamp(6px, .62vw, 12px); letter-spacing: normal; text-transform: none; }
+/* The staff-roll entry used to have its bottom border cut off by the fold at
+   1440x900. The cause is structural, not a sizing mistake in the control: the
+   list is the only part of this screen that grows without bound -- one row per
+   completed bout -- while .retro-screen centres its column inside a fixed,
+   overflow:hidden viewport, so a long card pushes the actions row off the
+   bottom and the screen clips it.
+   The list absorbs the overflow instead. min-height:0 is what lets a flex item
+   shrink past its own content, and the screen takes padding so the row clears
+   .retro-screen's inset frame (up to 40px) rather than sitting on it.
+   Deliberately nothing here resizes .scorecard-back or the entry: those two
+   were matched to each other on purpose and stay pixel-identical. */
+.scorecard-screen { padding: clamp(18px, 2.6vh, 34px) clamp(22px, 2.6vw, 48px); }
+.scorecard-list { flex: 0 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-color: #46527c var(--navy); }
+/* A round with no opponent lane says so on its own row. It reads as a caveat
+   rather than a result -- yellow on the row's own dark ground, the same voice
+   the rest of the app uses for "this is a limit, not an outcome" -- because the
+   thing it corrects is an audience reading a blank as a missing number.
+   The ground is declared here rather than inherited so the ratio does not move
+   with whatever the row sits on: var(--yellow) on #10152f measures 12.3:1. */
+.scorecard-gap { margin: .6em 0 0; padding: .7em .85em; border-left: clamp(3px, .3vw, 6px) solid var(--yellow); color: var(--yellow); background: #10152f; font-size: clamp(6px, .58vw, 11px); line-height: 1.5; text-transform: none; }
+
+/* The final card is a ledger: six rows in one column, four aligned fields each,
+   with the verdict last. Ported from the approved `B-the-ledger.html`.
+   
+   The layout it replaced was six cards in a 3x2 grid, which had room for the
+   round and its proof and nowhere to put a result -- so the screen described the
+   product six times and never said who won any of it.
+
+   Two rules the mockup settled and this keeps. Chroma comes off the large type
+   and stays on the accent rail and the round chip: six statements in six
+   different hues at one weight spreads them across a luminance range and makes
+   the set harder to read than any single line in it. And the accent moves from
+   each card's top edge to the row's left edge, so the six rules stack into one
+   rail reading red, blue, yellow, red, blue, yellow down the screen. The
+   accent-to-round mapping is unchanged from FINALE_BEATS. */
+.finale-screen { justify-content: center; gap: clamp(10px, 1.5vh, 18px); padding: clamp(24px, 3.2vh, 38px) 4vw clamp(18px, 2.4vh, 28px); background: radial-gradient(circle at 50% 8%, #17214c 0, var(--navy) 44%, #040713 100%); }
+.finale-header { position: relative; z-index: 6; display: flex; align-items: center; justify-content: space-between; gap: 3vw; width: min(1520px, 92vw); text-align: left; text-transform: uppercase; }
+.finale-header > div { min-width: 0; }
+.finale-header p { margin: 0 0 .8em; color: var(--yellow); font-size: clamp(8px, .62vw, 11px); letter-spacing: .1em; }
+.finale-header h1 { margin: 0; color: var(--cream); font-size: clamp(28px, 3.5vw, 65px); line-height: 1.08; text-shadow: .1em .1em var(--red); }
+/* Direct child only: the corner plates carry their own spans. Kept at the size
+   it has always been -- it is the one full sentence on the screen and it sits
+   under 60px type, which is exactly where shrinking it stops being density and
+   starts being unreadable. */
+.finale-header > div > span { display: block; margin-top: 1em; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(9px, .82vw, 15px); font-weight: 900; line-height: 1.4; text-transform: none; }
+.finale-bill { display: flex; flex: none; align-items: center; gap: clamp(10px, 1.2vw, 20px); }
+.finale-bill strong { flex: none; padding: 1.2em 1.35em; border: clamp(3px, .3vw, 6px) solid #6bf39a; color: #6bf39a; background: #0a2c22; box-shadow: .35em .35em #000; font-size: clamp(7px, .62vw, 12px); }
+/* The fight card's own identity plates, same chips and same corner rules, so
+   the ledger and the card read as one production. */
+.finale-corners { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.finale-corners li { display: flex; align-items: center; gap: .7em; padding: clamp(4px, .45vw, 8px) clamp(7px, .8vw, 13px); background: rgba(7, 11, 34, .82); font-size: clamp(7px, .58vw, 11px); letter-spacing: .1em; }
+.finale-corners li[data-corner="red"] { box-shadow: inset 0 3px var(--red); }
+.finale-corners li[data-corner="blue"] { box-shadow: inset 0 3px var(--blue); }
+.finale-corners li > b { flex: none; padding: .25em .5em; color: var(--cream); font-weight: 400; }
+.finale-corners li[data-corner="red"] > b { background: var(--red); }
+.finale-corners li[data-corner="blue"] > b { background: var(--blue); }
+.finale-corners li > span { color: var(--cream); }
+.finale-grid { position: relative; z-index: 6; display: grid; flex: 0 1 auto; grid-template-columns: minmax(0, 1fr); grid-template-rows: repeat(6, minmax(0, auto)); gap: clamp(5px, .55vh, 9px); width: min(1520px, 92vw); min-height: 0; }
+.finale-beat { --finale-accent: var(--yellow); display: grid; grid-template-columns: minmax(0, 15em) minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 11em); grid-template-rows: auto; align-items: center; column-gap: clamp(13px, 1.7vw, 32px); min-width: 0; min-height: 0; padding: clamp(9px, 1.05vh, 17px) clamp(13px, 1.4vw, 24px); border: 2px solid #46527c; color: var(--cream); background: #0b1230; box-shadow: inset clamp(7px, .7vw, 13px) 0 var(--finale-accent), .3em .3em #000; text-align: left; }
+.finale-beat[data-accent="red"] { --finale-accent: var(--red); }
+.finale-beat[data-accent="blue"] { --finale-accent: var(--blue-light); }
+.finale-beat header { display: flex; align-items: center; gap: 1em; padding-left: clamp(5px, .55vw, 10px); text-transform: uppercase; }
+.finale-beat header span { display: grid; flex: none; place-items: center; width: 3.6em; height: 3.6em; color: var(--navy); background: var(--finale-accent); font-size: clamp(7px, .6vw, 11px); }
+.finale-beat header strong { color: var(--cream); font-size: clamp(8px, .74vw, 13px); line-height: 1.35; }
+.finale-beat h2 { align-self: center; margin: 0; color: var(--cream); font-size: clamp(11px, 1vw, 18px); line-height: 1.35; text-transform: none; text-shadow: .09em .09em #000; }
+.finale-beat p { align-self: center; min-height: 0; margin: 0; padding: .1em 0 .1em clamp(13px, 1.5vw, 26px); border-left: 2px solid #46527c; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(9px, .74vw, 13px); font-weight: 900; line-height: 1.45; }
+/* The lane fact that qualifies a verdict. Its own line and its own colour so it
+   never reads as another clause of the proof above it. */
+.finale-beat p em { display: block; margin-top: .5em; color: var(--yellow); font-size: .88em; font-style: normal; letter-spacing: .04em; text-transform: uppercase; }
+/* The fourth field: who took the round, and the one figure behind it. Same rule
+   and spacing as the third, so it reads as another aligned column rather than a
+   panel bolted on. Nothing in here is a sentence. */
+.finale-win { align-self: center; display: grid; gap: .32em; justify-items: end; padding: .1em 0 .1em clamp(13px, 1.5vw, 26px); border-left: 2px solid #46527c; text-align: right; }
+.finale-win b { display: flex; align-items: center; gap: .6em; color: var(--cream); font-weight: 400; font-size: clamp(11px, .86vw, 15px); line-height: 1.3; text-shadow: .09em .09em #000; }
+/* The winner's own chip, the fight card's again. Red because the only corner
+   that takes a round on this card is the red one. */
+.finale-win b span { flex: none; padding: .25em .45em; color: var(--cream); background: var(--red); text-shadow: none; }
+/* One constant colour for all six figures, deliberately NOT the row accent: the
+   rail swings red/blue/yellow down the screen, and putting that on the numbers
+   would spread them across a luminance range at identical weight -- the exact
+   fault that was taken off the six statements. The rail keeps the chroma. */
+.finale-win i { color: var(--yellow); font-size: clamp(11px, .86vw, 15px); font-style: normal; line-height: 1.3; }
+/* One token, never a clause: what qualifies the win, and the day a standing
+   result was sealed when it was not sealed today. */
+.finale-win u { color: #9aa6d0; font-size: clamp(9px, .74vw, 13px); line-height: 1.35; letter-spacing: .04em; text-decoration: none; }
+/* The round just run, lit. One row, and only ever the row whose figure this
+   room watched being produced. */
+.finale-beat[data-latest="true"] { background: #121c48; border-color: #7b8bc4; }
+/* A round with no winner states that and stops. Dimmed rather than struck
+   through or blanked: an empty cell reads as a number somebody lost. */
+.finale-beat[data-status="unrun"], .finale-beat[data-status="reading"] { background: #080d24; }
+.finale-beat[data-status="unrun"] .finale-win b,
+.finale-beat[data-status="reading"] .finale-win b,
+.finale-beat[data-status="abandoned"] .finale-win b,
+.finale-beat[data-status="no_result"] .finale-win b { color: #8e9ac6; font-size: clamp(9px, .74vw, 13px); text-shadow: none; }
+.finale-footer { position: relative; z-index: 6; display: flex; align-items: center; justify-content: flex-end; gap: clamp(8px, 1vh, 12px) 2vw; width: min(1520px, 92vw); }
+.finale-share-status { margin: 0; color: #6bf39a; font-family: ui-monospace, monospace; font-size: clamp(9px, .74vw, 13px); font-weight: 900; text-align: left; }
+/* The buttons keep their intrinsic width: no shrinking, so a label never breaks
+   mid-phrase, and a viewport too narrow for all three drops one to a second
+   line instead. */
+.finale-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 1vw; }
+.finale-actions button { flex: 0 0 auto; min-height: clamp(46px, 4vw, 66px); padding: 0 1.5em; text-transform: uppercase; }
+.finale-share { border: 4px solid #6bf39a; color: #081a10; background: #6bf39a; box-shadow: .4em .4em #000; }
+.finale-share:disabled { cursor: wait; filter: saturate(.45); opacity: .72; }
+.finale-summary { border: 3px solid #46527c; color: var(--cream); background: var(--navy); box-shadow: .4em .4em #000; }
+.finale-summary:hover, .finale-summary:focus-visible { background: #151e48; }
+@media (max-height: 920px) {
+  .finale-screen { gap: 9px; padding-top: 20px; padding-bottom: 14px; }
+  .finale-header p { margin-bottom: .55em; }
+  .finale-header > div > span { margin-top: .65em; }
+  .finale-beat { padding-top: 8px; padding-bottom: 8px; }
+  .finale-beat h2 { margin: 0; }
+  .finale-beat p { padding-top: .1em; }
+  .finale-actions button { min-height: 46px; }
+}
+
+.cooldown-proof-rules { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1vw; margin: 0; padding: 0; list-style: none; }
+.cooldown-proof-rules li { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 1em; min-width: 0; padding: .85em 1em; border: 2px solid #46527c; background: #050817; }
+.cooldown-proof-rules li > span { display: grid; place-items: center; width: 3.2em; height: 3.2em; color: var(--navy); background: var(--yellow); font-size: clamp(6px, .5vw, 10px); }
+.cooldown-proof-rules div, .cooldown-proof-rules strong, .cooldown-proof-rules small { display: block; min-width: 0; }
+.cooldown-proof-rules strong { color: var(--cream); font-size: clamp(6px, .55vw, 11px); line-height: 1.3; text-transform: uppercase; }
+.cooldown-proof-rules small { margin-top: .7em; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .58vw, 11px); font-weight: 900; line-height: 1.3; }
+
+@media (max-aspect-ratio: 4/3) {
+  .persona-card small { margin-top: .35em; font-size: clamp(4px, .34vw, 6px); white-space: normal; }
+  .persona-card .persona-pain { -webkit-line-clamp: 2; margin-top: .45em; font-size: clamp(4px, .3vw, 6px); }
+  .card-matchup > div > strong { white-space: normal; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+/* Configured compute, behind a click.
+   Both this block and .cost-receipt-disclosure were first written against a
+   light surface, then hung inside .ringside-take, which is navy (#10183e) with
+   cream text. Every colour here is therefore toned for a dark surface, on the
+   conventions .ringside-script sets one block up: cream carries a value,
+   #aeb9df carries secondary prose, and the yellow is reserved for labels.
+   The dark-on-light palette this used to draw from -- #49616b, #62747b,
+   #334d58, #0c232d and the rgba(12, 35, 45, x) tints -- lands between 1.06:1
+   and 3.52:1 against that navy, so it is not used on this surface at all.
+   That colour pass deliberately left widths and metrics alone and changed only
+   colours. The type contract below is the later change that did move metrics.
+
+   TYPE CONTRACT FOR ALL THREE DISCLOSURES. Same click, same surface, so one
+   contract, applied by role rather than by panel:
+
+     Label voice  -- "Press Start 2P" (the :root face), uppercase, short. Panel
+                     summaries, lane names, scope headings, status and basis
+                     chips. Anything colour-coded or enumerable.
+     Reading voice -- ui-monospace at weight 900, the treatment .ringside-script
+                     sets one block up for prose. Sentences, source citations
+                     and derivations. Numbers additionally take tabular-nums so
+                     dollar columns line up on the decimal.
+
+   This block and the pricing receipt below declared no font-family at all, so
+   their prose and their dollar figures fell through to the :root display face
+   at the :root 16px -- a 150-character source citation set in an 8x8 arcade
+   font. The return-to-idle panel between them already had the reading voice and
+   was the only one of the three that read as prose, so the other two are
+   brought to it rather than it being flattened to them. What was genuinely
+   mixed up is which voice each ELEMENT takes, not which panel it lives in.
+
+   FRAME CONTRACT FOR ALL THREE DISCLOSURES. 3px square, matching the panel
+   frames these sit beside inside the same overlay.
+
+   Two of the three carried border-radius: 8px, which is a modern-web idiom and
+   wrong here -- the app is an 8-bit tribute, sets image-rendering: pixelated on
+   its sprites, and forces border-radius: 0 onto the one control class that
+   would otherwise inherit rounding from the user agent. Square is not a
+   preference on this surface, it is the house style, and the one panel that
+   already had square corners was the correct one.
+
+   The width is 3px rather than either of the two values in play, because this
+   overlay already has a border vocabulary and neither 1px nor 2px was the
+   panel-frame entry in it. All of these are the same #46527c on the same navy:
+
+     1px  row rule inside a panel   -- the receipt's line-item separator
+     2px  divider inside a panel    -- .ringside-script small's top rule
+     3px  PANEL FRAME               -- .ringside-script > div, .ringside-take
+                                      nav button, i.e. the boxes these three
+                                      sit directly beside
+     4-5px  accent edge             -- the lane cards' top bars, the receipt
+                                      status block's left bar
+     6-12px yellow                  -- the overlay's own outer frame
+
+   So 1px was the row-rule weight and 2px the internal-divider weight, both of
+   them reading as something nested rather than as a frame, and the 1px pair
+   were additionally the thinnest borders in the stylesheet. 3px is the weight
+   every other peer box in this overlay already uses, and is the most common
+   border width in the file.
+
+   Selector names for the sibling panels are deliberately spelled out only in
+   their own blocks below: descent-cost.test.tsx scopes its audit by slicing
+   this file between the first mention of each, and naming them up here would
+   silently move where that audit starts. */
+.capacity-disclosure {
+  border: 3px solid #46527c;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+/* Same affordance as the other two summaries, so the same label voice. The
+   font-weight: 800 that used to sit here bought nothing: the face has one
+   weight and :root sets font-synthesis: none. */
+.capacity-disclosure summary {
+  color: var(--yellow);
+  cursor: pointer;
+  font-size: clamp(5px, .45vw, 9px);
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.capacity-disclosure > p {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: clamp(7px, .6vw, 11px);
+  font-weight: 900;
+  line-height: 1.45;
+  margin: 10px 0 0;
+}
+
+.capacity-lanes {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.capacity-lanes > article {
+  background: var(--navy);
+  border-top: 4px solid var(--steel);
+  color: #c7d2f5;
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+}
+
+.capacity-lanes > article[data-corner="red"] { border-top-color: var(--red); }
+.capacity-lanes > article[data-corner="blue"] { border-top-color: var(--blue); }
+
+/* The label voice sets a line-height wherever it can wrap. "Press Start 2P" is
+   an 8x8 face whose normal line-height leaves almost no leading, so a lane name
+   or a chip that runs onto a second line lands on top of the first. That is
+   visible at 390px on every one of these panels and is the reason each label
+   rule below carries one. */
+.capacity-lanes strong {
+  color: var(--cream);
+  font-size: 11px;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+/* The configured ceiling, read against its opposite number one column over. */
+.capacity-lanes b {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.capacity-lanes span {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+/* Label voice, unlike .descent-cost-lanes em. This is the basis chip: three
+   fixed short states, colour-coded by data-basis below. Its opposite number in
+   the descent panel is a written-out reason, which is why that one reads as
+   prose and this one does not. */
+.capacity-lanes em {
+  color: var(--steel);
+  font-size: 9px;
+  font-style: normal;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.capacity-lanes em[data-basis="observed"] { color: #6bf39a; }
+.capacity-lanes em[data-basis="unreported"] { color: var(--yellow); }
+
+/* Cost of returning to idle. Structurally a sibling of .capacity-disclosure --
+   same overlay, same kind of challenge answered behind the same click -- but the
+   prose colours follow .ringside-script rather than that block. The disclosure
+   renders inside .ringside-take, which is navy with cream text, so this panel is
+   toned for a dark surface. */
+.descent-cost-disclosure {
+  border: 3px solid #46527c;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.descent-cost-disclosure summary {
+  color: var(--yellow);
+  cursor: pointer;
+  font-size: clamp(5px, .45vw, 9px);
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.descent-cost-disclosure > p {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: clamp(7px, .6vw, 11px);
+  font-weight: 900;
+  line-height: 1.45;
+  margin: 10px 0 0;
+}
+
+.descent-cost-summary {
+  color: var(--cream);
+  font-size: clamp(8px, .72vw, 14px);
+}
+
+/* The measured reading, and the one line of this panel a hostile reader goes to
+   first, so it takes the cream a claim carries elsewhere on this surface rather
+   than the step-back prose colour the note below it keeps. It carries a decimal
+   count of seconds and a percentage, so tabular figures line them up. */
+.descent-cost-measured {
+  color: var(--cream);
+  font-variant-numeric: tabular-nums;
+}
+
+.descent-cost-lanes {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.descent-cost-lanes > article {
+  background: #050817;
+  border-top: 4px solid var(--steel);
+  color: #c7d2f5;
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px;
+}
+
+.descent-cost-lanes > article[data-corner="red"] { border-top-color: var(--red); }
+.descent-cost-lanes > article[data-corner="blue"] { border-top-color: var(--blue); }
+
+.descent-cost-lanes strong {
+  color: var(--cream);
+  font-size: 11px;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.descent-cost-lanes b {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.descent-cost-lanes span {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+/* The derivation is the whole point of opening this panel, so it is legible
+   rather than a footnote. */
+.descent-cost-lanes code {
+  color: #e4ecff;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* A band is only honest if the reason it is wide sits next to it, so this is
+   given the warning colour rather than being greyed out. Reading voice: this is
+   two or three written-out sentences, not a chip. */
+.descent-cost-lanes em {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
+/* Source citation, so reading voice, and it carries machine tokens: the rate
+   source names system.billing.list_prices in full. At 390px that single
+   unbreakable 26-character token set in the display face measured 234px of
+   min-content inside a 140px lane and spilled 105px across its neighbour, so it
+   wraps anywhere, exactly as the derivation above it already does. */
+.descent-cost-lanes small {
+  color: var(--steel);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  text-transform: uppercase;
+}
+
+.descent-cost-lanes > article[data-descends="false"] b { color: #ff9d6b; }
+
+/* Pricing receipt. Same surface, same conventions, same history as
+   .capacity-disclosure above -- see the note there. */
+.cost-receipt-disclosure {
+  border: 3px solid #46527c;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.cost-receipt-disclosure summary {
+  color: var(--yellow);
+  cursor: pointer;
+  font-size: clamp(5px, .45vw, 9px);
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.cost-receipt-disclosure > p {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: clamp(7px, .6vw, 11px);
+  font-weight: 900;
+  line-height: 1.45;
+  margin: 10px 0 0;
+}
+
+.cost-receipt-status {
+  align-items: center;
+  background: #10183e;
+  border-left: 5px solid var(--yellow);
+  color: #c7d2f5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 10px;
+  padding: 8px 10px;
+}
+
+/* The panel's lead: whether these figures are estimates or posted usage. It
+   keeps the display face and its inherited size, because that distinction is
+   the first thing the panel has to say. */
+.cost-receipt-status strong {
+  color: var(--yellow);
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.cost-receipt-status span {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+.cost-receipt-status[data-status="posted_through_window"],
+.cost-receipt-status[data-status="reconciled"] { border-color: #6bf39a; }
+.cost-receipt-status[data-status="posted_through_window"] strong,
+.cost-receipt-status[data-status="reconciled"] strong { color: #6bf39a; }
+.cost-receipt-status[data-status="attribution_ambiguous"],
+.cost-receipt-status[data-status="unavailable"] { border-color: var(--red); }
+
+.cost-receipt-totals {
+  display: grid;
+  gap: 6px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 8px;
+}
+
+.cost-receipt-totals > div {
+  background: #050817;
+  border-top: 3px solid #46527c;
+  display: grid;
+  gap: 4px;
+  padding: 7px 8px;
+}
+
+.cost-receipt-totals span,
+.cost-receipt-math span {
+  color: #aeb9df;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.cost-receipt-totals strong {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+}
+
+.cost-receipt-math {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 8px;
+}
+
+/* Original, posted and variance are the three figures the panel exists to
+   show. At #0c232d they measured 1.06:1 against the navy -- present in the DOM
+   and invisible on screen -- so they take the cream a value carries anywhere
+   else on this surface, leaving their labels a step back at #aeb9df.
+   Three figures meant to be read against each other, so tabular figures. */
+.cost-receipt-math strong {
+  color: var(--cream);
+  font-family: ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.cost-receipt-scope { margin-top: 10px; }
+.cost-receipt-scope h4 {
+  color: var(--yellow);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0;
+  text-transform: uppercase;
+}
+
+.cost-receipt-lines {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.cost-receipt-lines > div {
+  align-items: baseline;
+  border-top: 1px solid #46527c;
+  display: grid;
+  gap: 2px 12px;
+  grid-template-columns: minmax(180px, 1fr) minmax(180px, auto);
+  padding-top: 6px;
+}
+
+/* Component names carry machine identifiers -- db.t4g.micro, gp3 -- so they
+   keep their case and take the reading voice rather than an uppercased chip. */
+.cost-receipt-lines strong {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* The arithmetic column: quantity x rate = subtotal, one row per line item,
+   read down the column. This is the strongest case for tabular figures in the
+   three panels, and it was the one place that had neither them nor a monospace
+   face. Right-aligned, so the decimals stack. */
+.cost-receipt-lines span {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.cost-receipt-lines small {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 900;
+  grid-column: 1 / -1;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* Standing versus marginal cost. Fourth panel in the same overlay, so it takes
+   the same frame, the same two voices and the same dark-surface toning as the
+   three above -- see the note above .capacity-disclosure for why 3px and why
+   square. Sibling selector names are again left unspelled here on purpose: two
+   of the guard tests scope themselves by slicing this file at the first mention
+   of a panel class, and naming one in a comment moves where they start. */
+.standing-cost-disclosure {
+  border: 3px solid #46527c;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.standing-cost-disclosure summary {
+  color: var(--yellow);
+  cursor: pointer;
+  font-size: clamp(5px, .45vw, 9px);
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.standing-cost-disclosure > p {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: clamp(7px, .6vw, 11px);
+  font-weight: 900;
+  line-height: 1.45;
+  margin: 10px 0 0;
+}
+
+.standing-cost-summary {
+  color: var(--cream);
+  font-size: clamp(8px, .72vw, 14px);
+}
+
+/* The two totals, side by side. They are the same arithmetic over two different
+   scopes and the difference between them is the whole point, so they sit
+   adjacent rather than stacked with prose between them. */
+.standing-cost-totals {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.standing-cost-totals > article {
+  background: #050817;
+  border-top: 4px solid var(--yellow);
+  color: #c7d2f5;
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px;
+}
+
+/* A partial total is the one an audience must not read as complete, so it takes
+   the warning border rather than a footnote below the figure. */
+.standing-cost-totals > article[data-partial="true"] { border-top-color: #ff9d6b; }
+
+.standing-cost-totals strong {
+  color: var(--cream);
+  font-size: 11px;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.standing-cost-totals b {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* The condition, which may never be separated from the figure above it. Same
+   reading voice as the lane caveats for the same reason. */
+.standing-cost-totals em {
+  color: #c7d2f5;
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
+.standing-cost-totals small {
+  color: #ff9d6b;
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* Two columns at the wide breakpoint -- six across would be 60px each -- and one
+   on the same breakpoint the other grids use. This rule now dresses two grids:
+   the three named engines, and the three inside the remainder below. Same rule
+   on purpose, so a lane does not look like weaker evidence for being one click
+   further in, and so every overflow-wrap guard on the children keeps applying to
+   both. minmax(0, 1fr) rather than 1fr because these columns carry
+   system.billing.usage and a full Price List API URL, and an implicit auto track
+   would take min-content from the longest of them and push the grid wider than
+   the panel. */
+.standing-cost-lanes {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.standing-cost-lanes > article {
+  background: #050817;
+  border-top: 4px solid var(--steel);
+  color: #c7d2f5;
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px;
+}
+
+/* Whose lane it is, not which corner won. The neutral runner keeps the default
+   steel because it belongs to neither side, which is the reason it is a lane of
+   its own. */
+.standing-cost-lanes > article[data-side="lakebase"] { border-top-color: var(--red); }
+.standing-cost-lanes > article[data-side="platform"] { border-top-color: var(--red); }
+.standing-cost-lanes > article[data-side="competitor"] { border-top-color: var(--blue); }
+
+.standing-cost-lanes strong {
+  color: var(--cream);
+  font-size: 11px;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+/* The lane's own figure, in the headline slot its opposite numbers give theirs.
+   It is never a bare amount: a structural zero arrives with its basis already
+   inside the string, so this box has to hold a sentence as readily as a number
+   and wraps rather than clipping. */
+.standing-cost-lanes b {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* What the lane does when idle -- the axis the panel is organised around, and
+   the sentence that stops the figure above being read as a rate. */
+.standing-cost-lanes span {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.standing-cost-lanes code {
+  color: #e4ecff;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* The qualifier that keeps each figure honest, so it sits next to the figure in
+   the warning colour rather than being greyed out. Reading voice, like its
+   opposite numbers: this is written-out sentences, not a chip. */
+.standing-cost-lanes em {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
+/* Carries system.billing.usage in full, a 26-character unbreakable token in a
+   column narrower than the two-lane panels', so it wraps anywhere for the same
+   reason its opposite number does. */
+.standing-cost-lanes small {
+  color: var(--steel);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  text-transform: uppercase;
+}
+
+/* A lane that could not be priced is the one an audience must not read as a
+   small number, so its figure takes the warning colour the never-sleeps lane
+   used to. It renders the word, never an amount. */
+.standing-cost-lanes > article[data-evidence="unpriced"] b { color: #ff9d6b; }
+
+/* The rest of the total, one click further in. It is framed like its parent --
+   3px, square, the same navy keyline -- rather than tucked in, because it is the
+   reconciliation for the three lanes above it and a reader who cannot find it
+   cannot check either total. Nothing here is sized off viewport width in a
+   direction that costs height: the type inherits the panel's own clamps and the
+   only vertical values are the fixed paddings its siblings use, so opening it on
+   a wide-short viewport adds exactly the height of its own content. */
+.standing-cost-remainder {
+  border: 3px solid #46527c;
+  margin-top: 10px;
+  padding: 8px 10px;
+}
+
+/* The label inherits its colour, size and case from `.standing-cost-disclosure
+   summary`, which is a descendant rule and already covers this one; the only
+   thing it does not cover is that this summary is a sentence rather than a
+   phrase and names three products after it. At the 390px collapse that is four
+   lines, and a lane name is the one token in it that cannot be hyphenated. */
+.standing-cost-remainder > summary { overflow-wrap: anywhere; }
+
+/* The paragraph that says what the door is for. `.standing-cost-disclosure > p`
+   is a direct-child rule and deliberately not loosened to a descendant one --
+   that rule sets the panel's paragraph rhythm and would then also claim this
+   one -- so the voice is restated here instead. */
+.standing-cost-remainder > p {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: clamp(7px, .6vw, 11px);
+  font-weight: 900;
+  line-height: 1.45;
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+/* The accrued snapshot and the posted comparison. Both are step-back prose in
+   the panel's own paragraph colour; neither is a claim the panel leads with. */
+.standing-cost-credits,
+.standing-cost-posted,
+.standing-cost-origin,
+.standing-cost-unreadable { overflow-wrap: anywhere; }
+
+/* Drift is never summed into the totals above, so it is toned apart from them
+   rather than styled as one more figure. Unexpected accrual is the state that
+   wants an operator's eye; a holding seal does not. */
+.standing-cost-drift {
+  color: #c7d2f5;
+  overflow-wrap: anywhere;
+}
+
+.standing-cost-drift[data-state="unexpected_accrual"] { color: #ff9d6b; }
+
+/* The fairness paragraph is the one a hostile reader goes to first, so it is
+   given the cream a claim carries elsewhere on this surface rather than the
+   step-back prose colour the other paragraphs take. */
+.standing-cost-fairness { color: var(--cream); }
+
+/* Per-round Aurora marginal cost, measured. Deliberately placed after the
+   standing-cost block rather than beside the return-to-idle one: that panel's
+   test reads the stylesheet as a text slice bounded by the next selector it
+   knows about, so a new block wedged in there would be swept into its scope.
+   Same navy surface, same conventions, and it is toned for the dark surface
+   from the start rather than pasted from a light-surface panel and corrected. */
+.bout-cost-disclosure {
+  border: 3px solid #46527c;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.bout-cost-disclosure summary {
+  color: var(--yellow);
+  cursor: pointer;
+  font-size: clamp(5px, .45vw, 9px);
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.bout-cost-disclosure > p {
+  color: #aeb9df;
+  font-family: ui-monospace, monospace;
+  font-size: clamp(7px, .6vw, 11px);
+  font-weight: 900;
+  line-height: 1.45;
+  margin: 10px 0 0;
+}
+
+.bout-cost-summary {
+  color: var(--cream);
+  font-size: clamp(8px, .72vw, 14px);
+}
+
+/* The retired figure and the two claims a hostile reader checks first, so they
+   take the cream a claim carries on this surface rather than the step-back
+   prose colour. All three carry six-decimal dollars, so tabular figures keep
+   the columns of digits aligned against each other. */
+.bout-cost-superseded,
+.bout-cost-dearest,
+.bout-cost-lane {
+  color: var(--cream);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Six rows, so two columns rather than the flat list a three-lane panel can
+   afford. minmax(0, 1fr) rather than 1fr because the derivations contain long
+   unbreakable arithmetic tokens, and an auto minimum lets one of those set the
+   track width and push the grid wider than its container. */
+.bout-cost-rounds {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.bout-cost-rounds > article {
+  background: #050817;
+  border-top: 4px solid var(--steel);
+  color: #c7d2f5;
+  display: grid;
+  gap: 5px;
+  padding: 9px 11px;
+}
+
+/* Provenance is the load-bearing distinction on this panel, so it is carried by
+   the rail colour as well as by the words. A measured row is blue because it
+   is the opponent's lane; an exact zero is green because it is the one number
+   here that needs no caveat; an unavailable row is red because a provisioned
+   lane with no integral is a defect, not a discount. */
+.bout-cost-rounds > article[data-provenance="measured"] { border-top-color: var(--blue); }
+.bout-cost-rounds > article[data-provenance="structural_zero"] { border-top-color: #6bf39a; }
+.bout-cost-rounds > article[data-provenance="unavailable"] { border-top-color: var(--red); }
+
+.bout-cost-rounds strong {
+  color: var(--cream);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  text-transform: uppercase;
+}
+
+.bout-cost-rounds b {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* An exact zero is not a small number, it is a different kind of number, and it
+   is the only zero this panel prints. Green says so without a second label. */
+.bout-cost-rounds > article[data-provenance="structural_zero"] b { color: #6bf39a; }
+.bout-cost-rounds > article[data-provenance="unavailable"] b { color: #ff9d6b; }
+
+.bout-cost-rounds span {
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+/* The derivation is what makes the figure checkable, which is the whole reason
+   the panel opens, so it is legible rather than a footnote. It carries ACU-second
+   counts and division, and at 390px those run long, so it wraps anywhere. */
+.bout-cost-rounds code {
+  color: #e4ecff;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/* A band is only honest if the reason it is wide sits next to it, and here the
+   reason also says which of the two kinds of band it is. Warning colour rather
+   than greyed out, and reading voice: whole sentences, not a chip. */
+.bout-cost-rounds em {
+  color: var(--yellow);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 900;
+  line-height: 1.45;
+}
+
+/* Bout identifiers: 16-character unbreakable hex, two of them on some rows.
+   Inside a 140px column at 390px that overflows on its own, so it wraps
+   anywhere for the same reason the derivation above it does. */
+.bout-cost-rounds small {
+  color: var(--steel);
+  font-family: ui-monospace, monospace;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  text-transform: uppercase;
+}
+
+/* Source citation on the navy rather than inside an article, so it cannot take
+   --steel: that measures 4.02:1 against this surface and only clears AA on the
+   darker fill the rows paint for themselves. */
+.bout-cost-source {
+  color: #8792bd;
+  overflow-wrap: anywhere;
+  text-transform: uppercase;
+}
+
+@media (max-width: 700px) {
+  .capacity-lanes { grid-template-columns: 1fr; }
+  .cost-receipt-totals { grid-template-columns: 1fr; }
+  .cost-receipt-lines > div { grid-template-columns: 1fr; }
+  .cost-receipt-lines span { text-align: left; }
+  .standing-cost-lanes { grid-template-columns: 1fr; }
+  .standing-cost-totals { grid-template-columns: 1fr; }
+  .bout-cost-rounds { grid-template-columns: 1fr; }
+}

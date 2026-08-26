@@ -1,0 +1,94 @@
+command:
+  - "python"
+  - "-m"
+  - "uvicorn"
+  - "app:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
+  # One orchestrator process owns in-memory tasks; durable Lakebase fencing
+  # provides cross-replica safety without duplicate uvicorn workers.
+  #
+  # Read that as fencing only, not as state sharing. The ring is durable; an
+  # armed fight card is not -- it is a live object graph of engines, tasks and an
+  # SSE log in one process's memory, and only the lease row survives the process.
+  # So a second worker here, or Databricks Apps horizontal scaling (opt-in Beta,
+  # 1-5 instances, best-effort affinity only), would let an `arm` and its `run`
+  # land on two different processes: the run cannot find the session, and the
+  # ring stays fenced for the rest of the armed TTL. The refusal names that now
+  # instead of returning a bare 404 -- see RunManager.missing_session_detail --
+  # but the bout is still lost. Do not raise either number.
+  - "--workers"
+  - "1"
+  - "--timeout-keep-alive"
+  - "30"
+  - "--timeout-graceful-shutdown"
+  - "60"
+  - "--no-server-header"
+
+env:
+  - name: ANTI_DEMO_ENV
+    value: "databricks-app"
+  # Dependency installation, not the app. This repository ships no
+  # requirements.txt, so the runtime installs with uv and honours
+  # requires-python -- necessary, because this source uses 3.12 syntax and the
+  # pip path pins 3.11. uv's defaults are tuned for a fast index, and the
+  # workspace's package proxy is not one: at its default ~50 concurrent
+  # connections and 30s timeout, six consecutive deployments each lost a
+  # different wheel to "client error (Connect): operation timed out", which fails
+  # the whole deployment and takes the app down with it. Fewer connections and a
+  # longer patience trade build minutes for builds that finish.
+  #
+  # No interpreter is pinned here on purpose. requires-python = ">=3.12" is the
+  # whole correctness requirement, and uv.lock carries wheels for cp312 through
+  # cp315, so any interpreter uv picks can install and can parse this source.
+  # Pinning one would mean asking the proxy for a managed interpreter it may not
+  # have cached -- more traffic through the component that is already the least
+  # reliable part of the build. docs/DEPLOY.md records what a live deploy would
+  # have to observe before narrowing this.
+  - name: UV_CONCURRENT_DOWNLOADS
+    value: "4"
+  - name: UV_HTTP_TIMEOUT
+    value: "180"
+  # Probe, not a tuning knob. Neither variable above is echoed by uv, so
+  # whether this block reaches the dependency install step or only the running
+  # process has never been established -- and if it does not, both mitigations
+  # above are inert. uv prints "Bytecode compiled N files" if and only if it
+  # saw this, so its presence or absence in the build log answers that. Keeping
+  # it also shortens cold start, which is why it is safe to leave set either
+  # way.
+  - name: UV_COMPILE_BYTECODE
+    value: "1"
+  # Secret-free sealed ownership contract published after setup. The app validates
+  # this JSON as manifest v2-v6 and fails closed if a selected live round's seal
+  # is incomplete. Round 5 requires v5; live-validated Round 6 requires v6.
+  - name: ANTI_DEMO_MANIFEST_JSON
+    valueFrom: anti-demo-manifest-json
+  # Create Databricks secret resources with these resource keys. The app
+  # service principal receives them; browser users never supply AWS credentials.
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom: aws-access-key-id
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom: aws-secret-access-key
+  # Databricks Apps has no optional binding: an env entry is a name plus either
+  # value or valueFrom, and a valueFrom whose resource is missing fails the app
+  # at startup. SSO credentials need this token, so the binding stays. A
+  # permanent IAM user has none, and creates the secret with an empty value:
+  # botocore reads the token with `if token:` and server/aws_auth.py with
+  # bool(), so empty is absent to both. A space is not - it is truthy to both
+  # and would be signed into every request.
+  - name: AWS_SESSION_TOKEN
+    valueFrom: aws-session-token
+
+# Runtime target bindings and both Lakebase endpoint names are derived exclusively
+# from the sealed manifest after the injected app identity is verified. User-token
+# forwarding is intentionally absent/disabled.
+# Round 4 additionally requires the manifest-bound SQL warehouse and production
+# Lakebase database resources. Grant the app service principal only warehouse
+# CAN_USE, source-table SELECT/MODIFY, and target Postgres read privileges described
+# in README.md. Provisioning seals this app's client ID into manifest v2 and the
+# secret-free Round 5 baseline into v5. Ordinary Round 5 database credentials stay
+# only in root-owned files on the encrypted neutral runner. Per-bout Proxy resources
+# are journaled and created after T0; none are app bindings or Terraform baseline
+# resources. Do not duplicate manifest-owned identifiers as runtime environment values.

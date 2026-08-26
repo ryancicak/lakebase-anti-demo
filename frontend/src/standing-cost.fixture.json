@@ -1,0 +1,1041 @@
+{
+  "_provenance": "Real build_standing_cost_disclosure output, captured 2026-08-21T16:33Z from one author's installation, and kept because a hand-written fixture would let the tests assert a shape the server does not produce. It is a payload shape, not a price list: read no cost claim off it. Two of its figures are known not to be representative. (1) The $11.40/day 'Databricks App compute' line predates this installation -- totals.installation excludes it, and the fairness paragraph does not, so that paragraph's 2.6x margin is inflated by a workspace cost the demo did not create. (2) The $14.80/day 'Round 4 synced-table pipeline' line is a CONTINUOUS synced table left running around the clock between bouts; a pipeline scheduled only for the bout window costs a fraction of it. That $14.80/day is not a second rate for that pipeline: it is the top of the meter's measured band, and OPEN-FINDINGS D20c settles the rate at $14.57/day +/-2% (1.349239 DBU/h x $0.45/DBU) with server/pipeline_power.py deriving it. Cite D20c rather than this capture. The AWS half ($10.12/day) is also superseded: Round 1's RDS instance has since been deleted and the live installation reads $8.35/day. Regenerate from a well-configured priced run before quoting anything here.",
+  "priced": {
+    "run_id": "ad-20260820-1446-abcd",
+    "origin": "2026-08-20T14:46:33.556294Z",
+    "origin_field": "created_at",
+    "origin_basis": "Measured from manifest.created_at, when the resources came into being. expires_at is a reaper deadline and last_reset_at re-seeds data without creating anything, so neither one bounds a meter and neither is read.",
+    "as_of": "2026-08-21T16:33:22.791476Z",
+    "elapsed_hours": 25.78034310611111,
+    "seal_state": "sealed",
+    "seal_detail": "The seal is readable, and this disclosure never consults its TTL. An expired seal does not stop billing, so there is no expiry path for a figure here to take.",
+    "shape_basis": "sealed_shape_only",
+    "shape_detail": "The account was not inventoried, so every lane is the sealed shape priced at the rate card. The seal is what is billing; it is simply not confirmed against a describe-* call here.",
+    "lanes": [
+      {
+        "lane_id": "rds",
+        "product": "RDS PostgreSQL db.t4g.medium",
+        "side": "competitor",
+        "idle_label": "Never sleeps \u00b7 no idle floor to descend into",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.2947945205479452,
+          "usd_per_day": 7.075068493150685,
+          "display": "$7.0751/day \u00b7 $0.294795/hour",
+          "derivation": "sum of 4 sealed component(s): RDS PostgreSQL db.t4g.medium baseline instances, RDS PostgreSQL gp3 baseline storage, Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable RDS instance, AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per instance",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "RDS PostgreSQL db.t4g.medium baseline instances",
+            "cloud": "aws",
+            "kind": "compute",
+            "provenance": "assumed",
+            "quantity_basis": "instance count sealed in the v7 manifest; class from server/capacity.py:RDS_INSTANCE_CLASS",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.26,
+              "usd_per_day": 6.24,
+              "display": "$6.2400/day \u00b7 $0.260000/hour",
+              "derivation": "103.121372 instance-hour \u00d7 $0.0650/instance-hour over 25.7803 h \u00b7 instance count sealed in the v7 manifest; class from server/capacity.py:RDS_INSTANCE_CLASS",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonRDS/current/us-west-2/index.json \u00b7 SKU N2BHMKBGM78G338C"
+            }
+          },
+          {
+            "component": "RDS PostgreSQL gp3 baseline storage",
+            "cloud": "aws",
+            "kind": "storage",
+            "provenance": "assumed",
+            "quantity_basis": "allocated_storage = 20 GB gp3 in infra/aws/rds.tf",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.012602739726027398,
+              "usd_per_day": 0.30246575342465754,
+              "display": "$0.3025/day \u00b7 $0.012603/hour",
+              "derivation": "2.825243 GB-month \u00d7 $0.1150/GB-month over 25.7803 h \u00b7 allocated_storage = 20 GB gp3 in infra/aws/rds.tf",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable RDS instance",
+            "cloud": "aws",
+            "kind": "network",
+            "provenance": "assumed",
+            "quantity_basis": "one address per publicly reachable database endpoint",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.02,
+              "usd_per_day": 0.48,
+              "display": "$0.4800/day \u00b7 $0.020000/hour",
+              "derivation": "103.121372 address-hour \u00d7 $0.0050/address-hour over 25.7803 h \u00b7 one address per publicly reachable database endpoint",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per instance",
+            "cloud": "aws",
+            "kind": "other",
+            "provenance": "assumed",
+            "quantity_basis": "one managed secret per database, from the v7 manifest",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.002191780821917808,
+              "usd_per_day": 0.0526027397260274,
+              "display": "$0.0526/day \u00b7 $0.002192/hour",
+              "derivation": "0.141262 secret-month \u00d7 $0.4000/secret-month over 25.7803 h \u00b7 one managed secret per database, from the v7 manifest",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonRDS/current/us-west-2/index.json \u00b7 SKU N2BHMKBGM78G338C \u00b7 AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "An instance stands for each of Rounds 1, 2, 3 and 5, and only Rounds 2, 3 and 5 race it -- Round 1's box bills without ever being timed, because RDS has no idle state to wake from. Rounds 4 and 6 have no instance at all and bill straight through both. Nothing in this app stops or starts them. This lane prices db.t4g.medium, the configured class. No instance class was read back from AWS on this run, so this is the configured target and no claim is made about what the running fleet is.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "aurora",
+        "product": "Aurora Serverless v2",
+        "side": "competitor",
+        "idle_label": "Sleeps \u00b7 300s auto-pause, and parks at the sealed minimum capacity",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.02273972602739726,
+          "usd_per_day": 0.5457534246575343,
+          "display": "$0.5458/day \u00b7 $0.022740/hour",
+          "derivation": "sum of 4 sealed component(s): Aurora Serverless v2 baseline compute at the configured floor, Aurora baseline storage, Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable Aurora writer, AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per cluster",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Aurora Serverless v2 baseline compute at the configured floor",
+            "cloud": "aws",
+            "kind": "compute",
+            "provenance": "assumed",
+            "quantity_basis": "min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+            "predates_installation": false,
+            "figure": {
+              "state": "structural_zero",
+              "usd_per_hour": 0.0,
+              "usd_per_day": 0.0,
+              "display": "$0.00/day \u00b7 min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+              "derivation": "0 ACU-hour \u00d7 $0.1200/ACU-hour over 25.7803 h \u00b7 min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+              "zero_basis": "min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Aurora baseline storage",
+            "cloud": "aws",
+            "kind": "storage",
+            "provenance": "assumed",
+            "quantity_basis": "Aurora bills only the storage actually consumed by the cluster",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.000547945205479452,
+              "usd_per_day": 0.01315068493150685,
+              "display": "$0.0132/day \u00b7 $0.000548/hour",
+              "derivation": "0.141262 GB-month \u00d7 $0.1000/GB-month over 25.7803 h \u00b7 Aurora bills only the storage actually consumed by the cluster",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable Aurora writer",
+            "cloud": "aws",
+            "kind": "network",
+            "provenance": "assumed",
+            "quantity_basis": "one address per publicly reachable database endpoint",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.02,
+              "usd_per_day": 0.48,
+              "display": "$0.4800/day \u00b7 $0.020000/hour",
+              "derivation": "103.121372 address-hour \u00d7 $0.0050/address-hour over 25.7803 h \u00b7 one address per publicly reachable database endpoint",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per cluster",
+            "cloud": "aws",
+            "kind": "other",
+            "provenance": "assumed",
+            "quantity_basis": "one managed secret per database, from the v7 manifest",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.002191780821917808,
+              "usd_per_day": 0.0526027397260274,
+              "display": "$0.0526/day \u00b7 $0.002192/hour",
+              "derivation": "0.141262 secret-month \u00d7 $0.4000/secret-month over 25.7803 h \u00b7 one managed secret per database, from the v7 manifest",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "Compute parks at the sealed minimum, and that zero is a configuration rather than a missing measurement. Storage, the writer's address and its managed secret bill regardless of whether the cluster is awake.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "lakebase",
+        "product": "Lakebase",
+        "side": "lakebase",
+        "idle_label": "Sleeps \u00b7 60s suspend floor on every endpoint",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.00013584114629301597,
+          "usd_per_day": 0.0032601875110323834,
+          "display": "$0.0033/day \u00b7 $0.000136/hour",
+          "derivation": "sum of 2 sealed component(s): Lakebase always-on minimum compute, Lakebase database, PITR, and snapshot storage",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Lakebase always-on minimum compute",
+            "cloud": "databricks",
+            "kind": "compute",
+            "provenance": "measured",
+            "quantity_basis": "system.billing.usage rows where product_features.lakebase.compute_type = COMPUTE_NODE_ALWAYS_ON_MIN \u00b7 no COMPUTE_NODE_ALWAYS_ON_MIN rows posted for the sealed projects over this window: every endpoint scales to zero and bills no always-on minimum",
+            "predates_installation": false,
+            "figure": {
+              "state": "structural_zero",
+              "usd_per_hour": 0.0,
+              "usd_per_day": 0.0,
+              "display": "$0.00/day \u00b7 system.billing.usage rows where product_features.lakebase.compute_type = COMPUTE_NODE_ALWAYS_ON_MIN",
+              "derivation": "0 DBU \u00d7 $0.2600/DBU over 25.7803 h \u00b7 system.billing.usage rows where product_features.lakebase.compute_type = COMPUTE_NODE_ALWAYS_ON_MIN \u00b7 no COMPUTE_NODE_ALWAYS_ON_MIN rows posted for the sealed projects over this window: every endpoint scales to zero and bills no always-on minimum",
+              "zero_basis": "system.billing.usage rows where product_features.lakebase.compute_type = COMPUTE_NODE_ALWAYS_ON_MIN",
+              "rate_source": "system.billing.list_prices pricing.effective_list.default (promotional)"
+            }
+          },
+          {
+            "component": "Lakebase database, PITR, and snapshot storage",
+            "cloud": "databricks",
+            "kind": "storage",
+            "provenance": "measured",
+            "quantity_basis": "system.billing.usage STORAGE_SPACE rows for the sealed projects \u00b7 system.billing.usage DSU storage rows for the sealed projects",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.00013584114629301597,
+              "usd_per_day": 0.0032601875110323834,
+              "display": "$0.0033/day \u00b7 $0.000136/hour",
+              "derivation": "0.152262 DSU \u00d7 $0.0230/DSU over 25.7803 h \u00b7 system.billing.usage STORAGE_SPACE rows for the sealed projects \u00b7 system.billing.usage DSU storage rows for the sealed projects",
+              "zero_basis": "",
+              "rate_source": "system.billing.list_prices pricing.effective_list.default"
+            }
+          }
+        ],
+        "evidence": "posted_projection",
+        "rate_source": "system.billing.list_prices pricing.effective_list.default (promotional) \u00b7 system.billing.list_prices pricing.effective_list.default",
+        "caveat": "Lakebase idles at a floor and is billed for it; nothing here claims it idles free. No endpoint in this installation is configured no_suspension, so all six have a scale-down path and the standing compute is whatever the posted always-on minimum comes to.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "rds_proxy",
+        "product": "RDS Proxy credentials",
+        "side": "competitor",
+        "idle_label": "Nothing to sleep \u00b7 a secret bills whether or not a proxy stands",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.001095890410958904,
+          "usd_per_day": 0.0263013698630137,
+          "display": "$0.0263/day \u00b7 $0.001096/hour",
+          "derivation": "sum of 1 sealed component(s): AWS-managed database credentials \u00b7 2 of 10 managed secrets \u00b7 Terraform-managed proxy secrets, which stand whether or not a proxy does",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "AWS-managed database credentials \u00b7 2 of 10 managed secrets \u00b7 Terraform-managed proxy secrets, which stand whether or not a proxy does",
+            "cloud": "aws",
+            "kind": "other",
+            "provenance": "assumed",
+            "quantity_basis": "one managed secret per database, from the v7 manifest",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.001095890410958904,
+              "usd_per_day": 0.0263013698630137,
+              "display": "$0.0263/day \u00b7 $0.001096/hour",
+              "derivation": "0.070631 secret-month \u00d7 $0.4000/secret-month over 25.7803 h \u00b7 one managed secret per database, from the v7 manifest",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "describe-db-proxies returns nothing, and this lane is still not zero: the Terraform-managed proxy secrets stand whether or not a proxy does. That is why the lane needs no special case to avoid reading as free.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "neutral_runner",
+        "product": "Neutral m6i.large runner",
+        "side": "shared",
+        "idle_label": "Never sleeps \u00b7 the box bills whether or not a bout runs",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.10319178082191781,
+          "usd_per_day": 2.4766027397260273,
+          "display": "$2.4766/day \u00b7 $0.103192/hour",
+          "derivation": "sum of 3 sealed component(s): Neutral m6i.large burst runner, Neutral runner gp3 root volume, Neutral runner public IPv4",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Neutral m6i.large burst runner",
+            "cloud": "aws",
+            "kind": "compute",
+            "provenance": "assumed",
+            "quantity_basis": "instance_type in infra/aws/round5_runner.tf",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.096,
+              "usd_per_day": 2.304,
+              "display": "$2.3040/day \u00b7 $0.096000/hour",
+              "derivation": "25.780343 instance-hour \u00d7 $0.0960/instance-hour over 25.7803 h \u00b7 instance_type in infra/aws/round5_runner.tf",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonEC2 \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Neutral runner gp3 root volume",
+            "cloud": "aws",
+            "kind": "storage",
+            "provenance": "assumed",
+            "quantity_basis": "root_block_device volume_size = 20 GB gp3 in the v7 Terraform state",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.002191780821917808,
+              "usd_per_day": 0.0526027397260274,
+              "display": "$0.0526/day \u00b7 $0.002192/hour",
+              "derivation": "0.706311 GB-month \u00d7 $0.0800/GB-month over 25.7803 h \u00b7 root_block_device volume_size = 20 GB gp3 in the v7 Terraform state",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonEC2 \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Neutral runner public IPv4",
+            "cloud": "aws",
+            "kind": "network",
+            "provenance": "assumed",
+            "quantity_basis": "associate_public_ip_address = true for the runner",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.005,
+              "usd_per_day": 0.12,
+              "display": "$0.1200/day \u00b7 $0.005000/hour",
+              "derivation": "25.780343 address-hour \u00d7 $0.0050/address-hour over 25.7803 h \u00b7 associate_public_ip_address = true for the runner",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AmazonEC2 \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "The runner drives both lanes and belongs to neither corner, so it is neither side's cost and is still the installation's. Leaving it out would leave a total that does not reconcile.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "databricks_platform",
+        "product": "Databricks platform",
+        "side": "platform",
+        "idle_label": "Never sleeps \u00b7 the pipeline holds state and the app is always on",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 1.0917154785610639,
+          "usd_per_day": 26.201171485465533,
+          "display": "$26.2012/day \u00b7 $1.091715/hour",
+          "derivation": "sum of 2 sealed component(s): Databricks App compute, Round 4 synced-table pipeline",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Databricks App compute",
+            "cloud": "databricks",
+            "kind": "compute",
+            "provenance": "measured",
+            "quantity_basis": "system.billing.usage rows for 11111111-1111-4111-8111-111111111111, 36 intervals from 2026-08-20T00:00:00Z, which is before this installation was created",
+            "predates_installation": true,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.4749999999999998,
+              "usd_per_day": 11.399999999999997,
+              "display": "$11.4000/day \u00b7 $0.475000/hour",
+              "derivation": "0.5 DBU/hour \u00d7 $0.9500/DBU over 25.7803 h \u00b7 system.billing.usage rows for 11111111-1111-4111-8111-111111111111, 36 intervals from 2026-08-20T00:00:00Z, which is before this installation was created",
+              "zero_basis": "",
+              "rate_source": "system.billing.usage \u00d7 system.billing.list_prices"
+            }
+          },
+          {
+            "component": "Round 4 synced-table pipeline",
+            "cloud": "databricks",
+            "kind": "compute",
+            "provenance": "measured",
+            "quantity_basis": "system.billing.usage rows for 22222222-2222-4222-8222-222222222222, 133 intervals from 2026-08-20T15:00:00Z",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.6167154785610641,
+              "usd_per_day": 14.801171485465538,
+              "display": "$14.8012/day \u00b7 $0.616715/hour",
+              "derivation": "1.370479 DBU/hour \u00d7 $0.4500/DBU over 25.7803 h \u00b7 system.billing.usage rows for 22222222-2222-4222-8222-222222222222, 133 intervals from 2026-08-20T15:00:00Z",
+              "zero_basis": "",
+              "rate_source": "system.billing.usage \u00d7 system.billing.list_prices"
+            }
+          }
+        ],
+        "evidence": "posted_actual",
+        "rate_source": "system.billing.usage \u00d7 system.billing.list_prices",
+        "caveat": "This is not the Lakebase lane. The synced-table pipeline and the app's own compute are the largest standing lines in the installation, and folding them into Lakebase would overstate Lakebase roughly ninefold. An error that points against us is still an error.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      }
+    ],
+    "totals": {
+      "installation": {
+        "label": "Standing cost \u00b7 created by this run",
+        "usd_per_hour": 1.0386732375155763,
+        "usd_per_day": 24.92815770037383,
+        "display": "$24.9282/day \u00b7 $1.038673/hour",
+        "condition": "Covers what this run_id created. Excludes Databricks App compute, which bills whether or not this run exists.",
+        "lane_ids": [
+          "rds",
+          "aurora",
+          "lakebase",
+          "rds_proxy",
+          "neutral_runner",
+          "databricks_platform"
+        ],
+        "partial": false,
+        "partial_reason": ""
+      },
+      "with_platform": {
+        "label": "Standing cost \u00b7 with platform compute",
+        "usd_per_hour": 1.5136732375155761,
+        "usd_per_day": 36.32815770037383,
+        "display": "$36.3282/day \u00b7 $1.513673/hour",
+        "condition": "Adds Databricks App compute, which would bill anyway: it predates this installation. Do not quote this figure without that condition.",
+        "lane_ids": [
+          "rds",
+          "aurora",
+          "lakebase",
+          "rds_proxy",
+          "neutral_runner",
+          "databricks_platform"
+        ],
+        "partial": false,
+        "partial_reason": ""
+      }
+    },
+    "credits": {
+      "as_of": "2026-08-21T16:33:22.791476Z",
+      "origin": "2026-08-20T14:46:33.556294Z",
+      "elapsed_hours": 25.78034310611111,
+      "elapsed_display": "25.78 h",
+      "installation_accrued_usd": 26.777352438286798,
+      "with_platform_accrued_usd": 39.02301541368957,
+      "display": "$26.78 accrued since created_at, $39.02 including compute that predates it, over 25.78 h",
+      "basis": "One snapshot at as_of, from the sealed shape and the posted rates. Not a counter: nothing here advances between requests, and the figure is only ever as recent as the as_of beside it. Covers what this run_id created. Excludes Databricks App compute, which bills whether or not this run exists.",
+      "ticks": false
+    },
+    "posted": {
+      "state": "posted_through_window",
+      "cloud": "databricks",
+      "source": "system.billing.usage",
+      "window_start": "2026-08-20T00:00:00Z",
+      "window_end": "2026-08-21T13:20:00Z",
+      "posted_usd": 33.71168285446835,
+      "projection_usd": 28.14830164291588,
+      "projection_in_posted_window_usd": 24.629267424760357,
+      "variance_usd": 9.082415429707991,
+      "variance_fraction": 0.36876514729696075,
+      "posted_hours": 22.55734547388889,
+      "unposted_hours": 3.222997632222222,
+      "unposted_basis": "The disclosure window runs from created_at to as_of. Any part of it the posted read does not cover is carried here rather than assumed to match.",
+      "comparison_basis": "Variance is the posted figure minus the projection over the 22.5573 h the posted window and this disclosure window share, and is computed against nothing else. The whole-window projection of $28.148302 is carried separately and is not what the posted figure was differenced against.",
+      "explanation": "The gap is not an error term. Compute that predates this installation bills for the whole posted day rather than only the hours this run has existed, while the restricted projection covers only those hours. Both figures are shown and neither is adjusted to meet the other.",
+      "aws_posted": "no_posted_counterpart",
+      "aws_posted_basis": "AWS has no posted counterpart at all: ce:GetCostAndUsage is denied to this installation and is not being pursued. Any figure presented as a posted all-in would be a Databricks-only actual wearing an all-in label, so the posted comparison here is Databricks-only and says so.",
+      "unavailable_reason": "",
+      "display": "Posted $33.711683 for 22.56 h of 2026-08-20 \u00b7 projection over the same window $24.629267 \u00b7 variance $9.082415 (+36.9%) \u00b7 3.22 h of this disclosure window not yet posted"
+    },
+    "drift": {
+      "state": "unavailable",
+      "badge": "DRIFT NOT READ",
+      "summary": "No reconciliation accompanied this disclosure, so the account was not compared against the seal. The standing figures above are unaffected.",
+      "unexpected_usd_per_day": null,
+      "unexpected_accrued_usd": null,
+      "findings": [],
+      "separation_note": "Unexpected accrual is a separate figure and is never added to the totals above. Sealed accrual answers what this installation is meant to cost; unexpected accrual answers what it is costing that nobody asked for. Their sum answers neither.",
+      "unavailable_reason": "no reconciliation was supplied with this disclosure"
+    },
+    "fairness": {
+      "state": "stated",
+      "paragraph": "Both sides carry standing cost here, and ours is the larger half \u2014 $26.20/day Databricks against $10.12/day AWS, a 2.6x margin. The difference is capability, not this bill: Lakebase can scale to zero and does at 60s. No provisioned RDS instance can scale to zero at any price.",
+      "withheld_reason": ""
+    },
+    "summary": "Two questions, both answered. Marginal asks what this bout added. Standing asks what is being spent anyway.",
+    "note": "6 lanes, every one of them billing with no bout running. AWS figures are rate-card derived and have never been checked against an invoice: ce:GetCostAndUsage is denied to this installation. Databricks figures are posted usage multiplied by a posted price. The two are not the same kind of number and the totals are a blend of them, which is why each half is also shown on its own. No figure here is presented as settled against a bill."
+  },
+  "posted_unavailable": {
+    "run_id": "ad-20260820-1446-abcd",
+    "origin": "2026-08-20T14:46:33.556294Z",
+    "origin_field": "created_at",
+    "origin_basis": "Measured from manifest.created_at, when the resources came into being. expires_at is a reaper deadline and last_reset_at re-seeds data without creating anything, so neither one bounds a meter and neither is read.",
+    "as_of": "2026-08-21T16:33:29.963021Z",
+    "elapsed_hours": 25.782335201944445,
+    "seal_state": "sealed",
+    "seal_detail": "The seal is readable, and this disclosure never consults its TTL. An expired seal does not stop billing, so there is no expiry path for a figure here to take.",
+    "shape_basis": "sealed_shape_only",
+    "shape_detail": "The account was not inventoried, so every lane is the sealed shape priced at the rate card. The seal is what is billing; it is simply not confirmed against a describe-* call here.",
+    "lanes": [
+      {
+        "lane_id": "rds",
+        "product": "RDS PostgreSQL db.t4g.medium",
+        "side": "competitor",
+        "idle_label": "Never sleeps \u00b7 no idle floor to descend into",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.2947945205479452,
+          "usd_per_day": 7.075068493150685,
+          "display": "$7.0751/day \u00b7 $0.294795/hour",
+          "derivation": "sum of 4 sealed component(s): RDS PostgreSQL db.t4g.medium baseline instances, RDS PostgreSQL gp3 baseline storage, Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable RDS instance, AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per instance",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "RDS PostgreSQL db.t4g.medium baseline instances",
+            "cloud": "aws",
+            "kind": "compute",
+            "provenance": "assumed",
+            "quantity_basis": "instance count sealed in the v7 manifest; class from server/capacity.py:RDS_INSTANCE_CLASS",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.26,
+              "usd_per_day": 6.24,
+              "display": "$6.2400/day \u00b7 $0.260000/hour",
+              "derivation": "103.129341 instance-hour \u00d7 $0.0650/instance-hour over 25.7823 h \u00b7 instance count sealed in the v7 manifest; class from server/capacity.py:RDS_INSTANCE_CLASS",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonRDS/current/us-west-2/index.json \u00b7 SKU N2BHMKBGM78G338C"
+            }
+          },
+          {
+            "component": "RDS PostgreSQL gp3 baseline storage",
+            "cloud": "aws",
+            "kind": "storage",
+            "provenance": "assumed",
+            "quantity_basis": "allocated_storage = 20 GB gp3 in infra/aws/rds.tf",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.012602739726027398,
+              "usd_per_day": 0.30246575342465754,
+              "display": "$0.3025/day \u00b7 $0.012603/hour",
+              "derivation": "2.825461 GB-month \u00d7 $0.1150/GB-month over 25.7823 h \u00b7 allocated_storage = 20 GB gp3 in infra/aws/rds.tf",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable RDS instance",
+            "cloud": "aws",
+            "kind": "network",
+            "provenance": "assumed",
+            "quantity_basis": "one address per publicly reachable database endpoint",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.02,
+              "usd_per_day": 0.48,
+              "display": "$0.4800/day \u00b7 $0.020000/hour",
+              "derivation": "103.129341 address-hour \u00d7 $0.0050/address-hour over 25.7823 h \u00b7 one address per publicly reachable database endpoint",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per instance",
+            "cloud": "aws",
+            "kind": "other",
+            "provenance": "assumed",
+            "quantity_basis": "one managed secret per database, from the v7 manifest",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.002191780821917808,
+              "usd_per_day": 0.0526027397260274,
+              "display": "$0.0526/day \u00b7 $0.002192/hour",
+              "derivation": "0.141273 secret-month \u00d7 $0.4000/secret-month over 25.7823 h \u00b7 one managed secret per database, from the v7 manifest",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonRDS/current/us-west-2/index.json \u00b7 SKU N2BHMKBGM78G338C \u00b7 AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "An instance stands for each of Rounds 1, 2, 3 and 5, and only Rounds 2, 3 and 5 race it -- Round 1's box bills without ever being timed, because RDS has no idle state to wake from. Rounds 4 and 6 have no instance at all and bill straight through both. Nothing in this app stops or starts them. This lane prices db.t4g.medium, the configured class. No instance class was read back from AWS on this run, so this is the configured target and no claim is made about what the running fleet is.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "aurora",
+        "product": "Aurora Serverless v2",
+        "side": "competitor",
+        "idle_label": "Sleeps \u00b7 300s auto-pause, and parks at the sealed minimum capacity",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.02273972602739726,
+          "usd_per_day": 0.5457534246575343,
+          "display": "$0.5458/day \u00b7 $0.022740/hour",
+          "derivation": "sum of 4 sealed component(s): Aurora Serverless v2 baseline compute at the configured floor, Aurora baseline storage, Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable Aurora writer, AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per cluster",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Aurora Serverless v2 baseline compute at the configured floor",
+            "cloud": "aws",
+            "kind": "compute",
+            "provenance": "assumed",
+            "quantity_basis": "min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+            "predates_installation": false,
+            "figure": {
+              "state": "structural_zero",
+              "usd_per_hour": 0.0,
+              "usd_per_day": 0.0,
+              "display": "$0.00/day \u00b7 min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+              "derivation": "0 ACU-hour \u00d7 $0.1200/ACU-hour over 25.7823 h \u00b7 min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+              "zero_basis": "min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Aurora baseline storage",
+            "cloud": "aws",
+            "kind": "storage",
+            "provenance": "assumed",
+            "quantity_basis": "Aurora bills only the storage actually consumed by the cluster",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.000547945205479452,
+              "usd_per_day": 0.01315068493150685,
+              "display": "$0.0132/day \u00b7 $0.000548/hour",
+              "derivation": "0.141273 GB-month \u00d7 $0.1000/GB-month over 25.7823 h \u00b7 Aurora bills only the storage actually consumed by the cluster",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Database public IPv4 addresses \u00b7 4 of 8 chargeable addresses \u00b7 one address per publicly reachable Aurora writer",
+            "cloud": "aws",
+            "kind": "network",
+            "provenance": "assumed",
+            "quantity_basis": "one address per publicly reachable database endpoint",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.02,
+              "usd_per_day": 0.48,
+              "display": "$0.4800/day \u00b7 $0.020000/hour",
+              "derivation": "103.129341 address-hour \u00d7 $0.0050/address-hour over 25.7823 h \u00b7 one address per publicly reachable database endpoint",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "AWS-managed database credentials \u00b7 4 of 10 managed secrets \u00b7 one RDS-managed master credential per cluster",
+            "cloud": "aws",
+            "kind": "other",
+            "provenance": "assumed",
+            "quantity_basis": "one managed secret per database, from the v7 manifest",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.002191780821917808,
+              "usd_per_day": 0.0526027397260274,
+              "display": "$0.0526/day \u00b7 $0.002192/hour",
+              "derivation": "0.141273 secret-month \u00d7 $0.4000/secret-month over 25.7823 h \u00b7 one managed secret per database, from the v7 manifest",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AmazonRDS \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "Compute parks at the sealed minimum, and that zero is a configuration rather than a missing measurement. Storage, the writer's address and its managed secret bill regardless of whether the cluster is awake.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "lakebase",
+        "product": "Lakebase",
+        "side": "lakebase",
+        "idle_label": "Sleeps \u00b7 60s suspend floor on every endpoint",
+        "figure": {
+          "state": "unavailable",
+          "usd_per_hour": null,
+          "usd_per_day": null,
+          "display": "Unavailable",
+          "derivation": "not priced: Lakebase always-on minimum compute; Lakebase database, PITR, and snapshot storage could not be established, and a subtotal without it would read as a total",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Lakebase always-on minimum compute",
+            "cloud": "databricks",
+            "kind": "compute",
+            "provenance": "unavailable",
+            "quantity_basis": "no posted always-on-minimum DBU for this window",
+            "predates_installation": false,
+            "figure": {
+              "state": "unavailable",
+              "usd_per_hour": null,
+              "usd_per_day": null,
+              "display": "Unavailable",
+              "derivation": "quantity unavailable \u00b7 no posted always-on-minimum DBU for this window",
+              "zero_basis": "",
+              "rate_source": "system.billing.list_prices pricing.effective_list.default (promotional)"
+            }
+          },
+          {
+            "component": "Lakebase database, PITR, and snapshot storage",
+            "cloud": "databricks",
+            "kind": "storage",
+            "provenance": "unavailable",
+            "quantity_basis": "no posted storage DSU for this window",
+            "predates_installation": false,
+            "figure": {
+              "state": "unavailable",
+              "usd_per_hour": null,
+              "usd_per_day": null,
+              "display": "Unavailable",
+              "derivation": "quantity unavailable \u00b7 no posted storage DSU for this window",
+              "zero_basis": "",
+              "rate_source": "system.billing.list_prices pricing.effective_list.default"
+            }
+          }
+        ],
+        "evidence": "unpriced",
+        "rate_source": "system.billing.list_prices pricing.effective_list.default (promotional) \u00b7 system.billing.list_prices pricing.effective_list.default",
+        "caveat": "Lakebase idles at a floor and is billed for it; nothing here claims it idles free. No endpoint in this installation is configured no_suspension, so all six have a scale-down path and the standing compute is whatever the posted always-on minimum comes to.",
+        "counted_in_installation_total": false,
+        "counted_in_platform_total": false
+      },
+      {
+        "lane_id": "rds_proxy",
+        "product": "RDS Proxy credentials",
+        "side": "competitor",
+        "idle_label": "Nothing to sleep \u00b7 a secret bills whether or not a proxy stands",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.001095890410958904,
+          "usd_per_day": 0.0263013698630137,
+          "display": "$0.0263/day \u00b7 $0.001096/hour",
+          "derivation": "sum of 1 sealed component(s): AWS-managed database credentials \u00b7 2 of 10 managed secrets \u00b7 Terraform-managed proxy secrets, which stand whether or not a proxy does",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "AWS-managed database credentials \u00b7 2 of 10 managed secrets \u00b7 Terraform-managed proxy secrets, which stand whether or not a proxy does",
+            "cloud": "aws",
+            "kind": "other",
+            "provenance": "assumed",
+            "quantity_basis": "one managed secret per database, from the v7 manifest",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.001095890410958904,
+              "usd_per_day": 0.0263013698630137,
+              "display": "$0.0263/day \u00b7 $0.001096/hour",
+              "derivation": "0.070637 secret-month \u00d7 $0.4000/secret-month over 25.7823 h \u00b7 one managed secret per database, from the v7 manifest",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AWSSecretsManager \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "describe-db-proxies returns nothing, and this lane is still not zero: the Terraform-managed proxy secrets stand whether or not a proxy does. That is why the lane needs no special case to avoid reading as free.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "neutral_runner",
+        "product": "Neutral m6i.large runner",
+        "side": "shared",
+        "idle_label": "Never sleeps \u00b7 the box bills whether or not a bout runs",
+        "figure": {
+          "state": "priced",
+          "usd_per_hour": 0.10319178082191781,
+          "usd_per_day": 2.4766027397260273,
+          "display": "$2.4766/day \u00b7 $0.103192/hour",
+          "derivation": "sum of 3 sealed component(s): Neutral m6i.large burst runner, Neutral runner gp3 root volume, Neutral runner public IPv4",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "Neutral m6i.large burst runner",
+            "cloud": "aws",
+            "kind": "compute",
+            "provenance": "assumed",
+            "quantity_basis": "instance_type in infra/aws/round5_runner.tf",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.096,
+              "usd_per_day": 2.304,
+              "display": "$2.3040/day \u00b7 $0.096000/hour",
+              "derivation": "25.782335 instance-hour \u00d7 $0.0960/instance-hour over 25.7823 h \u00b7 instance_type in infra/aws/round5_runner.tf",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonEC2 \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Neutral runner gp3 root volume",
+            "cloud": "aws",
+            "kind": "storage",
+            "provenance": "assumed",
+            "quantity_basis": "root_block_device volume_size = 20 GB gp3 in the v7 Terraform state",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.002191780821917808,
+              "usd_per_day": 0.0526027397260274,
+              "display": "$0.0526/day \u00b7 $0.002192/hour",
+              "derivation": "0.706365 GB-month \u00d7 $0.0800/GB-month over 25.7823 h \u00b7 root_block_device volume_size = 20 GB gp3 in the v7 Terraform state",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonEC2 \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          },
+          {
+            "component": "Neutral runner public IPv4",
+            "cloud": "aws",
+            "kind": "network",
+            "provenance": "assumed",
+            "quantity_basis": "associate_public_ip_address = true for the runner",
+            "predates_installation": false,
+            "figure": {
+              "state": "priced",
+              "usd_per_hour": 0.005,
+              "usd_per_day": 0.12,
+              "display": "$0.1200/day \u00b7 $0.005000/hour",
+              "derivation": "25.782335 address-hour \u00d7 $0.0050/address-hour over 25.7823 h \u00b7 associate_public_ip_address = true for the runner",
+              "zero_basis": "",
+              "rate_source": "AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2"
+            }
+          }
+        ],
+        "evidence": "sealed_shape_only",
+        "rate_source": "AWS Price List API \u00b7 AmazonEC2 \u00b7 OnDemand \u00b7 us-west-2 \u00b7 AWS Price List API \u00b7 AmazonVPC \u00b7 OnDemand \u00b7 us-west-2",
+        "caveat": "The runner drives both lanes and belongs to neither corner, so it is neither side's cost and is still the installation's. Leaving it out would leave a total that does not reconcile.",
+        "counted_in_installation_total": true,
+        "counted_in_platform_total": true
+      },
+      {
+        "lane_id": "databricks_platform",
+        "product": "Databricks platform",
+        "side": "platform",
+        "idle_label": "Never sleeps \u00b7 the pipeline holds state and the app is always on",
+        "figure": {
+          "state": "unavailable",
+          "usd_per_hour": null,
+          "usd_per_day": null,
+          "display": "Unavailable",
+          "derivation": "not priced: databricks_platform \u00b7 nothing to price from could not be established, and a subtotal without it would read as a total",
+          "zero_basis": "",
+          "rate_source": ""
+        },
+        "components": [
+          {
+            "component": "databricks_platform \u00b7 nothing to price from",
+            "cloud": "databricks",
+            "kind": "other",
+            "provenance": "unavailable",
+            "quantity_basis": "No posted platform usage was supplied. The synced-table pipeline and the app's compute are the largest standing lines in this installation, so their absence is a gap in this disclosure rather than an absence of cost.",
+            "predates_installation": false,
+            "figure": {
+              "state": "unavailable",
+              "usd_per_hour": null,
+              "usd_per_day": null,
+              "display": "Unavailable",
+              "derivation": "No posted platform usage was supplied. The synced-table pipeline and the app's compute are the largest standing lines in this installation, so their absence is a gap in this disclosure rather than an absence of cost.",
+              "zero_basis": "",
+              "rate_source": ""
+            }
+          }
+        ],
+        "evidence": "unpriced",
+        "rate_source": "",
+        "caveat": "This is not the Lakebase lane. The synced-table pipeline and the app's own compute are the largest standing lines in the installation, and folding them into Lakebase would overstate Lakebase roughly ninefold. An error that points against us is still an error.",
+        "counted_in_installation_total": false,
+        "counted_in_platform_total": false
+      }
+    ],
+    "totals": {
+      "installation": {
+        "label": "Partial standing cost \u00b7 created by this run",
+        "usd_per_hour": 0.4218219178082192,
+        "usd_per_day": 10.123726027397261,
+        "display": "$10.1237/day \u00b7 $0.421822/hour",
+        "condition": "Covers what this run_id created, which on this reading is everything priced here: no component in the payload predates the installation.",
+        "lane_ids": [
+          "rds",
+          "aurora",
+          "rds_proxy",
+          "neutral_runner"
+        ],
+        "partial": true,
+        "partial_reason": "excluded from the total: Lakebase, Databricks platform could not be priced"
+      },
+      "with_platform": {
+        "label": "Partial standing cost \u00b7 with platform compute",
+        "usd_per_hour": 0.4218219178082192,
+        "usd_per_day": 10.123726027397261,
+        "display": "$10.1237/day \u00b7 $0.421822/hour",
+        "condition": "Equal to the figure above on this reading, because no priced component predates this installation. Still shown separately, because the app's compute normally does and a single total that quietly changes meaning is worse than two that do not.",
+        "lane_ids": [
+          "rds",
+          "aurora",
+          "rds_proxy",
+          "neutral_runner"
+        ],
+        "partial": true,
+        "partial_reason": "excluded from the total: Lakebase, Databricks platform could not be priced"
+      }
+    },
+    "credits": {
+      "as_of": "2026-08-21T16:33:29.963021Z",
+      "origin": "2026-08-20T14:46:33.556294Z",
+      "elapsed_hours": 25.782335201944445,
+      "elapsed_display": "25.78 h",
+      "installation_accrued_usd": 10.875554080458565,
+      "with_platform_accrued_usd": 10.875554080458565,
+      "display": "$10.88 accrued since created_at, $10.88 including compute that predates it, over 25.78 h",
+      "basis": "One snapshot at as_of, from the sealed shape and the posted rates. Not a counter: nothing here advances between requests, and the figure is only ever as recent as the as_of beside it. Covers what this run_id created, which on this reading is everything priced here: no component in the payload predates the installation.",
+      "ticks": false
+    },
+    "posted": {
+      "state": "unavailable",
+      "cloud": "databricks",
+      "source": "system.billing.usage",
+      "window_start": null,
+      "window_end": null,
+      "posted_usd": null,
+      "projection_usd": null,
+      "projection_in_posted_window_usd": null,
+      "variance_usd": null,
+      "variance_fraction": null,
+      "posted_hours": null,
+      "unposted_hours": 25.782335201944445,
+      "unposted_basis": "The disclosure window runs from created_at to as_of. Any part of it the posted read does not cover is carried here rather than assumed to match.",
+      "comparison_basis": "No variance is computed. A projection with no posted counterpart is still a projection and is left standing rather than adjusted.",
+      "explanation": "Posted actuals are unavailable, which suppresses the variance and nothing else. The projection is unaffected: losing the ability to read billing does not make the account stop spending.",
+      "aws_posted": "no_posted_counterpart",
+      "aws_posted_basis": "AWS has no posted counterpart at all: ce:GetCostAndUsage is denied to this installation and is not being pursued. Any figure presented as a posted all-in would be a Databricks-only actual wearing an all-in label, so the posted comparison here is Databricks-only and says so.",
+      "unavailable_reason": "no posted usage was supplied with this disclosure",
+      "display": "Posted actuals unavailable \u00b7 no posted usage was supplied with this disclosure"
+    },
+    "drift": {
+      "state": "unavailable",
+      "badge": "DRIFT NOT READ",
+      "summary": "No reconciliation accompanied this disclosure, so the account was not compared against the seal. The standing figures above are unaffected.",
+      "unexpected_usd_per_day": null,
+      "unexpected_accrued_usd": null,
+      "findings": [],
+      "separation_note": "Unexpected accrual is a separate figure and is never added to the totals above. Sealed accrual answers what this installation is meant to cost; unexpected accrual answers what it is costing that nobody asked for. Their sum answers neither.",
+      "unavailable_reason": "no reconciliation was supplied with this disclosure"
+    },
+    "fairness": {
+      "state": "withheld",
+      "paragraph": "",
+      "withheld_reason": "The paragraph states that our half is the larger one. One of the two halves is unpriced here, so the claim has nothing behind it and the paragraph is withheld rather than reworded."
+    },
+    "summary": "Two questions, both answered. Marginal asks what this bout added. Standing asks what is being spent anyway.",
+    "note": "6 lanes, every one of them billing with no bout running. AWS figures are rate-card derived and have never been checked against an invoice: ce:GetCostAndUsage is denied to this installation. Databricks figures are posted usage multiplied by a posted price. The two are not the same kind of number and the totals are a blend of them, which is why each half is also shown on its own. No figure here is presented as settled against a bill."
+  },
+  "unreadable": {
+    "run_id": "",
+    "origin": null,
+    "origin_field": "created_at",
+    "origin_basis": "The window is measured from manifest.created_at, the moment the resources came into being. No origin could be read here, so nothing is priced.",
+    "as_of": "2026-08-21T16:38:51.709023Z",
+    "elapsed_hours": null,
+    "seal_state": "unreadable",
+    "seal_detail": "manifest.created_at is missing or unreadable, so the window this cost accrued over cannot be established.",
+    "shape_basis": "sealed_shape_only",
+    "shape_detail": "No sealed shape could be read, so no lane is priced and no total is claimed. The account is presumably still billing; this disclosure simply cannot say for what.",
+    "lanes": [],
+    "totals": null,
+    "credits": null,
+    "posted": {
+      "state": "unavailable",
+      "cloud": "databricks",
+      "source": "system.billing.usage",
+      "window_start": null,
+      "window_end": null,
+      "posted_usd": null,
+      "projection_usd": null,
+      "projection_in_posted_window_usd": null,
+      "variance_usd": null,
+      "variance_fraction": null,
+      "posted_hours": null,
+      "unposted_hours": null,
+      "unposted_basis": "The disclosure window runs from created_at to as_of. Any part of it the posted read does not cover is carried here rather than assumed to match.",
+      "comparison_basis": "No variance is computed, because no projection could be built to compare one against.",
+      "explanation": "An unreadable seal leaves nothing to compare. The account is still billing; this disclosure cannot say how much.",
+      "aws_posted": "no_posted_counterpart",
+      "aws_posted_basis": "AWS has no posted counterpart at all: ce:GetCostAndUsage is denied to this installation and is not being pursued. Any figure presented as a posted all-in would be a Databricks-only actual wearing an all-in label, so the posted comparison here is Databricks-only and says so.",
+      "unavailable_reason": "the seal could not be read, so there is no window to compare against",
+      "display": "Posted actuals unavailable \u00b7 the seal could not be read, so there is no window to compare against"
+    },
+    "drift": {
+      "state": "unavailable",
+      "badge": "DRIFT NOT READ",
+      "summary": "No reconciliation accompanied this disclosure, so the account was not compared against the seal. The standing figures above are unaffected.",
+      "unexpected_usd_per_day": null,
+      "unexpected_accrued_usd": null,
+      "findings": [],
+      "separation_note": "Unexpected accrual is a separate figure and is never added to the totals above. Sealed accrual answers what this installation is meant to cost; unexpected accrual answers what it is costing that nobody asked for. Their sum answers neither.",
+      "unavailable_reason": "no reconciliation was supplied with this disclosure"
+    },
+    "fairness": {
+      "state": "withheld",
+      "paragraph": "",
+      "withheld_reason": "No figure could be derived, and the paragraph exists to concede a comparison between two figures."
+    },
+    "summary": "Two questions, both answered. Marginal asks what this bout added. Standing asks what is being spent anyway.",
+    "note": "The seal could not be read, so this disclosure carries no dollar figure at all rather than a zero. An unreadable manifest is not a free installation."
+  }
+}

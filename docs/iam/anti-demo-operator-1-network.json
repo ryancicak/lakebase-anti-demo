@@ -1,0 +1,109 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DiscoverNetworkAndFleet",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeAccountAttributes",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceCreditSpecifications",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeInstances",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVpcAttribute",
+        "ec2:DescribeVpcs"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "ManageDemoSecurityGroups",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:CreateSecurityGroup",
+        "ec2:DeleteSecurityGroup",
+        "ec2:ModifySecurityGroupRules",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
+        "ec2:UpdateSecurityGroupRuleDescriptionsIngress"
+      ],
+      "Resource": [
+        "arn:aws:ec2:<AWS_REGION>:<AWS_ACCOUNT_ID>:security-group/*",
+        "arn:aws:ec2:<AWS_REGION>:<AWS_ACCOUNT_ID>:security-group-rule/*",
+        "arn:aws:ec2:<AWS_REGION>:<AWS_ACCOUNT_ID>:vpc/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "RunAndRetireRound5Runner",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AttachVolume",
+        "ec2:CreateTags",
+        "ec2:CreateVolume",
+        "ec2:DeleteTags",
+        "ec2:DeleteVolume",
+        "ec2:DetachVolume",
+        "ec2:ModifyInstanceAttribute",
+        "ec2:ModifyInstanceMetadataOptions",
+        "ec2:MonitorInstances",
+        "ec2:RunInstances",
+        "ec2:TerminateInstances",
+        "ec2:UnmonitorInstances"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "ReadAmazonLinuxAmiPointerOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Resource": "arn:aws:ssm:<AWS_REGION>::parameter/aws/service/ami-amazon-linux-latest/*"
+    },
+    {
+      "Sid": "DriveRound5RunnerOverSsm",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:CancelCommand",
+        "ssm:DescribeInstanceInformation",
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations",
+        "ssm:ListCommands",
+        "ssm:SendCommand"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  /* The tests, and only the tests, get the ambients the tests need.
+   *
+   * `node` is here because credits-layout.test.tsx reads credits.css off disk:
+   * Vitest runs with `css: false`, so `import './credits.css'` -- and `?raw`
+   * and `?inline` with it -- resolves to an empty string, and a stylesheet
+   * assertion would pass vacuously against a stub. That was verified
+   * empirically; it is not a guess about the loader.
+   *
+   * It used to sit in tsconfig.app.json, which also covers these files. The
+   * side effect was that application source could reference `process`,
+   * `Buffer` or `fs` and still typecheck while failing in the browser. Splitting
+   * the projects keeps the disk read available to the tests and takes the node
+   * globals back off app code.
+   *
+   * `include` and `exclude` are both restated on purpose: an extending config
+   * OVERWRITES the inherited ones, so inheriting tsconfig.app.json's exclude --
+   * which excludes exactly these files -- would leave this project empty and
+   * silently typecheck nothing at all. */
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.test.tsbuildinfo",
+    "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom", "node"]
+  },
+  "include": ["src"],
+  "exclude": []
+}

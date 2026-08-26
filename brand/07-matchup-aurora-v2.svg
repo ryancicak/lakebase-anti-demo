@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase versus Aurora — retro console-boxing matchup screen</title>
+  <desc id="desc">An original 8-bit pre-fight card with two database-boxer portraits, a round announcement, a giant versus badge, and a Ring the Bell action.</desc>
+
+  <rect width="1920" height="1080" fill="#070B22"/>
+  <rect x="24" y="24" width="1872" height="1032" fill="none" stroke="#4A83E8" stroke-width="18"/>
+  <rect x="50" y="50" width="1820" height="980" fill="none" stroke="#EE452D" stroke-width="9"/>
+
+  <!-- Fight-card masthead. -->
+  <text x="960" y="108" fill="#F1EBD7" font-family="Menlo, Monaco, Courier New, monospace" font-size="28" font-weight="900" text-anchor="middle" letter-spacing="4">LAKEBASE: THE ANTI-DEMO</text>
+  <text x="966" y="188" fill="#070B22" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="78" font-weight="900" text-anchor="middle">ROUND 1</text>
+  <text x="960" y="178" fill="#F8D83B" stroke="#EE452D" stroke-width="5" paint-order="stroke fill" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="78" font-weight="900" text-anchor="middle">ROUND 1</text>
+  <text x="960" y="242" fill="#F1EBD7" font-family="Menlo, Monaco, Courier New, monospace" font-size="38" font-weight="900" text-anchor="middle" letter-spacing="2">WAKE THIS IDLE APP</text>
+
+  <!-- Red corner card. -->
+  <g>
+    <rect x="92" y="282" width="704" height="480" fill="#151E48" stroke="#F1EBD7" stroke-width="14"/>
+    <rect x="110" y="300" width="668" height="444" fill="none" stroke="#EE452D" stroke-width="10"/>
+    <rect x="110" y="300" width="668" height="76" fill="#EE452D"/>
+    <text x="444" y="353" fill="#FFF4C2" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="46" font-weight="900" text-anchor="middle" letter-spacing="2">LAKEBASE</text>
+
+    <!-- Original Lakebase database fighter. -->
+    <g>
+      <path d="M216 691V637H260V601H312V575H576V601H628V637H672V691Z" fill="#0A0E24"/>
+      <rect x="282" y="592" width="324" height="128" fill="#EE452D"/>
+      <rect x="326" y="573" width="236" height="147" fill="#10152F"/>
+      <rect x="392" y="603" width="104" height="85" fill="#F1EBD7"/>
+      <text x="444" y="666" fill="#10152F" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="42" font-weight="900" text-anchor="middle">LB</text>
+
+      <path d="M286 430H320V402H352V384H536V402H568V430H602V555H568V585H536V612H352V585H320V555H286Z" fill="#0A0E24"/>
+      <path d="M310 438H342V414H546V438H578V548H546V576H342V548H310Z" fill="#D7D9D4"/>
+
+      <!-- Database-layer crown and red headband. -->
+      <rect x="342" y="414" width="204" height="28" fill="#EE452D"/>
+      <rect x="326" y="450" width="236" height="24" fill="#FF735E"/>
+      <rect x="326" y="482" width="236" height="20" fill="#EE452D"/>
+
+      <!-- Face display looking toward center. -->
+      <rect x="358" y="520" width="54" height="28" fill="#10152F"/>
+      <rect x="476" y="520" width="66" height="28" fill="#10152F"/>
+      <rect x="388" y="525" width="18" height="12" fill="#F8D83B"/>
+      <rect x="510" y="525" width="24" height="12" fill="#F8D83B"/>
+      <rect x="422" y="559" width="102" height="16" fill="#10152F"/>
+
+      <!-- Gloves. -->
+      <rect x="184" y="602" width="112" height="102" fill="#0A0E24"/>
+      <rect x="198" y="586" width="84" height="88" fill="#EE452D"/>
+      <rect x="592" y="602" width="112" height="102" fill="#0A0E24"/>
+      <rect x="606" y="586" width="84" height="88" fill="#EE452D"/>
+    </g>
+  </g>
+
+  <!-- Blue corner card. -->
+  <g>
+    <rect x="1124" y="282" width="704" height="480" fill="#151E48" stroke="#F1EBD7" stroke-width="14"/>
+    <rect x="1142" y="300" width="668" height="444" fill="none" stroke="#4A83E8" stroke-width="10"/>
+    <rect x="1142" y="300" width="668" height="76" fill="#4A83E8"/>
+    <text x="1476" y="348" fill="#FFF4C2" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="36" font-weight="900" text-anchor="middle" letter-spacing="1">AURORA SERVERLESS v2</text>
+
+    <!-- Original Aurora database fighter. -->
+    <g>
+      <path d="M1248 691V637H1292V601H1344V575H1608V601H1660V637H1704V691Z" fill="#0A0E24"/>
+      <rect x="1314" y="592" width="324" height="128" fill="#4A83E8"/>
+      <rect x="1358" y="573" width="236" height="147" fill="#10152F"/>
+      <rect x="1424" y="603" width="104" height="85" fill="#F8D83B"/>
+      <text x="1476" y="662" fill="#10152F" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="31" font-weight="900" text-anchor="middle">AUR</text>
+
+      <path d="M1318 430H1352V402H1384V384H1568V402H1600V430H1634V555H1600V585H1568V612H1384V585H1352V555H1318Z" fill="#0A0E24"/>
+      <path d="M1342 438H1374V414H1578V438H1610V548H1578V576H1374V548H1342Z" fill="#D7D9D4"/>
+
+      <!-- Aurora-layer crown and blue headband. -->
+      <rect x="1374" y="414" width="204" height="28" fill="#4A83E8"/>
+      <rect x="1358" y="450" width="236" height="24" fill="#78A6FF"/>
+      <rect x="1358" y="482" width="236" height="20" fill="#4A83E8"/>
+
+      <!-- Face display looking toward center. -->
+      <rect x="1378" y="520" width="66" height="28" fill="#10152F"/>
+      <rect x="1496" y="520" width="54" height="28" fill="#10152F"/>
+      <rect x="1386" y="525" width="24" height="12" fill="#F8D83B"/>
+      <rect x="1502" y="525" width="18" height="12" fill="#F8D83B"/>
+      <rect x="1400" y="559" width="102" height="16" fill="#10152F"/>
+
+      <!-- Gloves. -->
+      <rect x="1216" y="602" width="112" height="102" fill="#0A0E24"/>
+      <rect x="1230" y="586" width="84" height="88" fill="#4A83E8"/>
+      <rect x="1624" y="602" width="112" height="102" fill="#0A0E24"/>
+      <rect x="1638" y="586" width="84" height="88" fill="#4A83E8"/>
+    </g>
+  </g>
+
+  <!-- Pixel VS burst. -->
+  <g>
+    <path d="M960 386L1004 420H1058V474L1092 518L1058 562V616H1004L960 650L916 616H862V562L828 518L862 474V420H916Z" fill="#070B22" stroke="#F8D83B" stroke-width="16"/>
+    <path d="M960 420L994 446H1032V484L1058 518L1032 552V590H994L960 616L926 590H888V552L862 518L888 484V446H926Z" fill="#EE452D"/>
+    <text x="960" y="553" fill="#FFF4C2" font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-size="92" font-weight="900" text-anchor="middle">VS</text>
+  </g>
+
+  <!-- The only action. -->
+  <rect x="620" y="820" width="680" height="112" fill="#EE452D"/>
+  <rect x="638" y="838" width="644" height="76" fill="#F8D83B"/>
+  <text x="960" y="891" fill="#10152F" font-family="Menlo, Monaco, Courier New, monospace" font-size="42" font-weight="900" text-anchor="middle">▶ RING THE BELL</text>
+
+  <text x="960" y="990" fill="#F1EBD7" font-family="Menlo, Monaco, Courier New, monospace" font-size="25" font-weight="900" text-anchor="middle" letter-spacing="2">SAME TASK · SAME DATA · ONE HONEST RESULT</text>
+</svg>

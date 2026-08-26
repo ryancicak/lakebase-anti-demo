@@ -1,0 +1,22 @@
+aws_region   = "us-west-2"
+aws_account_id = "123456789012"
+run_id       = "rehearsal-001"
+owner        = "you@databricks.com"
+expires_at   = "2026-08-20T18:00:00Z"
+operator_cidr = "203.0.113.10/32"
+
+# Exact IAM principal used by the local app to assume the narrow Round 5
+# execution role. This principal must belong to aws_account_id.
+round5_app_principal_arn = "arn:aws:iam::123456789012:role/lakebase-anti-demo-app"
+
+# Default mode: omit both values to discover the default VPC and its default subnets.
+#
+# Explicit mode: set both values. The subnets must belong to the VPC, span at
+# least two Availability Zones. runner_subnet_id must be one of those subnets
+# and its effective route table must send 0.0.0.0/0 directly to an Internet Gateway.
+# vpc_id = "vpc-0123456789abcdef0"
+# subnet_ids = [
+#   "subnet-0123456789abcdef0",
+#   "subnet-0fedcba9876543210",
+# ]
+# runner_subnet_id = "subnet-0123456789abcdef0"

@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="500" viewBox="0 0 1400 500" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase: The Anti-Demo — compact proof-header logo</title>
+  <desc id="desc">A compact fight-night lockup with a pixel boxing ring and the Lakebase Anti-Demo wordmark.</desc>
+  <rect width="1400" height="500" fill="#10152F"/>
+  <rect x="18" y="18" width="1364" height="464" fill="none" stroke="#F5D742" stroke-width="12"/>
+  <rect x="35" y="35" width="1330" height="430" fill="none" stroke="#E8482E" stroke-width="8"/>
+
+  <!-- Pixel boxing ring. -->
+  <g transform="translate(74 56)">
+    <rect x="10" y="40" width="32" height="354" fill="#EAE4CF"/>
+    <rect x="440" y="40" width="32" height="354" fill="#EAE4CF"/>
+    <rect x="0" y="22" width="52" height="42" fill="#E8482E"/>
+    <rect x="430" y="22" width="52" height="42" fill="#4A83E8"/>
+    <rect x="42" y="100" width="398" height="18" fill="#E8482E"/>
+    <rect x="42" y="154" width="398" height="18" fill="#F5D742"/>
+    <rect x="42" y="208" width="398" height="18" fill="#4A83E8"/>
+    <path d="M42 226H440L394 358H88Z" fill="#1C254F" stroke="#EAE4CF" stroke-width="14"/>
+    <rect x="172" y="260" width="138" height="22" fill="#E8482E"/>
+    <rect x="201" y="293" width="80" height="22" fill="#F5D742"/>
+    <rect x="222" y="326" width="38" height="22" fill="#EAE4CF"/>
+  </g>
+
+  <!-- Core wordmark only: proof-header scale cannot support slogan microcopy. -->
+  <g font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-weight="900">
+    <text x="632" y="229" fill="#070A16" font-size="126" letter-spacing="-7">LAKEBASE</text>
+    <text x="620" y="218" fill="#E8482E" font-size="126" letter-spacing="-7">LAKEBASE</text>
+    <text x="608" y="207" fill="#FFF4C2" stroke="#4A83E8" stroke-width="8" paint-order="stroke fill" font-size="126" letter-spacing="-7">LAKEBASE</text>
+    <text x="626" y="347" fill="#070A16" font-size="57" letter-spacing="1">THE ANTI-DEMO</text>
+    <text x="614" y="333" fill="#F5D742" stroke="#E8482E" stroke-width="6" paint-order="stroke fill" font-size="57" letter-spacing="1">THE ANTI-DEMO</text>
+  </g>
+</svg>

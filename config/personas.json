@@ -1,0 +1,281 @@
+{
+  "version": 2,
+  "source_presentation_id": "1k4XQNiXy1kwG0qMS7lEnI22o8UB8FKX8nd0OzJeQJLY",
+  "selection": {
+    "primary_required": 1,
+    "secondary_max": 2,
+    "total_max": 3
+  },
+  "personas": [
+    {
+      "id": "data_engineer",
+      "role": "Data Engineer",
+      "nickname": "Backfill Bill",
+      "pain": "Another pipeline, just to move one value.",
+      "portrait": "backfill-bill.svg",
+      "source_status": "authored_from_persona_deck",
+      "source_slide": 12,
+      "discovery_order": "build_or_maintain -> pipelines_or_systems -> consumer_or_purpose",
+      "recommended_rounds": ["put_model_score_in_app", "analyze_live_orders_without_slowing_checkout"],
+      "questions": {
+        "what": "What pipeline or system are you building or maintaining, and what must reach the application?",
+        "why": "Why does this data need to be operational now, and what breaks when it is late?",
+        "when": "How fresh must it be, and what is the current end-to-end delay?",
+        "where": "Where does the data originate, where is it transformed, and where is it finally consumed?",
+        "who": "Who owns each handoff, and who is the internal or external consumer?",
+        "how": "How many pipelines, services, or copies are required today, and how do you verify correctness?"
+      },
+      "presenter": {
+        "opening": "One new value, source to app. How many pipelines does that take you today?",
+        "risk": "Freshness is meaningless unless the application reads the correct new value.",
+        "interpretation": "Explain {remembered_number} as verified source-to-application time and identify only the systems actually eliminated.",
+        "objection": "Sure, the write landed fast. My consumer still cannot see it.",
+        "response": "That is exactly why the write does not stop the clock. The application has to read the unique value back first.",
+        "closing": "One fewer hop between the source and whatever reads it."
+      }
+    },
+    {
+      "id": "software_engineer",
+      "role": "Software Engineer",
+      "nickname": "Stacktrace Jack",
+      "pain": "Needs a test database. Files a ticket. Waits.",
+      "portrait": "stacktrace-jack.svg",
+      "source_status": "authored_from_persona_deck",
+      "source_slide": 13,
+      "discovery_order": "build_or_maintain -> applications_or_systems -> consumer_or_purpose",
+      "recommended_rounds": ["make_schema_change_safely", "survive_connection_spike", "wake_idle_app"],
+      "questions": {
+        "what": "What application or service are you changing, and which database change blocks the feature?",
+        "why": "Why does the feature matter to its users, and what is painful in the current loop?",
+        "when": "How long does an idea take to become a safely tested change?",
+        "where": "Where are development, test, and production environments created and operated?",
+        "who": "Who must approve, provision, test, or troubleshoot the change?",
+        "how": "How do you obtain representative data, isolate production, apply the migration, and prove the application still works?"
+      },
+      "presenter": {
+        "opening": "Idea to tested schema change. Clock the whole thing, not the fast part.",
+        "risk": "A copy that appears in seconds is not yet a change you would ship.",
+        "interpretation": "Explain {remembered_number} as idea-to-tested-change time, including environment wait, migration, and application smoke test.",
+        "objection": "RDS and Aurora also provide cloning, snapshots, or blue-green workflows.",
+        "response": "They do, and we run each one's normal path. Both clocks stop at the same isolated, migrated, app-verified copy.",
+        "closing": "Fewer hours between wanting the change and trusting it."
+      }
+    },
+    {
+      "id": "data_analyst",
+      "role": "Data Analyst",
+      "nickname": "Count Query",
+      "pain": "Two dashboards, two numbers, one meeting.",
+      "portrait": "count-query.svg",
+      "source_status": "draft_pending_tiger_team_review",
+      "source_slide": null,
+      "discovery_order": "build_or_maintain -> metrics_or_analysis -> decision_or_consumer",
+      "recommended_rounds": ["analyze_live_orders_without_slowing_checkout", "put_model_score_in_app"],
+      "questions": {
+        "what": "What metric, analysis, or decision needs operational data?",
+        "why": "Why must the answer be current, and what decision changes when it arrives?",
+        "when": "How stale can the data be before the analysis loses value?",
+        "where": "Where is the authoritative data, and where is the query executed today?",
+        "who": "Who consumes the result, and who reconciles disagreements in the number?",
+        "how": "How many exports, copies, or reconciliation steps stand between the transaction and the trusted answer?"
+      },
+      "presenter": {
+        "opening": "A number only matters if it is both correct and current.",
+        "risk": "A fast wrong number is still a wrong number.",
+        "interpretation": "Explain {remembered_number} only after the identical query and expected result have passed correctness verification.",
+        "objection": "Fresh is not the same as reconciled. I am the one who gets asked why two dashboards disagree.",
+        "response": "So correctness is a gate here, not a footnote. Neither lane gets a time until it returns the expected result.",
+        "closing": "The remembered number is how quickly the trusted answer became usable."
+      }
+    },
+    {
+      "id": "architect_it",
+      "role": "Architect / IT",
+      "nickname": "Major Pattern",
+      "pain": "Wrote the standard. Watched six teams route around it.",
+      "portrait": "major-pattern.svg",
+      "source_status": "authored_from_persona_deck",
+      "source_slide": 14,
+      "discovery_order": "build_or_maintain -> platforms_or_standards -> teams_or_business_result",
+      "recommended_rounds": ["make_schema_change_safely", "survive_connection_spike"],
+      "questions": {
+        "what": "What platform pattern or standard must teams follow for this database workflow?",
+        "why": "Why was that standard chosen, and which risk or business result does it protect?",
+        "when": "How long does a team wait for an approved, compliant environment or change path?",
+        "where": "Where are policies, platform components, and production boundaries enforced?",
+        "who": "Which teams consume the platform, and who approves or operates each component?",
+        "how": "How is a new pattern vetted, automated, adopted, and measured across teams?"
+      },
+      "presenter": {
+        "opening": "The fastest path is useless if forty teams cannot repeat it.",
+        "risk": "Quick to create and approved to use are two different reviews.",
+        "interpretation": "Explain {remembered_number} as time to a policy-conforming, isolated, application-verified environment.",
+        "objection": "One branch in a demo is not a standard I can publish.",
+        "response": "Nor is it offered as one. The time only counts after the agreed policy checks, the migration, and the smoke test all pass.",
+        "closing": "This is a repeatable path teams can use—not an exception demonstrated once."
+      }
+    },
+    {
+      "id": "data_scientist_ml",
+      "role": "Data Scientist / ML",
+      "nickname": "Doctor Drift",
+      "pain": "The score is fine. Nothing is using it.",
+      "portrait": "doctor-drift.svg",
+      "source_status": "authored_from_persona_deck",
+      "source_slide": 15,
+      "discovery_order": "build_or_maintain -> models -> product_or_decision",
+      "recommended_rounds": ["put_model_score_in_app"],
+      "questions": {
+        "what": "What model or score must become available to the application?",
+        "why": "Which product behavior or decision depends on it, and why does freshness matter?",
+        "when": "How quickly must a new score become usable after it is produced?",
+        "where": "Where is the model executed, where is the output stored, and where is it served?",
+        "who": "Who builds, deploys, operates, and consumes the model output?",
+        "how": "How are production swaps, online synchronization, correctness, and serving latency handled today?"
+      },
+      "presenter": {
+        "opening": "A score sitting in a table has not done anything yet.",
+        "risk": "This clock covers one hop of the model path and none of the rest.",
+        "interpretation": "Explain {remembered_number} as verified model-output-to-application time.",
+        "objection": "Model serving involves more than a database.",
+        "response": "Far more, and none of the rest is claimed here. The timer stops when the app reads the expected score — that hop only.",
+        "closing": "The model creates value only when the product can use its output."
+      }
+    },
+    {
+      "id": "dba",
+      "role": "DBA",
+      "nickname": "Lockjaw Lucy",
+      "pain": "Owns the restore nobody has rehearsed.",
+      "portrait": "lockjaw-lucy.svg",
+      "source_status": "authored_from_shared_dba_sre_card",
+      "source_slide": 16,
+      "discovery_order": "build_or_maintain -> databases_or_instances -> applications_or_users",
+      "recommended_rounds": ["recover_deleted_order", "wake_idle_app", "survive_connection_spike"],
+      "questions": {
+        "what": "Which database, recovery workflow, or operating standard matters most for this application?",
+        "why": "What is the blast radius when recovery, patching, or provisioning fails?",
+        "when": "What RTO, RPO, latency, and availability commitments must be met?",
+        "where": "Where are backups, recovery points, replicas, and development copies controlled?",
+        "who": "Which applications and users depend on the database, and who owns recovery?",
+        "how": "How are backups, failover, tuning, restoration, and post-recovery verification performed today?"
+      },
+      "presenter": {
+        "opening": "Available is not recovered. Recovered is when the app reads the right row at the agreed recovery point.",
+        "risk": "READY is a control-plane opinion. It is not a recovered row.",
+        "interpretation": "Explain {remembered_number} as verified application RTO and state the agreed recovery point.",
+        "objection": "A snapshot restore and a point-in-time branch are not identical mechanisms.",
+        "response": "They are not. Each platform runs its own normal mechanism to the same recovery point and the same verified read.",
+        "closing": "The clock stops on a row you can read, not a status you can quote."
+      }
+    },
+    {
+      "id": "sre",
+      "role": "SRE",
+      "nickname": "3 A.M. Sam",
+      "pain": "Paged for a database that says it is fine.",
+      "portrait": "3am-sam.svg",
+      "source_status": "authored_from_shared_dba_sre_card",
+      "source_slide": 16,
+      "discovery_order": "build_or_maintain -> reliability_systems -> applications_or_users",
+      "recommended_rounds": ["wake_idle_app", "recover_deleted_order", "survive_connection_spike"],
+      "questions": {
+        "what": "Which reliability event or workload transition causes the most operational pain?",
+        "why": "What happens to customers or the business when the application misses its objective?",
+        "when": "What latency, recovery, or concurrency threshold defines success?",
+        "where": "Where can a cold start, connection pool, network boundary, or dependency fail?",
+        "who": "Who is paged, who owns mitigation, and which users are affected?",
+        "how": "How is the condition detected, recovered, verified, rehearsed, and automated today?"
+      },
+      "presenter": {
+        "opening": "At three in the morning, the only status that matters is a verified application transaction.",
+        "risk": "Background probes, stale connections, and control-plane states can create a dishonest recovery clock.",
+        "interpretation": "Explain {remembered_number} as time from the shared start barrier to the first verified application transaction.",
+        "objection": "Your dashboard went green. My pager did not stop.",
+        "response": "Which is why green is not the stop condition here. Neither timer stops until the identical transaction actually succeeds.",
+        "closing": "This is the time the application actually came back."
+      }
+    },
+    {
+      "id": "executive",
+      "role": "Executive",
+      "nickname": "The Big Why",
+      "pain": "Has heard “faster” and wants “so what”.",
+      "portrait": "the-big-why.svg",
+      "source_status": "authored_from_persona_deck",
+      "source_slide": 17,
+      "discovery_order": "beneficiary_or_purpose -> capability -> delivery_and_ownership",
+      "recommended_rounds": ["inherit_primary_round"],
+      "questions": {
+        "what": "What business or customer outcome must change?",
+        "why": "Why does it matter now, and what happens if nothing changes?",
+        "when": "When must the outcome be delivered?",
+        "where": "Where will the capability live, and where does organizational friction occur?",
+        "who": "Who benefits, who owns delivery, and who measures success?",
+        "how": "How will the team prove progress with one agreed operational or delivery metric?"
+      },
+      "presenter": {
+        "opening": "Who benefits, why now, and what one number would prove the outcome?",
+        "risk": "Seconds on a screen are not dollars until someone in this room says what they cost.",
+        "interpretation": "Lead with the confirmed beneficiary and explain {remembered_number} using only the pre-agreed consequence.",
+        "objection": "I have watched fast demos before. What did it change?",
+        "response": "Nothing, by itself. It settles one agreed technical outcome; you supply the baseline and the beneficiary that turn it into money.",
+        "closing": "One verified number matters because the room agreed beforehand what it changes."
+      }
+    },
+    {
+      "id": "infosec",
+      "role": "Infosec",
+      "nickname": "Cipher Viper",
+      "pain": "Signs off on things built before anyone asked.",
+      "portrait": "cipher-viper.svg",
+      "source_status": "draft_pending_tiger_team_review",
+      "source_slide": null,
+      "discovery_order": "protect_or_govern -> control_or_evidence -> system_and_consumer",
+      "recommended_rounds": ["make_schema_change_safely", "recover_deleted_order", "survive_connection_spike"],
+      "questions": {
+        "what": "Which control, trust boundary, or evidence requirement applies to this workflow?",
+        "why": "Which threat or compliance obligation makes that control necessary?",
+        "when": "At what point must access, isolation, approval, or evidence be verified?",
+        "where": "Where are identities, secrets, policies, audit records, and production boundaries enforced?",
+        "who": "Who may perform the action, who approves it, and who reviews the evidence?",
+        "how": "How are least privilege, secret handling, isolation, and auditability tested today?"
+      },
+      "presenter": {
+        "opening": "Show me the control, then show me the record that it held.",
+        "risk": "A fast workflow must not bypass policy, blur trust boundaries, or expose secrets.",
+        "interpretation": "Explain {remembered_number} only after the agreed isolation and policy checks pass.",
+        "objection": "Ten minutes in a sandbox tells me nothing about our posture.",
+        "response": "It does not, and no broader claim is on the card. What you can inspect is this workflow's configured controls and nothing past them.",
+        "closing": "Faster counts only once the control and its paper trail both hold."
+      }
+    },
+    {
+      "id": "application_owner",
+      "role": "Application Owner",
+      "nickname": "Launch-Day Lola",
+      "pain": "Launch is Thursday. Checkout is the whole product.",
+      "portrait": "launch-day-lola.svg",
+      "source_status": "draft_pending_tiger_team_review",
+      "source_slide": null,
+      "discovery_order": "own_or_deliver -> application_capability -> customers_or_business",
+      "recommended_rounds": ["wake_idle_app", "make_schema_change_safely", "recover_deleted_order", "survive_connection_spike"],
+      "questions": {
+        "what": "Which customer journey or application capability is being launched, changed, or protected?",
+        "why": "Why does it matter to customers, and what is the consequence of delay or failure?",
+        "when": "When must it be ready, and what customer-facing threshold defines ready?",
+        "where": "Where does the customer path depend on the database or data product?",
+        "who": "Who owns delivery, operations, support, and the final go or no-go decision?",
+        "how": "How is the release validated end to end, and how quickly can the team recover when it fails?"
+      },
+      "presenter": {
+        "opening": "Ready means the tested database action works—not that infrastructure says it should.",
+        "risk": "Nothing here touches a real customer path; this is the database step alone.",
+        "interpretation": "Explain {remembered_number} as time to the agreed tested database action.",
+        "objection": "My launch does not care how quick the database was if checkout is down.",
+        "response": "Fair, and checkout is not what this round measures. Both timers stop at the selected round's exact database boundary.",
+        "closing": "One database step, proven. The rest of launch day is still yours."
+      }
+    }
+  ]
+}

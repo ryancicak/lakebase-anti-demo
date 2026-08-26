@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090b10" />
+    <meta name="description" content="Developer listening room for the original Anti-Demo start-screen and round themes." />
+    <link rel="icon" href="/src/favicon.svg" type="image/svg+xml" />
+    <title>Round Theme Listening Room</title>
+  </head>
+  <body>
+    <main class="room">
+      <header class="room-header">
+        <div>
+          <p class="eyebrow">Lakebase: The Anti-Demo</p>
+          <h1>Music Listening Room</h1>
+          <p class="intro">Audition the whole score: the featured Start Screen theme, the six round cues &mdash; one motif through six keys, written as underscore to sit under a presenter rather than compete with one &mdash; and the end-title roll that takes that motif into the parallel major and finishes it. Audio begins only after you press Play.</p>
+        </div>
+        <div class="master-controls" aria-label="Master audio controls">
+          <button class="master-button" id="master-mute" type="button" aria-pressed="false">Mute</button>
+          <button class="master-button master-stop" id="master-stop" type="button" disabled>Stop all</button>
+        </div>
+      </header>
+
+      <section class="now-playing" aria-live="polite" aria-atomic="true">
+        <span class="status-light" aria-hidden="true"></span>
+        <span id="playback-status">Ready — choose a theme</span>
+      </section>
+
+      <section class="featured-theme" id="featured-theme" aria-label="Featured title and end-title themes"></section>
+
+      <section class="theme-grid" id="theme-grid" aria-label="Round themes"></section>
+
+      <footer>
+        <p><kbd>T</kbd> title theme · <kbd>C</kbd> credits theme · <kbd>1</kbd>–<kbd>6</kbd> round themes · <kbd>M</kbd> mute · <kbd>Esc</kbd> stop all</p>
+      </footer>
+    </main>
+    <script type="module" src="/src/music.ts"></script>
+  </body>
+</html>

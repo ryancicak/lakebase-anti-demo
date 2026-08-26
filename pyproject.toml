@@ -1,0 +1,70 @@
+[project]
+name = "lakebase-anti-demo"
+version = "0.1.0"
+description = "A persona-aware competitive proof engine for Lakebase"
+requires-python = ">=3.12"
+dependencies = [
+  "boto3>=1.40.0",
+  "databricks-sdk>=0.65.0",
+  "fastapi>=0.116.0",
+  "PyNaCl>=1.6.2",
+  "psycopg[binary]>=3.2.9",
+  "pydantic-settings>=2.10.0",
+  "sse-starlette>=2.4.0",
+  "uvicorn[standard]>=0.35.0",
+]
+
+# Declared explicitly so the index is a property of this project rather than of
+# whichever machine last ran uv. It is not a preference: a machine-global
+# ~/.config/uv/uv.toml on the maintainer's laptop sets an internal dev-fleet
+# mirror as `default = true`, and uv wrote that hostname into all 772 URLs in
+# uv.lock. The Databricks Apps build container has no route to that host, which
+# is what failed twenty-two consecutive deploys. Because `uv run` and `uv lock`
+# re-resolve by default, removing those URLs from uv.lock is not enough on that
+# laptop -- the next `uv run` puts them straight back. This block is what makes
+# the correction durable. Do not remove it without a lockfile check that runs in
+# a clean environment; tests/test_deploy_hygiene.py is that check.
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
+
+[tool.uv]
+# The workspace package proxy times out on TCP connect, not on read, and does
+# it under parallel load: uv's default of ~50 concurrent downloads has now lost
+# the same psycopg-binary wheel on four consecutive Databricks Apps builds.
+# app.yaml also sets UV_CONCURRENT_DOWNLOADS, but env is not known to reach the
+# install step, whereas this file is read by uv wherever it runs. uv has no
+# equivalent config key for the HTTP timeout, so that half stays env-only.
+concurrent-downloads = 4
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28.1",
+  "pytest>=8.4.0",
+  "pytest-asyncio>=1.1.0",
+  "ruff>=0.12.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+# `slow` is excluded by default, which is the whole point of the marker: one
+# test -- the bootstrap.sh stub matrix -- took 310 of the suite's 344 seconds,
+# so an ordinary `uv run pytest` was a five-minute wait for a thirty-four-second
+# answer. Nothing is skipped silently: pytest reports the deselection on every
+# run, and the excluded test is run by its own CI job and by the documented
+# command in CONTRIBUTING.md. Note that a marker exclusion beats a node id, so
+# naming that test on the command line without `-m slow` selects nothing.
+addopts = "-m 'not slow'"
+markers = [
+  "slow: minutes rather than seconds. Deselected by default; run with `-m slow`.",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

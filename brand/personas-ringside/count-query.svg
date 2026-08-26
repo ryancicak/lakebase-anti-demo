@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Count Query — Data Analyst ringside portrait</title><desc id="desc">An original 8-bit score judge with a fantastical high collar and COUNT query monocle.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#171333" stroke="#9B6CFF" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#F8D83B" stroke-width="6"/>
+  <g fill="#9B6CFF"><rect x="63" y="58" width="48" height="18"/><rect x="232" y="46" width="48" height="18"/><rect x="401" y="58" width="48" height="18"/></g>
+  <path d="M42 277H470M42 332H470M42 387H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 285H470M42 340H470M42 395H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- upright V-collar judge -->
+  <path d="M114 432L149 295L208 319L256 276L304 319L363 295L400 432Z" fill="#513A98"/><path d="M152 432L207 325L256 371L305 325L360 432Z" fill="#10152F"/>
+  <path d="M171 147H197V118H315V147H341V249L315 279H197L171 249Z" fill="#D7D9D4"/><path d="M172 151L198 111L228 125L256 99L284 125L314 111L340 151L304 137L256 151L208 137Z" fill="#16131F"/>
+  <rect x="205" y="177" width="28" height="20" fill="#070B22"/><rect x="279" y="177" width="28" height="20" fill="#070B22"/><rect x="227" y="239" width="58" height="15" fill="#6B1C2B"/>
+  <!-- query monocle -->
+  <rect x="265" y="161" width="70" height="54" fill="none" stroke="#F8D83B" stroke-width="9"/><text x="300" y="194" font-family="Menlo,monospace" font-size="15" font-weight="900" fill="#F8D83B" text-anchor="middle">COUNT</text><path d="M329 208L360 252" stroke="#F8D83B" stroke-width="9"/>
+  <rect x="68" y="405" width="376" height="68" fill="#111938" stroke="#9B6CFF" stroke-width="8"/><rect x="186" y="420" width="140" height="38" fill="#F8D83B"/><text x="256" y="446" font-family="Menlo,monospace" font-size="20" font-weight="900" fill="#10152F" text-anchor="middle">SCORE</text>
+</svg>

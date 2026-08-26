@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Cipher Viper — Infosec ringside portrait</title><desc id="desc">An original 8-bit credential inspector with an angular diamond silhouette and mirrored cipher-block visor.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#102B35" stroke="#21D4C2" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#9B6CFF" stroke-width="6"/>
+  <g fill="#21D4C2"><rect x="63" y="58" width="48" height="18"/><rect x="232" y="46" width="48" height="18"/><rect x="401" y="58" width="48" height="18"/></g>
+  <!-- rope entrance rather than a fighting ring -->
+  <path d="M42 289H183M329 289H470M42 347H174M338 347H470M42 405H157M355 405H470" stroke="#4A83E8" stroke-width="11"/><path d="M42 297H183M329 297H470M42 355H174M338 355H470M42 413H157M355 413H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- diamond credential-lane silhouette -->
+  <path d="M92 432L156 302L256 256L356 302L420 432Z" fill="#147A72"/><path d="M156 432L201 290H311L356 432Z" fill="#10152F"/>
+  <path d="M145 170L191 112H321L367 170L341 260L301 292H211L171 260Z" fill="#147A72"/>
+  <path d="M180 168H207V142H305V168H332V246L305 272H207L180 246Z" fill="#8F5A3C"/>
+  <!-- mirrored cipher-block visor -->
+  <rect x="195" y="174" width="122" height="52" fill="#10152F" stroke="#21D4C2" stroke-width="8"/>
+  <g fill="#F8D83B"><rect x="211" y="188" width="20" height="14"/><rect x="237" y="188" width="13" height="14"/><rect x="263" y="188" width="13" height="14"/><rect x="282" y="188" width="20" height="14"/></g><g fill="#9B6CFF"><rect x="218" y="207" width="32" height="8"/><rect x="263" y="207" width="32" height="8"/></g>
+  <rect x="229" y="244" width="54" height="14" fill="#4A2A22"/>
+  <path d="M170 301L256 363L342 301" fill="none" stroke="#21D4C2" stroke-width="17"/><rect x="68" y="408" width="376" height="66" fill="#111938" stroke="#21D4C2" stroke-width="8"/><path d="M101 442H180M332 442H411" stroke="#9B6CFF" stroke-width="9"/>
+</svg>

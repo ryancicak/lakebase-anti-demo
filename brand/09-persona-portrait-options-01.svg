@@ -1,0 +1,272 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="2100" viewBox="0 0 2400 2100" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase persona fighter portraits — options sheet one</title>
+  <desc id="desc">Two original 8-bit portrait directions each for Backfill Bill, Stacktrace Jack, Count Query, Major Pattern, and Doctor Drift.</desc>
+  <style>
+    .name{font-family:Arial Black,Helvetica Neue,Arial,sans-serif;font-weight:900;fill:#FFF4C2}
+    .role,.copy,.quote,.option{font-family:Menlo,Monaco,Courier New,monospace;font-weight:900}
+    .role{fill:#FFF4C2;font-size:22px;letter-spacing:1px}
+    .copy{fill:#D7D9D4;font-size:24px}
+    .quote{fill:#F8D83B;font-size:25px}
+    .option{fill:#10152F;font-size:25px;text-anchor:middle}
+  </style>
+
+  <rect width="2400" height="2100" fill="#070B22"/>
+  <rect x="24" y="24" width="2352" height="2052" fill="none" stroke="#4A83E8" stroke-width="16"/>
+  <rect x="48" y="48" width="2304" height="2004" fill="none" stroke="#EE452D" stroke-width="8"/>
+  <text x="1200" y="104" class="name" font-size="48" text-anchor="middle">CHOOSE YOUR CORNER — PORTRAIT RUNOFF 1/2</text>
+  <text x="1200" y="137" class="copy" font-size="19" text-anchor="middle">PICK A OR B FOR EACH FIGHTER · THE ROLE ALWAYS APPEARS BELOW THE NAME</text>
+
+  <!-- BACKFILL BILL A: pipefitter -->
+  <g transform="translate(48 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/>
+    <text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">BACKFILL BILL</text>
+    <text x="1110" y="48" class="role" text-anchor="end">DATA ENGINEER</text>
+    <rect x="22" y="91" width="400" height="236" fill="#1B2758" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- pipes -->
+    <rect x="42" y="116" width="36" height="150" fill="#F8D83B"/><rect x="78" y="116" width="98" height="30" fill="#F8D83B"/>
+    <rect x="338" y="128" width="34" height="138" fill="#8A95A8"/><rect x="282" y="236" width="90" height="30" fill="#8A95A8"/>
+    <!-- torso -->
+    <path d="M104 318V270H135V244H311V270H342V318Z" fill="#EE452D"/>
+    <rect x="150" y="252" width="146" height="66" fill="#26315E"/>
+    <rect x="196" y="276" width="52" height="32" fill="#F8D83B"/>
+    <!-- head -->
+    <path d="M145 148H171V126H275V148H301V226H278V246H168V226H145Z" fill="#B96F45"/>
+    <rect x="164" y="120" width="118" height="31" fill="#F8D83B"/>
+    <rect x="182" y="164" width="24" height="16" fill="#10152F"/><rect x="240" y="164" width="24" height="16" fill="#10152F"/>
+    <rect x="194" y="211" width="60" height="18" fill="#4A2A22"/>
+    <rect x="116" y="254" width="54" height="52" fill="#EE452D"/><rect x="276" y="254" width="54" height="52" fill="#EE452D"/>
+    <text x="468" y="132" class="copy">PIPEFITTER BUILD</text>
+    <text x="468" y="174" class="copy">Hardhat · pipe gauntlets</text>
+    <text x="468" y="214" class="copy">Rows visibly flow source → app</text>
+    <text x="468" y="286" class="quote">“Late data still hits.”</text>
+  </g>
+
+  <!-- BACKFILL BILL B: night-shift backfiller -->
+  <g transform="translate(1214 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/>
+    <text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">BACKFILL BILL</text>
+    <text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">DATA ENGINEER</text>
+    <rect x="22" y="91" width="400" height="236" fill="#161B46" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- midnight rows -->
+    <rect x="42" y="112" width="42" height="24" fill="#F8D83B"/><rect x="92" y="112" width="70" height="24" fill="#4A83E8"/>
+    <rect x="42" y="145" width="84" height="24" fill="#4A83E8"/><rect x="134" y="145" width="52" height="24" fill="#F8D83B"/>
+    <circle cx="350" cy="129" r="31" fill="#F8D83B"/><rect x="350" y="96" width="34" height="66" fill="#161B46"/>
+    <!-- torso and shovel -->
+    <path d="M116 318V270H150V244H312V270H346V318Z" fill="#513A98"/>
+    <rect x="178" y="247" width="106" height="71" fill="#0D1029"/>
+    <path d="M326 176L348 170L386 302L364 308Z" fill="#D7D9D4"/><path d="M346 294H405L376 326H348Z" fill="#8A95A8"/>
+    <!-- head and night cap -->
+    <path d="M156 150H182V128H282V150H308V228H284V248H180V228H156Z" fill="#8F5A3C"/>
+    <path d="M168 132H280L240 94H205Z" fill="#9B6CFF"/><rect x="230" y="88" width="28" height="28" fill="#F8D83B"/>
+    <rect x="190" y="168" width="22" height="16" fill="#10152F"/><rect x="252" y="168" width="22" height="16" fill="#10152F"/>
+    <rect x="199" y="216" width="66" height="14" fill="#34211B"/>
+    <text x="468" y="132" class="copy">NIGHT-SHIFT BUILD</text>
+    <text x="468" y="174" class="copy">Moon cap · missing-row shovel</text>
+    <text x="468" y="214" class="copy">Yesterday’s rows arrive at midnight</text>
+    <text x="468" y="286" class="quote">“Yesterday just arrived.”</text>
+  </g>
+
+  <!-- STACKTRACE JACK A: endless error-scroll hoodie -->
+  <g transform="translate(48 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">STACKTRACE JACK</text><text x="1110" y="48" class="role" text-anchor="end">SOFTWARE ENGINEER</text>
+    <rect x="22" y="91" width="400" height="236" fill="#151E48" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- trace scroll -->
+    <path d="M57 111H142V132H86V153H151V174H72V195H136V216H52V237H118" fill="none" stroke="#FF735E" stroke-width="13"/>
+    <!-- hoodie torso -->
+    <path d="M110 318V267H147V236H319V267H356V318Z" fill="#252B45"/>
+    <path d="M159 252L233 309L307 252" fill="none" stroke="#EE452D" stroke-width="14"/>
+    <rect x="207" y="274" width="52" height="28" fill="#F1EBD7"/>
+    <!-- face/hood -->
+    <path d="M142 144L176 114H286L320 144V234L288 257H174L142 234Z" fill="#0C1028"/>
+    <path d="M171 151H291V218L270 239H192L171 218Z" fill="#C98A5A"/>
+    <rect x="184" y="166" width="36" height="17" fill="#4A83E8"/><rect x="242" y="166" width="36" height="17" fill="#4A83E8"/>
+    <rect x="213" y="213" width="50" height="14" fill="#3B241C"/>
+    <!-- bracket gloves -->
+    <rect x="92" y="257" width="62" height="57" fill="#EE452D"/><text x="123" y="298" class="name" font-size="34" text-anchor="middle">{</text>
+    <rect x="312" y="257" width="62" height="57" fill="#EE452D"/><text x="343" y="298" class="name" font-size="34" text-anchor="middle">}</text>
+    <text x="468" y="132" class="copy">HOODIE DEBUGGER</text><text x="468" y="174" class="copy">Error-scroll scarf · bracket gloves</text>
+    <text x="468" y="214" class="copy">Every hit reveals another frame</text><text x="468" y="286" class="quote">“Works in my corner.”</text>
+  </g>
+
+  <!-- STACKTRACE JACK B: debugger mechanic -->
+  <g transform="translate(1214 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#43D17A" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#23834D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">STACKTRACE JACK</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">SOFTWARE ENGINEER</text>
+    <rect x="22" y="91" width="400" height="236" fill="#13243C" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- green test tiles -->
+    <rect x="50" y="110" width="78" height="25" fill="#43D17A"/><rect x="50" y="143" width="112" height="25" fill="#43D17A"/>
+    <rect x="326" y="108" width="55" height="24" fill="#EE452D"/><rect x="346" y="138" width="35" height="24" fill="#F8D83B"/>
+    <!-- mechanic torso -->
+    <path d="M108 318V270H144V242H320V270H356V318Z" fill="#23834D"/>
+    <rect x="174" y="250" width="116" height="68" fill="#10152F"/>
+    <rect x="209" y="270" width="48" height="34" fill="#43D17A"/>
+    <!-- head, cap, debug goggles -->
+    <path d="M148 146H176V126H286V146H314V226H290V248H172V226H148Z" fill="#6F4934"/>
+    <rect x="164" y="115" width="136" height="35" fill="#43D17A"/><rect x="278" y="133" width="55" height="16" fill="#43D17A"/>
+    <rect x="180" y="165" width="45" height="25" fill="#10152F" stroke="#F8D83B" stroke-width="6"/>
+    <rect x="240" y="165" width="45" height="25" fill="#10152F" stroke="#F8D83B" stroke-width="6"/>
+    <rect x="219" y="173" width="27" height="8" fill="#F8D83B"/>
+    <rect x="201" y="219" width="64" height="14" fill="#2C1B16"/>
+    <!-- wrench gloves -->
+    <rect x="88" y="258" width="70" height="58" fill="#43D17A"/><rect x="308" y="258" width="70" height="58" fill="#43D17A"/>
+    <text x="468" y="132" class="copy">DEBUG MECHANIC</text><text x="468" y="174" class="copy">Test-green cap · breakpoint goggles</text>
+    <text x="468" y="214" class="copy">Repairs the failing frame in place</text><text x="468" y="286" class="quote">“Reproduce. Isolate. Fix.”</text>
+  </g>
+
+  <!-- COUNT QUERY A: vampire accountant -->
+  <g transform="translate(48 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">COUNT QUERY</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">DATA ANALYST</text>
+    <rect x="22" y="91" width="400" height="236" fill="#171333" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- cape/torso -->
+    <path d="M94 318L132 246L189 270L230 233L271 270L328 246L370 318Z" fill="#513A98"/>
+    <path d="M132 318L178 264L230 300L282 264L328 318Z" fill="#10152F"/>
+    <!-- pale vampire face -->
+    <path d="M151 139H180V117H282V139H311V224H284V250H178V224H151Z" fill="#D7D9D4"/>
+    <path d="M166 126L206 104H285L302 144L272 134L245 148L216 132L178 146Z" fill="#11131F"/>
+    <rect x="181" y="166" width="28" height="17" fill="#10152F"/><rect x="251" y="166" width="28" height="17" fill="#10152F"/>
+    <!-- SQL monocle -->
+    <rect x="238" y="153" width="55" height="43" fill="none" stroke="#F8D83B" stroke-width="7"/><path d="M291 191L322 232" stroke="#F8D83B" stroke-width="7"/>
+    <rect x="203" y="217" width="55" height="12" fill="#6B1C2B"/><rect x="208" y="228" width="8" height="13" fill="#FFF4C2"/><rect x="245" y="228" width="8" height="13" fill="#FFF4C2"/>
+    <!-- tally glove -->
+    <rect x="81" y="254" width="70" height="62" fill="#9B6CFF"/><text x="116" y="296" class="name" font-size="26" text-anchor="middle">#</text>
+    <text x="468" y="132" class="copy">VAMPIRE BOOKKEEPER</text><text x="468" y="174" class="copy">SQL monocle · COUNT(*) cape</text>
+    <text x="468" y="214" class="copy">Refuses a claim until rows reconcile</text><text x="468" y="286" class="quote">“I brought receipts.”</text>
+  </g>
+
+  <!-- COUNT QUERY B: ringside auditor -->
+  <g transform="translate(1214 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#F8D83B" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#A36B00"/>
+    <rect x="14" y="13" width="48" height="46" fill="#FFF4C2"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">COUNT QUERY</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">DATA ANALYST</text>
+    <rect x="22" y="91" width="400" height="236" fill="#20203F" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- receipt trail -->
+    <path d="M54 109H136V132H70V155H151V178H62V201H142V224H74V247H153" fill="none" stroke="#FFF4C2" stroke-width="15"/>
+    <!-- suit torso -->
+    <path d="M113 318V268H150V242H321V268H358V318Z" fill="#A36B00"/>
+    <path d="M186 247L235 288L284 247V318H186Z" fill="#10152F"/>
+    <rect x="224" y="272" width="22" height="44" fill="#F8D83B"/>
+    <!-- head -->
+    <path d="M153 145H180V123H290V145H317V226H292V249H178V226H153Z" fill="#8F5A3C"/>
+    <rect x="164" y="118" width="139" height="32" fill="#2A201D"/><rect x="167" y="106" width="68" height="23" fill="#2A201D"/>
+    <rect x="184" y="167" width="34" height="18" fill="#10152F"/><rect x="252" y="167" width="34" height="18" fill="#10152F"/>
+    <rect x="207" y="219" width="57" height="14" fill="#3B241C"/>
+    <!-- abacus gloves -->
+    <rect x="83" y="254" width="70" height="62" fill="#F8D83B"/><g fill="#10152F"><rect x="91" y="268" width="54" height="5"/><rect x="91" y="283" width="54" height="5"/><rect x="91" y="298" width="54" height="5"/></g>
+    <text x="468" y="132" class="copy">RINGSIDE AUDITOR</text><text x="468" y="174" class="copy">Receipt scarf · abacus gloves</text>
+    <text x="468" y="214" class="copy">Turns every boast into one checked number</text><text x="468" y="286" class="quote">“Show your work.”</text>
+  </g>
+
+  <!-- MAJOR PATTERN A: military pattern officer -->
+  <g transform="translate(48 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#43D17A" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#23834D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">MAJOR PATTERN</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">ARCHITECT / IT</text>
+    <rect x="22" y="91" width="400" height="236" fill="#152A32" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- grid -->
+    <g stroke="#315B67" stroke-width="5"><path d="M42 130H400M42 175H400M42 220H400M42 265H400"/><path d="M86 104V316M142 104V316M198 104V316M254 104V316M310 104V316M366 104V316"/></g>
+    <!-- uniform -->
+    <path d="M103 318V266H143V238H323V266H363V318Z" fill="#23834D"/>
+    <rect x="178" y="246" width="110" height="72" fill="#14221E"/>
+    <rect x="198" y="263" width="28" height="12" fill="#F8D83B"/><rect x="237" y="263" width="28" height="12" fill="#F8D83B"/>
+    <!-- head/cap -->
+    <path d="M147 147H176V127H290V147H319V226H292V250H174V226H147Z" fill="#C98A5A"/>
+    <path d="M161 130H303L271 100H199Z" fill="#23834D"/><rect x="204" y="110" width="56" height="24" fill="#F8D83B"/>
+    <rect x="180" y="168" width="34" height="18" fill="#10152F"/><rect x="252" y="168" width="34" height="18" fill="#10152F"/>
+    <path d="M198 216H270" stroke="#5A3224" stroke-width="15"/>
+    <!-- T-square glove -->
+    <rect x="79" y="254" width="74" height="62" fill="#43D17A"/><path d="M94 268H139M116 268V305" stroke="#10152F" stroke-width="8"/>
+    <text x="468" y="132" class="copy">PATTERN OFFICER</text><text x="468" y="174" class="copy">Grid uniform · T-square gauntlet</text>
+    <text x="468" y="214" class="copy">Drills every team onto one standard</text><text x="468" y="286" class="quote">“Stay inside the pattern.”</text>
+  </g>
+
+  <!-- MAJOR PATTERN B: blueprint commander -->
+  <g transform="translate(1214 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#4A83E8" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#3158A3"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">MAJOR PATTERN</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">ARCHITECT / IT</text>
+    <rect x="22" y="91" width="400" height="236" fill="#17305E" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- blueprint scroll -->
+    <rect x="45" y="112" width="108" height="145" fill="#4A83E8"/><g stroke="#C7E1FF" stroke-width="5"><path d="M58 140H139M58 168H118M58 196H139M58 224H105"/><rect x="78" y="151" width="48" height="54" fill="none"/></g>
+    <!-- formal uniform -->
+    <path d="M110 318V267H149V239H324V267H363V318Z" fill="#3158A3"/>
+    <path d="M179 244L236 286L294 244V318H179Z" fill="#10152F"/>
+    <rect x="220" y="267" width="32" height="45" fill="#F8D83B"/>
+    <!-- head and peaked cap -->
+    <path d="M150 146H178V126H292V146H320V226H294V250H176V226H150Z" fill="#8F5A3C"/>
+    <rect x="164" y="113" width="142" height="36" fill="#3158A3"/><rect x="189" y="99" width="92" height="23" fill="#3158A3"/><rect x="216" y="118" width="40" height="22" fill="#F8D83B"/>
+    <rect x="184" y="167" width="34" height="18" fill="#10152F"/><rect x="254" y="167" width="34" height="18" fill="#10152F"/>
+    <rect x="206" y="218" width="60" height="14" fill="#34211B"/>
+    <!-- compass glove -->
+    <rect x="84" y="255" width="69" height="61" fill="#4A83E8"/><circle cx="118" cy="285" r="19" fill="none" stroke="#F8D83B" stroke-width="7"/><path d="M118 272L126 294L108 289Z" fill="#F8D83B"/>
+    <text x="468" y="132" class="copy">BLUEPRINT COMMANDER</text><text x="468" y="174" class="copy">Peaked cap · compass glove</text>
+    <text x="468" y="214" class="copy">Approves exactly one golden path</text><text x="468" y="286" class="quote">“Pattern approved.”</text>
+  </g>
+
+  <!-- DOCTOR DRIFT A: bell-curve scientist -->
+  <g transform="translate(48 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">DOCTOR DRIFT</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">DATA SCIENTIST / ML</text>
+    <rect x="22" y="91" width="400" height="236" fill="#18143D" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- changing distribution pixels -->
+    <g fill="#9B6CFF"><rect x="42" y="224" width="28" height="28"/><rect x="76" y="194" width="28" height="58"/><rect x="110" y="154" width="28" height="98"/><rect x="144" y="194" width="28" height="58"/><rect x="178" y="224" width="28" height="28"/></g>
+    <!-- lab coat -->
+    <path d="M114 318V268H153V239H321V268H360V318Z" fill="#D7D9D4"/>
+    <path d="M186 242L236 281L286 242V318H186Z" fill="#513A98"/>
+    <rect x="224" y="269" width="24" height="43" fill="#F8D83B"/>
+    <!-- bell-curve hair and face -->
+    <path d="M144 150H173V128H293V150H322V227H295V250H171V227H144Z" fill="#C98A5A"/>
+    <path d="M153 144L174 111L202 132L231 91L260 132L289 108L312 144Z" fill="#F1EBD7"/>
+    <rect x="177" y="166" width="45" height="27" fill="#10152F" stroke="#9B6CFF" stroke-width="6"/><rect x="244" y="166" width="45" height="27" fill="#10152F" stroke="#9B6CFF" stroke-width="6"/>
+    <rect x="216" y="174" width="34" height="8" fill="#9B6CFF"/><path d="M204 221H270" stroke="#5A3224" stroke-width="13"/>
+    <!-- mismatched gloves -->
+    <rect x="88" y="256" width="71" height="60" fill="#9B6CFF"/><rect x="309" y="246" width="79" height="70" fill="#EE452D"/>
+    <text x="468" y="132" class="copy">BELL-CURVE GENIUS</text><text x="468" y="174" class="copy">Distribution hair · drifting gloves</text>
+    <text x="468" y="214" class="copy">Nothing is the same size next round</text><text x="468" y="286" class="quote">“Your baseline moved.”</text>
+  </g>
+
+  <!-- DOCTOR DRIFT B: prediction alchemist -->
+  <g transform="translate(1214 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#21D4C2" stroke-width="8"/>
+    <rect width="1138" height="72" fill="#147A72"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">DOCTOR DRIFT</text><text x="1110" y="48" class="role" text-anchor="end" fill="#FFF4C2">DATA SCIENTIST / ML</text>
+    <rect x="22" y="91" width="400" height="236" fill="#102B35" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- model-score vial -->
+    <rect x="50" y="128" width="64" height="120" fill="#F1EBD7"/><rect x="60" y="169" width="44" height="68" fill="#21D4C2"/><rect x="60" y="111" width="44" height="25" fill="#8A95A8"/>
+    <g fill="#F8D83B"><rect x="132" y="125" width="20" height="20"/><rect x="160" y="152" width="14" height="14"/><rect x="139" y="181" width="17" height="17"/></g>
+    <!-- dark lab robe -->
+    <path d="M116 318V269H152V240H321V269H357V318Z" fill="#147A72"/>
+    <path d="M182 245L236 284L291 245V318H182Z" fill="#10152F"/>
+    <rect x="218" y="263" width="36" height="52" fill="#21D4C2"/>
+    <!-- asymmetric glitch face -->
+    <path d="M149 148H177V126H294V148H322V227H295V250H175V227H149Z" fill="#8F5A3C"/>
+    <path d="M158 138L180 113L209 129L239 101L267 130L299 112L314 141Z" fill="#20243A"/>
+    <rect x="180" y="166" width="44" height="24" fill="#10152F"/><rect x="248" y="160" width="53" height="30" fill="#10152F"/>
+    <rect x="190" y="172" width="18" height="10" fill="#21D4C2"/><rect x="270" y="167" width="22" height="12" fill="#EE452D"/>
+    <path d="M207 221H268" stroke="#3B241C" stroke-width="13"/>
+    <!-- probability gloves -->
+    <rect x="88" y="257" width="70" height="59" fill="#21D4C2"/><text x="123" y="296" class="name" font-size="22" text-anchor="middle">.9</text>
+    <rect x="310" y="257" width="70" height="59" fill="#EE452D"/><text x="345" y="296" class="name" font-size="22" text-anchor="middle">.1</text>
+    <text x="468" y="132" class="copy">PREDICTION ALCHEMIST</text><text x="468" y="174" class="copy">Model vial · probability gloves</text>
+    <text x="468" y="214" class="copy">The score changes before your eyes</text><text x="468" y="286" class="quote">“Probability favors me.”</text>
+  </g>
+</svg>

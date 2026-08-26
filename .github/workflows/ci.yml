@@ -1,0 +1,367 @@
+name: CI
+
+# What this workflow is for: proving that somebody who clones this repository and
+# has no AWS account, no Databricks workspace and no credentials of any kind can
+# still get a green suite. That is not a nicety here -- the repository provisions
+# real infrastructure, and a contributor who cannot run the tests will either not
+# contribute or will "verify" a change by spending money. tests/conftest.py's
+# containment fixtures are what make a credential-free run possible; this
+# workflow is what keeps them honest.
+#
+# Nothing here needs a secret, a cloud credential or a paid runner, and nothing
+# here provisions anything. No job calls terraform, bootstrap.sh, the `antidemo`
+# subcommands, AWS or Databricks.
+
+on:
+  push:
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Note on the uv flags used below, because they are load-bearing rather than
+# stylistic. `uv run` re-resolves by default, and a re-resolution is exactly how
+# uv.lock acquired an internal mirror hostname in every one of its URLs and broke
+# twenty-two consecutive deploys. So: `uv sync --locked` (install from the
+# lockfile, and fail if the lockfile no longer agrees with pyproject.toml)
+# followed by `uv run --no-sync` (use the environment that sync just built,
+# resolve nothing). Setting UV_FROZEN globally instead does not work -- uv
+# rejects `--locked` when UV_FROZEN is set. See pyproject.toml and
+# tests/test_deploy_hygiene.py.
+#
+# Note on how the actions below are pinned, because the three of them are not
+# pinned the same way and the difference is not a style choice.
+#
+# `actions/checkout` and `actions/setup-node` are pinned to a major tag, which is
+# what those repositories publish and move. `astral-sh/setup-uv` is pinned to a
+# full version, because it *stopped* publishing major and minor tags in its
+# v8.0.0 release -- deliberately, to close the class of supply-chain attack that
+# a moving tag enables. So `astral-sh/setup-uv@v10` is not a shorthand for the
+# v10 line, it is a tag that does not exist, and a workflow naming it fails
+# immediately on every job with an unresolvable-action error. Verified against
+# the GitHub API rather than assumed: `git/ref/tags/v10` on that repository is a
+# 404 while the same lookup on the two `actions/*` repositories resolves. Bump
+# this one by reading its releases, not by incrementing the number.
+
+jobs:
+  # Split out and run first because these are the guards that protect
+  # publication rather than correctness: if one of them fails, the answer is
+  # "do not merge", and it should not be buried at minute five of a full suite.
+  hygiene:
+    name: Publication guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.18"
+          # Single-version deliberately, while the `python` job below is a
+          # matrix. Neither check here is interpreter-sensitive: this job asserts
+          # what the lockfiles name and what the tree does not commit, and
+          # tests/test_deploy_hygiene.py's parse check already targets the
+          # *oldest* interpreter requires-python admits via `ast`'s
+          # feature_version rather than the running one -- so it tests 3.12 no
+          # matter which interpreter executes it. Matrixing this would buy a
+          # second identical answer.
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install from the lockfile
+        run: uv sync --locked --all-groups
+
+      - name: Lockfile hostnames must be reachable from any build container
+        # Both lockfiles are asserted to name only public PyPI / public npm. A
+        # machine-global uv mirror silently rewrites all of uv.lock's URLs to an
+        # internal host, which is unreachable from the Databricks Apps build
+        # container and from every stranger's laptop.
+        run: uv run --no-sync pytest -q tests/test_deploy_hygiene.py
+
+      - name: No live identifiers may be committed
+        # Account IDs, workspace hostnames, ARNs, bucket names, tokens.
+        run: uv run --no-sync pytest -q tests/test_no_live_identifiers_committed.py
+
+  # Two legs, and the second one is the whole point of the matrix.
+  # pyproject.toml declares `requires-python = ">=3.12"` -- a floor with no
+  # ceiling -- so this job pinned to 3.12 proved the floor and proved nothing
+  # about what a stranger actually runs. A stranger runs `uv sync`, which picks
+  # the newest interpreter uv can find; today that is 3.14, and uv.lock already
+  # carries wheels through cp315. The maintainer's own environment is 3.14.
+  #
+  # Pinning an interpreter instead is the correction this repository has already
+  # rejected, for reasons docs/DEPLOY.md sets out under "Why nothing pins an
+  # interpreter" -- a root `.python-version` once deleted a provisioned 3.14
+  # environment mid-incident, and tests/test_deploy_hygiene.py now refuses the
+  # file outright. Covering both ends of the declared range is the alternative to
+  # narrowing the range.
+  #
+  # Both legs block. Neither is marked experimental and neither carries
+  # `continue-on-error`: a leg that cannot fail reports coverage it does not
+  # have, which is exactly the shape of guard the `frontend` lint step below used
+  # to be and deliberately no longer is.
+  python:
+    name: Python suite ${{ matrix.python-version }} (no credentials)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      # The reason for two legs is to compare them, and fail-fast cancels the
+      # leg that has not answered yet. "3.14 failed, 3.12 cancelled" is the one
+      # result this job must never produce, because it is indistinguishable from
+      # "both are broken" and the difference is the entire finding.
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    env:
+      # This is the lever that actually decides which interpreter runs, and it is
+      # worth being explicit about where it comes from. `setup-uv`'s
+      # `python-version` input below is not a `setup-python`-style install
+      # directive -- its own action.yml describes it as "The version of Python to
+      # set UV_PYTHON to", so that input *is* the UV_PYTHON source and there is
+      # no separate UV_PYTHON line anywhere in this repository. Restating it here
+      # off the same matrix value is redundancy on purpose: the failure it guards
+      # against is silent, because a leg named 3.14 whose uv quietly resolved
+      # 3.12 reports false coverage, which is worse than having no second leg at
+      # all. Both spellings read from `matrix.python-version` so they cannot
+      # drift, and the step below fails the job if they somehow do.
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.18"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install from the lockfile
+        # --locked additionally asserts uv.lock still agrees with pyproject.toml,
+        # so a dependency added without relocking fails here rather than at
+        # deploy time.
+        run: uv sync --locked --all-groups
+
+      - name: This leg must be running the interpreter its name claims
+        # Asserted rather than printed, and this is the step that makes the
+        # matrix mean something. Everything above expresses an *intent* that
+        # 3.14 be used; nothing above observes that it was. uv resolves an
+        # interpreter from several sources in precedence order, so a
+        # misconfiguration here does not error -- it silently falls back to
+        # whatever else is on the runner and the leg goes green under the wrong
+        # version while still calling itself 3.14. That is the one outcome worse
+        # than not having the leg, so it is a hard failure and not a log line.
+        run: |
+          claimed='${{ matrix.python-version }}'
+          actual=$(uv run --no-sync python -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+          uv run --no-sync python -VV
+          if [ "$actual" != "$claimed" ]; then
+            echo "::error::This leg is named $claimed but uv resolved $actual."
+            exit 1
+          fi
+          echo "Resolved interpreter $actual matches the leg's declared $claimed."
+
+      - name: Assert the runner has no cloud credentials
+        # The whole point of the job. If a credential ever leaks into this
+        # environment, the suite stops proving what it claims to prove, because
+        # server/aws_auth.py changes behaviour when real keys are present.
+        #
+        # `ANTI_DEMO_MANIFEST(_JSON)?=` rather than `ANTI_DEMO_MANIFEST=`. The
+        # bare `=` made the match exact, which is right, and it therefore also
+        # excluded `ANTI_DEMO_MANIFEST_JSON` -- the *higher* precedence of the two
+        # manifest sources, the one `server/manifest.py::load_manifest` reads
+        # first, and the one that carries a whole sealed installation inline
+        # rather than a path to one. The variable this job exists to catch was the
+        # variable it could not see.
+        #
+        # `AURORA_`/`RDS_`/`LAKEBASE_` for the same reason one step out: the
+        # prefixes above are the credential families, and those three are the live
+        # *identifier* families. `app.py::_bind_deployed_runtime` and
+        # `manifest.py::apply_manifest_environment` export
+        # `AURORA_SECRET_ARN` and `AURORA_CLUSTER_ID` from a real seal, and
+        # `aws_auth.APP_AWS_BINDINGS` requires both -- so half of what a deployed
+        # runtime is configured from named nothing this grep matched.
+        run: |
+          leaks='^(AWS_|DATABRICKS_|AURORA_|RDS_|LAKEBASE_|ANTI_DEMO_MANIFEST(_JSON)?=)'
+          if env | grep -Eq "$leaks"; then
+            env | grep -E "$leaks" | cut -d= -f1
+            echo "::error::CI must run with no cloud credentials and no live manifest."
+            exit 1
+          fi
+
+      - name: Lint
+        run: uv run --no-sync ruff check .
+
+      - name: Test
+        # One deselection, and it is not about credentials -- nothing in this
+        # suite needs any. `-m 'not slow'` in pyproject.toml's addopts excludes
+        # tests/test_bootstrap_stub_harness.py::test_bootstrap_shell_paths_hold_against_stubs,
+        # a ~5 minute shell matrix that was 90% of this job's runtime. It is not
+        # dropped: the `bootstrap` job below runs it, and only it. Deselecting by
+        # marker rather than by node id is what stops the two from drifting --
+        # the previous spelling named the test here and nothing marked the test,
+        # so a rename would have quietly re-admitted it.
+        #
+        # The other five tests in that file are pure Python and still run here:
+        # every harness case is registered, bootstrap.sh stays bash-3.2 clean,
+        # the missing-prerequisite gate names every absent tool, and a failed
+        # provision says what is already billing.
+        run: uv run --no-sync pytest -q
+
+  # Its own job rather than a step, for the same reason `hygiene` is split out:
+  # this is the only coverage of bootstrap.sh's money-spending refusal branches
+  # and bootstrap.sh is the first thing a stranger executes, so when it fails the
+  # answer needs to be legible rather than buried at minute five of a full suite.
+  #
+  # History worth knowing before touching this: the test was deselected here by
+  # name on the grounds that the harness used BSD `stat -f '%Lp'`, which GNU
+  # coreutils does not have. The harness has since grown a
+  # `stat -f '%Lp' || stat -c '%a'` fallback, so that reason has expired -- but
+  # the deselection outlived it and the test had stopped running in CI at all.
+  # If this job proves flaky rather than failing honestly, mark it
+  # `continue-on-error` and say so here; do not delete it and do not go back to
+  # deselecting it silently.
+  bootstrap:
+    name: bootstrap.sh stub matrix (slow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.18"
+          # Single-version on purpose, and not an oversight now that `python`
+          # above is a matrix: this job is the ~5 minute shell matrix, the thing
+          # it exercises is bootstrap.sh's refusal branches rather than any
+          # Python API, and doubling the slowest job to re-run bash under a
+          # different interpreter would cost the most and prove the least.
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install from the lockfile
+        run: uv sync --locked --all-groups
+
+      - name: Assert the runner has no cloud credentials
+        # The harness drives bootstrap.sh against stubbed aws/databricks/terraform
+        # binaries. A real credential in this environment is the one thing that
+        # could turn a stubbed provision into a billed one.
+        #
+        # Kept identical to the same step in the `checks` job above, including the
+        # `(_JSON)?` group and the identifier prefixes; the reasoning is written
+        # out there. Two copies because a composite action for four lines of shell
+        # is worse, but they have to agree -- a guard that is weaker in the job
+        # that can actually spend money is the wrong way round.
+        #
+        # Before the npm install below, not after: `npm ci` runs whatever install
+        # scripts the dependency tree carries, and asserting the environment is
+        # clean is worth less once something else has already run in it.
+        run: |
+          leaks='^(AWS_|DATABRICKS_|AURORA_|RDS_|LAKEBASE_|ANTI_DEMO_MANIFEST(_JSON)?=)'
+          if env | grep -Eq "$leaks"; then
+            env | grep -E "$leaks" | cut -d= -f1
+            echo "::error::CI must run with no cloud credentials and no live manifest."
+            exit 1
+          fi
+
+      # Not optional, and not here for the frontend's sake -- the `frontend` job
+      # owns the frontend. The harness stubs `uv` and `npm` with `exit 0`, so
+      # bootstrap.sh's step 1b reports a synced .venv and a built frontend/dist
+      # having produced neither -- and then asserts both exist, because
+      # ./antidemo refuses every subcommand without the first and the deployed UI
+      # answers 503 on every page without the second. Those two assertions are
+      # the point of step 1b and nothing stubs them, so the matrix requires a
+      # tree where both are already there.
+      #
+      # `Install from the lockfile` above supplies .venv. frontend/dist is
+      # gitignored build output, so a fresh checkout has none -- which is why
+      # this job failed on the repository's first CI run, with all nineteen
+      # cases reporting the same line: `frontend/dist/index.html is still
+      # missing after the build step`. Every tree the harness had run on until
+      # then was a warm laptop, where the requirement is invisible. The harness
+      # now refuses up front and names both preconditions rather than reporting
+      # nineteen failures for one cause.
+      #
+      # `npm ci` and not `npm install`: package-lock.json is committed and this
+      # must not re-resolve, for the same reason `uv sync --locked` is used above.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build the frontend the harness asserts exists
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Test
+        # `-m slow` overrides the `-m 'not slow'` default from pyproject.toml,
+        # and selects exactly the one test carrying the marker.
+        run: uv run --no-sync pytest -q -m slow
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # 22 rather than latest: several transitive dependencies declare
+          # engine ranges that a newer major trips, which prints a wall of
+          # EBADENGINE warnings over the real output.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install from the lockfile
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # BLOCKING, as of 2026-08-25. This step carried `continue-on-error: true`
+      # and no longer does. Read this before adding it back.
+      #
+      # This job ran `npm ci`, typecheck, build and test and never ran eslint,
+      # while CONTRIBUTING.md lists `npm run lint` among the checks to run before
+      # opening a change and records its baseline as "clean". Nothing enforced
+      # that, so the baseline was a claim rather than a fact -- at the time the
+      # step was added `npm run lint` reported 8 errors and 9 warnings, and six of
+      # the eight were dead imports and an unused binding introduced in
+      # `frontend/src/App.tsx` within the hour. Every one of them would have been
+      # caught here. That is the gap: not that lint was failing, but that the only
+      # check nobody automated was the only check that had drifted.
+      #
+      # `continue-on-error` bought exactly one thing -- not going red on a public
+      # first run for eight errors a reader did not write -- and that reason has
+      # expired: those eight are fixed. `cd frontend && npm run lint` now exits 0
+      # with 0 errors and 9 warnings, all of them `react-refresh/only-export-
+      # components` in `installation.tsx` and `ring.tsx`, and eslint does not fail
+      # on warnings. Verified by running it before this line was removed, because
+      # deleting it on the strength of the comment alone is how a passing job turns
+      # red.
+      #
+      # So it blocks now, and that is the point: a lint step that cannot fail is
+      # the shape of guard this repository has shipped before, and exactly what the
+      # comment above `bootstrap` warns against. If it ever needs to be
+      # non-blocking again, say here which errors and why -- and note that
+      # `--max-warnings` is deliberately not set, so those 9 warnings do not gate
+      # the job. Removing them is a separate change from enforcing errors.
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test

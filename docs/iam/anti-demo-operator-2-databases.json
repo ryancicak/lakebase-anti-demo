@@ -1,0 +1,99 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadRdsCatalogAndState",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeAccountAttributes",
+        "rds:DescribeDBClusterSnapshots",
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBEngineVersions",
+        "rds:DescribeDBInstanceAutomatedBackups",
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBParameterGroups",
+        "rds:DescribeDBParameters",
+        "rds:DescribeDBProxies",
+        "rds:DescribeDBProxyTargetGroups",
+        "rds:DescribeDBProxyTargets",
+        "rds:DescribeDBSnapshots",
+        "rds:DescribeDBSubnetGroups",
+        "rds:DescribeEvents",
+        "rds:DescribeOrderableDBInstanceOptions",
+        "rds:ListTagsForResource"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "ManageDemoOwnedSubnetGroups",
+      "Effect": "Allow",
+      "Action": [
+        "rds:AddTagsToResource",
+        "rds:CreateDBSubnetGroup",
+        "rds:DeleteDBSubnetGroup",
+        "rds:ModifyDBSubnetGroup",
+        "rds:RemoveTagsFromResource"
+      ],
+      "Resource": "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:subgrp:lakebase-ant*"
+    },
+    {
+      "Sid": "ManageDemoOwnedDatabases",
+      "Effect": "Allow",
+      "Action": [
+        "rds:AddRoleToDBCluster",
+        "rds:AddTagsToResource",
+        "rds:CreateDBCluster",
+        "rds:CreateDBInstance",
+        "rds:DeleteDBCluster",
+        "rds:DeleteDBInstance",
+        "rds:ModifyDBCluster",
+        "rds:ModifyDBInstance",
+        "rds:RebootDBInstance",
+        "rds:RemoveTagsFromResource",
+        "rds:RestoreDBClusterToPointInTime",
+        "rds:RestoreDBInstanceToPointInTime",
+        "rds:StartDBCluster",
+        "rds:StartDBInstance",
+        "rds:StopDBCluster",
+        "rds:StopDBInstance"
+      ],
+      "Resource": [
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adrc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adrc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:subgrp:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:pg:default.postgres17",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster-pg:*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:secgrp:*"
+      ]
+    },
+    {
+      "Sid": "ManageRound5ProxiesInThisRegionOnly",
+      "Effect": "Allow",
+      "Action": [
+        "rds:AddTagsToResource",
+        "rds:CreateDBProxy",
+        "rds:DeleteDBProxy",
+        "rds:DeregisterDBProxyTargets",
+        "rds:ModifyDBProxy",
+        "rds:ModifyDBProxyTargetGroup",
+        "rds:RegisterDBProxyTargets",
+        "rds:RemoveTagsFromResource"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    }
+  ]
+}

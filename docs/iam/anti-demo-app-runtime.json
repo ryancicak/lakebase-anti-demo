@@ -1,0 +1,130 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConfirmOwnIdentityAtStartup",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadRdsCatalogUnfiltered",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBInstanceAutomatedBackups",
+        "rds:DescribeDBInstances",
+        "rds:DescribeEvents",
+        "rds:ListTagsForResource"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "RestoreSealedDatabasesIntoPerBoutArtifacts",
+      "Effect": "Allow",
+      "Action": [
+        "rds:CreateDBInstance",
+        "rds:RestoreDBClusterToPointInTime",
+        "rds:RestoreDBInstanceToPointInTime"
+      ],
+      "Resource": [
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adrc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adrc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:subgrp:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster-pg:*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:pg:*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:og:*"
+      ]
+    },
+    {
+      "Sid": "TagOnCreateSoTheReaperCanFindItsOwnResidue",
+      "Effect": "Allow",
+      "Action": "rds:AddTagsToResource",
+      "Resource": [
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adrc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adrc-*"
+      ]
+    },
+    {
+      "Sid": "DeleteOnlyPerBoutArtifactsNeverASealedResident",
+      "Effect": "Allow",
+      "Action": [
+        "rds:DeleteDBCluster",
+        "rds:DeleteDBInstance"
+      ],
+      "Resource": [
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster:adrc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adsc-*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adrc-*"
+      ]
+    },
+    {
+      "Sid": "ReadRdsManagedMasterPasswordsOnly",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:rds!*"
+    },
+    {
+      "Sid": "UseKmsThroughRdsAndSecretsManagerOnly",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateGrant",
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": [
+            "rds.<AWS_REGION>.amazonaws.com",
+            "secretsmanager.<AWS_REGION>.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadCapacityEvidenceForRoundOne",
+      "Effect": "Allow",
+      "Action": "cloudwatch:GetMetricStatistics",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "ObserveEc2SoTheOrphanReaperCanSay",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeInstances",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "AssumeTheRoundFiveControlRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anti-demo-runtime*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/*-r5-exec-*"
+      ]
+    }
+  ]
+}

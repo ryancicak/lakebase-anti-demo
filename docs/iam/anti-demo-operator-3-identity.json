@@ -1,0 +1,215 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConfirmOwnIdentity",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "iam:GetUser",
+        "iam:ListRoles"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AssumeTheRound5ControlRole",
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r5-exec-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/r5-execution-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anti-demo-runtime*"
+      ]
+    },
+    {
+      "Sid": "ManageRound5Roles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:DeleteRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRolePolicies",
+        "iam:ListRoleTags",
+        "iam:PutRolePermissionsBoundary",
+        "iam:PutRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription"
+      ],
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anti-demo-runtime*"
+      ]
+    },
+    {
+      "Sid": "ManageTheSealedRuntimeRolePolicies",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListEntitiesForPolicy",
+        "iam:ListPolicyVersions",
+        "iam:ListPolicyTags",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
+      ],
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/anti-demo-runtime-*"
+    },
+    {
+      "Sid": "ManageRound5RunnerPermissionsBoundaryPolicy",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicyVersions",
+        "iam:ListPolicyTags",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/i*-r5-runner-boundary-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/r5-*-runner-boundary-*"
+      ]
+    },
+    {
+      "Sid": "AttachOnlyTheAwsManagedSsmCorePolicy",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion"
+      ],
+      "Resource": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    },
+    {
+      "Sid": "ManageRound5RunnerInstanceProfile",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AddRoleToInstanceProfile",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:GetInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagInstanceProfile",
+        "iam:UntagInstanceProfile"
+      ],
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/i*-r5-runner-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/r5-*-runner-*"
+      ]
+    },
+    {
+      "Sid": "PassOnlyDemoOwnedRolesToTheirOwnServices",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/r5-*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": [
+            "ec2.amazonaws.com",
+            "rds.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "AllowAwsToCreateItsOwnServiceLinkedRoles",
+      "Effect": "Allow",
+      "Action": "iam:CreateServiceLinkedRole",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:AWSServiceName": [
+            "rds.amazonaws.com",
+            "ssm.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ManageDemoOwnedSecrets",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:TagResource",
+        "secretsmanager:UntagResource",
+        "secretsmanager:UpdateSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:lakebase-ant*",
+        "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:rds!*"
+      ]
+    },
+    {
+      "Sid": "ListSecretsForOwnershipReconciliation",
+      "Effect": "Allow",
+      "Action": "secretsmanager:ListSecrets",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "UseAwsManagedKeysForRdsAndSecretsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateGrant",
+        "kms:Decrypt",
+        "kms:DescribeKey",
+        "kms:GenerateDataKey"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": [
+            "rds.<AWS_REGION>.amazonaws.com",
+            "secretsmanager.<AWS_REGION>.amazonaws.com",
+            "ec2.<AWS_REGION>.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadDatabaseMetricsForCostAndCapacityEvidence",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    }
+  ]
+}

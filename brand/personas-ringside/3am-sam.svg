@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">3 A.M. Sam — SRE ringside portrait</title><desc id="desc">An original 8-bit incident observer leaning diagonally in a chair with a bright pager integrated into the collar.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#171A38" stroke="#F8D83B" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#43D17A" stroke-width="6"/>
+  <g fill="#F8D83B"><rect x="61" y="62" width="20" height="20"/><rect x="109" y="92" width="13" height="13"/><rect x="397" y="63" width="18" height="18"/></g>
+  <path d="M42 279H470M42 334H470M42 389H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 287H470M42 342H470M42 397H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- chair and diagonal capable slump -->
+  <path d="M104 117H392V442H104Z" fill="#1B2758" stroke="#3158A3" stroke-width="13"/><path d="M125 432L153 314L215 279L355 323L391 432Z" fill="#6A4F7D"/>
+  <g transform="rotate(-9 259 219)">
+    <path d="M173 151H200V121H314V151H341V246L314 279H200L173 246Z" fill="#6F4934"/><path d="M174 155L198 113L225 128L256 101L283 127L316 112L340 155L309 139L278 150L247 136L214 150Z" fill="#25202A"/>
+    <!-- alert eyes despite the late hour -->
+    <rect x="208" y="178" width="28" height="18" fill="#070B22"/><rect x="278" y="178" width="28" height="18" fill="#070B22"/><rect x="229" y="238" width="57" height="15" fill="#34211B"/>
+  </g>
+  <!-- one bare hand props the cheek -->
+  <path d="M143 274L177 239L208 270L175 317Z" fill="#6F4934"/><rect x="130" y="260" width="42" height="52" fill="#6F4934"/>
+  <path d="M172 306L246 364L327 307" fill="none" stroke="#FFF4C2" stroke-width="16"/>
+  <!-- pager integrated into collar -->
+  <rect x="232" y="343" width="83" height="47" fill="#10152F" stroke="#F8D83B" stroke-width="8"/><text x="274" y="374" font-family="Menlo,monospace" font-size="20" font-weight="900" fill="#43D17A" text-anchor="middle">03:00</text>
+  <rect x="68" y="406" width="376" height="68" fill="#111938" stroke="#F8D83B" stroke-width="8"/><path d="M95 443H191M322 443H417" stroke="#43D17A" stroke-width="9"/>
+</svg>

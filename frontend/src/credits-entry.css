@@ -1,0 +1,266 @@
+/* The credits trigger, the layer the roll is portalled into, and the standing
+ * note it shows over a live bout.
+ *
+ * No new colors. --yellow, --cream and --blue are the app's own :root tokens,
+ * and the focus ring is inherited from the global `button:focus-visible` rule
+ * in styles.css (5px solid var(--yellow)) rather than redefined here.
+ *
+ * Placement of each trigger belongs to the screen that hosts it and lives in
+ * styles.css next to that screen's other rules; this file owns only how the
+ * control looks and how the overlay is layered.
+ */
+
+/* ---- The trigger ----
+ *
+ * The app's secondary-control language, borrowed from `.game-back`: a thin
+ * slate keyline on deep navy, going yellow on hover and focus. Two instances
+ * exist -- the title screen and the final scorecard -- and they should read as
+ * the same control in two places, so the look is defined once here. */
+.credits-entry {
+  display: inline-flex;
+  align-items: baseline;
+  gap: .7em;
+  padding: 1em 1.4em;
+  border: 3px solid #5e6c9b;
+  color: #b6c1e6;
+  background: #0d1432;
+  font-size: clamp(6px, .55vw, 11px);
+  line-height: 1;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.credits-entry:hover,
+.credits-entry:focus-visible {
+  color: var(--yellow);
+  border-color: var(--yellow);
+}
+
+/* Matches `.cbar button` and the rest of the pixel chrome, which nudge down on
+   press rather than brightening. */
+.credits-entry:active { transform: translateY(2px); }
+
+@media (prefers-reduced-motion: reduce) {
+  .credits-entry:active { transform: none; }
+}
+
+/* ---- The menu cursor ----
+ *
+ * An NES menu does not print a caret beside every option; it parks one caret
+ * against the option you are on. So this is hidden at rest and appears on
+ * hover and on keyboard focus, which is the only state that means "selected"
+ * for a control that is not part of a roving list.
+ *
+ * `visibility`, not `display` or `content`: the glyph keeps its box either way,
+ * so revealing it cannot shift the label sideways. It stays aria-hidden -- it
+ * says nothing the label does not already say. */
+.credits-entry-cursor { visibility: hidden; }
+
+.credits-entry:hover .credits-entry-cursor,
+.credits-entry:focus-visible .credits-entry-cursor { visibility: visible; }
+
+/* ---- The attract blink ----
+ *
+ * Bottom-line prompts of the era (PUSH START BUTTON, PRESS START) blinked at
+ * roughly 1 Hz as a hard on/off step. `step-end` holds each half of the cycle
+ * flat, so the value jumps between 1 and 0 with nothing in between: a smooth
+ * opacity fade is the modern tell this is avoiding. */
+@keyframes credits-entry-blink {
+  0% { opacity: 1; }
+  50% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+.credits-entry { animation: credits-entry-blink 1.4s step-end infinite; }
+
+/* The blink must never be what a click lands in the middle of, and it must
+   never dim a focus ring. Any state that means somebody is addressing this
+   control pins it fully on. */
+.credits-entry:hover,
+.credits-entry:focus,
+.credits-entry:focus-visible,
+.credits-entry:active {
+  animation: none;
+  opacity: 1;
+}
+
+/* Reduced motion: steady and fully legible, never mid-blink. Set from the
+   useReducedMotion hook, the same way the roll drives `data-static`, with the
+   media query kept as the no-JS floor. */
+.credits-entry[data-static="true"] { animation: none; opacity: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .credits-entry { animation: none; opacity: 1; }
+}
+
+/* ---- The layer the roll is portalled into ----
+ *
+ * .retro-screen inside <Credits> is already `position: fixed; inset: 0`, so
+ * this only has to establish the stacking context and sit above the app.
+ * z-index 60 clears .bout-owner-overlay (30), .replay-overlay (42) and the
+ * credits' own internal layers (max 21). */
+.credits-portal {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+}
+
+/* ---- "Round still running" note ----
+ *
+ * Rendered by <Credits> when boutInFlight is true. The credits do not pause,
+ * mute, or otherwise touch a live bout, so the one thing they owe the operator
+ * is to not look like an ending. Bottom-center, clear of the B / SKIP chrome in
+ * the two bottom corners and of the scrub bar on the standalone build. */
+.credits-live-note {
+  position: absolute;
+  z-index: 8;
+  left: 50%;
+  bottom: clamp(26px, 3vh, 50px);
+  margin: 0;
+  padding: .75em 1em;
+  border: 3px solid var(--yellow);
+  color: var(--yellow);
+  background: #0d1432f2;
+  font-size: clamp(5px, .46vw, 9px);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  transform: translateX(-50%);
+}
+
+/* ---- The roll's authorship card ----
+ *
+ * WHY THESE RULES ARE HERE AND NOT IN credits.css. The roll is split across
+ * two hand-authored sheets: credits.css dresses the scene and everything that
+ * scrolls through it, and this sheet dresses the authorship card, the held
+ * mark that follows the crawl, and the footer control that opens the roll.
+ * This card already belonged to this sheet before it was redrawn, and it is
+ * still the block on the roll that credits.css does not dress.
+ *
+ * WHAT CHANGED, AND WHY IT WAS NOT THE TYPEFACE. These rules used to dress the
+ * app-wide production footer -- a 6-10px line between two colour bars, set on
+ * one nowrap row. That footer is gone, and inheriting its metrics is what made
+ * the author credit read as body copy: measured at 1440x900, `.production-credit
+ * strong` resolved to 7.2px, smaller than the fairness rules at 8.35px and the
+ * smallest type on the roll. The face was never the problem -- .retro-screen
+ * hands "Press Start 2P" to everything in here and always did. The problem was
+ * a footer's type scale on what is now a beat, and no container around it when
+ * every neighbouring beat has one.
+ *
+ * So it is now built like the crew, fairness and invitation cards: bordered
+ * --panel box, inset accent, hard shadow. The accent is `--steel`, the quietest
+ * of the four (crew is --yellow, fairness --red, invitation --blue), because
+ * this is authorship and not the climax the roll builds toward.
+ *
+ * NO `white-space: nowrap`, and no ellipsis. "Press Start 2P" is far wider per
+ * character than the ui-monospace this line used to fall back to, so a
+ * letter-spaced display string that could not wrap is precisely how a 390px
+ * overflow would be reintroduced. The name must WRAP -- a clipped author credit
+ * is worse than a two-line one -- which is the same rule credits.css records in
+ * its `.credits-finale` removal note, and credits-layout.test.tsx enforces
+ * against both sheets.
+ *
+ * Portrait BESIDE the name, stacking below 640px: the reasoning is carried
+ * forward by that same removal note and it still holds. A picture stacked on a
+ * caption reads as a logo; a portrait paired with a name reads as a billing. */
+.production-credit {
+  position: relative;
+  z-index: 21;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(16px, 2vw, 34px);
+  width: min(880px, 90%);
+  margin: 0 auto;
+  padding: clamp(20px, 2.4vw, 38px) clamp(18px, 2.2vw, 34px);
+  border: clamp(5px, .55vw, 10px) solid var(--cream);
+  background: var(--panel);
+  box-shadow: inset 0 clamp(6px, .6vw, 12px) var(--steel), .7em .7em 0 var(--sink, #050817);
+}
+.production-credit img {
+  flex: none;
+  width: clamp(84px, 7.6vw, 136px);
+  image-rendering: pixelated;
+}
+/* Pinned for the same reason every grid inside the roll is: an implicit `auto`
+   track takes its minimum from its widest item, so the name would push this
+   column past the frame instead of wrapping inside it. */
+.production-credit > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: clamp(10px, 1.3vh, 18px);
+  min-width: 0;
+  text-align: left;
+}
+.production-credit strong {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--cream);
+  font-size: clamp(11px, 1.15vw, 23px);
+  line-height: 1.4;
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  text-shadow: 4px 4px var(--sink, #050817);
+  overflow-wrap: break-word;
+}
+.production-credit small {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--yellow);
+  font-size: clamp(6px, .58vw, 11px);
+  line-height: 1.5;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  overflow-wrap: break-word;
+}
+
+@media (max-width: 640px) {
+  .production-credit { flex-direction: column; }
+  .production-credit > div { text-align: center; }
+}
+
+/* ---- The held card after the crawl ----
+ *
+ * The outro no longer repeats the author; it holds the game's own mark, which
+ * is what an arcade ending held before the attract loop came back round. See
+ * the note in credits.tsx for why the authorship claim went to the roll rather
+ * than staying here.
+ *
+ * `.credits-outro` itself -- the absolute layer, the centring and the step-in
+ * animation -- is in credits.css and is not touched. */
+.credits-outro-ring {
+  width: clamp(64px, 5.4vw, 104px);
+  height: auto;
+  image-rendering: pixelated;
+}
+.credits-outro-title {
+  display: grid;
+  grid-template-columns: minmax(12px, 110px) minmax(0, auto) minmax(12px, 110px);
+  align-items: center;
+  justify-content: center;
+  gap: clamp(10px, 1vw, 20px);
+  width: min(100%, 760px);
+  margin: 0;
+  padding: 0 clamp(10px, 2vw, 24px);
+}
+.credits-outro-title strong {
+  min-width: 0;
+  color: var(--cream);
+  font-size: clamp(16px, 1.9vw, 38px);
+  line-height: 1.1;
+  letter-spacing: .1em;
+  text-align: center;
+  text-transform: uppercase;
+  text-shadow: 5px 5px var(--sink, #050817);
+  overflow-wrap: break-word;
+}
+/* The bars the production line used to carry, kept because they are the one
+   piece of that card worth holding on to. */
+.credits-outro-title > span { height: 3px; background: linear-gradient(90deg, var(--red) 0 33%, var(--yellow) 33% 66%, var(--blue) 66%); }
+.credits-outro-tagline {
+  color: var(--yellow);
+  font-size: clamp(7px, .7vw, 14px);
+  font-style: normal;
+  letter-spacing: .22em;
+  text-align: center;
+  text-transform: uppercase;
+}

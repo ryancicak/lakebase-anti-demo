@@ -1,0 +1,222 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="2100" viewBox="0 0 2400 2100" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase persona boxer portraits — options sheet one</title>
+  <desc id="desc">Two original retro boxing portrait directions each for Backfill Bill, Stacktrace Jack, Count Query, Major Pattern, and Doctor Drift.</desc>
+  <style>
+    .name{font-family:Arial Black,Helvetica Neue,Arial,sans-serif;font-weight:900;fill:#FFF4C2}
+    .role,.copy,.concept,.quote,.option,.tiny{font-family:Menlo,Monaco,Courier New,monospace;font-weight:900}
+    .role{fill:#FFF4C2;font-size:22px;letter-spacing:1px}
+    .concept{fill:#FFF4C2;font-size:27px}
+    .copy{fill:#D7D9D4;font-size:20px}
+    .quote{fill:#F8D83B;font-size:24px}
+    .option{fill:#10152F;font-size:25px;text-anchor:middle}
+    .tiny{fill:#FFF4C2;font-size:12px}
+    .eye{fill:#070B22}
+    .mouth{fill:#4A2A22}
+  </style>
+  <defs>
+    <g id="ring">
+      <rect width="460" height="236" fill="#101733" stroke="#F1EBD7" stroke-width="6"/>
+      <path d="M18 74H442M18 132H442M18 190H442" stroke="#4A83E8" stroke-width="7"/>
+      <path d="M18 82H442M18 140H442M18 198H442" stroke="#FFF4C2" stroke-width="4"/>
+      <rect x="18" y="34" width="18" height="184" fill="#EE452D"/><rect x="424" y="34" width="18" height="184" fill="#EE452D"/>
+      <path d="M8 218H452L430 233H30Z" fill="#1B2758"/>
+    </g>
+  </defs>
+
+  <rect width="2400" height="2100" fill="#070B22"/>
+  <rect x="24" y="24" width="2352" height="2052" fill="none" stroke="#4A83E8" stroke-width="16"/>
+  <rect x="48" y="48" width="2304" height="2004" fill="none" stroke="#EE452D" stroke-width="8"/>
+  <text x="1200" y="104" class="name" font-size="48" text-anchor="middle">CHOOSE YOUR FIGHTER — BOXER RUNOFF 1/2</text>
+  <text x="1200" y="137" class="copy" font-size="19" text-anchor="middle">BOXING SILHOUETTE FIRST · ONE PERSONA CUE · PICK A OR B</text>
+
+  <!-- BACKFILL BILL A — barrel-chested pressure fighter -->
+  <g transform="translate(48 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">BACKFILL BILL</text><text x="1110" y="48" class="role" text-anchor="end">DATA ENGINEER</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- low pressure crouch -->
+      <path d="M133 225V188L158 156H302L327 188V225Z" fill="#EE452D"/><rect x="173" y="184" width="114" height="41" fill="#1B2758"/>
+      <path d="M173 181L121 137L143 111L201 157Z" fill="#B96F45"/><path d="M287 157L333 119L354 145L305 183Z" fill="#B96F45"/>
+      <!-- pipe-elbow glove cuffs -->
+      <path d="M89 87H143V106H165V153H107V134H84V105Z" fill="#F8D83B"/><path d="M295 91H350V110H373V147H350V163H296V139H318V117H295Z" fill="#F8D83B"/>
+      <path d="M94 80H139L154 95V132L139 146H96L82 132V96Z" fill="#EE452D"/><path d="M321 83H365L380 98V134L365 149H322L307 134V99Z" fill="#EE452D"/>
+      <path d="M175 65H192V45H269V65H287V123L268 142H193L174 123Z" fill="#B96F45"/><rect x="193" y="79" width="19" height="14" class="eye"/><rect x="249" y="79" width="19" height="14" class="eye"/><rect x="211" y="116" width="43" height="12" class="mouth"/>
+      <path d="M173 65L191 40H271L288 65L257 55L230 63L204 53Z" fill="#2A201D"/>
+      <rect x="184" y="191" width="95" height="11" fill="#F8D83B"/><path d="M193 198H270" stroke="#43D17A" stroke-width="8" stroke-dasharray="13 8"/>
+    </g>
+    <text x="520" y="132" class="concept">PIPELINE PRESSURE</text><text x="520" y="176" class="copy">Low pressure crouch · pipe-elbow cuffs</text>
+    <text x="520" y="216" class="copy">A stocky fighter who keeps every row moving</text><text x="520" y="286" class="quote">“Late data still lands.”</text>
+  </g>
+
+  <!-- BACKFILL BILL B — tall streaming jabber -->
+  <g transform="translate(1214 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#4A83E8" stroke-width="8"/><rect width="1138" height="72" fill="#3158A3"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">BACKFILL BILL</text><text x="1110" y="48" class="role" text-anchor="end">DATA ENGINEER</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- rear-loaded long jab -->
+      <path d="M188 225V158H309L332 225Z" fill="#3158A3"/><path d="M207 152L150 116L164 91L229 135Z" fill="#8F5A3C"/><path d="M291 157L327 108L353 125L316 178Z" fill="#8F5A3C"/>
+      <path d="M78 82H143L159 98V126L143 142H78L62 126V98Z" fill="#4A83E8"/><path d="M331 73H374L390 89V122L374 138H331L315 122V89Z" fill="#4A83E8"/>
+      <path d="M207 55H225V35H286V55H305V118L286 137H225L206 118Z" fill="#8F5A3C"/><rect x="226" y="72" width="17" height="13" class="eye"/><rect x="269" y="72" width="17" height="13" class="eye"/><rect x="239" y="111" width="36" height="11" class="mouth"/>
+      <path d="M207 57L222 31H288L306 57L282 49L255 58L232 47Z" fill="#211A20"/>
+      <!-- continuous pixel stream waistband -->
+      <rect x="190" y="178" width="136" height="17" fill="#10152F"/><rect x="196" y="183" width="24" height="7" fill="#43D17A"/><rect x="226" y="183" width="36" height="7" fill="#43D17A"/><rect x="268" y="183" width="18" height="7" fill="#F8D83B"/><rect x="292" y="183" width="28" height="7" fill="#43D17A"/>
+      <path d="M188 199H332" stroke="#FFF4C2" stroke-width="7"/><path d="M222 199V225M294 199V225" stroke="#10152F" stroke-width="7"/>
+    </g>
+    <text x="520" y="132" class="concept">STREAMING SOUTHPAW</text><text x="520" y="176" class="copy">Rear-loaded stance · continuous-row waistband</text>
+    <text x="520" y="216" class="copy">A long jab that reaches yesterday’s records</text><text x="520" y="286" class="quote">“Nothing arrives too late.”</text>
+  </g>
+
+  <!-- STACKTRACE JACK A — bracket guard -->
+  <g transform="translate(48 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">STACKTRACE JACK</text><text x="1110" y="48" class="role" text-anchor="end">SOFTWARE ENGINEER</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- compact square guard -->
+      <path d="M142 225V176L173 145H292L322 176V225Z" fill="#252B45"/><path d="M178 166L133 133L151 105L204 147Z" fill="#C98A5A"/><path d="M282 147L328 109L348 136L303 170Z" fill="#C98A5A"/>
+      <path d="M100 74H151L167 90V133L151 149H100L84 133V90Z" fill="#EE452D"/><path d="M317 77H368L384 93V136L368 152H317L301 136V93Z" fill="#EE452D"/>
+      <!-- curly bracket cuffs -->
+      <text x="158" y="151" class="name" font-size="52" text-anchor="middle">{</text><text x="310" y="153" class="name" font-size="52" text-anchor="middle">}</text>
+      <path d="M179 58H197V40H267V58H285V120L267 139H197L178 120Z" fill="#C98A5A"/><rect x="199" y="76" width="18" height="14" fill="#4A83E8"/><rect x="247" y="76" width="18" height="14" fill="#4A83E8"/><rect x="212" y="114" width="41" height="11" class="mouth"/>
+      <path d="M178 61L197 35H269L286 61L259 51L231 58L206 49Z" fill="#171923"/>
+      <path d="M170 183L231 213L296 183" fill="none" stroke="#FF735E" stroke-width="10"/><path d="M190 190L231 211L272 190" fill="none" stroke="#FFF4C2" stroke-width="5"/>
+    </g>
+    <text x="520" y="132" class="concept">BRACKET BRAWLER</text><text x="520" y="176" class="copy">Compact high guard · opposing brace cuffs</text>
+    <text x="520" y="216" class="copy">Closes every opening before throwing the fix</text><text x="520" y="286" class="quote">“Reproduce. Isolate. Counter.”</text>
+  </g>
+
+  <!-- STACKTRACE JACK B — stepped outside boxer -->
+  <g transform="translate(1214 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#43D17A" stroke-width="8"/><rect width="1138" height="72" fill="#23834D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">STACKTRACE JACK</text><text x="1110" y="48" class="role" text-anchor="end">SOFTWARE ENGINEER</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- long outside-boxer stance -->
+      <path d="M183 225V158H305L331 225Z" fill="#23834D"/><path d="M205 158L116 168L108 139L216 130Z" fill="#6F4934"/><path d="M284 150L325 89L351 105L311 171Z" fill="#6F4934"/>
+      <path d="M63 133H117L134 149V177L117 193H63L47 177V149Z" fill="#43D17A"/><path d="M328 61H375L391 77V117L375 133H328L312 117V77Z" fill="#43D17A"/>
+      <path d="M206 52H224V34H286V52H304V116L286 135H224L205 116Z" fill="#6F4934"/><rect x="226" y="70" width="17" height="13" class="eye"/><rect x="268" y="70" width="17" height="13" class="eye"/><rect x="239" y="109" width="35" height="11" class="mouth"/>
+      <path d="M206 54L222 30H288L305 54L280 47L254 55L231 46Z" fill="#10152F"/>
+      <!-- stack-frame lapel -->
+      <path d="M198 157H231V171H218V184H244V198H230V212H260V225H195Z" fill="#10152F"/><path d="M248 157H292V225H268V210H281V196H257V182H271V169H248Z" fill="#FFF4C2"/>
+    </g>
+    <text x="520" y="132" class="concept">STACK-FRAME OUTBOXER</text><text x="520" y="176" class="copy">Long measuring jab · stepped-frame lapels</text>
+    <text x="520" y="216" class="copy">Finds the failing frame without trading chaos</text><text x="520" y="286" class="quote">“Trace it. Then strike.”</text>
+  </g>
+
+  <!-- COUNT QUERY A — tall counterpunching Count -->
+  <g transform="translate(48 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/><rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">COUNT QUERY</text><text x="1110" y="48" class="role" text-anchor="end">DATA ANALYST</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- tall counterpuncher with high-collared robe -->
+      <path d="M172 225L183 150L214 132H282L312 151L330 225Z" fill="#513A98"/><path d="M182 154L207 119L229 151L258 119L290 153" fill="#10152F" stroke="#FFF4C2" stroke-width="8"/>
+      <path d="M200 164L144 128L158 101L221 142Z" fill="#D7D9D4"/><path d="M282 150L326 108L350 130L305 174Z" fill="#D7D9D4"/>
+      <path d="M99 77H151L167 93V133L151 149H99L83 133V93Z" fill="#9B6CFF"/><path d="M326 78H373L389 94V130L373 146H326L310 130V94Z" fill="#9B6CFF"/>
+      <path d="M198 57H216V39H281V57H299V119L281 139H216L197 119Z" fill="#D7D9D4"/><path d="M197 59L215 35H283L300 59L273 50L248 58L223 49Z" fill="#16131F"/>
+      <rect x="216" y="74" width="19" height="14" class="eye"/><rect x="264" y="74" width="19" height="14" class="eye"/>
+      <!-- COUNT lens is part of headguard -->
+      <rect x="252" y="65" width="47" height="37" fill="none" stroke="#F8D83B" stroke-width="6"/><text x="276" y="89" class="tiny" text-anchor="middle">COUNT</text><path d="M295 98L318 120" stroke="#F8D83B" stroke-width="6"/>
+      <rect x="229" y="115" width="38" height="10" fill="#6B1C2B"/><path d="M229 225L249 199L269 225" fill="#F8D83B"/>
+    </g>
+    <text x="520" y="132" class="concept">THE COUNT</text><text x="520" y="176" class="copy">Tall counterpuncher · COUNT lens headguard</text>
+    <text x="520" y="216" class="copy">Waits for the number, then makes it matter</text><text x="520" y="286" class="quote">“One query. One answer.”</text>
+  </g>
+
+  <!-- COUNT QUERY B — compact metric body puncher -->
+  <g transform="translate(1214 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#F8D83B" stroke-width="8"/><rect width="1138" height="72" fill="#A36B00"/>
+    <rect x="14" y="13" width="48" height="46" fill="#FFF4C2"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">COUNT QUERY</text><text x="1110" y="48" class="role" text-anchor="end">DATA ANALYST</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- short wide body-punching crouch -->
+      <path d="M116 225V178L154 150H314L349 180V225Z" fill="#A36B00"/><path d="M177 163L123 136L135 107L204 143Z" fill="#8F5A3C"/><path d="M287 143L340 129L351 158L307 174Z" fill="#8F5A3C"/>
+      <path d="M75 77H143L160 94V137L143 154H75L58 137V94Z" fill="#F8D83B"/><path d="M330 95H389L406 112V151L389 168H330L313 151V112Z" fill="#F8D83B"/>
+      <!-- abacus rails are built into the glove faces -->
+      <g stroke="#10152F" stroke-width="5"><path d="M73 103H146M73 120H146M73 137H146"/><path d="M329 120H393M329 137H393M329 154H393"/></g><g fill="#EE452D"><rect x="86" y="98" width="12" height="10"/><rect x="118" y="115" width="12" height="10"/><rect x="98" y="132" width="12" height="10"/><rect x="344" y="115" width="12" height="10"/><rect x="369" y="132" width="12" height="10"/></g>
+      <path d="M177 61H197V43H267V61H287V122L267 142H197L176 122Z" fill="#8F5A3C"/><rect x="198" y="78" width="20" height="14" class="eye"/><rect x="248" y="78" width="20" height="14" class="eye"/><rect x="214" y="116" width="38" height="11" class="mouth"/>
+      <path d="M176 63L196 38H269L288 63L258 53L232 61L205 51Z" fill="#2A201D"/>
+      <rect x="174" y="190" width="117" height="23" fill="#10152F"/><text x="233" y="207" class="tiny" text-anchor="middle">COUNT(*)</text>
+    </g>
+    <text x="520" y="132" class="concept">METRIC BODY PUNCHER</text><text x="520" y="176" class="copy">Deep crouch · abacus-knuckle gloves</text>
+    <text x="520" y="216" class="copy">Turns every claim into a checked result</text><text x="520" y="286" class="quote">“Show me the number.”</text>
+  </g>
+
+  <!-- MAJOR PATTERN A — modular robe boxer -->
+  <g transform="translate(48 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#43D17A" stroke-width="8"/><rect width="1138" height="72" fill="#23834D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">MAJOR PATTERN</text><text x="1110" y="48" class="role" text-anchor="end">ARCHITECT / IT</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- ruler-straight upright stance -->
+      <path d="M166 225V143L196 124H274L304 143V225Z" fill="#23834D"/>
+      <!-- modular grid cut into floor-length robe -->
+      <g stroke="#43D17A" stroke-width="6"><path d="M180 151H291M180 178H291M180 205H291"/><path d="M207 139V225M235 139V225M263 139V225"/></g>
+      <path d="M194 151L150 113L168 89L218 132Z" fill="#C98A5A"/><path d="M277 132L321 91L342 114L299 156Z" fill="#C98A5A"/>
+      <path d="M111 66H159L175 82V124L159 140H111L95 124V82Z" fill="#43D17A"/><path d="M318 65H366L382 81V123L366 139H318L302 123V81Z" fill="#43D17A"/>
+      <path d="M194 48H212V30H278V48H296V111L278 130H212L193 111Z" fill="#C98A5A"/><rect x="213" y="66" width="18" height="14" class="eye"/><rect x="259" y="66" width="18" height="14" class="eye"/><rect x="226" y="105" width="37" height="11" class="mouth"/>
+      <path d="M194 50L211 26H280L297 50L270 42L245 49L221 41Z" fill="#3A241B"/>
+      <path d="M166 225H304" stroke="#FFF4C2" stroke-width="8"/>
+    </g>
+    <text x="520" y="132" class="concept">MODULAR OUTBOXER</text><text x="520" y="176" class="copy">Upright narrow guard · reusable-grid robe</text>
+    <text x="520" y="216" class="copy">Gives every team a safe path into the ring</text><text x="520" y="286" class="quote">“Build once. Move freely.”</text>
+  </g>
+
+  <!-- MAJOR PATTERN B — compass-seam southpaw -->
+  <g transform="translate(1214 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#4A83E8" stroke-width="8"/><rect width="1138" height="72" fill="#3158A3"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">MAJOR PATTERN</text><text x="1110" y="48" class="role" text-anchor="end">ARCHITECT / IT</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- broad cross-arm southpaw -->
+      <path d="M131 225V174L169 143H307L344 174V225Z" fill="#3158A3"/><path d="M180 152L290 105L305 135L198 181Z" fill="#8F5A3C"/><path d="M291 150L181 111L168 141L279 181Z" fill="#8F5A3C"/>
+      <path d="M100 94H160L177 111V151L160 168H100L83 151V111Z" fill="#4A83E8"/><path d="M304 88H366L383 105V145L366 162H304L287 145V105Z" fill="#4A83E8"/>
+      <!-- four-point compass roses span both glove backs -->
+      <path d="M139 105L147 120L161 127L147 134L139 152L131 134L117 127L131 120Z" fill="#F8D83B"/><rect x="135" y="123" width="8" height="8" fill="#3158A3"/>
+      <path d="M343 98L351 113L365 120L351 127L343 145L335 127L321 120L335 113Z" fill="#F8D83B"/><rect x="339" y="116" width="8" height="8" fill="#3158A3"/>
+      <path d="M190 49H210V31H277V49H297V111L277 132H210L189 111Z" fill="#8F5A3C"/><rect x="211" y="67" width="19" height="14" class="eye"/><rect x="257" y="67" width="19" height="14" class="eye"/><rect x="224" y="106" width="39" height="11" class="mouth"/>
+      <path d="M190 51L208 27H279L298 51L269 43L243 51L219 42Z" fill="#211A20"/>
+      <rect x="172" y="190" width="130" height="25" fill="#10152F"/><path d="M189 198H285" stroke="#C7E1FF" stroke-width="5" stroke-dasharray="14 8"/>
+    </g>
+    <text x="520" y="132" class="concept">COMPASS SOUTHPAW</text><text x="520" y="176" class="copy">Broad cross-arm guard · compass-seam gloves</text>
+    <text x="520" y="216" class="copy">Maps repeatable routes without blocking choice</text><text x="520" y="286" class="quote">“Every path has a pattern.”</text>
+  </g>
+
+  <!-- DOCTOR DRIFT A — bell-curve switch hitter -->
+  <g transform="translate(48 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/><rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">DOCTOR DRIFT</text><text x="1110" y="48" class="role" text-anchor="end">DATA SCIENTIST / ML</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- tall open switch-hitter stance -->
+      <path d="M180 225V155H300L322 225Z" fill="#513A98"/><path d="M204 155L139 134L148 105L221 132Z" fill="#C98A5A"/><path d="M281 140L330 104L349 128L301 169Z" fill="#C98A5A"/>
+      <path d="M90 91H146L162 107V143L146 159H90L74 143V107Z" fill="#9B6CFF"/><path d="M329 77H376L392 93V129L376 145H329L313 129V93Z" fill="#EE452D"/>
+      <path d="M201 58H219V40H282V58H300V119L282 139H219L200 119Z" fill="#C98A5A"/><rect x="220" y="77" width="18" height="13" class="eye"/><rect x="263" y="77" width="18" height="13" class="eye"/><rect x="233" y="113" width="35" height="11" class="mouth"/>
+      <!-- bell-curve crest is the headguard, not wild hair -->
+      <path d="M198 61V47H211L224 29L238 47L250 14L263 47L277 29L290 47H302V61Z" fill="#FFF4C2"/><path d="M207 69H294" stroke="#9B6CFF" stroke-width="7"/>
+      <rect x="188" y="183" width="126" height="24" fill="#10152F"/><path d="M196 199C220 199 220 181 250 181C280 181 280 199 306 199" fill="none" stroke="#F8D83B" stroke-width="6"/>
+    </g>
+    <text x="520" y="132" class="concept">BELL-CURVE SWITCH HITTER</text><text x="520" y="176" class="copy">Open stance · distribution-crest headguard</text>
+    <text x="520" y="216" class="copy">Changes stance when the baseline moves</text><text x="520" y="286" class="quote">“Your baseline moved.”</text>
+  </g>
+
+  <!-- DOCTOR DRIFT B — probability power guard -->
+  <g transform="translate(1214 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#21D4C2" stroke-width="8"/><rect width="1138" height="72" fill="#147A72"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">DOCTOR DRIFT</text><text x="1110" y="48" class="role" text-anchor="end">DATA SCIENTIST / ML</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- compact coiled power guard -->
+      <path d="M126 225V176L161 146H315L349 176V225Z" fill="#147A72"/><path d="M183 158L142 124L161 100L210 141Z" fill="#8F5A3C"/><path d="M291 141L331 99L353 121L312 164Z" fill="#8F5A3C"/>
+      <path d="M91 67H154L172 85V137L154 155H91L73 137V85Z" fill="#21D4C2"/><path d="M328 67H391L409 85V137L391 155H328L310 137V85Z" fill="#EE452D"/>
+      <text x="122" y="122" class="name" font-size="31" text-anchor="middle">.9</text><text x="359" y="122" class="name" font-size="31" text-anchor="middle">.1</text>
+      <path d="M190 55H210V37H278V55H298V119L278 139H210L189 119Z" fill="#8F5A3C"/><rect x="211" y="74" width="19" height="14" class="eye"/><rect x="258" y="74" width="19" height="14" class="eye"/><rect x="224" y="113" width="40" height="11" class="mouth"/>
+      <path d="M190 57L208 33H280L299 57L269 48L243 56L218 47Z" fill="#25202A"/>
+      <rect x="171" y="185" width="132" height="24" fill="#10152F"/><path d="M183 197H291" stroke="#F8D83B" stroke-width="7"/><path d="M221 197L236 185L251 201L268 180" fill="none" stroke="#21D4C2" stroke-width="5"/>
+    </g>
+    <text x="520" y="132" class="concept">PROBABILITY POWER GUARD</text><text x="520" y="176" class="copy">Compact coiled stance · probability gloves</text>
+    <text x="520" y="216" class="copy">Knows which punch is likely—and when it drifts</text><text x="520" y="286" class="quote">“Confidence is measurable.”</text>
+  </g>
+</svg>

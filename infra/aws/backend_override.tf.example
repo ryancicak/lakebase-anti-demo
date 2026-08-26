@@ -1,0 +1,33 @@
+# Reference copy of the file `_terraform_init` generates when a generation has
+# opted into S3 state. Never rename this to `backend_override.tf` by hand: that
+# name is gitignored and machine-owned, regenerated on every init from
+# `<manifest dir>/terraform-backend.json`, and hand-editing it is how one
+# generation ends up pointed at another generation's state.
+#
+# Terraform's override mechanism: any file named `*_override.tf` is merged last,
+# and a `backend` block in it replaces the one in versions.tf entirely. That is
+# what makes two modes possible without two backend blocks, which Terraform
+# rejects, and without variables in a backend block, which Terraform also
+# rejects.
+#
+# Every value here is a literal because backend blocks cannot interpolate. The
+# generator substitutes them from the generation's record.
+
+terraform {
+  backend "s3" {
+    bucket = "REPLACED-WITH-STATE-BUCKET"
+    key    = "anti-demo/REPLACED-WITH-GENERATION/terraform.tfstate"
+    region = "REPLACED-WITH-REGION"
+
+    # S3-native state locking, GA in Terraform 1.11. It writes a sibling
+    # `<key>.tflock` object for the duration of an operation, which is why the
+    # IAM policy needs DeleteObject on `<key>.tflock` but not on `<key>`.
+    # Deliberately no `dynamodb_table`: DynamoDB locking is deprecated and would
+    # add a second billed resource that `antidemo cleanup` does not know to destroy.
+    use_lockfile = true
+
+    # Belt and braces. The bucket bootstrap.sh creates already has SSE-S3 as its
+    # default, so this matters only for a pre-existing bucket without it.
+    encrypt = true
+  }
+}

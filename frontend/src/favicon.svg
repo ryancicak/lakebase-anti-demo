@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" shape-rendering="crispEdges">
+  <!-- A navy outer silhouette keeps the pale posts visible on light browser chrome. -->
+  <path d="M2 4H8V30H2ZM24 4H30V30H24Z" fill="#08112E"/>
+  <path d="M4 6H6V28H4ZM26 6H28V28H26Z" fill="#FFF4C2"/>
+
+  <!-- Corner caps remain oversized so their red/blue identity survives at 16px. -->
+  <path d="M0 2H10V8H0ZM22 2H32V8H22Z" fill="#08112E"/>
+  <path d="M2 4H8V6H2Z" fill="#EE452D"/>
+  <path d="M24 4H30V6H24Z" fill="#4A83E8"/>
+
+  <!-- Dark undersides separate every rope from both light and dark tab themes. -->
+  <path d="M6 8H26V12H6ZM6 14H26V18H6ZM6 20H26V24H6Z" fill="#08112E"/>
+  <path d="M6 8H26V10H6Z" fill="#EE452D"/>
+  <path d="M6 14H26V16H6Z" fill="#F8D83B"/>
+  <path d="M6 20H26V22H6Z" fill="#4A83E8"/>
+
+  <path d="M6 22H26L22 30H10Z" fill="#08112E"/>
+  <path d="M9 24H23L21 28H11Z" fill="#1C2B60"/>
+</svg>

@@ -1,0 +1,240 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="2100" viewBox="0 0 2400 2100" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase persona fighter portraits — options sheet two</title>
+  <desc id="desc">Two original 8-bit portrait directions each for Lockjaw Lucy, 3 A.M. Sam, The Big Why, Cipher Viper, and Launch-Day Lola.</desc>
+  <style>
+    .name{font-family:Arial Black,Helvetica Neue,Arial,sans-serif;font-weight:900;fill:#FFF4C2}
+    .role,.copy,.quote,.option{font-family:Menlo,Monaco,Courier New,monospace;font-weight:900}
+    .role{fill:#FFF4C2;font-size:22px;letter-spacing:1px}
+    .copy{fill:#D7D9D4;font-size:24px}
+    .quote{fill:#F8D83B;font-size:25px}
+    .option{fill:#10152F;font-size:25px;text-anchor:middle}
+  </style>
+
+  <rect width="2400" height="2100" fill="#070B22"/>
+  <rect x="24" y="24" width="2352" height="2052" fill="none" stroke="#4A83E8" stroke-width="16"/>
+  <rect x="48" y="48" width="2304" height="2004" fill="none" stroke="#EE452D" stroke-width="8"/>
+  <text x="1200" y="104" class="name" font-size="48" text-anchor="middle">CHOOSE YOUR CORNER — PORTRAIT RUNOFF 2/2</text>
+  <text x="1200" y="137" class="copy" font-size="19" text-anchor="middle">PICK A OR B FOR EACH FIGHTER · ALL ART IS ORIGINAL AND EDITABLE</text>
+
+  <!-- LOCKJAW LUCY A: transaction enforcer -->
+  <g transform="translate(48 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">LOCKJAW LUCY</text><text x="1110" y="48" class="role" text-anchor="end">DBA</text>
+    <rect x="22" y="91" width="400" height="236" fill="#1B2758" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- chain/transaction backdrop -->
+    <g fill="none" stroke="#8A95A8" stroke-width="12"><rect x="43" y="117" width="72" height="38"/><rect x="91" y="151" width="72" height="38"/><rect x="316" y="112" width="72" height="38"/><rect x="268" y="146" width="72" height="38"/></g>
+    <!-- torso, key belt -->
+    <path d="M107 318V267H145V240H323V267H361V318Z" fill="#7B2636"/><rect x="168" y="249" width="132" height="69" fill="#10152F"/>
+    <rect x="174" y="286" width="120" height="18" fill="#F8D83B"/><circle cx="207" cy="295" r="13" fill="#FFF4C2"/><circle cx="262" cy="295" r="13" fill="#FFF4C2"/>
+    <!-- face/hair -->
+    <path d="M146 147H176V125H292V147H322V226H294V250H174V226H146Z" fill="#8F5A3C"/>
+    <path d="M151 151L163 119L196 101L236 116L272 101L309 128L316 161L289 146L265 155L231 138L197 155L169 144Z" fill="#211A20"/>
+    <rect x="179" y="169" width="34" height="17" fill="#10152F"/><rect x="254" y="169" width="34" height="17" fill="#10152F"/>
+    <!-- padlock mouthguard -->
+    <rect x="198" y="210" width="72" height="35" fill="#F8D83B"/><rect x="215" y="197" width="38" height="26" fill="none" stroke="#F8D83B" stroke-width="9"/><rect x="229" y="221" width="10" height="15" fill="#10152F"/>
+    <rect x="84" y="255" width="72" height="61" fill="#EE452D"/><rect x="312" y="255" width="72" height="61" fill="#EE452D"/>
+    <text x="468" y="132" class="copy">TRANSACTION ENFORCER</text><text x="468" y="174" class="copy">Padlock guard · key-ring belt</text>
+    <text x="468" y="214" class="copy">Her clinch never releases early</text><text x="468" y="286" class="quote">“Nobody commits till I say.”</text>
+  </g>
+
+  <!-- LOCKJAW LUCY B: vault keeper -->
+  <g transform="translate(1214 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#8A95A8" stroke-width="8"/><rect width="1138" height="72" fill="#4C5668"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">LOCKJAW LUCY</text><text x="1110" y="48" class="role" text-anchor="end">DBA</text>
+    <rect x="22" y="91" width="400" height="236" fill="#202633" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- vault door -->
+    <circle cx="92" cy="181" r="58" fill="#4C5668" stroke="#8A95A8" stroke-width="10"/><circle cx="92" cy="181" r="18" fill="#F8D83B"/>
+    <path d="M92 125V237M36 181H148M52 141L132 221M132 141L52 221" stroke="#D7D9D4" stroke-width="7"/>
+    <!-- armored torso -->
+    <path d="M117 318V267H151V240H325V267H359V318Z" fill="#4C5668"/><rect x="180" y="247" width="116" height="71" fill="#10152F"/>
+    <circle cx="238" cy="282" r="27" fill="#F8D83B"/><path d="M238 260V304M216 282H260" stroke="#10152F" stroke-width="8"/>
+    <!-- vault helmet face -->
+    <path d="M151 148H180V126H294V148H323V228H296V251H178V228H151Z" fill="#C98A5A"/>
+    <path d="M145 155V124H178V102H296V124H329V155H303V138H171V155Z" fill="#4C5668"/>
+    <rect x="183" y="169" width="37" height="19" fill="#10152F"/><rect x="254" y="169" width="37" height="19" fill="#10152F"/>
+    <rect x="199" y="215" width="75" height="18" fill="#4C5668"/>
+    <!-- lock gloves -->
+    <rect x="84" y="252" width="74" height="64" fill="#8A95A8"/><rect x="311" y="252" width="74" height="64" fill="#8A95A8"/>
+    <text x="468" y="132" class="copy">VAULT KEEPER</text><text x="468" y="174" class="copy">Vault helmet · transaction wheel</text>
+    <text x="468" y="214" class="copy">Old-school control, zero surprises</text><text x="468" y="286" class="quote">“Commit when the vault opens.”</text>
+  </g>
+
+  <!-- 3 A.M. SAM A: bathrobe on-call -->
+  <g transform="translate(48 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#F8D83B" stroke-width="8"/><rect width="1138" height="72" fill="#A36B00"/>
+    <rect x="14" y="13" width="48" height="46" fill="#FFF4C2"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">3 A.M. SAM</text><text x="1110" y="48" class="role" text-anchor="end">SRE</text>
+    <rect x="22" y="91" width="400" height="236" fill="#171A38" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- stars and alarm -->
+    <g fill="#F8D83B"><rect x="48" y="115" width="18" height="18"/><rect x="94" y="151" width="13" height="13"/><rect x="349" y="119" width="17" height="17"/></g>
+    <rect x="318" y="154" width="70" height="54" fill="#EE452D"/><rect x="330" y="166" width="46" height="30" fill="#10152F"/><text x="353" y="189" class="name" font-size="17" text-anchor="middle">03</text>
+    <!-- bathrobe torso -->
+    <path d="M105 318V267H144V239H325V267H364V318Z" fill="#6A4F7D"/><path d="M174 242L234 287L296 242" fill="none" stroke="#F1EBD7" stroke-width="16"/>
+    <rect x="171" y="294" width="127" height="14" fill="#F1EBD7"/>
+    <!-- sleepy face/hair -->
+    <path d="M145 147H174V125H294V147H323V226H296V250H172V226H145Z" fill="#6F4934"/>
+    <path d="M153 142L171 112L201 128L226 99L249 127L280 108L314 143Z" fill="#25202A"/>
+    <path d="M179 174H215M253 174H289" stroke="#10152F" stroke-width="11"/><rect x="205" y="218" width="60" height="12" fill="#34211B"/>
+    <!-- coffee and pager gloves -->
+    <rect x="79" y="257" width="79" height="59" fill="#F8D83B"/><rect x="92" y="268" width="42" height="35" fill="#3B241C"/><rect x="134" y="276" width="18" height="18" fill="none" stroke="#3B241C" stroke-width="7"/>
+    <rect x="309" y="257" width="79" height="59" fill="#EE452D"/><rect x="324" y="270" width="48" height="27" fill="#10152F"/><rect x="330" y="276" width="35" height="8" fill="#43D17A"/>
+    <text x="468" y="132" class="copy">BATHROBE ON-CALL</text><text x="468" y="174" class="copy">Coffee glove · pager glove</text>
+    <text x="468" y="214" class="copy">Half awake; completely unflappable</text><text x="468" y="286" class="quote">“Don’t ring twice.”</text>
+  </g>
+
+  <!-- 3 A.M. SAM B: incident commander -->
+  <g transform="translate(1214 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#43D17A" stroke-width="8"/><rect width="1138" height="72" fill="#23834D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">3 A.M. SAM</text><text x="1110" y="48" class="role" text-anchor="end">SRE</text>
+    <rect x="22" y="91" width="400" height="236" fill="#122A32" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- incident board -->
+    <rect x="43" y="110" width="115" height="120" fill="#10152F" stroke="#43D17A" stroke-width="6"/><path d="M56 196L81 177L103 187L122 148L145 158" fill="none" stroke="#EE452D" stroke-width="8"/>
+    <!-- command jacket -->
+    <path d="M111 318V267H149V239H326V267H364V318Z" fill="#23834D"/><rect x="179" y="246" width="118" height="72" fill="#10152F"/>
+    <rect x="193" y="261" width="38" height="15" fill="#43D17A"/><rect x="243" y="261" width="38" height="15" fill="#F8D83B"/>
+    <!-- headset face -->
+    <path d="M148 147H177V125H296V147H325V227H298V250H175V227H148Z" fill="#B96F45"/>
+    <path d="M156 142L176 111H296L316 142L286 131L256 142L225 127L189 143Z" fill="#15151B"/>
+    <rect x="181" y="168" width="37" height="18" fill="#10152F"/><rect x="257" y="168" width="37" height="18" fill="#10152F"/>
+    <path d="M151 158V215M322 158V215" stroke="#43D17A" stroke-width="12"/><path d="M322 207L287 224" stroke="#43D17A" stroke-width="8"/>
+    <rect x="209" y="216" width="60" height="13" fill="#4A2A22"/>
+    <!-- beacon gloves -->
+    <rect x="84" y="256" width="73" height="60" fill="#43D17A"/><rect x="101" y="239" width="39" height="25" fill="#EE452D"/>
+    <rect x="313" y="256" width="73" height="60" fill="#43D17A"/><rect x="330" y="239" width="39" height="25" fill="#F8D83B"/>
+    <text x="468" y="132" class="copy">INCIDENT COMMANDER</text><text x="468" y="174" class="copy">Headset · status-beacon gloves</text>
+    <text x="468" y="214" class="copy">Runs the bridge until green is proven</text><text x="468" y="286" class="quote">“Green means verified.”</text>
+  </g>
+
+  <!-- THE BIG WHY A: executive question mark -->
+  <g transform="translate(48 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#F8D83B" stroke-width="8"/><rect width="1138" height="72" fill="#A36B00"/>
+    <rect x="14" y="13" width="48" height="46" fill="#FFF4C2"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">THE BIG WHY</text><text x="1110" y="48" class="role" text-anchor="end">EXECUTIVE</text>
+    <rect x="22" y="91" width="400" height="236" fill="#1F1D31" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- one big KPI -->
+    <text x="91" y="216" class="name" font-size="105" fill="#F8D83B" text-anchor="middle">1</text>
+    <!-- pinstripe robe -->
+    <path d="M111 318V267H149V239H326V267H364V318Z" fill="#171923"/>
+    <g stroke="#D7D9D4" stroke-width="4"><path d="M170 252V318M202 246V318M268 246V318M300 252V318"/></g>
+    <path d="M184 243L237 284L291 243" fill="none" stroke="#F1EBD7" stroke-width="12"/><text x="237" y="313" class="name" font-size="54" fill="#F8D83B" text-anchor="middle">?</text>
+    <!-- head -->
+    <path d="M150 146H178V124H295V146H323V226H296V249H176V226H150Z" fill="#8F5A3C"/>
+    <path d="M160 140L177 112H300L313 140L283 130L253 139L222 126L188 142Z" fill="#27201F"/>
+    <rect x="182" y="166" width="38" height="20" fill="#10152F"/><rect x="254" y="166" width="38" height="20" fill="#10152F"/>
+    <rect x="202" y="217" width="69" height="14" fill="#34211B"/>
+    <rect x="84" y="255" width="72" height="61" fill="#F8D83B"/><rect x="313" y="255" width="72" height="61" fill="#F8D83B"/>
+    <text x="468" y="132" class="copy">PINSTRIPE QUESTIONER</text><text x="468" y="174" class="copy">Question-mark tie · one-number belt</text>
+    <text x="468" y="214" class="copy">Purpose enters the ring before product</text><text x="468" y="286" class="quote">“Skip the how. Who wins?”</text>
+  </g>
+
+  <!-- THE BIG WHY B: outcome timekeeper -->
+  <g transform="translate(1214 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#7B2636"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">THE BIG WHY</text><text x="1110" y="48" class="role" text-anchor="end">EXECUTIVE</text>
+    <rect x="22" y="91" width="400" height="236" fill="#25162A" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- stopwatch -->
+    <circle cx="91" cy="181" r="61" fill="#F8D83B" stroke="#FFF4C2" stroke-width="8"/><rect x="75" y="105" width="32" height="25" fill="#F8D83B"/><path d="M91 181L91 140M91 181L125 197" stroke="#10152F" stroke-width="9"/>
+    <!-- championship robe -->
+    <path d="M112 318V268H150V240H326V268H364V318Z" fill="#7B2636"/><path d="M176 246L237 289L299 246" fill="none" stroke="#F8D83B" stroke-width="15"/>
+    <rect x="183" y="290" width="108" height="23" fill="#F8D83B"/><text x="237" y="309" class="role" font-size="14" text-anchor="middle">OUTCOME</text>
+    <!-- face and gold ? glasses -->
+    <path d="M151 147H179V125H296V147H324V226H297V250H177V226H151Z" fill="#C98A5A"/>
+    <path d="M160 140L178 111H299L315 140L280 127L253 140L222 126L187 142Z" fill="#19171B"/>
+    <rect x="176" y="159" width="54" height="37" fill="none" stroke="#F8D83B" stroke-width="8"/><rect x="245" y="159" width="54" height="37" fill="none" stroke="#F8D83B" stroke-width="8"/><rect x="225" y="171" width="25" height="9" fill="#F8D83B"/>
+    <text x="203" y="187" class="name" font-size="26" fill="#F8D83B" text-anchor="middle">?</text><text x="272" y="187" class="name" font-size="26" fill="#F8D83B" text-anchor="middle">?</text>
+    <rect x="204" y="219" width="69" height="14" fill="#4A2A22"/>
+    <text x="468" y="132" class="copy">OUTCOME TIMEKEEPER</text><text x="468" y="174" class="copy">Stopwatch glove · KPI championship robe</text>
+    <text x="468" y="214" class="copy">Only the remembered number scores</text><text x="468" y="286" class="quote">“Why now? Prove it.”</text>
+  </g>
+
+  <!-- CIPHER VIPER A: encrypted snake -->
+  <g transform="translate(48 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#21D4C2" stroke-width="8"/><rect width="1138" height="72" fill="#147A72"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">CIPHER VIPER</text><text x="1110" y="48" class="role" text-anchor="end">INFOSEC</text>
+    <rect x="22" y="91" width="400" height="236" fill="#102B35" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- hash pixels -->
+    <g fill="#21D4C2"><rect x="43" y="115" width="22" height="22"/><rect x="74" y="143" width="16" height="16"/><rect x="49" y="174" width="28" height="28"/><rect x="354" y="118" width="20" height="20"/><rect x="332" y="151" width="28" height="28"/></g>
+    <!-- scaled robe -->
+    <path d="M109 318V267H147V239H324V267H362V318Z" fill="#147A72"/>
+    <g fill="#21D4C2"><path d="M175 254L190 270L205 254L220 270L235 254L250 270L265 254L280 270L295 254V318H175Z"/></g>
+    <!-- cobra hood/mask -->
+    <path d="M135 155L166 115H194L236 92L279 115H307L337 155L316 234L287 258H185L156 234Z" fill="#147A72"/>
+    <path d="M173 151H299V224L274 244H198L173 224Z" fill="#10152F"/>
+    <rect x="188" y="169" width="40" height="18" fill="#F8D83B"/><rect x="245" y="169" width="40" height="18" fill="#F8D83B"/>
+    <path d="M223 218H251L237 235Z" fill="#21D4C2"/>
+    <!-- cipher gloves -->
+    <rect x="78" y="256" width="79" height="60" fill="#21D4C2"/><text x="117" y="295" class="name" font-size="20" text-anchor="middle">#</text>
+    <rect x="314" y="256" width="79" height="60" fill="#21D4C2"/><text x="353" y="295" class="name" font-size="20" text-anchor="middle">{ }</text>
+    <text x="468" y="132" class="copy">ENCRYPTED SERPENT</text><text x="468" y="174" class="copy">Cobra hood · mirrored cipher visor</text>
+    <text x="468" y="214" class="copy">Every move dissolves into hash blocks</text><text x="468" y="286" class="quote">“Prove your access.”</text>
+  </g>
+
+  <!-- CIPHER VIPER B: cipher knight -->
+  <g transform="translate(1214 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/><rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">CIPHER VIPER</text><text x="1110" y="48" class="role" text-anchor="end">INFOSEC</text>
+    <rect x="22" y="91" width="400" height="236" fill="#1B153B" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- audit shield -->
+    <path d="M46 122H142V203C142 244 94 266 94 266C94 266 46 244 46 203Z" fill="#513A98" stroke="#F8D83B" stroke-width="8"/><path d="M68 190L87 209L122 166" fill="none" stroke="#F8D83B" stroke-width="10"/>
+    <!-- armored torso -->
+    <path d="M116 318V267H151V239H326V267H361V318Z" fill="#513A98"/><rect x="181" y="245" width="116" height="73" fill="#10152F"/><text x="239" y="294" class="name" font-size="34" fill="#F8D83B" text-anchor="middle">#</text>
+    <!-- helmet -->
+    <path d="M147 154L177 115H296L326 154V227L297 252H176L147 227Z" fill="#513A98"/>
+    <path d="M172 155H301V217L276 238H197L172 217Z" fill="#10152F"/>
+    <rect x="190" y="174" width="93" height="17" fill="#F8D83B"/><rect x="211" y="204" width="51" height="12" fill="#9B6CFF"/>
+    <!-- key glove -->
+    <rect x="313" y="255" width="75" height="61" fill="#9B6CFF"/><circle cx="340" cy="284" r="13" fill="none" stroke="#F8D83B" stroke-width="7"/><path d="M353 284H377M367 284V298" stroke="#F8D83B" stroke-width="7"/>
+    <text x="468" y="132" class="copy">CIPHER KNIGHT</text><text x="468" y="174" class="copy">Audit shield · encryption helmet</text>
+    <text x="468" y="214" class="copy">The control and its evidence travel together</text><text x="468" y="286" class="quote">“Control verified.”</text>
+  </g>
+
+  <!-- LAUNCH-DAY LOLA A: launch commander -->
+  <g transform="translate(48 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">LAUNCH-DAY LOLA</text><text x="1110" y="48" class="role" text-anchor="end">APPLICATION OWNER</text>
+    <rect x="22" y="91" width="400" height="236" fill="#1B2758" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- ticket storm / countdown -->
+    <g fill="#F8D83B"><rect x="43" y="111" width="66" height="24"/><rect x="55" y="145" width="90" height="24"/><rect x="43" y="179" width="55" height="24"/></g>
+    <rect x="324" y="112" width="67" height="57" fill="#10152F" stroke="#EE452D" stroke-width="7"/><text x="358" y="151" class="name" font-size="29" text-anchor="middle">T-1</text>
+    <!-- product jacket -->
+    <path d="M111 318V267H149V239H326V267H364V318Z" fill="#EE452D"/><rect x="181" y="247" width="116" height="71" fill="#10152F"/>
+    <rect x="216" y="268" width="46" height="36" fill="#F8D83B"/><path d="M226 279H252V294H226Z" fill="#EE452D"/>
+    <!-- headset face -->
+    <path d="M149 147H177V125H296V147H324V227H297V250H175V227H149Z" fill="#B96F45"/>
+    <path d="M155 145L173 113L205 128L238 103L267 130L298 111L318 145Z" fill="#2B1F1D"/>
+    <rect x="181" y="168" width="37" height="18" fill="#10152F"/><rect x="257" y="168" width="37" height="18" fill="#10152F"/>
+    <path d="M152 158V214M322 158V214" stroke="#F8D83B" stroke-width="11"/><path d="M322 207L288 223" stroke="#F8D83B" stroke-width="8"/>
+    <path d="M207 217H272" stroke="#4A2A22" stroke-width="13"/>
+    <text x="468" y="132" class="copy">LAUNCH COMMANDER</text><text x="468" y="174" class="copy">Customer headset · ticket-storm cape</text>
+    <text x="468" y="214" class="copy">Owns every second before release</text><text x="468" y="286" class="quote">“The customer is waiting.”</text>
+  </g>
+
+  <!-- LAUNCH-DAY LOLA B: flight director -->
+  <g transform="translate(1214 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#4A83E8" stroke-width="8"/><rect width="1138" height="72" fill="#3158A3"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">LAUNCH-DAY LOLA</text><text x="1110" y="48" class="role" text-anchor="end">APPLICATION OWNER</text>
+    <rect x="22" y="91" width="400" height="236" fill="#15264D" stroke="#F1EBD7" stroke-width="6"/>
+    <!-- rocket + roadmap -->
+    <path d="M76 225V144L102 112L128 144V225L102 250Z" fill="#F1EBD7"/><rect x="91" y="140" width="22" height="51" fill="#4A83E8"/><path d="M76 205L48 236H76M128 205L156 236H128" fill="#EE452D"/><path d="M90 250L102 286L114 250" fill="#F8D83B"/>
+    <path d="M325 118H385V143H344V168H385V193H325V218H370" fill="none" stroke="#F8D83B" stroke-width="12"/>
+    <!-- flight jacket -->
+    <path d="M112 318V268H150V240H326V268H364V318Z" fill="#3158A3"/><rect x="181" y="247" width="116" height="71" fill="#10152F"/>
+    <circle cx="238" cy="281" r="25" fill="#F8D83B"/><path d="M226 290L238 264L250 290Z" fill="#EE452D"/>
+    <!-- aviator/headset face -->
+    <path d="M149 148H177V126H296V148H324V227H297V250H175V227H149Z" fill="#C98A5A"/>
+    <path d="M155 145L175 113H299L318 145L285 130L251 141L221 126L185 143Z" fill="#3A241B"/>
+    <rect x="175" y="163" width="53" height="31" fill="#10152F" stroke="#F8D83B" stroke-width="6"/><rect x="245" y="163" width="53" height="31" fill="#10152F" stroke="#F8D83B" stroke-width="6"/><rect x="224" y="173" width="25" height="8" fill="#F8D83B"/>
+    <path d="M152 160V214M322 160V214" stroke="#4A83E8" stroke-width="11"/><path d="M322 207L289 223" stroke="#4A83E8" stroke-width="8"/>
+    <rect x="208" y="218" width="63" height="13" fill="#4A2A22"/>
+    <text x="468" y="132" class="copy">FLIGHT DIRECTOR</text><text x="468" y="174" class="copy">Aviators · rocket badge · roadmap rope</text>
+    <text x="468" y="214" class="copy">Balances launch, uptime, and customers</text><text x="468" y="286" class="quote">“All systems serve the launch.”</text>
+  </g>
+</svg>

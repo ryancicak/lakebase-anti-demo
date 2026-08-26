@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 84" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Simplified boxing ring</title>
+  <desc id="desc">A compact pixel boxing ring with red, yellow, and blue ropes.</desc>
+  <rect x="10" y="12" width="9" height="62" fill="#F1EBD7"/>
+  <rect x="93" y="12" width="9" height="62" fill="#F1EBD7"/>
+  <rect x="5" y="7" width="19" height="13" fill="#EE452D"/>
+  <rect x="88" y="7" width="19" height="13" fill="#4A83E8"/>
+  <rect x="19" y="25" width="74" height="6" fill="#EE452D"/>
+  <rect x="19" y="38" width="74" height="6" fill="#F8D83B"/>
+  <rect x="19" y="51" width="74" height="6" fill="#4A83E8"/>
+  <path d="M19 57H93L84 76H28Z" fill="#1C2B60" stroke="#F1EBD7" stroke-width="4"/>
+</svg>

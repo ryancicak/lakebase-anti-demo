@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.app.tsbuildinfo",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    /* Browser globals only. Application code ships to a browser, so `process`,
+       `Buffer`, `fs` and the rest must not typecheck here -- an ambient `node`
+       entry buys a green typecheck for something that throws at runtime, and
+       the compiler is the only thing that catches it before the demo does.
+       Test-only ambients (vitest, jest-dom) are absent for the same reason. */
+    "types": ["vite/client"]
+  },
+  "include": ["src"],
+  /* The colocated tests are a separate project -- tsconfig.test.json -- because
+     they legitimately need `node`: credits-layout.test.tsx reads credits.css
+     off disk, since Vitest runs with `css: false` and every CSS import,
+     including `?raw` and `?inline`, resolves to an empty string. Excluding them
+     here is what keeps that need from leaking into app source.
+
+     Both projects are typechecked: `npm run typecheck` runs this one AND the
+     test one. Keep it that way. Dropping either half means a whole class of
+     file stops being checked at all, which is worse than the leak this split
+     exists to close. */
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test"]
+}

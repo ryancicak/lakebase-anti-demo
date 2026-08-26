@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase: The Anti-Demo — retro opening title screen</title>
+  <desc id="desc">A full-screen original 8-bit fight-night opening screen showing the Anti-Demo title above a boxing ring and a Ring the Bell prompt.</desc>
+  <rect width="1920" height="1080" fill="#0A0E24"/>
+  <rect x="32" y="32" width="1856" height="1016" fill="none" stroke="#4A83E8" stroke-width="14"/>
+  <rect x="52" y="52" width="1816" height="976" fill="none" stroke="#E8482E" stroke-width="8"/>
+
+  <text x="960" y="160" fill="#F5D742" font-family="Menlo, Monaco, Courier New, monospace" font-size="34" font-weight="900" text-anchor="middle" letter-spacing="5">TONIGHT'S MAIN EVENT</text>
+  <g font-family="Arial Black, Helvetica Neue, Arial, sans-serif" font-weight="900" text-anchor="middle">
+    <text x="982" y="338" fill="#050711" font-size="176" letter-spacing="-9">LAKEBASE</text>
+    <text x="972" y="328" fill="#E8482E" font-size="176" letter-spacing="-9">LAKEBASE</text>
+    <text x="960" y="314" fill="#FFF4C2" stroke="#4A83E8" stroke-width="10" paint-order="stroke fill" font-size="176" letter-spacing="-9">LAKEBASE</text>
+    <text x="973" y="445" fill="#070A16" font-size="74" letter-spacing="2">THE ANTI-DEMO!!</text>
+    <text x="960" y="430" fill="#F5D742" stroke="#E8482E" stroke-width="7" paint-order="stroke fill" font-size="74" letter-spacing="2">THE ANTI-DEMO!!</text>
+  </g>
+
+  <!-- Perspective ring / stage. -->
+  <g transform="translate(500 488)">
+    <path d="M66 90L463 0L854 90L462 290Z" fill="#19234D" stroke="#EAE4CF" stroke-width="16"/>
+    <path d="M66 146L463 56L854 146L462 346Z" fill="none" stroke="#E8482E" stroke-width="13"/>
+    <path d="M66 202L463 112L854 202L462 402Z" fill="none" stroke="#4A83E8" stroke-width="13"/>
+    <rect x="46" y="66" width="40" height="294" fill="#E8482E"/>
+    <rect x="443" y="-24" width="40" height="294" fill="#EAE4CF"/>
+    <rect x="834" y="66" width="40" height="294" fill="#4A83E8"/>
+    <rect x="442" y="266" width="40" height="146" fill="#F5D742"/>
+  </g>
+
+  <!-- Deliberately simple stage action. -->
+  <rect x="663" y="870" width="594" height="92" fill="#E8482E"/>
+  <rect x="679" y="886" width="562" height="60" fill="#F5D742"/>
+  <text x="960" y="931" fill="#10152F" font-family="Menlo, Monaco, Courier New, monospace" font-size="39" font-weight="900" text-anchor="middle">▶ RING THE BELL</text>
+  <text x="960" y="1002" fill="#EAE4CF" font-family="Menlo, Monaco, Courier New, monospace" font-size="20" font-weight="900" text-anchor="middle" letter-spacing="2">SAME TASK · SAME DATA · ONE HONEST RESULT</text>
+</svg>

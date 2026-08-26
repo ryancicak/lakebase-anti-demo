@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Stacktrace Jack — Software Engineer ringside portrait</title><desc id="desc">An original 8-bit color commentator with a headphone arc formed from stacked error frames.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#101733" stroke="#43D17A" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#EE452D" stroke-width="6"/>
+  <g fill="#43D17A"><rect x="62" y="58" width="52" height="18"/><rect x="230" y="46" width="52" height="18"/><rect x="398" y="58" width="52" height="18"/></g>
+  <path d="M42 278H470M42 333H470M42 388H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 286H470M42 341H470M42 396H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- tall narrow commentator -->
+  <path d="M151 430V324L190 282H322L361 324V430Z" fill="#23834D"/><path d="M191 430V307H321V430Z" fill="#171923"/>
+  <path d="M187 145H209V118H303V145H325V253L302 282H210L187 253Z" fill="#F0C39B"/><path d="M188 149L206 112H306L324 149L293 136L255 148L218 135Z" fill="#10152F"/>
+  <rect x="216" y="176" width="25" height="19" fill="#4A83E8"/><rect x="271" y="176" width="25" height="19" fill="#4A83E8"/><rect x="232" y="238" width="49" height="15" fill="#4A2A22"/>
+  <!-- unmistakable headphone arch; the left band descends as stacked frames -->
+  <rect x="198" y="82" width="116" height="14" fill="#43D17A"/><rect x="178" y="96" width="20" height="28" fill="#43D17A"/><rect x="314" y="96" width="20" height="28" fill="#43D17A"/>
+  <rect x="162" y="118" width="18" height="110" fill="#43D17A"/><rect x="334" y="118" width="18" height="110" fill="#43D17A"/><rect x="145" y="166" width="35" height="67" fill="#23834D"/><rect x="334" y="166" width="35" height="67" fill="#23834D"/>
+  <g fill="#FF735E"><rect x="137" y="137" width="43" height="16"/><rect x="143" y="158" width="37" height="16"/><rect x="149" y="179" width="31" height="16"/></g>
+  <path d="M203 307L256 348L309 307" fill="none" stroke="#FFF4C2" stroke-width="13"/>
+  <!-- bare hands stay planted on the keyboard console -->
+  <path d="M197 331L155 401H203L231 350Z" fill="#F0C39B"/><path d="M315 331L357 401H309L281 350Z" fill="#F0C39B"/>
+  <rect x="64" y="405" width="384" height="68" fill="#111938" stroke="#43D17A" stroke-width="8"/><rect x="143" y="419" width="226" height="38" fill="#252B45"/>
+  <g fill="#43D17A"><rect x="158" y="430" width="27" height="10"/><rect x="192" y="430" width="27" height="10"/><rect x="226" y="430" width="27" height="10"/><rect x="260" y="430" width="27" height="10"/><rect x="294" y="430" width="27" height="10"/><rect x="328" y="430" width="27" height="10"/></g><rect x="199" y="445" width="114" height="7" fill="#FF735E"/>
+</svg>

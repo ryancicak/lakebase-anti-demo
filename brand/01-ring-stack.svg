@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase: The Anti-Demo — Ring Stack logo concept</title>
+  <desc id="desc">A minimal isometric boxing ring whose three ropes also resemble database layers, paired with a bold wordmark.</desc>
+  <rect width="1600" height="600" rx="28" fill="#F7F3EA"/>
+
+  <!-- Four posts: two neutral corners, two Lakebase-red corners. -->
+  <g stroke-linecap="square">
+    <path d="M107 145V260" stroke="#101214" stroke-width="22"/>
+    <path d="M300 64V181" stroke="#FF3621" stroke-width="22"/>
+    <path d="M515 143V260" stroke="#101214" stroke-width="22"/>
+    <path d="M321 241V358" stroke="#FF3621" stroke-width="22"/>
+  </g>
+
+  <!-- Three honest ropes / three database layers. -->
+  <g fill="none" stroke="#101214" stroke-width="14" stroke-linejoin="round">
+    <path d="M107 145L300 64L515 143L321 241Z"/>
+    <path d="M107 188L300 107L515 186L321 284Z"/>
+    <path d="M107 231L300 150L515 229L321 327Z"/>
+  </g>
+  <g fill="#FF3621">
+    <rect x="92" y="127" width="30" height="30" rx="3"/>
+    <rect x="285" y="46" width="30" height="30" rx="3"/>
+    <rect x="500" y="125" width="30" height="30" rx="3"/>
+    <rect x="306" y="223" width="30" height="30" rx="3"/>
+  </g>
+
+  <!-- Wordmark lockup. -->
+  <g fill="#101214" font-family="Arial Black, Helvetica Neue, Arial, sans-serif">
+    <text x="625" y="264" font-size="132" font-weight="900" letter-spacing="-6">LAKEBASE</text>
+    <text x="628" y="367" font-size="62" font-weight="900" letter-spacing="5">THE ANTI-DEMO</text>
+  </g>
+  <rect x="628" y="405" width="122" height="14" rx="7" fill="#FF3621"/>
+  <text x="770" y="421" fill="#45494D" font-family="Helvetica Neue, Arial, sans-serif" font-size="25" font-weight="700" letter-spacing="2.4">SAME TASK · SAME DATA · ONE HONEST RESULT</text>
+</svg>

@@ -1,0 +1,236 @@
+/*
+ * The round summary.
+ *
+ * Deliberately the least dense screen in the app. An earlier attempt at this view
+ * was rejected for being "TOO much info", so everything here is in service of one
+ * line per round: who finished it and how long it took. Anything that would need a
+ * second glance belongs on the proof screen, not here.
+ *
+ * Every foreground is checked against the surface it actually sits on, and the
+ * lowest pairing used is 7.79:1 -- comfortably past AA. The two brand accents that
+ * fall under 4.5:1 on a lighter panel (--red, --blue) appear only as borders here,
+ * never as text.
+ */
+
+.summary-screen {
+  box-sizing: border-box;
+  min-height: 100vh;
+  width: 100%;
+  /* No horizontal scrollbar can be introduced by a child, at any width. */
+  overflow-x: hidden;
+  padding: 20px 16px 28px;
+  background: #02040e;
+  color: var(--cream);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.summary-screen * {
+  box-sizing: border-box;
+}
+
+.summary-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.summary-header p {
+  margin: 0;
+  font-family: "Press Start 2P", monospace;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: #f8d83b;
+}
+
+.summary-header h1 {
+  margin: 0;
+  font-family: "Press Start 2P", monospace;
+  font-size: 18px;
+  line-height: 1.5;
+  color: var(--cream);
+  overflow-wrap: anywhere;
+}
+
+.summary-header span {
+  font-family: ui-monospace, monospace;
+  font-weight: 900;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #9aa3c4;
+  overflow-wrap: anywhere;
+}
+
+.summary-rounds {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.summary-round {
+  border: 3px solid #46527c;
+  background: var(--navy);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* The one lit row: a round with a stopwatch result. */
+.summary-round[data-status="lakebase_faster"] {
+  border-color: #ee452d;
+}
+
+.summary-round[data-status="running"] {
+  border-color: #f8d83b;
+}
+
+.summary-round-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.summary-round-head b {
+  font-family: "Press Start 2P", monospace;
+  font-size: 12px;
+  color: #f8d83b;
+  flex: none;
+}
+
+.summary-round-head strong {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  line-height: 1.7;
+  letter-spacing: 0.04em;
+  color: var(--cream);
+  /* Receipts carry sentence-case titles and the unrun fallback is uppercase.
+     Settling it here keeps the six rows reading as one board. */
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.summary-result {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-family: ui-monospace, monospace;
+  font-weight: 900;
+  min-width: 0;
+}
+
+.summary-winner {
+  font-family: "Press Start 2P", monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: #f8d83b;
+  overflow-wrap: anywhere;
+}
+
+.summary-round[data-status="no_result"] .summary-winner,
+.summary-round[data-status="unrun"] .summary-winner {
+  color: #9aa3c4;
+}
+
+.summary-time {
+  font-size: 15px;
+  color: var(--cream);
+  overflow-wrap: anywhere;
+}
+
+.summary-against {
+  font-size: 13px;
+  color: #9aa3c4;
+  overflow-wrap: anywhere;
+}
+
+.summary-note {
+  margin: 0;
+  font-family: ui-monospace, monospace;
+  font-weight: 900;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #9aa3c4;
+  overflow-wrap: anywhere;
+}
+
+.summary-footer {
+  border-top: 3px solid #46527c;
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.summary-footer p {
+  margin: 0;
+  font-family: ui-monospace, monospace;
+  font-weight: 900;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #9aa3c4;
+  overflow-wrap: anywhere;
+}
+
+.summary-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.summary-actions button {
+  font-family: "Press Start 2P", monospace;
+  font-size: 9px;
+  line-height: 1.7;
+  letter-spacing: 0.04em;
+  color: var(--cream);
+  background: var(--navy);
+  border: 3px solid #46527c;
+  padding: 10px 12px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  transition: background 120ms steps(2);
+}
+
+.summary-actions button:hover,
+.summary-actions button:focus-visible {
+  background: #151e48;
+}
+
+.summary-status {
+  font-family: ui-monospace, monospace;
+  font-weight: 900;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #f8d83b;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .summary-actions button {
+    transition: none;
+  }
+}
+
+@media (min-width: 720px) {
+  .summary-screen {
+    padding: 32px 40px 40px;
+  }
+
+  .summary-header h1 {
+    font-size: 26px;
+  }
+
+  .summary-round-head strong {
+    font-size: 11px;
+  }
+}

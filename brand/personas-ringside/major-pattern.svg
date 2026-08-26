@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Major Pattern — Architect and IT ringside portrait</title><desc id="desc">An original 8-bit rules commissioner with a square silhouette and modular grid sash.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#152A32" stroke="#43D17A" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#4A83E8" stroke-width="6"/>
+  <path d="M42 276H470M42 331H470M42 386H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 284H470M42 339H470M42 394H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- high-backed chair and square silhouette -->
+  <rect x="104" y="92" width="304" height="349" fill="#17305E" stroke="#3158A3" stroke-width="14"/><rect x="126" y="114" width="260" height="307" fill="#111938"/>
+  <path d="M127 430V305L169 271H343L385 305V430Z" fill="#23834D"/>
+  <path d="M174 144H199V116H313V144H338V250L313 279H199L174 250Z" fill="#EDB98F"/><path d="M175 148L197 109H315L337 148L304 136L256 149L208 135Z" fill="#3A241B"/>
+  <rect x="207" y="175" width="28" height="20" fill="#070B22"/><rect x="277" y="175" width="28" height="20" fill="#070B22"/><rect x="226" y="237" width="60" height="16" fill="#5A3224"/>
+  <!-- modular grid sash -->
+  <path d="M159 287L225 430H275L353 286" fill="#43D17A"/>
+  <g stroke="#10152F" stroke-width="8"><path d="M184 315H325M197 346H310M211 377H294M225 408H278"/><path d="M217 295V422M256 295V430M295 295V421"/></g>
+  <rect x="72" y="416" width="368" height="58" fill="#111938" stroke="#43D17A" stroke-width="8"/>
+</svg>

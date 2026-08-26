@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Doctor Drift — Data Scientist and ML ringside portrait</title><desc id="desc">An original 8-bit expert commentator in profile with a clean bell-curve hairline.</desc>
+  <rect width="512" height="512" fill="#070B22"/><rect x="16" y="16" width="480" height="480" fill="#18143D" stroke="#9B6CFF" stroke-width="12"/><rect x="32" y="32" width="448" height="448" fill="none" stroke="#21D4C2" stroke-width="6"/>
+  <g fill="#21D4C2"><rect x="60" y="58" width="54" height="18"/><rect x="229" y="46" width="54" height="18"/><rect x="398" y="58" width="54" height="18"/></g>
+  <path d="M42 278H470M42 333H470M42 388H470" stroke="#4A83E8" stroke-width="10"/><path d="M42 286H470M42 341H470M42 396H470" stroke="#FFF4C2" stroke-width="5"/>
+  <!-- side-facing commentator -->
+  <path d="M133 432V329L183 282H349L389 328V432Z" fill="#513A98"/><path d="M201 432V302L284 282L347 323V432Z" fill="#147A72"/>
+  <path d="M177 151H204V121H310V151H337V244L308 278H204L177 244Z" fill="#C98A5A"/>
+  <!-- bell curve hairline -->
+  <path d="M173 156L194 119H215L232 89H246L256 49L266 89H282L299 119H320L341 156L308 137L281 147L256 131L229 147L201 136Z" fill="#FFF4C2"/>
+  <rect x="217" y="177" width="28" height="20" fill="#070B22"/><rect x="284" y="177" width="28" height="20" fill="#070B22"/><rect x="245" y="236" width="58" height="15" fill="#5A3224"/>
+  <path d="M188 296L256 349L326 296" fill="none" stroke="#21D4C2" stroke-width="16"/>
+  <rect x="68" y="405" width="376" height="68" fill="#111938" stroke="#9B6CFF" stroke-width="8"/><path d="M97 447H145V427H193V447H241V417H289V447H337V434H415" fill="none" stroke="#21D4C2" stroke-width="8"/>
+</svg>

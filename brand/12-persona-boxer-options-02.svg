@@ -1,0 +1,217 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="2100" viewBox="0 0 2400 2100" shape-rendering="crispEdges" role="img" aria-labelledby="title desc">
+  <title id="title">Lakebase persona boxer portraits — options sheet two</title>
+  <desc id="desc">Two original retro boxing portrait directions each for Lockjaw Lucy, 3 A.M. Sam, The Big Why, Cipher Viper, and Launch-Day Lola.</desc>
+  <style>
+    .name{font-family:Arial Black,Helvetica Neue,Arial,sans-serif;font-weight:900;fill:#FFF4C2}
+    .role,.copy,.concept,.quote,.option,.tiny,.tinyLg{font-family:Menlo,Monaco,Courier New,monospace;font-weight:900}
+    .role{fill:#FFF4C2;font-size:22px;letter-spacing:1px}
+    .concept{fill:#FFF4C2;font-size:27px}
+    .copy{fill:#D7D9D4;font-size:20px}
+    .quote{fill:#F8D83B;font-size:24px}
+    .option{fill:#10152F;font-size:25px;text-anchor:middle}
+    .tiny{fill:#FFF4C2;font-size:14px}
+    .tinyLg{fill:#FFF4C2;font-size:19px}
+    .eye{fill:#070B22}.mouth{fill:#4A2A22}
+  </style>
+  <defs>
+    <g id="ring">
+      <rect width="460" height="236" fill="#101733" stroke="#F1EBD7" stroke-width="6"/>
+      <path d="M18 74H442M18 132H442M18 190H442" stroke="#4A83E8" stroke-width="7"/>
+      <path d="M18 82H442M18 140H442M18 198H442" stroke="#FFF4C2" stroke-width="4"/>
+      <rect x="18" y="34" width="18" height="184" fill="#EE452D"/><rect x="424" y="34" width="18" height="184" fill="#EE452D"/>
+      <path d="M8 218H452L430 233H30Z" fill="#1B2758"/>
+    </g>
+  </defs>
+
+  <rect width="2400" height="2100" fill="#070B22"/>
+  <rect x="24" y="24" width="2352" height="2052" fill="none" stroke="#4A83E8" stroke-width="16"/>
+  <rect x="48" y="48" width="2304" height="2004" fill="none" stroke="#EE452D" stroke-width="8"/>
+  <text x="1200" y="104" class="name" font-size="48" text-anchor="middle">CHOOSE YOUR FIGHTER — BOXER RUNOFF 2/2</text>
+  <text x="1200" y="137" class="copy" font-size="19" text-anchor="middle">BOXING SILHOUETTE FIRST · ONE PERSONA CUE · PICK A OR B</text>
+
+  <!-- LOCKJAW LUCY A — database-stack clincher -->
+  <g transform="translate(48 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">LOCKJAW LUCY</text><text x="1110" y="48" class="role" text-anchor="end">DBA</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- square clinch stance, elbows sealed -->
+      <path d="M126 225V174L164 145H309L346 174V225Z" fill="#7B2636"/><path d="M184 158L145 132L158 103L211 143Z" fill="#8F5A3C"/><path d="M290 143L331 106L350 132L311 164Z" fill="#8F5A3C"/>
+      <!-- gloves are database stacks, clearly boxing gloves -->
+      <path d="M79 77H151L168 94V143L151 160H79L62 143V94Z" fill="#EE452D"/><path d="M325 77H397L414 94V143L397 160H325L308 143V94Z" fill="#EE452D"/>
+      <g fill="none" stroke="#F8D83B" stroke-width="6"><path d="M75 102C75 91 155 91 155 102V137C155 149 75 149 75 137Z"/><path d="M75 102C75 114 155 114 155 102M75 120C75 132 155 132 155 120"/><path d="M321 102C321 91 401 91 401 102V137C401 149 321 149 321 137Z"/><path d="M321 102C321 114 401 114 401 102M321 120C321 132 401 132 401 120"/></g>
+      <path d="M190 51H210V33H280V51H300V117L280 138H210L189 117Z" fill="#8F5A3C"/><rect x="211" y="70" width="19" height="14" class="eye"/><rect x="260" y="70" width="19" height="14" class="eye"/>
+      <path d="M190 53L207 29H283L301 53L273 44L245 53L218 43Z" fill="#211A20"/><rect x="222" y="110" width="48" height="14" fill="#F8D83B"/><rect x="233" y="114" width="26" height="6" fill="#10152F"/>
+      <rect x="171" y="187" width="130" height="25" fill="#10152F"/><text x="236" y="205" class="tiny" text-anchor="middle">COMMIT</text>
+    </g>
+    <text x="520" y="132" class="concept">TRANSACTION CLINCHER</text><text x="520" y="176" class="copy">Square inside guard · database-stack gloves</text>
+    <text x="520" y="216" class="copy">Protects every commit without blocking the team</text><text x="520" y="286" class="quote">“Consistency wins inside.”</text>
+  </g>
+
+  <!-- LOCKJAW LUCY B — recovery cross guard -->
+  <g transform="translate(1214 164)">
+    <rect width="1138" height="350" fill="#111938" stroke="#8A95A8" stroke-width="8"/><rect width="1138" height="72" fill="#4C5668"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">LOCKJAW LUCY</text><text x="1110" y="48" class="role" text-anchor="end">DBA</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- tall cross-arm recovery guard -->
+      <path d="M159 225V157H309L331 225Z" fill="#4C5668"/><path d="M194 159L297 105L312 135L211 188Z" fill="#C98A5A"/><path d="M292 158L186 111L173 141L278 188Z" fill="#C98A5A"/>
+      <path d="M109 91H166L183 108V148L166 165H109L92 148V108Z" fill="#8A95A8"/><path d="M303 87H360L377 104V144L360 161H303L286 144V104Z" fill="#8A95A8"/>
+      <!-- restore arrows built into glove cuffs -->
+      <path d="M117 140A22 22 0 1 1 153 119" fill="none" stroke="#43D17A" stroke-width="7"/><path d="M151 106L159 124L140 122Z" fill="#43D17A"/><path d="M311 136A22 22 0 1 1 347 115" fill="none" stroke="#43D17A" stroke-width="7"/><path d="M345 102L353 120L334 118Z" fill="#43D17A"/>
+      <path d="M193 48H212V30H279V48H298V111L279 132H212L192 111Z" fill="#C98A5A"/><rect x="213" y="67" width="18" height="14" class="eye"/><rect x="259" y="67" width="18" height="14" class="eye"/><rect x="226" y="105" width="39" height="11" class="mouth"/>
+      <path d="M193 50L210 26H281L299 50L272 42L246 50L221 41Z" fill="#2A201D"/>
+      <rect x="174" y="191" width="126" height="21" fill="#10152F"/><path d="M184 201H290" stroke="#43D17A" stroke-width="6"/>
+    </g>
+    <text x="520" y="132" class="concept">RECOVERY CROSS-GUARD</text><text x="520" y="176" class="copy">Tall X guard · restore-arrow cuffs</text>
+    <text x="520" y="216" class="copy">Takes the hit, restores cleanly, keeps serving</text><text x="520" y="286" class="quote">“Recover. Verify. Continue.”</text>
+  </g>
+
+  <!-- 3 A.M. SAM A — calm on-call southpaw -->
+  <g transform="translate(48 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#F8D83B" stroke-width="8"/><rect width="1138" height="72" fill="#A36B00"/>
+    <rect x="14" y="13" width="48" height="46" fill="#FFF4C2"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">3 A.M. SAM</text><text x="1110" y="48" class="role" text-anchor="end">SRE</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- planted low-guard southpaw -->
+      <path d="M153 225V158H315L338 225Z" fill="#6A4F7D"/><path d="M181 159L117 174L109 144L195 128Z" fill="#6F4934"/><path d="M291 150L327 108L351 129L314 176Z" fill="#6F4934"/>
+      <path d="M62 139H119L136 156V190L119 207H62L45 190V156Z" fill="#F8D83B"/><path d="M326 83H378L395 100V137L378 154H326L309 137V100Z" fill="#EE452D"/>
+      <path d="M195 53H214V35H282V53H301V117L282 138H214L194 117Z" fill="#6F4934"/><path d="M195 55L212 31H284L302 55L275 47L248 55L222 46Z" fill="#25202A"/>
+      <path d="M215 77H234M263 77H282" stroke="#10152F" stroke-width="10"/><rect x="229" y="112" width="39" height="11" class="mouth"/>
+      <!-- pager-shaped championship buckle -->
+      <path d="M172 154L233 190L302 154" fill="none" stroke="#FFF4C2" stroke-width="14"/><rect x="210" y="188" width="69" height="30" fill="#10152F" stroke="#F8D83B" stroke-width="6"/><text x="245" y="208" class="tiny" text-anchor="middle">03:00</text>
+    </g>
+    <text x="520" y="132" class="concept">ON-CALL SOUTHPAW</text><text x="520" y="176" class="copy">Loose low guard · pager championship buckle</text>
+    <text x="520" y="216" class="copy">Battle-tested calm when the bell rings at three</text><text x="520" y="286" class="quote">“Paged. Present. Proven.”</text>
+  </g>
+
+  <!-- 3 A.M. SAM B — alert incident closer -->
+  <g transform="translate(1214 552)">
+    <rect width="1138" height="350" fill="#111938" stroke="#43D17A" stroke-width="8"/><rect width="1138" height="72" fill="#23834D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">3 A.M. SAM</text><text x="1110" y="48" class="role" text-anchor="end">SRE</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- compact fully alert high guard -->
+      <path d="M126 225V173L163 145H315L352 173V225Z" fill="#23834D"/><path d="M184 157L145 121L164 96L211 140Z" fill="#B96F45"/><path d="M292 140L332 97L354 120L313 162Z" fill="#B96F45"/>
+      <path d="M91 62H156L174 80V136L156 154H91L73 136V80Z" fill="#43D17A"/><path d="M330 62H395L413 80V136L395 154H330L312 136V80Z" fill="#43D17A"/>
+      <!-- red-to-green incident bars are glove cuffs -->
+      <rect x="78" y="132" width="91" height="17" fill="#EE452D"/><rect x="124" y="132" width="45" height="17" fill="#43D17A"/><rect x="317" y="132" width="91" height="17" fill="#EE452D"/><rect x="317" y="132" width="70" height="17" fill="#43D17A"/>
+      <path d="M191 50H210V32H279V50H298V114L279 135H210L190 114Z" fill="#B96F45"/><rect x="211" y="69" width="19" height="14" class="eye"/><rect x="259" y="69" width="19" height="14" class="eye"/><rect x="225" y="108" width="39" height="11" class="mouth"/>
+      <path d="M191 52L208 28H281L299 52L272 44L246 52L220 43Z" fill="#15151B"/>
+      <rect x="173" y="188" width="129" height="25" fill="#10152F"/><path d="M186 200H289" stroke="#43D17A" stroke-width="7"/>
+    </g>
+    <text x="520" y="132" class="concept">INCIDENT CLOSER</text><text x="520" y="176" class="copy">Forward high guard · red-to-green cuffs</text>
+    <text x="520" y="216" class="copy">Stays on the issue until recovery is verified</text><text x="520" y="286" class="quote">“Green means proven.”</text>
+  </g>
+
+  <!-- THE BIG WHY A — immovable heavyweight -->
+  <g transform="translate(48 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#F8D83B" stroke-width="8"/><rect width="1138" height="72" fill="#A36B00"/>
+    <rect x="14" y="13" width="48" height="46" fill="#FFF4C2"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">THE BIG WHY</text><text x="1110" y="48" class="role" text-anchor="end">EXECUTIVE</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- dead-center immovable heavyweight -->
+      <path d="M105 225V174L150 139H324L367 174V225Z" fill="#171923"/><path d="M183 157L142 126L160 97L211 139Z" fill="#8F5A3C"/><path d="M294 139L336 98L358 123L315 163Z" fill="#8F5A3C"/>
+      <path d="M78 66H151L170 85V140L151 159H78L59 140V85Z" fill="#F8D83B"/><path d="M331 66H404L423 85V140L404 159H331L312 140V85Z" fill="#F8D83B"/>
+      <path d="M190 51H210V33H281V51H301V116L281 138H210L189 116Z" fill="#8F5A3C"/><rect x="211" y="70" width="19" height="14" class="eye"/><rect x="261" y="70" width="19" height="14" class="eye"/><rect x="225" y="110" width="40" height="11" class="mouth"/>
+      <path d="M190 53L208 29H283L302 53L273 44L246 53L219 43Z" fill="#27201F"/>
+      <!-- giant question-mark belt buckle -->
+      <rect x="169" y="184" width="135" height="35" fill="#FFF4C2"/><rect x="209" y="179" width="55" height="44" fill="#A36B00"/><text x="237" y="214" class="name" font-size="45" text-anchor="middle">?</text>
+    </g>
+    <text x="520" y="132" class="concept">THE WHY HEAVYWEIGHT</text><text x="520" y="176" class="copy">Immovable center stance · question-mark belt</text>
+    <text x="520" y="216" class="copy">Starts every round with who benefits and why</text><text x="520" y="286" class="quote">“Why now? Who wins?”</text>
+  </g>
+
+  <!-- THE BIG WHY B — one-number outboxer -->
+  <g transform="translate(1214 940)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#7B2636"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">THE BIG WHY</text><text x="1110" y="48" class="role" text-anchor="end">EXECUTIVE</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- lean mobile measuring jab -->
+      <path d="M186 225V155H303L328 225Z" fill="#7B2636"/><path d="M207 153L125 119L135 89L223 130Z" fill="#C98A5A"/><path d="M286 149L329 97L352 117L309 170Z" fill="#C98A5A"/>
+      <path d="M65 69H132L149 86V127L132 144H65L48 127V86Z" fill="#EE452D"/><path d="M329 68H380L397 85V127L380 144H329L312 127V85Z" fill="#EE452D"/>
+      <path d="M204 51H223V33H285V51H304V114L285 135H223L203 114Z" fill="#C98A5A"/><rect x="224" y="70" width="18" height="14" class="eye"/><rect x="267" y="70" width="18" height="14" class="eye"/><rect x="237" y="108" width="36" height="11" class="mouth"/>
+      <path d="M204 53L221 29H287L305 53L280 45L254 53L231 44Z" fill="#19171B"/>
+      <!-- single oversized one woven into robe -->
+      <path d="M207 155L252 181L295 155V225H207Z" fill="#10152F"/><text x="252" y="220" class="name" font-size="86" fill="#F8D83B" text-anchor="middle">1</text>
+    </g>
+    <text x="520" y="132" class="concept">ONE-NUMBER OUTBOXER</text><text x="520" y="176" class="copy">Lean measuring jab · single-result robe</text>
+    <text x="520" y="216" class="copy">Cuts the scorecard down to what matters most</text><text x="520" y="286" class="quote">“One outcome. Prove it.”</text>
+  </g>
+
+  <!-- CIPHER VIPER A — coiled zero-trust guard -->
+  <g transform="translate(48 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#21D4C2" stroke-width="8"/><rect width="1138" height="72" fill="#147A72"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">CIPHER VIPER</text><text x="1110" y="48" class="role" text-anchor="end">INFOSEC</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- compact coiled boxing guard -->
+      <path d="M129 225V174L166 144H313L350 174V225Z" fill="#147A72"/><path d="M184 157L146 123L164 98L211 140Z" fill="#8F5A3C"/><path d="M291 140L332 98L353 121L313 163Z" fill="#8F5A3C"/>
+      <path d="M91 65H155L173 83V136L155 154H91L73 136V83Z" fill="#21D4C2"/><path d="M330 65H394L412 83V136L394 154H330L312 136V83Z" fill="#21D4C2"/>
+      <!-- cobra-flared boxing headguard; face remains visible -->
+      <path d="M176 56L197 27H220L246 9L272 27H295L316 56L305 123L282 141H210L187 123Z" fill="#147A72"/>
+      <path d="M199 58H218V42H276V58H295V113L277 130H217L198 113Z" fill="#8F5A3C"/><rect x="219" y="76" width="18" height="14" class="eye"/><rect x="258" y="76" width="18" height="14" class="eye"/><rect x="231" y="109" width="34" height="10" class="mouth"/>
+      <path d="M196 56L177 43L188 88M297 56L316 43L305 88" fill="none" stroke="#21D4C2" stroke-width="8"/><path d="M239 130H255L247 142Z" fill="#F8D83B"/>
+      <rect x="170" y="189" width="130" height="23" fill="#10152F"/><path d="M181 201H289" stroke="#21D4C2" stroke-width="6" stroke-dasharray="11 7"/>
+    </g>
+    <text x="520" y="132" class="concept">ZERO-TRUST COILER</text><text x="520" y="176" class="copy">Compact coiled guard · cobra headguard</text>
+    <text x="520" y="216" class="copy">Verifies every opening before committing</text><text x="520" y="286" class="quote">“Trust nothing. Prove everything.”</text>
+  </g>
+
+  <!-- CIPHER VIPER B — hash-wrap shoulder roll -->
+  <g transform="translate(1214 1328)">
+    <rect width="1138" height="350" fill="#111938" stroke="#9B6CFF" stroke-width="8"/><rect width="1138" height="72" fill="#513A98"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">CIPHER VIPER</text><text x="1110" y="48" class="role" text-anchor="end">INFOSEC</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- tall angular shoulder roll -->
+      <path d="M180 225V156H304L329 225Z" fill="#513A98"/><path d="M202 154L126 165L121 136L219 130Z" fill="#8F5A3C"/><path d="M284 146L329 88L354 108L310 170Z" fill="#8F5A3C"/>
+      <path d="M72 129H130L147 146V180L130 197H72L55 180V146Z" fill="#9B6CFF"/><path d="M329 60H381L398 77V119L381 136H329L312 119V77Z" fill="#9B6CFF"/>
+      <!-- hash-block panels tiled across wraps -->
+      <g fill="#F8D83B"><rect x="76" y="143" width="16" height="16"/><rect x="99" y="143" width="16" height="16"/><rect x="88" y="166" width="16" height="16"/><rect x="332" y="76" width="16" height="16"/><rect x="355" y="76" width="16" height="16"/><rect x="343" y="99" width="16" height="16"/></g>
+      <path d="M203 51H222V33H285V51H304V115L285 136H222L202 115Z" fill="#8F5A3C"/><rect x="223" y="70" width="18" height="14" class="eye"/><rect x="267" y="70" width="18" height="14" class="eye"/><rect x="236" y="109" width="36" height="11" class="mouth"/>
+      <path d="M203 53L220 29H287L305 53L280 45L254 53L230 44Z" fill="#3A241B"/>
+      <path d="M189 178L230 157L298 196" fill="none" stroke="#F8D83B" stroke-width="8"/><rect x="189" y="198" width="116" height="18" fill="#10152F"/>
+    </g>
+    <text x="520" y="132" class="concept">HASH-WRAP OUTBOXER</text><text x="520" y="176" class="copy">Tall shoulder roll · cipher-block wraps</text>
+    <text x="520" y="216" class="copy">Controls the angle and carries the evidence</text><text x="520" y="286" class="quote">“Control verified.”</text>
+  </g>
+
+  <!-- LAUNCH-DAY LOLA A — release-bell sprinter -->
+  <g transform="translate(48 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#EE452D" stroke-width="8"/><rect width="1138" height="72" fill="#EE452D"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">A</text>
+    <text x="82" y="52" class="name" font-size="38">LAUNCH-DAY LOLA</text><text x="1110" y="48" class="role" text-anchor="end">APPLICATION OWNER</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- sprinter-like forward boxing crouch -->
+      <path d="M121 225V180L164 148H319L356 180V225Z" fill="#EE452D"/><path d="M184 160L149 124L169 99L212 142Z" fill="#B96F45"/><path d="M294 142L329 99L354 120L316 166Z" fill="#B96F45"/>
+      <path d="M96 66H158L176 84V137L158 155H96L78 137V84Z" fill="#EE452D" stroke="#F8D83B" stroke-width="6"/><path d="M329 66H391L409 84V137L391 155H329L311 137V84Z" fill="#EE452D" stroke="#F8D83B" stroke-width="6"/>
+      <path d="M193 53H212V35H282V53H301V117L282 138H212L192 117Z" fill="#B96F45"/><rect x="213" y="72" width="19" height="14" class="eye"/><rect x="262" y="72" width="19" height="14" class="eye"/><rect x="227" y="111" width="39" height="11" class="mouth"/>
+      <path d="M193 55L210 31H284L302 55L274 46L247 55L220 45Z" fill="#2B1F1D"/>
+      <!-- T-1 is the championship belt buckle -->
+      <rect x="171" y="186" width="135" height="34" fill="#10152F" stroke="#F8D83B" stroke-width="6"/><text x="239" y="210" class="tinyLg" text-anchor="middle">T-1</text>
+    </g>
+    <text x="520" y="132" class="concept">RELEASE-BELL SPRINTER</text><text x="520" y="176" class="copy">Explosive forward crouch · T-1 belt buckle</text>
+    <text x="520" y="216" class="copy">Owns every second before customers arrive</text><text x="520" y="286" class="quote">“Ready when the bell rings.”</text>
+  </g>
+
+  <!-- LAUNCH-DAY LOLA B — roadmap ring general without military cues -->
+  <g transform="translate(1214 1716)">
+    <rect width="1138" height="350" fill="#111938" stroke="#4A83E8" stroke-width="8"/><rect width="1138" height="72" fill="#3158A3"/>
+    <rect x="14" y="13" width="48" height="46" fill="#F8D83B"/><text x="38" y="47" class="option">B</text>
+    <text x="82" y="52" class="name" font-size="38">LAUNCH-DAY LOLA</text><text x="1110" y="48" class="role" text-anchor="end">APPLICATION OWNER</text>
+    <g transform="translate(22 91)"><use href="#ring"/>
+      <!-- wide command stance, measuring lead hand -->
+      <path d="M151 225V151L187 129H307L341 151V225Z" fill="#3158A3"/><path d="M202 155L112 128L121 99L220 132Z" fill="#C98A5A"/><path d="M288 146L330 101L352 123L311 168Z" fill="#C98A5A"/>
+      <path d="M57 78H123L140 95V132L123 149H57L40 132V95Z" fill="#4A83E8"/><path d="M329 75H380L397 92V132L380 149H329L312 132V92Z" fill="#4A83E8"/>
+      <path d="M201 51H220V33H285V51H304V115L285 136H220L200 115Z" fill="#C98A5A"/><rect x="221" y="70" width="18" height="14" class="eye"/><rect x="267" y="70" width="18" height="14" class="eye"/><rect x="234" y="109" width="38" height="11" class="mouth"/>
+      <path d="M201 53L218 29H287L305 53L279 45L253 53L228 44Z" fill="#3A241B"/>
+      <!-- one continuous roadmap seam circles the robe -->
+      <path d="M164 163H213V181H274V164H329V187H292V205H237V188H187V207H153" fill="none" stroke="#F8D83B" stroke-width="9"/>
+      <rect x="205" y="198" width="82" height="23" fill="#10152F"/><path d="M218 209H275" stroke="#43D17A" stroke-width="6"/>
+    </g>
+    <text x="520" y="132" class="concept">ROADMAP RING LEADER</text><text x="520" y="176" class="copy">Wide command stance · continuous-route robe</text>
+    <text x="520" y="216" class="copy">Balances customers, uptime, and the next move</text><text x="520" y="286" class="quote">“Every move serves the launch.”</text>
+  </g>
+</svg>

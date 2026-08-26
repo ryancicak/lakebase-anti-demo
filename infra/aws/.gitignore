@@ -1,0 +1,13 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+!terraform.tfvars.example
+# Machine-generated per generation from <manifest dir>/terraform-backend.json.
+# It names a specific state bucket and key, so committing it would point every
+# clone at one installation's state.
+backend_override.tf
+!backend_override.tf.example
+crash.log
+crash.*.log
