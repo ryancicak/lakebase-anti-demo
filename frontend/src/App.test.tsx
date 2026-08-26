@@ -354,6 +354,67 @@ function safeChangeSession(state: DemoSession['state']): DemoSession {
   }
 }
 
+function safeChangeTowelCleanupSession(): DemoSession {
+  const base = safeChangeSession('running')
+  const requestedAt = '2026-08-25T23:51:43Z'
+  return {
+    ...base,
+    state: 'towelled',
+    updated_at: requestedAt,
+    run_started_at: '2026-08-25T23:51:35Z',
+    lanes: {
+      lakebase: {
+        ...base.lanes.lakebase,
+        state: 'verified',
+        elapsed_ms: 7_200,
+        attempts: 1,
+        status: 'Isolated schema migration verified',
+      },
+      competitor: {
+        ...base.lanes.competitor,
+        state: 'towelled',
+        elapsed_ms: null,
+        elapsed_at_snapshot_ms: 55_570,
+        attempts: 8,
+        status: 'Towel thrown · Clone still creating',
+      },
+    },
+    towel: {
+      state: 'cleaning',
+      requested_at: requestedAt,
+      censored_lower_bounds_ms: { competitor: 55_570 },
+      restore_started: true,
+      cleanup_failure: null,
+    },
+    cooldown: {
+      mode: 'delete_isolated_environment',
+      state: 'watching',
+      started_at: requestedAt,
+      failure: null,
+      lanes: {
+        lakebase: {
+          id: 'lakebase', name: 'Lakebase', state: 'watching',
+          started_at: requestedAt, confirmed_at: null, elapsed_ms: null,
+          status: 'Deleting owned branch',
+        },
+        competitor: {
+          id: 'competitor', name: 'Aurora Serverless v2', state: 'watching',
+          started_at: requestedAt, confirmed_at: null, elapsed_ms: null,
+          status: 'Deleting owned clone',
+        },
+      },
+    },
+    comparison: {
+      kind: 'adjudicated_stoppage',
+      winner_lane_id: 'lakebase',
+      margin: null,
+      detail: 'Lakebase verified before the towel; the unfinished opponent remains a lower bound.',
+    },
+    remembered_result: 'TOWELED LIVE · LAKEBASE 7.20s · AURORA LOWER BOUND >55.57s',
+    failure: null,
+  }
+}
+
 function modelScoreSession(
   state: DemoSession['state'],
   redoState?: 'ready' | 'running' | 'verified' | 'failed',
@@ -528,6 +589,74 @@ function recoveryTowelSession(towelState: TowelFixtureState): DemoSession {
     remembered_result: hasTowel
       ? 'TOWEL THROWN AT 90.00s · LAKEBASE VERIFIED 14.38s · AURORA STILL RECOVERING'
       : null,
+    failure: null,
+  }
+}
+
+function roundFiveTowelCleanupSession(): DemoSession {
+  const base = session('towelled')
+  const round = FALLBACK_CATALOG.rounds.find(
+    (candidate) => candidate.id === 'survive_connection_spike',
+  )!
+  return {
+    ...base,
+    state: 'towelled',
+    round,
+    run_started_at: '2026-08-25T23:20:00Z',
+    updated_at: '2026-08-25T23:21:10Z',
+    lanes: {
+      lakebase: {
+        ...base.lanes.lakebase,
+        state: 'verified',
+        status: 'Built-in Lakebase pool verified',
+      },
+      competitor: {
+        ...base.lanes.competitor,
+        state: 'towelled',
+        status: 'Toweled before the exact setup stop',
+      },
+    },
+    towel: {
+      state: 'cleaning',
+      requested_at: '2026-08-25T23:21:10Z',
+      censored_lower_bounds_ms: { competitor: 70_790 },
+      restore_started: false,
+      cleanup_failure: null,
+    },
+    round5_setup: {
+      state: 'towelled',
+      workflow_launch_skew_ms: 0.75,
+      setup_validated: false,
+      downstream_validated: false,
+      cleanup_retryable: true,
+      lanes: {
+        lakebase: {
+          id: 'lakebase',
+          name: 'Lakebase',
+          state: 'verified',
+          setup_elapsed_ms: 3_150,
+          status: 'Built-in Lakebase pool verified',
+          stop_gate_evidence: {
+            gate_id: 'native_transaction',
+            expected: [{ key: 'transaction_verified', value: true }],
+            observed: [{ key: 'transaction_verified', value: true }],
+            exact: true,
+          },
+          verified: true,
+        },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          state: 'towelled',
+          setup_elapsed_ms: 70_790,
+          status: 'Toweled before the exact setup stop',
+          stop_gate_evidence: null,
+          verified: false,
+        },
+      },
+    },
+    comparison: null,
+    remembered_result: 'TOWELED AT 70.79s · NO WINNER · MARGIN N/A',
     failure: null,
   }
 }
@@ -789,6 +918,177 @@ describe('backstage setup', () => {
     expect(fetchMock.mock.calls.some((call) => call[0] === '/api/sessions')).toBe(false)
   })
 
+  it('keeps a refreshed Round 2 timer and towel control live through stale pre-run replay', async () => {
+    const running: DemoSession = {
+      ...safeChangeSession('running'),
+      id: 'round-2-current-session',
+      updated_at: '2026-08-25T23:30:20Z',
+      lanes: {
+        lakebase: {
+          ...safeChangeSession('running').lanes.lakebase,
+          elapsed_ms: 1_930,
+          elapsed_at_snapshot_ms: 21_250,
+        },
+        competitor: {
+          ...safeChangeSession('running').lanes.competitor,
+          elapsed_ms: 1_930,
+          elapsed_at_snapshot_ms: 21_250,
+          status: 'RDS.DescribeDBClusters',
+        },
+      },
+    }
+    const stopping: DemoSession = {
+      ...running,
+      state: 'towelled',
+      updated_at: '2026-08-25T23:30:21Z',
+      lanes: {
+        lakebase: { ...running.lanes.lakebase, state: 'towelled' },
+        competitor: { ...running.lanes.competitor, state: 'towelled' },
+      },
+      towel: {
+        state: 'stopping',
+        requested_at: '2026-08-25T23:30:21Z',
+        censored_lower_bounds_ms: { lakebase: 21_250, competitor: 21_250 },
+        restore_started: false,
+        cleanup_failure: null,
+      },
+    }
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: running.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${running.id}`) return Promise.resolve(jsonResponse(running))
+      if (input === `/api/sessions/${running.id}/towel` && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(stopping))
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    const competitorLane = await screen.findByLabelText('Aurora Serverless v2 result')
+    const source = FakeEventSource.instances.at(-1)!
+    act(() => source.open())
+    const displayedSeconds = () => Number(
+      competitorLane.querySelector('.timer-readout')?.textContent?.replace('s', ''),
+    )
+    await waitFor(() => expect(displayedSeconds()).toBeGreaterThanOrEqual(21.25))
+    const beforeReplay = displayedSeconds()
+
+    // A new EventSource replays retained setup history. This event is real but
+    // older than the authoritative GET and must not downgrade RUNNING to CHECKING.
+    act(() => source.emit({
+      sequence: 2,
+      event: 'arm_started',
+      occurred_at: '2026-08-25T23:30:00Z',
+      payload: { state: 'checking' },
+    }))
+
+    const towel = screen.getByRole('button', { name: /throw in the towel/i })
+    expect(towel).toBeEnabled()
+    expect(screen.queryByText(/^CHECKING$/i)).not.toBeInTheDocument()
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 80))
+    })
+    expect(displayedSeconds()).toBeGreaterThan(beforeReplay)
+
+    await user.click(towel)
+    expect(fetchMock.mock.calls.some(([input, init]) => (
+      input === `/api/sessions/${running.id}/towel` && init?.method === 'POST'
+    ))).toBe(true)
+    expect(await screen.findByText(/towel in/i)).toBeInTheDocument()
+  })
+
+  it('does not expose towel during a genuinely non-cancellable pre-arm check', async () => {
+    const checking = safeChangeSession('checking')
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: checking.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${checking.id}`) return Promise.resolve(jsonResponse(checking))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+
+    render(<App />)
+
+    expect(await screen.findByText(/checking both corners/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /throw in the towel/i })).not.toBeInTheDocument()
+  })
+
+  it('returns from a Round 2 towel result immediately while its cleanup lease stays active', async () => {
+    const towelled = safeChangeTowelCleanupSession()
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: towelled.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${towelled.id}`) return Promise.resolve(jsonResponse(towelled))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /throw in the towel/i })).not.toBeInTheDocument()
+    const next = screen.getByRole('button', { name: /^a · next round$/i })
+    expect(next).toBeEnabled()
+    expect(next).toHaveAttribute('type', 'button')
+    expect(next).not.toHaveAttribute('tabindex')
+
+    const snapshotBeforeNavigation = JSON.stringify(towelled)
+    await user.click(next)
+
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(window.location.hash).toBe('#setup/card')
+    expect(JSON.stringify(towelled)).toBe(snapshotBeforeNavigation)
+    expect(towelled.towel?.state).toBe('cleaning')
+    expect(towelled.cooldown?.state).toBe('watching')
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
+  })
+
+  it('returns from a Round 5 towel result while cleanup stays authoritative backstage', async () => {
+    const towelled = roundFiveTowelCleanupSession()
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: towelled.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${towelled.id}`) return Promise.resolve(jsonResponse(towelled))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
+    const snapshotBeforeNavigation = JSON.stringify(towelled)
+    await user.click(screen.getByRole('button', { name: /a · (next round|fight card)/i }))
+
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(screen.queryByText(/result posted · cleanup backstage/i)).not.toBeInTheDocument()
+    expect(window.location.hash).toBe('#setup/card')
+    expect(JSON.stringify(towelled)).toBe(snapshotBeforeNavigation)
+    expect(towelled.towel?.state).toBe('cleaning')
+    expect(towelled.round5_setup?.cleanup_retryable).toBe(true)
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
+  })
+
   it.each([
     ['generic proof', 'wake_idle_app'],
     ['Round 4', 'put_model_score_in_app'],
@@ -813,6 +1113,7 @@ describe('backstage setup', () => {
 
     const view = render(<App />)
     expect(await screen.findByRole('button', { name: /throw in the towel/i })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
     view.unmount()
     window.sessionStorage.clear()
 
@@ -3789,7 +4090,7 @@ describe('backstage setup', () => {
     expect(replay).not.toHaveTextContent(/0\.000ms/)
   })
 
-  it('throws the Round 3 towel, censors the active opponent, and unlocks the receipt only after cleanup', async () => {
+  it('throws the Round 3 towel, exposes Next immediately, and cleanup-gates receipt actions', async () => {
     const eligible = recoveryTowelSession('eligible')
     const stopping = recoveryTowelSession('stopping')
     const cleaning = recoveryTowelSession('cleaning')
@@ -3826,7 +4127,7 @@ describe('backstage setup', () => {
     expect(towelRequest?.[1]).toMatchObject({ method: 'POST' })
     const opponentLane = screen.getByLabelText('Aurora Serverless v2 result')
     await waitFor(() => expect(opponentLane.querySelector('.lane-time')).toHaveTextContent('>90.00s'))
-    expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /next round/i })).toBeEnabled()
 
     const source = FakeEventSource.instances.at(-1)!
     source.emit({
@@ -3837,7 +4138,7 @@ describe('backstage setup', () => {
     })
     expect(await screen.findByText(/cleaning owned recovery environments/i)).toBeInTheDocument()
     expect(await screen.findByText(/aws restore already in motion.*safe cleanup may take minutes/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /next round/i })).toBeEnabled()
 
     // Cleanup can sit here for minutes. The ringside strip is already up --
     // a towel lands in `towelled` with a remembered result -- but the actions
@@ -3956,7 +4257,7 @@ describe('backstage setup', () => {
     })
   })
 
-  it('retries a failed towel cleanup without exposing Next', async () => {
+  it('retries a failed towel cleanup while keeping terminal navigation available', async () => {
     const eligible = recoveryTowelSession('eligible')
     const stopping = recoveryTowelSession('stopping')
     const failed = recoveryTowelSession('failed')
@@ -3997,11 +4298,11 @@ describe('backstage setup', () => {
     })
     const retry = await screen.findByRole('button', { name: /retry/i })
     expect(screen.getByText(/recovery environments could not be safely removed/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /next round/i })).toBeEnabled()
 
     await user.click(retry)
     await waitFor(() => expect(towelCalls).toBe(2))
-    expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /next round/i })).toBeEnabled()
     expect(await screen.findByText(/cleaning owned recovery environments/i)).toBeInTheDocument()
     expect(await screen.findByText(/aws restore already in motion.*safe cleanup may take minutes/i)).toBeInTheDocument()
   })

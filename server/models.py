@@ -333,6 +333,10 @@ class LaneSnapshot(BaseModel):
     name: str
     state: LaneState = LaneState.SEALED
     elapsed_ms: float | None = None
+    # Public, server-derived lower bound at serialization time. Active timed
+    # lanes use the bout's authoritative monotonic origin; terminal lanes keep
+    # `elapsed_ms` as their exact stopped measurement.
+    elapsed_at_snapshot_ms: float | None = None
     attempts: int = 0
     successes: int = 0
     errors: int = 0
@@ -364,6 +368,11 @@ class RoundFiveSetupLaneSnapshot(BaseModel):
     name: str
     state: RoundFiveSetupState = RoundFiveSetupState.PENDING
     setup_elapsed_ms: float | None = None
+    # Public, server-derived lower bound at the instant this snapshot was made.
+    # Unlike the progress latch above, this advances across silent provider waits.
+    # It carries no wall or monotonic timestamp, so clients cannot mix clock
+    # domains; they only interpolate forward from this already-authoritative base.
+    elapsed_at_snapshot_ms: float | None = None
     status: str = "Waiting for setup"
     stop_gate_evidence: RoundFiveSetupGateSnapshot | None = None
     verified: bool = False

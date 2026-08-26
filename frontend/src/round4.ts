@@ -117,6 +117,13 @@ function redoIsTerminal(session: DemoSession): boolean {
   return session.redo?.state === 'verified' || session.redo?.state === 'failed'
 }
 
+const activeSessionRank: Partial<Record<DemoSession['state'], number>> = {
+  draft: 0,
+  checking: 1,
+  armed: 2,
+  running: 3,
+}
+
 const runningLaneRank: Partial<Record<LaneSnapshot['state'], number>> = {
   sealed: 0,
   connecting: 1,
@@ -138,6 +145,13 @@ function runningLaneRegresses(current: LaneSnapshot, incoming: LaneSnapshot): bo
 export function acceptsReconciledSession(current: DemoSession, incoming: DemoSession): boolean {
   if (current.id !== incoming.id) return false
   if (timestamp(incoming.updated_at) < timestamp(current.updated_at)) return false
+  const currentActiveRank = activeSessionRank[current.state]
+  const incomingActiveRank = activeSessionRank[incoming.state]
+  if (
+    currentActiveRank !== undefined
+    && incomingActiveRank !== undefined
+    && incomingActiveRank < currentActiveRank
+  ) return false
   if (
     current.state === 'verified'
     && incoming.state !== 'verified'

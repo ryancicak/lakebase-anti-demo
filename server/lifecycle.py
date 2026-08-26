@@ -4183,6 +4183,51 @@ def _prepare_and_reassert_round5_aws_credentials(
     return digests
 
 
+def _reassert_round5_aws_credentials(
+    ssm: Any,
+    *,
+    runner_instance_id: str,
+    common: dict[str, Any],
+    lanes: tuple[tuple[str, str, str, str, str], ...],
+) -> None:
+    """Restore static Proxy secrets without rotating an existing baseline.
+
+    A running app and a running local server each hold the immutable manifest
+    snapshot they started with. An ordinary reset used to mint new Aurora/RDS
+    passwords and replace the runner files, which made both processes stale
+    immediately: their next bout sent the old digest and failed
+    ``baseline_auth_hash_invalid`` only after the slow Proxy provisioning path.
+
+    Reasserting is the operation reset actually needs. The runner proves the
+    sealed digest still matches its root-owned file, re-applies that same
+    ordinary-role password, and copies it into the static Proxy secret. Any real
+    drift still fails closed instead of silently blessing a new credential.
+    """
+
+    for (
+        lane_id,
+        direct_host,
+        master_secret_arn,
+        destination_secret_arn,
+        credential_sha256,
+    ) in lanes:
+        _round5_setup_request(
+            ssm,
+            runner_instance_id=runner_instance_id,
+            payload={
+                **common,
+                "action": "reassert_rds_credentials",
+                "nonce": secrets.token_hex(16),
+                "lane_id": lane_id,
+                "endpoint_host": direct_host,
+                "credential_host": direct_host,
+                "master_secret_arn": master_secret_arn,
+                "destination_secret_arn": destination_secret_arn,
+                "credential_sha256": credential_sha256,
+            },
+        )
+
+
 def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
     from .connection_spike import ConnectionSpikeContract
     from .connection_spike_live import runner_harness_sha256
@@ -4276,7 +4321,7 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
                 "credential_sha256": sealed.lakebase_credential_sha256,
             },
         )
-        aws_digests = _prepare_and_reassert_round5_aws_credentials(
+        _reassert_round5_aws_credentials(
             ssm,
             runner_instance_id=sealed.runner_instance_id,
             common=common,
@@ -4286,20 +4331,20 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
                     str(sealed.aurora_direct_host),
                     str(sealed.aurora_master_secret_arn),
                     str(sealed.aurora_proxy_secret_arn),
+                    sealed.aurora_credential_sha256,
                 ),
                 (
                     "rds",
                     sealed.rds_direct_host,
                     sealed.rds_master_secret_arn,
                     str(sealed.rds_proxy_secret_arn),
+                    sealed.rds_credential_sha256,
                 ),
             ),
         )
         candidate = _reseal_round5(
             sealed,
             harness_sha256=harness_sha256,
-            aurora_credential_sha256=aws_digests["aurora"],
-            rds_credential_sha256=aws_digests["rds"],
             # Rebuilt, never carried forward. `renew` moves the installation
             # expiry and re-applies the Terraform that conditions Round 5's
             # `ec2:CreateTags` grant on it, so the previous tag set is exactly

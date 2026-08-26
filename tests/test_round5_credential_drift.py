@@ -114,12 +114,21 @@ def _stub_reseal_preconditions(monkeypatch: pytest.MonkeyPatch, manifest) -> lis
         "_round5_setup_request",
         lambda *args, **kwargs: {"public_key_sha256": sealed.runner_public_key_sha256},
     )
-    # The irreversible half: by the time this returns, the runner's Aurora and
-    # RDS credential files hold new secrets whose digests are these.
+    # An existing seal is reasserted, never rotated. Keep the old helper loud so
+    # any regression back to reset-time rotation fails every re-seal test here.
+    def refuse_rotation(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("an existing sealed baseline must not be rotated")
+
     monkeypatch.setattr(
         lifecycle,
         "_prepare_and_reassert_round5_aws_credentials",
-        lambda *args, **kwargs: {"aurora": ROTATED_AURORA, "rds": ROTATED_RDS},
+        refuse_rotation,
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_reassert_round5_aws_credentials",
+        lambda *args, **kwargs: None,
     )
 
     def record(candidate, path=None):
@@ -137,20 +146,24 @@ def _stub_reseal_preconditions(monkeypatch: pytest.MonkeyPatch, manifest) -> lis
     return saved
 
 
-def test_the_rotated_digests_are_recorded_even_when_the_gate_refuses(
+def test_a_refused_gate_preserves_the_existing_credential_seal(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The exact shape of the 2026-08-24 failure, now with the record kept.
+    """A reset-time gate failure must not invalidate running processes.
 
-    The runner's credentials have already been replaced when the gate runs, so a
-    manifest that omits the new digests is not the careful outcome -- it is the
-    false one. It describes files that no longer exist, and the next bout dies
-    after the bell proving it.
+    Re-sealing still records the candidate before the topology gate, but an
+    existing baseline is now reasserted rather than replaced. The candidate and
+    every process already holding the prior manifest therefore keep naming the
+    same runner files even when the later gate refuses.
     """
 
     manifest = _round5_manifest(tmp_path)
-    stale_aurora = manifest.require_round5_resources().aurora_credential_sha256
+    sealed = manifest.require_round5_resources()
+    existing = (
+        sealed.aurora_credential_sha256,
+        sealed.rds_credential_sha256,
+    )
     saved = _stub_reseal_preconditions(monkeypatch, manifest)
     monkeypatch.setattr(
         lifecycle,
@@ -167,12 +180,14 @@ def test_the_rotated_digests_are_recorded_even_when_the_gate_refuses(
     assert "Round 5 secret-free doctor failed" in str(refusal.value)
     assert "runner is not online in SSM" in str(refusal.value)
 
-    # ... and the digests reached the manifest anyway.
-    assert saved, "a failed gate must not discard the record of the rotation"
+    # ... and the unchanged digests reached the candidate written before it.
+    assert saved, "a failed gate must still record the re-sealed candidate"
     _, aurora, rds = saved[0]
-    assert (aurora, rds) == (ROTATED_AURORA, ROTATED_RDS)
-    assert aurora != stale_aurora
-    assert manifest.require_round5_resources().aurora_credential_sha256 == ROTATED_AURORA
+    assert (aurora, rds) == existing
+    assert (
+        manifest.require_round5_resources().aurora_credential_sha256,
+        manifest.require_round5_resources().rds_credential_sha256,
+    ) == existing
 
 
 def test_a_refused_gate_never_leaves_the_installation_advertising_ready(
@@ -208,9 +223,14 @@ def test_a_passing_gate_still_seals_and_publishes_exactly_as_before(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The success path is unchanged, which is what makes the fix safe to land."""
+    """A successful re-seal keeps the credential identity stable."""
 
     manifest = _round5_manifest(tmp_path)
+    sealed = manifest.require_round5_resources()
+    existing = (
+        sealed.aurora_credential_sha256,
+        sealed.rds_credential_sha256,
+    )
     saved = _stub_reseal_preconditions(monkeypatch, manifest)
     monkeypatch.setattr(
         lifecycle,
@@ -222,11 +242,84 @@ def test_a_passing_gate_still_seals_and_publishes_exactly_as_before(
 
     resealed = lifecycle._prepare_and_reseal_round5(manifest, timeout=1)
 
-    assert resealed.require_round5_resources().aurora_credential_sha256 == ROTATED_AURORA
-    assert resealed.require_round5_resources().rds_credential_sha256 == ROTATED_RDS
+    assert (
+        resealed.require_round5_resources().aurora_credential_sha256,
+        resealed.require_round5_resources().rds_credential_sha256,
+    ) == existing
     # Round 6 is sealed in the v7 fixture, so readiness is deliberately withheld
     # until its canary re-runs -- the behaviour that predates this change.
     assert [status for status, _, _ in saved] == ["seeding", "seeding"]
+
+
+def test_resealing_an_existing_baseline_does_not_rotate_aws_credentials(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reset must not invalidate already-running app and localhost processes.
+
+    Both read an immutable manifest snapshot when they start. Rotating the
+    runner's Aurora/RDS files during an ordinary re-seal leaves those processes
+    sending the old digest until they restart; the next bout then spends minutes
+    creating a Proxy before dying on ``baseline_auth_hash_invalid``.
+    """
+
+    manifest = _round5_manifest(tmp_path)
+    sealed = manifest.require_round5_resources()
+    before = (
+        sealed.aurora_credential_sha256,
+        sealed.rds_credential_sha256,
+    )
+    _stub_reseal_preconditions(monkeypatch, manifest)
+    monkeypatch.setattr(
+        lifecycle,
+        "_round5_topology_check",
+        lambda candidate, resources=None: lifecycle.Check(
+            "round5_secret_free_topology", True, "clean baseline"
+        ),
+    )
+
+    def rotate(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("an existing sealed baseline must not be rotated")
+
+    reasserted: list[tuple[tuple[str, str, str, str, str], ...]] = []
+
+    def reassert(*args, **kwargs):
+        del args
+        reasserted.append(kwargs["lanes"])
+
+    monkeypatch.setattr(lifecycle, "_prepare_and_reassert_round5_aws_credentials", rotate)
+    monkeypatch.setattr(
+        lifecycle,
+        "_reassert_round5_aws_credentials",
+        reassert,
+        raising=False,
+    )
+
+    resealed = lifecycle._prepare_and_reseal_round5(manifest, timeout=1)
+
+    assert reasserted == [
+        (
+            (
+                "aurora",
+                sealed.aurora_direct_host,
+                sealed.aurora_master_secret_arn,
+                sealed.aurora_proxy_secret_arn,
+                before[0],
+            ),
+            (
+                "rds",
+                sealed.rds_direct_host,
+                sealed.rds_master_secret_arn,
+                sealed.rds_proxy_secret_arn,
+                before[1],
+            ),
+        )
+    ]
+    assert (
+        resealed.require_round5_resources().aurora_credential_sha256,
+        resealed.require_round5_resources().rds_credential_sha256,
+    ) == before
 
 
 def test_every_credential_the_runner_stores_has_a_sealed_digest_to_compare(

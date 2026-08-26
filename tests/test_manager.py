@@ -23,6 +23,7 @@ from server.connection_spike import (
     SetupStopGateEvidence,
     arm_setup_phase,
 )
+from server.connection_spike_live import ConnectionSpikeLiveOperationError
 from server.coordination import InMemoryBoutLeaseStore, LeaseLostError, round_ring_key
 from server.manager import (
     COST_LEDGER_GRANT_HEADLINE,
@@ -2212,6 +2213,19 @@ async def test_round_five_publishes_exact_lakebase_stop_while_competitor_continu
         clock["ns"] += silent_gap_ns
         silent_floor_ms = 500.0 + silent_gap_ns / 1_000_000
 
+        # What a refreshed browser reads. The progress latch deliberately stays
+        # at the last callback, while the public snapshot floor advances from
+        # that lane-owned observation anchor. A UI that restarts from the latch
+        # would visibly rewind from 223.27s to 0.50s here.
+        refreshed = await manager.get(created.id)
+        assert refreshed.round5_setup is not None
+        refreshed_lakebase = refreshed.round5_setup.lanes["lakebase"]
+        refreshed_competitor = refreshed.round5_setup.lanes["competitor"]
+        assert refreshed_lakebase.setup_elapsed_ms == 375.25
+        assert refreshed_lakebase.elapsed_at_snapshot_ms == 375.25
+        assert refreshed_competitor.setup_elapsed_ms == 500.0
+        assert refreshed_competitor.elapsed_at_snapshot_ms == silent_floor_ms
+
         toweled = await manager.start_towel(created.id, operator)
         assert toweled.state == SessionState.TOWELLED
         assert toweled.towel is not None
@@ -2441,7 +2455,7 @@ def test_no_round_five_towel_branch_names_the_preflight_inclusive_origin() -> No
     )
 
 
-async def test_round_five_setup_failure_retains_absorbed_exact_stop() -> None:
+async def test_round_five_setup_failure_retains_absorbed_exact_stop(caplog) -> None:
     class FailingSetupEngine:
         has_timed_setup = True
 
@@ -2470,7 +2484,10 @@ async def test_round_five_setup_failure_retains_absorbed_exact_stop() -> None:
                     setup_elapsed_ms=750.0,
                 )
             )
-            raise RuntimeError("provider setup failed")
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 setup runner did not return exact sanitized evidence: "
+                "the runner refused with baseline_auth_hash_invalid"
+            )
 
         async def cancel_setup_and_settle(self, _bout_id):
             return None
@@ -2499,6 +2516,16 @@ async def test_round_five_setup_failure_retains_absorbed_exact_stop() -> None:
         assert failed.round5_setup.lanes["competitor"].setup_elapsed_ms == 750.0
         assert failed.comparison is None
         assert failed.metrics == []
+        setup_failures = [
+            record
+            for record in caplog.records
+            if record.name == "server.manager" and "bout failed" in record.getMessage()
+        ]
+        assert setup_failures
+        line = setup_failures[-1].getMessage()
+        assert "baseline_auth_hash_invalid" in line
+        assert created.id in line
+        assert setup_failures[-1].exc_info is not None
     finally:
         await manager.close()
 
@@ -2823,6 +2850,45 @@ async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> 
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.state == SessionState.TOWELLED
     assert await manager._lease_store.current() is None
+
+
+async def test_round_two_public_timer_floor_matches_authoritative_towel_cutoff() -> None:
+    clock = {"ns": 10_000_000_000}
+    engine = BlockingTowelSafeChangeEngine()
+    manager = RunManager(
+        safe_change_factory=lambda: engine,
+        clock_ns=lambda: clock["ns"],
+    )
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="software_engineer",
+            corners=[Corner.SIMPLICITY],
+            round_id=RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
+        )
+    )
+    await manager.start_arm(created.id)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id)
+    await asyncio.wait_for(engine.run_entered.wait(), timeout=1)
+
+    # The provider stays silent after its first 1ms callback while AWS continues
+    # polling. A public refresh must serialize the bout clock, not that stale latch.
+    clock["ns"] += 21_250_000_000
+    refreshed = await manager.get(created.id)
+    assert refreshed.state == SessionState.RUNNING
+    assert refreshed.lanes["lakebase"].elapsed_ms == 1.0
+    assert refreshed.lanes["lakebase"].elapsed_at_snapshot_ms == 21_250.0
+    assert refreshed.lanes["competitor"].elapsed_ms is None
+    assert refreshed.lanes["competitor"].elapsed_at_snapshot_ms == 21_250.0
+
+    stopped = await manager.start_towel(created.id)
+    assert stopped.towel is not None
+    assert stopped.towel.censored_lower_bounds_ms == {
+        "lakebase": 21_250.0,
+        "competitor": 21_250.0,
+    }
+    await wait_for_towel(manager, created.id, "ready")
 
 
 async def test_a_towel_thrown_mid_run_settles_each_rounds_own_engine() -> None:

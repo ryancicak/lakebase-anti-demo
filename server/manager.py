@@ -1486,13 +1486,118 @@ class RunManager:
         )
         return snapshot.model_copy(deep=True)
 
+    def _round_five_elapsed_floors(
+        self,
+        record: SessionRecord,
+        *,
+        as_of_ns: int,
+    ) -> dict[str, float]:
+        """Project each setup latch to one lane-owned monotonic observation.
+
+        ``setup_elapsed_ms`` is deliberately a callback latch. It is exact when
+        the setup orchestrator reports, but AWS can then stay silent for minutes
+        while a Proxy target becomes available. The manager cannot recover the
+        orchestrator's private T0, so the safe floor is the published elapsed
+        plus the interval on *this same measurement clock* since the manager
+        observed it.
+
+        This is the only arithmetic used both for public running snapshots and
+        the towel cutoff. A browser therefore restarts from the same floor that
+        would become authoritative if the operator stopped the bout at that
+        instant, without receiving either process-local monotonic values or
+        wall-clock anchors.
+        """
+
+        setup = record.snapshot.round5_setup
+        if setup is None:
+            return {}
+        floors: dict[str, float] = {}
+        for lane_id, lane in setup.lanes.items():
+            published_ms = lane.setup_elapsed_ms
+            if published_ms is None:
+                continue
+            floor_ms = published_ms
+            observed_ns = record.round5_progress_observed_ns.get(lane_id)
+            if (
+                record.snapshot.state == SessionState.RUNNING
+                and lane.state == RoundFiveSetupState.RUNNING
+                and observed_ns is not None
+            ):
+                floor_ms += max(0.0, (as_of_ns - observed_ns) / 1_000_000)
+            floors[lane_id] = floor_ms
+        return floors
+
+    def _public_snapshot_locked(
+        self,
+        record: SessionRecord,
+        *,
+        as_of_ns: int | None = None,
+    ) -> SessionSnapshot:
+        """Copy a snapshot and stamp server-derived active timer floors.
+
+        Normal timed rounds share the same monotonic origin used by towel
+        adjudication. Round 5 has lane-owned setup clocks, so it keeps its
+        callback-latch projection below. Neither path exposes process-local
+        timestamps to the browser.
+        """
+
+        snapshot = record.snapshot.model_copy(deep=True)
+        active_lane_ids = [
+            lane_id
+            for lane_id, lane in record.snapshot.lanes.items()
+            if lane.state in {LaneState.CONNECTING, LaneState.VERIFYING}
+        ]
+        started_ns = record.run_started_monotonic_ns
+        if (
+            record.recovery_stop_control is not None
+            and record.recovery_stop_control.started_ns is not None
+        ):
+            started_ns = record.recovery_stop_control.started_ns
+        needs_lane_projection = (
+            record.snapshot.state == SessionState.RUNNING
+            and started_ns is not None
+            and bool(active_lane_ids)
+        )
+        setup = snapshot.round5_setup
+        needs_round_five_projection = (
+            setup is not None
+            and record.snapshot.state == SessionState.RUNNING
+            and any(
+            lane.state == RoundFiveSetupState.RUNNING
+            and lane.setup_elapsed_ms is not None
+            and lane_id in record.round5_progress_observed_ns
+            for lane_id, lane in record.snapshot.round5_setup.lanes.items()
+            )
+        )
+        measured_at_ns = (
+            self._clock_ns()
+            if as_of_ns is None and (needs_lane_projection or needs_round_five_projection)
+            else as_of_ns if as_of_ns is not None else 0
+        )
+
+        if needs_lane_projection:
+            assert started_ns is not None
+            bout_floor_ms = max(0.0, (measured_at_ns - started_ns) / 1_000_000)
+            for lane_id in active_lane_ids:
+                lane = snapshot.lanes[lane_id]
+                lane.elapsed_at_snapshot_ms = max(
+                    lane.elapsed_ms if lane.elapsed_ms is not None else 0.0,
+                    bout_floor_ms,
+                )
+
+        if setup is not None:
+            floors = self._round_five_elapsed_floors(record, as_of_ns=measured_at_ns)
+            for lane_id, lane in setup.lanes.items():
+                lane.elapsed_at_snapshot_ms = floors.get(lane_id)
+        return snapshot
+
     async def get(self, session_id: str) -> SessionSnapshot:
         record = await self._record(session_id)
         async with record.lock:
             record.snapshot.standing_cost = self._standing_cost_disclosure(
                 record.snapshot.capacity
             )
-            return record.snapshot.model_copy(deep=True)
+            return self._public_snapshot_locked(record)
 
     async def cancel_arm(
         self,
@@ -2035,24 +2140,11 @@ class RunManager:
             cutoff_ns: int | None = None
             round_five_elapsed_at_cutoff_ms: dict[str, float] = {}
             if is_round_five:
-                # Round 5's clock origin belongs to the setup orchestrator, so
-                # the towel cannot measure from the run start -- that origin is
-                # earlier and preflight-inclusive. What it can do is take each
-                # lane's own last published elapsed time and add the monotonic
-                # interval since that value was observed. The result is on the
-                # lane's own origin, and it can only understate by the callback
-                # delivery latency, which is the safe direction for a floor.
                 round_five_cutoff_ns = self._clock_ns()
-                for lane_id, observed_ns in record.round5_progress_observed_ns.items():
-                    published_ms = (
-                        round_five_setup.lanes[lane_id].setup_elapsed_ms
-                        if round_five_setup is not None and lane_id in round_five_setup.lanes
-                        else None
-                    )
-                    if published_ms is None:
-                        continue
-                    silent_ms = max(0.0, (round_five_cutoff_ns - observed_ns) / 1_000_000)
-                    round_five_elapsed_at_cutoff_ms[lane_id] = published_ms + silent_ms
+                round_five_elapsed_at_cutoff_ms = self._round_five_elapsed_floors(
+                    record,
+                    as_of_ns=round_five_cutoff_ns,
+                )
             else:
                 started_ns = record.run_started_monotonic_ns
                 if stop_control is not None and stop_control.started_ns is not None:
@@ -4580,7 +4672,7 @@ class RunManager:
                 lane.p99_ms = None
                 lane.error = None
                 lane.activity = LaneActivity(phase="setup")
-            running_snapshot = record.snapshot.model_copy(deep=True)
+            running_snapshot = self._public_snapshot_locked(record)
         await record.event_log.publish(
             "run_started",
             {
@@ -4683,7 +4775,7 @@ class RunManager:
                     lane.status = status
                     lane.activity = LaneActivity(phase=phase)
                 record.snapshot.updated_at = datetime.now(UTC)
-                snapshot = record.snapshot.model_copy(deep=True)
+                snapshot = self._public_snapshot_locked(record)
             await publish_lane_snapshots(snapshot, affected_lane_ids)
 
         if setup_operation is not None:
@@ -4706,7 +4798,7 @@ class RunManager:
                         preliminary,
                         terminal=False,
                     )
-                    setup_snapshot = record.snapshot.model_copy(deep=True)
+                    setup_snapshot = self._public_snapshot_locked(record)
                 await publish_lane_snapshots(
                     setup_snapshot,
                     ("lakebase", "competitor"),
@@ -4716,12 +4808,13 @@ class RunManager:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.error(
-                    "Round 5 timed setup failed session=%s competitor=%s diagnostic=%s",
-                    record.snapshot.id,
-                    record.snapshot.competitor.id,
-                    _redacted_exception_chain(exc),
-                )
+                # Setup owns the same operator-safe quoting boundary as every
+                # other bout failure. The old bespoke log used only exception
+                # types, discarding our runner's bounded refusal token (for
+                # example ``baseline_auth_hash_invalid``) even though the
+                # runner had returned it explicitly. Third-party messages still
+                # remain redacted by ``operator_diagnosis``.
+                self._log_bout_refusal(record, exc, round_number=5)
                 message = "The Round 5 setup phase failed; no comparison was declared."
                 await self._finish_connection_spike_failure(
                     record,
@@ -4736,7 +4829,7 @@ class RunManager:
             for lane in record.snapshot.lanes.values():
                 lane.status = "Executing the frozen 128-client secondary burst"
                 lane.activity = LaneActivity(phase="burst")
-            burst_snapshot = record.snapshot.model_copy(deep=True)
+            burst_snapshot = self._public_snapshot_locked(record)
         await publish_lane_snapshots(
             burst_snapshot,
             ("lakebase", "competitor"),

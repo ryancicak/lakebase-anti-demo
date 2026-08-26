@@ -274,6 +274,8 @@ export interface LaneSnapshot {
   name: string
   state: LaneState
   elapsed_ms: number | null
+  /** Server-derived current floor for an active timed lane at serialization. */
+  elapsed_at_snapshot_ms?: number | null
   attempts: number
   status: string
   error: string | null
@@ -808,7 +810,13 @@ export interface SetupLaneResult {
   id: LaneId
   name: string
   state: RoundFiveSetupState
+  /** Exact progress callback latch; terminal setup evidence is scored from this value. */
   setup_elapsed_ms: number | null
+  /**
+   * Server-derived floor when this snapshot was serialized. Active lanes may
+   * advance beyond the callback latch during silent provider waits.
+   */
+  elapsed_at_snapshot_ms?: number | null
   status: string
   stop_gate_evidence: SetupStopGateEvidence | null
   verified: boolean

@@ -600,9 +600,14 @@ case_deploy_happy() {
   if [[ -f "$gen/app-deploy.json" ]]; then
     local mode
     # BSD stat on macOS, GNU coreutils stat everywhere else. Neither spelling
-    # exists on both, so this harness refused to run on Linux at all.
-    mode="$(stat -f '%Lp' "$gen/app-deploy.json" 2>/dev/null ||
-      stat -c '%a' "$gen/app-deploy.json")"
+    # exists on both. Keep their output in separate assignments: GNU stat
+    # interprets -f as filesystem mode and prints for the valid file before
+    # rejecting the BSD format operand, which would contaminate the fallback.
+    if mode="$(stat -f '%Lp' "$gen/app-deploy.json" 2>/dev/null)"; then
+      :
+    else
+      mode="$(stat -c '%a' "$gen/app-deploy.json")"
+    fi
     if [[ "$mode" == "600" ]]; then
       printf '  %sok%s   deploy record is mode 600\n' "$GREEN" "$RESET"
       PASS=$((PASS + 1))

@@ -405,6 +405,58 @@ it('renders the running Round 5 race in the canonical two-clock arena', async ()
   expect(displayedSeconds(competitor)).toBeGreaterThan(initialCompetitorSeconds)
 })
 
+it('restores a silent Round 5 lane from the server snapshot floor without rewinding', async () => {
+  vi.useFakeTimers()
+  const stale = stoppedLakebaseSetup(runningRoundFiveSession())
+  stale.round5_setup!.lanes.competitor!.setup_elapsed_ms = 7_000
+  const props = {
+    roundNumber: 5,
+    error: null,
+    liveEvidenceConnected: true,
+    uiReview: false,
+    hasNextRound: true,
+    commentaryOpen: true,
+    onContinue: vi.fn(),
+    onToggleCommentary: vi.fn(),
+    onHome: vi.fn(),
+  }
+  const first = render(<RoundFiveProof session={stale} {...props} />)
+  await act(async () => { await vi.advanceTimersByTimeAsync(50_100) })
+  const beforeRefresh = displayedSeconds(
+    screen.getByLabelText('RDS PostgreSQL + RDS Proxy result'),
+  )
+  expect(beforeRefresh).toBeGreaterThanOrEqual(57)
+  first.unmount()
+
+  const refreshed = {
+    ...stale,
+    round5_setup: {
+      ...stale.round5_setup!,
+      lanes: {
+        ...stale.round5_setup!.lanes,
+        competitor: {
+          ...stale.round5_setup!.lanes.competitor!,
+          // The callback latch is still 7s. This separate value is the floor
+          // computed by the server at GET time from the same lane-owned clock
+          // source used when a towel freezes the bout.
+          elapsed_at_snapshot_ms: 57_100,
+        },
+      },
+    },
+  } as DemoSession
+  render(<RoundFiveProof session={refreshed} {...props} />)
+
+  const afterRefresh = displayedSeconds(
+    screen.getByLabelText('RDS PostgreSQL + RDS Proxy result'),
+  )
+  expect(afterRefresh).toBeGreaterThanOrEqual(beforeRefresh)
+  expect(afterRefresh).toBeGreaterThanOrEqual(57.1)
+  await act(async () => { await vi.advanceTimersByTimeAsync(96) })
+  expect(displayedSeconds(
+    screen.getByLabelText('RDS PostgreSQL + RDS Proxy result'),
+  )).toBeGreaterThan(afterRefresh)
+})
+
 it('keeps the shared preflight untimed until the setup clocks actually start', () => {
   render(
     <RoundFiveProof
@@ -494,6 +546,37 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
     /Bout stopped.*No winner · margin N\/A/i,
   )
   expect(screen.getByLabelText('Ringside commentator')).toHaveTextContent(/Live setup call/i)
+})
+
+it('offers Next Round while a towel cleanup continues backstage', () => {
+  const onContinue = vi.fn()
+  const towelled = towelledRoundFiveSession()
+  towelled.towel = { ...towelled.towel!, state: 'cleaning' }
+  towelled.round5_setup = {
+    ...towelled.round5_setup!,
+    cleanup_retryable: true,
+  }
+  render(
+    <RoundFiveProof
+      session={towelled}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen
+      onContinue={onContinue}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+
+  expect(screen.getByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
+  const next = screen.getByRole('button', { name: /a · next round/i })
+  fireEvent.click(next)
+  expect(onContinue).toHaveBeenCalledOnce()
+  expect(towelled.towel.state).toBe('cleaning')
+  expect(towelled.round5_setup.cleanup_retryable).toBe(true)
 })
 
 it('stops Lakebase at its exact setup elapsed while AWS and the commentator continue', async () => {
@@ -751,8 +834,12 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
         ...proof.round5_setup!.lanes,
         lakebase: {
           ...proof.round5_setup!.lanes.lakebase!,
-          state: 'failed',
-          setup_elapsed_ms: null,
+          // Verbatim state shape from a terminal setup failure: progress had
+          // reached the lane stop callback, but the final stop-gate evidence
+          // was never attached because its peer failed.
+          state: 'verified',
+          setup_elapsed_ms: 3_112.673,
+          stop_gate_evidence: null,
           verified: false,
         },
       },
@@ -792,6 +879,9 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(/both lanes did not reach the exact setup stop gate.*no timing comparison/i)
   expect(screen.queryByLabelText(/warm burst evidence|setup result|fair proof contract|managed component disclosure/i)).not.toBeInTheDocument()
   expect(screen.getByText('Technical details')).toBeInTheDocument()
+  fireEvent.click(screen.getByText('Technical details'))
+  expect(screen.getByText(/progress reached · not finalized · stop gate not verified/i)).toBeInTheDocument()
+  expect(screen.queryByText(/^verified · stop gate not verified$/i)).not.toBeInTheDocument()
   expect(screen.queryByText(/fence-token|journal=row|workflow-id/i)).not.toBeInTheDocument()
   expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
   expect(screen.queryByRole('button', { name: /ring again/i })).not.toBeInTheDocument()
@@ -969,7 +1059,8 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.queryByRole('button', { name: /retry cleanup|next round/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
 
   rerender(
     <RoundFiveProof

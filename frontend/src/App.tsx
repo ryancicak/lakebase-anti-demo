@@ -1558,12 +1558,17 @@ function towelCleanupAllowsExit(session: DemoSession): boolean {
   return !session.towel || session.towel.state === 'ready'
 }
 
-function roundFiveCleanupAllowsExit(session: DemoSession): boolean {
+function cleanupAllowsTerminalActions(session: DemoSession): boolean {
   return towelCleanupAllowsExit(session)
-    && (
-      session.round.id !== 'survive_connection_spike'
-      || session.round5_setup?.cleanup_retryable !== true
-    )
+    && session.round5_setup?.cleanup_retryable !== true
+}
+
+function proofNavigationAllowsExit(session: DemoSession): boolean {
+  // `towelled` is the terminal stopped-short result for every round. Leaving
+  // that posted result only drops this browser's view; it neither cancels the
+  // cleanup task, releases its per-round lease, nor marks cleanup complete.
+  // Declared and failed results retain their existing cleanup requirements.
+  return session.state === 'towelled' || cleanupAllowsTerminalActions(session)
 }
 
 function roundSixElapsed(session: DemoSession): string {
@@ -3612,7 +3617,7 @@ function App() {
       session.state !== 'verified'
       && session.state !== 'towelled'
       && !(isRoundFive(session) && session.state === 'failed')
-    ) || !roundFiveCleanupAllowsExit(session)) return
+    ) || !proofNavigationAllowsExit(session)) return
     const completed = session
     setError(null)
     if (isRoundSix(completed) && completed.state === 'verified') {
@@ -4735,6 +4740,8 @@ function RoundSixScene({
     || (session.state === 'towelled' && session.lanes.lakebase.state === 'verified')
   const failed = session.state === 'failed'
   const presentation = uiReview ? 'review' : session.state === 'towelled' ? 'towelled' : verified ? 'verified' : failed ? 'failed' : 'running'
+  const terminal = verified || failed || session.state === 'towelled'
+  const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
 
   return (
     <>
@@ -4755,12 +4762,12 @@ function RoundSixScene({
         actions={!uiReview ? (
           <>
             <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
-            {(verified || failed || session.state === 'towelled') && towelCleanupAllowsExit(session) && <>
-              <button type="button" className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>
-              {verified && <button type="button" className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
-              {verified && <button type="button" className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
-              {verified && <button type="button" className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
-              <button type="button" className="round4-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : verified ? 'Next · Final recap' : 'Fight card'}</button>
+            {terminal && proofNavigationAllowsExit(session) && <>
+              {cleanupAllowsActions && <button type="button" className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
+              {cleanupAllowsActions && verified && <button type="button" className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
+              {cleanupAllowsActions && verified && <button type="button" className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
+              {cleanupAllowsActions && verified && <button type="button" className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
+              <button type="button" className="round4-next" onClick={onContinue}>A · {session.state === 'towelled' || hasNextRound ? 'Next round' : verified ? 'Next · Final recap' : 'Fight card'}</button>
             </>}
           </>
         ) : undefined}
@@ -4789,10 +4796,17 @@ function roundFiveArenaLane(
         : setupState === 'towelled'
           ? 'towelled'
           : 'sealed'
-  const elapsedMs = typeof setupLane?.setup_elapsed_ms === 'number'
-    && Number.isFinite(setupLane.setup_elapsed_ms)
-    && setupLane.setup_elapsed_ms >= 0
-    ? setupLane.setup_elapsed_ms
+  // Only a running lane consumes the projected floor. Once a lane reaches any
+  // terminal state, the exact callback latch is the stopped measurement. This
+  // keeps refresh recovery from rewinding a silent setup phase without letting
+  // a stale projection leak past a stop gate, failure, or towel.
+  const elapsedCandidate = setupState === 'running'
+    ? setupLane?.elapsed_at_snapshot_ms ?? setupLane?.setup_elapsed_ms
+    : setupLane?.setup_elapsed_ms
+  const elapsedMs = typeof elapsedCandidate === 'number'
+    && Number.isFinite(elapsedCandidate)
+    && elapsedCandidate >= 0
+    ? elapsedCandidate
     : null
   const status = state === 'sealed'
     ? 'Untimed shared preflight · Setup clock has not started'
@@ -4867,7 +4881,7 @@ export function RoundFiveProof({
      and the second is the one where a run-owned proxy may still exist. Set
      only on abandonment, so its presence is the distinction. */
   const cleanupAbandoned = session.round5_setup?.cleanup_failure || null
-  const cleanupAllowsExit = roundFiveCleanupAllowsExit(session)
+  const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
   const hasComparison = roundFiveHasComparison(session)
   const showCleanupFallback = cleanupRetryable
     && !session.towel
@@ -4964,7 +4978,7 @@ export function RoundFiveProof({
                     B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
                   </button>
                 )}
-                {!uiReview && hasComparison && cleanupAllowsExit && (
+                {!uiReview && hasComparison && cleanupAllowsActions && (
                   <div className="proof-actions">
                     <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>
                     <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
@@ -4981,9 +4995,9 @@ export function RoundFiveProof({
                   <strong>No winner · margin N/A</strong>
                 </div>
                 <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
-                {!uiReview && cleanupAllowsExit && (
+                {!uiReview && proofNavigationAllowsExit(session) && (
                   <div className="proof-actions">
-                    <button className="proof-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
+                    <button type="button" className="proof-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
                   </div>
                 )}
               </>
@@ -5024,6 +5038,11 @@ export function RoundFiveProof({
     lakebase: roundFiveSetupLaneResult(session, 'lakebase'),
     competitor: roundFiveSetupLaneResult(session, 'competitor'),
   }
+  const setupStateLabel = (result: typeof setupResults.lakebase) => (
+    terminal && result.state === 'verified' && !result.stopGateExact
+      ? 'progress reached · not finalized'
+      : result.state
+  )
   const setupValidated = Boolean(
     session.round5_setup?.setup_validated
     && setupResults.lakebase.verified
@@ -5073,14 +5092,14 @@ export function RoundFiveProof({
             <details className="round5-technical-details">
               <summary>Technical details</summary>
               <dl>
-                <div><dt>Lakebase setup</dt><dd>{setupResults.lakebase.state} · stop gate {setupResults.lakebase.stopGateExact ? 'exact' : 'not verified'}</dd></div>
-                <div><dt>{awsEngineName} setup</dt><dd>{setupResults.competitor.state} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
+                <div><dt>Lakebase setup</dt><dd>{setupStateLabel(setupResults.lakebase)} · stop gate {setupResults.lakebase.stopGateExact ? 'exact' : 'not verified'}</dd></div>
+                <div><dt>{awsEngineName} setup</dt><dd>{setupStateLabel(setupResults.competitor)} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
                 <div><dt>Workflow launch skew</dt><dd>{setupSkew}</dd></div>
               </dl>
               <p>Lakebase uses its built-in pooled host. The AWS lane adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are required before the clock.</p>
             </details>
             <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
-            {!uiReview && (showCleanupFallback || (!cleanupFailed && terminal && cleanupAllowsExit)) && (
+            {!uiReview && (showCleanupFallback || (!cleanupFailed && terminal && cleanupAllowsActions)) && (
               <div className="round5-compact-actions">
                 {showCleanupFallback && (
                   <button
@@ -5091,7 +5110,7 @@ export function RoundFiveProof({
                     B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
                   </button>
                 )}
-                {!cleanupFailed && terminal && cleanupAllowsExit && (
+                {!cleanupFailed && terminal && cleanupAllowsActions && (
                   <button className="round5-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
                 )}
               </div>
@@ -5296,6 +5315,7 @@ function RoundFourProof({
   const redoEvidence = redo ? modelScoreEvidence(redo.lanes.lakebase) : null
   const showV1Ribbon = presentation === 'redo_running' || presentation === 'redo_verified' || presentation === 'redo_failed'
   const terminal = presentation !== 'initial_running' && presentation !== 'redo_running'
+  const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
   const activeSession: DemoSession = presentation.startsWith('redo_') && redo
     ? { ...session, lanes: redo.lanes, metrics: redo.metrics, comparison: redo.comparison ?? null, failure: redo.failure ?? null }
     : session
@@ -5401,20 +5421,20 @@ function RoundFourProof({
 
       <footer className="round4-footer">
         <p className="sr-only">{resultText}</p>
-        {terminal && towelCleanupAllowsExit(session) && (
+        {terminal && proofNavigationAllowsExit(session) && (
           <div className="round4-actions">
-            {presentation === 'initial_verified' && canStartRoundFourRedo(session) && (
+            {cleanupAllowsActions && presentation === 'initial_verified' && canStartRoundFourRedo(session) && (
               <div className="starred-redo-action">
                 <button className="round4-redo" disabled={redoPending} onClick={onRedo}>
                   B · RE-DO
                 </button>
               </div>
             )}
-            <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>
-            {shareable && <button className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
-            {shareable && <button className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
-            {shareable && <button className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
-            <button className="round4-next" title={hasNextRound ? 'Continue to the next round' : 'Return to the fight card'} onClick={onContinue}>A · Next round</button>
+            {cleanupAllowsActions && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
+            {cleanupAllowsActions && shareable && <button className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
+            {cleanupAllowsActions && shareable && <button className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
+            {cleanupAllowsActions && shareable && <button className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
+            <button type="button" className="round4-next" title={hasNextRound ? 'Continue to the next round' : 'Return to the fight card'} onClick={onContinue}>A · Next round</button>
           </div>
         )}
       </footer>
@@ -5478,6 +5498,7 @@ function Proof({
   const liveEvidenceInterrupted = !uiReview
     && session.state === 'running'
     && !liveEvidenceConnected
+  const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
   const [showRingsideTake, setShowRingsideTake] = useState(false)
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
@@ -5529,18 +5550,14 @@ function Proof({
           <div className="fairness"><span aria-hidden="true">◆</span>{fairnessCopy(session.round.id)}<span aria-hidden="true">◆</span></div>
         )}
         {!uiReview && complete && capabilityGap && <CapabilityNote compact />}
-        {/* The ringside strip and the actions row do not appear together for the
-            whole of a bout's tail. A towel puts the session straight into
-            `towelled` WITH a remembered_result, so the strip renders at once,
-            while `.proof-actions` waits on towelCleanupAllowsExit -- cleanup
-            starts at `stopping`, can sit in `cleaning` for minutes, and can
-            end at `failed` and never clear. For that whole window the strip is
-            on screen with no route to "Explain to the room", which is where its
-            prose now lives, so it carries its own trigger there instead. */}
+        {/* A towel posts the terminal result immediately while auxiliary
+            receipt actions remain cleanup-gated. The strip therefore keeps its
+            own "Explain" route until cleanup settles; Next is independently
+            available from the shared terminal-navigation rule below. */}
         {!uiReview && successful && session.remembered_result && (
           <RingsideMeanings
             session={session}
-            onExplain={towelCleanupAllowsExit(session) ? undefined : () => setShowRingsideTake(true)}
+            onExplain={cleanupAllowsActions ? undefined : () => setShowRingsideTake(true)}
           />
         )}
         {!uiReview && complete && session.remembered_result && !capabilityGap && <p className="final-fairness">{fairnessCopy(session.round.id)}</p>}
@@ -5550,9 +5567,9 @@ function Proof({
           disabled={!liveEvidenceConnected}
           onTowel={onTowel}
         />
-        {!uiReview && complete && towelCleanupAllowsExit(session) && (
+        {!uiReview && complete && proofNavigationAllowsExit(session) && (
           <div className="proof-actions">
-            {((session.state === 'verified' && genericRedoAllowed) || failedOwnedArtifactRound) && (
+            {cleanupAllowsActions && ((session.state === 'verified' && genericRedoAllowed) || failedOwnedArtifactRound) && (
               <div className="starred-redo-action">
                 <button
                   className="proof-redo"
@@ -5570,11 +5587,12 @@ function Proof({
                 )}
               </div>
             )}
-            <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>
-            {successful && <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
-            {successful && <button className="proof-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
-            {successful && <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
+            {cleanupAllowsActions && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
+            {cleanupAllowsActions && successful && <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
+            {cleanupAllowsActions && successful && <button className="proof-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
+            {cleanupAllowsActions && successful && <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
             <button
+              type="button"
               className="proof-next"
               title={hasNextRound ? 'Continue to the next round' : 'Return to the fight card'}
               onClick={onContinue}
@@ -5678,7 +5696,7 @@ function TowelProgress({ session, onRetry }: { session: DemoSession; onRetry: ()
     : towel.state === 'stopping'
       ? `Server cutoff ${laneReceiptTime(towelCutoffMs(session))} · Freezing exact evidence`
       : recoveryRound
-        ? 'Only run-owned recovery environments are being removed · Next unlocks after verified cleanup'
+        ? 'Only run-owned recovery environments are being removed · Cleanup continues backstage under this round lease'
         : 'Verified results stay exact · Unfinished lanes stay lower bounds'
   return (
     <div className="towel-progress" data-state={towel.state} role={failed ? 'alert' : 'status'} aria-live="polite">
@@ -7629,6 +7647,13 @@ function Lane({
   const couldBeActive = !uiReview && sessionState === 'running' && (
     lane.state === 'connecting' || lane.state === 'verifying'
   )
+  const snapshotFloor = lane.elapsed_at_snapshot_ms
+  const elapsedMs = couldBeActive
+    && typeof snapshotFloor === 'number'
+    && Number.isFinite(snapshotFloor)
+    && snapshotFloor >= 0
+    ? Math.max(lane.elapsed_ms ?? 0, snapshotFloor)
+    : lane.elapsed_ms
   const active = couldBeActive && liveEvidenceConnected
   const disconnected = couldBeActive && !liveEvidenceConnected
   const status = censored
@@ -7659,7 +7684,7 @@ function Lane({
                 ? 'Not timed'
               : censored
                 ? <span className="timer-readout" data-width="long">&gt;{(censoredMs / 1000).toFixed(2)}<span className="timer-unit">s</span></span>
-                : <TimerValue elapsedMs={lane.elapsed_ms} active={active} disconnected={disconnected} />}
+                : <TimerValue elapsedMs={elapsedMs} active={active} disconnected={disconnected} />}
       </div>
       <p className="lane-status"><span aria-hidden="true">{lane.state === 'verified' ? '✓' : lane.state === 'failed' ? '!' : unsupported ? '—' : '•'}</span>{status}</p>
       {failed && lane.error && (
