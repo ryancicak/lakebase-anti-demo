@@ -564,6 +564,48 @@ case_deploy_refusals() {
   check "refuses with no installation" "--deploy-only needs an installation to deploy"
 }
 
+case_deploy_runner_guard() {
+  printf '\n%s== deploy refuses runner source ahead of the EC2 seal ==%s\n' "$BOLD" "$RESET"
+  local sb gen status source_sha tmp
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  tmp="$gen/manifest.next"
+  jq '.round5 = {"harness_sha256": ("0" * 64)}' "$gen/manifest.json" >"$tmp"
+  mv "$tmp" "$gen/manifest.json"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+
+  ROUND4_CATALOG=stubcat STUB_STATE_DIR="$sb" run "$sb" --deploy-only --yes
+  status=$?
+  check "names the incompatible runner source" "REFUSING TO DEPLOY INCOMPATIBLE ROUND 5 RUNNER SOURCE"
+  check "prints the targeted repair" "./antidemo runner refresh"
+  check "prints the deploy that follows" "./bootstrap.sh --deploy-only --yes"
+  check "states remote app surfaces were untouched" \
+    "No Databricks secret, workspace source, or app deployment was changed"
+  check_absent "refuses before publishing a secret" "published the seal to"
+  check_absent "refuses before syncing source" "source synced"
+  check_absent "refuses before deploying the app" "deployment accepted"
+  if ((status != 0)); then
+    printf '  %sok%s   mismatch exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s mismatch exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  source_sha="$("$PYTHON_ENVIRONMENT/bin/python" - <<'PY'
+from server.connection_spike_live import runner_harness_sha256
+print(runner_harness_sha256())
+PY
+)"
+  jq --arg sha "$source_sha" '.round5.harness_sha256 = $sha' \
+    "$gen/manifest.json" >"$tmp"
+  mv "$tmp" "$gen/manifest.json"
+  ROUND4_CATALOG=stubcat STUB_STATE_DIR="$sb" run "$sb" --deploy-only --yes
+  check "aligned source passes the guard" "Round 5 source matches the sealed EC2 harness"
+  check "aligned source reaches publication" "published the seal to"
+  check "aligned source reaches sync" "source synced"
+}
+
 case_deploy_happy() {
   printf '\n%s== deploy, happy path ==%s\n' "$BOLD" "$RESET"
   local sb gen
@@ -1092,6 +1134,7 @@ CASES=(
   case_s3_bucket_states
   case_drift
   case_deploy_refusals
+  case_deploy_runner_guard
   case_deploy_happy
   case_deploy_seal_only
   case_deploy_record_merge

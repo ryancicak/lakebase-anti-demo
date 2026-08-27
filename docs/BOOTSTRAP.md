@@ -406,6 +406,33 @@ the reference for both** and supersedes anything below that disagrees with it.
 The manual sequence is kept here because it is what the automation performs, and
 because knowing it is what makes a failed deploy debuggable:
 
+When a change touches any file under the Round 5 runner contract, refresh that
+sealed runner before deploying the app:
+
+```bash
+./antidemo runner refresh
+env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
+  ANTI_DEMO_MANIFEST="$PWD/.anti-demo-v10/manifest.json" \
+  ./bootstrap.sh --deploy-only --yes
+```
+
+`runner refresh` holds the generation lock and both Round 5 rings, verifies the
+sealed account, region, principal chain, EC2 instance profile, and SSM state,
+installs only the three runner assets, verifies every file and their combined
+digest from EC2, then atomically changes only the Round 5 harness seal. It does
+not run Terraform, reset a database, or touch another round. `--deploy-only`
+independently recomputes the source digest before its first Databricks secret
+write or workspace sync and exits non-zero if the source is still ahead of the
+seal.
+
+Normal uptime and app restarts do not create harness drift: source, manifest,
+and EC2 hashes remain stable until runner source changes. Aurora cold wake time
+is inherently variable, so direct-wake verification uses 100 seconds of the
+120-second SSM command boundary and reserves 20 seconds for result serialization
+and command completion. This protects application reliability across long
+uptimes; it cannot prevent an external scheduled EphemeralNuke or other owner
+from deleting the underlying infrastructure.
+
 1. Build the frontend: `cd frontend && npm ci && npm run build`. `frontend/dist`
    is not committed and the app serves 503 without it.
 2. Create four app resources on the app that `bootstrap.sh` created or adopted,

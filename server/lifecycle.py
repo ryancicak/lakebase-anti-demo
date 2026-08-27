@@ -13,9 +13,10 @@ import secrets
 import shutil
 import subprocess
 import tarfile
+import threading
 import time
 import urllib.request
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -3096,15 +3097,12 @@ def _enable_round5_lakebase_native_login(manifest: DemoManifest) -> tuple[str, s
 
 
 def _round5_runner_archive() -> str:
+    from .connection_spike_live import RUNNER_ASSETS
+
     runner_root = PROJECT_ROOT / "runner"
-    asset_names = (
-        "connection_spike_runner.py",
-        "run_connection_spike.sh",
-        "requirements-round5.txt",
-    )
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w:gz") as archive:
-        for name in asset_names:
+        for name in RUNNER_ASSETS:
             path = runner_root / name
             if not path.is_file():
                 raise RuntimeError(f"Round 5 runner asset is missing: {name}")
@@ -3129,6 +3127,11 @@ def _round5_runner_archive() -> str:
 #: so a value chosen at the floor buys nothing and risks refusing a cleanup the
 #: runner would have permitted.
 ROUND5_SSM_COMMAND_TIMEOUT_SECONDS = 120
+# SSM limits the complete command document plus parameters to 100 KB. The
+# compressed base64 runner archive is one parameter entry; reserve 20 KB for the
+# document wrapper and install commands instead of carrying the old arbitrary
+# 20,000-character cliff.
+ROUND5_RUNNER_SSM_ARCHIVE_MAX_CHARS = 80_000
 
 
 def _run_round5_ssm_command(
@@ -3164,7 +3167,10 @@ def _run_round5_ssm_command(
         status = str(invocation.get("Status") or "")
         if status in terminal:
             if status != "Success":
-                raise RuntimeError("Round 5 runner configuration command failed")
+                standard_error = str(invocation.get("StandardErrorContent") or "")
+                stages = re.findall(r"ANTI_DEMO_STAGE=([a-z_]{1,32})", standard_error)
+                stage = f" at stage {stages[-1]}" if stages else ""
+                raise RuntimeError(f"Round 5 runner configuration command failed{stage}")
             return str(invocation.get("StandardOutputContent") or "")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -3272,22 +3278,14 @@ def _configure_round5_runner(
     runner_instance_id: str,
     expected_harness_sha256: str,
 ) -> str:
-    from .connection_spike_live import RUNNER_PATH
+    from .connection_spike_live import RUNNER_PATH, runner_asset_sha256s
 
     install_root = str(Path(RUNNER_PATH).parent)
     trust_bundle_path = f"{install_root}/round5-ca.pem"
-    archive = _round5_runner_archive()
-    if len(archive) > 20_000:
-        raise RuntimeError("Round 5 runner bundle exceeds the bounded SSM install payload")
+    expected_assets = runner_asset_sha256s()
+    _install_round5_runner_assets(session, runner_instance_id=runner_instance_id)
     commands = [
         "set -euo pipefail",
-        "dnf install -y python3.12",
-        f"install -d -m 0755 {install_root}",
-        f"printf '%s' '{archive}' | base64 -d | tar -xz -C {install_root}",
-        f"python3.12 -m venv {install_root}/venv",
-        f"{install_root}/venv/bin/pip install --disable-pip-version-check "
-        f"--no-cache-dir -r {install_root}/requirements-round5.txt",
-        f"chmod 0755 {RUNNER_PATH} {install_root}/connection_spike_runner.py",
         "test -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
         "curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "
         "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem "
@@ -3308,27 +3306,68 @@ def _configure_round5_runner(
         timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
     )
 
-    harness_checksum, trust_checksum = _round5_runner_checksums(
+    installed_assets, harness_checksum, trust_checksum = _round5_runner_asset_checksums(
         session,
         runner_instance_id=runner_instance_id,
         trust_bundle_path=trust_bundle_path,
     )
+    if installed_assets != expected_assets:
+        raise RuntimeError("Round 5 runner per-file checksums differ from the local assets")
     if harness_checksum != expected_harness_sha256:
         raise RuntimeError("Round 5 runner checksum differs from the sealed local harness")
     return trust_checksum
 
 
-def _round5_runner_checksums(
+def _install_round5_runner_assets(
+    session: boto3.Session,
+    *,
+    runner_instance_id: str,
+) -> None:
+    """Install only the three versioned runner assets and their Python environment."""
+    from .connection_spike_live import RUNNER_PATH
+
+    install_root = str(Path(RUNNER_PATH).parent)
+    archive = _round5_runner_archive()
+    if len(archive) > ROUND5_RUNNER_SSM_ARCHIVE_MAX_CHARS:
+        raise RuntimeError("Round 5 runner bundle exceeds the bounded SSM install payload")
+    commands = [
+        "set -euo pipefail",
+        "stage=bootstrap",
+        "trap 'echo ANTI_DEMO_STAGE=$stage >&2' ERR",
+        "stage=packages",
+        "dnf install -y python3.12",
+        "stage=directory",
+        f"install -d -m 0755 {install_root}",
+        "stage=archive",
+        f"printf '%s' '{archive}' | base64 -d | tar -xz -C {install_root}",
+        "stage=venv",
+        f"python3.12 -m venv {install_root}/venv",
+        "stage=dependencies",
+        f"{install_root}/venv/bin/pip install --disable-pip-version-check "
+        f"--no-cache-dir -r {install_root}/requirements-round5.txt",
+        "stage=permissions",
+        f"chmod 0755 {RUNNER_PATH} {install_root}/connection_spike_runner.py",
+    ]
+    _run_round5_ssm_command(
+        session.client("ssm"),
+        runner_instance_id=runner_instance_id,
+        commands=commands,
+        timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def _round5_runner_asset_checksums(
     session: boto3.Session,
     *,
     runner_instance_id: str,
     trust_bundle_path: str,
-) -> tuple[str, str]:
-    from .connection_spike_live import RUNNER_PATH
+) -> tuple[dict[str, str], str, str]:
+    from .connection_spike_live import RUNNER_ASSETS, RUNNER_PATH
 
     install_root = str(Path(RUNNER_PATH).parent)
-    # Doctor output contains only digests; no secret value or database
-    # credential enters the command, runner stdout, app logs, or browser payloads.
+    asset_literal = repr(RUNNER_ASSETS)
+    # Output is deliberately digest-only. No path, host, account, credential, or
+    # provider message is returned to the caller.
     output = _run_round5_ssm_command(
         session.client("ssm"),
         runner_instance_id=runner_instance_id,
@@ -3337,11 +3376,13 @@ def _round5_runner_checksums(
             f"{install_root}/venv/bin/python3.12 - <<'PY'",
             "import hashlib, pathlib",
             f"root = pathlib.Path('{install_root}')",
+            f"names = {asset_literal}",
             "digest = hashlib.sha256()",
-            "for name in ('connection_spike_runner.py','run_connection_spike.sh',"
-            "'requirements-round5.txt'):",
+            "for name in names:",
+            "    value = (root / name).read_bytes()",
             "    digest.update(name.encode()); digest.update(b'\\0')",
-            "    digest.update((root / name).read_bytes()); digest.update(b'\\0')",
+            "    digest.update(value); digest.update(b'\\0')",
+            "    print('ASSET=' + name + ':' + hashlib.sha256(value).hexdigest())",
             "print('HARNESS=' + digest.hexdigest())",
             f"print('TRUST=' + hashlib.sha256(pathlib.Path('{trust_bundle_path}')"
             ".read_bytes()).hexdigest())",
@@ -3349,16 +3390,42 @@ def _round5_runner_checksums(
         ],
         timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
     )
-    values = {
-        key: value
-        for line in output.splitlines()
-        if "=" in line
-        for key, value in [line.strip().split("=", 1)]
-    }
-    harness = values.get("HARNESS", "")
-    trust = values.get("TRUST", "")
-    if not re.fullmatch(r"[0-9a-f]{64}", harness) or not re.fullmatch(r"[0-9a-f]{64}", trust):
+    assets: dict[str, str] = {}
+    harness = ""
+    trust = ""
+    for line in output.splitlines():
+        if line.startswith("ASSET="):
+            name, separator, checksum = line.removeprefix("ASSET=").partition(":")
+            if (
+                separator
+                and name in RUNNER_ASSETS
+                and re.fullmatch(r"[0-9a-f]{64}", checksum)
+            ):
+                assets[name] = checksum
+        elif line.startswith("HARNESS="):
+            harness = line.removeprefix("HARNESS=")
+        elif line.startswith("TRUST="):
+            trust = line.removeprefix("TRUST=")
+    if (
+        set(assets) != set(RUNNER_ASSETS)
+        or not re.fullmatch(r"[0-9a-f]{64}", harness)
+        or not re.fullmatch(r"[0-9a-f]{64}", trust)
+    ):
         raise RuntimeError("Round 5 secret-free checksum doctor returned invalid output")
+    return assets, harness, trust
+
+
+def _round5_runner_checksums(
+    session: boto3.Session,
+    *,
+    runner_instance_id: str,
+    trust_bundle_path: str,
+) -> tuple[str, str]:
+    _assets, harness, trust = _round5_runner_asset_checksums(
+        session,
+        runner_instance_id=runner_instance_id,
+        trust_bundle_path=trust_bundle_path,
+    )
     return harness, trust
 
 
@@ -4065,6 +4132,361 @@ def _require_round5_runner_idle(manifest: DemoManifest) -> None:
 def _reseal_round5_harness(sealed: Round5Resources, harness_sha256: str) -> Round5Resources:
     """Return a canonical v5 seal for an installed, verified runner harness."""
     return _reseal_round5(sealed, harness_sha256=harness_sha256)
+
+
+def _round5_runner_refresh_session(manifest: DemoManifest) -> boto3.Session:
+    """Reach the sealed Round 5 control role from the verified ambient principal."""
+    from .connection_spike_live import (
+        _control_role_source_session,
+        connection_spike_live_config_from_manifest,
+    )
+
+    config = connection_spike_live_config_from_manifest(
+        manifest,
+        "aurora_serverless_v2",
+    )
+    ambient = _aws_session(manifest)
+    identity = ambient.client("sts", region_name=config.region).get_caller_identity()
+    account = str(identity.get("Account") or "")
+    principal = str(identity.get("Arn") or "")
+    if account != config.expected_account_id or f"::{account}:" not in principal:
+        raise RuntimeError(
+            "Runner refresh refused: the ambient AWS principal is not in the sealed account"
+        )
+    try:
+        source = _control_role_source_session(
+            lambda **_kwargs: ambient,
+            region=config.region,
+            expected_account_id=config.expected_account_id,
+            runtime_role_arn=config.runtime_role_arn,
+            session_name="anti-demo-runner-refresh-runtime",
+        )
+        response = source.client("sts", region_name=config.region).assume_role(
+            RoleArn=config.execution_role_arn,
+            RoleSessionName="anti-demo-runner-refresh",
+            DurationSeconds=900,
+        )
+    except ClientError:
+        # FE sandbox administrators may be sealed as trusted operators while an
+        # independently swept/recreated role chain is temporarily unavailable.
+        # Their SSO role is already bounded to the sealed account and region, so
+        # use it directly rather than forcing a broad reset merely to repair the
+        # runner files. Ordinary IAM users do not get this fallback.
+        assumed_role = re.fullmatch(
+            rf"arn:aws:sts::{re.escape(account)}:assumed-role/([^/]+)/[^/]+",
+            principal,
+        )
+        trusted_role_names = {
+            arn.rsplit("/", 1)[-1]
+            for arn in (manifest.aws.runtime_role_trusted_principal_arns or ())
+            if ":role/" in arn
+        }
+        if (
+            assumed_role is None
+            or assumed_role.group(1) not in trusted_role_names
+            or "sandbox-admin" not in assumed_role.group(1)
+        ):
+            raise RuntimeError(
+                "Runner refresh refused: the sealed role chain denied AssumeRole "
+                "(category=runner_role_chain_denied)"
+            ) from None
+        print(
+            "RUNNER using the sealed sandbox administrator directly because the "
+            "least-privilege role chain denied AssumeRole",
+            flush=True,
+        )
+        return ambient
+    credentials = response.get("Credentials") or {}
+    required = ("AccessKeyId", "SecretAccessKey", "SessionToken")
+    if any(not credentials.get(key) for key in required):
+        raise RuntimeError("Runner refresh refused: the sealed control role returned no session")
+    assumed = boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        region_name=config.region,
+    )
+    assumed_identity = assumed.client("sts", region_name=config.region).get_caller_identity()
+    if str(assumed_identity.get("Account") or "") != config.expected_account_id:
+        raise RuntimeError("Runner refresh refused: the control role left the sealed account")
+    return assumed
+
+
+def _round5_refresh_ring_keys(manifest: DemoManifest) -> list[tuple[str, str]]:
+    from .coordination import ROUND5_RING_KEY, round_ring_key
+
+    if manifest.manifest_version != 7 or not manifest.installation_id:
+        return [(ROUND5_RING_KEY, "Round 5")]
+    return [
+        (
+            round_ring_key(
+                manifest.installation_id,
+                RoundId.SURVIVE_CONNECTION_SPIKE.value,
+            ),
+            "Round 5 main ring",
+        ),
+        (
+            round_ring_key(
+                manifest.installation_id,
+                RoundId.SURVIVE_CONNECTION_SPIKE.value,
+                cleanup=True,
+            ),
+            "Round 5 cleanup ring",
+        ),
+    ]
+
+
+def _verify_round5_runner_instance(
+    manifest: DemoManifest,
+    session: boto3.Session,
+) -> None:
+    sealed = manifest.require_round5_resources()
+    reservations = session.client("ec2", region_name=manifest.aws.region).describe_instances(
+        InstanceIds=[sealed.runner_instance_id]
+    ).get("Reservations", [])
+    instances = [
+        instance for reservation in reservations for instance in reservation.get("Instances", [])
+    ]
+    if len(instances) != 1:
+        raise RuntimeError("Runner refresh refused: the sealed EC2 runner did not resolve once")
+    instance = instances[0]
+    availability_zone = str((instance.get("Placement") or {}).get("AvailabilityZone") or "")
+    profile_arn = str((instance.get("IamInstanceProfile") or {}).get("Arn") or "")
+    if (
+        instance.get("InstanceId") != sealed.runner_instance_id
+        or (instance.get("State") or {}).get("Name") != "running"
+        or not availability_zone.startswith(manifest.aws.region)
+        or profile_arn != sealed.runner_instance_profile_arn
+    ):
+        raise RuntimeError(
+            "Runner refresh refused: the EC2 runner no longer matches its sealed "
+            "account, region, state, or instance profile"
+        )
+
+
+def _refresh_round5_runner_locked(
+    manifest: DemoManifest,
+    session: boto3.Session,
+    *,
+    commit_allowed: Callable[[], bool] = lambda: True,
+) -> DemoManifest:
+    """Install, verify, then atomically advance only the runner-related seal."""
+    from .connection_spike_live import runner_asset_sha256s, runner_harness_sha256
+
+    sealed = manifest.require_round5_resources()
+    source_assets = runner_asset_sha256s()
+    source_harness = runner_harness_sha256()
+    try:
+        installed_assets, installed_harness, installed_trust = (
+            _round5_runner_asset_checksums(
+                session,
+                runner_instance_id=sealed.runner_instance_id,
+                trust_bundle_path=sealed.trust_bundle_path,
+            )
+        )
+    except Exception:
+        # A missing/corrupt runner file is the main condition this command exists
+        # to repair. The post-install read below remains mandatory and fail-closed.
+        installed_assets, installed_harness, installed_trust = {}, "", ""
+    aligned = (
+        installed_assets == source_assets
+        and installed_harness == source_harness
+        and installed_trust == sealed.trust_bundle_sha256
+    )
+    if not aligned:
+        try:
+            _install_round5_runner_assets(
+                session,
+                runner_instance_id=sealed.runner_instance_id,
+            )
+        except Exception as exc:
+            stage = re.search(r" at stage ([a-z_]{1,32})", str(exc))
+            stage_detail = f"; stage={stage.group(1)}" if stage else ""
+            raise RuntimeError(
+                "Runner refresh failed during the bounded SSM install; "
+                "the manifest seal was not changed "
+                f"(category=runner_install_failed{stage_detail})"
+            ) from None
+        try:
+            installed_assets, installed_harness, installed_trust = (
+                _round5_runner_asset_checksums(
+                    session,
+                    runner_instance_id=sealed.runner_instance_id,
+                    trust_bundle_path=sealed.trust_bundle_path,
+                )
+            )
+        except Exception:
+            raise RuntimeError(
+                "Runner refresh could not verify the installed files; "
+                "the manifest seal was not changed (category=runner_verify_failed)"
+            ) from None
+    if installed_assets != source_assets or installed_harness != source_harness:
+        raise RuntimeError(
+            "Runner refresh installed bytes that differ from source; "
+            "the manifest seal was not changed (category=runner_hash_mismatch)"
+        )
+    if installed_trust != sealed.trust_bundle_sha256:
+        raise RuntimeError(
+            "Runner refresh found trust-bundle drift; the manifest seal was not changed "
+            "(category=runner_trust_mismatch)"
+        )
+    if runner_asset_sha256s() != source_assets or runner_harness_sha256() != source_harness:
+        raise RuntimeError(
+            "Runner source changed during refresh; the manifest seal was not changed "
+            "(category=runner_source_changed)"
+        )
+    if not commit_allowed():
+        raise RuntimeError(
+            "Runner refresh lost its Round 5 fence before commit; "
+            "the manifest seal was not changed (category=runner_fence_lost)"
+        )
+    candidate = manifest.model_copy(deep=True)
+    candidate.round5 = _reseal_round5_harness(sealed, source_harness)
+    candidate.status = manifest.status
+    try:
+        save_manifest(candidate)
+    except Exception:
+        raise RuntimeError(
+            "Runner refresh verified EC2 but could not atomically save the new seal "
+            "(category=runner_seal_write_failed); run './antidemo runner refresh' again"
+        ) from None
+    print(f"RUNNER source   sha256:{source_harness}", flush=True)
+    print(f"RUNNER installed sha256:{installed_harness}", flush=True)
+    sealed_harness = candidate.require_round5_resources().harness_sha256
+    print(f"RUNNER sealed    sha256:{sealed_harness}", flush=True)
+    return candidate
+
+
+async def _refresh_round5_runner_under_fence(
+    manifest: DemoManifest,
+    session: boto3.Session,
+    *,
+    timeout_seconds: float,
+) -> DemoManifest:
+    from .coordination import LeaseHeldError, build_lease_store
+    from .models import BoutOperator, SessionState
+
+    apply_manifest_environment(manifest)
+    ring_keys = _round5_refresh_ring_keys(manifest)
+    primary = build_lease_store(ring_key=ring_keys[0][0])
+    await primary.initialize()
+    rings: list[tuple[Any, str]] = [(primary, ring_keys[0][1])]
+    for ring_key, label in ring_keys[1:]:
+        sibling = primary.for_ring_key(ring_key)
+        await sibling.initialize()
+        rings.append((sibling, label))
+    operator = BoutOperator(
+        display_name=manifest.owner.split("@", 1)[0].replace(".", " ").title()
+        or "Demo operator",
+        email=manifest.owner if "@" in manifest.owner else None,
+        subject=f"maintenance:{manifest.owner.casefold()}",
+    )
+    ttl = timedelta(seconds=max(90.0, min(timeout_seconds + 30.0, 900.0)))
+    held: list[tuple[Any, Any]] = []
+    stop = asyncio.Event()
+    fence_lost = threading.Event()
+    try:
+        for store, label in rings:
+            try:
+                lease = await store.claim(
+                    session_id=f"maintenance-runner-refresh-{manifest.run_id}",
+                    operator=operator,
+                    phase="maintenance_runner_refresh",
+                    session_state=SessionState.RUNNING,
+                    round_id="maintenance_runner_refresh",
+                    round_title="Round 5 runner refresh",
+                    competitor_id="all",
+                    competitor_name="Round 5 runner",
+                    ttl=ttl,
+                )
+            except LeaseHeldError as exc:
+                owner = exc.lease.operator.email or exc.lease.operator.display_name
+                raise RuntimeError(
+                    f"Runner refresh refused: {label} is active; {owner} owns "
+                    f"phase {exc.lease.phase}"
+                ) from None
+            held.append((store, lease))
+
+        async def heartbeat() -> None:
+            try:
+                while not stop.is_set():
+                    await asyncio.sleep(15)
+                    for index, (store, lease) in enumerate(held):
+                        held[index] = (store, await store.renew(lease, ttl=ttl))
+            except BaseException:
+                fence_lost.set()
+                raise
+
+        heartbeat_task = asyncio.create_task(heartbeat(), name="runner-refresh-heartbeat")
+        operation_task = asyncio.create_task(
+            asyncio.to_thread(
+                _refresh_round5_runner_locked,
+                manifest,
+                session,
+                commit_allowed=lambda: not fence_lost.is_set(),
+            ),
+            name="round5-runner-refresh",
+        )
+        done, _pending = await asyncio.wait(
+            {heartbeat_task, operation_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            failure = heartbeat_task.exception()
+            fence_lost.set()
+            await operation_task
+            raise RuntimeError(
+                "Runner refresh stopped because its Round 5 fence was lost"
+            ) from failure
+        result = operation_task.result()
+        stop.set()
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        return result
+    finally:
+        stop.set()
+        for store, lease in reversed(held):
+            try:
+                await store.release(lease)
+            except Exception:
+                print("WARN  a runner-refresh ring will expire on its bounded TTL", flush=True)
+        for store, _label in rings:
+            try:
+                await store.close()
+            except Exception:
+                print("WARN  a runner-refresh coordinator could not be closed", flush=True)
+
+
+def refresh_round5_runner(*, timeout: float = 300.0) -> DemoManifest:
+    """Refresh only the sealed Round 5 runner; never run Terraform or reset a lane."""
+    manifest = load_manifest()
+    if manifest.status != "ready" or not manifest.round5_ready:
+        raise RuntimeError("Runner refresh requires a ready installation with Round 5 sealed")
+    if timeout < ROUND5_SSM_COMMAND_TIMEOUT_SECONDS or timeout > 900:
+        raise RuntimeError("Runner refresh timeout must be between 120 and 900 seconds")
+    actual_user = _verify_databricks_identity(manifest.databricks.profile)
+    if actual_user != manifest.databricks.user:
+        raise RuntimeError("Runner refresh refused: the Databricks principal changed")
+    _verify_aws_identity(
+        manifest.aws.profile,
+        manifest.aws.region,
+        manifest.aws.account_id,
+        manifest.aws.auth_mode,
+    )
+    session = _round5_runner_refresh_session(manifest)
+    _verify_round5_runner_instance(manifest, session)
+    _wait_round5_runner_ready(
+        session,
+        runner_instance_id=manifest.require_round5_resources().runner_instance_id,
+        timeout=timeout,
+    )
+    return asyncio.run(
+        _refresh_round5_runner_under_fence(
+            manifest,
+            session,
+            timeout_seconds=timeout,
+        )
+    )
 
 
 def _round5_ownership_tags(

@@ -21,6 +21,7 @@ EXPECTED_CASES = {
     "case_s3_bucket_states",
     "case_drift",
     "case_deploy_refusals",
+    "case_deploy_runner_guard",
     "case_deploy_happy",
     "case_deploy_seal_only",
     "case_deploy_record_merge",

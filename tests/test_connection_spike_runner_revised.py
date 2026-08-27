@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 
 from runner import connection_spike_runner as runner
+from server.connection_spike_live import SSM_TIMEOUT_SECONDS
 
 
 def _encode_request(request: dict[str, object]) -> str:
@@ -19,6 +20,77 @@ def _encode_request(request: dict[str, object]) -> str:
             mtime=0,
         )
     ).decode()
+
+
+def _setup_verify_material(lane_id: str) -> tuple[dict[str, object], dict[str, object]]:
+    stored: dict[str, object] = {
+        "host": f"{lane_id}.example.test",
+        "port": 5432,
+        "dbname": "anti_demo",
+        "username": runner.BASELINE_ROLE,
+        "password": "credential-must-never-appear",
+    }
+    if lane_id != "lakebase":
+        stored["master_secret_arn"] = "provider-identifier-must-never-appear"
+    request = {
+        "protocol": runner.SETUP_PROTOCOL,
+        "action": "verify",
+        "nonce": f"nonce-{lane_id}",
+        "bout_id": "baseline-run-1",
+        "lane_id": lane_id,
+        "endpoint_host": f"{lane_id}.example.test",
+        "credential_host": f"{lane_id}.example.test",
+        "port": 5432,
+        "dbname": "anti_demo",
+        "username": runner.BASELINE_ROLE,
+        "trust_bundle_path": str(runner.TRUST_BUNDLE_PATH),
+        "trust_bundle_sha256": "a" * 64,
+        "credential_sha256": runner.hashlib.sha256(runner._canonical_json(stored)).hexdigest(),
+    }
+    return request, stored
+
+
+class _VerifiedCursor:
+    nonce = ""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *unused):
+        return None
+
+    async def execute(self, statement, parameters, *, prepare):
+        assert statement == "SELECT %s::text, current_user"
+        assert prepare is False
+        self.nonce = parameters[0]
+
+    async def fetchone(self):
+        return self.nonce, runner.BASELINE_ROLE
+
+
+class _VerifiedConnection:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def cursor(self):
+        return _VerifiedCursor()
+
+    async def commit(self):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+
+class _DeadlineClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.now += delay
 
 
 def test_runtime_competitor_selects_fixed_physical_credential_slot(
@@ -219,6 +291,241 @@ async def test_aurora_backstage_verify_retries_resume_timeout_only(
     assert connect_calls[-1] == "rds.example.test"
     assert connect_calls.count("rds.example.test") == 1
     assert retry_delays == [1.0]
+
+
+async def test_aurora_direct_verify_survives_the_76_to_80_second_resume_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sixth attempt is the proof: the retired fixed limit stopped after five."""
+
+    request, stored = _setup_verify_material("aurora")
+    clock = _DeadlineClock()
+    available_at = 78.0
+    attempts = 0
+    connections: list[_VerifiedConnection] = []
+    sleeps: list[float] = []
+
+    def read_root_json(path, keys):
+        assert path == runner.BASELINE_CREDENTIAL_PATHS["aurora"]
+        assert keys == runner.RDS_BASELINE_KEYS
+        return stored
+
+    async def connect(database, application_name):
+        nonlocal attempts
+        assert database["host"] == request["endpoint_host"]
+        assert application_name == "anti-demo-r5-setup-verify"
+        attempts += 1
+        attempt_end = clock.now + runner.CONNECT_TIMEOUT_SECONDS
+        if available_at <= attempt_end:
+            clock.now = available_at
+            connection = _VerifiedConnection()
+            connections.append(connection)
+            return connection
+        clock.now = attempt_end
+        raise TimeoutError(
+            "raw provider message with endpoint.example.test and credential-must-never-appear"
+        )
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await clock.sleep(delay)
+
+    monkeypatch.setattr(runner, "_validate_trust_bundle", lambda digest: None)
+    monkeypatch.setattr(runner, "_read_root_json", read_root_json)
+    monkeypatch.setattr(runner, "_connect", connect)
+    monkeypatch.setattr(runner.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(runner.asyncio, "sleep", sleep)
+
+    result = await runner._execute_setup(request)
+
+    assert result["status"] == "verified"
+    assert attempts == len(runner.BASELINE_RESTART_RETRY_DELAYS) + 2 == 6
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 8.0]
+    assert clock.now == available_at
+    assert len(connections) == 1 and connections[0].closed
+
+
+async def test_aurora_direct_verify_deadline_fails_closed_with_sanitized_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, stored = _setup_verify_material("aurora")
+    clock = _DeadlineClock()
+    attempts = 0
+    sleeps: list[float] = []
+    raw_detail = (
+        "host=endpoint.example.test user=operator password=credential-must-never-appear "
+        "arn=provider-identifier-must-never-appear account=123456789012"
+    )
+
+    monkeypatch.setattr(runner, "_read_root_json", lambda path, keys: stored)
+
+    async def connect(*unused):
+        nonlocal attempts
+        attempts += 1
+        clock.now += min(runner.CONNECT_TIMEOUT_SECONDS, 100.0 - clock.now)
+        raise runner.psycopg.OperationalError(raw_detail)
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await clock.sleep(delay)
+
+    monkeypatch.setattr(runner, "_connect", connect)
+    with pytest.raises(runner.RunnerContractError) as raised:
+        await runner._verify_setup_transaction(
+            request,
+            retry_transient_restart=True,
+            _monotonic=clock.monotonic,
+            _sleep=sleep,
+        )
+
+    diagnostic = str(raised.value)
+    assert diagnostic == "setup_verify_deadline_state_none_attempts_7_elapsed_100s"
+    assert attempts == 7
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0]
+    assert len(diagnostic) <= 64
+    assert all(
+        forbidden not in diagnostic
+        for forbidden in (
+            "endpoint.example.test",
+            "operator",
+            "credential-must-never-appear",
+            "provider-identifier-must-never-appear",
+            "123456789012",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "sqlstate"),
+    (
+        (runner.psycopg.errors.InvalidPassword("raw password and endpoint"), "28p01"),
+        (runner.psycopg.errors.InvalidCatalogName("raw database configuration"), "3d000"),
+    ),
+)
+async def test_aurora_direct_verify_auth_and_configuration_fail_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    sqlstate: str,
+) -> None:
+    request, stored = _setup_verify_material("aurora")
+    calls = 0
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(runner, "_read_root_json", lambda path, keys: stored)
+
+    async def connect(*unused):
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runner, "_connect", connect)
+    with pytest.raises(runner.RunnerContractError) as raised:
+        await runner._verify_setup_transaction(
+            request,
+            retry_transient_restart=True,
+            _monotonic=lambda: 0.0,
+            _sleep=sleep,
+        )
+
+    assert str(raised.value) == (
+        f"setup_verify_nonretryable_state_{sqlstate}_attempts_1_elapsed_0s"
+    )
+    assert calls == 1
+    assert sleeps == []
+    assert "raw " not in str(raised.value)
+
+
+async def test_aurora_direct_verify_digest_mismatch_never_connects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, stored = _setup_verify_material("aurora")
+    request["credential_sha256"] = "0" * 64
+    monkeypatch.setattr(runner, "_read_root_json", lambda path, keys: stored)
+
+    async def connect(*unused):
+        pytest.fail("digest refusal must happen before any database connection")
+
+    monkeypatch.setattr(runner, "_connect", connect)
+    with pytest.raises(runner.RunnerContractError, match="^baseline_auth_hash_invalid$"):
+        await runner._verify_setup_transaction(request, retry_transient_restart=True)
+
+
+async def test_aurora_direct_verify_cancellation_interrupts_retry_sleep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, stored = _setup_verify_material("aurora")
+    sleeping = asyncio.Event()
+    calls = 0
+
+    monkeypatch.setattr(runner, "_read_root_json", lambda path, keys: stored)
+
+    async def connect(*unused):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("transient wake")
+
+    async def sleep(unused):
+        sleeping.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_connect", connect)
+    verification = asyncio.create_task(
+        runner._verify_setup_transaction(
+            request,
+            retry_transient_restart=True,
+            _sleep=sleep,
+        )
+    )
+    await sleeping.wait()
+    verification.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await verification
+    assert calls == 1
+
+
+@pytest.mark.parametrize("lane_id", ("lakebase", "rds"))
+async def test_non_aurora_setup_verify_remains_single_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    lane_id: str,
+) -> None:
+    request, stored = _setup_verify_material(lane_id)
+    calls = 0
+    sleeps: list[float] = []
+
+    monkeypatch.setattr(runner, "_read_root_json", lambda path, keys: stored)
+
+    async def connect(*unused):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("not retried outside Aurora direct wake")
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runner, "_connect", connect)
+    with pytest.raises(runner.RunnerContractError, match="^setup_verify_failed$"):
+        await runner._verify_setup_transaction(
+            request,
+            retry_transient_restart=False,
+            _sleep=sleep,
+        )
+    assert calls == 1
+    assert sleeps == []
+
+
+def test_aurora_verify_budget_preserves_the_ssm_completion_margin() -> None:
+    assert SSM_TIMEOUT_SECONDS == runner.SSM_COMMAND_TIMEOUT_SECONDS == 120.0
+    assert runner.SETUP_VERIFY_DEADLINE_SECONDS == 100.0
+    assert runner.SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS == 20.0
+    assert (
+        runner.SETUP_VERIFY_DEADLINE_SECONDS
+        + runner.SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS
+        == SSM_TIMEOUT_SECONDS
+    )
+    assert runner.SETUP_VERIFY_DEADLINE_SECONDS < SSM_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize(

@@ -23,7 +23,7 @@ from server.connection_spike_live import (
     connection_spike_setup_config_from_manifest,
 )
 from server.coordination import round_ring_key
-from server.manager import RunManager
+from server.manager import RunManager, operator_diagnosis
 
 ACCOUNT = "123456789012"
 
@@ -1566,6 +1566,30 @@ def test_setup_output_failure_repeats_the_runner_refusal_token() -> None:
         f"RUNNER_FLOCK_RELEASED:{'b' * 32}\n"
     )
     assert "baseline_auth_hash_invalid" in message
+
+
+def test_setup_output_and_operator_log_preserve_only_the_typed_deadline_category() -> None:
+    token = "setup_verify_deadline_state_none_attempts_7_elapsed_100s"
+    output = (
+        f"RUNNER_ERROR:{token}\n"
+        "provider said host=private.example.test password=must-not-escape\n"
+        f"SETUP_SETTLED:{'n' * 64}\n"
+        f"RUNNER_FLOCK_RELEASED:{'b' * 32}\n"
+    )
+
+    with pytest.raises(ConnectionSpikeLiveOperationError) as raised:
+        LiveConnectionSpikeSetupOrchestrator._validate_setup_output(
+            output,
+            bout_id="b" * 32,
+            lane_id="aurora",
+            action="verify",
+            nonce="n" * 64,
+        )
+
+    diagnosis = operator_diagnosis(raised.value)
+    assert token in diagnosis
+    assert "private.example.test" not in diagnosis
+    assert "must-not-escape" not in diagnosis
 
 
 def test_setup_output_failure_bounds_what_it_repeats() -> None:

@@ -31,6 +31,7 @@ from .lifecycle import (
     installation_presence_check,
     operator_ingress_check,
     provision,
+    refresh_round5_runner,
     renew,
     reset,
     resume_provision,
@@ -641,6 +642,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     reset_parser.add_argument("--timeout", type=float, default=900)
 
+    runner_parser = subparsers.add_parser(
+        "runner",
+        help="Inspect or refresh the sealed Round 5 runner",
+    )
+    runner_subparsers = runner_parser.add_subparsers(dest="runner_command", required=True)
+    runner_refresh_parser = runner_subparsers.add_parser(
+        "refresh",
+        help="Install and atomically reseal only the current Round 5 runner assets",
+    )
+    runner_refresh_parser.add_argument("--timeout", type=float, default=300)
+
     resume_parser = subparsers.add_parser(
         "resume",
         help="Safely continue an interrupted owned provision",
@@ -1005,6 +1017,17 @@ def main() -> int:
             with _mutating("antidemo reset"):
                 manifest = reset(args.timeout)
             print(f"READY {manifest.run_id} — ring the bell within the armed UI window")
+            return 0
+        if args.command == "runner" and args.runner_command == "refresh":
+            with _mutating("antidemo runner refresh"):
+                manifest = refresh_round5_runner(timeout=args.timeout)
+            print(
+                f"REFRESHED {manifest.run_id} — Round 5 runner source, EC2, and seal align"
+            )
+            print(
+                "NEXT ./bootstrap.sh --deploy-only --yes — publish the refreshed seal "
+                "and matching app source"
+            )
             return 0
         if args.command == "resume":
             with _mutating("antidemo resume"):

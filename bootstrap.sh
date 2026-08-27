@@ -2255,6 +2255,39 @@ step "Deploy the Databricks App"
 [[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] || die "the app's service principal is unresolved"
 ((${#APP_RESOURCE_KEYS[@]} > 0)) || die "app.yaml declared no resource keys to bind"
 
+# A Round 5 source change is a two-surface deployment: the sealed EC2 runner
+# first, then the Databricks App. Publishing in the opposite order leaves the
+# app carrying code that its own manifest correctly refuses. This gate runs
+# before the seal snapshot, every put-secret, resource update, workspace sync,
+# and app deploy. A warning is not enough because the resulting app is healthy
+# everywhere except the round the operator is trying to repair.
+SEALED_RUNNER_SHA="$(jq -r '.round5.harness_sha256 // empty' "$ANTI_DEMO_MANIFEST")"
+if [[ -n "$SEALED_RUNNER_SHA" ]]; then
+  SOURCE_RUNNER_SHA="$("$PYTHON_ENVIRONMENT/bin/python" - <<'PY'
+from server.connection_spike_live import runner_harness_sha256
+print(runner_harness_sha256())
+PY
+)" || die "could not compute the Round 5 source harness digest"
+  if [[ "$SOURCE_RUNNER_SHA" != "$SEALED_RUNNER_SHA" ]]; then
+    die "REFUSING TO DEPLOY INCOMPATIBLE ROUND 5 RUNNER SOURCE.
+
+       source  sha256:$SOURCE_RUNNER_SHA
+       sealed  sha256:$SEALED_RUNNER_SHA
+
+       No Databricks secret, workspace source, or app deployment was changed.
+       Refresh and verify the sealed EC2 runner first:
+
+         ./antidemo runner refresh
+
+       Then publish the now-matching seal and source:
+
+         env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \\
+           ANTI_DEMO_MANIFEST=\"\$PWD/$(basename "$MANIFEST_DIR")/manifest.json\" \\
+           ./bootstrap.sh --deploy-only --yes"
+  fi
+  ok "Round 5 source matches the sealed EC2 harness (sha256:${SOURCE_RUNNER_SHA:0:16})"
+fi
+
 # The seal has to be servable before anything is pushed. app.py raises inside
 # the FastAPI lifespan, so an unservable seal is not a degraded app -- it is a
 # container that never starts, while the deploy still reports success.

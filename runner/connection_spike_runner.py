@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -16,7 +17,7 @@ import signal
 import stat
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,22 @@ WITNESS_CONCURRENCY = 8
 CONNECT_TIMEOUT_SECONDS = 10
 ATTEMPT_TIMEOUT_SECONDS = 20.0
 RUN_TIMEOUT_SECONDS = 110.0
+# This file is copied onto the neutral runner and deliberately cannot import the
+# app's server package. Keep this boundary equal to
+# server.connection_spike_live.SSM_TIMEOUT_SECONDS; a regression test binds the
+# two standalone constants together.
+SSM_COMMAND_TIMEOUT_SECONDS = 120.0
+# The setup verification deadline starts only after the Python process has
+# imported, decoded and validated its request, acquired the flock, checked the
+# trust bundle, and verified the sealed credential digest. It therefore cannot
+# consume the whole SSM executionTimeout. Twenty seconds remains for that
+# pre-deadline work, result serialization/printing, flock release, and the SSM
+# agent to report terminal completion.
+SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS = 20.0
+SETUP_VERIFY_DEADLINE_SECONDS = (
+    SSM_COMMAND_TIMEOUT_SECONDS - SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS
+)
+SETUP_VERIFY_MAX_RETRY_DELAY_SECONDS = 8.0
 TLS_MODE = "verify-full"
 TRUST_BUNDLE_PATH = Path("/opt/lakebase-anti-demo/round5/round5-ca.pem")
 LOCK_PATH = Path("/run/lock/lakebase-anti-demo-round5.lock")
@@ -76,6 +93,7 @@ BASELINE_DATABASE_KEYS = frozenset({"host", "port", "dbname", "username", "passw
 RDS_BASELINE_KEYS = BASELINE_DATABASE_KEYS | {"master_secret_arn"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 SEALED_ADMIN_MAX_ENCODED_LENGTH = 21_848
 BASELINE_RESTART_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 _SECRET_ARN = re.compile(
@@ -809,7 +827,19 @@ async def _verify_setup_transaction(
     request: Mapping[str, object],
     *,
     retry_transient_restart: bool = False,
+    _monotonic: Callable[[], float] | None = None,
+    _sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> None:
+    """Verify the sealed ordinary login, with a deadline only for Aurora wake.
+
+    RDS and Lakebase retain their single-attempt behavior. Aurora retries only
+    connection-class failures until a monotonic deadline below SSM's own
+    execution boundary. Every emitted failure token is assembled exclusively
+    from fixed labels, a validated SQLSTATE, and bounded counters.
+    """
+
+    clock = time.monotonic if _monotonic is None else _monotonic
+    sleep = asyncio.sleep if _sleep is None else _sleep
     credential_id = _setup_credential_id(request)
     path = BASELINE_CREDENTIAL_PATHS[credential_id]
     keys = (
@@ -823,27 +853,58 @@ async def _verify_setup_transaction(
         expected_host=str(request["credential_host"]),
     )
     database["host"] = request["endpoint_host"]
-    retry_index = 0
+    started_at = clock()
+    deadline = started_at + SETUP_VERIFY_DEADLINE_SECONDS
+    attempts = 0
+    last_sqlstate = "none"
+
+    def refusal(reason: str) -> RunnerContractError:
+        elapsed = max(0.0, min(SETUP_VERIFY_DEADLINE_SECONDS, clock() - started_at))
+        elapsed_seconds = int(math.ceil(elapsed))
+        return RunnerContractError(
+            f"setup_verify_{reason}_state_{last_sqlstate}"
+            f"_attempts_{attempts}_elapsed_{elapsed_seconds}s"
+        )
+
     while True:
+        remaining = deadline - clock()
+        if retry_transient_restart and remaining <= 0:
+            raise refusal("deadline")
+        attempts += 1
         connection: Any | None = None
         retry_delay: float | None = None
         try:
-            connection = await _connect(database, f"{APP_PREFIX}-setup-verify")
-            async with connection.cursor() as cursor:
-                await cursor.execute(
-                    "SELECT %s::text, current_user",
-                    (request["nonce"],),
-                    prepare=False,
-                )
-                row = await cursor.fetchone()
-            await connection.commit()
+            async def verify() -> object:
+                nonlocal connection
+                connection = await _connect(database, f"{APP_PREFIX}-setup-verify")
+                async with connection.cursor() as cursor:
+                    await cursor.execute(
+                        "SELECT %s::text, current_user",
+                        (request["nonce"],),
+                        prepare=False,
+                    )
+                    row = await cursor.fetchone()
+                await connection.commit()
+                return row
+
+            if retry_transient_restart:
+                async with asyncio.timeout(remaining):
+                    row = await verify()
+            else:
+                row = await verify()
             if row != (request["nonce"], BASELINE_ROLE):
                 raise RunnerContractError("setup_verify_failed")
             return
         except RunnerContractError:
             raise
         except Exception as exc:
-            sqlstate = exc.sqlstate if isinstance(exc, psycopg.OperationalError) else None
+            raw_sqlstate = getattr(exc, "sqlstate", None)
+            sqlstate = (
+                raw_sqlstate
+                if isinstance(raw_sqlstate, str) and _SQLSTATE.fullmatch(raw_sqlstate)
+                else None
+            )
+            last_sqlstate = sqlstate.lower() if sqlstate is not None else "none"
             transient_restart = (
                 isinstance(exc, (OSError, TimeoutError))
                 or (
@@ -855,15 +916,18 @@ async def _verify_setup_transaction(
                     )
                 )
             )
-            if (
-                retry_transient_restart
-                and transient_restart
-                and retry_index < len(BASELINE_RESTART_RETRY_DELAYS)
-            ):
-                retry_delay = BASELINE_RESTART_RETRY_DELAYS[retry_index]
-                retry_index += 1
-            else:
+            if not retry_transient_restart:
                 raise RunnerContractError("setup_verify_failed") from exc
+            if not transient_restart:
+                raise refusal("nonretryable") from exc
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise refusal("deadline") from exc
+            retry_delay = min(
+                2.0 ** (attempts - 1),
+                SETUP_VERIFY_MAX_RETRY_DELAY_SECONDS,
+                remaining,
+            )
         finally:
             if connection is not None:
                 try:
@@ -871,7 +935,7 @@ async def _verify_setup_transaction(
                 except psycopg.Error:
                     pass
         assert retry_delay is not None
-        await asyncio.sleep(retry_delay)
+        await sleep(retry_delay)
 
 
 async def _execute_setup(request: Mapping[str, object]) -> dict[str, object]:

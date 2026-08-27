@@ -978,6 +978,15 @@ Sleeper = Callable[[float], Awaitable[None]]
 ProgressCallback = Callable[[ConnectionSpikeLiveProgress], Awaitable[None]]
 
 
+def runner_asset_sha256s(root: Path | None = None) -> dict[str, str]:
+    """Return the source digest of each file in the installed runner contract."""
+    asset_root = root or Path(__file__).resolve().parents[1] / "runner"
+    return {
+        name: hashlib.sha256((asset_root / name).read_bytes()).hexdigest()
+        for name in RUNNER_ASSETS
+    }
+
+
 def runner_harness_sha256(root: Path | None = None) -> str:
     asset_root = root or Path(__file__).resolve().parents[1] / "runner"
     digest = hashlib.sha256()
