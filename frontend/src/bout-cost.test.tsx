@@ -371,10 +371,12 @@ describe('house rules', () => {
   const app = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
   const css = readFileSync(join(import.meta.dirname, 'styles.css'), 'utf8')
 
-  it('hangs the panel off the same overlay as the other disclosures', () => {
-    const overlay = app.slice(app.indexOf('function RingsideTake'))
-    const body = overlay.slice(0, overlay.indexOf('\nfunction '))
+  it('keeps the panel in What It Cost and out of the presenter cue', () => {
+    const room = app.slice(app.indexOf('export function CostRoom'))
+    const body = room.slice(0, room.indexOf('\nfunction '))
     expect(body).toContain('<BoutCostDisclosure session={session} />')
+    const cue = app.slice(app.indexOf('function RingsideTake'))
+    expect(cue.slice(0, cue.indexOf('/** One lane'))).not.toContain('<BoutCostDisclosure')
   })
 
   it('uses no purple and no VERIFIED slogan', () => {

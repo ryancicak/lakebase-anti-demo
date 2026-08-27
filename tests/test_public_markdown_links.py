@@ -1300,3 +1300,29 @@ def test_repeated_headings_get_githubs_numeric_suffixes() -> None:
         "using-it-1",
         "using-it-2",
     }
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "frontend/src/ringside-cues/verified-corpus.jsonl",
+        "frontend/src/ringside-cues/outcome-copy.jsonl",
+        "RINGSIDE.md",
+    ],
+)
+def test_ringside_audience_copy_avoids_unexplained_contract_test(
+    relative_path: str,
+) -> None:
+    """Projected copy must say what was tested instead of naming test taxonomy."""
+
+    path = PROJECT_ROOT / relative_path
+    pattern = re.compile(r"\bcontract(?:\s+|-+)test\b", re.IGNORECASE)
+    findings = [
+        f"{line_number}: {line.strip()}"
+        for line_number, line in enumerate(path.read_text().splitlines(), start=1)
+        if pattern.search(line)
+    ]
+    assert findings == [], (
+        f"{relative_path} contains audience-facing 'contract test' jargon:\n"
+        + "\n".join(findings)
+    )

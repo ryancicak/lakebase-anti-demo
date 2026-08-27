@@ -240,6 +240,8 @@ deployment record and known gaps are in
 ## More documentation
 
 - [ROUNDS.md](ROUNDS.md): round contracts and scoring
+- [RINGSIDE.md](RINGSIDE.md): audience personas, Explain to the Room, and proof
+  boundaries
 - [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md): setup, credentials, networking, and
   cleanup
 - [docs/DEPLOY.md](docs/DEPLOY.md): Databricks App deployment and known gaps

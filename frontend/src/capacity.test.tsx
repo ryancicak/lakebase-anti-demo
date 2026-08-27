@@ -280,10 +280,12 @@ describe('CapacityDisclosure · what the summary is willing to claim', () => {
 describe('wiring', () => {
   const source = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
 
-  it('hangs the capacity disclosure off the Explain to the room overlay', () => {
-    const overlay = source.slice(source.indexOf('function RingsideTake'))
-    const body = overlay.slice(0, overlay.indexOf('\nfunction '))
+  it('keeps capacity in Instant Replay and out of the presenter cue', () => {
+    const replay = source.slice(source.indexOf('function InstantReplay'))
+    const body = replay.slice(0, replay.indexOf('\nfunction '))
     expect(body).toContain('<CapacityDisclosure session={session} />')
+    const cue = source.slice(source.indexOf('function RingsideTake'))
+    expect(cue.slice(0, cue.indexOf('\nfunction '))).not.toContain('<CapacityDisclosure')
   })
 
   it('shows the idle-policy floor on the return-to-idle screen', () => {

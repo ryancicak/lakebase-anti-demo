@@ -783,24 +783,33 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
   expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
-  const ringsideTake = screen.getByRole('dialog', { name: /make the result matter/i })
-  expect(ringsideTake).toHaveTextContent(/from the declared start.*Lakebase verified its built-in pooled path in 12\.35s.*RDS PostgreSQL verified its RDS Proxy path in 24\.00s.*already-deployed RDS Proxy would not pay this setup delay/i)
-  expect(ringsideTake).toHaveTextContent(/proof behind it.*from the declared start.*Lakebase verified its built-in pooled path in 12\.35s.*RDS PostgreSQL verified its RDS Proxy path in 24\.00s/i)
-  expect(ringsideTake).toHaveTextContent(/shared exact proof.*performance.*Readiness setup: Lakebase 12\.35s.*RDS PostgreSQL 24\.00s.*identical 128-connection spike was pass\/fail validation, not a speed comparison/i)
-  fireEvent.click(within(ringsideTake).getByText(/pricing receipt.*usage later/i))
-  expect(ringsideTake).toHaveTextContent(/Posted partial.*Posted through 2026-08-20 01:45:00 UTC.*Revision 2.*Queried 2026-08-20 02:00:00 UTC/i)
-  expect(within(ringsideTake).getByLabelText('Cost scopes')).toHaveTextContent(/Bout estimate.*\$0\.005.*Monthly carrying.*\$2\.70.*month.*Installation overhead.*Pending/i)
-  expect(within(ringsideTake).getByLabelText('Cost reconciliation')).toHaveTextContent(/Original.*\$0\.004.*Posted.*\$0\.005.*Variance.*\$0\.001/i)
-  expect(ringsideTake).toHaveTextContent(/Lakebase compute.*current promo \$0\.260.*DBU.*normal list \$0\.520/i)
-  expect(ringsideTake).toHaveTextContent(/no published end date.*revalidate before presenting/i)
-  expect(ringsideTake).toHaveTextContent(/RDS Proxy.*10-minute minimum.*0\.333 vCPU-hour.*\$0\.015.*\$0\.005.*final Proxy lifetime pending/i)
-  expect(ringsideTake).toHaveTextContent(/Secrets Manager API requests.*Quantity pending.*\$0\.050.*10,000 requests/i)
-  expect(ringsideTake).toHaveTextContent(/Provider adjustment.*Quantity pending.*Rate pending/i)
-  expect(ringsideTake).not.toHaveTextContent(/Provider adjustment.*\$0\.000/i)
-  expect(ringsideTake).toHaveTextContent(/AWS published pricing.*provider published.*2026-08-18 00:11:58 UTC/i)
-  expect(ringsideTake).toHaveTextContent(/what this does not claim.*declared-start readiness comparison.*not a steady-state RDS Proxy benchmark.*RDS Proxy is AWS best practice.*already deployed.*setup delay does not apply.*both lanes must pass.*burst-performance superiority.*sustained throughput.*customer traffic.*dollar savings.*general benchmark/i)
+  const ringsideTake = screen.getByRole('dialog', { name: /for the data engineer/i })
+  const selectedPriorities = within(ringsideTake).getByLabelText('Room priorities')
+  expect(selectedPriorities.children).toHaveLength(2)
+  expect(selectedPriorities).toHaveTextContent(/cost.*performance/i)
+  expect(ringsideTake).toHaveTextContent(
+    /what this means.*readiness difference needs launch frequency and pooling spend.*cost evidence/i,
+  )
+  expect(ringsideTake).toHaveTextContent(/question for the room.*what job deadline makes connection setup financially material/i)
+  expect(ringsideTake).toHaveTextContent(
+    /what we proved.*lakebase became ready in 12\.35s.*new RDS Proxy setup took 24\.00s.*both passed 128 attempts, 64 at a time.*existing contract-matching Proxies were not tested/i,
+  )
+  expect(ringsideTake.querySelector('details')).toBeNull()
+  expect(ringsideTake).not.toHaveTextContent(
+    /full verified proof|configured compute|pricing receipt|standing cost|component disclosure/i,
+  )
   fireEvent.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
-  expect(screen.queryByRole('dialog', { name: /make the result matter/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('dialog', { name: /for the data engineer/i })).not.toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: /what it cost/i }))
+  const costRoom = screen.getByRole('dialog', { name: /the bill does not stop with the bell/i })
+  fireEvent.click(within(costRoom).getByText(/pricing receipt.*usage later/i))
+  expect(costRoom).toHaveTextContent(/Posted partial.*Posted through 2026-08-20 01:45:00 UTC.*Revision 2.*Queried 2026-08-20 02:00:00 UTC/i)
+  expect(within(costRoom).getByLabelText('Cost scopes')).toHaveTextContent(/Bout estimate.*\$0\.005.*Monthly carrying.*\$2\.70.*month.*Installation overhead.*Pending/i)
+  expect(within(costRoom).getByLabelText('Cost reconciliation')).toHaveTextContent(/Original.*\$0\.004.*Posted.*\$0\.005.*Variance.*\$0\.001/i)
+  expect(costRoom).toHaveTextContent(/RDS Proxy.*10-minute minimum.*0\.333 vCPU-hour.*\$0\.015.*\$0\.005.*final Proxy lifetime pending/i)
+  expect(costRoom).not.toHaveTextContent(/Provider adjustment.*\$0\.000/i)
+  fireEvent.click(within(costRoom).getByRole('button', { name: /back to the ring/i }))
 
   stubReceiptCanvas()
   fireEvent.click(screen.getByRole('button', { name: /share the receipt/i }))
@@ -1154,9 +1163,12 @@ it('names Aurora in the canonical Round 5 arena and its on-demand explanation', 
   expect(within(container).queryByLabelText('Managed component disclosure')).not.toBeInTheDocument()
 
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
-  const explanation = screen.getByRole('dialog', { name: /make the result matter/i })
-  expect(explanation).toHaveTextContent(/from the declared start.*Lakebase verified its built-in pooled path in 12\.35s.*Aurora Serverless v2 verified its RDS Proxy path in 24\.00s.*already-deployed RDS Proxy would not pay this setup delay/i)
-  expect(explanation).toHaveTextContent(/declared-start bout provisioned a new Proxy \+ 8 supporting changes/i)
+  const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
+  expect(explanation).toHaveTextContent(
+    /what we proved.*lakebase became ready in 12\.35s.*new RDS Proxy setup took 24\.00s.*both passed 128 attempts, 64 at a time.*existing contract-matching Proxies were not tested/i,
+  )
+  expect(explanation.querySelector('details')).toBeNull()
+  expect(explanation).not.toHaveTextContent(/full verified proof|component disclosure|supporting changes/i)
   expect(explanation).not.toHaveTextContent(/Aurora unexecuted|not executed or scored/i)
 })
 
@@ -1194,6 +1206,12 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
   // The start gap must be the setup barrier, never the downstream burst skew.
   expect(replay).toHaveTextContent('0.750ms')
   expect(replay).not.toHaveTextContent('1.235ms')
+  expect(within(replay).getByLabelText('Round 5 detailed proof')).toHaveTextContent(
+    /full verified proof.*readiness setup is scored.*identical spike is pass\/fail/i,
+  )
+  expect(within(replay).getByLabelText('Managed component disclosure')).toHaveTextContent(
+    /new Proxy \+ 8 supporting changes.*already-deployed Proxy would not pay this setup delay/i,
+  )
 
   // Every step is Round 5 specific, not the "adapter is not executable" placeholder.
   const steps = within(replay).getAllByRole('button', { expanded: false })

@@ -529,15 +529,29 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 /* The proof remains inside the game: one ring, two clocks, one verdict. */
 .proof-screen { position: fixed; inset: 0; overflow: hidden; display: grid; grid-template-rows: 17vh 59vh 24vh; color: var(--cream); background: var(--navy); font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(6px, .7vw, 14px) var(--blue), inset 0 0 0 clamp(11px, 1.2vw, 24px) var(--navy), inset 0 0 0 clamp(15px, 1.65vw, 32px) var(--red); }
 .proof-screen[data-session-state="verified"], .proof-screen[data-session-state="towelled"] { grid-template-rows: 15vh 52vh 33vh; }
-.proof-header { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(64px, 5vw) 1fr auto auto; align-items: center; gap: 1.4vw; padding: 2.2vh 4.2vw 1.7vh; border-bottom: clamp(5px, .55vw, 10px) solid var(--yellow); background: #050817; box-shadow: inset 0 -.55vh 0 var(--red); }
+.proof-header { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(50px, 4vw) minmax(0, 1fr) auto auto; align-items: center; gap: clamp(8px, .8vw, 16px); padding: 2.2vh 3.4vw 1.7vh; border-bottom: clamp(5px, .55vw, 10px) solid var(--yellow); background: #050817; box-shadow: inset 0 -.55vh 0 var(--red); }
+.proof-title { min-width: 0; }
 .proof-header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; letter-spacing: .08em; text-transform: uppercase; }
-.proof-header h1 { margin: 0; font-size: clamp(18px, 2.35vw, 46px); line-height: 1.2; text-transform: uppercase; text-shadow: .13em .13em #000; }
+.proof-header h1 { margin: 0; font-size: clamp(18px, calc(1.8vw + 3px), 46px); line-height: 1.2; white-space: nowrap; text-transform: uppercase; text-shadow: .13em .13em #000; }
 .proof-state { padding: 1.25em 1.4em; border: clamp(3px, .3vw, 6px) solid var(--cream); color: var(--cream); background: #10183e; font-size: clamp(6px, .55vw, 11px); line-height: 1.2; text-transform: uppercase; box-shadow: .45em .45em #000; }
 .proof-state[data-state="running"] { color: var(--yellow); border-color: var(--yellow); }
 .proof-state[data-state="offline"] { color: #ff9888; border-color: #ff806d; background: #3a0d12; }
 .proof-state[data-state="verified"] { color: #6bf39a; border-color: #6bf39a; }
 .proof-state[data-state="towelled"] { color: var(--yellow); border-color: var(--yellow); }
 .proof-state[data-state="failed"] { color: #ff806d; border-color: #ff806d; }
+/* The four-column broadcast header has room down to a small tablet. Below that,
+   the title owns the first row while the still-visible status and mute share the
+   second. The desktop title is intentionally unbreakable; only this contained
+   mobile layout restores wrapping. */
+@media (max-width: 700px) {
+  .proof-header { grid-template-columns: 50px minmax(0, 1fr) auto; grid-template-rows: auto auto; gap: .7vh 8px; padding: 1.4vh 5vw 1.2vh; }
+  .proof-header > .home-logo-compact { grid-column: 1; grid-row: 1 / 3; }
+  .proof-header > .proof-title { grid-column: 2 / 4; grid-row: 1; }
+  .proof-header > .proof-state { grid-column: 2; grid-row: 2; min-width: 0; padding: .85em 1em; overflow-wrap: anywhere; justify-self: start; }
+  .proof-header > .sound-button-arena { grid-column: 3; grid-row: 2; }
+  .proof-header p { margin-bottom: .65em; }
+  .proof-header h1 { font-size: clamp(12px, 3.4vw, 18px); line-height: 1.25; overflow-wrap: anywhere; white-space: normal; }
+}
 .proof-lanes { position: relative; z-index: 2; display: grid; grid-template-columns: 1fr clamp(5px, .45vw, 9px) 1fr; align-items: stretch; min-height: 0; margin: 1.6vh 3.4vw; overflow: hidden; border: clamp(6px, .62vw, 12px) solid var(--cream); background: #111a40; box-shadow: .7em .7em #000; }
 .proof-lanes::before { content: ""; position: absolute; z-index: 0; top: 23%; left: 0; right: 0; height: clamp(5px, .45vw, 9px); background: var(--cream); box-shadow: 0 clamp(24px, 2.2vw, 44px) var(--red), 0 clamp(48px, 4.4vw, 88px) var(--blue); opacity: .2; }
 .proof-lanes::after { content: ""; position: absolute; z-index: 0; left: 0; right: 0; bottom: 0; height: 29%; background: repeating-linear-gradient(135deg, #182654 0 18px, #111a40 18px 36px); border-top: clamp(5px, .45vw, 9px) solid #344477; }
@@ -965,36 +979,46 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cooldown-detail-lanes article code { color: var(--cream); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
 .cooldown-detail-lanes article p { color: #6bf39a; }
 
-/* Persona selection changes the AE's words, never the recorded proof. */
-.ringside-overlay { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 4vh 5vw; background: #02040eef; }
-.ringside-take { display: grid; grid-template-rows: auto auto auto 1fr auto; gap: 2vh; width: min(1320px, 90vw); max-height: 92vh; padding: 3vh 3vw; overflow: auto; border: clamp(6px, .65vw, 12px) solid var(--yellow); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
-.ringside-take > header { display: flex; align-items: start; justify-content: space-between; gap: 2vw; }
-.ringside-take > header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
-.ringside-take > header h2 { margin: 0; font-size: clamp(20px, 2.5vw, 48px); line-height: 1.2; text-shadow: .12em .12em #000; text-transform: uppercase; }
-.ringside-take > header > span { flex: none; padding: 1em; border: 3px solid #6bf39a; color: #6bf39a; font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
-.ringside-take nav { display: flex; gap: 1vw; }
-.ringside-take nav button { display: grid; grid-template-columns: clamp(40px, 3.8vw, 70px) auto; grid-template-rows: auto auto; align-items: center; min-width: 0; padding: .7em 1em; border: 3px solid #46527c; color: #aeb9df; background: #050817; text-align: left; text-transform: uppercase; }
-.ringside-take nav button[aria-pressed="true"] { border-color: var(--yellow); color: var(--cream); box-shadow: inset .55em 0 var(--red); }
-.ringside-take nav img { grid-row: 1 / 3; width: clamp(40px, 3.8vw, 70px); height: clamp(40px, 3.8vw, 70px); margin-right: 1em; image-rendering: pixelated; }
-.ringside-take nav span { color: var(--yellow); font-size: clamp(4px, .38vw, 7px); line-height: 1.35; }
-.ringside-take nav strong { font-size: clamp(6px, .55vw, 11px); line-height: 1.4; }
-.ringside-result { margin: 0; padding: 1.1em 1.3em; border-left: .7em solid var(--red); color: var(--cream); background: #050817; }
-.ringside-result span { color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
-.ringside-result p { margin: .8em 0 0; font-family: ui-monospace, monospace; font-size: clamp(9px, .85vw, 16px); font-weight: 900; line-height: 1.5; }
-.ringside-script { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2vw; }
-.ringside-script > div { min-width: 0; padding: 1.2em; border: 3px solid #46527c; background: #0a1130; }
-.ringside-script > div:first-child { grid-column: 1 / -1; }
-.ringside-script span { color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
-.ringside-script p { margin: .9em 0 0; font-family: ui-monospace, monospace; font-size: clamp(8px, .72vw, 14px); font-weight: 900; line-height: 1.45; }
-.ringside-script small { display: block; margin-top: 1em; padding-top: 1em; border-top: 2px solid #46527c; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; line-height: 1.45; }
-.ringside-script ul { display: grid; gap: .6em; margin: .9em 0 0; padding: 0; list-style: none; }
-.ringside-script li { font-family: ui-monospace, monospace; font-size: clamp(7px, .64vw, 12px); font-weight: 900; line-height: 1.4; }
-.ringside-script li strong { margin-right: .7em; color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: .72em; text-transform: uppercase; }
-.ringside-close { padding: 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
+/* Explain to the Room is an audience briefing, not an evidence dashboard. The
+   authored engine is large; the projected surface stays deliberately small. */
+.ringside-overlay { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; max-width: 100%; padding: 3vh 4vw; overflow: hidden; background: #02040ef2; }
+.ringside-take { display: grid; gap: clamp(12px, 1.8vh, 20px); width: min(900px, 92vw); max-width: 100%; max-height: 94vh; padding: clamp(18px, 2.6vh, 30px) clamp(18px, 2.5vw, 34px); overflow-x: hidden; overflow-y: auto; border: clamp(5px, .5vw, 8px) solid var(--yellow); color: var(--cream); background: #0a1130; box-shadow: inset 0 7px var(--red), .7em .7em #000; text-align: left; }
+.ringside-take > * { min-width: 0; }
+.ringside-take > header { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.ringside-persona-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.ringside-persona-identity > img { flex: none; width: 52px; height: 52px; border: 2px solid var(--yellow); background: #050817; object-fit: cover; image-rendering: pixelated; }
+.ringside-persona-identity > div { min-width: 0; }
+.ringside-take > header h2 { margin: 0; font-size: clamp(18px, 2vw, 32px); line-height: 1.25; overflow-wrap: anywhere; text-transform: uppercase; text-shadow: .1em .1em #000; }
+.ringside-persona-identity small { display: block; margin-top: 4px; color: var(--yellow); font-size: 11px; line-height: 1.2; text-transform: uppercase; }
+.ringside-priority-chips { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.ringside-priority-chips span { min-height: 28px; padding: 7px 9px 6px; border: 2px solid #46527c; color: var(--yellow); background: #050817; font-size: 12px; line-height: 1; text-transform: uppercase; }
+.ringside-take nav { display: flex; gap: 7px; min-width: 0; }
+.ringside-take nav button { flex: 1 1 0; min-width: 0; min-height: 44px; padding: 8px 10px; border: 2px solid #46527c; color: #c5cdea; background: #050817; font-size: clamp(11px, .8vw, 13px); line-height: 1.35; overflow-wrap: anywhere; text-align: center; text-transform: uppercase; }
+.ringside-take nav button[aria-selected="true"] { border-color: var(--yellow); color: var(--cream); box-shadow: inset 0 -5px var(--red); }
+.ringside-take nav button:focus-visible { outline: 3px solid var(--blue-light); outline-offset: 2px; }
+.ringside-persona-panel { display: grid; min-width: 0; border-top: 2px solid #46527c; }
+.ringside-cue { display: grid; grid-template-columns: minmax(140px, .24fr) minmax(0, 1fr); align-items: start; gap: clamp(12px, 2vw, 24px); min-width: 0; padding: clamp(15px, 2vh, 22px) 0; border-bottom: 2px solid #46527c; }
+.ringside-cue h3 { margin: .3em 0 0; color: var(--yellow); font-size: clamp(12px, .8vw, 14px); line-height: 1.3; text-transform: uppercase; }
+.ringside-cue p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(16px, 1.15vw, 20px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
+.ringside-show p { color: #d7def6; }
+.ringside-close { position: sticky; bottom: 0; min-height: 44px; padding: .9em 1em; border: 3px solid var(--cream); color: #050817; background: var(--red); box-shadow: .3em .3em #000; font-size: clamp(10px, .7vw, 13px); text-transform: uppercase; }
+
+@media (max-width: 700px) {
+  .ringside-overlay { padding: 1.5vh 2.5vw; }
+  .ringside-take { gap: 12px; width: 100%; max-height: 97vh; padding: 18px 14px 14px; box-shadow: inset 0 6px var(--red); }
+  .ringside-take > header { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .ringside-persona-identity > img { width: 44px; height: 44px; }
+  .ringside-priority-chips { justify-content: flex-start; }
+  .ringside-take nav { gap: 5px; }
+  .ringside-take nav button { padding: 7px 5px; font-size: 11px; }
+  .ringside-cue { grid-template-columns: minmax(0, 1fr); gap: 6px; padding: 13px 0; }
+  .ringside-cue h3 { margin-top: 0; }
+  .ringside-cue p { font-size: 16px; line-height: 1.4; }
+}
 
 /* The cost view behind "What it cost".
-   The panels inside it are the same disclosure components <RingsideTake>
-   carries, so this block styles only the frame and the idle strip above them.
+   The panels inside it have one evidence destination here; RingsideTake stays
+   a disclosure-free presenter cue. This block styles the frame and idle strip.
    Square corners and 3px keylines, like every other panel behind a click.
    The strip's own subject is the lane that has no idle floor to descend into,
    so the RDS article takes this app's amber warning keyline -- the same pair

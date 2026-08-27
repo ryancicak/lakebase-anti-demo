@@ -250,11 +250,12 @@ describe('house rules', () => {
   const app = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
   const css = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8')
 
-  it('hangs the cost disclosure off the same overlay as the capacity one', () => {
-    const overlay = app.slice(app.indexOf('function RingsideTake'))
-    const body = overlay.slice(0, overlay.indexOf('\nfunction '))
-    expect(body).toContain('<CapacityDisclosure session={session} />')
+  it('keeps the cost disclosure in What It Cost and out of the presenter cue', () => {
+    const room = app.slice(app.indexOf('export function CostRoom'))
+    const body = room.slice(0, room.indexOf('\nfunction '))
     expect(body).toContain('<DescentCostDisclosure session={session} />')
+    const cue = app.slice(app.indexOf('function RingsideTake'))
+    expect(cue.slice(0, cue.indexOf('/** One lane'))).not.toContain('<DescentCostDisclosure')
   })
 
   it('passes the descent payload into the return-to-idle screen', () => {

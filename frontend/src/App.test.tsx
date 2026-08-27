@@ -1539,6 +1539,56 @@ describe('backstage setup', () => {
     expect(base[0]).toMatch(/grid-template-columns:\s*auto\s+minmax\(\s*0\s*,\s*1fr\s*\)\s+auto/)
   })
 
+  it('keeps the minimal Explain to the Room cue inside a narrow viewport', () => {
+    // Browser geometry is covered by the visual-review fixture contract. This
+    // non-vacuous stylesheet guard pins the overflow and mobile adaptations
+    // that make those fixtures possible.
+    const css = readFileSync(join(import.meta.dirname, 'styles.css'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const overlayRule = css.match(/\.ringside-overlay\s*\{([^}]*)\}/)?.[1] ?? ''
+    const dialogRule = css.match(/\.ringside-take\s*\{([^}]*)\}/)?.[1] ?? ''
+    expect(overlayRule).toMatch(/max-width:\s*100%/)
+    expect(overlayRule).toMatch(/overflow:\s*hidden/)
+    expect(dialogRule).toMatch(/max-width:\s*100%/)
+    expect(dialogRule).toMatch(/overflow-x:\s*hidden/)
+
+    const mediaStart = css.indexOf('@media (max-width: 700px)', css.indexOf('.ringside-overlay'))
+    expect(mediaStart).toBeGreaterThan(-1)
+    let cursor = css.indexOf('{', mediaStart)
+    let depth = 1
+    while (depth > 0 && cursor < css.length - 1) {
+      cursor += 1
+      if (css[cursor] === '{') depth += 1
+      if (css[cursor] === '}') depth -= 1
+    }
+    const narrow = css.slice(mediaStart, cursor + 1)
+    expect(narrow).toMatch(/\.ringside-take\s*\{[^}]*width:\s*100%/)
+    expect(narrow).toMatch(/\.ringside-take nav\s*\{[^}]*gap:\s*5px/)
+    expect(narrow).toMatch(/\.ringside-cue\s*\{[^}]*grid-template-columns:\s*minmax\(\s*0,\s*1fr\)/)
+    expect(narrow).toMatch(/\.ringside-cue h3\s*\{[^}]*margin-top:\s*0/)
+    expect(css).toMatch(/\.ringside-close\s*\{[^}]*position:\s*sticky[^}]*bottom:\s*0/)
+    expect(css).not.toMatch(/\.ringside-priority-grid\s*\{/)
+  })
+
+  it('rejects a disclosure stack or live region inside RingsideTake', () => {
+    const source = readFileSync(join(import.meta.dirname, 'App.tsx'), 'utf8')
+    const start = source.indexOf('function RingsideTake')
+    const cue = source.slice(start, source.indexOf('/** One lane', start))
+    const forbidden = /<(?:RoundFiveEvidenceDetails|CapacityDisclosure|DescentCostDisclosure|BoutCostDisclosure|StandingCostDisclosure|CostReceiptDisclosure)\b|<details\b|aria-live=/
+    const assertMinimal = (value: string) => {
+      if (forbidden.test(value)) throw new Error('RingsideTake contains displaced disclosure UI')
+    }
+    expect(() => assertMinimal(cue)).not.toThrow()
+    expect(cue).toMatch(/<h2[^>]*>For the \{selected\.role\}<\/h2>/)
+    expect(cue).toContain('<h3>What this means</h3>')
+    expect(cue).toContain('<h3>Question for the room</h3>')
+    expect(cue).toContain('<h3>What we proved</h3>')
+    expect(cue).toContain('aria-label="Room priorities"')
+    expect(cue).not.toMatch(/<h3>(?:Say|Ask|Show)<\/h3>|Selected priorities|Explain to ·/)
+    const mutant = `${cue}\n<CapacityDisclosure session={session} />`
+    expect(() => assertMinimal(mutant)).toThrow(/displaced disclosure UI/i)
+  })
+
   it('keeps the bell locked and does not claim a non-start when the run request aborts', async () => {
     const abort = deferred<ReturnType<typeof jsonResponse>>()
     let armedReads = 0
@@ -2079,10 +2129,11 @@ describe('backstage setup', () => {
 
   it('ticks in the ring for presentation, then replaces both clocks with server-verified times', async () => {
     const running = session('running')
+    const analyst = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'data_analyst')!
     const executive = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'executive')!
     const verified: DemoSession = {
       ...session('verified'),
-      secondary_personas: [executive],
+      secondary_personas: [analyst, executive],
       corners: ['cost', 'simplicity', 'performance'],
       lanes: {
         lakebase: {
@@ -2179,8 +2230,9 @@ describe('backstage setup', () => {
     expect(ringsideMeanings).toHaveTextContent(/why this matters at ringside/i)
     expect(ringsideMeanings).toHaveTextContent(/cost \+ simplicity \+ performance/i)
     expect(ringsideMeanings).toHaveTextContent(/3 a\.m\. sam · sre/i)
+    expect(ringsideMeanings).toHaveTextContent(/count query · data analyst/i)
     expect(ringsideMeanings).toHaveTextContent(/the big why · executive/i)
-    expect(ringsideMeanings.querySelectorAll('img')).toHaveLength(2)
+    expect(ringsideMeanings.querySelectorAll('img')).toHaveLength(3)
     expect(ringsideMeanings.querySelector('p')).toBeNull()
     expect(ringsideMeanings).not.toHaveTextContent(/on-call gets a tested database-action recovery signal from the transaction itself/i)
     expect(ringsideMeanings).not.toHaveTextContent(/idle infrastructure returned to useful work without an operator in the loop/i)
@@ -2215,17 +2267,46 @@ describe('backstage setup', () => {
     expect(replay).not.toHaveTextContent(/RDS\.DescribeDBClusters/i)
     await user.click(within(replay).getByRole('button', { name: /back to the ring/i }))
 
-    await user.click(screen.getByRole('button', { name: /explain to the room/i }))
-    const ringsideTake = await screen.findByRole('dialog', { name: /make the result matter/i })
-    expect(ringsideTake).toHaveTextContent(/one-line takeaway for the sre/i)
-    expect(ringsideTake).toHaveTextContent(/on-call gets a tested database-action recovery signal from the transaction itself/i)
-    expect(ringsideTake).toHaveTextContent(/proof behind it.*0\.84s.*0\.45s before aurora serverless v2/i)
-    expect(ringsideTake).toHaveTextContent(/shared exact proof.*lakebase 0\.84s.*aurora serverless v2 1\.29s.*commit \+ read-back/i)
-    expect(ringsideTake).toHaveTextContent(/what this does not claim.*service recovery and customer experience were not tested/i)
-    expect(ringsideTake).toHaveTextContent(/what must recover/i)
-    await user.click(within(ringsideTake).getByRole('button', { name: /the big why/i }))
-    expect(ringsideTake).toHaveTextContent(/who benefits.*why now/i)
-    await user.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
+    const explainTrigger = screen.getByRole('button', { name: /explain to the room/i })
+    await user.click(explainTrigger)
+    const ringsideTake = await screen.findByRole('dialog', { name: /for the sre/i })
+    const priorities = within(ringsideTake).getByLabelText('Room priorities')
+    expect(priorities.children).toHaveLength(3)
+    expect(priorities).toHaveTextContent(/cost.*simplicity.*performance/i)
+    expect(ringsideTake.querySelectorAll('.ringside-cue')).toHaveLength(3)
+    expect(ringsideTake.querySelector('details')).toBeNull()
+    expect(ringsideTake.querySelector('.ringside-priority-grid')).toBeNull()
+    expect(ringsideTake).toHaveTextContent(
+      /what this means.*database woke and completed a transaction automatically.*SLO risk.*mitigation effort.*warm-capacity cost/i,
+    )
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which services should stay warm after SLO risk and mitigation effort are considered/i)
+    expect(ringsideTake).toHaveTextContent(
+      /what we proved.*first committed transaction after idle.*lakebase 0\.84s.*aurora serverless v2 1\.29s.*only the database transaction was tested/i,
+    )
+    const sreTab = within(ringsideTake).getByRole('tab', { name: /^sre$/i })
+    const close = within(ringsideTake).getByRole('button', { name: /back to the ring/i })
+    expect(sreTab).toHaveFocus()
+    await user.keyboard('{Shift>}{Tab}{/Shift}')
+    expect(close).toHaveFocus()
+    await user.keyboard('{Tab}')
+    expect(sreTab).toHaveFocus()
+
+    await user.click(within(ringsideTake).getByRole('tab', { name: /^data analyst$/i }))
+    expect(ringsideTake).toHaveAccessibleName(/for the data analyst/i)
+    expect(ringsideTake).toHaveTextContent(
+      /what this means.*first answer arrived without a manual database start.*usefulness depends on timing.*access steps.*cost of staying warm/i,
+    )
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which decision is worth paying to avoid wake delay and access handoffs/i)
+    await user.click(within(ringsideTake).getByRole('tab', { name: /^executive$/i }))
+    expect(ringsideTake).toHaveAccessibleName(/for the executive/i)
+    expect(ringsideTake).toHaveTextContent(/what this means.*first transaction returned automatically.*avoiding that delay and support handoffs.*paying to keep capacity warm/i)
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which business deadline makes this delay unacceptable.*who decides whether to keep capacity warm/i)
+    expect(ringsideTake).not.toHaveTextContent(
+      /proof scope|success measure|point to the proof|they care about|pricing receipt|configured compute/i,
+    )
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: /for the/i })).not.toBeInTheDocument()
+    await waitFor(() => expect(explainTrigger).toHaveFocus())
 
     expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
     stubReceiptCanvas()
@@ -2433,7 +2514,7 @@ describe('backstage setup', () => {
     expect(screen.queryByLabelText(/integrity proof receipt/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/Reverse ETL sync 640\.00 ms/)).not.toBeInTheDocument()
     expect(screen.queryByText('round4-v1-full-proof-nonce-aaaaaaaaaaaaaaaa')).not.toBeInTheDocument()
-    expect(screen.getByText(/Verified: customer customer-42 risk score 0\.81 reached the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
+    expect(screen.getByText(/Verified: customer-42 risk score 0\.81 reached the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
     expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent(/Managed reverse ETL · live app verified in 0\.84s/i)
     const commentator = screen.getByLabelText(/ringside commentator/i)
     expect(commentator).toHaveTextContent(/The exact row reached Lakebase in 0\.64s.*0\.84s full proof adds a sync check, fresh app connection, and exact row read; it is not SQL query time/i)
@@ -2446,10 +2527,19 @@ describe('backstage setup', () => {
     expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
-    const ringsideTake = screen.getByRole('dialog', { name: /make the result matter/i })
-    expect(ringsideTake).toHaveTextContent(/one exact analytics row reached the live app in 0\.84s through managed reverse ETL/i)
-    expect(ringsideTake).toHaveTextContent(/RDS\/Aurora alone are OLTP sinks/i)
-    expect(ringsideTake).not.toHaveTextContent(/non-executable/i)
+    const ringsideTake = screen.getByRole('dialog', { name: /for the sre/i })
+    const selectedPriorities = within(ringsideTake).getByLabelText('Room priorities')
+    expect(selectedPriorities.children).toHaveLength(1)
+    expect(selectedPriorities).toHaveTextContent(/^performance$/i)
+    expect(ringsideTake).toHaveTextContent(
+      /what this means.*clock measured Delta commit through app read.*not service SLOs or availability/i,
+    )
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which SLO threshold defines healthy score delivery/i)
+    expect(ringsideTake).toHaveTextContent(
+      /what we proved.*Delta commit to exact app read: 0\.84s.*score for customer-42 matched 0\.81.*model execution and an AWS delivery stack were not tested/i,
+    )
+    expect(ringsideTake.querySelector('details')).toBeNull()
+    expect(ringsideTake).not.toHaveTextContent(/non-executable|RDS\/Aurora alone are OLTP sinks/i)
     await user.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
 
     stubReceiptCanvas()
@@ -2466,7 +2556,7 @@ describe('backstage setup', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
     await user.click(within(shareReceipt).getByRole('button', { name: /copy caption/i }))
     expect(writeText).toHaveBeenCalledWith(expect.stringMatching(
-      /^Lakebase moved an analytics change into the live app in 0\.84s[\s\S]*Lakebase · Live app verified in 0\.84s · built-in managed reverse ETL[\s\S]*separate reverse-ETL stack required · not built or timed[\s\S]*Integrity · customer customer-42[\s\S]*One live managed reverse-ETL proof, not a benchmark\./,
+      /^Lakebase moved an analytics change into the live app in 0\.84s[\s\S]*Lakebase · Live app verified in 0\.84s · built-in managed reverse ETL[\s\S]*separate reverse-ETL stack required · not built or timed[\s\S]*Integrity · customer-42[\s\S]*One live managed reverse-ETL proof, not a benchmark\./,
     ))
     expect(await within(shareReceipt).findByRole('button', { name: /prepare linkedin post/i })).toBeInTheDocument()
     await user.click(within(shareReceipt).getByRole('button', { name: /^b · back$/i }))
@@ -2496,7 +2586,7 @@ describe('backstage setup', () => {
     expect(await screen.findByText('LIVE APP UPDATED AGAIN · CUSTOMER customer-42 · RISK SCORE 0.81 → 0.33 · MODEL risk-v1 → risk-v2')).toBeInTheDocument()
     expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/The exact row reached Lakebase in 0\.51s.*0\.72s full proof adds a sync check, fresh app connection, and exact row read; it is not SQL query time/i)
     expect(screen.queryByText('round4-v2-full-proof-nonce-bbbbbbbbbbbbbbbb')).not.toBeInTheDocument()
-    expect(screen.getByText(/Verified again: customer customer-42 risk score changed 0\.81 → 0\.33 in the lakehouse and reached the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
+    expect(screen.getByText(/Verified again: customer-42 risk score changed 0\.81 → 0\.33 in the lakehouse and reached the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
     expect(screen.queryByText(/faster|sooner|speedup/i)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
   })
@@ -3170,10 +3260,10 @@ describe('backstage setup', () => {
       expect(finalRecap).toBeInTheDocument()
 
       await user.click(screen.getByRole('button', { name: /explain to the room/i }))
-      expect(screen.getByRole('dialog', { name: /make the result matter/i })).toHaveTextContent(
-        /exact Delta answer.*separate checkout.*no throughput or p99 impact claim/i,
+      expect(screen.getByRole('dialog', { name: /for the sre/i })).toHaveTextContent(
+        /what we proved.*exact Delta answer arrived 1\.23s after checkout committed.*another checkout committed.*throughput, p99, and an AWS CDC stack were not tested/i,
       )
-      await user.click(within(screen.getByRole('dialog', { name: /make the result matter/i })).getByRole('button', { name: /back to the ring/i }))
+      await user.click(within(screen.getByRole('dialog', { name: /for the sre/i })).getByRole('button', { name: /back to the ring/i }))
       stubReceiptCanvas()
       await user.click(finalRecap)
       const finale = screen.getByLabelText(/six-round final recap/i)
@@ -3327,12 +3417,15 @@ describe('backstage setup', () => {
     expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/exact Delta answer verified in 1\.23s/i)
   })
 
-  it('keeps shared evidence for the selected priorities in the overlay and out of the ringside strip', async () => {
-    const executive = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'executive')!
+  it('turns Analyst, DBA, and Architect tabs into materially different room talk tracks', async () => {
+    const analyst = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'data_analyst')!
+    const dba = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'dba')!
+    const architect = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'architect_it')!
     const verified: DemoSession = {
       ...safeChangeSession('verified'),
       corners: ['cost', 'simplicity', 'performance'],
-      secondary_personas: [executive],
+      primary_persona: analyst,
+      secondary_personas: [dba, architect],
     }
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
@@ -3368,15 +3461,68 @@ describe('backstage setup', () => {
       expect(card.querySelector('p')).toBeNull()
     })
 
-    // Every one of those sentences is still one click away, still scoped to the
-    // selected priorities and still unduplicated.
+    // The dialog keeps the exact receipt, but its speaking order is the person
+    // in the room rather than a generic benchmark report.
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
-    const take = await screen.findByRole('dialog', { name: /make the result matter/i })
-    const evidence = within(take).getByText(/shared exact proof/i).parentElement!
-    expect(evidence).toHaveTextContent(/cost.*developer wait measured; storage and compute dollars not calculated/i)
-    expect(evidence).toHaveTextContent(/simplicity.*orchestrator ran create → migrate → transaction → final source check; no manual timed step/i)
-    expect(evidence).toHaveTextContent(/performance.*lakebase 1\.80s; aurora serverless v2 9\.80s to migration \+ transaction verify \+ final source check/i)
-    expect(evidence).not.toHaveTextContent(/8\.00s sooner/i)
+    const take = await screen.findByRole('dialog', { name: /for the data analyst/i })
+    const identity = take.querySelector('.ringside-persona-identity')!
+    expect(identity.querySelector('img')).not.toBeNull()
+    expect(identity).toHaveTextContent(`AKA ${analyst.nickname}`)
+    const panel = within(take).getByRole('tabpanel')
+    expect([...panel.children].map((child) => child.className)).toEqual([
+      'ringside-cue ringside-say',
+      'ringside-cue ringside-ask',
+      'ringside-cue ringside-show',
+    ])
+    expect(panel.querySelector('details')).toBeNull()
+    expect(panel.querySelector('article')).toBeNull()
+    expect(panel.querySelector('img')).toBeNull()
+    const fieldText = (label: RegExp) => within(take).getByRole('heading', { name: label }).closest('section')!.textContent!
+    const analystFields = {
+      say: fieldText(/^what this means$/i),
+      ask: fieldText(/^question for the room$/i),
+      show: fieldText(/^what we proved$/i),
+    }
+    expect(analystFields.say).toMatch(/ship only when compatibility checks can prevent expensive report rework.*decision deadline/i)
+    expect(analystFields.ask).toMatch(/which report deadline should decide whether this change ships/i)
+    expect(analystFields.show).toMatch(/migration, tested transaction, and source check.*lakebase 1\.80s.*aurora serverless v2 9\.80s.*no customer traffic was tested/i)
+    expect(take).not.toHaveTextContent(
+      /success measure|proof scope|point to the proof|they care about|shared exact proof|pricing receipt/i,
+    )
+
+    const analystTab = within(take).getByRole('tab', { name: /^data analyst$/i })
+    const dbaTab = within(take).getByRole('tab', { name: /^dba$/i })
+    expect(analystTab).toHaveAttribute('aria-selected', 'true')
+    analystTab.focus()
+    await user.keyboard('{ArrowRight}')
+    expect(dbaTab).toHaveFocus()
+    expect(dbaTab).toHaveAttribute('aria-selected', 'true')
+    expect(take).toHaveAccessibleName(/for the dba/i)
+    expect(identity).toHaveTextContent(`AKA ${dba.nickname}`)
+    const dbaFields = {
+      say: fieldText(/^what this means$/i),
+      ask: fieldText(/^question for the room$/i),
+      show: fieldText(/^what we proved$/i),
+    }
+    expect(dbaFields.say).toMatch(/source stayed intact.*promotion.*restore labor.*runbook effort.*database deadline/i)
+    expect(dbaFields.ask).toMatch(/which database changes require this isolation before promotion/i)
+    expect(dbaFields.say).not.toBe(analystFields.say)
+    expect(dbaFields.ask).not.toBe(analystFields.ask)
+    expect(dbaFields.show).toBe(analystFields.show)
+
+    await user.keyboard('{ArrowRight}')
+    const architectTab = within(take).getByRole('tab', { name: /^architect \/ it$/i })
+    expect(architectTab).toHaveFocus()
+    expect(architectTab).toHaveAttribute('aria-selected', 'true')
+    expect(take).toHaveAccessibleName(/for the architect \/ it/i)
+    expect(identity).toHaveTextContent(`AKA ${architect.nickname}`)
+    expect(fieldText(/^what this means$/i)).toMatch(/standardize this workflow.*delivery deadlines.*exception or setup cost/i)
+    expect(fieldText(/^question for the room$/i)).toMatch(/which teams adopt first.*what rule excludes the rest/i)
+    expect(fieldText(/^what we proved$/i)).toBe(analystFields.show)
+    await user.keyboard('{Home}')
+    expect(analystTab).toHaveFocus()
+    await user.keyboard('{End}')
+    expect(architectTab).toHaveFocus()
   })
 
   it('shows a failed lane error immediately while the other lane is still running', async () => {
@@ -4148,11 +4294,12 @@ describe('backstage setup', () => {
     expect(cleaningStrip).toBeInTheDocument()
     const strippedExplain = within(cleaningStrip).getByRole('button', { name: /explain to the room/i })
     await user.click(strippedExplain)
-    const cleaningTake = await screen.findByRole('dialog', { name: /make the result matter/i })
-    // The exact sentence the strip used to print inline, reachable from the
-    // strip itself while the actions row is still withheld.
-    expect(cleaningTake).toHaveTextContent(/one-line takeaway for the sre/i)
-    expect(cleaningTake).toHaveTextContent(/the lease stayed with cleanup, preventing another bout from mutating the configured sources/i)
+    const cleaningTake = await screen.findByRole('dialog', { name: /for the sre/i })
+    expect(within(cleaningTake).getByLabelText('Room priorities')).toHaveTextContent(/^performance$/i)
+    expect(cleaningTake).toHaveTextContent(
+      /what we proved.*deletion to exact recovered read.*Lakebase 14\.38s.*Aurora Serverless v2 was still unverified at 90\.00s.*recovery time is greater than 90\.00s.*failover was not tested/i,
+    )
+    expect(cleaningTake.querySelector('details')).toBeNull()
     await user.click(within(cleaningTake).getByRole('button', { name: /back to the ring/i }))
 
     source.emit({
@@ -4169,11 +4316,15 @@ describe('backstage setup', () => {
     expect(opponentLane).toHaveTextContent(/unverified when stopped.*lower bound/i)
 
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
-    const towelTake = await screen.findByRole('dialog', { name: /make the result matter/i })
-    expect(towelTake).toHaveTextContent(/proof behind it.*exact recovered read.*censored lower bound.*no service failover or customer slo was tested/i)
-    expect(towelTake).toHaveTextContent(/shared exact proof.*aurora serverless v2 >90\.00s, unverified when stopped/i)
-    await user.click(within(towelTake).getByRole('button', { name: /the big why/i }))
-    expect(towelTake).toHaveTextContent(/proof behind it.*censored lower bound at the cutoff/i)
+    const towelTake = await screen.findByRole('dialog', { name: /for the sre/i })
+    const towelProof = within(towelTake).getByRole('heading', { name: /^what we proved$/i }).closest('section')!.textContent
+    expect(towelProof).toMatch(
+      /deletion to exact recovered read.*Lakebase 14\.38s.*Aurora Serverless v2 was still unverified at 90\.00s.*recovery time is greater than 90\.00s.*failover was not tested/i,
+    )
+    expect(towelProof).not.toMatch(/stopped at >/i)
+    await user.click(within(towelTake).getByRole('tab', { name: /^executive$/i }))
+    expect(towelTake).toHaveTextContent(/what this means.*order became readable on a clock.*business process recovered/i)
+    expect(within(towelTake).getByRole('heading', { name: /^what we proved$/i }).closest('section')!.textContent).toBe(towelProof)
     await user.click(within(towelTake).getByRole('button', { name: /back to the ring/i }))
 
     stubReceiptCanvas()

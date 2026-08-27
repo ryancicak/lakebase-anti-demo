@@ -90,7 +90,25 @@ Setup progress is browser-native. Back and Forward restore the prior screen, whi
 
 ## Persona contract
 
-Persona selection changes discovery order, vocabulary, recommended round, and one concise role-specific interpretation. It never changes the task, verifier, timestamps, shared priority evidence, or result. Every selected priority renders independently, while **Explain to the room** shows the shared exact proof, one persona-specific question, and the round's explicit non-claim boundary. Cost copy identifies measured inputs without claiming dollar savings; performance copy shows each authoritative lane value or a truthful capability gap/censored lower bound. A new acceptance condition requires a new round and explicit re-arm.
+Persona selection changes discovery order, vocabulary, recommended round, and the presenter's role-specific talk track. It never changes the task, verifier, timestamps, receipt, or result.
+
+**Explain to the room** is a minimal, audience-facing briefing that can be projected or shared:
+
+1. `FOR THE <ROLE>` with a compact text-only role switcher and plain `COST`, `SIMPLICITY`, and `PERFORMANCE` context chips.
+2. **WHAT THIS MEANS** — one plain-language authored sentence, at most 25 words.
+3. **QUESTION FOR THE ROOM** — one natural invitation to discuss, at most 18 words and exactly one question mark.
+4. **WHAT WE PROVED** — one exact, comprehensible receipt-backed line, normally at most 26 words. Round 5 may use up to 36 words because the new-Proxy setup boundary and the untested existing-Proxy caveat must both remain visible.
+5. `B · BACK TO THE RING`.
+
+The ten runtime roles, six rounds, and seven canonical non-empty priority sets resolve all 420 tracks from one reviewed JSONL corpus. Every record preserves its stable meaning and question IDs, exact final text, and KEEP/REWRITE decisions. A separate 23-record JSONL outcome matrix supplies proof templates and the override copy for partial, failed, towel, and no-result states. The frontend parses those two static sources once into typed lookups and applies one round-specific evidence classifier; no second handwritten corpus or generated copy layer exists.
+
+Pair and triple selections use a complete integrative question, not a concatenation of single-priority clauses. A missing compiled leaf is an error. The proof line is invariant across role and priority for the same session; only exact receipt tokens such as elapsed times, competitor, verified row ID, or score may vary. If neither lane has verified evidence, the resolver uses a round-specific no-result meaning and question across every role and priority. A towel in that state reports the actual cutoff and any censored lower bounds instead of exposing success-authored language.
+
+Every track is dual-use: a presenter can read it verbatim without sounding like backstage instruction, and an attendee can read it silently and understand what happened and why it may matter. Visible copy never exposes template machinery or labels people as a persona, consumer, or beneficiary. Relevance is framed for the selected role and tested through the room question rather than asserted as fact. Lower bounds and material caveats are explained in plain language inside **WHAT WE PROVED**.
+
+The dialog renders no priority cards, accordions, nested details, success measure, universal disclosure stack, or supporting priority list. Material caveats live directly in **WHAT WE PROVED**. Extended evidence remains available at its dedicated destination: configured capacity and Round 5's full setup/burst proof in **Instant Replay**; descent, bout, standing, and pricing-receipt evidence in **What It Cost**; exact calls in **Technical Details** or replay steps; and the portable exact result in **Share Receipt**.
+
+Cost language distinguishes measured rates, standing or per-event spend, and measured wait. Operator toil remains unmeasured unless executed steps are counted; cost of delay remains a discovery question. Performance names the exact executed stop boundary. Simplicity names concrete tools, tickets, runbooks, approvals, steps, handoffs, and owners without treating demo automation as proof of customer simplicity. A new acceptance condition requires a new round and explicit re-arm.
 
 The source registry is `config/personas.json`. Authored Tiger Team content remains distinguishable from Anti-Demo drafts.
 

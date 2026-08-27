@@ -48,6 +48,12 @@ import {
   verdictFor,
 } from './recap'
 import { offerNativeShare, shareDismissalPrefix } from './share'
+import {
+  buildRingsideCue,
+  classifyRingsideOutcome,
+  isShareableRingsideOutcome,
+  priorityKeyFor,
+} from './ringside-cues'
 import { compactDuration, preciseDuration } from './time'
 import {
   ROUND_FOUR_LEGEND,
@@ -399,71 +405,6 @@ const competitorEpithet: Record<CompetitorId, { epithet: string; tagline?: strin
   rds_postgres: { epithet: 'NEVER SLEEPS', tagline: 'Like Samara from the Ring, it never sleeps.' },
 }
 
-const personaAudience: Record<PersonaId, string> = {
-  data_engineer: 'the data team',
-  software_engineer: 'the release team',
-  data_analyst: 'the analytics team',
-  architect_it: 'the platform team',
-  data_scientist_ml: 'the ML team',
-  dba: 'database operations',
-  sre: 'the on-call team',
-  executive: 'the business',
-  infosec: 'the security review',
-  application_owner: 'the product team',
-}
-
-const wakeSummary: Record<PersonaId, string> = {
-  data_engineer: 'The tested data write needed no manual database wake handoff.',
-  software_engineer: 'Application code reached its first transaction without a separate database-start step.',
-  data_analyst: 'Committed data—not an infrastructure status—proved the database was usable.',
-  architect_it: 'Scale-to-zero and connection-triggered wake operated as one platform behavior.',
-  data_scientist_ml: 'Only database wake was measured; no model execution or serving path was exercised.',
-  dba: 'Recovery ended at commit and read-back, not at an available signal.',
-  sre: 'On-call gets a tested database-action recovery signal from the transaction itself.',
-  executive: 'Idle infrastructure returned to useful work without an operator in the loop.',
-  infosec: 'The normal authenticated app connection remained the path back to service.',
-  application_owner: 'The tested database action passed; a customer-facing path was not exercised.',
-}
-
-const safeChangeSummary: Record<PersonaId, string> = {
-  data_engineer: 'Schema-dependent data work was validated without changing the trusted source.',
-  software_engineer: 'The schema and tested database action passed together without changing the configured source.',
-  data_analyst: 'The configured source kept its original schema and baseline row throughout the test.',
-  architect_it: 'Isolation kept the change workflow separate from the configured source.',
-  data_scientist_ml: 'A schema-dependent experiment reached a database check without altering the configured source.',
-  dba: 'The source check proved neither the migration nor its test row leaked.',
-  sre: 'The configured source was not the mutation target while the database contract was tested.',
-  executive: 'The team gained database evidence before asking the configured source to carry the change.',
-  infosec: 'Both source schema and source data were checked after the isolated test.',
-  application_owner: 'The changed database contract passed; a customer-facing path was not exercised.',
-}
-
-const recoverySummary: Record<PersonaId, string> = {
-  data_engineer: 'The missing synthetic row was inspected in recovery without writing it back to the configured source.',
-  software_engineer: 'An application read—not restore status—proved the recovered database worked.',
-  data_analyst: 'The exact run-owned synthetic payload was verified, so an approximate match could not pass.',
-  architect_it: 'A separate recovery environment preserved the configured source while proving the recovery point.',
-  data_scientist_ml: 'A deleted synthetic input was inspected without changing the configured source of record.',
-  dba: 'The exact synthetic row was readable while its configured-source deletion remained intact.',
-  sre: 'The exact recovered read was verified; service failover and customer SLOs were not tested.',
-  executive: 'The synthetic order remained recoverable without erasing evidence of the configured-source deletion.',
-  infosec: 'Recovery evidence stayed separate from the configured source, preserving the tested incident boundary.',
-  application_owner: 'The exact synthetic order became readable while its configured-source deletion remained intact.',
-}
-
-const towelSummary: Record<PersonaId, string> = {
-  data_engineer: 'Lakebase proved the recovered synthetic row; the stopped lane remains a censored lower bound.',
-  software_engineer: 'Only Lakebase completed the full database proof before the presenter stopped the run.',
-  data_analyst: 'The unfinished lane is a lower bound, not a completed value to average.',
-  architect_it: 'The ring could not reopen until cancelled work and owned artifacts were cleared.',
-  data_scientist_ml: 'This lower bound belongs outside completed-run trend or training data.',
-  dba: 'Lakebase passed the proof; the unfinished restore was handed to owned cleanup.',
-  sre: 'The lease stayed with cleanup, preventing another bout from mutating the configured sources.',
-  executive: 'The presenter moved on without claiming a finish time for the other lane.',
-  infosec: 'Cleanup targeted only recovery artifacts owned by this demo run.',
-  application_owner: 'The synthetic order was readable on Lakebase; no result was invented for the stopped lane.',
-}
-
 interface FightSelection {
   competitor: CompetitorId
   corners: CustomerCorner[]
@@ -550,266 +491,6 @@ function scorecardEntry(session: DemoSession): ScorecardEntry | null {
   }
 }
 
-function ringsideMeaning(
-  session: DemoSession,
-  personaId: PersonaId,
-  role: string,
-): string {
-  if (isRoundFour(session)) {
-    const evidence = modelScoreEvidence(session.lanes.lakebase)
-    const appProof = metricDisplay(session, 'application_proof_elapsed_ms')
-    const exactUpdate = `customer ${evidence.primaryKey}'s risk score ${scoreText(evidence.score)} from ${evidence.modelVersion}`
-    const meanings: Record<PersonaId, string> = {
-      data_engineer: `Managed reverse ETL carried ${exactUpdate} from Analytics Delta into an exact Lakebase Postgres row and app read in ${appProof}; the AWS lane was not executed or timed.`,
-      software_engineer: `The live application read the exact operational Postgres record for ${exactUpdate}; the managed OLAP → OLTP path, not application code, performed the movement.`,
-      data_analyst: `The application-facing record matched ${exactUpdate} and the committed Delta version, so freshness and row identity were both proved.`,
-      architect_it: `This bout proved one governed Analytics Delta → managed reverse ETL → operational Postgres path in the Databricks platform; RDS/Aurora alone are OLTP sinks and need a separately operated pipeline stack.`,
-      data_scientist_ml: `The model output became usable application data: ${exactUpdate} was read exactly from the live app database. Model training and online inference were not tested.`,
-      dba: `The Lakebase Postgres destination returned the exact key, score, model version, and full nonce written from Delta; no AWS database path was executed.`,
-      sre: `The exact app read closed the proof for ${exactUpdate}; this tested data delivery, not end-to-end service availability or an SLO.`,
-      executive: `One analytics output became live application data without a separately selected, deployed, and operated reverse-ETL product in this Lakebase path; no AWS speed comparison was made.`,
-      infosec: `The proof receipt binds the Delta version, customer key, score, model version, and full nonce to the exact app read; broader data-governance controls were not tested.`,
-      application_owner: `The live app database showed ${exactUpdate}; this proves the data reached the application record, not that a customer-facing UI was exercised.`,
-    }
-    return meanings[personaId] ?? `For the ${role}, this run proved an exact managed OLAP → OLTP application update.`
-  }
-  if (isRoundFive(session)) {
-    const lakebaseSetup = roundFiveSetupElapsedDisplay(roundFiveSetupLaneResult(session, 'lakebase'))
-    const awsSetup = roundFiveSetupElapsedDisplay(roundFiveSetupLaneResult(session, 'competitor'))
-    const aws = session.competitor.short_name
-    const meanings: Record<PersonaId, string> = {
-      data_engineer: `From the declared start, Lakebase verified its built-in pooled path in ${lakebaseSetup}; ${aws} verified its RDS Proxy path in ${awsSetup}.`,
-      software_engineer: `Both paths passed an exact application transaction. Lakebase pooling was built in; this bout provisioned the AWS best-practice RDS Proxy path.`,
-      data_analyst: `Readiness setup is the scored result: Lakebase ${lakebaseSetup}; ${aws} ${awsSetup}. The identical spike is pass/fail validation only.`,
-      architect_it: `This declared-start bout compares built-in pooling with a newly provisioned AWS best-practice RDS Proxy; an existing Proxy would not pay this setup delay.`,
-      data_scientist_ml: `The connection path verified under burst after setup; no model, feature, or inference path was tested.`,
-      dba: `Both lanes verified 64 held clients with fewer than 64 backend sessions; readiness setup was scored, while burst performance was not compared.`,
-      sre: `The identical spike and pooling witness validated both paths; sustained load, burst superiority, and service SLOs were not tested.`,
-      executive: `Lakebase used built-in pooling while this bout provisioned ${aws}'s AWS best-practice RDS Proxy path; an existing Proxy would start ready.`,
-      infosec: `The AWS path required IAM, Proxy credentials in Secrets Manager, and network rules; those prerequisites were disclosed outside the setup clock.`,
-      application_owner: `Both application connection paths verified after readiness setup; this was a controlled pass/fail spike, not customer traffic.`,
-    }
-    return meanings[personaId] ?? `For the ${role}, this run compared built-in pooling with an AWS best-practice RDS Proxy path from the declared start.`
-  }
-  if (isRoundSix(session)) {
-    const answerTime = roundSixElapsed(session)
-    const meanings: Record<PersonaId, string> = {
-      data_engineer: `One checkout commit became one exact Delta order and revenue answer through native CDF in ${answerTime}.`,
-      software_engineer: `A separate checkout committed while analytics read Delta—not the application database.`,
-      data_analyst: `One $84.50 order became an exact 1-order / $84.50 Delta answer in ${answerTime}.`,
-      architect_it: `Lakebase supplied the native feed; ${session.competitor.short_name} needs a separate CDC stack before Delta can answer.`,
-      data_scientist_ml: `Fresh operational data reached governed Delta; no model or feature pipeline was tested.`,
-      dba: `Checkout committed normally while the analytical query ran against separate Delta history.`,
-      sre: `A separate checkout committed during the feed wait; throughput and p99 were not measured.`,
-      executive: `The exact answer arrived through Lakebase native CDF; AWS needs an added CDC stack whose product and price are not assumed.`,
-      infosec: `One unique checkout order matched one exact Delta insert; broader controls were not tested.`,
-      application_owner: `Checkout committed while analytics received the exact order and revenue answer from Delta.`,
-    }
-    return meanings[personaId] ?? `For the ${role}, one exact checkout order reached Delta in ${answerTime}.`
-  }
-  const lakebaseTime = laneReceiptTime(session.lanes.lakebase.elapsed_ms)
-  const competitorTime = session.lanes.competitor.elapsed_ms
-  const competitor = session.competitor.short_name
-  let comparison = ''
-  if (session.lanes.competitor.state === 'not_supported') {
-    comparison = `; ${competitor} has no automatic scale-to-zero wake path to time`
-  } else if (session.lanes.lakebase.elapsed_ms !== null && competitorTime !== null) {
-    const difference = Math.abs(session.lanes.lakebase.elapsed_ms - competitorTime)
-    const direction = difference < 5
-      ? ` — effectively tied with ${competitor}`
-      : session.lanes.lakebase.elapsed_ms < competitorTime
-        ? ` — ${laneReceiptTime(difference)} before ${competitor}`
-        : ` — ${laneReceiptTime(difference)} after ${competitor}`
-    comparison = direction
-  }
-
-  const wakeMeaning: Record<PersonaId, string> = {
-    data_engineer: `The source-to-app write was verified ${lakebaseTime} after IDLE${comparison}, without waiting for a manual database start.`,
-    software_engineer: `A real app transaction worked ${lakebaseTime} after IDLE${comparison}, with automatic wake kept out of the developer workflow.`,
-    data_analyst: `Fresh data was readable and verified ${lakebaseTime} after IDLE${comparison}; correctness—not an “available” status—stopped the clock.`,
-    architect_it: `Lakebase paired zero-compute idle with a verified transaction in ${lakebaseTime}${comparison}—a platform behavior to test against your policy.`,
-    data_scientist_ml: `The app database verified a write and read in ${lakebaseTime} from IDLE${comparison}; only database wake was measured, not model execution or serving.`,
-    dba: `From IDLE, Lakebase accepted, committed, and read back a transaction in ${lakebaseTime}${comparison}—the database recovery this run proved.`,
-    sre: `Lakebase restored a committed, read-back database action from IDLE in ${lakebaseTime}${comparison}; service recovery was not tested.`,
-    executive: `Lakebase put the app back to verified work in ${lakebaseTime}${comparison}; value that waiting time with your own cost of delay.`,
-    infosec: `This authenticated app path committed and read back a transaction in ${lakebaseTime} from IDLE${comparison}, proving this path recovered—not a broader security posture.`,
-    application_owner: `The tested database action wrote and read data ${lakebaseTime} after IDLE${comparison}; no customer-facing path was exercised.`,
-  }
-
-  const safeChangeMeaning: Record<PersonaId, string> = {
-    data_engineer: `Lakebase changed and database-tested an isolated copy in ${lakebaseTime}${comparison}, then proved the data contract never reached the configured source.`,
-    software_engineer: `Lakebase finished isolate → migrate → app-test → source-check in ${lakebaseTime}${comparison}—idea-to-tested-change time, not branch creation alone.`,
-    data_analyst: `Lakebase verified the changed database contract in ${lakebaseTime}${comparison} while the configured source schema and baseline stayed unchanged.`,
-    architect_it: `Lakebase delivered an isolated, app-verified change in ${lakebaseTime}${comparison} and rechecked the source—a repeatable workflow, not just a fast copy.`,
-    data_scientist_ml: `Lakebase verified a changed database schema in ${lakebaseTime}${comparison} without touching the configured source; no model path was exercised.`,
-    dba: `Lakebase verified the schema change in ${lakebaseTime}${comparison}, then proved no schema or test row reached the source—the operational safety boundary.`,
-    sre: `Lakebase verified the changed database contract in ${lakebaseTime}${comparison} while the configured source stayed untouched.`,
-    executive: `Lakebase completed one fully verified change loop in ${lakebaseTime}${comparison}; value the engineering wait and change risk removed, not branch speed alone.`,
-    infosec: `Lakebase completed the isolated change in ${lakebaseTime}${comparison}, then proved the source schema and test row were unchanged.`,
-    application_owner: `Lakebase passed the changed database contract in ${lakebaseTime}${comparison} without changing the configured source; the customer-facing path was not exercised.`,
-  }
-
-  const recoveryMeaning: Record<PersonaId, string> = {
-    data_engineer: `Lakebase read the exact run-owned synthetic row from recovery in ${lakebaseTime}${comparison} and the final configured-source check kept it absent.`,
-    software_engineer: `A database read verified the exact synthetic row in ${lakebaseTime}${comparison}; control-plane readiness alone could not pass.`,
-    data_analyst: `The exact synthetic payload matched in recovery in ${lakebaseTime}${comparison}, so an approximate row could not pass.`,
-    architect_it: `A separate recovery environment produced the exact read in ${lakebaseTime}${comparison} while the configured source remained unchanged.`,
-    data_scientist_ml: `The exact synthetic input was readable from recovery in ${lakebaseTime}${comparison}; no model or serving path was tested.`,
-    dba: `Lakebase reached the agreed recovery point and exact read in ${lakebaseTime}${comparison}, then a fresh configured-source session confirmed absence.`,
-    sre: `The exact recovered read verified in ${lakebaseTime}${comparison}; service failover and customer SLOs were not tested.`,
-    executive: `Lakebase proved one run-owned synthetic order recoverable in ${lakebaseTime}${comparison}; this run did not establish business impact.`,
-    infosec: `The exact synthetic row verified in a separate recovery environment in ${lakebaseTime}${comparison}, preserving the configured-source boundary.`,
-    application_owner: `Lakebase recovered the exact synthetic order in ${lakebaseTime}${comparison}; no customer-facing recovery path was exercised.`,
-  }
-
-  const towelMeaning: Record<PersonaId, string> = {
-    data_engineer: `Lakebase completed the exact synthetic-row proof in ${lakebaseTime}; ${competitor} was unverified when stopped at ${laneReceiptTime(towelLowerBoundMs(session, 'competitor'))}, so its result is only a censored lower bound.`,
-    software_engineer: `Lakebase completed the database proof in ${lakebaseTime}; ${competitor} was unverified when stopped, so its value is only a censored lower bound.`,
-    data_analyst: `${competitor}'s >${laneReceiptTime(towelLowerBoundMs(session, 'competitor'))} value is a censored lower bound, not a completed observation to average with Lakebase's ${lakebaseTime}.`,
-    architect_it: `Lakebase verified in ${lakebaseTime}; ${competitor} remained unverified at the cutoff, leaving only a censored lower bound while the ring stayed fenced.`,
-    data_scientist_ml: `${competitor} was unverified when stopped at ${laneReceiptTime(towelLowerBoundMs(session, 'competitor'))}, so its censored lower bound must stay outside completed-run trend or training data.`,
-    dba: `Lakebase passed the exact read and final configured-source check in ${lakebaseTime}; ${competitor} has only a censored lower bound.`,
-    sre: `Lakebase verified the exact recovered read in ${lakebaseTime}; ${competitor} has only a censored lower bound, and no service failover or customer SLO was tested.`,
-    executive: `Lakebase verified in ${lakebaseTime}; ${competitor}'s >${laneReceiptTime(towelLowerBoundMs(session, 'competitor'))} result is only a censored lower bound at the cutoff.`,
-    infosec: `Lakebase completed the separated recovery proof in ${lakebaseTime}; ${competitor} has only a censored lower bound and cleanup remained ownership-scoped.`,
-    application_owner: `Lakebase read the exact synthetic order in ${lakebaseTime}; ${competitor} has only a censored lower bound and no customer-facing path was exercised.`,
-  }
-
-  if (session.towel) {
-    const legacyRoundThree = session.towel.cutoff_ms === undefined
-      && session.towel.censored_lower_bounds_ms === undefined
-      && session.round.id === 'recover_deleted_order'
-    if (legacyRoundThree) return towelMeaning[personaId]
-    return `${session.lanes.lakebase.name} · ${towelLaneValue(session, 'lakebase')}; ${session.lanes.competitor.name} · ${towelLaneValue(session, 'competitor')}. Exact finishes were preserved; unfinished lanes are lower bounds.`
-  }
-  return session.round.id === 'wake_idle_app'
-    ? wakeMeaning[personaId]
-    : session.round.id === 'make_schema_change_safely'
-      ? safeChangeMeaning[personaId]
-      : session.round.id === 'recover_deleted_order'
-        ? recoveryMeaning[personaId]
-        : `For the ${role}, this non-executable round has no measured persona claim.`
-}
-
-function ringsideSummary(session: DemoSession, personaId: PersonaId): string {
-  if (isRoundFour(session)) {
-    return `One exact analytics row reached the live app in ${roundFourAppElapsed(session)} through managed reverse ETL—the concrete outcome for ${personaAudience[personaId]}.`
-  }
-  if (session.towel) {
-    const legacyRoundThree = session.towel.cutoff_ms === undefined
-      && session.towel.censored_lower_bounds_ms === undefined
-      && session.round.id === 'recover_deleted_order'
-    return legacyRoundThree
-      ? towelSummary[personaId]
-      : 'The server preserved exact finishes and censored unfinished lanes at the towel cutoff.'
-  }
-  if (session.round.id === 'wake_idle_app') return wakeSummary[personaId]
-  if (session.round.id === 'make_schema_change_safely') return safeChangeSummary[personaId]
-  if (session.round.id === 'recover_deleted_order') return recoverySummary[personaId]
-  if (isRoundFive(session)) {
-    const lakebaseSetup = roundFiveSetupElapsedDisplay(roundFiveSetupLaneResult(session, 'lakebase'))
-    const awsSetup = roundFiveSetupElapsedDisplay(roundFiveSetupLaneResult(session, 'competitor'))
-    return `From the declared start, Lakebase verified its built-in pooled path in ${lakebaseSetup}; ${session.competitor.short_name} verified its RDS Proxy path in ${awsSetup}. An already-deployed RDS Proxy would not pay this setup delay.`
-  }
-  if (isRoundSix(session)) {
-    const summaries: Record<PersonaId, string> = {
-      data_engineer: 'Native CDF carried one exact checkout order into Delta.',
-      software_engineer: 'Analytics read Delta while a separate checkout committed.',
-      data_analyst: 'The $84.50 order became an exact 1-order / $84.50 answer.',
-      architect_it: 'Lakebase had the native feed; AWS needs an added CDC stack.',
-      data_scientist_ml: 'Fresh operational data reached Delta; no model path was tested.',
-      dba: 'Checkout and analytics used separate serving and history paths.',
-      sre: 'Checkout correctness passed; throughput and p99 were not measured.',
-      executive: 'One exact answer arrived through Lakebase native CDF; AWS needs an added CDC stack.',
-      infosec: 'One unique checkout matched one exact Delta insert.',
-      application_owner: 'Checkout committed and Delta returned the exact order answer.',
-    }
-    return summaries[personaId]
-  }
-
-  return `This run proved the agreed outcome for ${personaAudience[personaId]}.`
-}
-
-function ringsidePerformanceEvidence(session: DemoSession): string {
-  if (isRoundFour(session)) {
-    return `Exact Lakebase app row verified in ${metricDisplay(session, 'application_proof_elapsed_ms')} from the Delta commit; AWS lane unexecuted and not timed; no speed margin.`
-  }
-  if (isRoundFive(session)) {
-    const lakebaseSetup = roundFiveSetupElapsedDisplay(roundFiveSetupLaneResult(session, 'lakebase'))
-    const awsSetup = roundFiveSetupElapsedDisplay(roundFiveSetupLaneResult(session, 'competitor'))
-    return `Readiness setup: Lakebase ${lakebaseSetup}; ${session.competitor.short_name} ${awsSetup}. The identical 128-connection spike was pass/fail validation, not a speed comparison.`
-  }
-  if (isRoundSix(session)) {
-    return `Exact Delta answer in ${roundSixElapsed(session)} after checkout commit; separate checkout committed; no throughput or p99 impact claim.`
-  }
-  const boundary = session.round.id === 'wake_idle_app'
-    ? 'commit + read-back of the run-unique value'
-    : session.round.id === 'make_schema_change_safely'
-      ? 'migration + transaction verify + final source check'
-      : session.round.id === 'recover_deleted_order'
-        ? 'exact recovery read + final source check'
-        : 'no executable verified boundary'
-  if (session.towel) {
-    if (session.towel.cutoff_ms === undefined && session.towel.censored_lower_bounds_ms === undefined) {
-      return `Lakebase ${laneReceiptTime(towelVerifiedMs(session, 'lakebase'))} to ${boundary}; ${session.competitor.short_name} >${laneReceiptTime(towelLowerBoundMs(session, 'competitor'))}, unverified when stopped`
-    }
-    return `${session.lanes.lakebase.name} ${towelLaneValue(session, 'lakebase')} to ${boundary}; ${session.lanes.competitor.name} ${towelLaneValue(session, 'competitor')}`
-  }
-  const lakebaseMs = session.lanes.lakebase.elapsed_ms
-  const competitorMs = session.lanes.competitor.elapsed_ms
-  if (session.lanes.competitor.state === 'not_supported') {
-    return `Lakebase ${laneReceiptTime(lakebaseMs)} to ${boundary}; no comparable ${session.competitor.short_name} lane`
-  }
-  if (lakebaseMs === null || competitorMs === null) return `No two-lane verified elapsed result to ${boundary}`
-  return `Lakebase ${laneReceiptTime(lakebaseMs)}; ${session.competitor.short_name} ${laneReceiptTime(competitorMs)} to ${boundary}`
-}
-
-function ringsidePriorityEvidence(session: DemoSession, corner: CustomerCorner): string {
-  if (corner === 'performance') return ringsidePerformanceEvidence(session)
-  if (corner === 'cost' && session.cost_receipt) {
-    const proxy = session.cost_receipt.lines.find((line) => line.component.startsWith('RDS Proxy ·'))
-    const unpriced = session.cost_receipt.lines.find((line) => line.status === 'selection_required')
-    if (proxy?.subtotal_usd != null) {
-      return `Published rate estimate: RDS Proxy 10-minute minimum is ${formatUsd(proxy.subtotal_usd)}; final Proxy lifetime, compute, and storage reconcile when provider usage arrives. No savings claim.`
-    }
-    if (unpriced) {
-      return `Published rates captured for both databases; ${unpriced.component.toLowerCase()} remains unpriced until a product and plan are selected. No $0 assumption.`
-    }
-    return `Published rates captured for Lakebase and ${session.competitor.short_name}; per-bout compute and storage quantities await provider usage. No savings claim.`
-  }
-  if (isRoundFour(session)) {
-    return corner === 'cost'
-      ? 'Managed reverse ETL was verified; infrastructure dollars and savings were not calculated.'
-      : 'Analytics Delta → managed reverse ETL → exact Lakebase Postgres app read; no separately operated pipeline in the executed path.'
-  }
-  if (isRoundFive(session)) {
-    return corner === 'cost'
-      ? 'Lakebase used its built-in pool; this declared-start AWS lane provisioned the best-practice RDS Proxy path. Dollar savings are not claimed.'
-      : 'This bout compares built-in pooling with an AWS best-practice RDS Proxy provisioned from the declared start; an existing Proxy would not pay the setup delay.'
-  }
-  if (isRoundSix(session)) {
-    return corner === 'cost'
-      ? 'Native CDF verified; infrastructure dollars and savings were not calculated.'
-      : 'Checkout Postgres → native CDF → exact Delta answer; AWS requires an added CDC stack.'
-  }
-  if (session.round.id === 'wake_idle_app') {
-    return corner === 'cost'
-      ? 'Zero-compute start verified; dollars not calculated.'
-      : 'PostgreSQL connection triggered wake; no manual start after the bell.'
-  }
-  if (session.round.id === 'make_schema_change_safely') {
-    return corner === 'cost'
-      ? 'Developer wait measured; storage and compute dollars not calculated.'
-      : 'Orchestrator ran create → migrate → transaction → final source check; no manual timed step.'
-  }
-  if (session.round.id === 'recover_deleted_order') {
-    return corner === 'cost'
-      ? 'Recovery wait measured; infrastructure and operating dollars not calculated.'
-      : 'Orchestrator ran delete → eligibility → recovery → exact read → final source check; no manual timed step.'
-  }
-  return 'Non-executable round; no selected-priority evidence was measured.'
-}
-
 function costNumber(value: number | string): number | null {
   const parsed = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(parsed) ? parsed : null
@@ -883,13 +564,12 @@ function costStatusDetail(status: string, postedThrough: string | null): string 
  *
  * The project's own on-screen rule is that every untimed prerequisite is
  * disclosed, and compute sizing is exactly that: it is never measured, but it
- * bounds what the measurement can mean. It lives in "Explain to the room"
- * rather than on the proof surface because it answers a challenge rather than
- * carrying the result.
+ * bounds what the measurement can mean. It lives in Instant Replay because it
+ * answers a technical challenge rather than carrying the presenter cue.
  *
- * `basis` is rendered rather than hidden. A figure read back from a live
- * control plane during arming is a stronger claim than the value the installer
- * asked for, and the difference is worth showing to the person asking.
+ * `basis` is rendered rather than hidden in Instant Replay. A figure read back
+ * from a live control plane during arming is a stronger claim than the value
+ * the installer asked for, and the difference is worth showing there.
  *
  * WHY THE SUMMARY IS A FOUR-WAY VERDICT AND NOT `matched`. The payload's
  * `matched` answers "do the constants agree", which is not the question the
@@ -1389,28 +1069,6 @@ export function CostReceiptDisclosure({ session }: { session: DemoSession }) {
   )
 }
 
-function roundClaimBoundary(session: DemoSession): string {
-  if (isRoundFour(session)) {
-    return 'This proves one exact governed Delta-to-Lakebase Postgres application update through managed reverse ETL. RDS/Aurora alone are OLTP sinks; the required connector, IAM/secrets, network, mapping/upsert, checkpoint/retry, and monitoring stack was not built or timed. Its unselected product is marked unpriced—not $0—and no speed margin, benchmark, savings, or full model-serving claim is made.'
-  }
-  if (isRoundFive(session)) {
-    return 'This is a declared-start readiness comparison, not a steady-state RDS Proxy benchmark. RDS Proxy is AWS best practice for connection spikes; if it is already deployed, its setup delay does not apply. Both lanes must pass the same 128-connection validation. Burst-performance superiority, sustained throughput, customer traffic, dollar savings, and a general benchmark are not claimed.'
-  }
-  if (isRoundSix(session)) {
-    return 'This proves one exact checkout order reached separate Delta history through Public Preview native CDF. A separate checkout committed as a correctness guardrail. The unselected AWS CDC stack is marked unpriced—not $0—and throughput, p99, zero impact, AWS speed, and savings are not claimed.'
-  }
-  if (session.round.id === 'wake_idle_app') {
-    return 'Only database wake and the tested transaction were measured; service recovery and customer experience were not tested.'
-  }
-  if (session.round.id === 'make_schema_change_safely') {
-    return 'Only the changed database contract and final configured-source check were tested; no customer-facing path was exercised.'
-  }
-  if (session.round.id === 'recover_deleted_order') {
-    return 'Only the run-owned synthetic order’s recovered read and configured-source absence were tested; service failover and customer SLOs were not.'
-  }
-  return 'This round is non-executable; it makes no measured comparison or persona claim.'
-}
-
 function priorityLabel(corners: CustomerCorner[]): string {
   return corners.map((corner) => corner.toUpperCase()).join(' + ')
 }
@@ -1569,13 +1227,6 @@ function proofNavigationAllowsExit(session: DemoSession): boolean {
   // cleanup task, releases its per-round lease, nor marks cleanup complete.
   // Declared and failed results retain their existing cleanup requirements.
   return session.state === 'towelled' || cleanupAllowsTerminalActions(session)
-}
-
-function roundSixElapsed(session: DemoSession): string {
-  const elapsed = metricValue(session, 'analytics_available_ms')?.value
-  return laneReceiptTime(
-    typeof elapsed === 'number' ? elapsed : session.lanes.lakebase.elapsed_ms,
-  )
 }
 
 function competitorReceiptValue(session: DemoSession): string {
@@ -1824,7 +1475,7 @@ function linkedInReceipt(session: DemoSession, roundNumber: number): string {
       '',
       `ROUND ${roundNumber} · ${session.round.title}`,
       'One live OLAP → OLTP proof: Analytics Delta → managed reverse ETL → operational Lakebase Postgres → exact app read.',
-      `Integrity · customer ${evidence.primaryKey} · risk score ${scoreText(evidence.score)} · model ${evidence.modelVersion} · Delta ${evidence.deltaVersion} · nonce ${evidence.proofNonce}`,
+      `Integrity · ${evidence.primaryKey} · risk score ${scoreText(evidence.score)} · model ${evidence.modelVersion} · Delta ${evidence.deltaVersion} · nonce ${evidence.proofNonce}`,
       '',
       'Aurora/RDS alone are OLTP sinks and do not move lakehouse data. The same outcome requires an added reverse-ETL stack with connectors, IAM/secrets, network access, mappings/upserts, checkpoints/retries, and monitoring.',
       'That added AWS stack was not built or timed; there is no honest AWS timer or speed margin.',
@@ -4742,6 +4393,8 @@ function RoundSixScene({
   const presentation = uiReview ? 'review' : session.state === 'towelled' ? 'towelled' : verified ? 'verified' : failed ? 'failed' : 'running'
   const terminal = verified || failed || session.state === 'towelled'
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
+  const ringsideOutcome = classifyRingsideOutcome(session)
+  const shareable = isShareableRingsideOutcome(ringsideOutcome)
 
   return (
     <>
@@ -4764,9 +4417,9 @@ function RoundSixScene({
             <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
             {terminal && proofNavigationAllowsExit(session) && <>
               {cleanupAllowsActions && <button type="button" className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
-              {cleanupAllowsActions && verified && <button type="button" className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
-              {cleanupAllowsActions && verified && <button type="button" className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
-              {cleanupAllowsActions && verified && <button type="button" className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
+              <button type="button" className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
+              {cleanupAllowsActions && shareable && <button type="button" className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
+              {cleanupAllowsActions && shareable && <button type="button" className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
               <button type="button" className="round4-next" onClick={onContinue}>A · {session.state === 'towelled' || hasNextRound ? 'Next round' : verified ? 'Next · Final recap' : 'Fight card'}</button>
             </>}
           </>
@@ -4883,6 +4536,8 @@ export function RoundFiveProof({
   const cleanupAbandoned = session.round5_setup?.cleanup_failure || null
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
   const hasComparison = roundFiveHasComparison(session)
+  const ringsideOutcome = classifyRingsideOutcome(session)
+  const shareable = isShareableRingsideOutcome(ringsideOutcome)
   const showCleanupFallback = cleanupRetryable
     && !session.towel
     && !uiReview
@@ -4899,7 +4554,7 @@ export function RoundFiveProof({
         <main className="proof-screen round5-arena" data-session-state={liveEvidenceInterrupted ? 'offline' : session.state}>
           <header className="proof-header">
             <HomeLogo className="home-logo-compact" onHome={onHome} />
-            <div>
+            <div className="proof-title">
               <p>
                 Round {roundNumber} · Pass/fail spike: {ROUND_FIVE_SCHEDULED_CLIENTS} fresh app connection attempts / lane · max {ROUND_FIVE_CONCURRENCY} at once · after {ROUND_FIVE_WARMUPS} untimed warmups
               </p>
@@ -4978,12 +4633,15 @@ export function RoundFiveProof({
                     B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
                   </button>
                 )}
-                {!uiReview && hasComparison && cleanupAllowsActions && (
+                {!uiReview && !cleanupAllowsActions && (
+                  <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
+                )}
+                {!uiReview && cleanupAllowsActions && (
                   <div className="proof-actions">
-                    <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>
+                    {shareable && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
                     <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
-                    <button className="proof-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>
-                    <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>
+                    {shareable && <button className="proof-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
+                    {shareable && <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
                     <button className="proof-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
                   </div>
                 )}
@@ -4997,6 +4655,7 @@ export function RoundFiveProof({
                 <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
                 {!uiReview && proofNavigationAllowsExit(session) && (
                   <div className="proof-actions">
+                    <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
                     <button type="button" className="proof-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
                   </div>
                 )}
@@ -5072,53 +4731,57 @@ export function RoundFiveProof({
         : `Lakebase and ${awsEngineName} are completing their setup workflows. Timing stops only after each exact transaction verifies.`
 
   return (
-    <main className="round5-screen" data-session-state={session.state} data-layout="compact">
-      <header className="round5-header">
-        <HomeLogo className="home-logo-compact" onHome={onHome} />
-        <div>
-          <p>Round {roundNumber} · Built-in pool · Added RDS Proxy</p>
-          <h1>{ROUND_FIVE_DISPLAY_TITLE}</h1>
-          <p className="round5-matchup"><strong>Lakebase</strong><span>vs</span><strong>{session.lanes.competitor.name}</strong></p>
-        </div>
-        <strong>{uiReview ? 'UI REVIEW' : cleanupFailed ? 'Backstage recovery' : stateLabel(session.state)}</strong>
-        <SoundToggle sound={sound} onToggle={onToggleSound} arena />
-      </header>
+    <>
+      <main className="round5-screen" data-session-state={session.state} data-layout="compact">
+        <header className="round5-header">
+          <HomeLogo className="home-logo-compact" onHome={onHome} />
+          <div>
+            <p>Round {roundNumber} · Built-in pool · Added RDS Proxy</p>
+            <h1>{ROUND_FIVE_DISPLAY_TITLE}</h1>
+            <p className="round5-matchup"><strong>Lakebase</strong><span>vs</span><strong>{session.lanes.competitor.name}</strong></p>
+          </div>
+          <strong>{uiReview ? 'UI REVIEW' : cleanupFailed ? 'Backstage recovery' : stateLabel(session.state)}</strong>
+          <SoundToggle sound={sound} onToggle={onToggleSound} arena />
+        </header>
 
-      <div className="round5-compact-body">
-          <section className="round5-result-card" aria-label="Round 5 setup status" role="status">
-            <p>PRIMARY SETUP RESULT</p>
-            <h2>{compactResult}</h2>
-            <p className="round5-result-reason">{compactReason}</p>
-            <details className="round5-technical-details">
-              <summary>Technical details</summary>
-              <dl>
-                <div><dt>Lakebase setup</dt><dd>{setupStateLabel(setupResults.lakebase)} · stop gate {setupResults.lakebase.stopGateExact ? 'exact' : 'not verified'}</dd></div>
-                <div><dt>{awsEngineName} setup</dt><dd>{setupStateLabel(setupResults.competitor)} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
-                <div><dt>Workflow launch skew</dt><dd>{setupSkew}</dd></div>
-              </dl>
-              <p>Lakebase uses its built-in pooled host. The AWS lane adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are required before the clock.</p>
-            </details>
-            <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
-            {!uiReview && (showCleanupFallback || (!cleanupFailed && terminal && cleanupAllowsActions)) && (
-              <div className="round5-compact-actions">
-                {showCleanupFallback && (
-                  <button
-                    className="round5-retry-cleanup"
-                    disabled={cleanupPending}
-                    onClick={onRetryCleanup}
-                  >
-                    B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
-                  </button>
-                )}
-                {!cleanupFailed && terminal && cleanupAllowsActions && (
-                  <button className="round5-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
-                )}
-              </div>
-            )}
-          </section>
-        </div>
-      <div className="proof-scanlines" aria-hidden="true" />
-    </main>
+        <div className="round5-compact-body">
+            <section className="round5-result-card" aria-label="Round 5 setup status" role="status">
+              <p>PRIMARY SETUP RESULT</p>
+              <h2>{compactResult}</h2>
+              <p className="round5-result-reason">{compactReason}</p>
+              <details className="round5-technical-details">
+                <summary>Technical details</summary>
+                <dl>
+                  <div><dt>Lakebase setup</dt><dd>{setupStateLabel(setupResults.lakebase)} · stop gate {setupResults.lakebase.stopGateExact ? 'exact' : 'not verified'}</dd></div>
+                  <div><dt>{awsEngineName} setup</dt><dd>{setupStateLabel(setupResults.competitor)} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
+                  <div><dt>Workflow launch skew</dt><dd>{setupSkew}</dd></div>
+                </dl>
+                <p>Lakebase uses its built-in pooled host. The AWS lane adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are required before the clock.</p>
+              </details>
+              <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
+              {!uiReview && (terminal || showCleanupFallback) && (
+                <div className="round5-compact-actions">
+                  {showCleanupFallback && (
+                    <button
+                      className="round5-retry-cleanup"
+                      disabled={cleanupPending}
+                      onClick={onRetryCleanup}
+                    >
+                      B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
+                    </button>
+                  )}
+                  <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
+                  {!cleanupFailed && terminal && cleanupAllowsActions && (
+                    <button className="round5-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
+                  )}
+                </div>
+              )}
+            </section>
+          </div>
+        <div className="proof-scanlines" aria-hidden="true" />
+      </main>
+      {showRingsideTake && <RingsideTake session={session} onClose={() => setShowRingsideTake(false)} />}
+    </>
   )
 }
 
@@ -5320,9 +4983,9 @@ function RoundFourProof({
     ? { ...session, lanes: redo.lanes, metrics: redo.metrics, comparison: redo.comparison ?? null, failure: redo.failure ?? null }
     : session
   const resultText = presentation === 'initial_verified'
-    ? `Verified: customer ${initialEvidence.primaryKey} risk score ${scoreText(initialEvidence.score)} reached the live app.`
+    ? `Verified: ${initialEvidence.primaryKey} risk score ${scoreText(initialEvidence.score)} reached the live app.`
     : presentation === 'redo_verified' && redoEvidence
-      ? `Verified again: customer ${redoEvidence.primaryKey} risk score changed ${scoreText(initialEvidence.score)} → ${scoreText(redoEvidence.score)} in the lakehouse and reached the live app.`
+      ? `Verified again: ${redoEvidence.primaryKey} risk score changed ${scoreText(initialEvidence.score)} → ${scoreText(redoEvidence.score)} in the lakehouse and reached the live app.`
       : presentation === 'redo_running'
         ? 'Changing the score in the lakehouse and watching the live app for the v2 update.'
       : presentation === 'initial_running'
@@ -5330,14 +4993,12 @@ function RoundFourProof({
           : presentation === 'initial_towelled'
             ? session.remembered_result ?? 'The bout was toweled at the server cutoff.'
           : 'No new live app update was verified.'
-  const shareable = presentation === 'initial_verified' || presentation === 'initial_towelled' || presentation === 'redo_verified' || presentation === 'redo_failed'
-  const capabilityVerified = presentation === 'initial_verified'
-    || (presentation === 'initial_towelled' && session.lanes.lakebase.state === 'verified')
-    || presentation === 'redo_verified'
-    || presentation === 'redo_failed'
   const resultSession: DemoSession = presentation === 'redo_verified' && redo
     ? { ...activeSession, state: 'verified', remembered_result: resultText }
     : { ...session, remembered_result: resultText }
+  const ringsideOutcome = classifyRingsideOutcome(resultSession)
+  const shareable = isShareableRingsideOutcome(ringsideOutcome)
+  const capabilityVerified = shareable
   const [showRingsideTake, setShowRingsideTake] = useState(false)
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
@@ -5431,7 +5092,7 @@ function RoundFourProof({
               </div>
             )}
             {cleanupAllowsActions && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
-            {cleanupAllowsActions && shareable && <button className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
+            <button className="round4-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
             {cleanupAllowsActions && shareable && <button className="round4-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
             {cleanupAllowsActions && shareable && <button className="round4-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
             <button type="button" className="round4-next" title={hasNextRound ? 'Continue to the next round' : 'Return to the fight card'} onClick={onContinue}>A · Next round</button>
@@ -5486,7 +5147,6 @@ function Proof({
   missedCalls?: number
 }) {
   const complete = session.state === 'verified' || session.state === 'towelled' || session.state === 'failed'
-  const successful = session.state === 'verified' || session.state === 'towelled'
   const failedOwnedArtifactRound = session.state === 'failed'
     && (session.round.id === 'make_schema_change_safely' || session.round.id === 'recover_deleted_order')
   const genericRedoAllowed = session.round.redo?.policy === 'show'
@@ -5499,6 +5159,8 @@ function Proof({
     && session.state === 'running'
     && !liveEvidenceConnected
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
+  const ringsideOutcome = classifyRingsideOutcome(session)
+  const shareable = isShareableRingsideOutcome(ringsideOutcome)
   const [showRingsideTake, setShowRingsideTake] = useState(false)
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
@@ -5507,7 +5169,7 @@ function Proof({
     <main className="proof-screen" data-session-state={liveEvidenceInterrupted ? 'offline' : session.state}>
       <header className="proof-header">
         <HomeLogo className="home-logo-compact" onHome={onHome} />
-        <div><p>Round {roundNumber} · Live competitive proof</p><h1>{task}</h1></div>
+        <div className="proof-title"><p>Round {roundNumber} · Live competitive proof</p><h1>{task}</h1></div>
         <div className="proof-state" data-state={liveEvidenceInterrupted ? 'offline' : session.state}>
           {uiReview ? 'UI review' : liveEvidenceInterrupted ? 'Proof paused · reconnecting' : stateLabel(session.state)}
         </div>
@@ -5554,7 +5216,7 @@ function Proof({
             receipt actions remain cleanup-gated. The strip therefore keeps its
             own "Explain" route until cleanup settles; Next is independently
             available from the shared terminal-navigation rule below. */}
-        {!uiReview && successful && session.remembered_result && (
+        {!uiReview && complete && (
           <RingsideMeanings
             session={session}
             onExplain={cleanupAllowsActions ? undefined : () => setShowRingsideTake(true)}
@@ -5588,9 +5250,9 @@ function Proof({
               </div>
             )}
             {cleanupAllowsActions && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
-            {cleanupAllowsActions && successful && <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
-            {cleanupAllowsActions && successful && <button className="proof-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
-            {cleanupAllowsActions && successful && <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
+            {cleanupAllowsActions && <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>}
+            {cleanupAllowsActions && shareable && <button className="proof-cost" onClick={() => setShowCostRoom(true)}>Select · What it cost</button>}
+            {cleanupAllowsActions && shareable && <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>}
             <button
               type="button"
               className="proof-next"
@@ -6216,6 +5878,10 @@ function InstantReplay({ session, roundNumber, onClose }: { session: DemoSession
             )
           })}
         </ol>
+        {isRoundFive(session) && session.state === 'verified' && (
+          <RoundFiveEvidenceDetails session={session} />
+        )}
+        <CapacityDisclosure session={session} />
         <dl className="replay-facts">
           <div><dt>Fair start</dt><dd>{fairnessCopy(session.round.id)}</dd></div>
           {untimedOpponent
@@ -6236,13 +5902,10 @@ function InstantReplay({ session, roundNumber, onClose }: { session: DemoSession
 /**
  * Who is at ringside, as a scoreboard strip rather than a briefing note.
  *
- * This used to carry a full prose sentence per persona from `ringsideSummary`
- * plus one per selected corner from `ringsidePriorityEvidence`. At the maximum
- * the setup flow allows -- a lead plus two lenses, three corners -- that is six
- * sentences, and it renders in `.proof-footer` on the screen a presenter is
- * talking over. None of it is lost: every one of those sentences is still
- * rendered, verbatim, by <RingsideTake> behind "Explain to the room", which
- * also adds the discovery question and the interpretation.
+ * The talk track belongs in <RingsideTake>; this strip only identifies who is
+ * in the room and which priorities they selected. Keeping the receipt out of
+ * the footer lets a presenter reveal it in the order they will actually speak:
+ * role, takeaway, stakes, question, proof, then boundary.
  *
  * `onExplain` is the way into that overlay, and it is only passed when the
  * screen's own actions row is suppressed -- see the call site. Without it there
@@ -6273,47 +5936,129 @@ function RingsideTake({ session, onClose }: { session: DemoSession; onClose: () 
   const personas = [session.primary_persona, ...session.secondary_personas]
   const [selectedId, setSelectedId] = useState<PersonaId>(session.primary_persona.id)
   const selected = personas.find((persona) => persona.id === selectedId) ?? personas[0]
-  const discoveryQuestion = selected.questions.why
-    ?? Object.values(selected.questions)[0]
-    ?? (selected.id === session.primary_persona.id
-      ? session.presenter_pack.discovery_question
-      : selected.presenter.opening)
-  const interpretation = ringsideMeaning(session, selected.id, selected.role)
-  const summary = ringsideSummary(session, selected.id)
-  const priorities = priorityLabel(session.corners)
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
+  const surfaceRef = useRef<HTMLElement | null>(null)
+  const openerRef = useRef<HTMLElement | null>(
+    typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null,
+  )
+  const closeRef = useRef(onClose)
+  const cue = buildRingsideCue(session, selected.id, priorityKeyFor(session.corners))
+  const selectedTabId = `ringside-persona-${selected.id}-tab`
+
+  useEffect(() => {
+    closeRef.current = onClose
+  }, [onClose])
+
+  useEffect(() => {
+    const surface = surfaceRef.current
+    if (!(surface instanceof HTMLElement)) return
+    const opener = openerRef.current
+    tabRefs.current[0]?.focus()
+
+    const focusables = () => Array.from(
+      surface.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    )
+    function keepFocusInside(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeRef.current()
+        return
+      }
+      if (event.key !== 'Tab') return
+      const nodes = focusables()
+      if (nodes.length === 0) return
+      const first = nodes[0]
+      const last = nodes[nodes.length - 1]
+      if (event.shiftKey && (document.activeElement === first || !surface?.contains(document.activeElement))) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && (document.activeElement === last || !surface?.contains(document.activeElement))) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    surface.addEventListener('keydown', keepFocusInside)
+    return () => {
+      surface.removeEventListener('keydown', keepFocusInside)
+      if (opener?.isConnected) opener.focus()
+    }
+  }, [])
+
+  const selectTabFromKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex: number | null = null
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') nextIndex = (index + 1) % personas.length
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') nextIndex = (index - 1 + personas.length) % personas.length
+    if (event.key === 'Home') nextIndex = 0
+    if (event.key === 'End') nextIndex = personas.length - 1
+    if (nextIndex === null) return
+    event.preventDefault()
+    setSelectedId(personas[nextIndex].id)
+    tabRefs.current[nextIndex]?.focus()
+  }
   return (
     <div className="ringside-overlay" role="presentation" onClick={onClose}>
-      <section className="ringside-take" role="dialog" aria-modal="true" aria-labelledby="ringside-take-heading" onClick={(event) => event.stopPropagation()}>
+      <section
+        ref={surfaceRef}
+        className="ringside-take"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="ringside-take-heading"
+        onClick={(event) => event.stopPropagation()}
+      >
         <header>
-          <div><p>Explain to the room</p><h2 id="ringside-take-heading">Make the result matter.</h2></div>
-          <span>Same proof · Their value</span>
+          <div className="ringside-persona-identity">
+            <img src={personaPortraits[selected.id] ?? selected.portrait} alt="" />
+            <div>
+              <h2 id="ringside-take-heading">For the {selected.role}</h2>
+              <small>AKA {selected.nickname}</small>
+            </div>
+          </div>
+          <div className="ringside-priority-chips" aria-label="Room priorities">
+            {session.corners.map((corner) => <span key={corner}>{corner}</span>)}
+          </div>
         </header>
-        <nav aria-label="Selected ringside stakeholder">
+        <nav role="tablist" aria-label="People in the room">
           {personas.map((persona, index) => (
-            <button aria-pressed={selected.id === persona.id} key={persona.id} onClick={() => setSelectedId(persona.id)}>
-              <img src={personaPortraits[persona.id] ?? persona.portrait} alt="" />
-              <span>{index === 0 ? 'Lead' : 'Lens'} · {persona.role}</span>
-              <strong>{persona.nickname}</strong>
+            <button
+              ref={(node) => { tabRefs.current[index] = node }}
+              id={`ringside-persona-${persona.id}-tab`}
+              role="tab"
+              type="button"
+              aria-selected={selected.id === persona.id}
+              aria-controls="ringside-persona-panel"
+              tabIndex={selected.id === persona.id ? 0 : -1}
+              key={persona.id}
+              onClick={() => setSelectedId(persona.id)}
+              onKeyDown={(event) => selectTabFromKeyboard(event, index)}
+            >
+              {persona.role}
             </button>
           ))}
         </nav>
-        <div className="ringside-result"><span>Focus · {priorities} · One-line takeaway for the {selected.role}</span><p>{summary}</p></div>
-        <div className="ringside-script">
-          <div><span>Proof behind it</span><p>{interpretation}</p></div>
-          <div>
-            <span>Shared exact proof</span>
-            <ul>{session.corners.map((corner) => <li key={corner}><strong>{corner}</strong>{ringsidePriorityEvidence(session, corner)}</li>)}</ul>
-          </div>
-          <div><span>Ask them</span><p>{discoveryQuestion}</p></div>
-          <div><span>What this does not claim</span><p>{roundClaimBoundary(session)}</p></div>
+        <div
+          id="ringside-persona-panel"
+          className="ringside-persona-panel"
+          role="tabpanel"
+          aria-labelledby={selectedTabId}
+        >
+          <section className="ringside-cue ringside-say">
+            <h3>What this means</h3>
+            <p>{cue.say}</p>
+          </section>
+          <section className="ringside-cue ringside-ask">
+            <h3>Question for the room</h3>
+            <p>{cue.ask}</p>
+          </section>
+          <section className="ringside-cue ringside-show">
+            <h3>What we proved</h3>
+            <p>{cue.show}</p>
+          </section>
         </div>
-        {isRoundFive(session) && session.state === 'verified' && <RoundFiveEvidenceDetails session={session} />}
-        <CapacityDisclosure session={session} />
-        <DescentCostDisclosure session={session} />
-        <BoutCostDisclosure session={session} />
-        <StandingCostDisclosure session={session} />
-        <CostReceiptDisclosure session={session} />
-        <button className="ringside-close" onClick={onClose}>B · Back to the ring</button>
+        <button type="button" className="ringside-close" onClick={onClose}>B · Back to the ring</button>
       </section>
     </div>
   )
@@ -6340,12 +6085,10 @@ const COST_ROOM_EVIDENCE: Record<StandingLane['evidence'], string> = {
 /**
  * The cost view behind "What it cost", composed rather than authored.
  *
- * Every panel below the strip already existed and already rendered -- inside
- * <RingsideTake>, behind a button about persona framing. The cost was real,
- * computed and effectively hidden, so this overlay is those same components in
- * a frame of their own: a question about money now has a door with money
- * written on it. Nothing here re-derives a figure, and there is deliberately no
- * second copy of any panel's markup.
+ * Every panel below the strip has one evidence destination here. Explain to the
+ * Room deliberately renders none of them: a question about money has a door
+ * with money written on it, while the presenter cue stays SAY / ASK / SHOW.
+ * Nothing here re-derives a figure.
  *
  * The idle strip is the only new rendering and it invents nothing. Each lane's
  * product, `idle_label`, figure and `evidence` come straight off
@@ -6359,15 +6102,9 @@ const COST_ROOM_EVIDENCE: Record<StandingLane['evidence'], string> = {
  * A lane whose figure is `unavailable` prints the word, never a number, and
  * never a zero -- the same rule the panels below it follow.
  *
- * The standing-cost panel is deliberately not among the panels here. It is
- * pinned by standing-cost.test.tsx to exactly one render site, inside
- * <RingsideTake>, so that a claim needed by three rounds cannot be wired up
- * three times and drift. The strip above reads the same `standing_cost`
- * payload for the same three engine lanes -- one shared `NAMED_ENGINE_LANES`, so
- * the two surfaces cannot disagree about which three those are -- and the full
- * six-lane table, the neutral runner and the Databricks platform included,
- * without which the totals do not reconcile, stays one click away under
- * "Explain to the room" and then one more inside that panel's own remainder.
+ * The standing-cost panel is pinned to exactly one render site here, so its
+ * six-lane table cannot drift across rounds. The strip and disclosure read the
+ * same payload and share `NAMED_ENGINE_LANES`.
  */
 export function CostRoom({ session, onClose }: { session: DemoSession; onClose: () => void }) {
   const lanes = session.standing_cost?.lanes ?? []
@@ -6408,6 +6145,7 @@ export function CostRoom({ session, onClose }: { session: DemoSession; onClose: 
         )}
         <DescentCostDisclosure session={session} />
         <BoutCostDisclosure session={session} />
+        <StandingCostDisclosure session={session} />
         <CostReceiptDisclosure session={session} />
         <button className="cost-room-close" onClick={onClose}>B · Back to the ring</button>
       </section>
