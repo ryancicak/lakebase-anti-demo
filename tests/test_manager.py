@@ -5126,7 +5126,8 @@ async def test_completed_round_two_cleanup_is_idempotent_and_consumes_no_new_fen
 
 
 async def test_only_one_session_can_own_the_ring_at_a_time() -> None:
-    manager = RunManager(resolver=FakeResolver(), verifier=make_verifier())
+    manager = RunManager(resolver=SequencedCooldownResolver(), verifier=make_verifier())
+    manager._arm_poll = 0.001
     request = SessionCreate(
         competitor=CompetitorId.AURORA_SERVERLESS_V2,
         primary_persona="sre",
@@ -5154,6 +5155,10 @@ async def test_only_one_session_can_own_the_ring_at_a_time() -> None:
 
     await manager.start_run(first.id)
     await wait_for_state(manager, first.id, SessionState.VERIFIED)
+    cleanup = await manager.bout_status()
+    assert cleanup.active is True
+    assert cleanup.phase == "cooldown"
+    await drain_record_operations(manager, manager._records[first.id])
     assert (await manager.bout_status()).active is False
     checking = await manager.start_arm(second.id)
 
@@ -5285,10 +5290,11 @@ async def test_v7_round_five_status_includes_its_lingering_cleanup_only() -> Non
 async def test_separate_app_replicas_share_one_visible_ring_lease() -> None:
     lease_store = InMemoryBoutLeaseStore()
     first_replica = RunManager(
-        resolver=FakeResolver(),
+        resolver=SequencedCooldownResolver(),
         verifier=make_verifier(),
         lease_store=lease_store,
     )
+    first_replica._arm_poll = 0.001
     second_replica = RunManager(
         resolver=FakeResolver(),
         verifier=make_verifier(),
@@ -5332,6 +5338,10 @@ async def test_separate_app_replicas_share_one_visible_ring_lease() -> None:
 
     await first_replica.start_run(first.id, owner)
     await wait_for_state(first_replica, first.id, SessionState.VERIFIED)
+    cleanup_from_other_replica = await second_replica.bout_status()
+    assert cleanup_from_other_replica.active is True
+    assert cleanup_from_other_replica.phase == "cooldown"
+    await drain_record_operations(first_replica, first_replica._records[first.id])
     assert (await second_replica.bout_status()).active is False
 
 
