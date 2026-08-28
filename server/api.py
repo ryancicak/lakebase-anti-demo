@@ -5,7 +5,7 @@ import logging
 import os
 from collections.abc import Awaitable
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -27,9 +27,13 @@ from .manifest import (
     LOCAL_OPERATOR_ID_ENV,
 )
 from .models import (
+    AllBoutStatus,
+    Availability,
     BoutOperator,
     BoutStatus,
     CatalogResponse,
+    FightCardRoundStatus,
+    FightCardState,
     RoundId,
     SessionCreate,
     SessionSnapshot,
@@ -43,6 +47,42 @@ logger = logging.getLogger(__name__)
 _CONTROL_UNAVAILABLE = (
     "Ring state is temporarily unavailable. Refresh before retrying this action."
 )
+_CLEANUP_PHASES = frozenset(
+    {
+        "cooldown",
+        "towel_cleanup",
+        "cleanup_retry",
+        "round5_cleanup",
+        "round5_cleanup_recovery",
+        "startup_cleanup",
+    }
+)
+_CLEANUP_DETAIL = {
+    RoundId.WAKE_IDLE_APP: (
+        "This round will reopen when both corners return to the required idle state. "
+        "Other rounds remain available."
+    ),
+    RoundId.MAKE_SCHEMA_CHANGE_SAFELY: (
+        "This round will reopen when both isolated environments are confirmed deleted. "
+        "Other rounds remain available."
+    ),
+    RoundId.RECOVER_DELETED_ORDER: (
+        "This round will reopen when both recovery environments are confirmed deleted. "
+        "Other rounds remain available."
+    ),
+    RoundId.PUT_MODEL_SCORE_IN_APP: (
+        "This round will reopen when its current cleanup finishes. "
+        "Other rounds remain available."
+    ),
+    RoundId.SURVIVE_CONNECTION_SPIKE: (
+        "Round 5 will reopen automatically when its Proxy and security group are "
+        "confirmed deleted. Other rounds remain available."
+    ),
+    RoundId.ANALYZE_LIVE_ORDERS: (
+        "This round will reopen when its current cleanup finishes. "
+        "Other rounds remain available."
+    ),
+}
 
 
 def manager(request: Request) -> RunManager:
@@ -203,11 +243,23 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
     # life, which is when somebody is most likely to be loading the screen.
     status_now = getattr(gate, "status", None)
     round5_status = getattr(gate, "round5_status", None)
+    round5_reason_code = getattr(round5_status, "reason_code", None)
+    if (
+        round5_reason_code is None
+        and getattr(round5_status, "maintenance_state", None) == "maintenance"
+    ):
+        # The readiness reconciler is replica-local and can observe the durable
+        # cleanup phase one poll after the result publisher. Maintenance without
+        # a durable blocked verdict is conservatively cleanup, never generic
+        # UNAVAILABLE. A live lease still outranks this as BOUT IN PROGRESS in
+        # the all-round endpoint.
+        round5_reason_code = "cleanup_in_progress"
     return replace(
         signals,
         ring_ready=bool(getattr(status_now, "ring_ready", False)),
         ring_detail=getattr(status_now, "maintenance_detail", None),
         round5_ring_ready=bool(getattr(round5_status, "ring_ready", False)),
+        round5_reason_code=round5_reason_code,
         round5_detail=getattr(round5_status, "maintenance_detail", None),
     )
 
@@ -230,6 +282,72 @@ async def get_catalog(request: Request) -> CatalogResponse:
             )
         }
     )
+
+
+def _fight_card_round_status(
+    round_id: RoundId,
+    availability: object,
+    bout: BoutStatus,
+) -> FightCardRoundStatus:
+    active_phase = bout.phase if bout.active else None
+    if bout.active and active_phase in _CLEANUP_PHASES:
+        state = FightCardState.CLEANUP_IN_PROGRESS
+        detail = _CLEANUP_DETAIL[round_id]
+    elif bout.active:
+        state = FightCardState.BOUT_IN_PROGRESS
+        detail = "BOUT IN PROGRESS · This round is already in use. Other rounds remain available."
+    elif getattr(availability, "availability_reason_code", None) == "cleanup_in_progress":
+        state = FightCardState.CLEANUP_IN_PROGRESS
+        detail = _CLEANUP_DETAIL[round_id]
+    elif (
+        getattr(availability, "availability", None) != Availability.READY
+        or not bout.can_start
+    ):
+        state = FightCardState.UNAVAILABLE
+        detail = (
+            getattr(availability, "availability_headline", None)
+            or "This round is unavailable right now."
+        )
+    else:
+        state = FightCardState.READY
+        detail = None
+    return FightCardRoundStatus(
+        round_id=round_id,
+        state=state,
+        can_start=state == FightCardState.READY,
+        active_phase=active_phase,
+        detail=detail,
+        updated_at=bout.updated_at,
+        expires_at=bout.expires_at,
+    )
+
+
+@router.get("/bout/all", response_model=AllBoutStatus)
+async def get_all_bout_statuses(request: Request) -> AllBoutStatus:
+    """Return the six fight-card states without exposing lease ownership."""
+
+    try:
+        run_manager = manager(request)
+        bouts = await run_manager.all_bout_statuses()
+        live_catalog = await get_catalog(request)
+        availability = {item.id: item for item in live_catalog.rounds}
+        return AllBoutStatus(
+            rounds={
+                round_id: _fight_card_round_status(
+                    round_id,
+                    availability[round_id],
+                    bouts[round_id],
+                )
+                for round_id in RoundId
+            },
+            updated_at=datetime.now(UTC),
+        )
+    except Exception as exc:
+        logger.error("All-round status lookup failed: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_CONTROL_UNAVAILABLE,
+        ) from exc
 
 
 @router.get("/bout", response_model=BoutStatus)

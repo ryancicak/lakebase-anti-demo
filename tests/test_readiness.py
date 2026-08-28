@@ -226,6 +226,7 @@ async def test_busy_round5_lease_does_not_block_main_readiness() -> None:
         assert gate.status.ring_ready is True
         assert gate.round5_status.ring_ready is False
         assert gate.round5_status.maintenance_state == "maintenance"
+        assert gate.round5_status.reason_code == "cleanup_in_progress"
         gate.require_ready()
         with pytest.raises(InvalidStateError, match="BACKSTAGE CLEANUP"):
             gate.require_round5_ready()
@@ -313,6 +314,7 @@ async def test_round5_monitor_reconciles_old_bout_after_active_lease_releases(
         assert reconciled[0][1] > active.fencing_token
         assert gate.status.ring_ready is True
         assert gate.round5_status.ring_ready is True
+        assert gate.round5_status.reason_code is None
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -561,18 +563,22 @@ async def test_settled_round5_reconciler_wakes_on_demand_to_clean_a_late_failure
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_bout_status_exposes_gate_without_running_cleanup() -> None:
+async def test_bout_status_combines_durable_ring_with_cached_gate() -> None:
     status = SimpleNamespace(
         ring_ready=False,
         maintenance_state="maintenance",
         maintenance_detail=MAINTENANCE_COPY,
     )
-    class NoViewerDatabaseReads(DurableFakeLeaseStore):
-        async def current(self):
-            raise AssertionError("viewer polling must use the readiness cache")
+    class CountedViewerDatabaseReads(DurableFakeLeaseStore):
+        reads = 0
 
+        async def current(self):
+            self.reads += 1
+            return None
+
+    lease_store = CountedViewerDatabaseReads()
     manager = RunManager(
-        lease_store=NoViewerDatabaseReads(),
+        lease_store=lease_store,
         readiness_status=lambda: status,
     )
 
@@ -581,6 +587,7 @@ async def test_bout_status_exposes_gate_without_running_cleanup() -> None:
     assert bout.ring_ready is False
     assert bout.maintenance_state == "maintenance"
     assert bout.maintenance_detail == MAINTENANCE_COPY
+    assert lease_store.reads == 1
 
 
 # ---------------------------------------------------------------------------

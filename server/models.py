@@ -77,6 +77,32 @@ class BoutStatus(BaseModel):
     competitor: str | None = None
 
 
+class FightCardState(StrEnum):
+    READY = "ready"
+    BOUT_IN_PROGRESS = "bout_in_progress"
+    CLEANUP_IN_PROGRESS = "cleanup_in_progress"
+    UNAVAILABLE = "unavailable"
+
+
+class FightCardRoundStatus(BaseModel):
+    """Sanitized shared state for one tile on the six-round fight card."""
+
+    round_id: RoundId
+    state: FightCardState
+    can_start: bool
+    active_phase: str | None = None
+    detail: str | None = None
+    updated_at: datetime | None = None
+    expires_at: datetime | None = None
+
+
+class AllBoutStatus(BaseModel):
+    """One bounded observation of every round ring."""
+
+    rounds: dict[RoundId, FightCardRoundStatus]
+    updated_at: datetime
+
+
 class LaneState(StrEnum):
     SEALED = "sealed"
     CONNECTING = "connecting"
@@ -241,6 +267,15 @@ class RoundDefinition(BaseModel):
     scorecard_by_corner: dict[Corner, str]
     competitors: list[CompetitorId]
     availability: Availability
+    #: Machine-readable context for a live refusal that is expected to clear
+    #: without operator action. The refusal copy remains present for older
+    #: clients and diagnostics; new clients branch on this field, never on the
+    #: prose. Absent for every durable configuration, credential, permission,
+    #: and health failure.
+    availability_reason_code: Literal["cleanup_in_progress"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     #: Why this round cannot be offered, when it cannot. Set for exactly the
     #: `UNAVAILABLE` rounds: "not ready" with no reason is barely better than a
     #: wrong "ready", because neither tells an operator what to do about it.

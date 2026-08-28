@@ -72,6 +72,7 @@ class ReadinessStatus:
     ring_ready: bool
     maintenance_state: Literal["ready", "maintenance", "blocked"]
     maintenance_detail: str | None
+    reason_code: Literal["cleanup_in_progress"] | None = None
 
 
 @dataclass(frozen=True)
@@ -536,8 +537,18 @@ class ShowtimeReadinessGate:
     def _blocked(self, detail: str) -> None:
         self._status = ReadinessStatus(False, "blocked", detail)
 
-    def _round5_maintenance(self, detail: str = MAINTENANCE_COPY) -> None:
-        self._round5_status = ReadinessStatus(False, "maintenance", detail)
+    def _round5_maintenance(
+        self,
+        detail: str = MAINTENANCE_COPY,
+        *,
+        reason_code: Literal["cleanup_in_progress"] | None = "cleanup_in_progress",
+    ) -> None:
+        self._round5_status = ReadinessStatus(
+            False,
+            "maintenance",
+            detail,
+            reason_code,
+        )
 
     def _round5_ready(self) -> None:
         self._round5_status = ReadinessStatus(True, "ready", None)
@@ -911,7 +922,14 @@ class ShowtimeReadinessGate:
 
         active = await lease_store.current()
         if active is not None:
-            self._round5_maintenance()
+            cleanup_phase = active.phase in {
+                "cleanup_retry",
+                "round5_cleanup",
+                "round5_cleanup_recovery",
+            }
+            self._round5_maintenance(
+                reason_code="cleanup_in_progress" if cleanup_phase else None
+            )
             return False
 
         bouts = await self._unresolved_round5_bouts(journal)

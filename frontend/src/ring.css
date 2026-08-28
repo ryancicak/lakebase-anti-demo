@@ -439,6 +439,9 @@ html:has(.game-screen[data-scene="card"]) #root {
   font: inherit; cursor: pointer;
 }
 .ring-key:hover { color: var(--cream); background: #182356; border-color: var(--blue); }
+.ring-key:disabled { cursor: not-allowed; color: #66729f; background: #0b112a; border-color: #252e56; }
+.ring-key:disabled:hover { color: #66729f; background: #0b112a; border-color: #252e56; }
+.ring-key:disabled .ring-key-t { color: #9aa4c8; }
 .ring-key:focus-visible { outline: 4px solid var(--yellow); outline-offset: 3px; }
 .ring-key-n { grid-row: 1 / 3; align-self: start; color: var(--cream); font-size: clamp(12px, 1.2vw, 22px); line-height: 1.05; }
 /* Titles wrap at word boundaries and never mid-word; a sheared word reads as a
@@ -460,7 +463,8 @@ html:has(.game-screen[data-scene="card"]) #root {
 .ring-key[data-lane="untimed"] .ring-key-l, .ring-key[data-lane="none"] .ring-key-l { color: var(--yellow); }
 /* Availability is the backend's answer and it outranks the artwork. A round
    the ring says is not ready must never read as ready. */
-.ring-key-a { grid-column: 2; justify-self: start; padding: .2em .5em; background: var(--red); color: var(--cream); font-size: var(--t-meta); letter-spacing: .14em; text-transform: uppercase; }
+.ring-key-a { grid-column: 2; max-width: 100%; justify-self: start; padding: .2em .5em; background: var(--red); color: var(--cream); font-size: var(--t-meta); line-height: 1.4; letter-spacing: .14em; overflow-wrap: anywhere; text-transform: uppercase; }
+.ring-key-a[data-state="cleanup"] { background: var(--yellow); color: #070c22; }
 /* SELECTION: A YELLOW EDGE, NOT A YELLOW BLOCK.
    The previous rule filled the tile with `--yellow` and set the text to
    `var(--deep)` -- a custom property that is defined nowhere in this codebase.
@@ -492,11 +496,20 @@ html:has(.game-screen[data-scene="card"]) #root {
    about 11:1, red about 4:1, and legibility outranks the colour cue on text.
    The lamp is an 8px block with no glyphs, so it can carry the cue for free.
 
-   BOTH SELECTORS, and neither is redundant. A busy tile is always the selected
-   one, so the rule has to beat `[aria-current="true"][data-lane="none"] i`
-   above -- which carries one more attribute than a lone `[data-busy]` would. */
+   BOTH SELECTORS, and neither is redundant. An active tile may be unselected;
+   when it is selected, the rule still has to beat
+   `[aria-current="true"][data-lane="none"] i` above -- which carries one more
+   attribute than a lone `[data-busy]` would. */
 .ring-key[data-busy="true"] i,
 .ring-key[aria-current="true"][data-busy="true"] i { border-color: var(--red); background: var(--red); }
+/* Disabled is an interaction state, not a visibility state. The generic
+   disabled colour made an unselected bout marker effectively disappear at
+   presentation size; selecting the tile happened to turn it yellow. Keep the
+   on-air words at the same high-contrast yellow whether selected or not. */
+.ring-key[data-busy="true"] .ring-key-l,
+.ring-key[aria-current="true"][data-busy="true"] .ring-key-l { color: var(--yellow); }
+.ring-key[data-cleanup="true"] i,
+.ring-key[aria-current="true"][data-cleanup="true"] i { border-color: var(--yellow); background: var(--yellow); }
 
 .ring-refusal { grid-column: 1 / -1; padding: clamp(8px, 1vw, 14px) 0; }
 
@@ -530,6 +543,12 @@ html:has(.game-screen[data-scene="card"]) #root {
   .ring-cell { border-left: 0; }
   .ring-cell + .ring-cell { border-top: 2px solid #131c44; }
   .ring-keys { grid-template-columns: minmax(0, 1fr); }
+  .ring-identity { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); }
+  .ring-identity li[data-corner="blue"] { min-width: 0; }
+  .ring-pick { flex: 1 1 auto; width: auto; }
+  .ring-picker { width: 100%; min-width: 0; }
+  .ring-who { flex: 1 1 0; padding-inline: .35em; }
+  .ring-nudge { flex: 0 0 17px; width: 17px; }
 }
 
 /* ========================== reduced motion ==========================

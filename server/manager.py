@@ -2481,13 +2481,6 @@ class RunManager:
             "scope": "round" if scoped_round is not None else "global",
             "round_id": scoped_round,
         }
-        if readiness is not None and not readiness.ring_ready:
-            return BoutStatus(
-                active=False,
-                can_start=False,
-                **status_scope,
-                **readiness_fields,
-            )
         store = (
             self._lease_store_for_round(scoped_round)
             if scoped_round is not None
@@ -2496,27 +2489,46 @@ class RunManager:
         lease = await store.current()
         if scoped_round == RoundId.SURVIVE_CONNECTION_SPIKE and lease is None:
             lease = await self._round5_cleanup_store().current()
-        if lease is None:
+        if lease is not None:
+            # A real lease outranks a replica-local readiness cache. This matters
+            # most for Round 5: its reconciler deliberately marks the artifact
+            # ring unready while a bout owns it, but the fight card must still say
+            # BOUT IN PROGRESS rather than hiding another viewer's active bout
+            # behind generic maintenance.
             return BoutStatus(
-                active=False,
-                can_start=True,
                 **status_scope,
                 **readiness_fields,
+                active=True,
+                can_start=False,
+                operator=lease.operator,
+                started_at=lease.started_at,
+                updated_at=lease.updated_at,
+                expires_at=lease.expires_at,
+                phase=lease.phase,
+                state=lease.session_state,
+                round_title=lease.round_title,
+                competitor=lease.competitor_name,
             )
         return BoutStatus(
+            active=False,
+            can_start=bool(readiness is None or readiness.ring_ready),
             **status_scope,
             **readiness_fields,
-            active=True,
-            can_start=False,
-            operator=lease.operator,
-            started_at=lease.started_at,
-            updated_at=lease.updated_at,
-            expires_at=lease.expires_at,
-            phase=lease.phase,
-            state=lease.session_state,
-            round_title=lease.round_title,
-            competitor=lease.competitor_name,
         )
+
+    async def all_bout_statuses(self) -> dict[RoundId, BoutStatus]:
+        """Observe all six round rings through one bounded manager call.
+
+        The bound is structural: six enum members, with Round 5 allowed one
+        additional cleanup-ring read inside ``bout_status``. Reads run
+        concurrently so this endpoint does not turn six independent network
+        latencies into one long serial wait.
+        """
+
+        statuses = await asyncio.gather(
+            *(self.bout_status(round_id=round_id) for round_id in RoundId)
+        )
+        return dict(zip(RoundId, statuses, strict=True))
 
     def _every_ring_store(self) -> tuple[BoutLeaseStore, ...]:
         """Every ring this installation can hold a bout on.
@@ -3385,10 +3397,23 @@ class RunManager:
         ):
             ttl_seconds = (
                 self._running_lease_ttl
-                if lease.phase in {"run_committed", "redo_committed", "towel_cleanup"}
+                if lease.phase in {
+                    "run_committed",
+                    "redo_committed",
+                    "towel_cleanup",
+                    "cooldown",
+                }
                 or lease.phase == "cleanup_retry"
                 else self._active_lease_ttl
             )
+            if (
+                lease.phase == "cooldown"
+                and record.snapshot.round.id == RoundId.WAKE_IDLE_APP
+            ):
+                ttl_seconds = max(
+                    ttl_seconds,
+                    self._cooldown_timeout + self._active_lease_ttl,
+                )
             self._start_lease_heartbeat(record, timedelta(seconds=ttl_seconds))
         return False
 
@@ -3668,6 +3693,17 @@ class RunManager:
         record: SessionRecord,
         session_state: SessionState,
     ) -> None:
+        cleanup_ttl_seconds = self._running_lease_ttl
+        if record.snapshot.round.id == RoundId.WAKE_IDLE_APP:
+            # Aurora's configured auto-pause floor can outlive the ordinary
+            # 90-second running lease. A replica restart stops the in-process
+            # watcher, so the durable cleanup fence must itself span the whole
+            # observation window; otherwise the board turns green early and the
+            # next arm rediscovers the hidden wait.
+            cleanup_ttl_seconds = max(
+                cleanup_ttl_seconds,
+                self._cooldown_timeout + self._active_lease_ttl,
+            )
         async with record.lease_lock:
             lease = record.lease
             if lease is None or lease.session_id != record.snapshot.id:
@@ -3679,13 +3715,13 @@ class RunManager:
                     expected_phase="run_committed",
                     phase="cooldown",
                     session_state=session_state,
-                    ttl=timedelta(seconds=self._running_lease_ttl),
+                    ttl=timedelta(seconds=cleanup_ttl_seconds),
                 )
             except LeaseLostError as exc:
                 raise InvalidStateError("RING LEASE CHANGED · CLEANUP REMAINS FENCED") from exc
         self._start_lease_heartbeat(
             record,
-            timedelta(seconds=self._running_lease_ttl),
+            timedelta(seconds=cleanup_ttl_seconds),
         )
 
     def _schedule_round_settlement(
@@ -3881,6 +3917,18 @@ class RunManager:
         try:
             await asyncio.sleep(0)
             await self._monitor_cooldown(record)
+            async with record.lock:
+                cooldown = record.snapshot.cooldown
+                ready = bool(cooldown is not None and cooldown.state == CooldownState.READY)
+            if ready and not await self._release_bout(record):
+                async with record.lock:
+                    cooldown = record.snapshot.cooldown
+                    if cooldown is not None:
+                        cooldown.state = CooldownState.FAILED
+                        cooldown.failure = (
+                            "Return to idle was verified, but ring release could not be confirmed."
+                        )
+                        record.snapshot.updated_at = datetime.now(UTC)
         except asyncio.CancelledError:
             raise
         finally:
@@ -5462,6 +5510,20 @@ class RunManager:
                 )
             record.armed_at_monotonic = None
             record.connection_spike_setup_result = None
+            try:
+                # Publish the verdict only after the durable main-ring phase says
+                # cleanup. The Round 5 readiness reconciler may need one poll to
+                # observe its separate artifact lease; this fence makes every
+                # intermediate all-round snapshot conservatively CLEANUP rather
+                # than BOUT or generic UNAVAILABLE.
+                await self._transition_bout_to_cleanup(record, record.snapshot.state)
+            except InvalidStateError:
+                logger.error(
+                    "Round 5 result reached terminal state before its cleanup phase "
+                    "could be durably published session=%s",
+                    record.snapshot.id,
+                    exc_info=True,
+                )
             snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
             "run_finished",
@@ -5517,6 +5579,15 @@ class RunManager:
                 lane.error = record.snapshot.failure
                 lane.activity = LaneActivity(
                     phase="cleanup_failed" if not cleanup_verified else "failed"
+                )
+            try:
+                await self._transition_bout_to_cleanup(record, record.snapshot.state)
+            except InvalidStateError:
+                logger.error(
+                    "Round 5 failure reached terminal state before its cleanup phase "
+                    "could be durably published session=%s",
+                    record.snapshot.id,
+                    exc_info=True,
                 )
             snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
@@ -7105,10 +7176,9 @@ class RunManager:
             self._schedule_owned_artifact_cleanup(record, recovery=False)
 
     async def _finish(self, record: SessionRecord, result: VerificationResult) -> None:
+        cleanup_owned = False
         async with record.lock:
             if record.snapshot.towel is not None:
-                return
-            if not await self._confirm_terminal_release(record):
                 return
             record.snapshot.fairness = FairnessSnapshot(launch_skew_ms=result.launch_skew_ms)
             for lane_id, lane_result in result.lanes.items():
@@ -7149,10 +7219,29 @@ class RunManager:
                 else:
                     record.snapshot.failure = "One or more lanes could not be verified."
                 self._log_lane_refusals(record, round_number=1)
-            record.snapshot.cooldown = self._new_cooldown(
-                record,
-                ResetMode.RETURN_TO_IDLE,
-            )
+            try:
+                # The verdict ends the timed bout, but not the round's ownership.
+                # Keep the same durable fence in a cleanup phase until both
+                # control planes prove zero. Releasing here was the hidden-wait
+                # defect: every viewer saw READY while the next arm was forced to
+                # rediscover Aurora's auto-pause floor.
+                await self._transition_bout_to_cleanup(record, record.snapshot.state)
+            except InvalidStateError as exc:
+                logger.error(
+                    "Round 1 result verified but cleanup fence was lost session=%s: %s",
+                    record.snapshot.id,
+                    type(exc).__name__,
+                )
+                cooldown = self._new_cooldown(record, ResetMode.RETURN_TO_IDLE)
+                cooldown.state = CooldownState.FAILED
+                cooldown.failure = "Automatic return-to-idle cleanup lost its ring fence"
+                record.snapshot.cooldown = cooldown
+            else:
+                record.snapshot.cooldown = self._new_cooldown(
+                    record,
+                    ResetMode.RETURN_TO_IDLE,
+                )
+                cleanup_owned = True
             record.snapshot.updated_at = datetime.now(UTC)
             record.armed_at_monotonic = None
             snapshot = record.snapshot.model_copy(deep=True)
@@ -7160,7 +7249,8 @@ class RunManager:
             "run_finished",
             {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
         )
-        self._schedule_round_one_cooldown(record)
+        if cleanup_owned:
+            self._schedule_round_one_cooldown(record)
 
     @staticmethod
     def _new_towel_cooldown(record: SessionRecord) -> CooldownSnapshot:

@@ -285,6 +285,7 @@ class AvailabilitySignals:
     ring_ready: bool = True
     ring_detail: str | None = None
     round5_ring_ready: bool = True
+    round5_reason_code: str | None = None
     round5_detail: str | None = None
     #: A `server.aws_credential_probe.CredentialVerdict`, or None when this
     #: process runs no probe. Typed loosely to keep this module importable
@@ -347,6 +348,7 @@ class RoundRefusal:
 
     headline: str
     detail: str
+    reason_code: str | None = None
 
 
 def _credential_state(signals: AvailabilitySignals) -> str | None:
@@ -470,6 +472,11 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
             return RoundRefusal(
                 _ROUND5_RING_HEADLINE,
                 signals.round5_detail or _ROUND5_UNSETTLED_REFUSAL,
+                (
+                    "cleanup_in_progress"
+                    if signals.round5_reason_code == "cleanup_in_progress"
+                    else None
+                ),
             )
 
     presence = signals.presence
@@ -522,6 +529,9 @@ def apply(
             item.model_copy(
                 update={
                     "availability": availability,
+                    "availability_reason_code": (
+                        None if reason is None else reason.reason_code
+                    ),
                     "availability_reason": None if reason is None else reason.detail,
                     "availability_headline": (
                         None if reason is None else reason.headline

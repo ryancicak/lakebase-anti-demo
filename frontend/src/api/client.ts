@@ -1,5 +1,5 @@
 import type { BoutReceipt } from '../recap'
-import type { BoutStatus, CatalogResponse, CreateSessionRequest, DemoSession, EventName, InstallationStatus, RecoveryAttempt, RecoverySpawned, RoundId, RunEvent } from './types'
+import type { AllBoutStatus, BoutStatus, CatalogResponse, CreateSessionRequest, DemoSession, EventName, InstallationStatus, RecoveryAttempt, RecoverySpawned, RoundId, RunEvent } from './types'
 
 export interface ReceiptsResponse {
   receipts: BoutReceipt[]
@@ -78,6 +78,7 @@ export const api = {
   boutStatus: (roundId: RoundId) => request<BoutStatus>(
     `/api/bout?round_id=${encodeURIComponent(roundId)}`,
   ),
+  allBoutStatuses: () => request<AllBoutStatus>('/api/bout/all'),
   createSession: (body: CreateSessionRequest) =>
     request<DemoSession>('/api/sessions', { method: 'POST', body: JSON.stringify(body) }),
   getSession: (id: string) => request<DemoSession>(`/api/sessions/${encodeURIComponent(id)}`),

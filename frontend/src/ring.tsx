@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { CatalogResponse, CompetitorId, RoundDefinition, RoundId } from './api/types'
+import type {
+  CatalogResponse,
+  CompetitorId,
+  FightCardRoundStatus,
+  RoundDefinition,
+  RoundId,
+} from './api/types'
 import { NO_EQUIVALENT_NATIVE_PATH } from './recap'
 
 /**
@@ -212,18 +218,10 @@ export function FightRing(props: {
   selectedRoundId: RoundId
   opponentLabel: string
   recommendedRoundId: RoundId
-  /**
-   * The round the ring is holding a bout on, and the words to print against it,
-   * as ONE value -- a round id with no wording and wording with no round are
-   * both a tile that cannot be drawn honestly. Null when nothing on this grid
-   * is known to be busy, which includes "not read yet": five of the six rings
-   * are never polled, so silence here is ignorance and not an idle ring.
-   *
-   * The wording is composed by the caller rather than here, because the caller
-   * is where the ring's single busy-wording writer lives and this must not
-   * become a second phrasing of the same fact.
-   */
-  liveBout: { roundId: RoundId; note: string } | null
+  /** One server snapshot for all six tiles; never six tile-owned requests. */
+  roundStatuses: Record<RoundId, FightCardRoundStatus> | null
+  /** Live cards fail closed until the first all-round snapshot arrives. */
+  statusRequired: boolean
   onRound: (id: RoundId) => void
   onCompetitor: (id: CompetitorId) => void
 }) {
@@ -803,9 +801,18 @@ export function FightRing(props: {
              right thing to give up -- static copy derived from the catalog,
              unchanged when it comes back, and not what anybody is reading the
              strip for while a bout is live. */
-          const busy = props.liveBout?.roundId === item.id ? props.liveBout.note : null
-          const words = busy ?? laneKeyText(item, props.competitor)
-          const ready = item.availability === 'ready'
+          const live = props.roundStatuses?.[item.id] ?? null
+          const state = live?.state
+            ?? (item.availability_reason_code === 'cleanup_in_progress'
+              ? 'cleanup_in_progress'
+              : item.availability === 'ready' ? 'ready' : 'unavailable')
+          const busy = state === 'bout_in_progress'
+          const cleaning = state === 'cleanup_in_progress'
+          const stateNote = state.replaceAll('_', ' ').toUpperCase()
+          const words = busy ? stateNote : laneKeyText(item, props.competitor)
+          const badge = state === 'ready' || busy ? null : stateNote
+          const selectable = live?.can_start
+            ?? (!props.statusRequired && item.availability === 'ready')
           return (
             <button
               className="ring-key"
@@ -813,9 +820,11 @@ export function FightRing(props: {
               key={item.id}
               data-lane={blueCornerLane(item, props.competitor)}
               data-busy={busy ? 'true' : undefined}
+              data-cleanup={cleaning ? 'true' : undefined}
               data-availability={item.availability}
               aria-current={item.id === round.id ? 'true' : 'false'}
-              aria-label={`Round ${index + 1} · ${item.title} · ${words} · ${item.availability}`}
+              aria-label={`Round ${index + 1} · ${item.title} · ${words} · ${stateNote}`}
+              disabled={!selectable}
               onClick={() => props.onRound(item.id)}
             >
               <span className="ring-key-n">{index + 1}</span>
@@ -823,7 +832,11 @@ export function FightRing(props: {
               <span className="ring-key-l"><i aria-hidden="true" /><span>{words}</span></span>
               {/* Availability is the backend's answer and it outranks the artwork:
                   a round that cannot arm never renders as ready here. */}
-              {!ready && <span className="ring-key-a">{item.availability}</span>}
+              {badge && (
+                <span className="ring-key-a" data-state={cleaning ? 'cleanup' : 'unavailable'}>
+                  {badge}
+                </span>
+              )}
             </button>
           )
         })}

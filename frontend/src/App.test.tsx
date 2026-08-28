@@ -60,7 +60,13 @@ function laneLinesOnScreen(): string[] {
 }
 import { compactDuration, preciseDuration } from './time'
 import type { BoutReceipt } from './recap'
-import type { DemoSession, RunEvent } from './api/types'
+import type {
+  AllBoutStatus,
+  DemoSession,
+  FightCardRoundStatus,
+  RoundId,
+  RunEvent,
+} from './api/types'
 
 vi.mock('./hooks/useReducedMotion', () => ({ useReducedMotion: () => true }))
 const audioMocks = vi.hoisted(() => ({
@@ -695,6 +701,27 @@ function earlyTowelSession(): DemoSession {
   }
 }
 
+function allReadyBoutBoard(
+  updates: Partial<Record<RoundId, Partial<FightCardRoundStatus>>> = {},
+): AllBoutStatus {
+  return {
+    rounds: Object.fromEntries(FALLBACK_CATALOG.rounds.map((round) => [
+      round.id,
+      {
+        round_id: round.id,
+        state: 'ready',
+        can_start: true,
+        active_phase: null,
+        detail: null,
+        updated_at: null,
+        expires_at: null,
+        ...updates[round.id],
+      },
+    ])) as Record<RoundId, FightCardRoundStatus>,
+    updated_at: new Date(0).toISOString(),
+  }
+}
+
 describe('backstage setup', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -702,6 +729,7 @@ describe('backstage setup', () => {
     window.sessionStorage.clear()
     FakeEventSource.instances = []
     window.history.replaceState({}, '', '/')
+    vi.spyOn(api, 'allBoutStatuses').mockResolvedValue(allReadyBoutBoard())
     vi.spyOn(api, 'boutStatus').mockResolvedValue({
       ring_ready: true,
       maintenance_state: 'ready',
@@ -794,20 +822,13 @@ describe('backstage setup', () => {
   })
 
   it('keeps fight-card preparation locked while backstage maintenance runs', async () => {
-    vi.mocked(api.boutStatus).mockResolvedValue({
-      ring_ready: false,
-      maintenance_state: 'maintenance',
-      maintenance_detail: 'BACKSTAGE CLEANUP IN PROGRESS · SHOWTIME WILL UNLOCK AUTOMATICALLY',
-      active: false,
-      operator: null,
-      started_at: null,
-      updated_at: null,
-      expires_at: null,
-      phase: null,
-      state: null,
-      round_title: null,
-      competitor: null,
-    })
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      wake_idle_app: {
+        state: 'cleanup_in_progress',
+        can_start: false,
+        detail: 'BACKSTAGE CLEANUP IN PROGRESS · SHOWTIME WILL UNLOCK AUTOMATICALLY',
+      },
+    }))
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(FALLBACK_CATALOG)))
     const user = userEvent.setup()
     render(<App />)
@@ -1963,28 +1984,17 @@ describe('backstage setup', () => {
     expect(screen.queryByText(/please wait · the current bout owns the ring/i)).not.toBeInTheDocument()
   })
 
-  it('preserves global-scope locking and identifies the current owner before posting', async () => {
-    const currentBout = {
-      scope: 'global' as const,
-      round_id: null,
-      ring_ready: true,
-      can_start: false,
-      maintenance_state: 'ready' as const,
-      maintenance_detail: null,
-      active: true,
-      operator: { display_name: 'Demo Operator', email: 'operator@example.com' },
-      started_at: '2026-08-17T20:15:30Z',
-      updated_at: '2026-08-17T20:15:45Z',
-      expires_at: '2026-08-17T20:45:45Z',
-      phase: 'run_committed',
-      state: 'running' as const,
-      round_title: 'Wake this idle app',
-      competitor: 'Aurora Serverless v2',
-    }
-    vi.mocked(api.boutStatus).mockResolvedValue(currentBout)
+  it('locks an active round before posting without exposing its owner', async () => {
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      wake_idle_app: {
+        state: 'bout_in_progress',
+        can_start: false,
+        active_phase: 'run_committed',
+        detail: 'BOUT IN PROGRESS · This round is already in use. Other rounds remain available.',
+      },
+    }))
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
-      if (input === '/api/bout') return Promise.resolve(jsonResponse(currentBout))
       if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
       if (input.endsWith('/arm')) {
         return Promise.resolve({
@@ -2007,66 +2017,20 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
     const prepare = await screen.findByRole('button', { name: /prepare fight card/i })
     expect(prepare).toBeDisabled()
-    expect(await screen.findByText(/bout in progress.*wake this idle app.*demo operator.*unlocks automatically/i)).toBeInTheDocument()
+    expect(await screen.findByText(/bout in progress.*already in use.*other rounds remain available/i)).toBeInTheDocument()
+    expect(screen.queryByText(/demo operator|operator@example\.com/i)).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some((call) => call[0] === '/api/sessions')).toBe(false)
   })
 
-  it('polls the selected round, marks that round busy on the card, and never greys Prepare without saying why', async () => {
-    const occupiedRound = {
-      scope: 'round' as const,
-      round_id: 'wake_idle_app' as const,
-      ring_ready: true,
-      can_start: false,
-      maintenance_state: 'ready' as const,
-      maintenance_detail: null,
-      active: true,
-      operator: { display_name: 'Round One Operator', email: 'round.one@databricks.com' },
-      started_at: '2026-08-17T20:15:30Z',
-      updated_at: '2026-08-17T20:15:45Z',
-      expires_at: '2026-08-17T20:45:45Z',
-      phase: 'run_committed',
-      state: 'running' as const,
-      round_title: 'Wake this idle app',
-      competitor: 'Aurora Serverless v2',
-    }
-    // A FREE RING AS THE SERVER ACTUALLY REPORTS ONE. This used to spread
-    // `occupiedRound` and flip `can_start`, which describes a status
-    // `RunManager.bout_status` cannot return: it answers a ring with no lease
-    // as `active=False` with every lease field absent, and an occupied one as
-    // `active=True, can_start=False`. The two are exclusive there, so
-    // `active=True` beside `can_start=True` was a shape nothing could produce.
-    // It passed because nothing on screen read `active` for a round whose ring
-    // was free -- and the round tiles now do.
-    const selectedRoundAvailable = {
-      scope: 'round' as const,
-      round_id: 'make_schema_change_safely' as const,
-      ring_ready: true,
-      can_start: true,
-      maintenance_state: 'ready' as const,
-      maintenance_detail: null,
-      active: false,
-      operator: null,
-      started_at: null,
-      updated_at: null,
-      expires_at: null,
-      phase: null,
-      state: null,
-      round_title: null,
-      competitor: null,
-    }
-    // Round 2's answer is held until the test releases it. On the deployed app
-    // that window is a network round trip against the durable coordination row,
-    // and it is the window the owner was looking at: the status is keyed by
-    // round, so pressing a tile discards the one we have and there is nothing
-    // to reason from until the new read lands. Deferring it makes that state
-    // sit still to be inspected instead of being raced.
-    let releaseRoundTwo = () => {}
-    const roundTwoAnswered = new Promise<void>((resolve) => { releaseRoundTwo = resolve })
-    vi.mocked(api.boutStatus).mockImplementation(async (roundId) => {
-      if (roundId === 'wake_idle_app') return occupiedRound
-      await roundTwoAnswered
-      return selectedRoundAvailable
-    })
+  it('polls all rounds once and keeps an unselected active round marked', async () => {
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      wake_idle_app: {
+        state: 'bout_in_progress',
+        can_start: false,
+        active_phase: 'run_committed',
+        detail: 'BOUT IN PROGRESS · This round is already in use. Other rounds remain available.',
+      },
+    }))
     vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
       throw new Error(`Unexpected request: ${input}`)
@@ -2080,51 +2044,235 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
 
     expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeDisabled()
-    await waitFor(() => expect(refusalOnScreen()).toMatch(/wake this idle app.*round one operator/i))
-    expect(api.boutStatus).toHaveBeenCalledWith('wake_idle_app')
-
-    // THE ROUND ITSELF SAYS SO, not only the strip under the buttons. Round 1
-    // is the round the ring answered about, so Round 1's tile is the one that
-    // carries it -- and it carries it INSTEAD OF its lane line, not above it.
-    // Both halves are load-bearing: dropping the position check would pass a
-    // build that marked whichever tile it liked, and dropping the "gone" check
-    // would pass one that added a row and pushed PREPARE toward the fold.
+    await waitFor(() => expect(refusalOnScreen()).toMatch(/bout in progress/i))
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(1)
+    expect(api.boutStatus).not.toHaveBeenCalled()
     await waitFor(() => expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS'))
     expect(laneLinesOnScreen()[0]).not.toMatch(/both corners timed/i)
     expect(laneLinesOnScreen().slice(1)).not.toContain('BOUT IN PROGRESS')
-    // The tile is a swap of copy and never a new element, so the lane line is
-    // still one line's worth of words: the replacement may not outrun the
-    // longest thing it displaces. jsdom lays nothing out, so this is a proxy for
-    // the wrap and is deliberately measured against the real strings.
     expect('BOUT IN PROGRESS'.length).toBeLessThanOrEqual(
       Math.min(...laneLinesOnScreen().slice(1).map((line) => line.length)),
     )
 
     await pickRound(user, 'make_schema_change_safely')
-
-    // THE DEFECT. Prepare greys out the instant the selection moves, because a
-    // status it has not read cannot say the ring is free -- and every sentence
-    // on this screen was written behind a status that exists, so the room got a
-    // dead control and no words at all.
-    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
-    expect(refusalOnScreen()).toMatch(/checking the ring/i)
-    expect(screen.queryByText(/wake this idle app.*round one operator/i)).not.toBeInTheDocument()
-    // AND THE GRID STOPS CLAIMING IT. Round 1's status was read for Round 1 and
-    // is discarded with the selection, so nothing is polling that ring any more.
-    // Leaving the marking up would be the surface asserting a condition it is
-    // no longer checking, which is the standing fault here, and it would go
-    // stale silently rather than visibly.
-    expect(laneLinesOnScreen()).not.toContain('BOUT IN PROGRESS')
-
-    releaseRoundTwo()
-    await waitFor(() => expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled())
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
     expect(refusalOnScreen()).toBe('')
-    expect(api.boutStatus).toHaveBeenCalledWith('make_schema_change_safely')
-    expect(screen.queryByText(/wake this idle app.*round one operator/i)).not.toBeInTheDocument()
-    // Round 2 answered `can_start`, so no tile is marked -- including Round 1,
-    // whose ring this read says nothing at all about.
+    expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
+  })
+
+  it('marks an active Round 1 on initial mount while Round 5 is selected', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      wake_idle_app: {
+        state: 'bout_in_progress',
+        can_start: false,
+        active_phase: 'run_committed',
+        detail: 'BOUT IN PROGRESS · This round is already in use. Other rounds remain available.',
+      },
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+
+    render(<App />)
+
+    const roundOne = await screen.findByRole('button', { name: /^Round 1 ·/i })
+    const roundFive = screen.getByRole('button', { name: /^Round 5 ·/i })
+    expect(roundOne).toHaveAttribute('aria-current', 'false')
+    expect(roundFive).toHaveAttribute('aria-current', 'true')
+    expect(within(roundOne).getByText('BOUT IN PROGRESS')).toBeVisible()
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(1)
+    expect(api.boutStatus).not.toHaveBeenCalled()
+  })
+
+  it('broad-polls ready to active to cleanup to ready without selection', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    const boards = [
+      allReadyBoutBoard(),
+      allReadyBoutBoard({
+        wake_idle_app: {
+          state: 'bout_in_progress',
+          can_start: false,
+          active_phase: 'run_committed',
+        },
+        put_model_score_in_app: {
+          state: 'bout_in_progress',
+          can_start: false,
+          active_phase: 'run_committed',
+        },
+      }),
+      allReadyBoutBoard({
+        wake_idle_app: {
+          state: 'cleanup_in_progress',
+          can_start: false,
+          active_phase: 'cooldown',
+        },
+      }),
+      allReadyBoutBoard(),
+    ]
+    let boardRead = 0
+    vi.mocked(api.allBoutStatuses).mockImplementation(async () => (
+      boards[Math.min(boardRead++, boards.length - 1)]
+    ))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole('button', { name: /^Round 5 ·/i })).toHaveAttribute('aria-current', 'true')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_500)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(2)
+    expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
+    expect(laneLinesOnScreen()[3]).toBe('BOUT IN PROGRESS')
+    expect(screen.getByRole('button', { name: /^Round 5 ·/i })).toHaveAttribute('aria-current', 'true')
+
+    fireEvent.click(screen.getByRole('button', { name: /^Round 2 ·/i }))
+    expect(screen.getByRole('button', { name: /^Round 2 ·/i })).toHaveAttribute('aria-current', 'true')
+    expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
+    expect(laneLinesOnScreen()[3]).toBe('BOUT IN PROGRESS')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_500)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+    expect(within(screen.getByRole('button', { name: /^Round 1 ·/i })).getByText('CLEANUP IN PROGRESS')).toBeVisible()
+    expect(screen.getByRole('button', { name: /^Round 2 ·/i })).toHaveAttribute('aria-current', 'true')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_500)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(4)
+    expect(screen.queryByText('CLEANUP IN PROGRESS')).not.toBeInTheDocument()
     expect(laneLinesOnScreen()).not.toContain('BOUT IN PROGRESS')
-    expect(laneLinesOnScreen()[0]).toMatch(/both corners timed/i)
+    expect(api.boutStatus).not.toHaveBeenCalled()
+  })
+
+  it('preserves the last broad status through errors and retries safely', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    const active = allReadyBoutBoard({
+      wake_idle_app: {
+        state: 'bout_in_progress',
+        can_start: false,
+        active_phase: 'run_committed',
+      },
+    })
+    let boardRead = 0
+    vi.mocked(api.allBoutStatuses).mockImplementation(async () => {
+      boardRead += 1
+      if (boardRead === 1) return active
+      if (boardRead === 2 || boardRead === 3) throw new Error('temporary status failure')
+      return allReadyBoutBoard()
+    })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_500)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(2)
+    expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+    expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
+    expect(screen.getByText(/demo server offline/i)).toBeVisible()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(4)
+    expect(laneLinesOnScreen()).not.toContain('BOUT IN PROGRESS')
+    expect(api.boutStatus).not.toHaveBeenCalled()
+  })
+
+  it('shows another viewer the same active round with one broad request per mount', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      wake_idle_app: {
+        state: 'bout_in_progress',
+        can_start: false,
+        active_phase: 'run_committed',
+      },
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+
+    const firstViewer = render(<App />)
+    const secondViewer = render(<App />)
+
+    await waitFor(() => {
+      expect(within(firstViewer.container).getByRole('button', { name: /^Round 1 ·/i })).toHaveTextContent('BOUT IN PROGRESS')
+      expect(within(secondViewer.container).getByRole('button', { name: /^Round 1 ·/i })).toHaveTextContent('BOUT IN PROGRESS')
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(2)
+    expect(api.boutStatus).not.toHaveBeenCalled()
   })
 
   it('ticks in the ring for presentation, then replaces both clocks with server-verified times', async () => {
@@ -2338,7 +2486,12 @@ describe('backstage setup', () => {
   const AUDIENCE_HEADLINE = "THIS ROUND IS NOT ON TONIGHT'S CARD. It races a live AWS database that only "
     + "the operator's own machine is allowed to reach, and this is the hosted app."
 
-  function refusedCatalog(refused: string[], reason: string, headline: string | null) {
+  function refusedCatalog(
+    refused: string[],
+    reason: string,
+    headline: string | null,
+    reasonCode: 'cleanup_in_progress' | null = null,
+  ) {
     return {
       ...FALLBACK_CATALOG,
       rounds: FALLBACK_CATALOG.rounds.map((round) => (refused.includes(round.id)
@@ -2347,23 +2500,56 @@ describe('backstage setup', () => {
           availability: 'unavailable' as const,
           availability_reason: reason,
           ...(headline === null ? {} : { availability_headline: headline }),
+          ...(reasonCode === null ? {} : { availability_reason_code: reasonCode }),
         }
         : round)),
     }
   }
 
-  async function fightCardFor(catalog: ReturnType<typeof refusedCatalog>, roundId: string) {
+  async function fightCardFor(
+    catalog: ReturnType<typeof refusedCatalog>,
+    roundId: RoundId,
+    boardUpdates?: Partial<Record<RoundId, Partial<FightCardRoundStatus>>>,
+  ) {
+    const catalogUpdates = Object.fromEntries(catalog.rounds
+        .filter((round) => round.availability !== 'ready')
+        .map((round) => [
+          round.id,
+          round.availability_reason_code === 'cleanup_in_progress'
+            ? {
+              state: 'cleanup_in_progress',
+              can_start: false,
+              detail: round.id === 'survive_connection_spike'
+                ? 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.'
+                : null,
+            }
+            : {
+              state: 'unavailable',
+              can_start: false,
+              detail: round.availability_headline ?? round.availability_reason ?? null,
+            },
+        ])) as Partial<Record<RoundId, Partial<FightCardRoundStatus>>>
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(
+      allReadyBoutBoard(boardUpdates ?? catalogUpdates),
+    )
     vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
       throw new Error(`Unexpected request: ${input}`)
     }))
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: roundId,
+      sound: true,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
     const user = userEvent.setup()
     render(<App />)
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, roundId)
+    await screen.findByRole('button', { name: /prepare fight card/i })
     return user
   }
 
@@ -2371,26 +2557,27 @@ describe('backstage setup', () => {
     await fightCardFor(refusedCatalog(['wake_idle_app'], OPERATOR_REASON, AUDIENCE_HEADLINE), 'wake_idle_app')
 
     expect(screen.getByText(/not on tonight's card/i)).toBeVisible()
+    expect(screen.getByText(/This round is unavailable and cannot arm tonight/i)).toBeVisible()
+    expect(within(screen.getByRole('button', { name: /^Round 1 ·/i })).getByText(/unavailable/i)).toBeVisible()
+    expect(document.querySelector('.game-lock-note')).toHaveTextContent(/unavailable tonight/i)
+    expect(screen.queryByText(/cleanup in progress|will reopen automatically/i)).not.toBeInTheDocument()
     // None of the operator's vocabulary is on the screen unasked. Every clause
     // named here was being shown to a room, above the fold, in the same type as
     // the rest of the card.
-    expect(screen.getByText(/TCP 5432/)).not.toBeVisible()
-    expect(screen.getByText(/security groups admits a single operator CIDR/i)).not.toBeVisible()
-    expect(screen.getByText(/no ingress rule to add/i)).not.toBeVisible()
+    expect(screen.queryByText(/TCP 5432/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/security groups admits a single operator CIDR/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no ingress rule to add/i)).not.toBeInTheDocument()
   })
 
-  it('folds the operator’s account away rather than deleting it', async () => {
-    const user = await fightCardFor(
+  it('keeps operator-only diagnostics out of the broad fight-card board', async () => {
+    await fightCardFor(
       refusedCatalog(['wake_idle_app'], OPERATOR_REASON, AUDIENCE_HEADLINE),
       'wake_idle_app',
     )
 
-    const disclosure = screen.getByText('Operator detail').closest('details')!
-    expect(disclosure).not.toHaveAttribute('open')
-    await user.click(screen.getByText('Operator detail'))
-    expect(disclosure).toHaveAttribute('open')
-    expect(screen.getByText(/TCP 5432/)).toBeVisible()
-    expect(screen.getByText(/security groups admits a single operator CIDR/i)).toBeVisible()
+    expect(screen.queryByText('Operator detail')).not.toBeInTheDocument()
+    expect(screen.queryByText(/TCP 5432/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/security groups admits a single operator CIDR/i)).not.toBeInTheDocument()
   })
 
   it('never repeats the refusal in the strip under the buttons', async () => {
@@ -2423,6 +2610,139 @@ describe('backstage setup', () => {
 
     expect(screen.getByText('Why').parentElement).toHaveTextContent(/CANNOT RUN IN THE DEPLOYED APP/)
     expect(screen.queryByText(/operator detail/i)).not.toBeInTheDocument()
+  })
+
+  it('presents normal Round 5 cleanup as temporary while preserving the fence', async () => {
+    const cleanupCatalog = refusedCatalog(
+      ['survive_connection_spike'],
+      'ROUND 5 CANNOT ARM: its own backstage cleanup has not reported ready.',
+      "THIS ROUND IS NOT ON TONIGHT'S CARD. Round 5's own backstage cleanup has not finished.",
+      'cleanup_in_progress',
+    )
+    const user = await fightCardFor(cleanupCatalog, 'survive_connection_spike')
+
+    const roundFive = screen.getByRole('button', { name: /^Round 5 ·/i })
+    expect(roundFive).toHaveAccessibleName(/cleanup in progress/i)
+    expect(roundFive).not.toHaveAccessibleName(/unavailable/i)
+    expect(within(roundFive).getByText('CLEANUP IN PROGRESS')).toBeVisible()
+    expect(within(roundFive).queryByText(/unavailable/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.getByText(/Round 5 will reopen automatically when its Proxy and security group are confirmed deleted\. Other rounds remain available\./i)).toBeVisible()
+    expect(document.querySelector('.game-lock-note')).toHaveTextContent(
+      /cleanup in progress · other rounds remain available/i,
+    )
+
+    const card = document.querySelector('.card-scene')!
+    expect(card).not.toHaveTextContent(/cannot arm tonight|not on tonight's card/i)
+    expect(screen.getByRole('button', { name: /^Round 1 ·/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /^Round 2 ·/i })).toBeEnabled()
+
+    await pickRound(user, 'wake_idle_app')
+    const unselectedRoundFive = screen.getByRole('button', { name: /^Round 5 ·/i })
+    expect(unselectedRoundFive).toHaveAccessibleName(/cleanup in progress/i)
+    expect(unselectedRoundFive).not.toHaveAccessibleName(/unavailable/i)
+    expect(within(unselectedRoundFive).getByText('CLEANUP IN PROGRESS')).toBeVisible()
+  })
+
+  it('reopens Round 5 automatically when the catalog confirms cleanup', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: true,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    const cleanupCatalog = refusedCatalog(
+      ['survive_connection_spike'],
+      'ROUND 5 CANNOT ARM: its own backstage cleanup has not reported ready.',
+      "THIS ROUND IS NOT ON TONIGHT'S CARD. Round 5's own backstage cleanup has not finished.",
+      'cleanup_in_progress',
+    )
+    let boardReads = 0
+    vi.mocked(api.allBoutStatuses).mockImplementation(async () => {
+      boardReads += 1
+      return boardReads === 1
+        ? allReadyBoutBoard({
+          survive_connection_spike: {
+            state: 'cleanup_in_progress',
+            can_start: false,
+            detail: 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.',
+          },
+        })
+        : allReadyBoutBoard()
+    })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input !== '/api/catalog') throw new Error(`Unexpected request: ${input}`)
+      return Promise.resolve(jsonResponse(cleanupCatalog))
+    }))
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Round 5 ·/i })).toHaveAccessibleName(/cleanup in progress/i)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000)
+    })
+
+    expect(boardReads).toBeGreaterThanOrEqual(2)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /^Round 5 ·/i })).toHaveAccessibleName(/ready/i)
+    expect(screen.queryByText(/cleanup in progress/i)).not.toBeInTheDocument()
+  })
+
+  it('uses the terminal Round 5 cleanup lease phase before the catalog poll catches up', async () => {
+    await fightCardFor(
+      refusedCatalog([], 'unused', null),
+      'survive_connection_spike',
+      {
+        survive_connection_spike: {
+          state: 'cleanup_in_progress',
+          can_start: false,
+          active_phase: 'round5_cleanup',
+          detail: 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.',
+        },
+      },
+    )
+
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Round 5 ·/i })).toHaveAccessibleName(/cleanup in progress/i)
+    expect(screen.getByText(/Round 5 will reopen automatically/i)).toBeVisible()
+  })
+
+  it('keeps a live Round 5 bout distinct from backstage cleanup', async () => {
+    await fightCardFor(
+      refusedCatalog(
+        ['survive_connection_spike'],
+        'ROUND 5 CANNOT ARM: cleanup has not reported ready.',
+        "THIS ROUND IS NOT ON TONIGHT'S CARD.",
+        'cleanup_in_progress',
+      ),
+      'survive_connection_spike',
+      {
+        survive_connection_spike: {
+          state: 'bout_in_progress',
+          can_start: false,
+          active_phase: 'run_committed',
+          detail: 'BOUT IN PROGRESS · This round is already in use. Other rounds remain available.',
+        },
+      },
+    )
+
+    const roundFive = screen.getByRole('button', { name: /^Round 5 ·/i })
+    expect(roundFive).toHaveAccessibleName(/bout in progress/i)
+    expect(roundFive).not.toHaveAccessibleName(/cleanup|unavailable/i)
+    expect(within(roundFive).getByText('BOUT IN PROGRESS')).toBeVisible()
+    expect(screen.queryByText(/Round 5 will reopen automatically/i)).not.toBeInTheDocument()
+    expect(document.querySelector('.game-lock-note')).toHaveTextContent(/bout in progress/i)
   })
 
   it('renders the scoped Round 4 v1 and v2 proof without legacy or race claims', async () => {

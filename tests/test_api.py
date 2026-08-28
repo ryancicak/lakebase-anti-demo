@@ -20,6 +20,7 @@ from server import generation_lock, lifecycle, round_availability
 from server.api import operator_from_request, router
 from server.aws_auth import APP_AWS_BINDINGS, AwsAuthConfigurationError
 from server.aws_credential_probe import CredentialVerdict
+from server.catalog import catalog as sealed_catalog
 from server.coordination import (
     ALLOW_INMEMORY_COORDINATION_ENV,
     INMEMORY_COORDINATION_LOSSES,
@@ -31,6 +32,7 @@ from server.manager import InvalidStateError, RunManager, SessionNotFoundError
 from server.models import (
     Availability,
     BoutOperator,
+    BoutStatus,
     CompetitorId,
     Corner,
     RoundId,
@@ -791,6 +793,191 @@ async def test_bout_query_reports_only_the_requested_v7_round_and_refuses_none()
     await run_manager._release_bout(record)
 
 
+async def test_all_bout_statuses_cover_six_rounds_with_one_bounded_read(
+    monkeypatch,
+) -> None:
+    """One browser request reads the bounded ring set and sanitizes every tile."""
+
+    run_manager = RunManager(
+        round_isolation=True,
+        installation_id="install-board",
+        model_score_factory=lambda: object(),
+        connection_spike_factory=lambda: object(),
+        live_orders_factory=lambda: object(),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "_availability_signals",
+        lambda _request: round_availability.AvailabilitySignals(
+            round5_ring_ready=False,
+            round5_detail="Cleanup state has not propagated yet",
+        ),
+    )
+    owner = BoutOperator(
+        display_name="Owner Name",
+        email="owner@example.com",
+        subject="owner-subject",
+    )
+    phases = {
+        RoundId.WAKE_IDLE_APP: ("run_committed", SessionState.RUNNING),
+        RoundId.MAKE_SCHEMA_CHANGE_SAFELY: ("cooldown", SessionState.VERIFIED),
+        RoundId.RECOVER_DELETED_ORDER: ("cooldown", SessionState.VERIFIED),
+    }
+    for round_id, (phase, session_state) in phases.items():
+        await run_manager._lease_store_for_round(round_id).claim(
+            session_id=f"secret-{round_id.value}",
+            operator=owner,
+            phase=phase,
+            session_state=session_state,
+            round_id=round_id.value,
+            round_title=f"Round {round_id.value}",
+            competitor_id=CompetitorId.AURORA_SERVERLESS_V2.value,
+            competitor_name="Aurora Serverless v2",
+            ttl=timedelta(minutes=10),
+        )
+    await run_manager._round5_cleanup_store().claim(
+        session_id="secret-round-five",
+        operator=owner,
+        phase="round5_cleanup",
+        session_state=SessionState.VERIFIED,
+        round_id=RoundId.SURVIVE_CONNECTION_SPIKE.value,
+        round_title="Round 5",
+        competitor_id=CompetitorId.AURORA_SERVERLESS_V2.value,
+        competitor_name="Aurora Serverless v2",
+        ttl=timedelta(minutes=10),
+    )
+
+    reads = 0
+    for store in run_manager._every_ring_store():
+        current = store.current
+
+        async def counted_current(current=current):
+            nonlocal reads
+            reads += 1
+            return await current()
+
+        store.current = counted_current  # type: ignore[method-assign]
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = run_manager
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        response = await client.get("/api/bout/all")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload["rounds"]) == {round_id.value for round_id in RoundId}
+    assert len(payload["rounds"]) == 6
+    assert reads == len(RoundId) + 1
+    assert payload["rounds"][RoundId.WAKE_IDLE_APP.value]["state"] == "bout_in_progress"
+    assert (
+        payload["rounds"][RoundId.MAKE_SCHEMA_CHANGE_SAFELY.value]["state"]
+        == "cleanup_in_progress"
+    )
+    assert (
+        payload["rounds"][RoundId.RECOVER_DELETED_ORDER.value]["state"]
+        == "cleanup_in_progress"
+    )
+    assert (
+        payload["rounds"][RoundId.SURVIVE_CONNECTION_SPIKE.value]["state"]
+        == "cleanup_in_progress"
+    )
+    assert payload["rounds"][RoundId.PUT_MODEL_SCORE_IN_APP.value]["can_start"] is True
+    assert payload["rounds"][RoundId.ANALYZE_LIVE_ORDERS.value]["can_start"] is True
+    serialized = response.text
+    for secret in ("owner@example.com", "Owner Name", "owner-subject", "secret-round-five"):
+        assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ("round_id", "phase"),
+    [
+        (RoundId.SURVIVE_CONNECTION_SPIKE, "round5_cleanup"),
+        (RoundId.MAKE_SCHEMA_CHANGE_SAFELY, "cooldown"),
+    ],
+)
+def test_cleanup_phase_never_flashes_unavailable_during_catalog_gap(
+    round_id: RoundId,
+    phase: str,
+) -> None:
+    """A terminal cleanup fence outranks one stale generic catalog refusal.
+
+    This reproduces the live Round 5 ordering gap: the terminal result is
+    visible and its durable lease is already in cleanup, while a replica-local
+    readiness/catalog sample has not learned the cleanup reason yet. Round 2
+    proves the precedence is all-round behavior, not a Round 5 display patch.
+    """
+
+    sealed = api_module.catalog(
+        model_score_available=True,
+        connection_spike_available=True,
+        live_orders_available=True,
+    )
+    round_definition = next(item for item in sealed.rounds if item.id == round_id)
+    stale_catalog_sample = round_definition.model_copy(
+        update={
+            "availability": Availability.UNAVAILABLE,
+            "availability_reason_code": None,
+            "availability_headline": "Temporarily unavailable",
+            "availability_reason": "Cleanup detail has not propagated yet",
+        }
+    )
+    terminal_cleanup = BoutStatus(
+        scope="round",
+        round_id=round_id,
+        active=True,
+        can_start=False,
+        phase=phase,
+        state=SessionState.VERIFIED,
+    )
+
+    status = api_module._fight_card_round_status(
+        round_id,
+        stale_catalog_sample,
+        terminal_cleanup,
+    )
+
+    assert status.state == "cleanup_in_progress"
+    assert status.can_start is False
+    assert status.state != "unavailable"
+
+
+async def test_all_bout_statuses_keep_health_failures_unavailable(monkeypatch) -> None:
+    run_manager = RunManager(
+        round_isolation=True,
+        installation_id="install-blocked",
+        model_score_factory=lambda: object(),
+        connection_spike_factory=lambda: object(),
+        live_orders_factory=lambda: object(),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "_availability_signals",
+        lambda _request: round_availability.AvailabilitySignals(
+            ring_ready=False,
+            ring_detail="Durable coordination health check failed",
+        ),
+    )
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = run_manager
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        response = await client.get("/api/bout/all")
+
+    assert response.status_code == 200
+    assert {
+        item["state"] for item in response.json()["rounds"].values()
+    } == {"unavailable"}
+    assert all(not item["can_start"] for item in response.json()["rounds"].values())
+
+
 async def test_double_posted_run_returns_one_bout_over_http() -> None:
     """Two POST /run calls for one session must not open two runs.
 
@@ -1054,6 +1241,54 @@ def test_every_branch_that_refuses_a_round_also_writes_one_for_the_room() -> Non
         assert refusal.headline.startswith(round_availability.NOT_ON_THE_CARD), name
         assert refusal.headline != refusal.detail, name
         assert refusal.detail, name
+
+
+def test_round_five_cleanup_is_machine_readable_without_reclassifying_failures() -> None:
+    """Only normal retrying cleanup gets the temporary fight-card state."""
+
+    round_five = next(
+        item
+        for item in sealed_catalog(connection_spike_available=True).rounds
+        if item.id == RoundId.SURVIVE_CONNECTION_SPIKE
+    )
+    retrying = round_availability.apply(
+        [round_five],
+        round_availability.AvailabilitySignals(
+            round5_ring_ready=False,
+            round5_reason_code="cleanup_in_progress",
+            round5_detail="ROUND 5 BACKSTAGE CLEANUP",
+        ),
+    )[0].model_dump(mode="json")
+    assert retrying["availability"] == "unavailable"
+    assert retrying["availability_reason_code"] == "cleanup_in_progress"
+
+    blocked = round_availability.apply(
+        [round_five],
+        round_availability.AvailabilitySignals(
+            round5_ring_ready=False,
+            round5_detail="ROUND 5 CLEANUP FAILED",
+        ),
+    )[0].model_dump(mode="json")
+    assert blocked["availability"] == "unavailable"
+    assert "availability_reason_code" not in blocked
+
+    permanent = round_availability.apply(
+        [round_five],
+        round_availability.AvailabilitySignals(
+            deployed=True,
+            round5_ring_ready=False,
+            round5_reason_code="cleanup_in_progress",
+        ),
+    )[0].model_dump(mode="json")
+    assert permanent["availability"] == "unavailable"
+    assert "availability_reason_code" not in permanent
+
+    reopened = round_availability.apply(
+        [round_five],
+        round_availability.AvailabilitySignals(),
+    )[0].model_dump(mode="json")
+    assert reopened["availability"] == "ready"
+    assert "availability_reason_code" not in reopened
 
 
 def test_the_deployed_refusals_lift_once_the_installation_admits_the_app() -> None:

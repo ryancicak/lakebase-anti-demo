@@ -1876,6 +1876,12 @@ async def test_round_five_verdict_releases_main_before_full_backstage_cleanup() 
     await manager.start_run(created.id, operator)
     verified = await wait_for_state(manager, created.id, SessionState.VERIFIED)
     assert verified.comparison is not None
+    terminal_main_lease = await main_store.current()
+    assert terminal_main_lease is not None
+    assert terminal_main_lease.phase == "cooldown"
+    board_sample = await manager.bout_status(RoundId.SURVIVE_CONNECTION_SPIKE)
+    assert board_sample.active is True
+    assert board_sample.phase == "cooldown"
     await asyncio.wait_for(engine.cleanup_started.wait(), timeout=1)
     assert await main_store.current() is not None
     cleanup_lease = await round5_store.current()
@@ -4380,7 +4386,7 @@ async def test_round_one_owner_can_cancel_a_pending_arm_without_a_result() -> No
     assert repeated == cancelled
 
 
-async def test_round_one_automatically_rechecks_idle_without_holding_the_ring() -> None:
+async def test_round_one_automatically_rechecks_idle_while_holding_cleanup_fence() -> None:
     resolver = SequencedCooldownResolver()
     manager = RunManager(resolver=resolver, verifier=make_verifier())
     manager._arm_poll = 0.001
@@ -4402,8 +4408,9 @@ async def test_round_one_automatically_rechecks_idle_without_holding_the_ring() 
     assert started.cooldown is not None
 
     active = await manager.bout_status()
-    assert active.active is False
-    assert active.can_start is True
+    assert active.active is True
+    assert active.phase == "cooldown"
+    assert active.can_start is False
 
     cooldown = await wait_for_cooldown(manager, first.id, CooldownState.READY)
     cutoff = cooldown.started_at

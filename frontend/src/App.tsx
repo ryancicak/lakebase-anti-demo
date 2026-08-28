@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, ApiError, subscribeToSession } from './api/client'
 import type {
+  AllBoutStatus,
   BoutStatus,
   CatalogResponse,
   CompetitorId,
@@ -9,6 +10,7 @@ import type {
   CustomerCorner,
   DemoSession,
   DescentCostSnapshot,
+  FightCardRoundStatus,
   LaneId,
   LaneSnapshot,
   PersonaId,
@@ -100,8 +102,8 @@ import { Summary } from './summary'
 
 type ApiStatus = 'checking' | 'online' | 'offline'
 
-function boutCanStart(status: BoutStatus | null): boolean {
-  return status?.can_start ?? Boolean(status?.ring_ready && !status.active)
+function roundCanStart(status: FightCardRoundStatus | null): boolean {
+  return status?.can_start ?? false
 }
 
 /**
@@ -112,67 +114,61 @@ function boutCanStart(status: BoutStatus | null): boolean {
  * AUTOMATICALLY"); a third would be that defect again.
  */
 const BOUT_IN_PROGRESS = 'BOUT IN PROGRESS'
-
 /**
- * The ring's own account of why it will not take a new bout, for the operator
- * who just pressed a control and needs to know whether to wait or to act.
+ * The broad status board is also the cross-viewer invalidation channel.
  *
- * A refusal that reaches the operator as silence is indistinguishable from a
- * mis-click, which in front of an audience is worse than a control that never
- * works at all. So this never returns an empty sentence.
- *
- * ONE WRITER, TWO PLACES, and `pressed` is the whole of the difference between
- * them -- the facts and their order are composed once, here, rather than once
- * per surface. The fight card used to keep its own shorter copy of this
- * sentence, which is how two phrasings of one condition get to drift apart.
- *
- * A press earns the countdown and the promise that nothing ran. The note under
- * a disabled button earns neither: nothing has been pressed, so there is
- * nothing to reassure anybody about, and a number rendered once and then left
- * sitting between four-second polls is a countdown going stale on stage, which
- * is worse than no countdown at all.
+ * An all-ready response cannot wait on an "idle" cadence longer than the
+ * promised active-bout discovery bound: another browser can claim a round one
+ * millisecond after this browser receives that response. Keep every successful
+ * cadence below five seconds, with jitter so a room full of viewers does not
+ * synchronize its seven bounded lease reads.
  */
-function ringBusyMessage(status: BoutStatus | null, { pressed = true } = {}): string {
-  if (status?.maintenance_detail) return status.maintenance_detail
-  if (status?.active) {
-    const who = status.operator?.display_name ?? 'another operator'
-    const round = status.round_title ?? 'a live proof'
-    const seconds = pressed && status.expires_at
-      ? Math.max(0, Math.round((Date.parse(status.expires_at) - Date.now()) / 1000))
-      : null
-    const unlocks = seconds === null
-      ? 'The ring unlocks automatically.'
-      : `The ring unlocks automatically in about ${seconds}s.`
-    const nothing = pressed ? ' Nothing was started.' : ''
-    return `${BOUT_IN_PROGRESS} · ${round} · ${who}${status.phase ? ` · ${status.phase}` : ''}. ${unlocks}${nothing}`
-  }
-  return pressed
-    ? 'The ring is not ready to start another bout yet. Nothing was started; try again in a moment.'
-    : 'BACKSTAGE CLEANUP IN PROGRESS · SHOWTIME WILL UNLOCK AUTOMATICALLY'
+const BOUT_BOARD_BLOCKED_POLL_MIN_MS = 2500
+const BOUT_BOARD_BLOCKED_POLL_JITTER_MS = 1000
+const BOUT_BOARD_READY_POLL_MIN_MS = 3500
+const BOUT_BOARD_READY_POLL_JITTER_MS = 1000
+const BOUT_BOARD_ERROR_RETRY_MIN_MS = 3000
+const BOUT_BOARD_ERROR_RETRY_JITTER_MS = 1000
+const ROUND_CLEANUP_COPY: Record<RoundId, string> = {
+  wake_idle_app: 'This round will reopen when both corners return to the required idle state. Other rounds remain available.',
+  make_schema_change_safely: 'This round will reopen when both isolated environments are confirmed deleted. Other rounds remain available.',
+  recover_deleted_order: 'This round will reopen when both recovery environments are confirmed deleted. Other rounds remain available.',
+  put_model_score_in_app: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
+  survive_connection_spike: 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.',
+  analyze_live_orders_without_slowing_checkout: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
 }
 
+type RoundCardState =
+  | 'available'
+  | 'bout_in_progress'
+  | 'cleanup_in_progress'
+  | 'unavailable'
+
 /**
- * The busy fact at the width of one round tile, paired with the round it is
- * true of. Null when the ring is not holding a bout on that round.
+ * The fight card's semantic state for any round.
  *
- * WHY THE WORDS ARE THE LEAD AND NOTHING ELSE. A tile is one short line inside
- * a three-across grid, and the sentence above runs to a hundred characters. It
- * is not abridged at the call site either: that is the whole reason
- * `BOUT_IN_PROGRESS` is a constant rather than a literal in one string.
- *
- * WHY IT IS ONE VALUE AND NOT A ROUND ID PLUS A CAPTION. `status` describes
- * exactly one round -- the one it was read for, which the caller names -- and a
- * caption that could be paired with a different round than the read is the one
- * fault this treatment must not have. A tile is the only surface on this screen
- * with no room to qualify itself, so it may only speak from a status that
- * reported a bout on the round it is drawn against. Absence of a read is not
- * idleness and is emphatically not this.
+ * A present all-round status is authoritative. The catalog fallback exists for
+ * UI review and mixed-version tabs only; live selection stays locked until the
+ * status board has answered.
  */
-function ringBusyKey(
-  status: BoutStatus | null,
+function roundCardState(
+  round: CatalogResponse['rounds'][number],
+  status: FightCardRoundStatus | null,
+): RoundCardState {
+  if (status) return status.state === 'ready' ? 'available' : status.state
+  if (round.availability_reason_code === 'cleanup_in_progress') return 'cleanup_in_progress'
+  return round.availability === 'ready' ? 'available' : 'unavailable'
+}
+
+function roundBoardMessage(
   roundId: RoundId,
-): { roundId: RoundId; note: string } | null {
-  return status?.active ? { roundId, note: BOUT_IN_PROGRESS } : null
+  status: FightCardRoundStatus | null,
+): string {
+  if (status?.detail) return status.detail
+  if (status?.state === 'bout_in_progress') return BOUT_IN_PROGRESS
+  if (status?.state === 'cleanup_in_progress') return ROUND_CLEANUP_COPY[roundId]
+  if (status?.state === 'unavailable') return 'This round is unavailable right now.'
+  return 'CHECKING ALL SIX ROUNDS…'
 }
 
 export interface ScorecardEntry {
@@ -261,11 +257,6 @@ interface ActiveSessionPointer {
   id: string
   stage: Stage
   resumeStage: Stage
-}
-
-interface RingStatusLookup {
-  roundId: RoundId
-  status: BoutStatus
 }
 
 function loadActiveSessionPointer(): ActiveSessionPointer | null {
@@ -1120,8 +1111,16 @@ function selectedRoundWhy(
 function roundLockNote(
   round: CatalogResponse['rounds'][number],
   rounds: CatalogResponse['rounds'],
+  state: RoundCardState,
+  statuses: Record<RoundId, FightCardRoundStatus> | null,
 ): string {
-  const alternative = rounds.some((item) => item.id !== round.id && item.availability === 'ready')
+  if (state === 'cleanup_in_progress') {
+    return 'CLEANUP IN PROGRESS · OTHER ROUNDS REMAIN AVAILABLE'
+  }
+  const alternative = rounds.some((item) => (
+    item.id !== round.id
+    && (statuses?.[item.id]?.can_start ?? item.availability === 'ready')
+  ))
   return alternative
     ? 'UNAVAILABLE TONIGHT · CHANGE ROUND TO PICK ONE THAT CAN RUN'
     : 'UNAVAILABLE TONIGHT · NO ROUND CAN RUN RIGHT NOW'
@@ -1132,24 +1131,20 @@ function roundLockNote(
  * about it -- which is not the same fact as the ring being busy, and must not
  * borrow that sentence. It says what is happening and stops.
  */
-const RING_STATUS_UNREAD = 'CHECKING THE RING · PREPARE UNLOCKS WHEN THE RING ANSWERS'
+const RING_STATUS_UNREAD = 'CHECKING ALL SIX ROUNDS · PREPARE UNLOCKS WHEN THE BOARD ANSWERS'
 
 /**
  * Why PREPARE FIGHT CARD will not arm, or null when it will.
  *
  * THE DEFECT THIS REPLACES. Whether the button was live was decided in one
- * place and the reasons were written in another, each behind its own condition,
- * and one state fell between every one of them: the ring's status for the
- * SELECTED round not read yet. `boutCanStart(null)` is false, so absence of
- * knowledge disabled the button -- correctly -- while every sentence on the
- * screen was guarded on a status that exists, so none of them rendered. The
- * room got a greyed-out control and not one word about why, which a viewer
- * cannot tell apart from a broken app.
+ * place and the reasons were written in another. The all-round snapshot is now
+ * the one value both branches consume: missing knowledge locks the control,
+ * and every non-ready machine state carries visible copy.
  *
  * That state is not a corner case. It is entered on every fresh tab, because
- * the catalog poll turns the API indicator green before the slower bout poll
- * lands, and again on every round tile press, because the status is keyed by
- * round and is discarded the moment the selection moves.
+ * the catalog poll can turn the API indicator green before the status-board
+ * poll lands. It no longer reappears on every tile press because one snapshot
+ * already contains all six rounds.
  *
  * So the sentence and the disabled state are now ONE VALUE, and `canPrepare` is
  * this returning null and nothing else. A refusal with no wording stops being
@@ -1159,9 +1154,11 @@ function prepareRefusal(params: {
   uiReview: boolean
   restoringSession: boolean
   apiStatus: ApiStatus
-  ringStatus: BoutStatus | null
+  ringStatus: FightCardRoundStatus | null
+  roundStatuses: Record<RoundId, FightCardRoundStatus> | null
   round: CatalogResponse['rounds'][number]
   rounds: CatalogResponse['rounds']
+  roundState: RoundCardState
 }): string | null {
   if (params.restoringSession) return 'RESTORING LIVE BOUT…'
   if (params.uiReview) return null
@@ -1169,9 +1166,18 @@ function prepareRefusal(params: {
   // Ahead of the ring deliberately: the catalog already settled this without
   // asking, and "checking the ring" on a round that cannot run tonight is a
   // wait that never ends.
-  if (params.round.availability !== 'ready') return roundLockNote(params.round, params.rounds)
+  if (params.roundState === 'cleanup_in_progress' || params.roundState === 'unavailable') {
+    return roundLockNote(
+      params.round,
+      params.rounds,
+      params.roundState,
+      params.roundStatuses,
+    )
+  }
   if (params.apiStatus !== 'online' || params.ringStatus === null) return RING_STATUS_UNREAD
-  if (!boutCanStart(params.ringStatus)) return ringBusyMessage(params.ringStatus, { pressed: false })
+  if (!roundCanStart(params.ringStatus)) {
+    return roundBoardMessage(params.round.id, params.ringStatus)
+  }
   return null
 }
 
@@ -2340,7 +2346,7 @@ function App() {
   const [missedCalls, setMissedCalls] = useState(0)
   const [armStatus, setArmStatus] = useState('Verifying the sealed start state…')
   const [activeBout, setActiveBout] = useState<BoutStatus | null>(null)
-  const [ringStatusLookup, setRingStatusLookup] = useState<RingStatusLookup | null>(null)
+  const [boutBoard, setBoutBoard] = useState<AllBoutStatus | null>(null)
   const [sound, setSound] = useState(initialProgress.sound)
   const [titleMusicPlaying, setTitleMusicPlaying] = useState(false)
   const [scorecard, setScorecard] = useState<ScorecardEntry[]>(loadScorecard)
@@ -2385,9 +2391,8 @@ function App() {
     [catalog, competitor, corners, primary],
   )
   const selectedRoundId = roundOverride ?? recommendation.round_id
-  const ringStatus = ringStatusLookup?.roundId === selectedRoundId
-    ? ringStatusLookup.status
-    : null
+  const roundStatuses = boutBoard?.rounds ?? null
+  const ringStatus = roundStatuses?.[selectedRoundId] ?? null
   const selectedCompetitor = catalog.competitors.find((item) => item.id === competitor) ?? FALLBACK_CATALOG.competitors[0]
   const currentRoundIndex = session
     ? catalog.rounds.findIndex((round) => round.id === session.round.id)
@@ -2397,6 +2402,7 @@ function App() {
         index > currentRoundIndex
         && round.competitors.includes(session?.competitor.id ?? competitor)
         && round.availability === 'ready'
+        && (uiReview || roundStatuses?.[round.id]?.can_start === true)
       ))
     : undefined
   const selectedPersonas = [primary, ...secondary]
@@ -2664,20 +2670,26 @@ function App() {
   useEffect(() => {
     if (uiReview) return
     let active = true
+    let inFlight = false
     let timer: number | undefined
     let failures = 0
     const inspect = () => {
-      api.boutStatus(selectedRoundId)
+      if (!active || inFlight) return
+      inFlight = true
+      api.allBoutStatuses()
         .then((status) => {
           if (!active) return
           failures = 0
           setApiStatus('online')
-          setRingStatusLookup({ roundId: selectedRoundId, status })
+          setBoutBoard(status)
+          const blocked = Object.values(status.rounds).some((round) => !round.can_start)
           timer = window.setTimeout(
             inspect,
-            boutCanStart(status)
-              ? 30000 + Math.random() * 15000
-              : 4000 + Math.random() * 2000,
+            blocked
+              ? BOUT_BOARD_BLOCKED_POLL_MIN_MS
+                + Math.random() * BOUT_BOARD_BLOCKED_POLL_JITTER_MS
+              : BOUT_BOARD_READY_POLL_MIN_MS
+                + Math.random() * BOUT_BOARD_READY_POLL_JITTER_MS,
           )
         })
         .catch(() => {
@@ -2685,17 +2697,25 @@ function App() {
           failures += 1
           if (failures >= 2) {
             setApiStatus('offline')
-            setRingStatusLookup(null)
           }
-          timer = window.setTimeout(inspect, 6000 + Math.random() * 3000)
+          // A failed observation is not evidence that six known states became
+          // unknown. Keep the last board painted while retrying; clearing it
+          // hides another viewer's active bout and makes a later tile press look
+          // like the action that discovered it.
+          timer = window.setTimeout(
+            inspect,
+            BOUT_BOARD_ERROR_RETRY_MIN_MS
+              + Math.random() * BOUT_BOARD_ERROR_RETRY_JITTER_MS,
+          )
         })
+        .finally(() => { inFlight = false })
     }
     inspect()
     return () => {
       active = false
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [selectedRoundId, uiReview])
+  }, [uiReview])
 
   useEffect(() => {
     if (!sessionId || uiReview) return
@@ -2981,31 +3001,32 @@ function App() {
       selection.primary,
     )
     const selectionRoundId = selection.roundOverride ?? selectionRecommendation.round_id
-    let selectionRingStatus = ringStatusLookup?.roundId === selectionRoundId
-      ? ringStatusLookup.status
-      : null
+    let board = boutBoard
+    let selectionRingStatus = board?.rounds[selectionRoundId] ?? null
     if (!uiReview && !selectionRingStatus) {
       try {
-        selectionRingStatus = await api.boutStatus(selectionRoundId)
-        setRingStatusLookup({ roundId: selectionRoundId, status: selectionRingStatus })
+        board = await api.allBoutStatuses()
+        setBoutBoard(board)
+        selectionRingStatus = board.rounds[selectionRoundId]
       } catch {
         setApiStatus('offline')
         return
       }
     }
-    if (!uiReview && !boutCanStart(selectionRingStatus)) {
+    if (!uiReview && !roundCanStart(selectionRingStatus)) {
       // The cached status can be a moment stale, and the lease from the bout that
       // just ended is released asynchronously, so a press landing in that window
       // must not be dropped on stale evidence. Re-read once before refusing.
       try {
-        selectionRingStatus = await api.boutStatus(selectionRoundId)
-        setRingStatusLookup({ roundId: selectionRoundId, status: selectionRingStatus })
+        board = await api.allBoutStatuses()
+        setBoutBoard(board)
+        selectionRingStatus = board.rounds[selectionRoundId]
       } catch {
         setApiStatus('offline')
         return
       }
-      if (!boutCanStart(selectionRingStatus)) {
-        setError(ringBusyMessage(selectionRingStatus))
+      if (!roundCanStart(selectionRingStatus)) {
+        setError(roundBoardMessage(selectionRoundId, selectionRingStatus))
         return
       }
     }
@@ -3598,6 +3619,7 @@ function App() {
       scene={setupScene}
       apiStatus={apiStatus}
       ringStatus={ringStatus}
+      roundStatuses={roundStatuses}
       catalog={catalog}
       competitor={competitor}
       corners={corners}
@@ -3712,7 +3734,8 @@ function SoundToggle({ sound, onToggle, arena = false }: { sound: boolean; onTog
 function Setup(props: {
   scene: SetupScene
   apiStatus: ApiStatus
-  ringStatus: BoutStatus | null
+  ringStatus: FightCardRoundStatus | null
+  roundStatuses: Record<RoundId, FightCardRoundStatus> | null
   catalog: CatalogResponse
   competitor: CompetitorId
   corners: CustomerCorner[]
@@ -3735,8 +3758,17 @@ function Setup(props: {
   const recommendedRound = props.catalog.rounds.find((round) => round.id === props.recommendation.round_id)!
   const selectedRound = props.catalog.rounds.find((round) => round.id === props.selectedRoundId)!
   const roundNumber = props.catalog.rounds.findIndex((round) => round.id === selectedRound.id) + 1
-  const roundExecutable = selectedRound.availability === 'ready'
-  const selectedWhy = selectedRoundWhy(selectedRound, props.recommendation)
+  const selectedRoundState = roundCardState(selectedRound, props.ringStatus)
+  const roundRefused = selectedRoundState === 'cleanup_in_progress'
+    || selectedRoundState === 'unavailable'
+  const selectedWhy = selectedRoundState === 'cleanup_in_progress'
+    ? {
+        headline: props.ringStatus?.detail ?? ROUND_CLEANUP_COPY[selectedRound.id],
+        detail: null,
+      }
+    : selectedRoundState === 'unavailable' && props.ringStatus?.detail
+      ? { headline: props.ringStatus.detail, detail: null }
+    : selectedRoundWhy(selectedRound, props.recommendation)
   const selectedCompetitor = props.catalog.competitors.find((item) => item.id === props.competitor)!
   const selectedOpponent = fightCardOpponentLabel(selectedRound.id, props.competitor, selectedCompetitor.short_name)
   const primaryPersona = props.catalog.personas.find((persona) => persona.id === props.primary)!
@@ -3751,8 +3783,10 @@ function Setup(props: {
     restoringSession: props.restoringSession,
     apiStatus: props.apiStatus,
     ringStatus: props.ringStatus,
+    roundStatuses: props.roundStatuses,
     round: selectedRound,
     rounds: props.catalog.rounds,
+    roundState: selectedRoundState,
   })
   const canPrepare = refusal === null
 
@@ -3848,13 +3882,8 @@ function Setup(props: {
               selectedRoundId={props.selectedRoundId}
               opponentLabel={selectedOpponent}
               recommendedRoundId={recommendedRound.id}
-              /* The grid can mark exactly one tile, and it is this one: the
-                 status is read per round and `props.ringStatus` is nulled the
-                 moment the selection moves off the round it was read for, so
-                 the round named here is the round the ring answered about and
-                 the poller is still refreshing. A tile marked from any other
-                 read would be a claim about a ring nothing is watching. */
-              liveBout={ringBusyKey(props.ringStatus, props.selectedRoundId)}
+              roundStatuses={props.roundStatuses}
+              statusRequired={!props.uiReview}
               onRound={(id) => props.onRoundOverride(id === recommendedRound.id ? null : id)}
               onCompetitor={props.onCompetitor}
             />
@@ -3874,10 +3903,14 @@ function Setup(props: {
                 a bare yellow rule under the tiles. A refused round is the one
                 thing this screen may not leave unexplained, so that is what is
                 left. */}
-            {!roundExecutable && (
+            {roundRefused && (
               <div className="ring-apron">
                 <section className="ring-cell ring-refusal">
-                  <p className="sub">This round is {selectedRound.availability} and cannot arm tonight.</p>
+                  <p className="sub">
+                    {selectedRoundState === 'cleanup_in_progress'
+                      ? 'Cleanup in progress.'
+                      : `This round is ${selectedRound.availability} and cannot arm tonight.`}
+                  </p>
                   <dl className="scorecard-copy">
                     <div><dt>Why</dt><dd>
                       {selectedWhy.headline}

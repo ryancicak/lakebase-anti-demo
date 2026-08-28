@@ -204,6 +204,12 @@ export interface RoundDefinition {
   scorecard_by_corner: Record<CustomerCorner, string>
   competitors: CompetitorId[]
   availability: Availability
+  /**
+   * Machine-readable context for a temporary refusal. Absent for permanent
+   * configuration and health failures; presentation must never infer it from
+   * `availability_reason` or `availability_headline`.
+   */
+  availability_reason_code?: 'cleanup_in_progress' | null
   // The operator's full account of the refusal: the port, the security group,
   // the exact permission Databricks named. Never the thing a fight card leads
   // with -- see `availability_headline`, which is what the room reads.
@@ -241,6 +247,27 @@ export interface BoutStatus {
   state: SessionState | null
   round_title: string | null
   competitor: string | null
+}
+
+export type FightCardState =
+  | 'ready'
+  | 'bout_in_progress'
+  | 'cleanup_in_progress'
+  | 'unavailable'
+
+export interface FightCardRoundStatus {
+  round_id: RoundId
+  state: FightCardState
+  can_start: boolean
+  active_phase: string | null
+  detail: string | null
+  updated_at: string | null
+  expires_at: string | null
+}
+
+export interface AllBoutStatus {
+  rounds: Record<RoundId, FightCardRoundStatus>
+  updated_at: string
 }
 
 export interface PresenterLens {
