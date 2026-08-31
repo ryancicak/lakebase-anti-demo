@@ -748,29 +748,41 @@ class LoseTerminalLeaseStore(InMemoryBoutLeaseStore):
 
 
 class SlowRenewableTerminalStore(InMemoryBoutLeaseStore):
-    def __init__(self, *, phase: str, delay: float = 0.08) -> None:
+    def __init__(self, *, phase: str) -> None:
         super().__init__()
         self.phase = phase
-        self.delay = delay
         self.release_calls = 0
+        self.renew_calls = 0
+        self.first_release_expires_at: datetime | None = None
         self.release_started = asyncio.Event()
+        self.allow_release = asyncio.Event()
         self.current_started = asyncio.Event()
+        self.allow_current = asyncio.Event()
+        self.renewed = asyncio.Event()
 
     async def release(self, lease):
         if lease.phase != self.phase:
             return await super().release(lease)
         self.release_calls += 1
-        self.release_started.set()
-        await asyncio.sleep(self.delay)
         if self.release_calls == 1:
+            self.first_release_expires_at = lease.expires_at
+            self.release_started.set()
+            await self.allow_release.wait()
             return False
         return await super().release(lease)
 
     async def current(self):
         if self.release_calls == 1:
             self.current_started.set()
-            await asyncio.sleep(self.delay)
+            await self.allow_current.wait()
         return await super().current()
+
+    async def renew(self, lease, *, ttl):
+        renewed = await super().renew(lease, ttl=ttl)
+        if lease.phase == self.phase:
+            self.renew_calls += 1
+            self.renewed.set()
+        return renewed
 
 
 class ClearBeforeReleaseReturnsStore(InMemoryBoutLeaseStore):
@@ -3495,31 +3507,50 @@ async def test_slow_terminal_coordinator_io_keeps_lease_renewable_and_lock_free(
         model_score_factory=lambda: engine,
         lease_store=lease_store,
     )
-    manager._lease_heartbeat = 0.01
-    manager._active_lease_ttl = 0.03
-    manager._running_lease_ttl = 0.03
-    manager._terminal_release_call_timeout = 0.5
-    manager._terminal_release_backoff_cap = 0.01
     operator = BoutOperator(display_name="Round Four Owner", subject=f"owner-slow-{phase}")
 
     if phase == "run_committed":
         created = await manager.create(round_four_request())
         await manager.start_arm(created.id, operator)
         await wait_for_state(manager, created.id, SessionState.ARMED)
-        await manager.start_run(created.id, operator)
     else:
         created, _ = await verified_round_four(manager, operator)
-        await manager.start_redo(created.id, operator)
     record = manager._records[created.id]
 
-    async def take_lease_lock() -> None:
+    # The short lease belongs only to the terminal phase under test. Applying it
+    # before the prerequisite arm/verification made unrelated setup depend on a
+    # 30 ms wall-clock deadline and fail when a shared runner descheduled Python.
+    manager._lease_heartbeat = 0.01
+    manager._active_lease_ttl = 0.2
+    manager._running_lease_ttl = 0.2
+    manager._terminal_release_call_timeout = 2
+    manager._terminal_release_backoff_cap = 0.01
+    if phase == "run_committed":
+        await manager.start_run(created.id, operator)
+    else:
+        await manager.start_redo(created.id, operator)
+
+    async def read_lease_under_lock():
         async with record.lease_lock:
-            return None
+            return record.lease
 
     await asyncio.wait_for(lease_store.release_started.wait(), timeout=1)
-    await asyncio.wait_for(take_lease_lock(), timeout=0.05)
+    initial_expiry = lease_store.first_release_expires_at
+    assert initial_expiry is not None
+    assert await asyncio.wait_for(read_lease_under_lock(), timeout=1) is not None
+    await asyncio.wait_for(lease_store.renewed.wait(), timeout=1)
+    until_original_expiry = (initial_expiry - datetime.now(UTC)).total_seconds()
+    if until_original_expiry > 0:
+        await asyncio.sleep(until_original_expiry + 0.01)
+    renewed_lease = await asyncio.wait_for(read_lease_under_lock(), timeout=1)
+    assert lease_store.renew_calls > 0
+    assert renewed_lease is not None
+    assert renewed_lease.expires_at > datetime.now(UTC) >= initial_expiry
+
+    lease_store.allow_release.set()
     await asyncio.wait_for(lease_store.current_started.wait(), timeout=1)
-    await asyncio.wait_for(take_lease_lock(), timeout=0.05)
+    assert await asyncio.wait_for(read_lease_under_lock(), timeout=1) is not None
+    lease_store.allow_current.set()
 
     if phase == "run_committed":
         finished = await wait_for_state(manager, created.id, SessionState.VERIFIED)
