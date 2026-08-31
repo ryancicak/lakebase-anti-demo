@@ -978,6 +978,15 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cooldown-detail-lanes article span { color: #aeb9df; }
 .cooldown-detail-lanes article code { color: var(--cream); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
 .cooldown-detail-lanes article p { color: #6bf39a; }
+.cooldown-provenance { display: grid; gap: .8em; padding: 1em; border: 3px solid #46527c; background: #050817; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 12px); font-weight: 900; line-height: 1.45; text-align: left; }
+.cooldown-provenance h3, .cooldown-provenance p { margin: 0; }
+.cooldown-provenance h3 { color: var(--yellow); font-size: clamp(9px, .75vw, 14px); text-transform: uppercase; }
+.cooldown-provenance > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8em; }
+.cooldown-provenance article { display: grid; gap: .45em; min-width: 0; padding: .8em; border: 2px solid #46527c; }
+.cooldown-provenance article strong { color: var(--cream); }
+.cooldown-provenance article span { color: #aeb9df; overflow-wrap: anywhere; }
+.cooldown-provenance code { color: var(--cream); }
+.cooldown-provenance .between-policy-floor, .cooldown-provenance .between-floor-cost { width: 100%; margin: 0; }
 
 /* Explain to the Room is an audience briefing, not an evidence dashboard. The
    authored engine is large; the projected surface stays deliberately small. */
@@ -1128,6 +1137,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .between-screen > .pixel-kicker { margin: 0 0 .4vh; }
 .between-screen h1 { position: relative; z-index: 2; margin: .5vh 0 .5vh; color: var(--cream); font-size: clamp(25px, 3.1vw, 60px); line-height: 1.2; text-transform: uppercase; text-shadow: .12em .12em #000; }
 .between-rule { position: relative; z-index: 2; margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; }
+.between-origin-offset { position: relative; z-index: 2; margin: .55vh 0 0; color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-weight: 900; }
 /* minmax(0, 1fr) rather than 1fr on the two lane tracks: a bare 1fr floors at
    min-content, and the clock is one unbreakable 5-glyph token, so the widest
    reading ("~7:06" at the 48px clamp floor) used to push the whole grid wider
@@ -1153,6 +1163,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cooldown-lag { display: block; margin-top: .8em; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-weight: 900; line-height: 1.4; white-space: normal; }
 .cooldown-lane[data-state="not_supported"] .cooldown-time { font-size: clamp(18px, 2vw, 38px); line-height: 1.35; }
 .cooldown-lane > p { align-self: end; min-height: 2.2em; margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; line-height: 1.4; }
+.cooldown-summary strong, .cooldown-summary span { display: block; }
+.cooldown-summary strong { color: var(--cream); font-size: 1.05em; }
+.cooldown-summary span { margin-top: .45em; }
+.cooldown-lane[data-state="confirmed_zero"] .cooldown-summary strong { color: #6bf39a; }
 .between-policy-floor { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(0, 1fr); gap: .5vh; width: min(1160px, 100%); margin: .7vh auto 0; padding: .8vh 1.2vw; border-left: clamp(4px, .4vw, 7px) solid var(--yellow); color: #b7c2e7; background: rgba(16, 24, 62, .72); font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 12px); font-weight: 900; text-align: left; }
 .between-policy-floor span { color: var(--yellow); font-size: clamp(6px, .5vw, 10px); text-transform: uppercase; }
 /* The billed-floor line sits directly under the policy-floor line and shares its
@@ -1185,6 +1199,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    under the frame's side rules. Stacking is the same answer .capacity-lanes and
    .standing-cost-lanes already give at this breakpoint. */
 @media (max-width: 700px) {
+  .cooldown-provenance > div { grid-template-columns: minmax(0, 1fr); }
   .cooldown-match { grid-template-columns: minmax(0, 1fr); }
   .cooldown-match > b { padding: .5vh 0; font-size: clamp(20px, 6vw, 34px); }
 }

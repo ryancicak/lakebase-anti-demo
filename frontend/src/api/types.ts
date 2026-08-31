@@ -307,6 +307,7 @@ export interface LaneSnapshot {
   status: string
   error: string | null
   verified_at?: string | null
+  connection_closed_at?: string | null
   activity?: LaneActivity | null
   evidence?: Record<string, unknown>
 }
@@ -331,6 +332,11 @@ export interface CooldownLaneSnapshot {
   elapsed_ms: number | null
   status: string
   activity?: LaneActivity | null
+  observed_state?: string | null
+  observation_count?: number
+  confirmation_basis?: string | null
+  provider_updated_at?: string | null
+  checked_at?: string | null
 }
 
 export interface CooldownSnapshot {

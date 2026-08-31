@@ -945,6 +945,35 @@ def test_cleanup_phase_never_flashes_unavailable_during_catalog_gap(
     assert status.state != "unavailable"
 
 
+def test_terminal_round_one_cooldown_failure_is_unavailable_not_cleanup() -> None:
+    sealed = api_module.catalog(
+        model_score_available=True,
+        connection_spike_available=True,
+        live_orders_available=True,
+    )
+    round_definition = next(
+        item for item in sealed.rounds if item.id == RoundId.WAKE_IDLE_APP
+    )
+    failed_fence = BoutStatus(
+        scope="round",
+        round_id=RoundId.WAKE_IDLE_APP,
+        active=True,
+        can_start=False,
+        phase="cooldown_failed",
+        state=SessionState.VERIFIED,
+    )
+
+    status = api_module._fight_card_round_status(
+        RoundId.WAKE_IDLE_APP,
+        round_definition,
+        failed_fence,
+    )
+
+    assert status.state == "unavailable"
+    assert status.can_start is False
+    assert "timed out" in str(status.detail)
+
+
 async def test_all_bout_statuses_keep_health_failures_unavailable(monkeypatch) -> None:
     run_manager = RunManager(
         round_isolation=True,

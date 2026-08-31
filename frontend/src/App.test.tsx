@@ -3972,15 +3972,16 @@ describe('backstage setup', () => {
     expect(screen.getByText(/play-by-play hidden/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /show commentator/i })).toHaveAttribute('aria-pressed', 'false')
     await user.click(screen.getByRole('button', { name: /show commentator/i }))
-    expect(screen.getByText(/waiting for authoritative zero-state evidence/i)).toBeInTheDocument()
-    expect(screen.getByText(/ON THE WIRE/)).toHaveTextContent('databricks postgres get-endpoint')
-    expect(screen.getByText(/ON THE WIRE/)).toHaveTextContent('RDS DescribeDBClusters + DescribeDBInstances + DescribeEvents')
+    expect(screen.getByText(/waiting for both databases to return to idle/i)).toBeInTheDocument()
+    expect(screen.queryByText(/ON THE WIRE/)).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /back to idle/i })).toBeInTheDocument()
-    expect(screen.getByText(/clocks auto-started at 0:00 when the round ended/i)).toBeInTheDocument()
+    expect(screen.getByText(/each timer starts after that database's last connection closes/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/lakebase return to idle/i)).toHaveTextContent('0:00')
     expect(screen.getByLabelText(/aurora serverless v2 return to idle/i)).toHaveTextContent('0:00')
     expect(screen.getByRole('button', { name: /waiting for idle/i })).toBeDisabled()
     expect(screen.queryByRole('button', { name: /share idle proof/i })).not.toBeInTheDocument()
+    const main = screen.getByRole('main')
+    expect(main).not.toHaveTextContent(/provider|update_time|polling|delivery lag|not a floor|forecast|ui tick/i)
 
     await user.click(screen.getByRole('button', { name: /more details/i }))
     const details = await screen.findByRole('dialog', { name: /how the clocks stop/i })
@@ -3988,7 +3989,12 @@ describe('backstage setup', () => {
     expect(details).toHaveTextContent(/status\.current_state/i)
     expect(details).toHaveTextContent(/rds describedbclusters \+ describeevents/i)
     expect(details).toHaveTextContent(/cloudwatch getmetricstatistics/i)
-    expect(details).toHaveTextContent(/no wake effect.*watcher never opens sql/i)
+    expect(details).toHaveTextContent(/read-only watchers.*no sql wake effect/i)
+    expect(details).toHaveTextContent(/provider.*update_time/i)
+    expect(details).toHaveTextContent(/last control-plane check/i)
+    expect(details).toHaveTextContent(/one ui tick drives both live timers/i)
+    expect(details).toHaveTextContent(/polling and delivery lag/i)
+    expect(details).toHaveTextContent(/idle policy.*not idle speed/i)
     await user.click(within(details).getByRole('button', { name: /back to the clocks/i }))
     await user.click(screen.getByRole('button', { name: /hide play-by-play/i }))
     expect(screen.getByText(/play-by-play hidden/i)).toBeInTheDocument()
@@ -4063,7 +4069,7 @@ describe('backstage setup', () => {
     expect(screen.getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
   })
 
-  it('hands a provisional re-do clock back to exact provider time without hiding excluded polling lag', async () => {
+  it('stops an observed-idle clock without inventing a provider transition time', async () => {
     vi.useFakeTimers()
     const startedAt = '2026-08-20T12:00:00.000Z'
     vi.setSystemTime(new Date(startedAt))
@@ -4089,7 +4095,9 @@ describe('backstage setup', () => {
         lanes: {
           lakebase: {
             id: 'lakebase', name: 'Lakebase', state: 'watching', started_at: startedAt,
-            confirmed_at: null, elapsed_ms: null, status: 'Watching for confirmed zero',
+            confirmed_at: null, elapsed_ms: null,
+            status: 'IDLE observed after the lane connection closed; confirming monotonic dwell with another independent poll',
+            observed_state: 'IDLE', observation_count: 1,
           },
           competitor: {
             id: 'competitor', name: 'Aurora Serverless v2', state: 'watching', started_at: startedAt,
@@ -4116,8 +4124,9 @@ describe('backstage setup', () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(67_000) })
     const provisionalLane = screen.getByLabelText(/lakebase return to idle/i)
-    expect(within(provisionalLane).getByText('~1:07')).toBeInTheDocument()
-    expect(provisionalLane).toHaveTextContent(/provisional wall time.*awaiting provider timestamp/i)
+    expect(within(provisionalLane).getByText('1:07')).toBeInTheDocument()
+    expect(provisionalLane).toHaveTextContent(/confirming idle.*1:07 since its last connection/i)
+    expect(provisionalLane).not.toHaveTextContent(/active/i)
 
     const readyCooldown = {
       ...watching.cooldown!,
@@ -4129,6 +4138,8 @@ describe('backstage setup', () => {
           confirmed_at: '2026-08-20T12:01:00.000Z',
           elapsed_ms: 60_000,
           status: 'Control plane confirmed zero',
+          confirmation_basis: 'observed_idle_dwell',
+          observation_count: 2,
         },
         competitor: {
           ...watching.cooldown!.lanes.competitor,
@@ -4148,9 +4159,16 @@ describe('backstage setup', () => {
     }))
 
     const authoritativeLane = screen.getByLabelText(/lakebase return to idle/i)
-    expect(within(authoritativeLane).getByText('1:00')).toBeInTheDocument()
-    expect(authoritativeLane).toHaveTextContent(/~0:07 polling\/delivery lag excluded/i)
-    expect(authoritativeLane).toHaveTextContent(/idle confirmed.*provider transition time.*clock stopped/i)
+    expect(within(authoritativeLane).getByText('≤1:00')).toBeInTheDocument()
+    expect(authoritativeLane).toHaveTextContent(/idle confirmed.*within 1:00 of its last connection/i)
+    expect(within(authoritativeLane).getByLabelText(/observed upper bound.*within 1:00/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /more details/i }))
+    const details = screen.getByRole('dialog', { name: /how the clocks stop/i })
+    expect(details).toHaveTextContent(/evidence class.*observed upper bound.*repeated idle checks/i)
+    expect(details).toHaveTextContent(/arithmetic.*60000\.000 ms/i)
+    fireEvent.click(within(details).getByRole('button', { name: /back to the clocks/i }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(within(authoritativeLane).getByText('≤1:00')).toBeInTheDocument()
 
     stubReceiptCanvas()
     fireEvent.click(screen.getByRole('button', { name: /share idle proof/i }))
@@ -4158,6 +4176,169 @@ describe('backstage setup', () => {
     const poster = within(receipt).getByLabelText(/verified back to idle poster preview/i)
     expect(within(poster).getByLabelText(/lakebase receipt result/i)).toHaveTextContent('1:00')
     expect(poster).not.toHaveTextContent(/polling\/delivery lag/i)
+  })
+
+  it('uses one tick for unequal lane-close origins and explains the fixed offset', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-08-20T12:01:07.000Z'))
+    const lakebaseStartedAt = '2026-08-20T12:00:00.000Z'
+    const competitorStartedAt = '2026-08-20T12:00:07.000Z'
+    const base = session('verified')
+    const watching: DemoSession = {
+      ...base,
+      cooldown: {
+        mode: 'return_to_idle',
+        state: 'watching',
+        started_at: '2026-08-20T12:00:08.000Z',
+        failure: null,
+        lanes: {
+          lakebase: {
+            id: 'lakebase', name: 'Lakebase', state: 'watching',
+            started_at: lakebaseStartedAt, confirmed_at: null, elapsed_ms: null,
+            status: 'Lakebase endpoint is ACTIVE, not IDLE',
+          },
+          competitor: {
+            id: 'competitor', name: 'Aurora Serverless v2', state: 'watching',
+            started_at: competitorStartedAt, confirmed_at: null, elapsed_ms: null,
+            status: 'Aurora is waiting for a successful pause event',
+          },
+        },
+      },
+    }
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: watching.id,
+      stage: 'between',
+      resumeStage: 'between',
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${watching.id}`) return Promise.resolve(jsonResponse(watching))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    render(<App />)
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+    const lakebase = screen.getByLabelText(/lakebase return to idle/i)
+    const aurora = screen.getByLabelText(/aurora serverless v2 return to idle/i)
+    expect(within(lakebase).getByText('1:07')).toBeInTheDocument()
+    expect(within(aurora).getByText('1:00')).toBeInTheDocument()
+    expect(lakebase).toHaveTextContent(/waiting for idle.*1:07 since its last connection/i)
+    expect(aurora).toHaveTextContent(/waiting for idle.*1:00 since its last connection/i)
+    expect(screen.queryByText(/one ui tick drives both live timers/i)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /more details/i }))
+    const details = screen.getByRole('dialog', { name: /how the clocks stop/i })
+    expect(details).toHaveTextContent(
+      /one ui tick drives both live timers.*lakebase closed its final connection 0:07 before aurora serverless v2.*live clock starts 0:07 ahead/i,
+    )
+    fireEvent.click(within(details).getByRole('button', { name: /back to the clocks/i }))
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(within(lakebase).getByText('1:12')).toBeInTheDocument()
+    expect(within(aurora).getByText('1:05')).toBeInTheDocument()
+
+    const source = FakeEventSource.instances.at(-1)!
+    act(() => source.emit({
+      sequence: 10,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-20T12:01:12.000Z',
+      payload: {
+        cooldown: {
+          ...watching.cooldown!,
+          lanes: {
+            lakebase: {
+              ...watching.cooldown!.lanes.lakebase,
+              state: 'confirmed_zero',
+              confirmed_at: '2026-08-20T12:01:07.000Z',
+              elapsed_ms: 67_000,
+              observed_state: 'IDLE',
+              observation_count: 2,
+              confirmation_basis: 'observed_idle_dwell',
+            },
+            competitor: watching.cooldown!.lanes.competitor,
+          },
+        },
+      },
+    }))
+    expect(within(lakebase).getByText('≤1:07')).toBeInTheDocument()
+    expect(lakebase).toHaveTextContent(/idle confirmed.*within 1:07 of its last connection/i)
+    expect(within(aurora).getByText('1:05')).toBeInTheDocument()
+
+    const repeatedConfirmation = {
+      ...watching.cooldown!,
+      lanes: {
+        lakebase: {
+          ...watching.cooldown!.lanes.lakebase,
+          state: 'confirmed_zero' as const,
+          confirmed_at: '2026-08-20T12:02:39.000Z',
+          elapsed_ms: 159_000,
+          observed_state: 'IDLE',
+          observation_count: 18,
+          confirmation_basis: 'observed_idle_dwell',
+        },
+        competitor: watching.cooldown!.lanes.competitor,
+      },
+    }
+    act(() => source.emit({
+      sequence: 11,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-20T12:02:39.000Z',
+      payload: { cooldown: repeatedConfirmation },
+    }))
+    expect(within(lakebase).getByText('≤1:07')).toBeInTheDocument()
+
+    act(() => source.emit({
+      sequence: 11,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-20T12:02:40.000Z',
+      payload: { cooldown: repeatedConfirmation },
+    }))
+    act(() => source.emit({
+      sequence: 9,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-20T12:01:06.000Z',
+      payload: { cooldown: watching.cooldown! },
+    }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+    expect(within(lakebase).getByText('≤1:07')).toBeInTheDocument()
+    expect(within(aurora).getByText('1:10')).toBeInTheDocument()
+
+    act(() => source.emit({
+      sequence: 12,
+      event: 'cooldown_ready',
+      occurred_at: '2026-08-20T12:01:17.000Z',
+      payload: {
+        cooldown: {
+          ...watching.cooldown!,
+          state: 'ready',
+          lanes: {
+            lakebase: {
+              ...watching.cooldown!.lanes.lakebase,
+              state: 'confirmed_zero',
+              confirmed_at: '2026-08-20T12:01:07.000Z',
+              elapsed_ms: 67_000,
+              observed_state: 'IDLE',
+              observation_count: 2,
+              confirmation_basis: 'observed_idle_dwell',
+            },
+            competitor: {
+              ...watching.cooldown!.lanes.competitor,
+              state: 'confirmed_zero',
+              confirmed_at: '2026-08-20T12:01:17.000Z',
+              elapsed_ms: 70_000,
+              confirmation_basis: 'provider_transition',
+            },
+          },
+        },
+      },
+    }))
+    expect(within(lakebase).getByText('≤1:07')).toBeInTheDocument()
+    expect(within(aurora).getByText('1:10')).toBeInTheDocument()
+    expect(aurora).toHaveTextContent(/idle confirmed.*idle 1:10 after its last connection/i)
+    expect(within(aurora).getByLabelText(/exact provider transition.*1:10/i)).toBeInTheDocument()
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+    expect(within(lakebase).getByText('≤1:07')).toBeInTheDocument()
+    expect(within(aurora).getByText('1:10')).toBeInTheDocument()
   })
 
   it('rejects a stale SSE refresh after cooldown completion and preserves frozen reset proof', async () => {
@@ -4296,7 +4477,9 @@ describe('backstage setup', () => {
     })
 
     expect(await screen.findByText(/both isolated environments removed/i)).toBeInTheDocument()
-    expect(screen.getAllByText(/deleted confirmed · clock stopped/i)).toHaveLength(2)
+    expect(screen.getAllByText(/^deleted$/i)).toHaveLength(2)
+    expect(screen.getByText(/removed in 0:02/i)).toBeInTheDocument()
+    expect(screen.getByText(/removed in 0:10/i)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /ring again/i })).toBeEnabled()
   })
 

@@ -706,7 +706,7 @@ async def test_lakebase_rejects_a_cross_region_endpoint(
         await LakebaseCredentialProvider(runner=runner).assert_armed()
 
 
-async def test_lakebase_idle_evidence_carries_the_fresh_observation_time(
+async def test_lakebase_idle_evidence_carries_the_fresh_checked_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configure_lakebase(monkeypatch)
@@ -725,11 +725,13 @@ async def test_lakebase_idle_evidence_carries_the_fresh_observation_time(
 
     evidence = await LakebaseCredentialProvider(runner=runner).assert_armed()
 
-    observed_at = datetime.fromisoformat(str(evidence["observed_at"]))
-    assert before <= observed_at <= datetime.now(UTC)
+    checked_at = datetime.fromisoformat(str(evidence["checked_at"]))
+    assert before <= checked_at <= datetime.now(UTC)
+    assert evidence["provider_updated_at"] is None
+    assert "observed_at" not in evidence
 
 
-async def test_lakebase_idle_evidence_uses_the_provider_transition_time(
+async def test_lakebase_update_time_is_only_advisory_post_close_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configure_lakebase(monkeypatch)
@@ -752,7 +754,68 @@ async def test_lakebase_idle_evidence_uses_the_provider_transition_time(
         not_before=started_at
     )
 
-    assert datetime.fromisoformat(str(evidence["observed_at"])) == transitioned_at
+    assert datetime.fromisoformat(str(evidence["provider_updated_at"])) == transitioned_at
+    assert evidence["provider_update_after_not_before"] is True
+    assert "observed_at" not in evidence
+
+
+async def test_lakebase_stale_update_time_never_rejects_current_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_lakebase(monkeypatch)
+    lane_closed_at = datetime.now(UTC) - timedelta(seconds=5)
+    stale_resource_update = lane_closed_at - timedelta(minutes=30)
+    runner = FakeLakebaseRunner(
+        {
+            "name": "projects/anti-demo/branches/production/endpoints/primary",
+            "update_time": stale_resource_update.isoformat(),
+            "status": {
+                "current_state": "IDLE",
+                "hosts": {
+                    "host": "ep-example.database.us-west-2.cloud.databricks.com"
+                },
+            },
+        }
+    )
+
+    evidence = await LakebaseCredentialProvider(runner=runner).assert_armed(
+        not_before=lane_closed_at
+    )
+
+    assert evidence["state"] == "IDLE"
+    assert evidence["provider_update_after_not_before"] is False
+    assert evidence["provider_updated_at"] == stale_resource_update.isoformat()
+    assert runner.requests == [
+        (
+            "GET",
+            lakebase_resource_path(
+                "projects/anti-demo/branches/production/endpoints/primary"
+            ),
+        )
+    ]
+
+
+async def test_lakebase_active_endpoint_remains_unarmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_lakebase(monkeypatch)
+    endpoint = idle_lakebase_endpoint()
+    endpoint["status"]["current_state"] = "ACTIVE"  # type: ignore[index]
+    runner = FakeLakebaseRunner(endpoint)
+
+    with pytest.raises(TargetNotArmedError, match="ACTIVE, not IDLE"):
+        await LakebaseCredentialProvider(runner=runner).assert_armed(
+            not_before=datetime.now(UTC) - timedelta(minutes=1)
+        )
+
+    assert runner.requests == [
+        (
+            "GET",
+            lakebase_resource_path(
+                "projects/anti-demo/branches/production/endpoints/primary"
+            ),
+        )
+    ]
 
 
 async def test_aurora_proves_two_writer_level_zero_samples(

@@ -379,6 +379,14 @@ class LaneSnapshot(BaseModel):
     status: str = "Sealed"
     error: str | None = None
     verified_at: datetime | None = None
+    # Round 1's verifier returns only after the attempt's connection context has
+    # exited. This is therefore the lane-owned origin for post-bout idle
+    # observation, unlike `SessionSnapshot.updated_at`, which also includes
+    # settlement and lease-transition work performed after every lane closed.
+    connection_closed_at: datetime | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     activity: LaneActivity | None = None
     evidence: dict[str, Any] = Field(
         default_factory=dict,
@@ -471,6 +479,23 @@ class CooldownLaneSnapshot(BaseModel):
     elapsed_ms: float | None = None
     status: str = "Watching for confirmed zero"
     activity: LaneActivity | None = None
+    observed_state: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    observation_count: int = 0
+    confirmation_basis: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    provider_updated_at: datetime | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    checked_at: datetime | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class CooldownSnapshot(BaseModel):

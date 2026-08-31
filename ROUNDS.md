@@ -66,7 +66,23 @@ Round 6 is **Move live application data into the lakehouse**:
 - A separate checkout must also commit successfully as a correctness guardrail. This does not claim measured throughput, p99 impact, or zero production impact.
 - Aurora/RDS require a separately selected, secured, operated, and priced CDC-to-Delta stack. That stack is not built or timed, so no AWS speed margin or dollar savings is claimed.
 
-Round 1 re-do is a different contract: both clocks start together and independently freeze only at genuine idle/scale-zero. The setup uses each product's shortest native automatic suspension timeout—60 seconds for Lakebase and 300 seconds for Aurora Serverless v2—rather than making Lakebase wait five minutes for cosmetic parity. RDS is explicitly `NO SCALE-TO-ZERO`, not falsely reported as idle.
+Round 1 re-do is a different contract: each lane's clock starts when that
+lane's final data-plane connection closes and independently freezes at its
+confirmed idle/scale-zero evidence. The browser advances every still-live lane
+from one shared UI tick; any fixed display offset comes only from the two
+lane-close times and is disclosed under **More Details**, not projected beside
+the clocks. The first terminal snapshot latches that lane's stop time and
+elapsed value; later polls, duplicate events, stale snapshots, and refresh
+reconciliation cannot move it while the other lane continues. A shared overall-cooldown
+origin is deliberately not used, because it would erase real time when
+Lakebase's connection closed—and may already have returned to IDLE—before the
+other lane finished. A documented provider transition after the lane close may
+set an exact end; stale or semantically ambiguous metadata cannot. In that case,
+repeated read-only IDLE observations stop an explicitly labeled observed
+upper-bound clock. The setup still uses each product's shortest native automatic
+suspension timeout—60 seconds for Lakebase and 300 seconds for Aurora Serverless
+v2—rather than making Lakebase wait five minutes for cosmetic parity. RDS is
+explicitly `NO SCALE-TO-ZERO`, not falsely reported as idle.
 
 ## Experience contract
 

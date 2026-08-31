@@ -2742,23 +2742,27 @@ function App() {
         .then((incoming) => {
           if (!active) return
           let accepted = false
+          let reconciled = incoming
           setSession((current) => {
-            if (!current || !acceptsReconciledSession(current, incoming)) return current
+            if (!current) return current
+            const selected = selectRound4Session(current, incoming)
+            if (!selected || selected === current) return current
             accepted = true
-            sessionRef.current = incoming
-            return incoming
+            reconciled = selected
+            sessionRef.current = reconciled
+            return reconciled
           })
           queueMicrotask(() => {
             if (!active || !accepted) return
-            const terminal = incoming.state === 'verified'
-              || incoming.state === 'failed'
-              || incoming.state === 'towelled'
+            const terminal = reconciled.state === 'verified'
+              || reconciled.state === 'failed'
+              || reconciled.state === 'towelled'
             if (terminal) {
               streamInterrupted = false
               setLiveEvidenceConnected(true)
               setError((current) => current === STREAM_INTERRUPTION_ERROR ? null : current)
             }
-            const entry = scorecardEntry(incoming)
+            const entry = scorecardEntry(reconciled)
             if (entry) {
               setScorecard((current) => [
                 ...current.filter((candidate) => candidate.session_id !== entry.session_id),
@@ -2767,19 +2771,19 @@ function App() {
             }
             if (
               (stageRef.current === 'matchup' || stageRef.current === 'ready')
-              && incoming.state === 'failed'
-              && !incoming.run_started_at
+              && reconciled.state === 'failed'
+              && !reconciled.run_started_at
             ) {
               streamInterrupted = false
               sessionRef.current = null
               setSession(null)
-              setError(incoming.failure ?? 'The fight card could not be armed. No run started.')
+              setError(reconciled.failure ?? 'The fight card could not be armed. No run started.')
               navigate('setup', 'card', 'replace')
-            } else if (stageRef.current === 'matchup' && incoming.state === 'armed') {
+            } else if (stageRef.current === 'matchup' && reconciled.state === 'armed') {
               navigate('ready', 'card', 'replace')
             } else if (
               (stageRef.current === 'matchup' || stageRef.current === 'ready')
-              && (incoming.state === 'running' || incoming.run_started_at)
+              && (reconciled.state === 'running' || reconciled.run_started_at)
             ) {
               navigate('proof', 'card', 'replace')
             }
@@ -6422,6 +6426,7 @@ function CooldownDetails({
   const aurora = session.competitor.id === 'aurora_serverless_v2'
   const deleting = cooldown.mode !== 'return_to_idle'
   const recovery = cooldown.mode === 'delete_recovery_environment'
+  const originOffset = cooldownOriginOffsetCopy(cooldown, session.competitor.short_name)
   return (
     <div className="replay-overlay" role="presentation" onClick={onClose}>
       <section className="replay-modal cooldown-details" role="dialog" aria-modal="true" aria-labelledby="cooldown-details-heading" onClick={(event) => event.stopPropagation()}>
@@ -6435,7 +6440,8 @@ function CooldownDetails({
             <b>{deleting ? lakebase.state === 'confirmed_deleted' ? 'DELETED confirmed' : 'Deleting' : lakebase.state === 'confirmed_zero' ? 'IDLE confirmed' : 'Watching'}</b>
             <span>Call · <code>{deleting ? 'databricks postgres get-branch' : 'databricks postgres get-endpoint'}</code></span>
             <span>Read · <code>{deleting ? 'resource absent' : 'status.current_state'}</code></span>
-            <span>Stop · <code>{deleting ? `${recovery ? 'recovery branch' : 'branch'} absent` : 'IDLE'}</code></span>
+            <span>Stop · <code>{deleting ? `${recovery ? 'recovery branch' : 'branch'} absent` : 'verified transaction + final connection close + current IDLE'}</code></span>
+            {!deleting && <span>Fallback · repeated independent <code>IDLE</code> polls with monotonic dwell</span>}
             <p>Now · {lakebase.status}</p>
           </article>
           <article>
@@ -6463,10 +6469,34 @@ function CooldownDetails({
             <p>Now · {competitor.status}</p>
           </article>
         </div>
+        {!deleting && (
+          <section className="cooldown-provenance" aria-label="Timer evidence and arithmetic">
+            <h3>Timer evidence and arithmetic</h3>
+            <p>{originOffset}</p>
+            <div>
+              {([lakebase, competitor]).map((lane) => (
+                <article key={lane.id}>
+                  <strong>{lane.name}</strong>
+                  <span>Last connection closed · <code>{lane.started_at}</code></span>
+                  <span>Last control-plane check · <code>{lane.checked_at ?? 'not recorded'}</code></span>
+                  <span>Provider <code>update_time</code> · <code>{lane.provider_updated_at ?? 'not available'}</code></span>
+                  <span>Evidence class · <code>{cooldownEvidenceClass(lane)}</code></span>
+                  <span>
+                    Arithmetic · <code>{lane.elapsed_ms === null
+                      ? `live: shared display tick - ${lane.started_at}`
+                      : `${lane.confirmed_at ?? lane.checked_at ?? 'stop observation'} - ${lane.started_at} = ${lane.elapsed_ms.toFixed(3)} ms`}</code>
+                  </span>
+                </article>
+              ))}
+            </div>
+            <p>Polling and delivery lag never extends a frozen result. The server’s first terminal lane snapshot owns the displayed stop value.</p>
+            <IdlePolicyFloor competitorCannotIdle={competitor.state === 'not_supported'} descentCost={session.descent_cost} />
+          </section>
+        )}
         <ol className="cooldown-proof-rules">
-          <li><span>01</span><div><strong>One bell</strong><small>Shared server reset time</small></div></li>
-          <li><span>02</span><div><strong>Two watchers</strong><small>Read-only control planes</small></div></li>
-          <li><span>03</span><div><strong>No wake effect</strong><small>The watcher never opens SQL</small></div></li>
+          <li><span>01</span><div><strong>Lane-owned starts</strong><small>Each final connection close</small></div></li>
+          <li><span>02</span><div><strong>One display tick</strong><small>Both live clocks update together</small></div></li>
+          <li><span>03</span><div><strong>Read-only watchers</strong><small>No SQL wake effect</small></div></li>
         </ol>
         <button className="replay-close" onClick={onClose}>B · Back to the clocks</button>
       </section>
@@ -6502,6 +6532,7 @@ function BetweenRounds({
   const [showIdleReceipt, setShowIdleReceipt] = useState(false)
   const [showDetails, setShowDetails] = useState(false)
   const cooldown = session.cooldown
+  const sharedNow = useSharedCooldownTick(cooldown)
   if (!cooldown) return null
   const ready = cooldown.state === 'ready'
   const failed = cooldown.state === 'failed'
@@ -6521,7 +6552,8 @@ function BetweenRounds({
         : 'Lakebase clock is live · RDS has no automatic scale-to-zero'
       : ready
         ? 'Both databases IDLE · RING AGAIN is ready'
-        : 'Clocks are live · Waiting for each database to report IDLE'
+        : 'Waiting for each database to become idle'
+  const liveReferenceStartedAt = latestCooldownLaneStart(cooldown)
   const waitingLabel = deleting ? 'Waiting for cleanup' : 'Waiting for idle'
   return (
     <main className="retro-screen between-screen">
@@ -6532,13 +6564,12 @@ function BetweenRounds({
           ? 'Both clocks started together at 0:00. Each stops only when its owned recovery environment is confirmed deleted.'
           : deleting
           ? 'Both clocks started together at 0:00. Each stops only when its isolated environment is confirmed deleted.'
-          : 'Clocks auto-started at 0:00 when the round ended. Each stops only when the control plane confirms IDLE.'}
+          : "Each timer starts after that database's last connection closes."}
       </p>
-      {!deleting && <IdlePolicyFloor competitorCannotIdle={competitorCannotIdle} descentCost={session.descent_cost} />}
       <div className="cooldown-match">
-        <CooldownLane key={`lakebase:${cooldown.lanes.lakebase.started_at}`} lane={cooldown.lanes.lakebase} label="Lakebase" corner="red" mode={cooldown.mode} />
+        <CooldownLane key={`lakebase:${cooldown.lanes.lakebase.started_at}`} lane={cooldown.lanes.lakebase} label="Lakebase" corner="red" mode={cooldown.mode} sharedNow={sharedNow} liveReferenceStartedAt={liveReferenceStartedAt} />
         <b>VS</b>
-        <CooldownLane key={`competitor:${cooldown.lanes.competitor.started_at}`} lane={cooldown.lanes.competitor} label={competitor} corner="blue" mode={cooldown.mode} />
+        <CooldownLane key={`competitor:${cooldown.lanes.competitor.started_at}`} lane={cooldown.lanes.competitor} label={competitor} corner="blue" mode={cooldown.mode} sharedNow={sharedNow} liveReferenceStartedAt={liveReferenceStartedAt} />
       </div>
       <p className="between-status" data-ready={ready}>{resetStatus}</p>
       {error && <p className="between-refusal" role="alert">{error}</p>}
@@ -6954,65 +6985,133 @@ function scorecardCompetitorLabel(entry: ScorecardEntry): string {
   return 'OPP'
 }
 
+function useSharedCooldownTick(cooldown: CooldownSnapshot | null | undefined): number {
+  const ticking = Boolean(
+    cooldown
+    && Object.values(cooldown.lanes).some((lane) => lane.state === 'watching'),
+  )
+  const originKey = cooldown
+    ? Object.values(cooldown.lanes).map((lane) => lane.started_at).join('|')
+    : ''
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    if (!ticking) return
+    const interval = window.setInterval(() => setNow(Date.now()), 250)
+    return () => window.clearInterval(interval)
+  }, [originKey, ticking])
+  return now
+}
+
+function latestCooldownLaneStart(cooldown: CooldownSnapshot): string {
+  const starts = Object.values(cooldown.lanes).map((lane) => Date.parse(lane.started_at))
+  return new Date(Math.max(...starts)).toISOString()
+}
+
+function displayedOriginOffsetMs(
+  startedAt: string,
+  liveReferenceStartedAt: string,
+): number {
+  const differenceMs = Math.max(
+    0,
+    Date.parse(liveReferenceStartedAt) - Date.parse(startedAt),
+  )
+  return Math.round(differenceMs / 1000) * 1000
+}
+
+function liveCooldownElapsedMs(
+  startedAt: string,
+  liveReferenceStartedAt: string,
+  sharedNow: number,
+): number {
+  const sharedElapsedMs = cooldownDisplayMilliseconds(
+    Math.max(0, sharedNow - Date.parse(liveReferenceStartedAt)),
+  )
+  return sharedElapsedMs + displayedOriginOffsetMs(startedAt, liveReferenceStartedAt)
+}
+
+function cooldownOriginOffsetCopy(
+  cooldown: CooldownSnapshot,
+  competitor: string,
+): string {
+  const lakebaseStartedAt = Date.parse(cooldown.lanes.lakebase.started_at)
+  const competitorStartedAt = Date.parse(cooldown.lanes.competitor.started_at)
+  const differenceMs = Math.abs(lakebaseStartedAt - competitorStartedAt)
+  const displayedDifference = cooldownTime(Math.round(differenceMs / 1000) * 1000)
+  if (displayedDifference === '0:00') {
+    return 'One UI tick drives both live timers · Final connections closed within the same displayed second.'
+  }
+  const earlier = lakebaseStartedAt < competitorStartedAt ? 'Lakebase' : competitor
+  const later = lakebaseStartedAt < competitorStartedAt ? competitor : 'Lakebase'
+  return `One UI tick drives both live timers · ${earlier} closed its final connection ${displayedDifference} before ${later}, so its live clock starts ${displayedDifference} ahead.`
+}
+
 
 function CooldownLane({
   lane,
   label,
   corner,
   mode,
+  sharedNow,
+  liveReferenceStartedAt,
 }: {
   lane: NonNullable<DemoSession['cooldown']>['lanes'][LaneId]
   label: string
   corner: 'red' | 'blue'
   mode: CooldownSnapshot['mode']
+  sharedNow: number
+  liveReferenceStartedAt: string
 }) {
   const active = lane.state === 'watching'
-  const [clock, setClock] = useState(() => {
-    const now = Date.now()
-    const provisionalMs = Math.max(0, now - Date.parse(lane.started_at))
-    return {
-      startedAt: lane.started_at,
-      now,
-      highestProvisionalDisplayMs: active ? cooldownDisplayMilliseconds(provisionalMs) : 0,
-    }
-  })
-  useEffect(() => {
-    if (!active) return
-    const interval = window.setInterval(() => {
-      const now = Date.now()
-      const provisionalMs = Math.max(0, now - Date.parse(lane.started_at))
-      setClock((current) => ({
-        startedAt: lane.started_at,
-        now,
-        highestProvisionalDisplayMs: Math.max(
-          current.startedAt === lane.started_at ? current.highestProvisionalDisplayMs : 0,
-          cooldownDisplayMilliseconds(provisionalMs),
-        ),
-      }))
-    }, 250)
-    return () => window.clearInterval(interval)
-  }, [active, lane.started_at])
-  const elapsedMs = lane.elapsed_ms ?? Math.max(0, clock.now - Date.parse(lane.started_at))
+  const provisional = liveCooldownElapsedMs(
+    lane.started_at,
+    liveReferenceStartedAt,
+    sharedNow,
+  )
+  const elapsedMs = lane.elapsed_ms ?? provisional
   const display = cooldownTime(elapsedMs)
-  const authoritativeDisplayMs = lane.elapsed_ms === null
-    ? null
-    : cooldownDisplayMilliseconds(lane.elapsed_ms)
-  const excludedLagMs = !active && authoritativeDisplayMs !== null
-    ? Math.max(0, clock.highestProvisionalDisplayMs - authoritativeDisplayMs)
-    : 0
   const unsupported = lane.state === 'not_supported'
   const deleted = lane.state === 'confirmed_deleted'
-  const status = unsupported
-    ? 'No automatic scale-to-zero'
+  const idleObserved = lane.observed_state === 'IDLE'
+  const providerTransition = lane.confirmation_basis === 'provider_transition'
+  const observedUpperBound = lane.state === 'confirmed_zero' && !providerTransition
+  const statusTitle = unsupported
+    ? 'NO AUTOMATIC IDLE'
     : deleted
-      ? 'DELETED confirmed · Clock stopped'
+      ? 'DELETED'
       : lane.state === 'confirmed_zero'
-      ? 'IDLE confirmed · Provider transition time · Clock stopped'
+      ? 'IDLE CONFIRMED'
       : lane.state === 'failed'
-        ? mode === 'return_to_idle' ? 'IDLE could not be verified' : 'Delete could not be verified'
+        ? mode === 'return_to_idle' ? 'IDLE NOT VERIFIED' : 'DELETE NOT VERIFIED'
         : mode === 'return_to_idle'
-          ? 'ACTIVE · Provisional wall time · Awaiting provider timestamp'
-          : 'RESETTING · Provisional wall time · Awaiting provider timestamp'
+          ? idleObserved
+            ? 'CONFIRMING IDLE'
+            : 'WAITING FOR IDLE'
+          : 'RESETTING'
+  const statusDetail = unsupported
+    ? 'This database cannot pause automatically'
+    : deleted
+      ? `Removed in ${display}`
+      : lane.state === 'confirmed_zero'
+        ? observedUpperBound
+          ? `Within ${display} of its last connection`
+          : `Idle ${display} after its last connection`
+        : lane.state === 'failed'
+          ? mode === 'return_to_idle' ? 'The idle state could not be confirmed' : 'Deletion could not be confirmed'
+          : mode === 'return_to_idle'
+            ? `${display} since its last connection`
+            : `${display} since reset began`
+  const visibleClock = unsupported
+    ? 'NO SCALE-TO-ZERO'
+    : `${observedUpperBound ? '≤' : active && mode !== 'return_to_idle' ? '~' : ''}${display}`
+  const clockAriaLabel = unsupported
+    ? 'No automatic scale to zero'
+    : observedUpperBound
+      ? `Observed upper bound: IDLE confirmed within ${display} of its last connection`
+      : providerTransition
+        ? `Exact provider transition: IDLE ${display} after its last connection`
+        : active && mode === 'return_to_idle'
+          ? `${display} since its last connection; waiting for IDLE`
+          : visibleClock
   return (
     <section
       className="cooldown-lane"
@@ -7022,14 +7121,27 @@ function CooldownLane({
     >
       <div className="cooldown-name"><DatabaseFighter label={corner === 'red' ? 'LB' : label.toLowerCase().includes('aurora') ? 'AUR' : 'RDS'} corner={corner} /><strong>{label}</strong></div>
       <div className="cooldown-time">
-        <span>{unsupported ? 'NO SCALE-TO-ZERO' : `${active ? '~' : ''}${display}`}</span>
-        {excludedLagMs > 0 && (
-          <small className="cooldown-lag">~{cooldownTime(excludedLagMs)} polling/delivery lag excluded</small>
-        )}
+        <span aria-label={clockAriaLabel}>{visibleClock}</span>
       </div>
-      <p title={lane.status}>{status}</p>
+      <p className="cooldown-summary"><strong>{statusTitle}</strong><span>{statusDetail}</span></p>
     </section>
   )
+}
+
+function cooldownEvidenceClass(
+  lane: CooldownSnapshot['lanes'][LaneId],
+): string {
+  if (lane.confirmation_basis === 'provider_transition') return 'exact provider transition'
+  if (lane.confirmation_basis === 'provider_update_corroboration') {
+    return 'observed upper bound; provider update_time corroborates current state'
+  }
+  if (lane.confirmation_basis === 'observed_idle_dwell') {
+    return 'observed upper bound; repeated IDLE checks'
+  }
+  if (lane.confirmation_basis === 'observed_samples') {
+    return 'observed upper bound; repeated zero-capacity samples'
+  }
+  return lane.state === 'watching' ? 'live elapsed since lane close' : 'not recorded'
 }
 
 function cooldownDisplayMilliseconds(milliseconds: number): number {
@@ -7103,7 +7215,7 @@ function RingsideCommentator({
             {lines.lanes.map((line, index) => <li key={index}>{line}</li>)}
           </ul>
           <p>{lines.verdict}</p>
-          {wireCalls.length > 0 && !conciseFlowRound && <code>ON THE WIRE · {wireCalls.join(' · ')}</code>}
+          {wireCalls.length > 0 && !conciseFlowRound && !cooldown && <code>ON THE WIRE · {wireCalls.join(' · ')}</code>}
           </>
         )}
       </div>
@@ -7355,6 +7467,21 @@ function frozenLaneTime(elapsedMs: number | null): string {
 function cooldownCommentary(session: DemoSession): { lanes: string[]; verdict: string } {
   const cooldown = session.cooldown!
   const recovery = cooldown.mode === 'delete_recovery_environment'
+  if (cooldown.mode === 'return_to_idle') {
+    const lanes = ([cooldown.lanes.lakebase, cooldown.lanes.competitor]).map((lane) => {
+      if (lane.state === 'confirmed_zero') return `${lane.name} · IDLE confirmed`
+      if (lane.state === 'not_supported') return `${lane.name} · No automatic idle`
+      if (lane.state === 'failed') return `${lane.name} · IDLE not verified`
+      if (lane.observed_state === 'IDLE') return `${lane.name} · Confirming IDLE`
+      return `${lane.name} · Waiting for IDLE`
+    })
+    return {
+      lanes,
+      verdict: cooldown.state === 'ready'
+        ? 'Both databases are idle'
+        : 'Waiting for both databases to return to idle',
+    }
+  }
   const lanes = ([cooldown.lanes.lakebase, cooldown.lanes.competitor]).map((lane) => {
     const fallback = lane.state === 'confirmed_zero'
       ? 'Control plane confirmed zero'
@@ -7366,17 +7493,13 @@ function cooldownCommentary(session: DemoSession): { lanes: string[]; verdict: s
             ? cooldown.mode === 'return_to_idle'
               ? 'Zero was not confirmed'
               : `Owned ${recovery ? 'recovery' : 'isolated'} environment deletion failed`
-            : cooldown.mode === 'return_to_idle'
-              ? 'Watching for control-plane confirmation of zero'
-              : `Removing only the owned ${recovery ? 'recovery' : 'isolated'} environment`
+            : `Removing only the owned ${recovery ? 'recovery' : 'isolated'} environment`
     const current = lane.status || fallback
     return lane.state === 'watching' && current !== fallback
       ? `${lane.name} · ${fallback} · ${current}`
       : `${lane.name} · ${current}`
   })
-  const verdict = cooldown.mode === 'return_to_idle'
-    ? 'Re-do reset in progress · Waiting for authoritative zero-state evidence'
-    : `Cleanup in progress · Only owned ${recovery ? 'recovery' : 'isolated'} environments are targets`
+  const verdict = `Cleanup in progress · Only owned ${recovery ? 'recovery' : 'isolated'} environments are targets`
   return { lanes, verdict }
 }
 

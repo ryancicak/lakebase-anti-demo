@@ -617,6 +617,10 @@ class SessionRecord:
     # private T0. Kept off the snapshot deliberately: it is a raw monotonic
     # reading, and no monotonic value may reach a public event.
     round5_progress_observed_ns: dict[str, int] = field(default_factory=dict)
+    # Consecutive Lakebase IDLE observations are timed in the process monotonic
+    # domain. The public snapshot carries only their count and wall-clock upper
+    # bound; a raw monotonic value must never cross the API boundary.
+    cooldown_idle_observations: dict[str, tuple[int, int]] = field(default_factory=dict)
     towel_generation: int = 0
     towel_stop_event: asyncio.Event | None = None
     armed_at_monotonic: float | None = None
@@ -750,6 +754,10 @@ class RunManager:
         self._cooldown_timeout = float(os.environ.get("ANTI_DEMO_COOLDOWN_TIMEOUT_SECONDS", "900"))
         self._cooldown_poll_timeout = float(
             os.environ.get("ANTI_DEMO_COOLDOWN_POLL_TIMEOUT_SECONDS", "30")
+        )
+        self._lakebase_idle_dwell = max(
+            0.001,
+            float(os.environ.get("ANTI_DEMO_LAKEBASE_IDLE_DWELL_SECONDS", "0.001")),
         )
         self._lease_heartbeat = float(os.environ.get("ANTI_DEMO_LEASE_HEARTBEAT_SECONDS", "15"))
         self._active_lease_ttl = max(
@@ -2391,6 +2399,7 @@ class RunManager:
         reset_mode: ResetMode,
     ) -> CooldownSnapshot:
         started_at = datetime.now(UTC)
+        record.cooldown_idle_observations.clear()
         owns_artifacts = reset_mode in {
             ResetMode.DELETE_ISOLATED_ENVIRONMENT,
             ResetMode.DELETE_RECOVERY_ENVIRONMENT,
@@ -2403,7 +2412,15 @@ class RunManager:
                 lane_id: CooldownLaneSnapshot(
                     id=lane_id,
                     name=lane.name,
-                    started_at=started_at,
+                    started_at=(
+                        min(lane.connection_closed_at, started_at)
+                        if (
+                            reset_mode == ResetMode.RETURN_TO_IDLE
+                            and lane.state == LaneState.VERIFIED
+                            and lane.connection_closed_at is not None
+                        )
+                        else started_at
+                    ),
                     status=(
                         "Deleting owned recovery environment"
                         if is_recovery
@@ -3685,7 +3702,7 @@ class RunManager:
                         record,
                         recovery=mode == ResetMode.DELETE_RECOVERY_ENVIRONMENT,
                     )
-            else:
+            elif mode != ResetMode.RETURN_TO_IDLE or cleanup_ready:
                 await self._release_bout(record)
 
     async def _transition_bout_to_cleanup(
@@ -7187,6 +7204,12 @@ class RunManager:
                 lane.elapsed_ms = lane_result.elapsed_ms
                 lane.attempts = lane_result.attempts
                 lane.error = lane_result.error
+                lane.connection_closed_at = lane_result.connection_closed_at
+                lane.verified_at = (
+                    lane_result.connection_closed_at
+                    if lane_result.state == LaneState.VERIFIED
+                    else None
+                )
                 lane.status = (
                     "Transaction verified"
                     if lane_result.state == LaneState.VERIFIED
@@ -7712,7 +7735,6 @@ class RunManager:
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._cooldown_timeout
-        not_before = record.snapshot.cooldown.started_at
         while loop.time() < deadline:
             remaining = deadline - loop.time()
             poll_timeout = max(
@@ -7720,8 +7742,21 @@ class RunManager:
                 min(self._cooldown_poll_timeout, remaining),
             )
             tasks = [
-                asyncio.create_task(self._observe_cooldown_target(target, not_before, poll_timeout))
+                asyncio.create_task(
+                    self._observe_cooldown_target(
+                        target,
+                        record.snapshot.cooldown.lanes[target.id].started_at,
+                        poll_timeout,
+                    )
+                )
                 for target in record.live_targets
+                # A confirmed lane owns an immutable stop result. Continuing to
+                # poll it used to publish a later `confirmed_at`/`elapsed_ms`
+                # every cycle while the other lane was still active.
+                if (
+                    record.snapshot.cooldown.lanes[target.id].state
+                    != CooldownLaneState.CONFIRMED_ZERO
+                )
             ]
             for task in asyncio.as_completed(tasks):
                 target, check, completed_at = await task
@@ -7782,6 +7817,47 @@ class RunManager:
             "cooldown_update",
             {"cooldown": snapshot.model_dump(mode="json")},
         )
+        await self._pin_round_one_cooldown_failure(record)
+
+    async def _pin_round_one_cooldown_failure(self, record: SessionRecord) -> None:
+        """Publish a finite durable failure fence and stop renewing it.
+
+        A terminal observation timeout has no owned artifact to clean, but it
+        must not flash READY immediately either. Transitioning the existing row
+        to `cooldown_failed` keeps this round unavailable across replicas for one
+        ordinary active-lease TTL. The heartbeat is cancelled whether the
+        transition succeeds or not, so a coordinator fault degrades to the
+        existing row's finite expiry instead of an immortal cooldown lease.
+        """
+
+        expected: BoutLease | None
+        async with record.lease_lock:
+            expected = record.lease
+            if (
+                expected is not None
+                and expected.session_id == record.snapshot.id
+                and expected.phase == "cooldown"
+            ):
+                try:
+                    record.lease = await self._lease_store_for_record(record).transition(
+                        expected,
+                        operator=record.operator or expected.operator,
+                        expected_phase="cooldown",
+                        phase="cooldown_failed",
+                        session_state=record.snapshot.state,
+                        ttl=timedelta(seconds=self._active_lease_ttl),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Round 1 cooldown failure fence could not be persisted "
+                        "session=%s diagnostic=%s",
+                        record.snapshot.id,
+                        _redacted_exception_chain(exc),
+                    )
+        if expected is None:
+            self._cancel_lease_heartbeat(record)
+        else:
+            self._cancel_lease_heartbeat(record, expected)
 
     @staticmethod
     async def _observe_cooldown_target(
@@ -7809,73 +7885,190 @@ class RunManager:
             if cooldown is None:
                 raise InvalidStateError("The Round 1 re-do clock is no longer active")
             lane = cooldown.lanes[target_id]
+            if lane.state == CooldownLaneState.CONFIRMED_ZERO:
+                # A task may have been launched just before another observation
+                # confirmed this lane. Never let that in-flight or duplicated
+                # result move the terminal evidence boundary.
+                return False, cooldown.model_copy(deep=True)
+
+            def assign(field_name: str, value: object) -> None:
+                nonlocal changed
+                if getattr(lane, field_name) != value:
+                    setattr(lane, field_name, value)
+                    changed = True
+
             wire_call = _round_one_cooldown_wire_call(
                 target_id,
                 record.snapshot.competitor.id,
             )
+            assign("checked_at", completed_at)
             if isinstance(check, dict):
+                observed_state = str(check.get("state") or "").upper() or None
+                assign("observed_state", observed_state)
                 if check.get("eligible", True) is False:
-                    if lane.state != CooldownLaneState.NOT_SUPPORTED:
-                        lane.state = CooldownLaneState.NOT_SUPPORTED
-                        lane.confirmed_at = completed_at
-                        lane.elapsed_ms = None
-                        changed = True
+                    assign("state", CooldownLaneState.NOT_SUPPORTED)
+                    assign("confirmed_at", completed_at)
+                    assign("elapsed_ms", None)
+                    assign("observation_count", 1)
+                    assign("confirmation_basis", "engine_capability")
                     status = "No automatic scale-to-zero"
                     activity = LaneActivity(
                         phase="not_supported",
                         wire_call=wire_call,
                     )
+                elif (
+                    target_id == "lakebase"
+                    and cooldown.mode == ResetMode.RETURN_TO_IDLE
+                ):
+                    source_lane = record.snapshot.lanes[target_id]
+                    activity_proved = bool(
+                        source_lane.state == LaneState.VERIFIED
+                        and source_lane.connection_closed_at is not None
+                    )
+                    provider_updated_at = self._cooldown_timestamp(
+                        check.get("provider_updated_at")
+                    )
+                    assign("provider_updated_at", provider_updated_at)
+                    now_ns = time.monotonic_ns()
+                    previous = record.cooldown_idle_observations.get(target_id)
+                    if previous is None:
+                        observation_count, first_observed_ns = 1, now_ns
+                    else:
+                        prior_count, first_observed_ns = previous
+                        observation_count = prior_count + 1
+                    record.cooldown_idle_observations[target_id] = (
+                        observation_count,
+                        first_observed_ns,
+                    )
+                    assign("observation_count", observation_count)
+
+                    provider_corrobates_post_close = bool(
+                        provider_updated_at is not None
+                        and lane.started_at <= provider_updated_at <= completed_at
+                    )
+                    dwell_seconds = max(0.0, (now_ns - first_observed_ns) / 1e9)
+                    dwell_confirmed = bool(
+                        observation_count >= 2
+                        and now_ns > first_observed_ns
+                        and dwell_seconds >= self._lakebase_idle_dwell
+                    )
+                    if activity_proved and (
+                        provider_corrobates_post_close or dwell_confirmed
+                    ):
+                        # This is an observed-by upper bound. Even when the
+                        # provider resource was updated after the connection
+                        # closed, its `update_time` remains advisory metadata,
+                        # never a claimed IDLE transition time.
+                        assign("state", CooldownLaneState.CONFIRMED_ZERO)
+                        assign("confirmed_at", completed_at)
+                        assign(
+                            "elapsed_ms",
+                            max(
+                                0.0,
+                                (completed_at - lane.started_at).total_seconds() * 1000,
+                            ),
+                        )
+                        basis = (
+                            "provider_update_corroboration"
+                            if provider_corrobates_post_close
+                            else "observed_idle_dwell"
+                        )
+                        assign("confirmation_basis", basis)
+                        status = (
+                            "IDLE confirmed by current control-plane state; endpoint "
+                            "update metadata corroborates a post-close observation"
+                            if provider_corrobates_post_close
+                            else "IDLE confirmed by repeated independent control-plane "
+                            "observations after the lane connection closed"
+                        )
+                        activity = LaneActivity(
+                            phase="confirmed_zero",
+                            wire_call=wire_call,
+                        )
+                    else:
+                        assign("state", CooldownLaneState.WATCHING)
+                        assign("confirmed_at", None)
+                        assign("elapsed_ms", None)
+                        assign("confirmation_basis", None)
+                        if not activity_proved:
+                            status = (
+                                "IDLE observed, but no verified lane transaction and "
+                                "final connection close prove post-bout activity"
+                            )
+                        else:
+                            status = (
+                                "IDLE observed after the lane connection closed; "
+                                "confirming monotonic dwell with another independent poll"
+                            )
+                        activity = LaneActivity(
+                            phase="watching",
+                            wire_call=wire_call,
+                        )
                 else:
                     confirmed_at = self._cooldown_evidence_time(
                         check,
                         lane.started_at,
                         completed_at,
                     )
-                    if lane.state != CooldownLaneState.CONFIRMED_ZERO:
-                        lane.state = CooldownLaneState.CONFIRMED_ZERO
-                        lane.confirmed_at = confirmed_at
-                        lane.elapsed_ms = max(
+                    assign("state", CooldownLaneState.CONFIRMED_ZERO)
+                    assign("confirmed_at", confirmed_at)
+                    assign(
+                        "elapsed_ms",
+                        max(
                             0.0,
                             (confirmed_at - lane.started_at).total_seconds() * 1000,
-                        )
-                        changed = True
+                        ),
+                    )
+                    assign("observation_count", 1)
+                    assign(
+                        "confirmation_basis",
+                        (
+                            "provider_transition"
+                            if check.get("evidence") == "RDS_EVENT_SUCCESSFULLY_PAUSED"
+                            else "observed_samples"
+                        ),
+                    )
                     status = "Control plane confirmed zero"
                     activity = LaneActivity(
                         phase="confirmed_zero",
                         wire_call=wire_call,
                     )
-                if lane.activity != activity:
-                    lane.activity = activity
-                    changed = True
-                if lane.status != status:
-                    lane.status = status
-                    changed = True
+                assign("activity", activity)
+                assign("status", status)
             elif isinstance(check, TargetNotArmedError):
+                record.cooldown_idle_observations.pop(target_id, None)
+                assign("observation_count", 0)
+                assign("confirmation_basis", None)
+                assign("provider_updated_at", None)
+                assign("observed_state", None)
                 status = str(check)
                 activity = LaneActivity(phase="watching", wire_call=wire_call)
-                if lane.activity != activity:
-                    lane.activity = activity
-                    changed = True
+                assign("activity", activity)
                 if lane.state == CooldownLaneState.CONFIRMED_ZERO:
-                    lane.state = CooldownLaneState.WATCHING
-                    lane.confirmed_at = None
-                    lane.elapsed_ms = None
-                    changed = True
-                if lane.status != status:
-                    lane.status = status
-                    changed = True
+                    assign("state", CooldownLaneState.WATCHING)
+                    assign("confirmed_at", None)
+                    assign("elapsed_ms", None)
+                assign("status", status)
             else:
                 status = "Control-plane check delayed; retrying"
                 activity = LaneActivity(phase="watching", wire_call=wire_call)
-                if lane.activity != activity:
-                    lane.activity = activity
-                    changed = True
-                if lane.status != status:
-                    lane.status = status
-                    changed = True
+                assign("activity", activity)
+                assign("status", status)
             if changed:
                 record.snapshot.updated_at = completed_at
             return changed, cooldown.model_copy(deep=True)
+
+    @staticmethod
+    def _cooldown_timestamp(raw: object) -> datetime | None:
+        if not isinstance(raw, str):
+            return None
+        try:
+            observed_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if observed_at.tzinfo is None:
+            return None
+        return observed_at.astimezone(UTC)
 
     @staticmethod
     def _cooldown_evidence_time(
@@ -7883,14 +8076,8 @@ class RunManager:
         started_at: datetime,
         completed_at: datetime,
     ) -> datetime:
-        raw = check.get("observed_at")
-        if not isinstance(raw, str):
-            return completed_at
-        try:
-            observed_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            return completed_at
-        if observed_at.tzinfo is None:
+        observed_at = RunManager._cooldown_timestamp(check.get("observed_at"))
+        if observed_at is None:
             return completed_at
         # A provider can return the timestamp of its control-plane evidence. Clamp
         # it to this re-do window so skew or malformed evidence cannot forge a time.
@@ -7992,6 +8179,7 @@ class RunManager:
             lane.status = "Sealed"
             lane.error = None
             lane.verified_at = None
+            lane.connection_closed_at = None
             lane.activity = None
             lane.evidence = {}
 

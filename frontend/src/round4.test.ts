@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { FALLBACK_CATALOG } from './catalog'
-import type { DemoSession, RedoSnapshot, RunEvent } from './api/types'
+import type { CooldownSnapshot, DemoSession, RedoSnapshot, RunEvent } from './api/types'
 import {
   ROUND_FOUR_FOOTER,
   ROUND_FOUR_LEGEND,
@@ -12,6 +12,7 @@ import {
   roundFourFooter,
   roundFourPresentation,
   roundFourUnsupportedReason,
+  selectRound4Session,
 } from './round4'
 
 function proofLane(version: 'v1' | 'v2') {
@@ -217,5 +218,131 @@ describe('Round 4 event and reconciliation policy', () => {
       evidence: { unsupported_reason: 'No AWS-native equivalent lane was configured or timed in this scoped proof.' },
     })).toBe('No AWS-native equivalent lane was configured or timed in this scoped proof.')
     expect(roundFourUnsupportedReason({ ...lane, evidence: { unsupported_reason: 42 } })).toBe(lane.status)
+  })
+})
+
+function watchingCooldown(): CooldownSnapshot {
+  return {
+    mode: 'return_to_idle',
+    state: 'watching',
+    started_at: '2026-08-18T20:00:10Z',
+    failure: null,
+    lanes: {
+      lakebase: {
+        id: 'lakebase',
+        name: 'Lakebase',
+        state: 'watching',
+        started_at: '2026-08-18T20:00:00Z',
+        confirmed_at: null,
+        elapsed_ms: null,
+        status: 'Watching',
+      },
+      competitor: {
+        id: 'competitor',
+        name: 'Aurora Serverless v2',
+        state: 'watching',
+        started_at: '2026-08-18T20:00:10Z',
+        confirmed_at: null,
+        elapsed_ms: null,
+        status: 'Watching',
+      },
+    },
+  }
+}
+
+describe('Cooldown terminal lane merge policy', () => {
+  it('latches the first confirmed elapsed value across later and reconciled snapshots', () => {
+    const current = { ...session(), cooldown: watchingCooldown() }
+    const confirmed = applyRunEventSnapshot(current, {
+      sequence: 10,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-18T20:01:17Z',
+      payload: {
+        cooldown: {
+          ...watchingCooldown(),
+          lanes: {
+            ...watchingCooldown().lanes,
+            lakebase: {
+              ...watchingCooldown().lanes.lakebase,
+              state: 'confirmed_zero',
+              confirmed_at: '2026-08-18T20:01:17Z',
+              elapsed_ms: 77_000,
+              status: 'IDLE confirmed',
+            },
+          },
+        },
+      },
+    } satisfies RunEvent)!
+
+    const duplicate = applyRunEventSnapshot(confirmed, {
+      sequence: 11,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-18T20:02:39Z',
+      payload: {
+        cooldown: {
+          ...watchingCooldown(),
+          lanes: {
+            ...watchingCooldown().lanes,
+            lakebase: {
+              ...watchingCooldown().lanes.lakebase,
+              state: 'confirmed_zero',
+              confirmed_at: '2026-08-18T20:02:39Z',
+              elapsed_ms: 159_000,
+              status: 'Repeated IDLE confirmation',
+            },
+          },
+        },
+      },
+    } satisfies RunEvent)!
+    expect(duplicate.cooldown!.lanes.lakebase).toEqual(
+      confirmed.cooldown!.lanes.lakebase,
+    )
+    expect(duplicate.cooldown!.lanes.competitor.state).toBe('watching')
+
+    const staleWaiting = applyRunEventSnapshot(duplicate, {
+      sequence: 12,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-18T20:02:40Z',
+      payload: { cooldown: watchingCooldown() },
+    } satisfies RunEvent)!
+    expect(staleWaiting.cooldown!.lanes.lakebase.elapsed_ms).toBe(77_000)
+    expect(staleWaiting.cooldown!.lanes.lakebase.state).toBe('confirmed_zero')
+
+    const reconciled = selectRound4Session(staleWaiting, {
+      ...staleWaiting,
+      updated_at: '2026-08-18T20:03:00Z',
+      cooldown: watchingCooldown(),
+    })!
+    expect(reconciled.cooldown!.lanes.lakebase.elapsed_ms).toBe(77_000)
+    expect(reconciled.cooldown!.lanes.lakebase.state).toBe('confirmed_zero')
+  })
+
+  it('derives a frozen terminal elapsed value when an event omits it', () => {
+    const current = { ...session(), cooldown: watchingCooldown() }
+    const confirmed = applyRunEventSnapshot(current, {
+      sequence: 10,
+      event: 'cooldown_update',
+      occurred_at: '2026-08-18T20:01:17Z',
+      payload: {
+        cooldown: {
+          ...watchingCooldown(),
+          lanes: {
+            ...watchingCooldown().lanes,
+            lakebase: {
+              ...watchingCooldown().lanes.lakebase,
+              state: 'confirmed_zero',
+              confirmed_at: null,
+              elapsed_ms: null,
+              status: 'IDLE confirmed',
+            },
+          },
+        },
+      },
+    } satisfies RunEvent)!
+    expect(confirmed.cooldown!.lanes.lakebase).toMatchObject({
+      state: 'confirmed_zero',
+      confirmed_at: '2026-08-18T20:01:17Z',
+      elapsed_ms: 77_000,
+    })
   })
 })

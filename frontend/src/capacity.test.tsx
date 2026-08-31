@@ -288,11 +288,15 @@ describe('wiring', () => {
     expect(cue.slice(0, cue.indexOf('\nfunction '))).not.toContain('<CapacityDisclosure')
   })
 
-  it('shows the idle-policy floor on the return-to-idle screen', () => {
-    expect(source).toContain('<IdlePolicyFloor competitorCannotIdle={competitorCannotIdle}')
+  it('keeps the idle-policy floor in cooldown details', () => {
+    const details = source.slice(source.indexOf('function CooldownDetails'))
+    const body = details.slice(0, details.indexOf('\nfunction BetweenRounds'))
+    expect(body).toContain("<IdlePolicyFloor competitorCannotIdle={competitor.state === 'not_supported'}")
   })
 
-  it('keeps the idle-policy floor off the cleanup variants of that screen', () => {
-    expect(source).toContain('{!deleting && <IdlePolicyFloor')
+  it('keeps the idle-policy floor off the projected cooldown screen', () => {
+    const projected = source.slice(source.indexOf('function BetweenRounds'))
+    const body = projected.slice(0, projected.indexOf('\n/**'))
+    expect(body).not.toContain('<IdlePolicyFloor')
   })
 })

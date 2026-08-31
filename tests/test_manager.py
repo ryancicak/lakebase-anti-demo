@@ -30,6 +30,7 @@ from server.manager import (
     AmbiguousRingQueryError,
     InvalidStateError,
     RunManager,
+    SessionRecord,
     _redacted_exception_chain,
     arm_failure_message,
     authorization_refusal,
@@ -207,7 +208,12 @@ class FakeLiveTarget:
                 "state": "NO_SCALE_TO_ZERO",
                 "reason": "No automatic connection-triggered wake.",
             }
-        return {"state": "ZERO"}
+        evidence: dict[str, object] = {
+            "state": "IDLE" if self.id == "lakebase" else "ZERO"
+        }
+        if self.id == "lakebase" and not_before is not None:
+            evidence["provider_updated_at"] = not_before.isoformat()
+        return evidence
 
     async def prepare(self) -> FakePreparedTarget:
         self.prepare_calls += 1
@@ -602,6 +608,33 @@ class HangingCooldownResolver:
 
     def resolve(self, competitor: CompetitorId):
         return self.lakebase, self.competitor
+
+
+async def round_one_cooldown_record(
+    *,
+    verified_activity: bool = True,
+) -> tuple[RunManager, SessionRecord]:
+    manager = RunManager()
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+        )
+    )
+    record = manager._records[created.id]
+    lane = record.snapshot.lanes["lakebase"]
+    lane.state = LaneState.VERIFIED if verified_activity else LaneState.SEALED
+    lane.connection_closed_at = (
+        datetime.now(UTC) - timedelta(seconds=5)
+        if verified_activity
+        else None
+    )
+    record.snapshot.cooldown = manager._new_cooldown(
+        record,
+        ResetMode.RETURN_TO_IDLE,
+    )
+    return manager, record
 
 
 class BlockingReleaseStore(InMemoryBoutLeaseStore):
@@ -4329,9 +4362,16 @@ async def test_manager_runs_the_full_honest_state_machine() -> None:
         == "RDS DescribeDBClusters + DescribeDBInstances + DescribeEvents → "
         "CloudWatch GetMetricStatistics fallback"
     )
+    assert started.cooldown.lanes["lakebase"].started_at == (
+        finished.lanes["lakebase"].connection_closed_at
+    )
+    assert started.cooldown.lanes["competitor"].started_at == (
+        finished.lanes["competitor"].connection_closed_at
+    )
     assert (
         started.cooldown.lanes["lakebase"].started_at
-        == started.cooldown.lanes["competitor"].started_at
+        < started.cooldown.lanes["competitor"].started_at
+        <= started.cooldown.started_at
     )
     cooldown = await wait_for_cooldown(manager, created.id, CooldownState.READY)
     assert cooldown.lanes["lakebase"].elapsed_ms is not None
@@ -4413,23 +4453,212 @@ async def test_round_one_automatically_rechecks_idle_while_holding_cleanup_fence
     assert active.can_start is False
 
     cooldown = await wait_for_cooldown(manager, first.id, CooldownState.READY)
-    cutoff = cooldown.started_at
-    assert resolver.lakebase.cooldown_cutoffs == [cutoff, cutoff, cutoff]
-    assert resolver.competitor.cooldown_cutoffs == [cutoff, cutoff, cutoff]
+    lakebase_origin = cooldown.lanes["lakebase"].started_at
+    competitor_origin = cooldown.lanes["competitor"].started_at
+    assert len(resolver.lakebase.cooldown_cutoffs) >= 4
+    assert len(resolver.competitor.cooldown_cutoffs) >= 3
+    assert set(resolver.lakebase.cooldown_cutoffs) == {lakebase_origin}
+    assert set(resolver.competitor.cooldown_cutoffs) == {competitor_origin}
+    # Restoring the old global-not-before predicate makes this fail: neither
+    # target receives the later shared cooldown bookkeeping timestamp.
+    assert lakebase_origin != cooldown.started_at
+    assert competitor_origin != cooldown.started_at
 
     events = manager._records[first.id].event_log.events
     cooldown_states = [
         event.payload["cooldown"]["lanes"] for event in events if event.event == "cooldown_update"
     ]
     assert any(
-        lanes["lakebase"]["state"] == "confirmed_zero"
-        and lanes["competitor"]["state"] == "watching"
+        lanes["lakebase"]["state"] == "watching"
+        and lanes["lakebase"]["observation_count"] == 1
         for lanes in cooldown_states
     )
-    assert any(lanes["lakebase"]["state"] == "watching" for lanes in cooldown_states)
 
     await asyncio.sleep(0)
     assert (await manager.bout_status()).active is False
+
+
+async def test_lakebase_post_close_update_can_precede_shared_cooldown_origin() -> None:
+    manager, record = await round_one_cooldown_record()
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+    lane = cooldown.lanes["lakebase"]
+    provider_updated_at = cooldown.started_at - timedelta(seconds=1.81)
+    assert lane.started_at < provider_updated_at < cooldown.started_at
+    completed_at = cooldown.started_at + timedelta(seconds=1)
+
+    changed, snapshot = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {
+            "state": "IDLE",
+            "provider_updated_at": provider_updated_at.isoformat(),
+        },
+        completed_at,
+    )
+
+    observed = snapshot.lanes["lakebase"]
+    assert changed is True
+    assert observed.state == CooldownLaneState.CONFIRMED_ZERO
+    assert observed.confirmed_at == completed_at
+    assert observed.confirmation_basis == "provider_update_corroboration"
+    assert observed.provider_updated_at == provider_updated_at
+    assert observed.elapsed_ms == pytest.approx(
+        (completed_at - lane.started_at).total_seconds() * 1000
+    )
+
+
+async def test_confirmed_idle_lane_latches_first_terminal_evidence() -> None:
+    manager, record = await round_one_cooldown_record()
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+    lane = cooldown.lanes["lakebase"]
+    provider_updated_at = lane.started_at + timedelta(seconds=60)
+    first_completed_at = lane.started_at + timedelta(seconds=75)
+
+    changed, first = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {
+            "state": "IDLE",
+            "provider_updated_at": provider_updated_at.isoformat(),
+        },
+        first_completed_at,
+    )
+    assert changed is True
+    frozen = first.lanes["lakebase"]
+    assert frozen.state == CooldownLaneState.CONFIRMED_ZERO
+    assert frozen.confirmed_at == first_completed_at
+    assert frozen.elapsed_ms == pytest.approx(75_000)
+    assert frozen.checked_at == first_completed_at
+
+    changed, duplicate = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {
+            "state": "IDLE",
+            "provider_updated_at": provider_updated_at.isoformat(),
+        },
+        first_completed_at + timedelta(minutes=2),
+    )
+    assert changed is False
+    assert duplicate.lanes["lakebase"] == frozen
+
+    changed, stale_nonterminal = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        TargetNotArmedError("stale ACTIVE observation"),
+        first_completed_at + timedelta(minutes=3),
+    )
+    assert changed is False
+    assert stale_nonterminal.lanes["lakebase"] == frozen
+
+
+async def test_lakebase_stale_update_requires_repeated_idle_dwell() -> None:
+    manager, record = await round_one_cooldown_record()
+    manager._lakebase_idle_dwell = 0.001
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+    lane = cooldown.lanes["lakebase"]
+    stale = lane.started_at - timedelta(minutes=10)
+
+    _, first = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE", "provider_updated_at": stale.isoformat()},
+        cooldown.started_at,
+    )
+    first_lane = first.lanes["lakebase"]
+    assert first_lane.state == CooldownLaneState.WATCHING
+    assert first_lane.observed_state == "IDLE"
+    assert first_lane.observation_count == 1
+
+    await asyncio.sleep(0.002)
+    completed_at = cooldown.started_at + timedelta(seconds=2)
+    _, second = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE", "provider_updated_at": stale.isoformat()},
+        completed_at,
+    )
+    second_lane = second.lanes["lakebase"]
+    assert second_lane.state == CooldownLaneState.CONFIRMED_ZERO
+    assert second_lane.confirmation_basis == "observed_idle_dwell"
+    assert second_lane.confirmed_at == completed_at
+
+
+async def test_lakebase_missing_update_requires_repeated_idle_dwell() -> None:
+    manager, record = await round_one_cooldown_record()
+    manager._lakebase_idle_dwell = 0.001
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+
+    _, first = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at,
+    )
+    assert first.lanes["lakebase"].state == CooldownLaneState.WATCHING
+
+    await asyncio.sleep(0.002)
+    _, second = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at + timedelta(seconds=2),
+    )
+    assert second.lanes["lakebase"].state == CooldownLaneState.CONFIRMED_ZERO
+    assert second.lanes["lakebase"].provider_updated_at is None
+    assert second.lanes["lakebase"].confirmation_basis == "observed_idle_dwell"
+
+
+async def test_lakebase_idle_cannot_vacuously_pass_without_verified_lane_activity() -> None:
+    manager, record = await round_one_cooldown_record(verified_activity=False)
+    manager._lakebase_idle_dwell = 0.001
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+
+    for offset in (0, 2):
+        if offset:
+            await asyncio.sleep(0.002)
+        _, snapshot = await manager._apply_cooldown_observation(
+            record,
+            "lakebase",
+            {"state": "IDLE"},
+            cooldown.started_at + timedelta(seconds=offset),
+        )
+
+    lane = snapshot.lanes["lakebase"]
+    assert lane.state == CooldownLaneState.WATCHING
+    assert lane.confirmed_at is None
+    assert "no verified lane transaction" in lane.status
+
+
+async def test_lakebase_active_state_remains_waiting_and_resets_idle_dwell() -> None:
+    manager, record = await round_one_cooldown_record()
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+
+    _, first = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at,
+    )
+    assert first.lanes["lakebase"].observation_count == 1
+
+    _, active = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        TargetNotArmedError("Lakebase endpoint is ACTIVE, not IDLE"),
+        cooldown.started_at + timedelta(seconds=1),
+    )
+    lane = active.lanes["lakebase"]
+    assert lane.state == CooldownLaneState.WATCHING
+    assert lane.observation_count == 0
+    assert lane.confirmed_at is None
+    assert lane.status == "Lakebase endpoint is ACTIVE, not IDLE"
 
 
 @pytest.mark.parametrize("transient_once", [False, True])
@@ -4454,9 +4683,12 @@ async def test_round_one_redo_uses_each_lane_evidence_time_and_retries_transient
     await manager.start_cooldown(created.id)
     cooldown = await wait_for_cooldown(manager, created.id, CooldownState.READY)
 
-    assert cooldown.lanes["lakebase"].elapsed_ms == pytest.approx(2)
+    assert cooldown.lanes["lakebase"].elapsed_ms is not None
+    assert cooldown.lanes["lakebase"].elapsed_ms > 0
+    assert cooldown.lanes["lakebase"].confirmation_basis == "observed_idle_dwell"
+    assert cooldown.lanes["lakebase"].observation_count == 2
     assert cooldown.lanes["competitor"].elapsed_ms == pytest.approx(10)
-    assert resolver.lakebase.arm_calls == (4 if transient_once else 3)
+    assert resolver.lakebase.arm_calls == (5 if transient_once else 4)
 
 
 async def test_round_one_redo_bounds_a_hung_poll_and_fails_only_at_deadline() -> None:
@@ -4465,6 +4697,7 @@ async def test_round_one_redo_bounds_a_hung_poll_and_fails_only_at_deadline() ->
     manager._arm_poll = 0.001
     manager._cooldown_poll_timeout = 0.005
     manager._cooldown_timeout = 0.025
+    manager._active_lease_ttl = 0.02
     created = await manager.create(
         SessionCreate(
             competitor=CompetitorId.AURORA_SERVERLESS_V2,
@@ -4484,6 +4717,16 @@ async def test_round_one_redo_bounds_a_hung_poll_and_fails_only_at_deadline() ->
     assert cooldown.lanes["competitor"].state == CooldownLaneState.CONFIRMED_ZERO
     assert cooldown.lanes["lakebase"].activity.wire_call == "databricks postgres get-endpoint"
     assert cooldown.failure == "Timed out waiting for return to confirmed zero."
+    record = manager._records[created.id]
+    assert record.lease is not None
+    assert record.lease.phase == "cooldown_failed"
+    assert record.lease_heartbeat_task is None
+    assert record.lease_heartbeat_lease is None
+    status = await manager.bout_status()
+    assert status.active is True
+    assert status.phase == "cooldown_failed"
+    await asyncio.sleep(0.03)
+    assert await manager._lease_store.current() is None
 
 
 async def test_round_two_uses_isolated_change_engine_and_deletes_copies_on_redo() -> None:

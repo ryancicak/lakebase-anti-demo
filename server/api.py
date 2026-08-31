@@ -290,7 +290,13 @@ def _fight_card_round_status(
     bout: BoutStatus,
 ) -> FightCardRoundStatus:
     active_phase = bout.phase if bout.active else None
-    if bout.active and active_phase in _CLEANUP_PHASES:
+    if bout.active and active_phase == "cooldown_failed":
+        state = FightCardState.UNAVAILABLE
+        detail = (
+            "Return-to-idle confirmation timed out. The finite safety fence will "
+            "expire without a heartbeat; inspect the failed cleanup before retrying."
+        )
+    elif bout.active and active_phase in _CLEANUP_PHASES:
         state = FightCardState.CLEANUP_IN_PROGRESS
         detail = _CLEANUP_DETAIL[round_id]
     elif bout.active:

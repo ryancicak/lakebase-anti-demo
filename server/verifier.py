@@ -4,6 +4,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 
 from .models import LaneState
@@ -21,8 +22,13 @@ class PreparedTarget(Protocol):
     id: str
     name: str
 
-    async def attempt(self, nonce: str, expected_value: str, timeout_seconds: float) -> None:
-        """Complete one connection, transaction, commit, and read-back attempt."""
+    async def attempt(
+        self,
+        nonce: str,
+        expected_value: str,
+        timeout_seconds: float,
+    ) -> datetime | None:
+        """Complete an attempt and return when its data-plane connection closed."""
 
 
 EventCallback = Callable[[str, str, dict[str, object]], Awaitable[None]]
@@ -48,6 +54,7 @@ class LaneResult:
     attempts: int
     first_attempt_ns: int
     completed_ns: int | None
+    connection_closed_at: datetime | None
     error: str | None
 
 
@@ -190,7 +197,11 @@ class NeutralVerifier:
 
             try:
                 async with asyncio.timeout(attempt_timeout):
-                    await target.attempt(nonce, expected_value, attempt_timeout)
+                    connection_closed_at = await target.attempt(
+                        nonce,
+                        expected_value,
+                        attempt_timeout,
+                    )
             except FatalProbeError as exc:
                 last_error = str(exc)
                 break
@@ -198,6 +209,13 @@ class NeutralVerifier:
                 last_error = "The application transaction could not be verified before timeout."
             else:
                 self._raise_if_stopped(stop_event)
+                # Production targets return the instant immediately after their
+                # connection context exits. Protocol-compatible test or future
+                # targets that predate that evidence still get a conservative
+                # upper bound at the verifier boundary, never the later
+                # all-lane/cooldown completion time.
+                if connection_closed_at is None:
+                    connection_closed_at = datetime.now(UTC)
                 completed_ns = time.monotonic_ns()
                 verified_ms = (completed_ns - started_ns) / 1_000_000
                 await self._emit_unless_stopped(
@@ -219,6 +237,7 @@ class NeutralVerifier:
                     attempts=attempts,
                     first_attempt_ns=first_attempt_ns,
                     completed_ns=completed_ns,
+                    connection_closed_at=connection_closed_at,
                     error=None,
                 )
 
@@ -251,6 +270,7 @@ class NeutralVerifier:
             attempts=attempts,
             first_attempt_ns=first_attempt_ns,
             completed_ns=None,
+            connection_closed_at=None,
             error=last_error,
         )
 

@@ -1,4 +1,6 @@
 import type {
+  CooldownLaneSnapshot,
+  CooldownSnapshot,
   DemoSession,
   LaneSnapshot,
   MetricValue,
@@ -142,6 +144,55 @@ function runningLaneRegresses(current: LaneSnapshot, incoming: LaneSnapshot): bo
     && (incoming.elapsed_ms === null || incoming.elapsed_ms < current.elapsed_ms)
 }
 
+function cooldownLaneIsTerminal(lane: CooldownLaneSnapshot): boolean {
+  return lane.state === 'confirmed_zero'
+    || lane.state === 'confirmed_deleted'
+    || lane.state === 'not_supported'
+    || lane.state === 'failed'
+}
+
+function terminalCooldownLane(
+  lane: CooldownLaneSnapshot,
+  observedAt: string,
+): CooldownLaneSnapshot {
+  if (!cooldownLaneIsTerminal(lane) || lane.elapsed_ms !== null) return lane
+  const stoppedAt = Date.parse(lane.confirmed_at ?? observedAt)
+  const startedAt = Date.parse(lane.started_at)
+  if (!Number.isFinite(stoppedAt) || !Number.isFinite(startedAt)) return lane
+  return {
+    ...lane,
+    confirmed_at: lane.confirmed_at ?? observedAt,
+    elapsed_ms: Math.max(0, stoppedAt - startedAt),
+  }
+}
+
+function mergeCooldownLatches(
+  current: CooldownSnapshot | null | undefined,
+  incoming: CooldownSnapshot | null | undefined,
+  observedAt: string,
+): CooldownSnapshot | null | undefined {
+  if (!current || !incoming || current.started_at !== incoming.started_at) return incoming
+  const lanes = { ...incoming.lanes }
+  for (const laneId of Object.keys(lanes) as Array<keyof typeof lanes>) {
+    const currentLane = current.lanes[laneId]
+    const incomingLane = lanes[laneId]
+    if (!currentLane || !incomingLane) continue
+    lanes[laneId] = cooldownLaneIsTerminal(currentLane)
+      ? terminalCooldownLane(currentLane, observedAt)
+      : terminalCooldownLane(incomingLane, observedAt)
+  }
+  return { ...incoming, lanes }
+}
+
+export function preserveCooldownLaneLatches(
+  current: DemoSession,
+  incoming: DemoSession,
+  observedAt = incoming.updated_at,
+): DemoSession {
+  const cooldown = mergeCooldownLatches(current.cooldown, incoming.cooldown, observedAt)
+  return cooldown === incoming.cooldown ? incoming : { ...incoming, cooldown }
+}
+
 export function acceptsReconciledSession(current: DemoSession, incoming: DemoSession): boolean {
   if (current.id !== incoming.id) return false
   if (timestamp(incoming.updated_at) < timestamp(current.updated_at)) return false
@@ -193,7 +244,9 @@ export function selectRound4Session(
 ): DemoSession | null {
   if (!current || !candidate) return candidate
   if (current.id !== candidate.id) return candidate
-  return acceptsReconciledSession(current, candidate) ? candidate : current
+  return acceptsReconciledSession(current, candidate)
+    ? preserveCooldownLaneLatches(current, candidate)
+    : current
 }
 
 export function roundFourUnsupportedReason(lane: LaneSnapshot): string {
@@ -254,7 +307,13 @@ export function applyRunEventSnapshot(current: DemoSession | null, event: RunEve
     event.event === 'cooldown_started'
     || event.event === 'cooldown_update'
     || event.event === 'cooldown_ready'
-  ) return { ...current, cooldown: event.payload.cooldown }
+  ) {
+    return preserveCooldownLaneLatches(
+      current,
+      { ...current, cooldown: event.payload.cooldown },
+      event.occurred_at,
+    )
+  }
   if (event.event === 'lane_update') {
     if (event.payload.session) return event.payload.session
     const lane = current.lanes[event.payload.lane_id]

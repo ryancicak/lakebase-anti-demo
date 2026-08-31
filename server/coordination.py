@@ -152,10 +152,12 @@ def _as_utc(moment: datetime) -> datetime:
 #: Phases whose row is pinned when it is written and deliberately never renewed.
 #: ``RunManager._mark_bout_armed`` cancels the heartbeat and sets the expiry to
 #: the arm's own deadline, so an armed row is silent for the whole of its life by
-#: design. Every other phase heartbeats, which is what makes silence the only
-#: evidence a crashed owner leaves -- and what makes reading silence off a phase
-#: that never speaks a false accusation rather than a finding.
-PINNED_LEASE_PHASES = frozenset({"armed"})
+#: design. ``cooldown_failed`` is also silent by design: it is a terminal,
+#: finite-TTL safety fence whose whole purpose is to expire rather than renew.
+#: Every other phase heartbeats, which is what makes silence the only evidence a
+#: crashed owner leaves -- and what makes reading silence off a phase that never
+#: speaks a false accusation rather than a finding.
+PINNED_LEASE_PHASES = frozenset({"armed", "cooldown_failed"})
 
 
 @dataclass(frozen=True)

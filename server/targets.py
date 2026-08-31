@@ -250,11 +250,13 @@ class LakebaseCredentialProvider:
         if state != "IDLE":
             raise TargetNotArmedError(f"Lakebase endpoint is {state or 'UNKNOWN'}, not IDLE")
 
-        # The endpoint control plane reports when its state last changed. Use that
-        # provider timestamp for the stopwatch instead of adding our polling delay.
-        # Older responses may omit update_time, in which case the checked-at time is
-        # still the only evidence available.
-        observed_at = checked_at
+        # `update_time` is the endpoint resource's last-updated timestamp. The
+        # provider does not document it as a state-transition timestamp, and an
+        # IDLE endpoint can retain an old value indefinitely. Preserve it as
+        # advisory metadata; the manager decides whether it corroborates a
+        # post-connection observation or whether repeated independent IDLE reads
+        # are needed. It must never become the stopwatch's transition time.
+        provider_update_time: datetime | None = None
         raw_update_time = endpoint.get("update_time")
         if isinstance(raw_update_time, str):
             try:
@@ -265,16 +267,22 @@ class LakebaseCredentialProvider:
                 provider_update_time = None
             if provider_update_time is not None and provider_update_time.tzinfo is not None:
                 provider_update_time = provider_update_time.astimezone(UTC)
-                if not_before is not None and provider_update_time < not_before:
-                    raise TargetNotArmedError(
-                        "Lakebase IDLE evidence predates the re-do clock"
-                    )
-                observed_at = min(provider_update_time, checked_at)
+            else:
+                provider_update_time = None
+        post_close_update = bool(
+            provider_update_time is not None
+            and not_before is not None
+            and not_before.astimezone(UTC) <= provider_update_time <= checked_at
+        )
         return {
             "state": state,
             "disabled": disabled,
             "region": self.expected_region,
-            "observed_at": observed_at.isoformat(),
+            "checked_at": checked_at.isoformat(),
+            "provider_updated_at": (
+                None if provider_update_time is None else provider_update_time.isoformat()
+            ),
+            "provider_update_after_not_before": post_close_update,
             # Carried so the on-screen capacity disclosure reports the range the
             # control plane actually holds rather than the range we asked for.
             "autoscaling_limit_min_cu": status.get("autoscaling_limit_min_cu"),
@@ -961,7 +969,12 @@ class PsycopgPreparedTarget(PreparedTarget):
     name: str
     material: ConnectionMaterial = field(repr=False)
 
-    async def attempt(self, nonce: str, expected_value: str, timeout_seconds: float) -> None:
+    async def attempt(
+        self,
+        nonce: str,
+        expected_value: str,
+        timeout_seconds: float,
+    ) -> datetime | None:
         try:
             connection = await psycopg.AsyncConnection.connect(
                 host=self.material.host,
@@ -1007,6 +1020,11 @@ class PsycopgPreparedTarget(PreparedTarget):
             raise RuntimeError("PostgreSQL attempt failed") from exc
         if row is None or row[0] != expected_value:
             raise FatalProbeError("The transaction completed but nonce verification failed.")
+        # The `async with connection` scope has exited before this line, so this
+        # is the first wall-clock instant known to be after the lane's final
+        # data-plane connection close. Round 1's idle clock starts here, not at
+        # later all-lane settlement or cooldown lease bookkeeping.
+        return datetime.now(UTC)
 
 
 @dataclass(frozen=True)
