@@ -227,6 +227,13 @@ class NeutralVerifier:
                         "attempts": attempts,
                         "elapsed_ms": verified_ms,
                         "status": "Transaction verified",
+                        # This is the per-lane safety boundary, not presentation
+                        # metadata. A towel may stop the other lane before the
+                        # aggregate VerificationResult exists; without carrying
+                        # the close instant on this terminal lane event, Round 1
+                        # cannot prove the completed lane returned idle and its
+                        # cleanup fence remains pinned until timeout.
+                        "connection_closed_at": connection_closed_at,
                     },
                 )
                 return LaneResult(

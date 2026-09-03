@@ -10,6 +10,11 @@ import type {
   PersonaId,
   RoundId,
 } from './api/types'
+import {
+  linkedInReceipt,
+  receiptPresentation,
+  scorecardEntry,
+} from './App'
 import { FALLBACK_CATALOG } from './catalog'
 import {
   OUTCOME_COPY_RECORDS,
@@ -21,6 +26,8 @@ import {
   VERIFIED_CORPUS_SHA256,
   buildRingsideCue,
   buildRingsideShow,
+  classifyEvidence,
+  classifyOutcome,
   classifyRingsideOutcome,
   getOutcomeRecord,
   getVerifiedRecord,
@@ -224,6 +231,22 @@ function oneSided(roundId: RoundId): DemoSession {
   session.state = 'failed'
   session.lanes.competitor.state = 'failed'
   session.lanes.competitor.elapsed_ms = null
+  session.remembered_result = null
+  return session
+}
+
+function competitorOnly(roundId: RoundId): DemoSession {
+  const session = verifiedSession(roundId)
+  session.state = 'failed'
+  session.lanes.lakebase.state = 'failed'
+  session.lanes.lakebase.elapsed_ms = null
+  session.remembered_result = null
+  session.comparison = {
+    kind: 'adjudicated_stoppage',
+    winner_lane_id: 'competitor',
+    margin: null,
+    detail: 'The competitor exact proof completed first.',
+  }
   return session
 }
 
@@ -269,14 +292,107 @@ function noResultTowel(): DemoSession {
   return session
 }
 
+function oneSidedRoundFiveSetupTowel(): DemoSession {
+  const session = verifiedSession('survive_connection_spike')
+  session.state = 'towelled'
+  session.metrics = []
+  session.lanes.lakebase = {
+    ...session.lanes.lakebase,
+    state: 'verified',
+    elapsed_ms: 2_629.562715,
+    status: 'Built-in Lakebase pool verified',
+    evidence: undefined,
+  }
+  session.lanes.competitor = {
+    ...session.lanes.competitor,
+    name: 'Aurora Serverless v2 + RDS Proxy',
+    state: 'towelled',
+    elapsed_ms: null,
+    status: 'Toweled · setup unfinished · >60.84s observed lower bound',
+    evidence: {
+      censored: true,
+      lower_bound_ms: 60_840.221846,
+      display_value: '>60.84s',
+    },
+  }
+  session.round5_setup = {
+    ...session.round5_setup!,
+    state: 'towelled',
+    workflow_launch_skew_ms: null,
+    setup_validated: false,
+    downstream_validated: false,
+    cleanup_retryable: false,
+    lanes: {
+      lakebase: {
+        id: 'lakebase',
+        name: 'Lakebase',
+        state: 'verified',
+        setup_elapsed_ms: 2_629.562715,
+        status: 'Built-in Lakebase pool verified',
+        stop_gate_evidence: null,
+        verified: false,
+      },
+      competitor: {
+        id: 'competitor',
+        name: 'Aurora Serverless v2 + RDS Proxy',
+        state: 'towelled',
+        setup_elapsed_ms: 60_840.221846,
+        status: 'Toweled before the exact setup stop',
+        stop_gate_evidence: null,
+        verified: false,
+      },
+    },
+  }
+  session.towel = {
+    state: 'ready',
+    requested_at: session.updated_at,
+    censored_lower_bounds_ms: { competitor: 60_840.221846 },
+    active_lane: 'competitor',
+    lakebase_verified_ms: 2_629.562715,
+    restore_started: false,
+    cleanup_failure: null,
+  }
+  session.comparison = {
+    kind: 'not_comparable',
+    winner_lane_id: null,
+    margin: null,
+    detail: 'The shared spike did not run, so no winner or margin was declared.',
+  }
+  session.remembered_result = 'Lakebase setup verified first; comparison incomplete.'
+  return session
+}
+
+function noVerifiedRoundFiveSetupTowel(): DemoSession {
+  const session = oneSidedRoundFiveSetupTowel()
+  session.lanes.lakebase.state = 'towelled'
+  session.lanes.lakebase.elapsed_ms = null
+  session.round5_setup!.lanes.lakebase = {
+    ...session.round5_setup!.lanes.lakebase!,
+    state: 'towelled',
+    setup_elapsed_ms: 60_840.221846,
+    status: 'Toweled before the exact setup stop',
+  }
+  session.towel!.censored_lower_bounds_ms = {
+    lakebase: 60_840.221846,
+    competitor: 60_840.221846,
+  }
+  delete session.towel!.lakebase_verified_ms
+  return session
+}
+
 function incompleteSetup(): DemoSession {
   const session = verifiedSession('survive_connection_spike')
   session.state = 'failed'
-  const competitor = session.round5_setup!.lanes.competitor!
-  competitor.state = 'failed'
-  competitor.verified = false
-  competitor.setup_elapsed_ms = null
-  competitor.status = 'Transaction gate did not verify'
+  for (const laneId of ['lakebase', 'competitor'] as const) {
+    session.lanes[laneId].state = 'failed'
+    session.lanes[laneId].elapsed_ms = null
+    const setupLane = session.round5_setup!.lanes[laneId]!
+    setupLane.state = 'failed'
+    setupLane.verified = false
+    setupLane.setup_elapsed_ms = null
+    setupLane.stop_gate_evidence = null
+    setupLane.status = 'Transaction gate did not verify'
+  }
   session.round5_setup!.state = 'failed'
   session.round5_setup!.setup_validated = false
   return session
@@ -295,9 +411,55 @@ function failedSpike(): DemoSession {
 function failedCleanup(): DemoSession {
   const session = verifiedSession('survive_connection_spike')
   session.state = 'failed'
+  session.comparison = null
   session.round5_setup!.state = 'cleanup_failed'
+  session.round5_setup!.setup_validated = false
+  session.round5_setup!.downstream_validated = false
   session.round5_setup!.cleanup_failure = 'proxy deletion verification'
   session.round5_setup!.cleanup_retryable = true
+  for (const laneId of ['lakebase', 'competitor'] as const) {
+    session.lanes[laneId].state = 'failed'
+    session.lanes[laneId].elapsed_ms = null
+    session.lanes[laneId].evidence = undefined
+    const setupLane = session.round5_setup!.lanes[laneId]!
+    setupLane.state = 'failed'
+    setupLane.setup_elapsed_ms = null
+    setupLane.stop_gate_evidence = null
+    setupLane.verified = false
+  }
+  return session
+}
+
+function verifiedCleanupFailure(): DemoSession {
+  const session = verifiedSession('survive_connection_spike')
+  session.round5_setup!.cleanup_failure = 'proxy deletion verification'
+  session.round5_setup!.cleanup_retryable = true
+  return session
+}
+
+function cooldownCleanupFailure(roundId: RoundId): DemoSession {
+  const session = verifiedSession(roundId)
+  const startedAt = session.updated_at
+  const failedLane = (id: 'lakebase' | 'competitor', name: string) => ({
+    id,
+    name,
+    state: 'failed' as const,
+    started_at: startedAt,
+    confirmed_at: null,
+    elapsed_ms: null,
+    status: 'Run-owned cleanup did not verify',
+  })
+  session.state = 'failed'
+  session.cooldown = {
+    mode: 'return_to_idle',
+    state: 'failed',
+    started_at: startedAt,
+    failure: 'Run-owned cleanup did not verify',
+    lanes: {
+      lakebase: failedLane('lakebase', session.lanes.lakebase.name),
+      competitor: failedLane('competitor', session.lanes.competitor.name),
+    },
+  }
   return session
 }
 
@@ -308,7 +470,7 @@ describe('canonical Ringside sources', () => {
     expect(sha256(verified)).toBe(VERIFIED_CORPUS_SHA256)
     expect(sha256(outcomes)).toBe(OUTCOME_COPY_SHA256)
     expect(parsedSource('verified-corpus.jsonl')).toHaveLength(420)
-    expect(parsedSource('outcome-copy.jsonl')).toHaveLength(23)
+    expect(parsedSource('outcome-copy.jsonl')).toHaveLength(29)
   })
 
   it('loads the canonical JSONL directly without a generated copy layer', () => {
@@ -347,7 +509,7 @@ describe('canonical Ringside sources', () => {
     })
   })
 
-  it('preserves the exact 23-record outcome matrix', () => {
+  it('preserves the exact 29-record outcome matrix', () => {
     expect(OUTCOME_COPY_RECORDS.map(({ round_id, outcome_id }) => [round_id, outcome_id])).toEqual([
       ['wake_idle_app', 'verified_comparison'],
       ['make_schema_change_safely', 'verified_comparison'],
@@ -360,10 +522,16 @@ describe('canonical Ringside sources', () => {
       ['make_schema_change_safely', 'one_sided_verified'],
       ['recover_deleted_order', 'one_sided_verified'],
       ['recover_deleted_order', 'one_sided_towel_lower_bound'],
+      ['survive_connection_spike', 'one_sided_setup_verified_towel'],
       ['put_model_score_in_app', 'score_identity_unverified'],
+      ['wake_idle_app', 'cleanup_failed'],
+      ['make_schema_change_safely', 'cleanup_failed'],
+      ['recover_deleted_order', 'cleanup_failed'],
+      ['put_model_score_in_app', 'cleanup_failed'],
       ['survive_connection_spike', 'setup_incomplete'],
       ['survive_connection_spike', 'spike_contract_failed'],
       ['survive_connection_spike', 'cleanup_failed'],
+      ['analyze_live_orders_without_slowing_checkout', 'cleanup_failed'],
       ['analyze_live_orders_without_slowing_checkout', 'checkout_guardrail_unverified'],
       ['wake_idle_app', 'no_result'],
       ['make_schema_change_safely', 'no_result'],
@@ -379,7 +547,7 @@ describe('canonical Ringside sources', () => {
   })
 })
 
-describe('one round-specific outcome classifier', () => {
+describe('one generic evidence classifier with six round contracts', () => {
   const roundFourPartial = verifiedSession('put_model_score_in_app')
   roundFourPartial.lanes.lakebase.evidence = undefined
 
@@ -404,6 +572,8 @@ describe('one round-specific outcome classifier', () => {
     ['R2 one-sided', oneSided('make_schema_change_safely'), 'one_sided_verified'],
     ['R3 one-sided', oneSided('recover_deleted_order'), 'one_sided_verified'],
     ['R3 towel lower bound', oneSidedTowel(), 'one_sided_towel_lower_bound'],
+    ['R5 one-sided setup towel', oneSidedRoundFiveSetupTowel(), 'one_sided_setup_verified_towel'],
+    ['R5 both setups unverified at towel', noVerifiedRoundFiveSetupTowel(), 'setup_incomplete'],
     ['R4 identity incomplete', roundFourPartial, 'score_identity_unverified'],
     ['R5 setup incomplete', incompleteSetup(), 'setup_incomplete'],
     ['R5 spike failed', failedSpike(), 'spike_contract_failed'],
@@ -418,13 +588,180 @@ describe('one round-specific outcome classifier', () => {
   })
 
   it('cannot give incomplete R4-R6 gates verified meaning or questions', () => {
-    for (const session of [roundFourPartial, incompleteSetup(), failedSpike(), failedCleanup(), roundSixPartial]) {
+    for (const session of [
+      roundFourPartial,
+      oneSidedRoundFiveSetupTowel(),
+      incompleteSetup(),
+      failedSpike(),
+      failedCleanup(),
+      roundSixPartial,
+    ]) {
       const cue = buildRingsideCue(session, 'software_engineer', 'performance')
       expect(cue.outcome.copy_mode).toBe('OUTCOME_OVERRIDE')
       expect(cue.sayRecord.id).toMatch(/outcome|no-result/)
       expect(cue.askRecord.id).toMatch(/outcome|no-result/)
       expect(cue.proofRecord.id).toBe(cue.outcome.proof_template_id)
     }
+  })
+
+  it.each([
+    ['R1 comparison', verifiedSession('wake_idle_app'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
+    ['R2 comparison', verifiedSession('make_schema_change_safely'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
+    ['R3 comparison', verifiedSession('recover_deleted_order'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
+    ['R4 capability', verifiedSession('put_model_score_in_app'), 'capability_gap', 'declared_capability', 'lakebase', null],
+    ['R5 comparison', verifiedSession('survive_connection_spike'), 'both_exact_verified', 'declared_comparison', 'lakebase', 11_650],
+    ['R6 capability', verifiedSession('analyze_live_orders_without_slowing_checkout'), 'capability_gap', 'declared_capability', 'lakebase', null],
+    ['R2 Lakebase only', oneSided('make_schema_change_safely'), 'lakebase_only_exact', 'adjudicated_stoppage', 'lakebase', null],
+    ['R2 competitor only', competitorOnly('make_schema_change_safely'), 'competitor_only_exact', 'adjudicated_stoppage', 'competitor', null],
+    ['R3 exact plus bound', oneSidedTowel(), 'exact_and_censored_lower_bound', 'adjudicated_stoppage', 'lakebase', null],
+    ['R3 both bounds', noResultTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
+    ['R4 guardrail', roundFourPartial, 'guardrail_failure', 'guardrail_failure', null, null],
+    ['R5 verified-first', oneSidedRoundFiveSetupTowel(), 'exact_and_censored_lower_bound', 'comparison_incomplete', null, null],
+    ['R5 both bounds', noVerifiedRoundFiveSetupTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
+    ['R5 spike guardrail', failedSpike(), 'guardrail_failure', 'guardrail_failure', null, null],
+    ['R5 cleanup before result', failedCleanup(), 'cleanup_failure', 'cleanup_failure', null, null],
+    ['R5 cleanup after result', verifiedCleanupFailure(), 'cleanup_failure', 'cleanup_failure', 'lakebase', 11_650],
+    ['R6 guardrail', roundSixPartial, 'guardrail_failure', 'guardrail_failure', null, null],
+  ] as const)(
+    '%s has one evidence and contract decision',
+    (_label, session, shape, status, winner, margin) => {
+      const classified = classifyOutcome(session)
+      expect(classified.evidence.shape).toBe(shape)
+      expect(classified.status).toBe(status)
+      expect(classified.formalWinner).toBe(winner)
+      expect(classified.marginMs).toBe(margin)
+      expect(classified.shareable).toBe(
+        status === 'declared_comparison'
+        || status === 'declared_capability'
+        || status === 'adjudicated_stoppage',
+      )
+    },
+  )
+
+  it('classifies the generic evidence shapes before applying a round contract', () => {
+    const lane = (exactMs: number | null, lowerBoundMs: number | null, notSupported = false) => ({
+      exactMs,
+      lowerBoundMs,
+      notSupported,
+    })
+    expect(classifyEvidence({
+      lakebase: lane(1, null),
+      competitor: lane(2, null),
+    }).shape).toBe('both_exact_verified')
+    expect(classifyEvidence({
+      lakebase: lane(1, null),
+      competitor: lane(null, 3),
+    }).shape).toBe('exact_and_censored_lower_bound')
+    expect(classifyEvidence({
+      lakebase: lane(null, 3),
+      competitor: lane(null, 3),
+    }).shape).toBe('both_lower_bounds')
+    expect(classifyEvidence({
+      lakebase: lane(1, null),
+      competitor: lane(null, null, true),
+      capabilityGap: true,
+    }).shape).toBe('capability_gap')
+    expect(classifyEvidence({
+      lakebase: lane(1, null),
+      competitor: lane(null, null, true),
+      guardrailFailure: true,
+    }).shape).toBe('guardrail_failure')
+    expect(classifyEvidence({
+      lakebase: lane(1, null),
+      competitor: lane(2, null),
+      cleanupFailure: true,
+    }).shape).toBe('cleanup_failure')
+  })
+
+  it.each(ROUND_IDS)(
+    '%s treats failed cooldown cleanup as one non-shareable fenced outcome',
+    (roundId) => {
+      const session = cooldownCleanupFailure(roundId)
+      const classified = classifyOutcome(session)
+      const cue = buildRingsideCue(session, 'software_engineer', 'performance')
+      const receipt = receiptPresentation(session, 'round')
+      const scorecard = scorecardEntry(session)
+      const share = linkedInReceipt(session, 5)
+
+      expect(classified.evidence.shape).toBe('cleanup_failure')
+      expect(classified.status).toBe('cleanup_failure')
+      expect(classified.outcome.outcome_id).toBe('cleanup_failed')
+      expect(classified.shareable).toBe(false)
+      expect(classified.headline).toMatch(/RESULT RETAINED · CLEANUP FAILED · SHARING BLOCKED/)
+      expect(cue.outcome.outcome_id).toBe('cleanup_failed')
+      expect(cue.say).toMatch(/sharing is blocked.*same round remains fenced/i)
+      expect(receipt.verdict).toBe(classified.headline)
+      expect(scorecard?.contract_status).toBe('cleanup_failure')
+      expect(scorecard?.remembered_result).toBe(classified.headline)
+      expect(share).toMatch(/sharing (?:is )?blocked/i)
+    },
+  )
+
+  it('keeps main, receipt, share, Ringside, and scorecard semantics aligned', () => {
+    const sessions = [
+      ...ROUND_IDS.map((roundId) => verifiedSession(roundId)),
+      oneSided('make_schema_change_safely'),
+      oneSidedTowel(),
+      oneSidedRoundFiveSetupTowel(),
+      roundFourPartial,
+      roundSixPartial,
+    ]
+
+    for (const session of sessions) {
+      const classified = classifyOutcome(session)
+      const cue = buildRingsideCue(session, 'software_engineer', 'performance')
+      const receipt = receiptPresentation(session, 'round')
+      const scorecard = scorecardEntry(session)
+      const share = linkedInReceipt(session, 5)
+
+      expect(cue.outcome).toBe(classified.outcome)
+      expect(receipt.winner).toBe(classified.formalWinner)
+      expect(receipt.verdict).toBe(classified.headline)
+      expect(scorecard?.formal_winner).toBe(classified.formalWinner)
+      expect(scorecard?.margin_ms).toBe(classified.marginMs)
+      expect(scorecard?.remembered_result).toBe(classified.headline)
+
+      const allCopy = [
+        classified.headline,
+        cue.say,
+        cue.show,
+        receipt.verdict,
+        scorecard?.remembered_result ?? '',
+        share,
+      ].join(' ')
+      if (classified.evidence.exactLane !== null) {
+        expect(allCopy).not.toMatch(/neither setup|neither readiness|no verified result/i)
+      }
+      if (classified.formalWinner === null) {
+        expect(receipt.winner).toBeNull()
+        expect(classified.marginMs).toBeNull()
+      }
+      if (
+        session.round.id === 'put_model_score_in_app'
+        || session.round.id === 'analyze_live_orders_without_slowing_checkout'
+      ) {
+        expect(classified.marginMs).toBeNull()
+        expect(allCopy).not.toMatch(/aws.*\d+\.\d+s sooner|speed margin \d/i)
+      }
+    }
+  })
+
+  it('is non-vacuous against the old Round 5 full-document mutant', () => {
+    const observed = oneSidedRoundFiveSetupTowel()
+    expect(observed.round5_setup!.lanes.lakebase!.stop_gate_evidence).toBeNull()
+    expect(observed.round5_setup!.lanes.lakebase!.verified).toBe(false)
+    expect(classifyOutcome(observed).outcome.outcome_id).toBe(
+      'one_sided_setup_verified_towel',
+    )
+
+    const withoutPublishedExactStop = structuredClone(observed)
+    withoutPublishedExactStop.round5_setup!.lanes.lakebase!.state = 'towelled'
+    withoutPublishedExactStop.lanes.lakebase.state = 'towelled'
+    withoutPublishedExactStop.lanes.lakebase.elapsed_ms = null
+    withoutPublishedExactStop.towel!.censored_lower_bounds_ms!.lakebase = 60_840.221846
+    expect(classifyOutcome(withoutPublishedExactStop).outcome.outcome_id).toBe(
+      'setup_incomplete',
+    )
   })
 })
 
@@ -473,11 +810,43 @@ describe('Ringside output behavior', () => {
     )
   })
 
+  it('states a one-sided Round 5 towel consistently for every audience track', () => {
+    const session = oneSidedRoundFiveSetupTowel()
+    const classified = classifyOutcome(session)
+    const expectedProof = 'Lakebase setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The shared 128-attempt spike did not run; no completed comparison or margin was declared.'
+    expect(classified.headline).toBe(
+      'LAKEBASE SETUP VERIFIED 2.63s · AURORA SERVERLESS V2 + RDS PROXY UNVERIFIED BEYOND 60.84s · SHARED SPIKE NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A',
+    )
+    expect(classified.formalWinner).toBeNull()
+    expect(classified.marginMs).toBeNull()
+    expect(classified.shareable).toBe(false)
+    expect(classified.scorecardEligible).toBe(true)
+    for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
+      for (const priorityKey of PRIORITY_KEYS) {
+        const cue = buildRingsideCue(session, personaId, priorityKey)
+        expect(cue.outcome.outcome_id).toBe('one_sided_setup_verified_towel')
+        expect(cue.outcome.copy_mode).toBe('OUTCOME_OVERRIDE')
+        expect(cue.say).toBe(
+          'Lakebase verified connection readiness first. Aurora Serverless v2 + RDS Proxy remained unverified at the stop, and the shared spike never ran.',
+        )
+        expect(cue.ask).toBe(
+          'What must the shared spike verify before Round 5 can declare a winner?',
+        )
+        expect(cue.show).toBe(expectedProof)
+        expect(`${cue.say} ${cue.show}`).not.toMatch(
+          /neither setup|neither readiness|no verified result/i,
+        )
+      }
+    }
+  })
+
   it('refuses missing placeholders instead of rendering raw tokens', () => {
     expect(() => interpolateProof('Observed <MISSING_VALUE>.', {})).toThrow(/MISSING_VALUE/)
     const missingLowerBound = oneSidedTowel()
     missingLowerBound.towel!.censored_lower_bounds_ms = {}
-    expect(() => buildRingsideShow(missingLowerBound)).toThrow(/LOWER_BOUND_SECONDS/)
+    expect(buildRingsideShow(missingLowerBound)).toBe(
+      'Deletion to exact recovered read: Lakebase 1.23s. Aurora Serverless v2 did not verify. Source deletion held. Failover was not tested.',
+    )
   })
 
   it('canonicalizes priority order and rejects an empty selection', () => {

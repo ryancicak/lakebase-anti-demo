@@ -11,13 +11,14 @@ import pytest
 from databricks.sdk.errors.platform import PermissionDenied
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 from starlette.requests import Request
 
 import app as app_module
 from app import app
 from server import api as api_module
 from server import generation_lock, lifecycle, round_availability
-from server.api import operator_from_request, router
+from server.api import RecoveryRequest, operator_from_request, router
 from server.aws_auth import APP_AWS_BINDINGS, AwsAuthConfigurationError
 from server.aws_credential_probe import CredentialVerdict
 from server.catalog import catalog as sealed_catalog
@@ -50,6 +51,73 @@ from server.reconcile import (
 from server.server_launch import RestartHistory, RestartJournal, restart_record_path
 
 APP_CLIENT_ID = "11111111-2222-3333-4444-555555555555"
+
+
+async def test_session_create_rejects_unknown_fields_before_defaulting_round() -> None:
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = RunManager()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        response = await client.post(
+            "/api/sessions",
+            json={
+                "competitor": "rds_postgres",
+                "primary_persona": "data_engineer",
+                "corners": ["performance"],
+                "round_idd": "analyze_live_orders_without_slowing_checkout",
+            },
+        )
+
+    assert response.status_code == 422
+    issue = response.json()["detail"][0]
+    assert issue["loc"] == ["body", "round_idd"]
+    assert issue["type"] == "extra_forbidden"
+
+
+def test_other_public_request_models_also_forbid_unknown_fields() -> None:
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        RecoveryRequest.model_validate({"confirm": "expected phrase", "confim": "typo"})
+
+
+async def test_negative_event_resume_cursors_share_one_public_contract() -> None:
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = RunManager()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        query = await client.get("/api/sessions/missing/events?after=-1")
+        header = await client.get(
+            "/api/sessions/missing/events",
+            headers={"Last-Event-ID": "-1"},
+        )
+
+    assert query.status_code == header.status_code == 400
+    assert query.json() == header.json() == {
+        "detail": "Event resume cursors must be nonnegative integers"
+    }
+
+
+async def test_get_on_post_only_controls_returns_method_not_allowed() -> None:
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        session_control = await client.get("/api/sessions/example/run")
+        recovery_control = await client.get("/api/installation/recover")
+        unknown = await client.get("/api/sessions/example/not-a-control")
+
+    assert session_control.status_code == 405
+    assert session_control.headers["allow"] == "POST"
+    assert recovery_control.status_code == 405
+    assert recovery_control.headers["allow"] == "POST"
+    assert unknown.status_code == 404
 
 
 @dataclass
@@ -893,10 +961,123 @@ async def test_all_bout_statuses_cover_six_rounds_with_one_bounded_read(
 
 
 @pytest.mark.parametrize(
+    ("round_id", "phase", "session_state"),
+    [
+        (RoundId.WAKE_IDLE_APP, "cooldown", SessionState.TOWELLED),
+        (RoundId.MAKE_SCHEMA_CHANGE_SAFELY, "cooldown", SessionState.VERIFIED),
+        (RoundId.RECOVER_DELETED_ORDER, "cooldown", SessionState.VERIFIED),
+        (RoundId.PUT_MODEL_SCORE_IN_APP, "towel_cleanup", SessionState.TOWELLED),
+        (RoundId.SURVIVE_CONNECTION_SPIKE, "round5_cleanup", SessionState.VERIFIED),
+        (RoundId.ANALYZE_LIVE_ORDERS, "towel_cleanup", SessionState.TOWELLED),
+    ],
+)
+async def test_cleanup_fence_classifies_before_arm_for_every_round(
+    monkeypatch,
+    round_id: RoundId,
+    phase: str,
+    session_state: SessionState,
+) -> None:
+    """One durable fence drives scoped status, the board, and the arm refusal.
+
+    The live Round 1 regression released this row while its cooldown watcher was
+    still running. The catalog therefore advertised the sealed capability as
+    ready, the broad board had no blocker to overlay, and only the next arm
+    discovered the hidden wait. Keep the capability catalog as capability
+    metadata, but require the action surfaces to agree for every cleanup shape
+    any of the six rounds can hold.
+    """
+
+    monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
+    run_manager = RunManager(
+        round_isolation=True,
+        installation_id="install-cleanup-matrix",
+        model_score_factory=lambda: object(),
+        connection_spike_factory=lambda: object(),
+        live_orders_factory=lambda: object(),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "_availability_signals",
+        lambda _request: round_availability.AvailabilitySignals(
+            ring_ready=True,
+            round5_ring_ready=True,
+        ),
+    )
+    owner = BoutOperator(
+        display_name="Cleanup Owner",
+        email="cleanup@example.com",
+        subject="cleanup-owner",
+    )
+    store = run_manager._lease_store_for_round(round_id)
+    durable = await store.claim(
+        session_id=f"cleanup-{round_id.value}",
+        operator=owner,
+        phase=phase,
+        session_state=session_state,
+        round_id=round_id.value,
+        round_title=f"Round {round_id.value}",
+        competitor_id=CompetitorId.AURORA_SERVERLESS_V2.value,
+        competitor_name="Aurora Serverless v2",
+        ttl=timedelta(minutes=10),
+    )
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = run_manager
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        broad = await client.get("/api/bout/all")
+        scoped = await client.get(f"/api/bout?round_id={round_id.value}")
+        capability = await client.get("/api/catalog")
+        created = await client.post(
+            "/api/sessions",
+            json={
+                "competitor": "aurora_serverless_v2",
+                "primary_persona": "sre",
+                "secondary_personas": [],
+                "corners": ["performance"],
+                "round_id": round_id.value,
+            },
+        )
+        armed = await client.post(f"/api/sessions/{created.json()['id']}/arm")
+
+    board_round = broad.json()["rounds"][round_id.value]
+    scoped_round = scoped.json()
+    catalog_round = next(
+        item for item in capability.json()["rounds"] if item["id"] == round_id.value
+    )
+    current = await store.current()
+
+    assert broad.status_code == 200
+    assert board_round["state"] == "cleanup_in_progress"
+    assert board_round["can_start"] is False
+    assert board_round["active_phase"] == phase
+    assert scoped.status_code == 200
+    assert scoped_round["active"] is True
+    assert scoped_round["can_start"] is False
+    assert scoped_round["phase"] == phase
+    # Catalog availability is the installed capability, not mutable ring
+    # ownership. The board is the authoritative selection surface.
+    assert catalog_round["availability"] == "ready"
+    assert created.status_code == 201
+    assert created.json()["state"] == "draft"
+    assert armed.status_code == 409
+    assert "CLEANUP" in armed.json()["detail"]
+    assert current == durable
+    assert await store.release(durable) is True
+
+
+@pytest.mark.parametrize(
     ("round_id", "phase"),
     [
-        (RoundId.SURVIVE_CONNECTION_SPIKE, "round5_cleanup"),
+        (RoundId.WAKE_IDLE_APP, "cooldown"),
         (RoundId.MAKE_SCHEMA_CHANGE_SAFELY, "cooldown"),
+        (RoundId.RECOVER_DELETED_ORDER, "cooldown"),
+        (RoundId.PUT_MODEL_SCORE_IN_APP, "towel_cleanup"),
+        (RoundId.SURVIVE_CONNECTION_SPIKE, "round5_cleanup"),
+        (RoundId.ANALYZE_LIVE_ORDERS, "towel_cleanup"),
     ],
 )
 def test_cleanup_phase_never_flashes_unavailable_during_catalog_gap(
@@ -905,10 +1086,10 @@ def test_cleanup_phase_never_flashes_unavailable_during_catalog_gap(
 ) -> None:
     """A terminal cleanup fence outranks one stale generic catalog refusal.
 
-    This reproduces the live Round 5 ordering gap: the terminal result is
-    visible and its durable lease is already in cleanup, while a replica-local
-    readiness/catalog sample has not learned the cleanup reason yet. Round 2
-    proves the precedence is all-round behavior, not a Round 5 display patch.
+    This reproduces the live ordering gap: the terminal result is visible and
+    its durable lease is already in cleanup, while a replica-local
+    readiness/catalog sample has not learned the cleanup reason yet. Every
+    round proves the precedence is shared behavior, not a round-specific patch.
     """
 
     sealed = api_module.catalog(
@@ -1072,7 +1253,15 @@ async def test_double_posted_run_returns_one_bout_over_http() -> None:
         if snapshot.towel is not None and snapshot.towel.state == "ready":
             break
         await asyncio.sleep(0.005)
-    assert await run_manager._lease_store.current() is None
+    cleanup_lease = await run_manager._lease_store.current()
+    assert cleanup_lease is not None
+    assert cleanup_lease.phase == "cooldown"
+    assert (await run_manager.bout_status(RoundId.WAKE_IDLE_APP)).can_start is False
+    record = run_manager._records[created.id]
+    assert record.cooldown_task is not None
+    record.cooldown_task.cancel()
+    await asyncio.gather(record.cooldown_task, return_exceptions=True)
+    assert await run_manager._release_bout(record) is True
 
 
 async def test_catalog_reports_round_five_ready_without_instantiating_factory(
@@ -1549,7 +1738,38 @@ async def test_redo_api_returns_200_404_and_409(monkeypatch) -> None:
     assert query_resume.status_code == 200
     assert event_calls == [(snapshot.id, 9), (snapshot.id, 11)]
     assert invalid_resume.status_code == 400
-    assert invalid_resume.json()["detail"] == "Last-Event-ID must be a nonnegative integer"
+    assert invalid_resume.json()["detail"] == (
+        "Event resume cursors must be nonnegative integers"
+    )
+
+
+async def test_the_session_stream_rotates_cleanly_at_its_sequence_cursor() -> None:
+    waiting = asyncio.Event()
+
+    class QuietManager:
+        async def events(self, _session_id: str, _after: int):
+            await waiting.wait()
+            if False:
+                yield
+
+    class ConnectedRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    stream = api_module._rotating_session_stream(
+        QuietManager(),
+        ConnectedRequest(),
+        "long-bout",
+        37,
+        rotate_after_seconds=0,
+    )
+    rotation = await anext(stream)
+    await stream.aclose()
+
+    assert rotation["id"] == "37"
+    assert rotation["event"] == "stream_rotate"
+    assert '"sequence": 37' in rotation["data"]
+    assert "proactive_proxy_lifetime_rotation" in rotation["data"]
 
 
 async def test_a_control_action_on_a_fight_card_this_process_lost_explains_the_ring(

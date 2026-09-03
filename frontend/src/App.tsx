@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent } from 'react'
 import { api, ApiError, subscribeToSession } from './api/client'
 import type {
   AllBoutStatus,
@@ -33,6 +34,7 @@ import {
 import { CreditsButton, type CreditsEntry } from './credits-entry'
 import { creditsTally } from './credits-tally'
 import { brandAssets, personaPortraits } from './assets'
+import { useAccessibleDialog } from './hooks/useAccessibleDialog'
 import { FALLBACK_CATALOG, metricForCorners, recommend, stopCondition, withBundledPortraits, type LocalRecommendation } from './catalog'
 import { useReducedMotion } from './hooks/useReducedMotion'
 import {
@@ -52,11 +54,14 @@ import {
 import { offerNativeShare, shareDismissalPrefix } from './share'
 import {
   buildRingsideCue,
-  classifyRingsideOutcome,
-  isShareableRingsideOutcome,
+  classifyOutcome,
   priorityKeyFor,
+  type FormalWinner,
 } from './ringside-cues'
 import { compactDuration, preciseDuration } from './time'
+import { replayStory } from './instant-replay'
+import { loadScorecard, saveScorecard, type ScorecardEntry } from './scorecard-storage'
+export type { ScorecardEntry } from './scorecard-storage'
 import {
   ROUND_FOUR_LEGEND,
   acceptsReconciledSession,
@@ -80,10 +85,8 @@ import {
   ROUND_FIVE_WITNESS_CLIENTS,
   isRoundFive,
   roundFiveCountDisplay,
-  roundFiveHasComparison,
   roundFiveLaneResult,
   roundFiveP99Display,
-  roundFiveSetupElapsedDisplay,
   roundFiveSetupLaneResult,
   roundFiveSetupMarginDisplay,
 } from './round5'
@@ -171,44 +174,6 @@ function roundBoardMessage(
   return 'CHECKING ALL SIX ROUNDS…'
 }
 
-export interface ScorecardEntry {
-  session_id: string
-  round_id?: RoundId
-  round_title: string
-  competitor: string
-  /**
-   * Null when our own lane never verified -- a towel thrown before Lakebase
-   * finished. The round is on the card as `abandoned` rather than dropped, and
-   * an abandoned round carries no figure because none was measured.
-   */
-  lakebase_ms: number | null
-  competitor_ms: number | null
-  competitor_censored?: boolean
-  /**
-   * True when the opponent lane reported `not_supported` -- no AWS lane was
-   * built, so nothing was timed and no margin exists.
-   *
-   * A missing `competitor_ms` on its own cannot say this. It is also what a lane
-   * that failed mid-bout leaves behind, and the two are not the same claim: one
-   * is a capability gap, the other is a bout that broke. The card counted both as
-   * wins and labelled the column with the opponent's name, which read as though
-   * a race had happened and the number had gone missing.
-   *
-   * Optional because entries written by earlier builds are still in
-   * localStorage; absent means "not known to be a capability gap".
-   */
-  competitor_capability_gap?: boolean
-  remembered_result: string
-  completed_at: string
-  cooldown: {
-    mode: CooldownSnapshot['mode']
-    lakebase_ms: number | null
-    competitor_ms: number | null
-    lakebase_state?: CooldownLaneState
-    competitor_state?: CooldownLaneState
-  } | null
-}
-
 interface FinaleBeat {
   number: string
   /**
@@ -250,7 +215,6 @@ const ROUND_NUMBERS: readonly RoundId[] = [
   'analyze_live_orders_without_slowing_checkout',
 ]
 
-const SCORECARD_KEY = 'lakebase-anti-demo:scorecard:v1'
 const ACTIVE_SESSION_KEY = 'lakebase-anti-demo:active-session:v1'
 
 interface ActiveSessionPointer {
@@ -327,6 +291,11 @@ function fightCardOpponentLabel(roundId: RoundId, competitorId: CompetitorId, sh
     : 'RDS PostgreSQL + RDS Proxy'
 }
 const STREAM_INTERRUPTION_ERROR = 'Live evidence stream interrupted. Display timers are frozen at disconnect while the app reconnects; no result has been inferred.'
+const STREAM_FAILURE_ERROR = 'Live evidence stream remains unavailable after repeated reconnects. Last-known proof is retained; check the server before continuing.'
+
+function isStreamError(value: string | null): boolean {
+  return value === STREAM_INTERRUPTION_ERROR || value === STREAM_FAILURE_ERROR
+}
 
 /**
  * A client-side abort tells us nothing about the server. The bell may already be
@@ -336,6 +305,8 @@ const RUN_START_UNCONFIRMED_ERROR = 'The bell response timed out. The round may 
 const RUN_START_NOT_STARTED_ERROR = 'The bell response timed out and the ring still reports no run. Nothing was recorded. Ring again when you are ready.'
 const RUN_START_RECONCILE_INTERVAL_MS = 1_200
 const RUN_START_RECONCILE_ATTEMPTS = 10
+const SESSION_RESTORE_ATTEMPTS = 4
+const SESSION_RESTORE_INTERVAL_MS = 2_500
 
 /**
  * An abandoned backstage cleanup, headed and worded the same way wherever it
@@ -406,71 +377,31 @@ interface FightSelection {
 
 const wait = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds))
 
-function loadScorecard(): ScorecardEntry[] {
-  try {
-    const value: unknown = JSON.parse(window.localStorage.getItem(SCORECARD_KEY) ?? '[]')
-    if (!Array.isArray(value)) return []
-    return value.filter((item): item is ScorecardEntry => (
-      typeof item === 'object' && item !== null
-      && typeof (item as ScorecardEntry).session_id === 'string'
-      // Null is a value here, not a missing field: it is what an abandoned
-      // round carries. `undefined` still fails both arms and is still dropped.
-      && (typeof (item as ScorecardEntry).lakebase_ms === 'number'
-        || (item as ScorecardEntry).lakebase_ms === null)
-      && (item as ScorecardEntry).round_id !== 'put_model_score_in_app'
-    ))
-  } catch {
-    return []
-  }
-}
+// Exported for the all-surface contract matrix; it remains a pure reducer.
+// eslint-disable-next-line react-refresh/only-export-components
+export function scorecardEntry(session: DemoSession): ScorecardEntry | null {
+  const classified = classifyOutcome(session)
+  if (!classified.scorecardEligible) return null
+  const lakebaseMs = classified.evidence.lakebase.exactMs
+  const competitorExactMs = classified.evidence.competitor.exactMs
+  const competitorLowerBoundMs = classified.evidence.competitor.lowerBoundMs
+  const abandoned = classified.status === 'no_verified_evidence'
 
-function scorecardEntry(session: DemoSession): ScorecardEntry | null {
-  if (isRoundFour(session) || isRoundFive(session)) return null
-  if (session.state !== 'verified' && session.state !== 'towelled') return null
-  const lakebaseMs = session.towel
-    ? towelVerifiedMs(session, 'lakebase')
-    : session.lanes.lakebase.elapsed_ms
-  const outcome = verifiedOutcome(session)
-
-  /* A towel thrown before our own lane verified. Nothing was measured, so the
-     row carries no figure, no opponent time and no win -- but it is still a row.
-     Returning null here made the round disappear from the card entirely, which
-     is indistinguishable from a round nobody selected and reads as data loss
-     rather than as the decision the operator actually made. `recap.ts` calls
-     this state `abandoned` and the card uses its words. */
-  if (lakebaseMs === null) {
-    if (!session.towel) return null
-    return {
-      session_id: session.id,
-      round_id: session.round.id,
-      round_title: session.round.title,
-      competitor: session.competitor.short_name,
-      lakebase_ms: null,
-      // Their lane did not verify either, and a floor beside "no result" would
-      // invite the reader to treat it as one half of a comparison.
-      competitor_ms: null,
-      competitor_censored: false,
-      competitor_capability_gap: false,
-      remembered_result: outcome ?? ABANDONED_VERDICT.outcome,
-      completed_at: session.towel.requested_at,
-      // Nothing finished, so there was no environment to watch back to zero.
-      cooldown: null,
-    }
-  }
-
-  if (!outcome) return null
   return {
     session_id: session.id,
     round_id: session.round.id,
     round_title: session.round.title,
     competitor: session.competitor.short_name,
     lakebase_ms: lakebaseMs,
-    competitor_ms: session.towel
-      ? towelVerifiedMs(session, 'competitor') ?? towelLowerBoundMs(session, 'competitor')
-      : session.lanes.competitor.elapsed_ms,
-    competitor_censored: towelLowerBoundMs(session, 'competitor') !== null,
-    competitor_capability_gap: session.lanes.competitor.state === 'not_supported',
-    remembered_result: outcome,
+    competitor_ms: abandoned ? null : competitorExactMs ?? competitorLowerBoundMs,
+    competitor_censored:
+      !abandoned && competitorExactMs === null && competitorLowerBoundMs !== null,
+    competitor_capability_gap: classified.evidence.shape === 'capability_gap',
+    evidence_shape: classified.evidence.shape,
+    contract_status: classified.status,
+    formal_winner: classified.formalWinner,
+    margin_ms: classified.marginMs,
+    remembered_result: classified.headline,
     completed_at: session.towel?.requested_at ?? session.updated_at,
     cooldown: session.cooldown ? {
       mode: session.cooldown.mode,
@@ -583,7 +514,13 @@ function costStatusDetail(status: string, postedThrough: string | null): string 
  * arm that may never come. It is only the affirmative claim that has to be paid
  * for with a live reading.
  */
-export function CapacityDisclosure({ session }: { session: DemoSession }) {
+export function CapacityDisclosure({
+  session,
+  embedded = false,
+}: {
+  session: DemoSession
+  embedded?: boolean
+}) {
   const capacity = session.capacity
   if (!capacity) return null
   const allObserved = capacity.lanes.every((lane) => lane.basis === 'observed')
@@ -595,11 +532,8 @@ export function CapacityDisclosure({ session }: { session: DemoSession }) {
       : allObserved
         ? 'Matched memory ceiling'
         : 'Configured to match · not read back this run'
-  return (
-    <details className="capacity-disclosure">
-      <summary>
-        Configured compute · {verdict}
-      </summary>
+  const contents = (
+    <>
       <div className="capacity-lanes" aria-label="Configured compute per lane">
         {capacity.lanes.map((lane) => (
           <article key={`${lane.lane_id}:${lane.product}`} data-corner={lane.lane_id === 'lakebase' ? 'red' : 'blue'}>
@@ -620,6 +554,20 @@ export function CapacityDisclosure({ session }: { session: DemoSession }) {
         ))}
       </div>
       <p>{capacity.note}</p>
+    </>
+  )
+  if (embedded) {
+    return (
+      <section className="capacity-disclosure capacity-evidence" aria-label="Configured compute evidence">
+        <strong className="capacity-evidence-title">Configured compute · {verdict}</strong>
+        {contents}
+      </section>
+    )
+  }
+  return (
+    <details className="capacity-disclosure">
+      <summary>Configured compute · {verdict}</summary>
+      {contents}
     </details>
   )
 }
@@ -1154,6 +1102,7 @@ function prepareRefusal(params: {
   uiReview: boolean
   restoringSession: boolean
   apiStatus: ApiStatus
+  boardFresh: boolean
   ringStatus: FightCardRoundStatus | null
   roundStatuses: Record<RoundId, FightCardRoundStatus> | null
   round: CatalogResponse['rounds'][number]
@@ -1174,7 +1123,11 @@ function prepareRefusal(params: {
       params.roundStatuses,
     )
   }
-  if (params.apiStatus !== 'online' || params.ringStatus === null) return RING_STATUS_UNREAD
+  if (params.apiStatus !== 'online' || !params.boardFresh || params.ringStatus === null) {
+    return params.ringStatus && !params.boardFresh
+      ? 'ROUND STATUS STALE · PREPARE LOCKED UNTIL THE BOARD ANSWERS'
+      : RING_STATUS_UNREAD
+  }
   if (!roundCanStart(params.ringStatus)) {
     return roundBoardMessage(params.round.id, params.ringStatus)
   }
@@ -1249,21 +1202,13 @@ function measuredAt(session: DemoSession): string {
   return Number.isNaN(measured.getTime()) ? session.updated_at : measured.toISOString()
 }
 
-function verifiedOutcome(session: DemoSession): string | null {
-  if (!session.towel) return session.remembered_result
-  if (session.towel.cutoff_ms !== undefined || session.towel.censored_lower_bounds_ms !== undefined) {
-    return session.remembered_result ?? `TOWELED AT ${laneReceiptTime(towelCutoffMs(session))} · NO WINNER · MARGIN N/A`
-  }
-  return `TOWEL THROWN AT ${laneReceiptTime(towelCutoffMs(session))} · LAKEBASE VERIFIED ${laneReceiptTime(towelVerifiedMs(session, 'lakebase'))} · ${session.competitor.short_name.toUpperCase()} UNVERIFIED WHEN STOPPED · LOWER BOUND`
-}
-
 /**
  * The same outcome, worded for the verdict band and nowhere else.
  *
- * `verifiedOutcome` is the record. It travels to the scorecard and onto the
- * share receipt, and both of those leave this screen behind, so both have to
- * restate every caveat themselves -- ROUNDS.md fixes the receipt's shape for
- * exactly that reason. The band is the one surface that does not have to. It
+ * The shared classification is the record. It travels to the scorecard and
+ * onto the share receipt, and both of those leave this screen behind, so both
+ * have to restate every caveat themselves. The band is the one surface that
+ * does not have to. It
  * sits between two lane captions already carrying each lane's proof state and
  * a towel strip already saying the result is frozen, so spelling all of it out
  * again in 40px type ran the band to three lines and pushed the actions row
@@ -1276,36 +1221,33 @@ function verifiedOutcome(session: DemoSession): string | null {
  * for lanes, which is where they already are.
  */
 function verdictBandOutcome(session: DemoSession): string | null {
-  const outcome = verifiedOutcome(session)
-  const comparison = session.comparison
-  if (!session.towel || outcome === null || !comparison) return outcome
-  const winnerLane = comparison.winner_lane_id
-  const winner = winnerLane === 'lakebase' || winnerLane === 'competitor'
-    ? session.lanes[winnerLane].name.toUpperCase()
+  const classified = classifyOutcome(session)
+  const winner = classified.formalWinner === 'lakebase'
+    || classified.formalWinner === 'competitor'
+    ? session.lanes[classified.formalWinner].name.toUpperCase()
     : null
-  if (comparison.kind === 'capability_gap' && winner) {
+  if (!session.towel) return classified.headline
+  if (classified.status === 'declared_capability' && winner) {
     return `STOPPED SHORT · ${winner} CAPABILITY WIN · MARGIN N/A`
   }
-  if (comparison.kind === 'adjudicated_stoppage' && winner) {
-    return `STOPPED SHORT · ${winner} WINS · MARGIN N/A`
-  }
-  if (comparison.kind === 'not_comparable') {
+  if (classified.status === 'adjudicated_stoppage') return classified.headline
+  if (
+    classified.status === 'no_verified_evidence'
+    && classified.evidence.exactLane === null
+  ) {
     return 'STOPPED SHORT · NO WINNER DECLARED · MARGIN N/A'
   }
-  // `measured` and `tie` are the towel that landed after both lanes had already
-  // verified. Nothing was censored and the normal result stands, margin and all,
-  // so that wording is both accurate and already one line.
-  return outcome
+  return classified.headline
 }
 
 function receiptId(session: DemoSession): string {
   return session.id.replace(/[^a-z0-9]/gi, '').slice(0, 8).toUpperCase() || 'LIVE'
 }
 
-type ReceiptWinner = 'lakebase' | 'competitor' | 'tie'
+type ReceiptWinner = FormalWinner
 type ReceiptKind = 'round' | 'idle'
 
-interface ReceiptPresentation {
+export interface ReceiptPresentation {
   kind: ReceiptKind
   title: string
   focus: string
@@ -1327,13 +1269,7 @@ interface ReceiptPresentation {
 }
 
 function receiptWinner(session: DemoSession): ReceiptWinner {
-  if (session.towel) return 'lakebase'
-  if (isRoundFour(session) || isRoundSix(session)) return 'lakebase'
-  if (session.lanes.competitor.state === 'not_supported') return 'lakebase'
-  const lakebase = session.lanes.lakebase.elapsed_ms
-  const competitor = session.lanes.competitor.elapsed_ms
-  if (lakebase === null || competitor === null || Math.abs(lakebase - competitor) < 5) return 'tie'
-  return lakebase < competitor ? 'lakebase' : 'competitor'
+  return classifyOutcome(session).formalWinner
 }
 
 function roundFiveSetupMilliseconds(session: DemoSession, laneId: LaneId): number | null {
@@ -1363,25 +1299,18 @@ function roundFiveSetupSeconds(session: DemoSession, laneId: LaneId): string {
   return laneReceiptTime(roundFiveSetupMilliseconds(session, laneId))
 }
 
-function roundFiveSetupWinner(session: DemoSession): ReceiptWinner {
-  const winner = session.comparison?.winner_lane_id
-  return winner === 'lakebase' || winner === 'competitor' ? winner : 'tie'
-}
-
 function roundFiveVerifiedVerdict(session: DemoSession): string {
-  if (!roundFiveHasComparison(session)) {
-    return 'No readiness comparison · margin N/A · setup and validation gates must all verify'
-  }
-  if (session.comparison?.kind === 'tie') {
+  const classified = classifyOutcome(session)
+  if (!classified.contractComplete) return classified.headline
+  if (classified.formalWinner === 'tie') {
     return 'Both pooled paths verified together'
   }
-  const winnerId = session.comparison?.winner_lane_id
+  const winnerId = classified.formalWinner
   const winner = winnerId === 'lakebase' || winnerId === 'competitor'
     ? session.round5_setup?.lanes?.[winnerId]?.name ?? session.lanes[winnerId].name
     : 'Verified lane'
-  const margin = session.comparison?.margin?.value
-  const marginLabel = typeof margin === 'number' && Number.isFinite(margin) && margin >= 0
-    ? compactDuration(margin)
+  const marginLabel = classified.marginMs !== null
+    ? compactDuration(classified.marginMs)
     : 'an unreported margin'
   return `${winner} verified a pooled path · ${marginLabel} sooner`
 }
@@ -1404,6 +1333,7 @@ function publicDemoUrl(): string | null {
 }
 
 function linkedInHook(session: DemoSession): string {
+  const classified = classifyOutcome(session)
   if (isRoundFour(session)) {
     const elapsed = roundFourAppElapsed(session)
     return `Lakebase moved an analytics change into the live app in ${elapsed} through built-in managed reverse ETL. Aurora/RDS requires a separate reverse-ETL stack; it was not built or timed. 🥊`
@@ -1414,10 +1344,13 @@ function linkedInHook(session: DemoSession): string {
     return `Lakebase turned one checkout into an exact Delta answer in ${elapsedLabel}. ${session.competitor.short_name} requires a separate CDC stack; it was not built or timed. 🥊`
   }
   if (session.towel) {
+    if (isRoundFive(session) && classified.evidence.exactLane && !classified.contractComplete) {
+      return `${classified.headline}. 🥊`
+    }
     if (session.towel.cutoff_ms === undefined && session.towel.censored_lower_bounds_ms === undefined) {
       return `I threw in the towel at ${laneReceiptTime(towelCutoffMs(session))} — Lakebase verified in ${laneReceiptTime(towelVerifiedMs(session, 'lakebase'))}; ${session.competitor.short_name} was unverified when stopped, so its result is >${laneReceiptTime(towelLowerBoundMs(session, 'competitor'))}. 🥊`
     }
-    const winner = session.comparison?.winner_lane_id
+    const winner = classified.formalWinner
     const result = winner === 'lakebase' || winner === 'competitor'
       ? `${session.lanes[winner].name} kept its exact ${towelLaneValue(session, winner)} result`
       : 'no exact winner was declared'
@@ -1450,8 +1383,49 @@ function linkedInHook(session: DemoSession): string {
   return `${session.remembered_result ?? 'Two live PostgreSQL databases completed the same proof.'} 🥊`
 }
 
-function linkedInReceipt(session: DemoSession, roundNumber: number): string {
+// Exported for the receipt-copy contract test; it remains a pure renderer.
+// eslint-disable-next-line react-refresh/only-export-components
+export function linkedInReceipt(session: DemoSession, roundNumber: number): string {
   const demoUrl = publicDemoUrl()
+  const classified = classifyOutcome(session)
+  if (
+    isRoundFive(session)
+    && session.towel
+    && classified.outcome.outcome_id === 'one_sided_setup_verified_towel'
+  ) {
+    const exactLane = classified.evidence.exactLane
+    if (!exactLane) throw new Error('Round 5 one-sided receipt has no exact setup lane.')
+    const unfinishedLane: LaneId = exactLane === 'lakebase' ? 'competitor' : 'lakebase'
+    const exact = classified.evidence[exactLane].exactMs
+    const lowerBound = classified.evidence[unfinishedLane].lowerBoundMs
+    const lowerBoundLabel = lowerBound === null ? 'NOT VERIFIED' : `>${laneReceiptTime(lowerBound)}`
+    const exactName = session.round5_setup?.lanes?.[exactLane]?.name
+      ?? session.lanes[exactLane].name
+    const unfinishedName = session.round5_setup?.lanes?.[unfinishedLane]?.name
+      ?? session.lanes[unfinishedLane].name
+    const lines = [
+      `${exactName} reached verified connection readiness in ${laneReceiptTime(exact)}. ${unfinishedName} was still unverified ${lowerBound === null ? 'without an exact lower bound' : `beyond ${laneReceiptTime(lowerBound)}`}. The shared spike did not run, so Round 5 declared no winner or margin. 🥊`,
+      '',
+      `${exactLane === 'lakebase' ? '🔴' : '🔵'} ${exactName} · ${laneReceiptTime(exact)} · exact setup verified`,
+      `${unfinishedLane === 'lakebase' ? '🔴' : '🔵'} ${unfinishedName} · ${lowerBoundLabel} · unverified${lowerBound === null ? '' : ' lower bound'}`,
+      '',
+      `ROUND ${roundNumber} · ${ROUND_FIVE_DISPLAY_TITLE}`,
+      classified.headline,
+      `Receipt ${receiptId(session)} · Setup evidence only; the shared 128-attempt spike did not run · One live run, not a benchmark.`,
+    ]
+    if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
+    lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+    return lines.join('\n')
+  }
+  if (!classified.shareable) {
+    return [
+      `${classified.headline} 🥊`,
+      '',
+      `ROUND ${roundNumber} · ${session.round.title}`,
+      'This outcome is not shareable until the round contract completes.',
+      `Receipt ${receiptId(session)} · No unsupported winner or margin was inferred.`,
+    ].join('\n')
+  }
   if (isRoundFive(session)) {
     const lines = [
       linkedInHook(session),
@@ -1619,7 +1593,9 @@ function linkedInIdleReceipt(session: DemoSession): string {
   return lines.join('\n')
 }
 
-function receiptPresentation(
+// Exported for the all-surface contract matrix; it remains a pure renderer.
+// eslint-disable-next-line react-refresh/only-export-components
+export function receiptPresentation(
   session: DemoSession,
   kind: ReceiptKind,
 ): ReceiptPresentation {
@@ -1651,20 +1627,20 @@ function receiptPresentation(
       receiptLabel: 'IDLE RECEIPT',
     }
   }
+  const classified = classifyOutcome(session)
   if (session.towel) {
-    const towelWinner = session.comparison?.winner_lane_id
     return {
       kind,
       title: session.round.title,
       focus: priorityLabel(session.corners),
-      winner: towelWinner === 'lakebase' || towelWinner === 'competitor' ? towelWinner : 'tie',
+      winner: classified.formalWinner,
       lakebaseValue: towelLaneValue(session, 'lakebase'),
       competitorValue: towelLaneValue(session, 'competitor'),
       lakebaseStatus: towelVerifiedMs(session, 'lakebase') !== null ? 'EXACT VERIFIED' : towelLowerBoundMs(session, 'lakebase') !== null ? 'UNFINISHED · LOWER BOUND' : 'NO EXACT RESULT',
       competitorStatus: session.lanes.competitor.state === 'not_supported' ? 'NOT SUPPORTED · N/A' : towelVerifiedMs(session, 'competitor') !== null ? 'EXACT VERIFIED' : towelLowerBoundMs(session, 'competitor') !== null ? 'UNVERIFIED WHEN STOPPED · LOWER BOUND' : 'NO EXACT RESULT',
-      competitorCapabilityGap: false,
+      competitorCapabilityGap: classified.evidence.shape === 'capability_gap',
       verdictLabel: 'TOWEL RESULT · THIS ROUND',
-      verdict: verifiedOutcome(session) ?? 'TOWEL THROWN · CLEANUP VERIFIED',
+      verdict: classified.headline,
       fairness: fairnessCopy(session.round.id),
       measuredAt: session.towel.requested_at,
       verifiedStamp: 'TOWELED LIVE',
@@ -1678,7 +1654,7 @@ function receiptPresentation(
       kind,
       title: ROUND_FIVE_DISPLAY_TITLE,
       focus: 'READINESS SETUP · SPIKE PASS/FAIL',
-      winner: roundFiveSetupWinner(session),
+      winner: classified.formalWinner,
       lakebaseLabel: lakebase?.name ?? 'Lakebase',
       competitorLabel: competitor?.name ?? session.lanes.competitor.name,
       lakebaseValue: roundFiveSetupSeconds(session, 'lakebase'),
@@ -1686,13 +1662,17 @@ function receiptPresentation(
       lakebaseStatus: `EXACT SETUP STOP · ${lakebase?.status ?? 'VERIFIED'}`,
       competitorStatus: `EXACT SETUP STOP · ${competitor?.status ?? 'VERIFIED'}`,
       competitorCapabilityGap: false,
-      verdictLabel: 'READINESS RESULT DECLARED · SPIKE PASSED',
-      verdict: roundFiveVerifiedVerdict(session),
+      verdictLabel: classified.contractComplete
+        ? 'READINESS RESULT DECLARED · SPIKE PASSED'
+        : 'READINESS COMPARISON INCOMPLETE',
+      verdict: classified.headline,
       fairness: roundFiveSetupFairness(session),
       measuredAt: measuredAt(session),
-      verifiedStamp: 'SETUP VERIFIED',
+      verifiedStamp: classified.contractComplete ? 'SETUP VERIFIED' : 'NOT DECLARED',
       receiptLabel: 'SPIKE-READINESS RECEIPT',
-      integrityDetail: roundFiveIntegrityDetail(session),
+      integrityDetail: classified.contractComplete
+        ? roundFiveIntegrityDetail(session)
+        : undefined,
     }
   }
   if (isRoundFour(session)) {
@@ -1702,17 +1682,21 @@ function receiptPresentation(
       kind,
       title: 'ANALYTICS CHANGE → LIVE APP',
       focus: 'REVERSE ETL · OLAP → OLTP',
-      winner: 'lakebase',
+      winner: classified.formalWinner,
       lakebaseValue: elapsed,
       competitorValue: 'SEPARATE REVERSE-ETL STACK REQUIRED',
-      lakebaseStatus: 'LIVE APP VERIFIED · BUILT-IN MANAGED REVERSE ETL',
+      lakebaseStatus: classified.contractComplete
+        ? 'LIVE APP VERIFIED · BUILT-IN MANAGED REVERSE ETL'
+        : 'APP READ OBSERVED · SCORE IDENTITY NOT VERIFIED',
       competitorStatus: 'NOT BUILT OR TIMED · NO HONEST TIMER · NO SPEED MARGIN',
       competitorCapabilityGap: true,
-      verdictLabel: 'OLAP → OLTP OUTCOME DECLARED',
-      verdict: `ANALYTICS CHANGE → LIVE APP · ${elapsed}`,
+      verdictLabel: classified.contractComplete
+        ? 'OLAP → OLTP OUTCOME DECLARED'
+        : 'OLAP → OLTP OUTCOME INCOMPLETE',
+      verdict: classified.headline,
       fairness: fairnessCopy(session.round.id),
       measuredAt: measuredAt(session),
-      verifiedStamp: 'LIVE APP VERIFIED',
+      verifiedStamp: classified.contractComplete ? 'LIVE APP VERIFIED' : 'NOT DECLARED',
       receiptLabel: 'REVERSE-ETL RECEIPT',
       integrityDetail: `INTEGRITY · CUSTOMER ${evidence.primaryKey} · RISK ${scoreText(evidence.score)} · MODEL ${evidence.modelVersion} · DELTA ${evidence.deltaVersion} · NONCE ${evidence.proofNonce}`,
     }
@@ -1726,36 +1710,44 @@ function receiptPresentation(
       kind,
       title: 'CHECKOUT → EXACT DELTA ANSWER',
       focus: 'LIVE ORDERS → TRUSTED ANALYTICS',
-      winner: 'lakebase',
+      winner: classified.formalWinner,
       lakebaseValue: elapsedLabel,
       competitorValue: 'SEPARATE CDC STACK REQUIRED',
-      lakebaseStatus: 'ORDER INCLUDED · COUNT VERIFIED · SEPARATE CHECKOUT COMMITTED',
+      lakebaseStatus: classified.contractComplete
+        ? 'ORDER INCLUDED · COUNT VERIFIED · SEPARATE CHECKOUT COMMITTED'
+        : 'DELTA ANSWER OBSERVED · SEPARATE CHECKOUT NOT VERIFIED',
       competitorStatus: 'NOT BUILT OR TIMED · NO HONEST TIMER · NO SPEED MARGIN',
       competitorCapabilityGap: true,
-      verdictLabel: 'LIVE ANALYTICAL OUTCOME DECLARED',
-      verdict: `EXACT DELTA ANSWER · ${elapsedLabel}`,
+      verdictLabel: classified.contractComplete
+        ? 'LIVE ANALYTICAL OUTCOME DECLARED'
+        : 'LIVE ANALYTICAL OUTCOME INCOMPLETE',
+      verdict: classified.headline,
       fairness: fairnessCopy(session.round.id),
       measuredAt: measuredAt(session),
-      verifiedStamp: 'EXACT ANSWER VERIFIED',
+      verifiedStamp: classified.contractComplete ? 'EXACT ANSWER VERIFIED' : 'NOT DECLARED',
       receiptLabel: 'LIVE-ORDERS RECEIPT',
-      integrityDetail: 'ORDER INCLUDED ✓ · COUNT VERIFIED ✓ · SEPARATE CHECKOUT COMMITTED ✓',
+      integrityDetail: classified.contractComplete
+        ? 'ORDER INCLUDED ✓ · COUNT VERIFIED ✓ · SEPARATE CHECKOUT COMMITTED ✓'
+        : 'SEPARATE CHECKOUT NOT VERIFIED · NO CAPABILITY RESULT DECLARED',
     }
   }
   return {
     kind,
     title: session.round.title,
     focus: priorityLabel(session.corners),
-    winner: receiptWinner(session),
+    winner: classified.formalWinner,
     lakebaseValue: laneReceiptTime(session.lanes.lakebase.elapsed_ms),
     competitorValue: competitorReceiptValue(session),
     lakebaseStatus: session.lanes.lakebase.status,
     competitorStatus: session.lanes.competitor.status,
     competitorCapabilityGap: session.lanes.competitor.state === 'not_supported',
-    verdictLabel: 'RESULT DECLARED · THIS ROUND',
-    verdict: session.remembered_result ?? 'NO RESULT DECLARED',
+    verdictLabel: classified.contractComplete
+      ? 'RESULT DECLARED · THIS ROUND'
+      : 'NO RESULT DECLARED · THIS ROUND',
+    verdict: classified.headline,
     fairness: fairnessCopy(session.round.id),
     measuredAt: measuredAt(session),
-    verifiedStamp: 'VERIFIED LIVE',
+    verifiedStamp: classified.contractComplete ? 'VERIFIED LIVE' : 'NOT DECLARED',
     receiptLabel: 'BOUT RECEIPT',
   }
 }
@@ -2347,6 +2339,7 @@ function App() {
   const [armStatus, setArmStatus] = useState('Verifying the sealed start state…')
   const [activeBout, setActiveBout] = useState<BoutStatus | null>(null)
   const [boutBoard, setBoutBoard] = useState<AllBoutStatus | null>(null)
+  const [boutBoardFresh, setBoutBoardFresh] = useState(false)
   const [sound, setSound] = useState(initialProgress.sound)
   const [titleMusicPlaying, setTitleMusicPlaying] = useState(false)
   const [scorecard, setScorecard] = useState<ScorecardEntry[]>(loadScorecard)
@@ -2355,6 +2348,7 @@ function App() {
   const [roundFiveCleanupPending, setRoundFiveCleanupPending] = useState(false)
   const [armCancelPending, setArmCancelPending] = useState(false)
   const [sessionRestorePending, setSessionRestorePending] = useState(Boolean(initialActiveSession))
+  const [sessionRestoreError, setSessionRestoreError] = useState<string | null>(null)
   const sessionRef = useRef<DemoSession | null>(null)
   const stageRef = useRef<Stage>(stage)
   const resumeStageRef = useRef<Stage>(initialActiveSession?.resumeStage ?? stage)
@@ -2554,7 +2548,9 @@ function App() {
     if (!initialActiveSession || uiReview) return
     let active = true
     let retryTimer: number | undefined
+    let attempts = 0
     const restore = () => {
+      attempts += 1
       api.getSession(initialActiveSession.id)
         .then((incoming) => {
           if (!active) return
@@ -2574,7 +2570,7 @@ function App() {
           setRoundOverride(incoming.round.id)
           setCommentaryOpen(true)
           setSession(incoming)
-          setApiStatus('online')
+          setSessionRestoreError(null)
           setError(null)
           const restoredStage = initialActiveSession.stage === 'title'
             ? 'title'
@@ -2598,9 +2594,14 @@ function App() {
             if (initialActiveSession.stage !== 'title') navigate('setup', 'card', 'replace')
             return
           }
-          setApiStatus('offline')
-          setError('Reconnecting to the live bout…')
-          retryTimer = window.setTimeout(restore, 2500)
+          if (attempts >= SESSION_RESTORE_ATTEMPTS) {
+            setSessionRestoreError(
+              'The saved bout could not be restored after four attempts. No new bout was started.',
+            )
+            return
+          }
+          setError('Reconnecting to the saved bout…')
+          retryTimer = window.setTimeout(restore, SESSION_RESTORE_INTERVAL_MS)
         })
     }
     restore()
@@ -2624,7 +2625,7 @@ function App() {
   }, [stage, setupScene, competitor, corners, primary, secondary, roundOverride, sound])
 
   useEffect(() => {
-    window.localStorage.setItem(SCORECARD_KEY, JSON.stringify(scorecard))
+    saveScorecard(scorecard)
   }, [scorecard])
 
   useEffect(() => {
@@ -2672,15 +2673,13 @@ function App() {
     let active = true
     let inFlight = false
     let timer: number | undefined
-    let failures = 0
     const inspect = () => {
       if (!active || inFlight) return
       inFlight = true
       api.allBoutStatuses()
         .then((status) => {
           if (!active) return
-          failures = 0
-          setApiStatus('online')
+          setBoutBoardFresh(true)
           setBoutBoard(status)
           const blocked = Object.values(status.rounds).some((round) => !round.can_start)
           timer = window.setTimeout(
@@ -2694,10 +2693,7 @@ function App() {
         })
         .catch(() => {
           if (!active) return
-          failures += 1
-          if (failures >= 2) {
-            setApiStatus('offline')
-          }
+          setBoutBoardFresh(false)
           // A failed observation is not evidence that six known states became
           // unknown. Keep the last board painted while retrying; clearing it
           // hides another viewer's active bout and makes a later tile press look
@@ -2760,7 +2756,7 @@ function App() {
             if (terminal) {
               streamInterrupted = false
               setLiveEvidenceConnected(true)
-              setError((current) => current === STREAM_INTERRUPTION_ERROR ? null : current)
+              setError((current) => isStreamError(current) ? null : current)
             }
             const entry = scorecardEntry(reconciled)
             if (entry) {
@@ -2830,7 +2826,7 @@ function App() {
           window.clearTimeout(reconciliationTimer)
           reconciliationTimer = undefined
         }
-        setError((current) => current === STREAM_INTERRUPTION_ERROR ? null : current)
+        setError((current) => isStreamError(current) ? null : current)
         if (event.event === 'arm_started') {
           setArmStatus('Verifying the sealed start state…')
         }
@@ -2893,10 +2889,11 @@ function App() {
           navigate('proof', 'card', 'replace')
         }
       },
-      () => {
+      (failure) => {
         streamInterrupted = true
         setLiveEvidenceConnected(false)
-        setError((current) => current ?? STREAM_INTERRUPTION_ERROR)
+        const message = failure.permanent ? STREAM_FAILURE_ERROR : STREAM_INTERRUPTION_ERROR
+        setError((current) => isStreamError(current) || current === null ? message : current)
         reconcile()
       },
       () => {
@@ -2906,7 +2903,7 @@ function App() {
           window.clearTimeout(reconciliationTimer)
           reconciliationTimer = undefined
         }
-        setError((current) => current === STREAM_INTERRUPTION_ERROR ? null : current)
+        setError((current) => isStreamError(current) ? null : current)
       },
     )
     return () => {
@@ -3005,28 +3002,16 @@ function App() {
       selection.primary,
     )
     const selectionRoundId = selection.roundOverride ?? selectionRecommendation.round_id
-    let board = boutBoard
-    let selectionRingStatus = board?.rounds[selectionRoundId] ?? null
-    if (!uiReview && !selectionRingStatus) {
+    if (!uiReview) {
+      let selectionRingStatus: FightCardRoundStatus | null
       try {
-        board = await api.allBoutStatuses()
+        const board = await api.allBoutStatuses()
         setBoutBoard(board)
+        setBoutBoardFresh(true)
         selectionRingStatus = board.rounds[selectionRoundId]
       } catch {
-        setApiStatus('offline')
-        return
-      }
-    }
-    if (!uiReview && !roundCanStart(selectionRingStatus)) {
-      // The cached status can be a moment stale, and the lease from the bout that
-      // just ended is released asynchronously, so a press landing in that window
-      // must not be dropped on stale evidence. Re-read once before refusing.
-      try {
-        board = await api.allBoutStatuses()
-        setBoutBoard(board)
-        selectionRingStatus = board.rounds[selectionRoundId]
-      } catch {
-        setApiStatus('offline')
+        setBoutBoardFresh(false)
+        setError('Round status could not be refreshed. Prepare stays locked until the board answers.')
         return
       }
       if (!roundCanStart(selectionRingStatus)) {
@@ -3292,7 +3277,7 @@ function App() {
     if (!session || (
       session.state !== 'verified'
       && session.state !== 'towelled'
-      && !(isRoundFive(session) && session.state === 'failed')
+      && session.state !== 'failed'
     ) || !proofNavigationAllowsExit(session)) return
     const completed = session
     setError(null)
@@ -3448,6 +3433,30 @@ function App() {
     stopOriginalRoundTheme()
     setError(null)
     navigate('title', 'opponent')
+  }
+
+  function discardSavedSession() {
+    saveActiveSessionPointer(null)
+    sessionRef.current = null
+    setSession(null)
+    setSessionRestorePending(false)
+    setSessionRestoreError(null)
+    setError(null)
+    navigate('setup', 'card', 'replace')
+  }
+
+  if (sessionRestoreError) {
+    return (
+      <main className="retro-screen restore-failure-screen" role="alert">
+        <ApiIndicator status={apiStatus} />
+        <p className="pixel-kicker">Saved session</p>
+        <h1>Saved bout unavailable</h1>
+        <p>{sessionRestoreError}</p>
+        <button type="button" className="game-primary" onClick={discardSavedSession}>
+          Discard saved bout
+        </button>
+      </main>
+    )
   }
 
   if (stage === 'title') {
@@ -3622,6 +3631,7 @@ function App() {
     <Setup
       scene={setupScene}
       apiStatus={apiStatus}
+        boardFresh={boutBoardFresh}
       ringStatus={ringStatus}
       roundStatuses={roundStatuses}
       catalog={catalog}
@@ -3701,6 +3711,24 @@ function TitleScreen({
   )
 }
 
+function moveRovingRadio(
+  event: KeyboardEvent<HTMLButtonElement>,
+  index: number,
+  count: number,
+  select: (index: number) => void,
+): void {
+  let next: number | null = null
+  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % count
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index - 1 + count) % count
+  if (event.key === 'Home') next = 0
+  if (event.key === 'End') next = count - 1
+  if (next === null) return
+  event.preventDefault()
+  select(next)
+  const radios = event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="radio"]')
+  radios?.[next]?.focus()
+}
+
 function HomeLogo({ onHome, className }: { onHome: () => void; className?: string }) {
   return (
     <button className={`home-logo-lockup${className ? ` ${className}` : ''}`} type="button" onClick={onHome} aria-label="Home" title="Return to title screen">
@@ -3738,6 +3766,7 @@ function SoundToggle({ sound, onToggle, arena = false }: { sound: boolean; onTog
 function Setup(props: {
   scene: SetupScene
   apiStatus: ApiStatus
+  boardFresh: boolean
   ringStatus: FightCardRoundStatus | null
   roundStatuses: Record<RoundId, FightCardRoundStatus> | null
   catalog: CatalogResponse
@@ -3786,6 +3815,7 @@ function Setup(props: {
     uiReview: props.uiReview,
     restoringSession: props.restoringSession,
     apiStatus: props.apiStatus,
+    boardFresh: props.boardFresh,
     ringStatus: props.ringStatus,
     roundStatuses: props.roundStatuses,
     round: selectedRound,
@@ -3812,14 +3842,21 @@ function Setup(props: {
           <div className="game-scene opponent-scene">
             <div className="scene-heading"><p>Blue corner</p><h1>Choose the opponent</h1></div>
             <div className="opponent-grid" role="radiogroup" aria-label="Competitor">
-              {props.catalog.competitors.map((item) => (
+              {props.catalog.competitors.map((item, index) => (
                 <button
                   className="opponent-card"
                   data-selected={props.competitor === item.id}
                   role="radio"
                   aria-checked={props.competitor === item.id}
+                  tabIndex={props.competitor === item.id ? 0 : -1}
                   key={item.id}
                   onClick={() => props.onCompetitor(item.id)}
+                  onKeyDown={(event) => moveRovingRadio(
+                    event,
+                    index,
+                    props.catalog.competitors.length,
+                    (next) => props.onCompetitor(props.catalog.competitors[next].id),
+                  )}
                 >
                   <span className="select-cursor" aria-hidden="true">▶</span>
                   <DatabaseFighter label={item.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS'} corner="blue" />
@@ -3970,7 +4007,7 @@ function PersonaRoster(props: {
 }) {
   return (
     <div className="persona-roster" role={props.mode === 'lead' ? 'radiogroup' : 'group'} aria-label={props.mode === 'lead' ? 'Primary persona' : 'Secondary personas'}>
-      {props.personas.map((persona) => {
+      {props.personas.map((persona, index) => {
         const lead = persona.id === props.primary
         const lensIndex = props.secondary.indexOf(persona.id)
         const selected = props.mode === 'lead' ? lead : lensIndex >= 0
@@ -3984,8 +4021,17 @@ function PersonaRoster(props: {
             role={props.mode === 'lead' ? 'radio' : undefined}
             aria-checked={props.mode === 'lead' ? lead : undefined}
             aria-pressed={props.mode === 'lenses' ? lensIndex >= 0 : undefined}
+            tabIndex={props.mode === 'lead' ? (lead ? 0 : -1) : undefined}
             key={persona.id}
             onClick={() => props.mode === 'lead' ? props.onPrimary(persona.id) : props.onSecondary(persona.id)}
+            onKeyDown={props.mode === 'lead'
+              ? (event) => moveRovingRadio(
+                  event,
+                  index,
+                  props.personas.length,
+                  (next) => props.onPrimary(props.personas[next].id),
+                )
+              : undefined}
           >
             <span className="roster-cursor" aria-hidden="true">▶</span>
             <img src={persona.portrait} alt="" />
@@ -4024,8 +4070,8 @@ function DatabaseFighter({ label, corner }: { label: string; corner: 'red' | 'bl
 
 function ApiIndicator({ status, placement = 'setup' }: { status: ApiStatus; placement?: 'setup' | 'title' }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
-  const triggerRef = useRef<HTMLButtonElement>(null)
-  const closeRef = useRef<HTMLButtonElement>(null)
+  const closeDetails = useCallback(() => setDetailsOpen(false), [])
+  const detailsRef = useAccessibleDialog<HTMLElement>(detailsOpen, closeDetails)
   const dialogId = 'api-connection-details'
   const copy = status === 'online'
     ? 'Demo server connected'
@@ -4043,29 +4089,9 @@ function ApiIndicator({ status, placement = 'setup' }: { status: ApiStatus; plac
       ? 'Your browser cannot currently reach the local anti-demo server/API, so no session event stream can open from this page.'
       : 'Your browser is checking whether it can reach the local anti-demo server/API. No connection result is available yet.'
 
-  useEffect(() => {
-    if (!detailsOpen) return
-    closeRef.current?.focus()
-
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== 'Escape') return
-      setDetailsOpen(false)
-      triggerRef.current?.focus()
-    }
-
-    window.addEventListener('keydown', closeOnEscape)
-    return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [detailsOpen])
-
-  function closeDetails() {
-    setDetailsOpen(false)
-    triggerRef.current?.focus()
-  }
-
   return (
     <div className="api-indicator-wrap" data-placement={placement}>
       <button
-        ref={triggerRef}
         className="api-indicator"
         data-status={status}
         type="button"
@@ -4080,9 +4106,11 @@ function ApiIndicator({ status, placement = 'setup' }: { status: ApiStatus; plac
       </button>
       {detailsOpen && (
         <section
+          ref={detailsRef}
           className="api-context"
           id={dialogId}
           role="dialog"
+          aria-modal="true"
           aria-labelledby={`${dialogId}-title`}
         >
           <header>
@@ -4090,7 +4118,7 @@ function ApiIndicator({ status, placement = 'setup' }: { status: ApiStatus; plac
               <p>Connection details</p>
               <h2 id={`${dialogId}-title`}>{headline}</h2>
             </div>
-            <button ref={closeRef} type="button" onClick={closeDetails} aria-label="Close connection details">×</button>
+            <button type="button" onClick={closeDetails} aria-label="Close connection details">×</button>
           </header>
           <p>{connectionCopy}</p>
           <ul>
@@ -4133,6 +4161,8 @@ function Matchup({
   const [showOwner, setShowOwner] = useState(false)
   const [inspectedBout, setInspectedBout] = useState<BoutStatus | null>(null)
   const displayedBout = inspectedBout ?? activeBout
+  const closeOwner = useCallback(() => setShowOwner(false), [])
+  const ownerRef = useAccessibleDialog<HTMLElement>(showOwner, closeOwner)
 
   async function inspectBout() {
     setInspectedBout(await onInspectBout())
@@ -4170,8 +4200,8 @@ function Matchup({
         )}
       </div>
       {showOwner && (
-        <div className="bout-owner-overlay" role="presentation" onClick={() => setShowOwner(false)}>
-          <section className="bout-owner-card" role="dialog" aria-modal="true" aria-labelledby="bout-owner-heading" onClick={(event) => event.stopPropagation()}>
+        <div className="bout-owner-overlay" role="presentation" onClick={closeOwner}>
+          <section ref={ownerRef} className="bout-owner-card" role="dialog" aria-modal="true" aria-labelledby="bout-owner-heading" onClick={(event) => event.stopPropagation()}>
             <p>Current ring lease</p>
             {displayedBout?.active ? (
               <>
@@ -4190,7 +4220,7 @@ function Matchup({
             ) : (
               <h2 id="bout-owner-heading">The ring just cleared</h2>
             )}
-            <button onClick={() => setShowOwner(false)}>B · Close</button>
+            <button onClick={closeOwner}>B · Close</button>
           </section>
         </div>
       )}
@@ -4291,6 +4321,30 @@ function Ready(props: {
   )
 }
 
+function roundFiveExactSetupStopPublished(
+  session: DemoSession,
+  laneId: LaneId,
+): boolean {
+  const result = roundFiveSetupLaneResult(session, laneId)
+  if (result.stopGateExact) return true
+  return session.state === 'towelled'
+    && session.round5_setup?.lanes?.[laneId]?.state === 'verified'
+    && result.setupElapsedMs !== null
+    && classifyOutcome(session).evidence.exactLane === laneId
+}
+
+function roundFiveSetupStopEvidenceNote(
+  session: DemoSession,
+  laneId: LaneId,
+): string {
+  const result = roundFiveSetupLaneResult(session, laneId)
+  if (result.stopGateExact) return 'Stop gate exact: every expected fact matched.'
+  if (roundFiveExactSetupStopPublished(session, laneId)) {
+    return 'Exact setup stop published before the towel; the final expected/observed gate matrix was not returned.'
+  }
+  return 'Stop gate not verified for this lane.'
+}
+
 function RoundFiveSetupCard({
   session,
   laneId,
@@ -4302,17 +4356,20 @@ function RoundFiveSetupCard({
 }) {
   const lane = session.lanes[laneId]
   const result = roundFiveSetupLaneResult(session, laneId)
+  const exactStopPublished = roundFiveExactSetupStopPublished(session, laneId)
   return (
     <section className="round5-setup-lane" data-corner={corner} aria-label={`${lane.name} setup result`}>
-      <header><strong>{lane.name}</strong><span>{result.verified ? 'SETUP GATE ✓' : result.state}</span></header>
-      <div className="round5-setup-time">
-        <span>Primary · setup elapsed</span>
-        <strong>{roundFiveSetupElapsedDisplay(result)}</strong>
-        <small>Shared T0 → exact setup stop gate</small>
-      </div>
+      <header><strong>{lane.name}</strong><span>{exactStopPublished ? 'SETUP STOP ✓' : result.state}</span></header>
       <dl>
         <div><dt>Setup state</dt><dd>{result.state}</dd></div>
-        <div><dt>Stop gate</dt><dd>{result.stopGateExact ? 'EXACT ✓' : 'NOT VERIFIED'}</dd></div>
+        <div>
+          <dt>Stop gate</dt>
+          <dd>{result.stopGateExact
+            ? 'EXACT ✓'
+            : exactStopPublished
+              ? 'EXACT STOP ✓ · FINAL GATE MATRIX NOT RETURNED BEFORE TOWEL'
+              : 'NOT VERIFIED'}</dd>
+        </div>
       </dl>
     </section>
   )
@@ -4348,10 +4405,11 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
   const setupSkew = session.round5_setup?.workflow_launch_skew_ms
   const burstSkew = session.fairness.launch_skew_ms
   const awsEngineName = session.competitor.short_name
+  const complete = classifyOutcome(session).contractComplete
   return (
     <section className="round5-explain-proof" aria-label="Round 5 detailed proof">
       <header>
-        <span>Full verified proof</span>
+        <span>{complete ? 'Full verified proof' : 'Recorded proof status'}</span>
         <strong>Readiness setup is scored · identical spike is pass/fail</strong>
       </header>
       <section className="round5-explain-phase" aria-label="Scored setup evidence">
@@ -4379,7 +4437,6 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
         <strong>COMPONENT DISCLOSURE</strong>
         <p>Lakebase · built-in pooled host · 0 extra per-bout pooling components · 0 per-bout pooling infrastructure changes.</p>
         <p>{awsEngineName} · RDS Proxy is the AWS best-practice pooling layer · this declared-start bout provisioned a new Proxy + 8 supporting changes · an already-deployed Proxy would not pay this setup delay.</p>
-        <p>{roundFiveIntegrityDetail(session)}</p>
       </div>
     </section>
   )
@@ -4424,14 +4481,15 @@ function RoundSixScene({
     ? primaryMetric
     : session.lanes.lakebase.elapsed_ms
   const checkoutVerified = metricValue(session, 'checkout_verified')?.value === true
-  const verified = session.state === 'verified'
-    || (session.state === 'towelled' && session.lanes.lakebase.state === 'verified')
-  const failed = session.state === 'failed'
+  const classified = classifyOutcome(session)
+  const verified = classified.contractComplete
+  const terminal = session.state === 'verified'
+    || session.state === 'failed'
+    || session.state === 'towelled'
+  const failed = terminal && !verified && session.state !== 'towelled'
   const presentation = uiReview ? 'review' : session.state === 'towelled' ? 'towelled' : verified ? 'verified' : failed ? 'failed' : 'running'
-  const terminal = verified || failed || session.state === 'towelled'
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
-  const ringsideOutcome = classifyRingsideOutcome(session)
-  const shareable = isShareableRingsideOutcome(ringsideOutcome)
+  const shareable = classified.shareable
 
   return (
     <>
@@ -4572,9 +4630,20 @@ export function RoundFiveProof({
      only on abandonment, so its presence is the distinction. */
   const cleanupAbandoned = session.round5_setup?.cleanup_failure || null
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
-  const hasComparison = roundFiveHasComparison(session)
-  const ringsideOutcome = classifyRingsideOutcome(session)
-  const shareable = isShareableRingsideOutcome(ringsideOutcome)
+  const classified = classifyOutcome(session)
+  const hasComparison = classified.contractComplete
+  const shareable = classified.shareable
+  const oneSidedSetupTowel = classified.outcome.outcome_id === 'one_sided_setup_verified_towel'
+  const oneSidedExactLane = oneSidedSetupTowel ? classified.evidence.exactLane : null
+  const oneSidedUnverifiedLane: LaneId | null = oneSidedExactLane === 'lakebase'
+    ? 'competitor'
+    : oneSidedExactLane === 'competitor' ? 'lakebase' : null
+  const oneSidedLowerBound = oneSidedUnverifiedLane
+    ? classified.evidence[oneSidedUnverifiedLane].lowerBoundMs
+    : null
+  const oneSidedSetupLead = oneSidedExactLane && oneSidedUnverifiedLane
+    ? `${session.round5_setup?.lanes?.[oneSidedExactLane]?.name ?? session.lanes[oneSidedExactLane].name} verified first · ${session.round5_setup?.lanes?.[oneSidedUnverifiedLane]?.name ?? session.lanes[oneSidedUnverifiedLane].name} unverified${oneSidedLowerBound === null ? '' : ` beyond ${laneReceiptTime(oneSidedLowerBound)}`}`
+    : 'Bout stopped · Setup clocks frozen'
   const showCleanupFallback = cleanupRetryable
     && !session.towel
     && !uiReview
@@ -4686,12 +4755,15 @@ export function RoundFiveProof({
             ) : towelled ? (
               <>
                 <div className="remembered" role="status" aria-label="Round 5 setup status" aria-atomic="true">
-                  <span>Bout stopped · Setup clocks frozen</span>
-                  <strong>No winner · margin N/A</strong>
+                  <span>{oneSidedSetupLead}</span>
+                  <strong>{oneSidedSetupTowel
+                    ? 'No declared winner · comparison incomplete · margin N/A'
+                    : classified.headline}</strong>
                 </div>
                 <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
                 {!uiReview && proofNavigationAllowsExit(session) && (
                   <div className="proof-actions">
+                    {cleanupAllowsActions && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
                     <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
                     <button type="button" className="proof-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
                   </div>
@@ -4747,7 +4819,9 @@ export function RoundFiveProof({
   const compactResult = cleanupFailed
     ? 'BACKSTAGE RECOVERY'
     : session.state === 'failed'
-      ? setupValidated ? 'BURST NOT VERIFIED' : 'SETUP NOT VERIFIED'
+      ? oneSidedSetupTowel
+        ? 'ONE SETUP VERIFIED'
+        : setupValidated ? 'BURST NOT VERIFIED' : 'SETUP NOT VERIFIED'
       : 'SETUP IN PROGRESS'
   /* Same order of preference the remembered result uses: the server's sentence
      if it sent one, ours only if it did not.
@@ -4760,7 +4834,9 @@ export function RoundFiveProof({
   const compactReason = cleanupFailed
     ? cleanupAbandoned ?? 'Automatic cleanup is retrying backstage. The ring stays protected until a clean baseline is verified.'
     : session.state === 'failed'
-      ? setupValidated
+      ? oneSidedSetupTowel
+        ? classified.headline
+        : setupValidated
         ? 'Setup completed, but the warm connection burst did not pass every proof gate. No winner was declared.'
         : 'Both lanes did not reach the exact setup stop gate. No timing comparison was declared.'
       : setupValidated
@@ -5009,7 +5085,12 @@ function RoundFourProof({
   /** Calls the play-by-play never got to make; see `RingsideCommentator`. */
   missedCalls?: number
 }) {
-  const presentation = roundFourPresentation(session)
+  const serverPresentation = roundFourPresentation(session)
+  const initialClassification = classifyOutcome(session)
+  const presentation = serverPresentation === 'initial_verified'
+    && !initialClassification.contractComplete
+    ? 'initial_failed'
+    : serverPresentation
   const redo = session.redo
   const initialEvidence = modelScoreEvidence(session.lanes.lakebase)
   const redoEvidence = redo ? modelScoreEvidence(redo.lanes.lakebase) : null
@@ -5033,8 +5114,8 @@ function RoundFourProof({
   const resultSession: DemoSession = presentation === 'redo_verified' && redo
     ? { ...activeSession, state: 'verified', remembered_result: resultText }
     : { ...session, remembered_result: resultText }
-  const ringsideOutcome = classifyRingsideOutcome(resultSession)
-  const shareable = isShareableRingsideOutcome(ringsideOutcome)
+  const classified = classifyOutcome(resultSession)
+  const shareable = classified.shareable
   const capabilityVerified = shareable
   const [showRingsideTake, setShowRingsideTake] = useState(false)
   const [showShareReceipt, setShowShareReceipt] = useState(false)
@@ -5087,8 +5168,13 @@ function RoundFourProof({
         {presentation === 'initial_running' && <RoundFourRunningProof session={session} uiReview={uiReview} />}
         {presentation === 'initial_failed' && (
           <section className="round4-failure">
-            <strong>NO RESULT VERIFIED</strong>
-            <p>{session.failure ?? session.lanes.lakebase.error ?? 'The exact row proof did not verify.'}</p>
+            <strong>{initialClassification.evidence.exactLane
+              ? 'SCORE IDENTITY NOT VERIFIED'
+              : 'NO RESULT VERIFIED'}</strong>
+            <p>{initialClassification.headline}</p>
+            {(session.failure || session.lanes.lakebase.error) && (
+              <small>{session.failure ?? session.lanes.lakebase.error}</small>
+            )}
           </section>
         )}
         {presentation === 'initial_verified' && (
@@ -5191,13 +5277,12 @@ function Proof({
   const roundOneIdleClockLive = session.round.id === 'wake_idle_app'
     && session.cooldown?.state === 'watching'
   const capabilityGap = session.lanes.competitor.state === 'not_supported'
-  const failure = error ?? session.failure
   const liveEvidenceInterrupted = !uiReview
     && session.state === 'running'
     && !liveEvidenceConnected
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
-  const ringsideOutcome = classifyRingsideOutcome(session)
-  const shareable = isShareableRingsideOutcome(ringsideOutcome)
+  const classified = classifyOutcome(session)
+  const shareable = classified.shareable
   const [showRingsideTake, setShowRingsideTake] = useState(false)
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
@@ -5239,10 +5324,11 @@ function Proof({
         {error && !complete && <p className="proof-error" role="alert">{error}</p>}
         {uiReview ? (
           <div className="proof-review"><strong>No measurement recorded</strong><span>{capabilityGap ? 'UI review · RDS capability not checked live · No result' : 'UI review · No database connections · No result'}</span></div>
-        ) : complete && session.remembered_result ? (
-          <div className="remembered" role="status" aria-atomic="true"><span>Verified outcome</span><strong>{verdictBandOutcome(session)}</strong></div>
         ) : complete ? (
-          <div className="proof-failure" role="alert"><strong>No winner declared</strong><span>{failure ?? 'The application transaction could not be verified.'}</span></div>
+          <div className="remembered" role="status" aria-atomic="true">
+            <span>{classified.formalWinner === null ? 'Outcome incomplete' : 'Verified outcome'}</span>
+            <strong>{verdictBandOutcome(session)}</strong>
+          </div>
         ) : capabilityGap ? (
           <CapabilityNote />
         ) : (
@@ -5388,10 +5474,10 @@ function TowelProgress({ session, onRetry }: { session: DemoSession; onRetry: ()
     ? towel.cleanup_failure ?? CLEANUP_ABANDONED_FALLBACK
     : roundFive
       ? towel.state === 'stopping'
-        ? 'Freezing exact setup stops and censored post-T0 lower bounds · No winner · margin N/A'
+        ? 'Freezing exact setup stops and censored post-T0 lower bounds · No declared winner · comparison incomplete · margin N/A'
         : towel.state === 'cleaning'
-          ? 'Removing only run-owned setup artifacts · Exact setup evidence stays frozen · No winner · margin N/A'
-          : 'Exact setup evidence frozen · No winner · margin N/A'
+          ? 'Removing only run-owned setup artifacts · Exact setup evidence stays frozen · No declared winner · comparison incomplete · margin N/A'
+          : 'Exact setup evidence frozen · No declared winner · comparison incomplete · margin N/A'
     : towel.state === 'stopping'
       ? `Server cutoff ${laneReceiptTime(towelCutoffMs(session))} · Freezing exact evidence`
       : recoveryRound
@@ -5629,8 +5715,6 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     ]
   }
   if (session.round.id === 'survive_connection_spike') {
-    const lakebaseSetup = roundFiveSetupLaneResult(session, 'lakebase')
-    const competitorSetup = roundFiveSetupLaneResult(session, 'competitor')
     const lakebaseBurst = roundFiveLaneResult(session.lanes.lakebase)
     const competitorBurst = roundFiveLaneResult(session.lanes.competitor)
     const burstContract: ReplayCall[] = [
@@ -5675,11 +5759,11 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         shared: [{ label: 'Stop rule', code: 'event: lane_update · activity.phase=setup_stop · setup_elapsed_ms=<exact scored elapsed>' }],
         lakebase: [
           { label: 'Gate lakebase_fresh_pooled_transaction', code: 'fresh_pooled_path_verified=true · runner_verify_full_transaction=true' },
-          { label: 'Scored setup elapsed', code: roundFiveSetupElapsedDisplay(lakebaseSetup), note: lakebaseSetup.stopGateExact ? 'Stop gate exact: every expected fact matched.' : 'Stop gate not verified for this lane.' },
+          { label: 'Scored clock boundary', code: 'Shared T0 → exact Lakebase setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'lakebase') },
         ],
         competitor: [
           { label: 'Gate rds_proxy_topology_transaction', code: 'sealed_proxy_auth_verified=true · proxy_target_state=AVAILABLE · max_connections_percent=90 · connection_borrow_timeout_seconds=120 · runner_verify_full_transaction=true' },
-          { label: 'Scored setup elapsed', code: roundFiveSetupElapsedDisplay(competitorSetup), note: competitorSetup.stopGateExact ? 'Stop gate exact: every expected fact matched.' : 'Stop gate not verified for this lane.' },
+          { label: 'Scored clock boundary', code: 'Shared T0 → exact RDS Proxy setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'competitor') },
         ],
       },
       {
@@ -5753,7 +5837,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         lakebase: [
           { label: 'reading_application', code: 'Fresh application Postgres connection → read the exact primary key' },
           { label: 'Verified row', code: `${evidence.primaryKey} · score ${evidence.score} · model ${evidence.modelVersion}`, note: `Proof nonce ${evidence.proofNonce} · ${evidence.exactRowVerified ? 'Exact row verified: every field matched the committed update.' : 'The exact row was not verified for this attempt.'}` },
-          { label: 'End-to-end proof (secondary)', code: metricDisplay(session, 'application_proof_elapsed_ms'), note: 'Measured from the same Delta commit to the successful fresh application read.' },
+          { label: 'End-to-end clock boundary', code: 'Delta commit → successful fresh application read', note: 'The measured value is shown once in the Takeaway story.' },
         ],
         competitor: untimedOpponent,
       },
@@ -5799,7 +5883,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         lakebase: [
           { label: 'waiting_cdf', code: 'Poll Delta history for the exact order', note: 'Up to 60 polls at 1.0 s. Duplicate proof rows are rejected rather than counted as a match.' },
           { label: 'Gate · exact single insert', code: `matching live orders = ${metricDisplay(session, 'matching_live_orders')}`, note: `Delta history LSN ${laneEvidenceText(lane, 'history_lsn')}.` },
-          { label: 'Analytics available (primary)', code: metricDisplay(session, 'analytics_available_ms'), note: 'Measured from the completed checkout commit to the exact Delta answer being read.' },
+          { label: 'Analytics clock boundary', code: 'Completed checkout commit → exact Delta answer read', note: 'The measured value is shown once in the Takeaway story.' },
         ],
         competitor: untimedOpponent,
       },
@@ -5853,83 +5937,109 @@ function ReplayCallGroup({ title, corner, calls }: { title: string; corner: 'red
   )
 }
 
-function InstantReplay({ session, roundNumber, onClose }: { session: DemoSession; roundNumber: number; onClose: () => void }) {
+export function InstantReplay({ session, roundNumber, onClose }: { session: DemoSession; roundNumber: number; onClose: () => void }) {
   const skew = receiptStartSkewDisplay(session)
   const steps = replaySteps(session)
+  const story = replayStory(session)
   // A capability round never releases a second lane, so there is no gap between
   // lane start times to report. Naming the untimed opponent is honest; printing
   // a start gap for a race that did not happen is not.
   const untimedOpponent = session.lanes.competitor.state === 'not_supported'
-  const [selectedStep, setSelectedStep] = useState<number | null>(null)
+  const dialogRef = useAccessibleDialog<HTMLElement>(true, onClose)
   return (
     <div className="replay-overlay" role="presentation" onClick={onClose}>
-      <section className="replay-modal" role="dialog" aria-modal="true" aria-labelledby="replay-heading" onClick={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="replay-modal" role="dialog" aria-modal="true" aria-labelledby="replay-heading" onClick={(event) => event.stopPropagation()}>
         <header>
-          <div><p>Instant replay · Round {roundNumber}</p><h2 id="replay-heading">How this round was proved</h2></div>
-          <span>Exact contract · Real state</span>
+          <div>
+            <p>Instant replay · Round {roundNumber}</p>
+            <h2 id="replay-heading">{session.round.title}</h2>
+          </div>
+          <span data-state={story.state}>{story.status}</span>
         </header>
-        <div className="replay-lanes">
-          {(['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
-            // Round 5 scores the readiness setup, so its public clock lives on the
-            // setup lane. session.lanes carries only the pass/fail burst evidence.
-            const lane = isRoundFive(session)
-              ? roundFiveArenaLane(session, laneId)
-              : session.lanes[laneId]
-            return (
-              <article key={laneId} data-corner={laneId === 'lakebase' ? 'red' : 'blue'} data-state={lane.state}>
-                <strong>{lane.name}</strong>
-                <b>{lane.state === 'not_supported' ? 'NOT TIMED' : laneReceiptTime(lane.elapsed_ms)}</b>
-                <span>{lane.status}</span>
-                {lane.error && <p>{lane.error}</p>}
-              </article>
-            )
-          })}
-        </div>
-        <ol className="replay-steps">
-          {steps.map((step, index) => {
-            const expanded = selectedStep === index
-            const stepNumber = String(index + 1).padStart(2, '0')
-            return (
-              <li key={step.summary}>
-                <button
-                  type="button"
-                  aria-expanded={expanded}
-                  aria-controls={`replay-calls-${index}`}
-                  onClick={() => setSelectedStep(expanded ? null : index)}
-                >
-                  <span>{stepNumber}</span>
-                  <strong>{step.summary}</strong>
-                  <small>{expanded ? 'Hide calls' : 'View calls'}</small>
-                </button>
-                {expanded && (
-                  <section id={`replay-calls-${index}`} className="replay-call-panel" aria-label={`Exact calls for step ${stepNumber}`}>
-                    <header><strong>Step {stepNumber} · Exact calls</strong><span>Placeholders shown · No secrets</span></header>
+        <section className="replay-story" aria-label="Three-beat replay story">
+          {story.beats.map((beat, index) => (
+            <article key={beat.id} className="replay-beat" data-beat={beat.id}>
+              <header>
+                <span>{String(index + 1).padStart(2, '0')}</span>
+                <h3>{beat.title}</h3>
+              </header>
+              <p>{beat.body}</p>
+              {story.metricBeat === beat.id && story.metrics.length > 0 && (
+                <div className="replay-primary-metric" aria-label="Primary measured result">
+                  {story.metrics.map((metric) => (
+                    <div key={metric.laneId} data-corner={metric.laneId === 'lakebase' ? 'red' : 'blue'}>
+                      <span>{metric.label}</span>
+                      <strong data-width={metric.value.length >= 7 ? 'long' : 'standard'}>{metric.value}</strong>
+                      <small>{metric.note}</small>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </article>
+          ))}
+        </section>
+        <details className="replay-evidence">
+          <summary data-dialog-initial-focus>
+            <span>View full evidence</span>
+            <small>Calls, gates, matrices, timestamps, and configuration</small>
+          </summary>
+          <div className="replay-evidence-body">
+            <section className="replay-evidence-lanes" aria-label="Lane evidence status">
+              {(['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
+                const lane = isRoundFive(session)
+                  ? roundFiveArenaLane(session, laneId)
+                  : session.lanes[laneId]
+                return (
+                  <article key={laneId} data-corner={laneId === 'lakebase' ? 'red' : 'blue'} data-state={lane.state}>
+                    <strong>{lane.name}</strong>
+                    <span>{lane.status}</span>
+                    <small>{lane.state === 'not_supported' ? 'Not built or timed' : lane.state.replace(/_/g, ' ')}</small>
+                    {lane.error && <p>{lane.error}</p>}
+                  </article>
+                )
+              })}
+            </section>
+            <section className="replay-proof-sequence" aria-label="Exact proof sequence">
+              <header>
+                <strong>{story.state === 'verified' ? 'Exact proof sequence' : 'Required proof sequence · Incomplete'}</strong>
+                <span>Placeholders shown · No secrets</span>
+              </header>
+              {steps.map((step, index) => {
+                const stepNumber = String(index + 1).padStart(2, '0')
+                return (
+                  <article key={step.summary} className="replay-evidence-step">
+                    <h3>
+                      <span>{stepNumber}</span>
+                      {story.state === 'verified'
+                        ? step.summary
+                        : `Required proof step ${stepNumber} · not all calls completed`}
+                    </h3>
                     <div>
                       {step.shared && <ReplayCallGroup title="Shared verifier" corner="shared" calls={step.shared} />}
                       <ReplayCallGroup title="Lakebase" corner="red" calls={step.lakebase} />
                       <ReplayCallGroup title={session.competitor.short_name} corner="blue" calls={step.competitor} />
                     </div>
-                  </section>
-                )}
-              </li>
-            )
-          })}
-        </ol>
-        {isRoundFive(session) && session.state === 'verified' && (
-          <RoundFiveEvidenceDetails session={session} />
-        )}
-        <CapacityDisclosure session={session} />
-        <dl className="replay-facts">
-          <div><dt>Fair start</dt><dd>{fairnessCopy(session.round.id)}</dd></div>
-          {untimedOpponent
-            ? (
-              <div><dt>Opponent lane</dt><dd>Not timed<small>{roundFourUnsupportedReason(session.lanes.competitor)}</small></dd></div>
-            )
-            : (
-              <div><dt>Start gap</dt><dd>{skew}<small>Difference between lane start times; lower is fairer.</small></dd></div>
+                  </article>
+                )
+              })}
+            </section>
+            {isRoundFive(session) && (
+              <RoundFiveEvidenceDetails session={session} />
             )}
-          <div><dt>Receipt</dt><dd>{receiptId(session)} · {measuredAt(session)}</dd></div>
-        </dl>
+            <CapacityDisclosure session={session} embedded />
+            <dl className="replay-facts">
+              <div><dt>Fair start</dt><dd>{fairnessCopy(session.round.id)}</dd></div>
+              {untimedOpponent
+                ? (
+                  <div><dt>Opponent lane</dt><dd>Not timed<small>{roundFourUnsupportedReason(session.lanes.competitor)}</small></dd></div>
+                )
+                : (
+                  <div><dt>Start gap</dt><dd>{skew}<small>Difference between lane start times; lower is fairer.</small></dd></div>
+                )}
+              <div><dt>Receipt</dt><dd>{receiptId(session)} · {measuredAt(session)}</dd></div>
+            </dl>
+          </div>
+        </details>
         <button className="replay-close" onClick={onClose}>B · Back to the ring</button>
       </section>
     </div>
@@ -5974,56 +6084,9 @@ function RingsideTake({ session, onClose }: { session: DemoSession; onClose: () 
   const [selectedId, setSelectedId] = useState<PersonaId>(session.primary_persona.id)
   const selected = personas.find((persona) => persona.id === selectedId) ?? personas[0]
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
-  const surfaceRef = useRef<HTMLElement | null>(null)
-  const openerRef = useRef<HTMLElement | null>(
-    typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null,
-  )
-  const closeRef = useRef(onClose)
+  const surfaceRef = useAccessibleDialog<HTMLElement>(true, onClose)
   const cue = buildRingsideCue(session, selected.id, priorityKeyFor(session.corners))
   const selectedTabId = `ringside-persona-${selected.id}-tab`
-
-  useEffect(() => {
-    closeRef.current = onClose
-  }, [onClose])
-
-  useEffect(() => {
-    const surface = surfaceRef.current
-    if (!(surface instanceof HTMLElement)) return
-    const opener = openerRef.current
-    tabRefs.current[0]?.focus()
-
-    const focusables = () => Array.from(
-      surface.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-      ),
-    )
-    function keepFocusInside(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        closeRef.current()
-        return
-      }
-      if (event.key !== 'Tab') return
-      const nodes = focusables()
-      if (nodes.length === 0) return
-      const first = nodes[0]
-      const last = nodes[nodes.length - 1]
-      if (event.shiftKey && (document.activeElement === first || !surface?.contains(document.activeElement))) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && (document.activeElement === last || !surface?.contains(document.activeElement))) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    surface.addEventListener('keydown', keepFocusInside)
-    return () => {
-      surface.removeEventListener('keydown', keepFocusInside)
-      if (opener?.isConnected) opener.focus()
-    }
-  }, [])
 
   const selectTabFromKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex: number | null = null
@@ -6148,9 +6211,11 @@ export function CostRoom({ session, onClose }: { session: DemoSession; onClose: 
   const engines = NAMED_ENGINE_LANES
     .map((id) => lanes.find((lane) => lane.lane_id === id))
     .filter((lane): lane is StandingLane => lane !== undefined)
+  const dialogRef = useAccessibleDialog<HTMLElement>(true, onClose)
   return (
     <div className="cost-room-overlay" role="presentation" onClick={onClose}>
       <section
+        ref={dialogRef}
         className="cost-room"
         role="dialog"
         aria-modal="true"
@@ -6259,6 +6324,7 @@ function ShareReceipt({
 }) {
   const post = kind === 'idle' ? linkedInIdleReceipt(session) : linkedInReceipt(session, roundNumber)
   const [status, setStatus] = useState<string | null>(null)
+  const dialogRef = useAccessibleDialog<HTMLElement>(true, onClose)
   const cardKey = `${session.id}:${session.updated_at}:${roundNumber}:${kind}`
   const [renderedCard, setRenderedCard] = useState<{ key: string; blob: Blob } | null>(null)
   const [failedCardKey, setFailedCardKey] = useState<string | null>(null)
@@ -6332,7 +6398,7 @@ function ShareReceipt({
 
   return (
     <div className="receipt-overlay" role="presentation" onClick={onClose}>
-      <section className="receipt-modal" role="dialog" aria-modal="true" aria-labelledby="receipt-heading" onClick={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="receipt-modal" role="dialog" aria-modal="true" aria-labelledby="receipt-heading" onClick={(event) => event.stopPropagation()}>
         <header>
           <h2 id="receipt-heading">{kind === 'idle' ? 'Share idle proof' : 'Share the proof'}</h2>
         </header>
@@ -6420,6 +6486,7 @@ function CooldownDetails({
   onClose: () => void
 }) {
   const cooldown = session.cooldown
+  const dialogRef = useAccessibleDialog<HTMLElement>(true, onClose)
   if (!cooldown) return null
   const lakebase = cooldown.lanes.lakebase
   const competitor = cooldown.lanes.competitor
@@ -6429,7 +6496,7 @@ function CooldownDetails({
   const originOffset = cooldownOriginOffsetCopy(cooldown, session.competitor.short_name)
   return (
     <div className="replay-overlay" role="presentation" onClick={onClose}>
-      <section className="replay-modal cooldown-details" role="dialog" aria-modal="true" aria-labelledby="cooldown-details-heading" onClick={(event) => event.stopPropagation()}>
+      <section ref={dialogRef} className="replay-modal cooldown-details" role="dialog" aria-modal="true" aria-labelledby="cooldown-details-heading" onClick={(event) => event.stopPropagation()}>
         <header>
           <div><p>Control-plane replay</p><h2 id="cooldown-details-heading">How the clocks stop</h2></div>
           <span>{deleting ? 'Owned artifacts only' : 'No SQL polling'}</span>
@@ -6859,6 +6926,7 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
       <p className="scorecard-tally">
         Lakebase · {tally.lakebaseWins} verified win{tally.lakebaseWins === 1 ? '' : 's'}
         {tally.uncontested > 0 && ` · ${tally.uncontested} uncontested round${tally.uncontested === 1 ? '' : 's'} · no opponent time to compare`}
+        {(tally.incomplete ?? 0) > 0 && ` · ${tally.incomplete} incomplete comparison${tally.incomplete === 1 ? '' : 's'} · no winner declared`}
         {tally.abandoned > 0 && ` · ${tally.abandoned} abandoned round${tally.abandoned === 1 ? '' : 's'} · no result declared`}
       </p>
       <div className="scorecard-list">
@@ -6887,6 +6955,13 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
               <p className="scorecard-gap">
                 Capability gap, not a race · no AWS lane was built, so nothing was
                 timed against it and there is no margin to report.
+              </p>
+            )}
+            {(entry.contract_status === 'comparison_incomplete'
+              || entry.contract_status === 'guardrail_failure'
+              || (entry.contract_status === 'cleanup_failure' && entry.formal_winner === null)) && (
+              <p className="scorecard-gap">
+                Comparison incomplete · no formal winner or margin was declared.
               </p>
             )}
             {/* Verbatim from the ledger, not paraphrased: the finale screen
@@ -6928,11 +7003,18 @@ function scorecardRoundNumber(roundId: RoundId | undefined): number | null {
  * every part of the row asks the same question.
  */
 function scorecardIsAbandoned(entry: ScorecardEntry): boolean {
-  return entry.lakebase_ms === null
+  return entry.contract_status === undefined
+    ? entry.lakebase_ms === null
+    : entry.contract_status === 'no_verified_evidence'
 }
 
 function scorecardComparison(entry: ScorecardEntry): string {
   if (scorecardIsAbandoned(entry)) return 'abandoned'
+  if (entry.contract_status === 'comparison_incomplete') return 'incomplete'
+  if (entry.contract_status === 'guardrail_failure') return 'guardrail_failure'
+  if (entry.contract_status === 'cleanup_failure' && entry.formal_winner === null) {
+    return 'cleanup_failure'
+  }
   return entry.competitor_capability_gap ? 'capability_gap' : 'raced'
 }
 
@@ -6943,6 +7025,8 @@ function scorecardProofLabel(entry: ScorecardEntry): string {
   if (entry.round_id === 'recover_deleted_order' || entry.cooldown?.mode === 'delete_recovery_environment') return 'Deletion → verified recovery'
   if (entry.round_id === 'make_schema_change_safely' || entry.cooldown?.mode === 'delete_isolated_environment') return 'Copy + change → verified'
   if (entry.round_id === 'wake_idle_app') return 'Wake → verified'
+  if (entry.round_id === 'put_model_score_in_app') return 'Delta score → exact app read'
+  if (entry.round_id === 'survive_connection_spike') return 'Exact setup stops → shared spike'
   // Round 6 landed here and read "Non-executable round · no proof", which is
   // false twice over: it is the finale, it runs, and its proof is the exact
   // order arriving in Delta with the count verified. What it has no proof *of*
@@ -6972,7 +7056,7 @@ function scorecardLakebaseValue(entry: ScorecardEntry): string {
 function scorecardCompetitorValue(entry: ScorecardEntry): string {
   if (scorecardIsAbandoned(entry)) return NOT_VERIFIED
   if (entry.competitor_capability_gap) return 'NOT TIMED'
-  if (entry.competitor_ms === null) return 'N/A'
+  if (entry.competitor_ms === null) return NOT_VERIFIED
   return `${entry.competitor_censored ? '>' : ''}${shortSeconds(entry.competitor_ms)}`
 }
 
@@ -7797,6 +7881,9 @@ function fairnessCopy(roundId: RoundId): string {
   }
   if (roundId === 'recover_deleted_order') {
     return 'Same exact row · One deletion barrier · Eligibility + recovery + verified read timed · Source remains deleted'
+  }
+  if (roundId === 'survive_connection_spike') {
+    return 'Shared post-preflight monotonic T0 · Each setup clock stops at its own exact application transaction · Identical 128-connection spike is pass/fail'
   }
   return 'Non-executable round · No live fairness or timing contract'
 }

@@ -23,6 +23,30 @@ const REQUEST_TIMEOUT_MS = 15_000
  */
 export const RUN_REQUEST_TIMEOUT_MS = 60_000
 
+function validationIssue(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null
+  if (!value || typeof value !== 'object') return null
+  const issue = value as { loc?: unknown; msg?: unknown }
+  const location = Array.isArray(issue.loc)
+    ? issue.loc
+        .filter((part) => part !== 'body')
+        .filter((part): part is string | number => typeof part === 'string' || typeof part === 'number')
+        .join('.')
+    : ''
+  const message = typeof issue.msg === 'string' ? issue.msg.trim() : ''
+  if (!message) return null
+  return location ? `${location}: ${message}` : message
+}
+
+function apiErrorDetail(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null
+  if (Array.isArray(value)) {
+    const issues = value.map(validationIssue).filter((item): item is string => Boolean(item))
+    return issues.length ? issues.join('; ') : null
+  }
+  return validationIssue(value)
+}
+
 async function request<T>(
   path: string,
   init?: RequestInit,
@@ -48,8 +72,8 @@ async function request<T>(
   } catch {
     throw new ApiError(
       timedOut
-        ? 'The demo server did not answer in time. The app will reconnect automatically.'
-        : 'The demo server could not be reached. Make sure it is running, then try again.',
+        ? 'The API did not answer in time. The app will reconnect automatically.'
+        : 'The API could not be reached. Check your connection, then try again.',
       0,
     )
   } finally {
@@ -58,8 +82,8 @@ async function request<T>(
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`
     try {
-      const body = (await response.json()) as { detail?: string; title?: string }
-      message = body.detail ?? body.title ?? message
+      const body = (await response.json()) as { detail?: unknown; title?: unknown }
+      message = apiErrorDetail(body.detail) ?? apiErrorDetail(body.title) ?? message
     } catch {
       // A non-JSON proxy error still receives a useful HTTP fallback.
     }
@@ -133,29 +157,10 @@ export const api = {
 export function subscribeToSession(
   sessionId: string,
   onEvent: (event: RunEvent) => void,
-  onError: () => void,
+  onError: (failure: SessionStreamFailure) => void,
   onOpen: () => void = () => {},
+  options: SessionStreamOptions = {},
 ): () => void {
-  // No `after` cursor, deliberately.
-  //
-  // Reconnects are already exact without one: the browser resends
-  // `Last-Event-ID` on its own and the server resumes from it, taking the
-  // greater of that and any `after` in the URL. So a cursor here would buy
-  // nothing on the path that matters and could only make it worse -- because the
-  // server takes the *maximum*, a cursor the URL is wrong about cannot be
-  // corrected downwards for the lifetime of this EventSource.
-  //
-  // What it would change is a remount, which starts from the server's retention
-  // floor rather than from where the previous mount left off. To pass a cursor
-  // there, the high-water sequence would have to outlive the component, and then
-  // it would have to be scoped to the session or a fresh bout would resume from
-  // the previous bout's number and silently skip its own opening -- with no
-  // `gap_before`, because the server would be honouring the cursor it was given.
-  // That failure is invisible; this one is reported. `RunEvent.gap_before` names
-  // the hole on the first event of such a resume, the play-by-play now shows it,
-  // and every snapshot-bearing event carries the whole session, so a mid-history
-  // start reconstructs correctly.
-  const source = new EventSource(api.eventsUrl(sessionId))
   const eventNames: EventName[] = [
     'session_created', 'arm_started', 'arm_waiting', 'armed', 'session_cancelled', 'run_preparing',
     'run_started', 'lane_update', 'run_finished', 'session_failed',
@@ -163,20 +168,178 @@ export function subscribeToSession(
     'cooldown_started', 'cooldown_update', 'cooldown_ready',
     'redo_started', 'redo_lane_update', 'redo_finished', 'redo_failed',
   ]
+  const baseDelayMs = options.baseDelayMs ?? 500
+  const maxDelayMs = options.maxDelayMs ?? 10_000
+  const permanentAfter = options.permanentAfter ?? 6
+  const stableAfterMs = options.stableAfterMs ?? 10_000
+  const random = options.random ?? Math.random
+  const cursorKey = `lakebase-anti-demo:stream-cursor:${sessionId}`
+  let lastSequence = Math.max(options.initialSequence ?? 0, readStreamCursor(cursorKey))
+  let source: EventSource | null = null
+  let reconnectTimer: number | undefined
+  let stableTimer: number | undefined
+  let stopped = false
+  let failures = 0
+  let expectedRotation = false
+
+  const clearTimers = () => {
+    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
+    if (stableTimer !== undefined) window.clearTimeout(stableTimer)
+    reconnectTimer = undefined
+    stableTimer = undefined
+  }
+  const detach = (current: EventSource) => {
+    eventNames.forEach((name) => current.removeEventListener(name, handle))
+    current.removeEventListener('stream_rotate', handleRotation)
+    current.onopen = null
+    current.onerror = null
+  }
+  const closeCurrent = () => {
+    if (!source) return
+    const current = source
+    source = null
+    detach(current)
+    current.close()
+  }
+  const scheduleReconnect = (delay: number) => {
+    if (stopped || reconnectTimer !== undefined) return
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = undefined
+      connect()
+    }, delay)
+  }
   const handle = (message: Event) => {
+    let event: RunEvent
     try {
-      onEvent(JSON.parse((message as MessageEvent<string>).data) as RunEvent)
+      event = JSON.parse((message as MessageEvent<string>).data) as RunEvent
+      if (!Number.isSafeInteger(event.sequence) || event.sequence < 1) throw new Error('Invalid sequence')
     } catch {
-      onError()
+      closeCurrent()
+      failures += 1
+      onError({
+        kind: 'protocol',
+        attempts: failures,
+        permanent: failures >= permanentAfter,
+      })
+      scheduleReconnect(reconnectDelay(failures, baseDelayMs, maxDelayMs, random))
+      return
+    }
+    if (event.sequence <= lastSequence) return
+    lastSequence = event.sequence
+    writeStreamCursor(cursorKey, lastSequence)
+    failures = 0
+    onEvent(event)
+    if (event.event === 'cooldown_ready' || event.event === 'session_cancelled') {
+      stopped = true
+      clearTimers()
+      closeCurrent()
     }
   }
-  eventNames.forEach((name) => source.addEventListener(name, handle))
-  source.onopen = onOpen
-  source.onerror = onError
+  const handleRotation = (message: Event) => {
+    try {
+      const rotation = JSON.parse((message as MessageEvent<string>).data) as { sequence?: unknown }
+      if (typeof rotation.sequence === 'number' && Number.isSafeInteger(rotation.sequence)) {
+        lastSequence = Math.max(lastSequence, rotation.sequence)
+        writeStreamCursor(cursorKey, lastSequence)
+      }
+      expectedRotation = true
+    } catch {
+      // A malformed control event is a protocol failure, not a transport reset.
+      closeCurrent()
+      failures += 1
+      onError({
+        kind: 'protocol',
+        attempts: failures,
+        permanent: failures >= permanentAfter,
+      })
+      scheduleReconnect(reconnectDelay(failures, baseDelayMs, maxDelayMs, random))
+    }
+  }
+  const connect = () => {
+    if (stopped || source) return
+    expectedRotation = false
+    const separator = api.eventsUrl(sessionId).includes('?') ? '&' : '?'
+    const current = new EventSource(
+      `${api.eventsUrl(sessionId)}${separator}after=${encodeURIComponent(lastSequence)}`,
+    )
+    source = current
+    eventNames.forEach((name) => current.addEventListener(name, handle))
+    current.addEventListener('stream_rotate', handleRotation)
+    current.onopen = () => {
+      if (source !== current || stopped) return
+      if (stableTimer !== undefined) window.clearTimeout(stableTimer)
+      stableTimer = window.setTimeout(() => {
+        stableTimer = undefined
+        failures = 0
+        onOpen()
+      }, stableAfterMs)
+    }
+    current.onerror = () => {
+      if (source !== current || stopped) return
+      const rotated = expectedRotation
+      if (stableTimer !== undefined) window.clearTimeout(stableTimer)
+      stableTimer = undefined
+      closeCurrent()
+      if (rotated) {
+        scheduleReconnect(0)
+        return
+      }
+      failures += 1
+      onError({
+        kind: 'transport',
+        attempts: failures,
+        permanent: failures >= permanentAfter,
+      })
+      scheduleReconnect(reconnectDelay(failures, baseDelayMs, maxDelayMs, random))
+    }
+  }
+
+  connect()
   return () => {
-    eventNames.forEach((name) => source.removeEventListener(name, handle))
-    source.onopen = null
-    source.onerror = null
-    source.close()
+    stopped = true
+    clearTimers()
+    closeCurrent()
+  }
+}
+
+export interface SessionStreamFailure {
+  kind: 'transport' | 'protocol'
+  attempts: number
+  permanent: boolean
+}
+
+export interface SessionStreamOptions {
+  initialSequence?: number
+  baseDelayMs?: number
+  maxDelayMs?: number
+  permanentAfter?: number
+  stableAfterMs?: number
+  random?: () => number
+}
+
+function reconnectDelay(
+  failures: number,
+  baseDelayMs: number,
+  maxDelayMs: number,
+  random: () => number,
+): number {
+  const exponential = Math.min(maxDelayMs, baseDelayMs * (2 ** Math.max(0, failures - 1)))
+  return Math.round(exponential + exponential * 0.25 * random())
+}
+
+function readStreamCursor(key: string): number {
+  try {
+    const value = Number(window.sessionStorage.getItem(key))
+    return Number.isSafeInteger(value) && value >= 0 ? value : 0
+  } catch {
+    return 0
+  }
+}
+
+function writeStreamCursor(key: string, sequence: number): void {
+  try {
+    window.sessionStorage.setItem(key, String(sequence))
+  } catch {
+    // Memory still owns this mount's cursor when storage is unavailable.
   }
 }

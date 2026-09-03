@@ -159,8 +159,8 @@ describe('the credits entry point', () => {
 
   it('does not leave an Escape handler behind once it is closed', async () => {
     const user = userEvent.setup()
-    const addListener = vi.spyOn(window, 'addEventListener')
-    const removeListener = vi.spyOn(window, 'removeEventListener')
+    const addListener = vi.spyOn(document, 'addEventListener')
+    const removeListener = vi.spyOn(document, 'removeEventListener')
     render(<Host value={entry()} />)
 
     await user.click(trigger())
@@ -170,6 +170,7 @@ describe('the credits entry point', () => {
     const removed = removeListener.mock.calls.filter(([type]) => type === 'keydown').length
     expect(added).toBeGreaterThan(0)
     expect(removed).toBe(added)
+    expect(addListener).toHaveBeenCalledWith('keydown', expect.any(Function), true)
     addListener.mockRestore()
     removeListener.mockRestore()
   })

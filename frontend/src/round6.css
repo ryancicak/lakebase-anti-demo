@@ -331,7 +331,8 @@
 
 @media (max-width: 760px) {
   .round6-screen {
-    position: relative;
+    position: fixed;
+    height: 100dvh;
     min-height: 100dvh;
     grid-template-rows: auto 1fr auto;
     overflow-x: hidden;

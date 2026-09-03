@@ -519,10 +519,10 @@ export function Credits({
           <em className="credits-outro-tagline">The Anti-Demo</em>
         </div>
       )}
-      {/* The exit. `B · BACK` matches the app's own arcade prompt convention
-          (GameNav renders `B · {back}` / `A · {next}`). Escape does the same
-          thing, handled by CreditsButton. */}
-      <button className="game-back credits-back" type="button" onClick={exit}>B · Back</button>
+      {/* The exit. `B · BACK` matches the app's own arcade prompt convention.
+          The shared dialog lifecycle gives it initial focus and makes Escape
+          follow this same path without competing with arena shortcuts. */}
+      <button data-dialog-initial-focus className="game-back credits-back" type="button" onClick={exit}>B · Back</button>
 
       {/* The credits changed nothing about the bout underneath, so the one thing
           they owe the operator is to not look like an ending. */}

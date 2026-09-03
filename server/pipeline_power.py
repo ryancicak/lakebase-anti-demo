@@ -960,16 +960,7 @@ def stop(
         "post",
         _require_pipeline_path(pipeline_id, f"/api/2.0/pipelines/{pipeline_id}/stop"),
     )
-    stopped_at = now().astimezone(UTC).isoformat()
-    stopped_by = _actor(manifest)
-    record = {
-        "intent": _INTENT_STOPPED,
-        "pipeline_id": pipeline_id,
-        "run_id": manifest.run_id,
-        "stopped_at": stopped_at,
-        "stopped_by": stopped_by,
-        "usd_per_day_saved": f"{PIPELINE_USD_PER_DAY:.2f}",
-    }
+    record = stopped_record(manifest, now=now)
     _write_ledger(marker_path, record)
     if on_record is not None:
         on_record(record)
@@ -977,9 +968,39 @@ def stop(
         pipeline_id=pipeline_id,
         cloud_state="",
         stopped_deliberately=True,
-        stopped_at=stopped_at,
-        stopped_by=stopped_by,
+        stopped_at=str(record["stopped_at"]),
+        stopped_by=str(record["stopped_by"]),
     )
+
+
+def stopped_record(
+    manifest: DemoManifest,
+    *,
+    now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    stopped_by: str | None = None,
+) -> dict[str, Any]:
+    """Build the durable intent produced by a deliberate stop, without a verb.
+
+    Recovery uses this only after the pipeline, its newest update, and the
+    synced-table status together prove that an operator already stopped the
+    sealed pipeline. Issuing ``/stop`` again in that case would add a mutation
+    after the desired state was already reached; omitting the durable event
+    would leave the inherited debt as the newest authoritative intent forever.
+
+    This helper deliberately does not write either ledger. The ordinary
+    :func:`stop` path writes the local marker and hands the same record to its
+    durable callback. Startup recovery awaits the durable append itself and
+    clears the inherited snapshot only after that append succeeds.
+    """
+
+    return {
+        "intent": _INTENT_STOPPED,
+        "pipeline_id": _sealed_pipeline_id(manifest),
+        "run_id": manifest.run_id,
+        "stopped_at": now().astimezone(UTC).isoformat(),
+        "stopped_by": stopped_by or _actor(manifest),
+        "usd_per_day_saved": f"{PIPELINE_USD_PER_DAY:.2f}",
+    }
 
 
 def owed_stop_record(
@@ -1380,13 +1401,6 @@ async def record_power_request(record: Mapping[str, Any]) -> bool:
     so it is logged at warning level rather than swallowed.
     """
 
-    # Before the write is even attempted, and unconditionally. The snapshot
-    # below is "what a previous process left owed"; this process has now formed
-    # a newer intent about the same pipeline, so the snapshot is superseded
-    # whether or not it reaches the table. Clearing it only on a successful
-    # append would leave the far noisier failure -- a stop this process really
-    # did perform, still reported as owed by every later `/readyz`.
-    install_owed_stop_snapshot(None)
     store = _durable_store
     if store is None:
         return False
@@ -1400,6 +1414,11 @@ async def record_power_request(record: Mapping[str, Any]) -> bool:
             exc_info=True,
         )
         return False
+    # The durable history is the authority the next process will read. Keep the
+    # inherited snapshot visible until that authority contains the newer event:
+    # clearing it when an append was merely attempted made a transient store
+    # failure look exactly like successful repayment on `/readyz`.
+    install_owed_stop_snapshot(None)
     return True
 
 

@@ -20,6 +20,7 @@ export const OUTCOME_IDS = [
   'verified_rds_capability_gap',
   'one_sided_verified',
   'one_sided_towel_lower_bound',
+  'one_sided_setup_verified_towel',
   'score_identity_unverified',
   'setup_incomplete',
   'spike_contract_failed',

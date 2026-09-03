@@ -121,7 +121,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    min(100vw, 100vh * 16/9) and either axis can be the binding one. The fairness
    line is centred and 30% wide, so its left end is always clear. */
 @media (max-width: 900px), (max-height: 560px) {
-  .title-cartridge > .title-credits { left: 5%; bottom: 7.2%; transform: none; }
+  /* Keep the compact Staff Roll hit box below PRESS START. At 320–390px wide,
+     7.2% put their boxes over one another even though the labels only barely
+     touched, so a tap near the left edge could activate the wrong control. */
+  .title-cartridge > .title-credits { left: 5%; bottom: 1.5%; transform: none; }
   .title-cartridge > .title-credits:active { transform: none; }
 }
 .title-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; }
@@ -446,6 +449,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 
 /* Matchup and armed ritual. */
 .retro-screen { position: fixed; inset: 0; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--cream); background: var(--navy); text-align: center; font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(7px, 1vw, 20px) var(--blue), inset 0 0 0 clamp(12px, 1.5vw, 30px) var(--navy), inset 0 0 0 clamp(16px, 2vw, 40px) var(--red); }
+.restore-failure-screen { gap: clamp(16px, 2.5vh, 28px); padding: 10vh 8vw; }
+.restore-failure-screen h1 { margin: 0; font-size: clamp(24px, 4vw, 64px); line-height: 1.2; text-transform: uppercase; text-shadow: .12em .12em var(--red); }
+.restore-failure-screen > p:not(.pixel-kicker) { max-width: 760px; margin: 0; font-family: ui-monospace, monospace; font-size: clamp(13px, 1.2vw, 20px); font-weight: 900; line-height: 1.5; }
+.restore-failure-screen > .game-primary { min-height: 52px; padding: 12px 22px; }
 .retro-screen::before { content: ""; position: absolute; z-index: 5; inset: 0; pointer-events: none; opacity: .13; background: repeating-linear-gradient(to bottom, transparent 0 3px, #000 3px 5px); }
 .retro-review { position: absolute; z-index: 6; top: 4.5%; margin: 0; padding: 1em 1.2em; border: 4px solid var(--yellow); color: var(--yellow); background: var(--navy); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; text-transform: uppercase; }
 .pixel-kicker { position: relative; color: var(--yellow); font-size: clamp(7px, .7vw, 13px); text-transform: uppercase; letter-spacing: .12em; }
@@ -528,7 +535,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 
 /* The proof remains inside the game: one ring, two clocks, one verdict. */
 .proof-screen { position: fixed; inset: 0; overflow: hidden; display: grid; grid-template-rows: 17vh 59vh 24vh; color: var(--cream); background: var(--navy); font-family: "Press Start 2P", ui-monospace, monospace; box-shadow: inset 0 0 0 clamp(6px, .7vw, 14px) var(--blue), inset 0 0 0 clamp(11px, 1.2vw, 24px) var(--navy), inset 0 0 0 clamp(15px, 1.65vw, 32px) var(--red); }
-.proof-screen[data-session-state="verified"], .proof-screen[data-session-state="towelled"] { grid-template-rows: 15vh 52vh 33vh; }
+.proof-screen[data-session-state="verified"], .proof-screen[data-session-state="towelled"], .proof-screen[data-session-state="failed"] { grid-template-rows: 15vh 52vh 33vh; }
 .proof-header { position: relative; z-index: 2; display: grid; grid-template-columns: minmax(50px, 4vw) minmax(0, 1fr) auto auto; align-items: center; gap: clamp(8px, .8vw, 16px); padding: 2.2vh 3.4vw 1.7vh; border-bottom: clamp(5px, .55vw, 10px) solid var(--yellow); background: #050817; box-shadow: inset 0 -.55vh 0 var(--red); }
 .proof-title { min-width: 0; }
 .proof-header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; letter-spacing: .08em; text-transform: uppercase; }
@@ -631,6 +638,27 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .proof-replay { color: var(--blue-light); border-color: var(--blue-light); }
 .proof-ringside { color: var(--navy); background: var(--yellow); }
 .proof-share { color: #081a10; border-color: #6bf39a; background: #6bf39a; }
+/* A terminal footer can outgrow its fixed row at any desktop height when the
+   selected ringside roster and towel status stack below the verdict. Uploaded
+   screenshots may also be resized, so physical image dimensions are not a
+   trustworthy media-query boundary. Whenever actions exist, make this footer
+   the scroll owner and keep its escape actions first and sticky. */
+.proof-footer:has(.proof-actions) {
+  align-content: start;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.proof-footer:has(.proof-actions) .proof-actions {
+  position: sticky;
+  z-index: 4;
+  top: 0;
+  order: -1;
+  width: min(1240px, 92vw);
+  margin: 0 0 .65em;
+  padding: .65em;
+  border-bottom: 2px solid #46527c;
+  background: #050817f2;
+}
 .towel-call { display: flex; align-items: center; justify-content: center; gap: 1.2em; margin-top: 1em; }
 .towel-call p { margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-weight: 900; }
 .proof-towel { color: #081a10; border-color: var(--yellow); background: var(--yellow); }
@@ -934,13 +962,54 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
      clipped. Stacking it would only make a 42px pill 71px tall for no reason. */
 }
 
-/* Detail lives in the replay booth so the ring itself stays radically simple. */
-.replay-overlay { position: fixed; z-index: 42; inset: 0; display: grid; place-items: center; padding: 4vh 5vw; background: #02040ef2; }
-.replay-modal { display: grid; gap: 1.6vh; width: min(1260px, 92vw); max-height: 92vh; padding: 3vh 3vw; overflow: auto; border: clamp(6px, .65vw, 12px) solid var(--blue-light); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(8px, .75vw, 15px) var(--red), 1em 1em #000; text-align: left; }
+/* Instant Replay is the presenter story. Evidence has one boundary below it. */
+.replay-overlay { position: fixed; z-index: 42; inset: 0; display: grid; place-items: center; padding: 3vh 3vw; overflow: hidden; background: #02040ef2; }
+.replay-modal { display: grid; gap: clamp(10px, 1.5vh, 16px); width: min(1120px, 94vw); max-width: 100%; max-height: 94dvh; padding: clamp(18px, 2.4vh, 28px) clamp(18px, 2.4vw, 30px); overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; border: clamp(6px, .65vw, 10px) solid var(--blue-light); color: var(--cream); background: #10183e; box-shadow: inset 0 clamp(7px, .65vw, 11px) var(--red), .8em .8em #000; text-align: left; }
+.replay-modal > * { min-width: 0; }
 .replay-modal > header { display: flex; align-items: start; justify-content: space-between; gap: 2vw; }
-.replay-modal > header p { margin: 0 0 1em; color: var(--blue-light); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
-.replay-modal > header h2 { margin: 0; font-size: clamp(20px, 2.5vw, 48px); line-height: 1.2; text-shadow: .12em .12em #000; text-transform: uppercase; }
-.replay-modal > header > span { flex: none; padding: 1em; border: 3px solid #6bf39a; color: #6bf39a; font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+.replay-modal > header p { margin: 0 0 .7em; color: var(--blue-light); font-size: clamp(6px, .48vw, 9px); line-height: 1.35; text-transform: uppercase; }
+.replay-modal > header h2 { margin: 0; font-size: clamp(20px, 2vw, 36px); line-height: 1.2; overflow-wrap: anywhere; text-shadow: .1em .1em #000; text-transform: uppercase; }
+.replay-modal > header > span { flex: none; max-width: 36%; padding: .9em 1em; border: 3px solid #6bf39a; color: #6bf39a; font-size: clamp(6px, .5vw, 9px); line-height: 1.4; text-align: center; text-transform: uppercase; }
+.replay-modal > header > span[data-state="partial"] { border-color: var(--yellow); color: var(--yellow); }
+.replay-modal > header > span[data-state="no-result"] { border-color: #ff9888; color: #ff9888; }
+.replay-story { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(9px, 1vw, 14px); align-items: stretch; }
+.replay-beat { display: flex; flex-direction: column; min-width: 0; padding: clamp(13px, 1.5vw, 18px); border: 3px solid #46527c; border-top: 6px solid var(--yellow); background: #050817; }
+.replay-beat[data-beat="setup"] { border-top-color: var(--blue-light); }
+.replay-beat[data-beat="takeaway"] { border-top-color: #6bf39a; }
+.replay-beat > header { display: flex; align-items: center; gap: 9px; }
+.replay-beat > header span { color: var(--yellow); font-size: clamp(6px, .48vw, 9px); }
+.replay-beat > header h3 { margin: 0; font-size: clamp(9px, .72vw, 13px); line-height: 1.3; text-transform: uppercase; }
+.replay-beat > p { margin: .85em 0 0; color: #d7def6; font-family: ui-monospace, monospace; font-size: clamp(12px, .9vw, 15px); font-weight: 900; line-height: 1.42; overflow-wrap: anywhere; }
+.replay-primary-metric { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-top: auto; padding-top: 12px; }
+.replay-primary-metric > div { --corner: var(--blue-light); container-type: inline-size; display: grid; align-content: start; min-width: 0; padding: 10px; border: 2px solid #46527c; border-left: 5px solid var(--corner); background: #10183e; }
+.replay-primary-metric > div[data-corner="red"] { --corner: var(--red-light); }
+.replay-primary-metric span, .replay-primary-metric strong, .replay-primary-metric small { display: block; }
+.replay-primary-metric span { color: var(--corner); font-size: clamp(6px, .48vw, 9px); line-height: 1.35; overflow-wrap: anywhere; text-transform: uppercase; }
+.replay-primary-metric strong { max-width: 100%; margin-top: .45em; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(23px, 2.1vw, 36px); font-variant-numeric: tabular-nums; line-height: 1; white-space: nowrap; }
+.replay-primary-metric strong[data-width="long"] { font-size: clamp(18px, 1.65vw, 28px); font-size: clamp(18px, 20cqi, 28px); }
+.replay-primary-metric small { margin-top: .55em; color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(9px, .65vw, 11px); font-weight: 900; line-height: 1.3; }
+.replay-evidence { min-width: 0; border: 3px solid var(--yellow); background: #0a1130; }
+.replay-evidence > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 48px; padding: 10px 14px; color: var(--yellow); cursor: pointer; font-size: clamp(8px, .62vw, 11px); line-height: 1.4; text-transform: uppercase; }
+.replay-evidence > summary:focus-visible { outline: 3px solid var(--blue-light); outline-offset: 3px; }
+.replay-evidence > summary small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(9px, .65vw, 11px); font-weight: 900; text-align: right; text-transform: none; }
+.replay-evidence-body { display: grid; gap: 14px; padding: 14px; border-top: 3px solid var(--yellow); }
+.replay-evidence-lanes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.replay-evidence-lanes article { --corner: var(--blue-light); display: grid; gap: 7px; min-width: 0; padding: 12px; border: 2px solid #46527c; border-left: 6px solid var(--corner); background: #050817; }
+.replay-evidence-lanes article[data-corner="red"] { --corner: var(--red-light); }
+.replay-evidence-lanes strong { color: var(--corner); font-size: clamp(7px, .55vw, 10px); line-height: 1.4; overflow-wrap: anywhere; text-transform: uppercase; }
+.replay-evidence-lanes span, .replay-evidence-lanes p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(10px, .72vw, 12px); font-weight: 900; line-height: 1.4; overflow-wrap: anywhere; }
+.replay-evidence-lanes small { color: #aeb9df; font-size: clamp(6px, .46vw, 8px); text-transform: uppercase; }
+.replay-evidence-lanes p { color: #ff9888; }
+.replay-proof-sequence { display: grid; gap: 10px; }
+.replay-proof-sequence > header { display: flex; justify-content: space-between; gap: 12px; color: var(--yellow); font-size: clamp(7px, .55vw, 10px); line-height: 1.4; text-transform: uppercase; }
+.replay-proof-sequence > header span { color: #aeb9df; }
+.replay-evidence-step { min-width: 0; padding: 12px; border-left: 6px solid var(--yellow); background: #050817; }
+.replay-evidence-step > h3 { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; margin: 0; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(11px, .78vw, 14px); font-weight: 900; line-height: 1.45; }
+.replay-evidence-step > h3 span { color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: .7em; }
+.replay-evidence-step > div { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 9px; margin-top: 10px; align-items: start; }
+.replay-evidence .round5-setup-lane { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; gap: 9px; padding: 12px; }
+.replay-evidence .round5-setup-lane header { grid-column: 1; }
+.replay-evidence .round5-setup-lane dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .replay-lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2vw; }
 .replay-lanes article { --corner: var(--blue); position: relative; min-width: 0; padding: 1.2em 1.4em; border: 3px solid #46527c; background: #050817; box-shadow: inset .65em 0 var(--corner); }
 .replay-lanes article[data-corner="red"] { --corner: var(--red); }
@@ -949,17 +1018,6 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .replay-lanes article b { margin-top: .7em; color: var(--cream); font-size: clamp(18px, 2.1vw, 40px); }
 .replay-lanes article span, .replay-lanes article p { margin: .9em 0 0; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 900; line-height: 1.4; }
 .replay-lanes article p { padding-top: .8em; border-top: 2px solid #46527c; color: #ff9888; }
-.replay-steps { display: grid; gap: .65em; margin: 0; padding: 0; list-style: none; counter-reset: none; }
-.replay-steps > li { min-width: 0; border-left: .5em solid var(--yellow); color: var(--cream); background: #0a1130; }
-.replay-steps > li > button { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 1.2em; width: 100%; padding: .85em 1em; border: 0; color: inherit; background: transparent; text-align: left; }
-.replay-steps > li > button:hover, .replay-steps > li > button[aria-expanded="true"] { background: #151f4f; }
-.replay-steps > li > button > span { color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: clamp(6px, .52vw, 10px); }
-.replay-steps > li > button > strong { font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 14px); font-weight: 900; line-height: 1.4; }
-.replay-steps > li > button > small { color: var(--blue-light); font-size: clamp(5px, .42vw, 8px); text-transform: uppercase; white-space: nowrap; }
-.replay-call-panel { padding: .9em 1em 1em; border-top: 3px solid #46527c; background: #050817; }
-.replay-call-panel > header { display: flex; justify-content: space-between; gap: 1em; margin-bottom: .8em; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); text-transform: uppercase; }
-.replay-call-panel > header span { color: #aeb9df; }
-.replay-call-panel > div { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: .75em; align-items: start; }
 .replay-call-group { --corner: var(--blue); min-width: 0; padding: .8em; border: 2px solid #46527c; border-top: .45em solid var(--corner); background: #0a1130; }
 .replay-call-group[data-corner="red"] { --corner: var(--red); }
 .replay-call-group[data-corner="shared"] { --corner: var(--yellow); }
@@ -974,7 +1032,33 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .replay-facts dt { color: var(--yellow); font-size: clamp(5px, .43vw, 8px); text-transform: uppercase; }
 .replay-facts dd { margin: .8em 0 0; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
 .replay-facts dd small { display: block; margin-top: .5em; color: #aeb9df; font-size: .82em; font-weight: 800; }
-.replay-close { padding: 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
+.replay-close { min-height: 44px; padding: .9em 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .35em .35em #000; font-size: clamp(8px, .62vw, 12px); text-transform: uppercase; }
+.capacity-evidence { margin-top: 0; }
+.capacity-evidence-title { display: block; color: var(--yellow); font-size: clamp(6px, .5vw, 9px); line-height: 1.45; text-transform: uppercase; }
+@media (max-width: 759px) {
+  .replay-overlay { place-items: stretch; padding: 0; }
+  .replay-modal { width: 100vw; height: 100dvh; max-height: 100dvh; padding: 16px 14px max(14px, env(safe-area-inset-bottom)); border-width: 5px; box-shadow: inset 0 6px var(--red); }
+  .replay-modal > header { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .replay-modal > header > span { max-width: 100%; justify-self: start; padding: .7em .8em; }
+  .replay-story { grid-template-columns: minmax(0, 1fr); }
+  .replay-beat { padding: 14px; }
+  .replay-beat > p { font-size: 14px; }
+  .replay-primary-metric { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .replay-primary-metric strong { font-size: clamp(23px, 9vw, 32px); }
+  .replay-evidence > summary { align-items: flex-start; flex-direction: column; gap: 4px; min-height: 54px; }
+  .replay-evidence > summary small { text-align: left; }
+  .replay-evidence-lanes, .replay-facts { grid-template-columns: minmax(0, 1fr); }
+  .replay-evidence-step > div { grid-template-columns: minmax(0, 1fr); }
+  .replay-proof-sequence > header { display: grid; }
+  .replay-evidence .round5-explain-grid { grid-template-columns: minmax(0, 1fr); }
+  .replay-evidence .round5-lane dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 360px) {
+  .replay-modal { padding-right: 10px; padding-left: 10px; }
+  .replay-primary-metric { grid-template-columns: minmax(0, 1fr); }
+  .replay-primary-metric strong { font-size: 28px; }
+  .replay-evidence-body { padding: 10px; }
+}
 .cooldown-detail-lanes article span { color: #aeb9df; }
 .cooldown-detail-lanes article code { color: var(--cream); font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
 .cooldown-detail-lanes article p { color: #6bf39a; }
@@ -2197,4 +2281,144 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
   .standing-cost-lanes { grid-template-columns: 1fr; }
   .standing-cost-totals { grid-template-columns: 1fr; }
   .bout-cost-rounds { grid-template-columns: 1fr; }
+}
+
+/* Portrait setup keeps the cabinet styling but gives the cabinet the viewport
+   height and one explicit scroll owner. The desktop 16:9 composition remains
+   unchanged; only portrait screens that cannot contain it enter document-like
+   flow. */
+@media (orientation: portrait) and (max-width: 900px) {
+  .game-screen:not([data-scene="card"]) {
+    width: 100vw;
+    height: 100dvh;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+  .game-screen:not([data-scene="card"]) .game-topbar {
+    position: static;
+    min-height: 86px;
+    height: auto;
+  }
+  .game-screen:not([data-scene="card"]) .game-scene {
+    position: static;
+    min-height: calc(100dvh - 86px);
+    padding: 24px clamp(18px, 4vw, 34px);
+  }
+  .game-screen:not([data-scene="card"]) .game-mode,
+  .game-screen:not([data-scene="card"]) .api-indicator-wrap {
+    top: 96px;
+  }
+  .game-screen:not([data-scene="card"]) .game-nav {
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
+}
+
+@media (orientation: portrait) and (max-width: 700px) {
+  .game-screen:not([data-scene="card"]) .opponent-scene,
+  .game-screen:not([data-scene="card"]) .roster-scene {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .game-screen:not([data-scene="card"]) .opponent-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    min-height: 360px;
+  }
+  .game-screen:not([data-scene="card"]) .corner-picker {
+    padding: 20px;
+  }
+  .game-screen:not([data-scene="card"]) .persona-roster {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-rows: none;
+  }
+  .game-screen:not([data-scene="card"]) .persona-card {
+    min-height: 210px;
+  }
+  .game-screen:not([data-scene="card"]) .roster-confirm,
+  .game-screen:not([data-scene="card"]) .lens-score {
+    min-height: 180px;
+    padding: 20px;
+  }
+  .game-screen:not([data-scene="card"]) .roster-confirm img {
+    width: 96px;
+    margin: 14px 0;
+  }
+  .game-screen:not([data-scene="card"]) .lens-score strong,
+  .game-screen:not([data-scene="card"]) .lens-score b {
+    margin-top: 16px;
+  }
+  .game-screen:not([data-scene="card"]) .game-nav {
+    position: sticky;
+    z-index: 8;
+    bottom: 0;
+    margin: 0 -18px -24px;
+    padding: 12px 18px max(12px, env(safe-area-inset-bottom));
+    background: #050817f2;
+  }
+  .game-screen:not([data-scene="card"]) .game-nav button {
+    min-height: 48px;
+    padding: 8px 12px;
+  }
+}
+
+/* Terminal arenas previously kept fixed viewport rows and hidden overflow.
+   At phone widths the body can legitimately be taller than the screen, so the
+   arena itself owns vertical scrolling and every footer action remains in flow. */
+@media (max-width: 760px) {
+  .proof-screen,
+  .proof-screen[data-session-state="verified"],
+  .proof-screen[data-session-state="towelled"],
+  .proof-screen[data-session-state="failed"],
+  .round4-screen,
+  .round4-screen[data-presentation$="verified"],
+  .round4-screen[data-presentation$="failed"],
+  .round5-screen,
+  .round5-screen[data-layout="compact"] {
+    position: fixed;
+    height: 100dvh;
+    grid-template-rows: auto auto auto;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+  .proof-lanes {
+    min-height: 420px;
+    overflow: visible;
+  }
+  .round4-body,
+  .round5-body {
+    min-height: max-content;
+    overflow: visible;
+  }
+  .round4-body {
+    padding-top: 20px;
+    padding-bottom: 20px;
+  }
+  .round5-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding-top: 16px;
+    padding-bottom: 18px;
+  }
+  .proof-footer,
+  .round4-footer,
+  .round5-footer {
+    min-height: 72px;
+    padding-top: 14px;
+    /* Leave a real scroll tail after wrapped actions. Without it, subpixel
+       rounding could pin the last mobile button fractionally below the clip. */
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+  }
+  .proof-actions,
+  .round4-actions,
+  .round5-actions {
+    margin-bottom: 0;
+  }
+  .proof-actions::after,
+  .round4-actions::after,
+  .round5-actions::after {
+    content: "";
+    flex: 0 0 100%;
+    height: 4px;
+  }
 }

@@ -13,7 +13,7 @@ import {
 import verifiedSource from './verified-corpus.jsonl?raw'
 
 export const VERIFIED_CORPUS_SHA256 = '55bd71d5058e8388f358f8d0d34ab65f0326a6e0607ee8b5b774d53fa3820769'
-export const OUTCOME_COPY_SHA256 = 'aa180129fa725b83ef181183403581f3e674385c9cc92609d22f2fe0d235248b'
+export const OUTCOME_COPY_SHA256 = 'b2e12cb141630d72bd2718c50c2266d28829a9be4752c3b14b65c0a8428bf276'
 
 export const PERSONA_IDS = [
   'data_engineer',

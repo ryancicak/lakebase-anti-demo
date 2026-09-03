@@ -6,6 +6,7 @@
 // is what react-refresh/only-export-components is guarding.
 
 import { resultKind } from './recap'
+import type { ContractStatus, FormalWinner } from './outcome'
 
 /**
  * Structural subset of App.tsx's ScorecardEntry.
@@ -23,6 +24,8 @@ export interface CreditsScorecardEntry {
   competitor_censored?: boolean
   /** True when the opponent lane reported `not_supported` -- nothing was timed. */
   competitor_capability_gap?: boolean
+  contract_status?: ContractStatus
+  formal_winner?: FormalWinner
 }
 
 export interface CreditsTally {
@@ -30,6 +33,8 @@ export interface CreditsTally {
   lakebaseWins: number
   /** Bouts with no opponent time to compare against, counted apart from the wins. */
   uncontested: number
+  /** Optional for callers constructing the pre-classifier tally shape. */
+  incomplete?: number
   /**
    * Bouts stopped before our own lane verified. Neither a win nor uncontested:
    * uncontested means we finished and nobody entered against us, and only the
@@ -61,8 +66,32 @@ export interface CreditsTally {
 export function creditsTally(entries: CreditsScorecardEntry[]): CreditsTally {
   let lakebaseWins = 0
   let uncontested = 0
+  let incomplete = 0
   let abandoned = 0
   for (const entry of entries) {
+    if (entry.contract_status !== undefined) {
+      if (entry.contract_status === 'declared_capability') {
+        uncontested += 1
+      } else if (
+        entry.formal_winner === 'lakebase'
+        && (
+          entry.contract_status === 'declared_comparison'
+          || entry.contract_status === 'adjudicated_stoppage'
+          || entry.contract_status === 'cleanup_failure'
+        )
+      ) {
+        lakebaseWins += 1
+      } else if (
+        entry.contract_status === 'comparison_incomplete'
+        || entry.contract_status === 'guardrail_failure'
+        || entry.contract_status === 'cleanup_failure'
+      ) {
+        incomplete += 1
+      } else if (entry.contract_status === 'no_verified_evidence') {
+        abandoned += 1
+      }
+      continue
+    }
     const lakebaseMs = entry.lakebase_ms
     const competitorMs = entry.competitor_ms
     // A lane that was never built is not a bounded one: nothing ran to bound.
@@ -94,6 +123,7 @@ export function creditsTally(entries: CreditsScorecardEntry[]): CreditsTally {
     bouts: entries.length,
     lakebaseWins,
     uncontested,
+    incomplete,
     abandoned,
     competitors: [...new Set(entries.map((entry) => entry.competitor))],
   }

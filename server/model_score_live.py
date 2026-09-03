@@ -1363,7 +1363,7 @@ class Round4PipelineActivation:
         _PENDING_RECORDS.add(task)
         task.add_done_callback(_PENDING_RECORDS.discard)
 
-    async def _read_signals(self) -> _PipelineSignals:
+    async def _read_signals(self) -> PipelineSignals:
         """The three states that decide whether a sync is healthy.
 
         Read here rather than through ``inspect_sync`` because ``inspect_sync``
@@ -1375,47 +1375,21 @@ class Round4PipelineActivation:
         adapter uses; only the fetch is more forgiving.
         """
 
-        pipeline = await asyncio.to_thread(
+        return await read_pipeline_signals(
+            self._manifest,
             self._api,
-            self._manifest.databricks.profile,
-            "get",
-            f"/api/2.0/pipelines/{self._pipeline_id}",
+            pipeline_id=self._pipeline_id,
         )
-        synced = await asyncio.to_thread(
-            self._api,
-            self._manifest.databricks.profile,
-            "get",
-            f"/api/2.0/database/synced_tables/{quote(self._synced_table_id, safe='')}",
-        )
-        status = _mapping(synced.get("data_synchronization_status"))
-        return _PipelineSignals(
-            pipeline_state=_enum_value(pipeline.get("state")),
-            update_state=latest_pipeline_update_state(pipeline),
-            synced_table_state=_enum_value(status.get("detailed_state")),
-            continuous_reported=bool(_mapping(status.get("continuous_update_status"))),
-        )
-
-    @property
-    def _synced_table_id(self) -> str:
-        sealed = self._manifest.round4
-        return str(getattr(sealed, "synced_table_id", "") or "")
 
     @staticmethod
-    def _healthy(signals: _PipelineSignals) -> bool:
-        if not signals.continuous_reported:
-            return False
-        return (
-            classify_managed_sync_state(
-                {signals.synced_table_state},
-                signals.pipeline_state,
-                signals.update_state,
-            )
-            is ManagedSyncState.RUNNING
-        )
+    def _healthy(signals: PipelineSignals) -> bool:
+        return pipeline_signals_are_healthy(signals)
 
 
 @dataclass(frozen=True, slots=True)
-class _PipelineSignals:
+class PipelineSignals:
+    """The independent live signals used for Round 4 power decisions."""
+
     pipeline_state: str
     update_state: str
     synced_table_state: str
@@ -1429,6 +1403,94 @@ class _PipelineSignals:
             f"pipeline {self.pipeline_state or 'UNKNOWN'} · "
             f"update {self.update_state or 'NONE'} · {table}"
         )
+
+
+async def read_pipeline_signals(
+    manifest: DemoManifest,
+    api: Callable[..., dict[str, Any]],
+    *,
+    pipeline_id: str,
+) -> PipelineSignals:
+    """Read the sealed pipeline and its synced-table status without mutating either.
+
+    The pipeline path goes through the same exact-identity guard as
+    :func:`pipeline_power.stop`. The synced-table endpoint is GET-only and is
+    consulted because ``IDLE`` alone is ambiguous: only the pipeline, newest
+    update, and table status together can prove an operator already stopped the
+    continuous update.
+    """
+
+    sealed_pipeline = pipeline_power._sealed_pipeline_id(manifest)
+    if pipeline_id != sealed_pipeline:
+        raise ModelScoreLiveConfigurationError(
+            "Round 4 pipeline signal read does not name the sealed pipeline"
+        )
+    pipeline = await asyncio.to_thread(
+        api,
+        manifest.databricks.profile,
+        "get",
+        pipeline_power._require_pipeline_path(
+            pipeline_id,
+            f"/api/2.0/pipelines/{pipeline_id}",
+        ),
+    )
+    sealed = manifest.round4
+    synced_table_id = str(getattr(sealed, "synced_table_id", "") or "")
+    if not synced_table_id:
+        raise ModelScoreLiveConfigurationError(
+            "Round 4 pipeline signal read has no sealed synced-table identity"
+        )
+    synced = await asyncio.to_thread(
+        api,
+        manifest.databricks.profile,
+        "get",
+        f"/api/2.0/database/synced_tables/{quote(synced_table_id, safe='')}",
+    )
+    status = _mapping(synced.get("data_synchronization_status"))
+    return PipelineSignals(
+        pipeline_state=_enum_value(pipeline.get("state")),
+        update_state=latest_pipeline_update_state(pipeline),
+        synced_table_state=_enum_value(status.get("detailed_state")),
+        continuous_reported=bool(_mapping(status.get("continuous_update_status"))),
+    )
+
+
+def pipeline_signals_are_healthy(signals: PipelineSignals) -> bool:
+    """Whether all live signals prove a healthy continuous update."""
+
+    if not signals.continuous_reported:
+        return False
+    return (
+        classify_managed_sync_state(
+            {signals.synced_table_state},
+            signals.pipeline_state,
+            signals.update_state,
+        )
+        is ManagedSyncState.RUNNING
+    )
+
+
+def pipeline_signals_prove_deliberate_stop(signals: PipelineSignals) -> bool:
+    """Whether the measured operator-stop shape is present, not merely ``IDLE``.
+
+    This is deliberately narrower than ``ManagedSyncState.STOPPED``. That state
+    also includes an idle pipeline with no update history, a completed update,
+    and other inactive-but-ambiguous combinations. Recording any of those as a
+    deliberate stop would hide a genuine pipeline failure. The accepted shape
+    is the one observed after the sanctioned stop command: ``IDLE``, newest
+    update ``CANCELED``, the table still online with only its pipeline update
+    failed, and no continuous update reported.
+    """
+
+    return (
+        not signals.continuous_reported
+        and signals.pipeline_state.strip().upper() == "IDLE"
+        and synced_table_failure_is_a_stopped_pipeline(
+            {signals.synced_table_state},
+            signals.pipeline_state,
+            signals.update_state,
+        )
+    )
 
 
 #: Strong references to in-flight durable power writes, for the same reason

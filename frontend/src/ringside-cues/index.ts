@@ -1,11 +1,12 @@
 export {
   buildRingsideCue,
   buildRingsideShow,
+  classifyOutcome,
   classifyRingsideOutcome,
   interpolateProof,
-  isShareableRingsideOutcome,
   priorityKeyFor,
 } from './classifier'
+export type { ClassifiedSessionOutcome } from './classifier'
 export {
   OUTCOME_COPY_RECORDS,
   OUTCOME_COPY_SHA256,
@@ -30,3 +31,20 @@ export type {
   RingsideOutcomeId,
   VerifiedCorpusRecord,
 } from './types'
+export {
+  classifyEvidence,
+  resolveRoundContract,
+} from '../outcome'
+export type {
+  ClassifiedEvidence,
+  ContractComparison,
+  ContractStatus,
+  EvidenceInput,
+  EvidenceShape,
+  FormalWinner,
+  LaneEvidence,
+  LaneEvidenceShape,
+  ResultStatus,
+  RoundContractDecision,
+  RoundContractInput,
+} from '../outcome'

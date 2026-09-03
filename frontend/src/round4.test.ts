@@ -201,6 +201,88 @@ describe('Round 4 event and reconciliation policy', () => {
     )
   })
 
+  it('rejects a same-timestamp GET that regresses an SSE-verified initial lane', () => {
+    const verifiedLane = {
+      ...session().lanes.lakebase,
+      state: 'verified' as const,
+      elapsed_ms: 812,
+      status: 'Exact read-back verified',
+    }
+    const current = {
+      ...session('2026-08-18T20:00:02Z'),
+      state: 'running' as const,
+      lanes: { ...session().lanes, lakebase: verifiedLane },
+    }
+    const stale = {
+      ...current,
+      lanes: {
+        ...current.lanes,
+        lakebase: {
+          ...verifiedLane,
+          state: 'verifying' as const,
+          elapsed_ms: 500,
+          status: 'Still checking',
+        },
+      },
+    }
+
+    expect(acceptsReconciledSession(current, stale)).toBe(false)
+    expect(selectRound4Session(current, stale)).toBe(current)
+  })
+
+  it('merges initial and redo lane latches into a newer snapshot', () => {
+    const current = {
+      ...session('2026-08-18T20:00:02Z'),
+      state: 'running' as const,
+      lanes: {
+        ...session().lanes,
+        lakebase: {
+          ...session().lanes.lakebase,
+          state: 'verified' as const,
+          elapsed_ms: 812,
+          status: 'Initial verified',
+        },
+      },
+      redo: redo('running'),
+    }
+    current.redo!.lanes.lakebase = {
+      ...current.redo!.lanes.lakebase,
+      state: 'verified',
+      elapsed_ms: 440,
+      status: 'Redo verified',
+    }
+    const newer = {
+      ...current,
+      updated_at: '2026-08-18T20:00:03Z',
+      lanes: {
+        ...current.lanes,
+        lakebase: {
+          ...current.lanes.lakebase,
+          state: 'connecting' as const,
+          elapsed_ms: null,
+          status: 'Stale initial',
+        },
+      },
+      redo: {
+        ...current.redo!,
+        lanes: {
+          ...current.redo!.lanes,
+          lakebase: {
+            ...current.redo!.lanes.lakebase,
+            state: 'verifying' as const,
+            elapsed_ms: 100,
+            status: 'Stale redo',
+          },
+        },
+      },
+    }
+
+    const selected = selectRound4Session(current, newer)!
+    expect(selected.updated_at).toBe(newer.updated_at)
+    expect(selected.lanes.lakebase).toEqual(current.lanes.lakebase)
+    expect(selected.redo!.lanes.lakebase).toEqual(current.redo!.lanes.lakebase)
+  })
+
   it('never switches between terminal redo outcomes', () => {
     const verified = { ...session('2026-08-18T20:00:02Z'), redo: redo('verified') }
     const failed = { ...session('2026-08-18T20:00:03Z'), redo: redo('failed') }

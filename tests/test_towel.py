@@ -79,7 +79,13 @@ def test_round_five_towel_uses_only_shared_t0_setup_evidence() -> None:
     assert result.comparison.kind == ComparisonKind.NOT_COMPARABLE
     assert result.comparison.winner_lane_id is None
     assert result.comparison.margin is None
-    assert "No winner · Margin N/A" in result.public_result
+    assert result.public_result == (
+        "Toweled · Lakebase setup verified first · "
+        "RDS PostgreSQL + RDS Proxy unverified beyond 223.27s · "
+        "Shared spike did not run · No declared winner · "
+        "Comparison incomplete · Margin N/A"
+    )
+    assert "Neither setup" not in result.public_result
 
 
 def test_round_five_towel_will_not_time_a_lane_that_never_published_progress() -> None:
@@ -110,6 +116,78 @@ def test_round_five_towel_will_not_time_a_lane_that_never_published_progress() -
         assert lane.state == LaneState.TOWELLED
         assert lane.elapsed_ms is None
         assert lane.evidence == {"censored": True, "display_value": "NOT TIMED"}
+    assert result.public_result == (
+        "Toweled · No exact setup stop verified · Shared spike did not run · "
+        "No declared winner · Comparison incomplete · Margin N/A"
+    )
+
+
+def test_round_five_towel_preserves_a_competitor_first_exact_stop_without_a_winner() -> None:
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.CONNECTING),
+        "competitor": _lane("competitor", LaneState.CONNECTING),
+    }
+    setup_lanes = {
+        "lakebase": RoundFiveSetupLaneSnapshot(
+            id="lakebase",
+            name="Lakebase",
+            state=RoundFiveSetupState.RUNNING,
+            setup_elapsed_ms=500.0,
+        ),
+        "competitor": RoundFiveSetupLaneSnapshot(
+            id="competitor",
+            name="RDS PostgreSQL + RDS Proxy",
+            state=RoundFiveSetupState.VERIFIED,
+            setup_elapsed_ms=375.25,
+        ),
+    }
+
+    result = adjudicate_round_five_towel(
+        lanes=lanes,
+        setup_lanes=setup_lanes,
+        elapsed_at_cutoff_ms={"lakebase": 10_000.0, "competitor": 999_999.0},
+    )
+
+    assert result.comparison.kind == ComparisonKind.NOT_COMPARABLE
+    assert result.comparison.winner_lane_id is None
+    assert result.comparison.margin is None
+    assert result.public_result == (
+        "Toweled · RDS PostgreSQL + RDS Proxy setup verified first · "
+        "Lakebase unverified beyond 10.00s · Shared spike did not run · "
+        "No declared winner · Comparison incomplete · Margin N/A"
+    )
+
+
+def test_round_five_towel_does_not_compare_two_exact_setups_without_the_spike() -> None:
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.CONNECTING),
+        "competitor": _lane("competitor", LaneState.CONNECTING),
+    }
+    setup_lanes = {
+        "lakebase": RoundFiveSetupLaneSnapshot(
+            id="lakebase",
+            name="Lakebase",
+            state=RoundFiveSetupState.VERIFIED,
+            setup_elapsed_ms=375.25,
+        ),
+        "competitor": RoundFiveSetupLaneSnapshot(
+            id="competitor",
+            name="RDS PostgreSQL + RDS Proxy",
+            state=RoundFiveSetupState.VERIFIED,
+            setup_elapsed_ms=500.0,
+        ),
+    }
+
+    result = adjudicate_round_five_towel(lanes=lanes, setup_lanes=setup_lanes)
+
+    assert result.comparison.kind == ComparisonKind.NOT_COMPARABLE
+    assert result.comparison.winner_lane_id is None
+    assert result.comparison.margin is None
+    assert result.public_result == (
+        "Toweled · Exact setup stops preserved for Lakebase and "
+        "RDS PostgreSQL + RDS Proxy · Shared spike did not complete · "
+        "No declared winner · Comparison incomplete · Margin N/A"
+    )
 
 
 @pytest.mark.parametrize(

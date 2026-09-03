@@ -39,10 +39,16 @@ describe('Explain to the Room accessibility guards', () => {
   })
 
   it('restores focus only while the saved opener remains connected', () => {
-    const source = readFileSync(join(import.meta.dirname, 'App.tsx'), 'utf8')
-    const start = source.indexOf('function RingsideTake')
-    const cue = source.slice(start, source.indexOf('/** One lane', start))
-    expect(cue).toMatch(/if\s*\(opener\?\.isConnected\)\s*opener\.focus\(\)/)
-    expect(cue).not.toMatch(/requestAnimationFrame\(\(\)\s*=>\s*opener\?\.focus\(\)\)/)
+    const app = readFileSync(join(import.meta.dirname, 'App.tsx'), 'utf8')
+    const start = app.indexOf('function RingsideTake')
+    const cue = app.slice(start, app.indexOf('/** One lane', start))
+    const lifecycle = readFileSync(
+      join(import.meta.dirname, 'hooks/useAccessibleDialog.ts'),
+      'utf8',
+    )
+    expect(cue).toMatch(/useAccessibleDialog<HTMLElement>\(true,\s*onClose\)/)
+    expect(lifecycle).toMatch(/if\s*\(!opener\?\.isConnected\)\s*return/)
+    expect(lifecycle).toMatch(/opener\.focus\(\)/)
+    expect(lifecycle).not.toMatch(/requestAnimationFrame/)
   })
 })

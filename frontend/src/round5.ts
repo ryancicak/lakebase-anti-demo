@@ -140,9 +140,16 @@ export function isRoundFive(session: DemoSession | null | undefined): boolean {
 }
 
 export function roundFiveHasComparison(session: DemoSession): boolean {
-  if (!isRoundFive(session) || session.state !== 'verified') return false
+  if (!isRoundFive(session)) return false
   const setup = session.round5_setup
   const comparison = session.comparison
+  const cleanupFailed = Boolean(
+    setup?.cleanup_failure
+    || session.towel?.cleanup_failure
+    || session.cooldown?.state === 'failed'
+    || session.cooldown?.failure,
+  )
+  if (session.state !== 'verified' && !cleanupFailed) return false
   const bothSetupLanesVerified = roundFiveSetupLaneResult(session, 'lakebase').verified
     && roundFiveSetupLaneResult(session, 'competitor').verified
   const comparisonValid = comparison?.kind === 'tie'
@@ -158,7 +165,7 @@ export function roundFiveHasComparison(session: DemoSession): boolean {
     && bothSetupLanesVerified
     && setupLaunchSkew !== null
     && setupLaunchSkew <= ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS
-    && setup?.state === 'verified'
+    && (setup?.state === 'verified' || cleanupFailed)
     && setup?.setup_validated === true
     && setup?.downstream_validated === true
     && comparisonValid

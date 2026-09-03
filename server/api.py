@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from collections.abc import Awaitable
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, date, datetime
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse
 
 from . import round_availability, selfheal
@@ -41,6 +43,8 @@ from .models import (
 from .receipts import ReceiptsResponse, current_installation, load_receipts_async
 from .reconcile import presence_from_report
 
+SESSION_STREAM_ROTATE_SECONDS = 240.0
+
 router = APIRouter(prefix="/api")
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,7 @@ _CLEANUP_PHASES = frozenset(
         "cleanup_retry",
         "round5_cleanup",
         "round5_cleanup_recovery",
+        "round4_stop_recovery",
         "startup_cleanup",
     }
 )
@@ -493,6 +498,8 @@ class InstallationView(BaseModel):
 class RecoveryRequest(BaseModel):
     """The confirmation. No default, so an empty body is a 422 rather than a spend."""
 
+    model_config = ConfigDict(extra="forbid")
+
     confirm: str
 
 
@@ -819,33 +826,47 @@ async def start_cooldown(session_id: str, request: Request) -> SessionSnapshot:
     )
 
 
-@router.get("/sessions/{session_id}/events")
-async def session_events(
-    session_id: str,
+async def _rotating_session_stream(
+    run_manager: RunManager,
     request: Request,
-    after: int = 0,
-    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
-) -> EventSourceResponse:
-    resume_after = max(after, 0)
-    if last_event_id is not None:
-        try:
-            header_after = int(last_event_id)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Last-Event-ID must be a nonnegative integer",
-            ) from exc
-        if header_after < 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Last-Event-ID must be a nonnegative integer",
-            )
-        resume_after = max(resume_after, header_after)
+    session_id: str,
+    resume_after: int,
+    *,
+    rotate_after_seconds: float = SESSION_STREAM_ROTATE_SECONDS,
+):
+    """Complete an SSE request before the app proxy's long-connection ceiling.
 
-    await _control_operation(manager(request).get(session_id))
-
-    async def stream():
-        async for item in manager(request).events(session_id, resume_after):
+    `stream_rotate` is a control frame, not a bout event. It carries the last
+    delivered sequence, then the response ends normally. The browser owns the
+    next request and resumes with `?after=`, so rotation cannot create two live
+    subscribers or replay a delivered event.
+    """
+    iterator = run_manager.events(session_id, resume_after).__aiter__()
+    cursor = resume_after
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, rotate_after_seconds)
+    pending = asyncio.create_task(anext(iterator))
+    try:
+        while True:
+            remaining = max(0.0, deadline - loop.time())
+            done, _ = await asyncio.wait({pending}, timeout=remaining)
+            if not done:
+                yield {
+                    "id": str(cursor),
+                    "event": "stream_rotate",
+                    "data": json.dumps(
+                        {
+                            "sequence": cursor,
+                            "reason": "proactive_proxy_lifetime_rotation",
+                        }
+                    ),
+                }
+                break
+            try:
+                item = pending.result()
+            except StopAsyncIteration:
+                break
+            cursor = item.sequence
             if await request.is_disconnected():
                 break
             yield {
@@ -853,5 +874,49 @@ async def session_events(
                 "event": item.event,
                 "data": json.dumps(item.model_dump(mode="json")),
             }
+            if item.event in {"cooldown_ready", "session_cancelled"}:
+                break
+            pending = asyncio.create_task(anext(iterator))
+    finally:
+        if not pending.done():
+            pending.cancel()
+            with suppress(asyncio.CancelledError, StopAsyncIteration):
+                await pending
+        with suppress(RuntimeError):
+            await iterator.aclose()
 
-    return EventSourceResponse(stream(), ping=15)
+
+@router.get("/sessions/{session_id}/events")
+async def session_events(
+    session_id: str,
+    request: Request,
+    after: int = 0,
+    last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+) -> EventSourceResponse:
+    if after < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Event resume cursors must be nonnegative integers",
+        )
+    resume_after = after
+    if last_event_id is not None:
+        try:
+            header_after = int(last_event_id)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Event resume cursors must be nonnegative integers",
+            ) from exc
+        if header_after < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Event resume cursors must be nonnegative integers",
+            )
+        resume_after = max(resume_after, header_after)
+
+    run_manager = manager(request)
+    await _control_operation(run_manager.get(session_id))
+    return EventSourceResponse(
+        _rotating_session_stream(run_manager, request, session_id, resume_after),
+        ping=15,
+    )

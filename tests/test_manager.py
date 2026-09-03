@@ -502,8 +502,15 @@ class ChangingStartResolver:
 
 
 class SequencedCooldownTarget(FakeLiveTarget):
-    def __init__(self, id: str, name: str, cooldown_states: list[bool]) -> None:
-        super().__init__(id, name, 0.001)
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        cooldown_states: list[bool],
+        *,
+        verification_delay: float = 0.001,
+    ) -> None:
+        super().__init__(id, name, verification_delay)
         self.cooldown_states = list(cooldown_states)
         self.cooldown_cutoffs: list[datetime | None] = []
 
@@ -519,16 +526,23 @@ class SequencedCooldownTarget(FakeLiveTarget):
 
 
 class SequencedCooldownResolver:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        lakebase_verification_delay: float = 0.001,
+        competitor_verification_delay: float = 0.001,
+    ) -> None:
         self.lakebase = SequencedCooldownTarget(
             "lakebase",
             "Lakebase",
             [True, False, True],
+            verification_delay=lakebase_verification_delay,
         )
         self.competitor = SequencedCooldownTarget(
             "competitor",
             "Aurora Serverless v2",
             [False, False, True],
+            verification_delay=competitor_verification_delay,
         )
 
     def resolve(self, competitor: CompetitorId):
@@ -1719,7 +1733,14 @@ async def test_double_rung_bell_opens_exactly_one_run() -> None:
     await manager.start_towel(session_id)
     settled = await wait_for_towel(manager, session_id, "ready")
     assert settled.state == SessionState.TOWELLED
-    assert await manager._lease_store.current() is None
+    cleanup_lease = await manager._lease_store.current()
+    assert cleanup_lease is not None
+    assert cleanup_lease.phase == "cooldown"
+    assert (await manager.bout_status(RoundId.WAKE_IDLE_APP)).can_start is False
+    assert record.cooldown_task is not None
+    record.cooldown_task.cancel()
+    await asyncio.gather(record.cooldown_task, return_exceptions=True)
+    assert await manager._release_bout(record) is True
 
 
 async def test_bell_rung_again_after_verification_replays_the_same_result() -> None:
@@ -2303,7 +2324,12 @@ async def test_round_five_publishes_exact_lakebase_stop_while_competitor_continu
         # its Round 5 figures from here, so a stale value survives here even if
         # the censored bound above is right.
         assert toweled.round5_setup.lanes["competitor"].setup_elapsed_ms == silent_floor_ms
-        assert "No winner · Margin N/A" in (toweled.remembered_result or "")
+        assert toweled.remembered_result == (
+            "Toweled · Lakebase setup verified first · "
+            "RDS PostgreSQL + RDS Proxy unverified beyond 223.27s · "
+            "Shared spike did not run · No declared winner · "
+            "Comparison incomplete · Margin N/A"
+        )
 
         # What the result screen reads.
         receipt = derive_receipt(toweled, "towel_finished")
@@ -2312,6 +2338,8 @@ async def test_round_five_publishes_exact_lakebase_stop_while_competitor_continu
         assert receipt.lakebase.lower_bound is False
         assert receipt.opponent_lane.ms == silent_floor_ms
         assert receipt.opponent_lane.lower_bound is True
+        assert receipt.margin_ms is None
+        assert receipt.remembered_result == toweled.remembered_result
     finally:
         await manager.close()
 
@@ -2722,6 +2750,12 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         assert terminal.comparison.margin is not None
         assert terminal.comparison.margin.spec_id == "setup_elapsed_ms"
         assert terminal.comparison.margin.value == 250.0
+        assert terminal.remembered_result == (
+            "LAKEBASE VERIFIED A POOLED PATH · 0.25s SOONER"
+        )
+        assert derive_receipt(terminal, "run_finished").remembered_result == (
+            terminal.remembered_result
+        )
         setup_metrics = {
             item.lane_id: item.value
             for item in terminal.metrics
@@ -2825,13 +2859,22 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
     assert set(selected_opponents) == {selected_competitor}
 
 
-async def wait_for_cooldown(manager: RunManager, session_id: str, state: CooldownState):
-    for _ in range(100):
+async def wait_for_cooldown(
+    manager: RunManager,
+    session_id: str,
+    state: CooldownState,
+    *,
+    attempts: int = 100,
+):
+    for _ in range(attempts):
         snapshot = await manager.get(session_id)
         if snapshot.cooldown and snapshot.cooldown.state == state:
             return snapshot.cooldown
         await asyncio.sleep(0.005)
-    raise AssertionError(f"Cooldown never reached {state}")
+    raise AssertionError(
+        f"Cooldown never reached {state}: "
+        f"{snapshot.cooldown.model_dump(mode='json') if snapshot.cooldown else None}"
+    )
 
 
 async def wait_for_towel(manager: RunManager, session_id: str, state: str):
@@ -2875,13 +2918,9 @@ async def wait_for_redo(manager: RunManager, session_id: str, state: RedoState):
 
 
 async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> None:
-    resolver = SimpleNamespace(
-        resolve=lambda _competitor: (
-            FakeLiveTarget("lakebase", "Lakebase", 60),
-            FakeLiveTarget("competitor", "Aurora Serverless v2", 60),
-        )
-    )
+    resolver = SequencedCooldownResolver(competitor_verification_delay=60)
     manager = RunManager(resolver=resolver, verifier=make_verifier())
+    manager._arm_poll = 0.001
     created = await manager.create(
         SessionCreate(
             competitor=CompetitorId.AURORA_SERVERLESS_V2,
@@ -2894,12 +2933,37 @@ async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> 
     await wait_for_state(manager, created.id, SessionState.ARMED)
     await manager.start_run(created.id)
     await wait_for_state(manager, created.id, SessionState.RUNNING)
+    for _ in range(100):
+        partial = await manager.get(created.id)
+        if partial.lanes["lakebase"].state == LaneState.VERIFIED:
+            break
+        await asyncio.sleep(0.005)
+    else:
+        raise AssertionError("Lakebase never reached exact proof before the towel")
 
     frozen = await manager.start_towel(created.id)
     assert frozen.towel is not None
-    assert set(frozen.towel.censored_lower_bounds_ms) == {"lakebase", "competitor"}
+    assert set(frozen.towel.censored_lower_bounds_ms) == {"competitor"}
+    assert frozen.lanes["lakebase"].state == LaneState.VERIFIED
+    assert frozen.lanes["lakebase"].connection_closed_at is not None
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.state == SessionState.TOWELLED
+    active = await manager.bout_status(round_id=RoundId.WAKE_IDLE_APP)
+    assert active.active is True
+    assert active.phase == "cooldown"
+    assert active.can_start is False
+
+    cooldown = await wait_for_cooldown(
+        manager,
+        created.id,
+        CooldownState.READY,
+        attempts=500,
+    )
+    assert all(
+        lane.state == CooldownLaneState.CONFIRMED_ZERO
+        for lane in cooldown.lanes.values()
+    )
+    await asyncio.sleep(0)
     assert await manager._lease_store.current() is None
 
 
@@ -3256,7 +3320,12 @@ async def test_round_four_initial_proof_has_exact_evidence_metrics_and_gap() -> 
     assert record.model_score_engine is engine
     assert record.model_score_arm is engine.arm_result
     assert record.model_score_result is engine.initial_result
-    assert verified.remembered_result == ("LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A")
+    assert verified.remembered_result == (
+        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
+    )
+    assert derive_receipt(verified, "run_finished").remembered_result == (
+        verified.remembered_result
+    )
     assert verified.lanes["competitor"].state == LaneState.NOT_SUPPORTED
     assert set(verified.lanes["competitor"].evidence) == {"unsupported_reason"}
     assert verified.lanes["competitor"].evidence["unsupported_reason"] == (
@@ -3464,7 +3533,9 @@ async def test_initial_terminal_release_retries_same_fence_until_confirmed(
 
     lease_store.allow_success.set()
     finished = await wait_for_state(manager, created.id, SessionState.VERIFIED)
-    assert finished.remembered_result == ("LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A")
+    assert finished.remembered_result == (
+        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
+    )
     assert lease_store.release_calls == 2
     assert record.lease_heartbeat_task is None
     assert [event.event for event in record.event_log.events].count("run_finished") == 1
@@ -4094,7 +4165,9 @@ async def test_redo_failure_is_terminal_and_preserves_initial_proof() -> None:
 
     assert failed.state == SessionState.VERIFIED
     assert failed.lanes["lakebase"].evidence == initial_evidence
-    assert failed.remembered_result == ("LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A")
+    assert failed.remembered_result == (
+        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
+    )
     assert failed.comparison is not None
     assert failed.comparison.winner_lane_id == "lakebase"
     assert manager._records[created.id].model_score_result is initial_result
@@ -4263,7 +4336,9 @@ async def test_lost_redo_lease_preserves_initial_verified_proof() -> None:
 
     failed_redo = await manager.get(created.id)
     assert failed_redo.state == SessionState.VERIFIED
-    assert failed_redo.remembered_result == ("LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A")
+    assert failed_redo.remembered_result == (
+        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
+    )
     assert failed_redo.lanes["lakebase"].evidence == initial_evidence
     assert failed_redo.redo is not None
     assert failed_redo.redo.state == RedoState.FAILED
@@ -5746,6 +5821,36 @@ async def test_round_three_executes_and_resets_owned_recovery_environments() -> 
     assert resetting.cooldown.mode == ResetMode.DELETE_RECOVERY_ENVIRONMENT
     reset = await wait_for_cooldown(manager, created.id, CooldownState.READY)
     assert all(lane.state == CooldownLaneState.CONFIRMED_DELETED for lane in reset.lanes.values())
+
+
+async def test_round_one_lane_mutations_advance_snapshot_updated_at() -> None:
+    manager = RunManager(resolver=FakeRdsResolver(), verifier=make_verifier())
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.RDS_POSTGRES,
+            primary_persona="software_engineer",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.WAKE_IDLE_APP,
+        )
+    )
+    await manager.start_arm(created.id)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    record = manager._records[created.id]
+    observed_updates: list[datetime] = []
+    publish = record.event_log.publish
+
+    async def capture_lane_mutation(event, payload):
+        if event == "lane_update":
+            observed_updates.append(record.snapshot.updated_at)
+        return await publish(event, payload)
+
+    record.event_log.publish = capture_lane_mutation
+    started = await manager.start_run(created.id)
+    await wait_for_state(manager, created.id, SessionState.VERIFIED)
+
+    assert observed_updates
+    assert all(updated > started.updated_at for updated in observed_updates)
+    assert observed_updates == sorted(observed_updates)
 
 
 async def test_rds_round_is_won_only_after_lakebase_verifies() -> None:

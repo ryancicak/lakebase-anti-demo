@@ -96,6 +96,7 @@ from server.reconcile import (
     presence_from_report,
     reconcile_live,
 )
+from server.round4_stop_recovery import build_inherited_round4_stop_recovery
 from server.round5_cleanup_owed import round5_cleanup_owed_notice
 from server.round_construction import (
     build_round,
@@ -750,6 +751,7 @@ class _Runtime:
     process_record: Any
     credential_task: asyncio.Task[None] | None = None
     receipt_store: Any = None
+    round4_stop_recovery_task: asyncio.Task[None] | None = None
 
 
 async def _open_receipt_store(lease_store: Any) -> DurableReceiptStore | None:
@@ -1012,18 +1014,22 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
     readiness_task: asyncio.Task[None] | None = None
     posted_usage_task: asyncio.Task[None] | None = None
     credential_task: asyncio.Task[None] | None = None
+    round4_stop_recovery_task: asyncio.Task[None] | None = None
     receipt_store: DurableReceiptStore | None = None
+    pipeline_power_store: DurablePipelinePowerStore | None = None
+    inherited_round4_stop: dict[str, Any] | None = None
     try:
         receipt_store = await _open_receipt_store(lease_store)
         install_receipt_store(receipt_store)
-        install_pipeline_power_store(await _open_pipeline_power_store(lease_store))
+        pipeline_power_store = await _open_pipeline_power_store(lease_store)
+        install_pipeline_power_store(pipeline_power_store)
         if manifest is not None:
             # One read, here, because this is the only moment the answer can be
             # read cheaply and the only question worth asking: did the process
             # before this one leave a stop owed and not come back to perform it?
             # `/readyz` re-evaluates the snapshot against its own due time on
             # every poll, so the redo window is honoured without a second read.
-            await load_owed_stop_snapshot(manifest)
+            inherited_round4_stop = await load_owed_stop_snapshot(manifest)
         if deployed or lease_store.mode == "lakebase":
             assert manifest is not None
 
@@ -1156,6 +1162,50 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             # there has been one -- which the disclosure renders as not-read.
             drift_report=cached_installation_report,
         )
+        app.state.round4_stop_recovery = None
+        if inherited_round4_stop is not None:
+            try:
+                if pipeline_power_store is None:
+                    raise InvalidStateError(
+                        "The inherited stop debt has no durable power store to settle into"
+                    )
+                workspace = (
+                    WorkspaceClient()
+                    if deployed
+                    else WorkspaceClient(profile=manifest.databricks.profile)
+                )
+                round4_stop_recovery = build_inherited_round4_stop_recovery(
+                    manifest,
+                    lease_store,
+                    pipeline_power_store,
+                    inherited_round4_stop,
+                    workspace=workspace,
+                )
+            except Exception as exc:
+                LOGGER.error(
+                    "Inherited Round 4 pipeline stop debt remains visible because its "
+                    "restart-safe recovery task could not be built: %s",
+                    exc,
+                    exc_info=True,
+                )
+                app.state.round4_stop_recovery = RecoveryState(
+                    "given_up",
+                    attempts=1,
+                    detail=(
+                        "ROUND 4 PIPELINE STOP RECOVERY COULD NOT START · "
+                        f"{type(exc).__name__} · OPERATOR ACTION REQUIRED"
+                    ),
+                    error=type(exc).__name__,
+                )
+            else:
+                app.state.round4_stop_recovery = round4_stop_recovery
+                round4_stop_recovery_task = asyncio.create_task(
+                    round4_stop_recovery.run(),
+                    name="round4-inherited-pipeline-stop-recovery",
+                )
+                round4_stop_recovery_task.add_done_callback(
+                    lambda task: task.exception() if not task.cancelled() else None
+                )
         app.state.coordination_mode = lease_store.mode
         # Before this process claims the pidfile, so the record it reads still
         # describes the *previous* generation. A crashed predecessor leaves an
@@ -1187,6 +1237,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             process_record=process_record,
             credential_task=credential_task,
             receipt_store=receipt_store,
+            round4_stop_recovery_task=round4_stop_recovery_task,
         )
     except BaseException:
         # Uninstalled before the stores below are closed: the write hooks are
@@ -1197,7 +1248,12 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         # Awaited, not merely requested: `cancel()` only schedules the
         # CancelledError, and a gate that has not yet processed it can still be
         # mid-claim against a store this is about to close.
-        for task in (readiness_task, posted_usage_task, credential_task):
+        for task in (
+            round4_stop_recovery_task,
+            readiness_task,
+            posted_usage_task,
+            credential_task,
+        ):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -1280,6 +1336,17 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         except Exception:
             LOGGER.warning("Could not drain in-flight bout receipts", exc_info=True)
     install_receipt_store(None)
+    # This task can hold the exact Round 4 ring and can be inside the guarded
+    # pipeline stop. Cancel and await it before the manager or either
+    # coordination store closes; requesting cancellation without awaiting would
+    # leave the recovery itself as the next zombie.
+    if runtime.round4_stop_recovery_task is not None:
+        runtime.round4_stop_recovery_task.cancel()
+        await asyncio.gather(
+            runtime.round4_stop_recovery_task,
+            return_exceptions=True,
+        )
+    app.state.round4_stop_recovery = None
     runtime.posted_usage_task.cancel()
     await asyncio.gather(runtime.posted_usage_task, return_exceptions=True)
     if runtime.credential_task is not None:
@@ -1922,6 +1989,7 @@ def _readiness_response(
     _apply_credential_verdict(payload)
     _apply_restart_history(payload)
     _apply_startup_reap(payload)
+    _apply_round4_stop_recovery(payload)
     _apply_owed_pipeline_stop(payload)
     _apply_owed_round5_cleanup(payload)
     # Last, so it yields the one `degraded_detail` sentence to all seven ranked
@@ -2083,6 +2151,35 @@ def _apply_owed_pipeline_stop(payload: dict[str, Any]) -> None:
     payload["round4_stop_owed"] = notice is not None
     payload["round4_stop_owed_since"] = notice.since if notice is not None else None
     payload["round4_stop_owed_detail"] = notice.detail if notice is not None else None
+
+
+def _apply_round4_stop_recovery(payload: dict[str, Any]) -> None:
+    """Report what this replica is doing about inherited Round 4 stop debt.
+
+    Kept separate from the debt fields below: the debt is durable authority,
+    while this is process-local work against it. A permanent refusal must remain
+    visible even though the serving process and the other five rounds stay
+    healthy, and a transient retry must say that nobody has silently given up.
+    """
+
+    recovery = getattr(app.state, "round4_stop_recovery", None)
+    status = getattr(recovery, "status", recovery) or SETTLED
+    payload["round4_stop_recovery_state"] = str(
+        getattr(status, "state", "settled")
+    )
+    payload["round4_stop_recovery_attempts"] = int(
+        getattr(status, "attempts", 0) or 0
+    )
+    payload["round4_stop_recovery_detail"] = getattr(status, "detail", None)
+    payload["round4_stop_recovery_next_attempt_seconds"] = getattr(
+        status,
+        "next_attempt_seconds",
+        None,
+    )
+    payload["round4_stop_recovery_error"] = getattr(status, "error", None)
+    payload["round4_stop_recovery_lease_held"] = bool(
+        getattr(recovery, "lease_held", False)
+    )
 
 
 def _apply_startup_reap(payload: dict[str, Any]) -> None:
@@ -2307,6 +2404,32 @@ if FRONTEND_DIST.exists():
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
+
+
+_POST_ONLY_SESSION_CONTROLS = frozenset(
+    {"arm", "cancel-arm", "run", "redo", "retry-cleanup", "towel", "cooldown"}
+)
+
+
+@app.get("/api/sessions/{session_id}/{control}", include_in_schema=False)
+async def reject_get_session_control(session_id: str, control: str) -> JSONResponse:
+    del session_id
+    if control not in _POST_ONLY_SESSION_CONTROLS:
+        return JSONResponse({"detail": "API endpoint not found"}, status_code=404)
+    return JSONResponse(
+        {"detail": "Method Not Allowed"},
+        status_code=405,
+        headers={"Allow": "POST"},
+    )
+
+
+@app.get("/api/installation/recover", include_in_schema=False)
+async def reject_get_installation_recovery() -> JSONResponse:
+    return JSONResponse(
+        {"detail": "Method Not Allowed"},
+        status_code=405,
+        headers={"Allow": "POST"},
+    )
 
 
 @app.get("/{full_path:path}", include_in_schema=False)

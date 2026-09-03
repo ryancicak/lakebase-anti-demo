@@ -283,7 +283,7 @@ describe('wiring', () => {
   it('keeps capacity in Instant Replay and out of the presenter cue', () => {
     const replay = source.slice(source.indexOf('function InstantReplay'))
     const body = replay.slice(0, replay.indexOf('\nfunction '))
-    expect(body).toContain('<CapacityDisclosure session={session} />')
+    expect(body).toContain('<CapacityDisclosure session={session} embedded />')
     const cue = source.slice(source.indexOf('function RingsideTake'))
     expect(cue.slice(0, cue.indexOf('\nfunction '))).not.toContain('<CapacityDisclosure')
   })

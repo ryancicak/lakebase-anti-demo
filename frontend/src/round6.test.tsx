@@ -64,4 +64,36 @@ describe('RoundSixProof', () => {
     expect(screen.queryByLabelText('Round 6 receipt')).not.toBeInTheDocument()
     expect(document.body).not.toHaveTextContent(/nonce|lsn|change data feed|throughput result|p99 result/i)
   })
+
+  it('preserves an exact Delta answer when only the checkout guardrail fails', () => {
+    render(
+      <RoundSixProof
+        state="failed"
+        elapsedMs={1_234}
+        separateCheckoutVerified={false}
+        status="The separate checkout did not verify."
+      />,
+    )
+
+    expect(screen.getByText(/exact answer · guardrail not verified/i)).toBeInTheDocument()
+    expect(screen.getByText('1 ORDER · $84.50 REVENUE · EXACT ✓')).toBeInTheDocument()
+    expect(screen.getByText('SEPARATE CHECKOUT NOT VERIFIED')).toBeInTheDocument()
+    expect(screen.queryByLabelText('Round 6 receipt')).not.toBeInTheDocument()
+  })
+
+  it('states the formal no-result verdict after a towel before exact proof', () => {
+    render(
+      <RoundSixProof
+        state="towelled"
+        elapsedMs={null}
+        censoredMs={4_310}
+        separateCheckoutVerified={false}
+      />,
+    )
+
+    expect(screen.getByLabelText('Round 6 stopped result')).toHaveTextContent(
+      'NO EXACT VERIFIED RESULT · NO DECLARED WINNER · MARGIN N/A',
+    )
+    expect(screen.getByLabelText('Freshness lower bound')).toHaveTextContent('>4.31s')
+  })
 })

@@ -757,6 +757,40 @@ describe('backstage setup', () => {
     window.history.replaceState({}, '', '/')
   })
 
+  it('uses one-tab-stop radio groups with complete arrow navigation', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(FALLBACK_CATALOG)))
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    const competitorGroup = screen.getByRole('radiogroup', { name: 'Competitor' })
+    const competitors = within(competitorGroup).getAllByRole('radio')
+    expect(competitors.map((radio) => radio.tabIndex)).toEqual([0, -1])
+
+    competitors[0].focus()
+    await user.keyboard('{ArrowRight}')
+    expect(competitors[1]).toHaveFocus()
+    expect(competitors[1]).toHaveAttribute('aria-checked', 'true')
+    await user.keyboard('{Home}')
+    expect(competitors[0]).toHaveFocus()
+    await user.keyboard('{End}')
+    expect(competitors.at(-1)).toHaveFocus()
+
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    const personaGroup = screen.getByRole('radiogroup', { name: 'Primary persona' })
+    const personas = within(personaGroup).getAllByRole('radio')
+    expect(personas.filter((radio) => radio.tabIndex === 0)).toHaveLength(1)
+    personas.find((radio) => radio.tabIndex === 0)!.focus()
+    await user.keyboard('{ArrowDown}')
+    expect(personas.filter((radio) => radio.getAttribute('aria-checked') === 'true')).toEqual([
+      document.activeElement,
+    ])
+    await user.keyboard('{End}')
+    expect(personas.at(-1)).toHaveFocus()
+    await user.keyboard('{Home}')
+    expect(personas[0]).toHaveFocus()
+  })
+
   it('starts Final Bell from its explicit title control and clears it before the Start chime', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(FALLBACK_CATALOG)))
     const user = userEvent.setup()
@@ -939,6 +973,56 @@ describe('backstage setup', () => {
     expect(fetchMock.mock.calls.some((call) => call[0] === '/api/sessions')).toBe(false)
   })
 
+  it('bounds saved-session restore and offers an explicit discard without poisoning API state', async () => {
+    const running = session('running')
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'proof',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'wake_idle_app',
+      sound: false,
+    }))
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: running.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    vi.useFakeTimers()
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${running.id}`) return Promise.reject(new TypeError('offline'))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    render(<App />)
+
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    for (let attempt = 1; attempt < 4; attempt += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2_500)
+        await Promise.resolve()
+      })
+    }
+    expect(fetchMock.mock.calls.filter(([input]) => input === `/api/sessions/${running.id}`)).toHaveLength(4)
+    expect(screen.getByRole('heading', { name: /saved bout unavailable/i })).toBeInTheDocument()
+    expect(screen.getByText(/demo server connected/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: /discard saved bout/i })).toBeEnabled()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(fetchMock.mock.calls.filter(([input]) => input === `/api/sessions/${running.id}`)).toHaveLength(4)
+    fireEvent.click(screen.getByRole('button', { name: /discard saved bout/i }))
+    expect(window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')).toBeNull()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+  })
+
   it('keeps a refreshed Round 2 timer and towel control live through stale pre-run replay', async () => {
     const running: DemoSession = {
       ...safeChangeSession('running'),
@@ -1045,6 +1129,72 @@ describe('backstage setup', () => {
     expect(screen.queryByRole('button', { name: /throw in the towel/i })).not.toBeInTheDocument()
   })
 
+  it('keeps one working Next Round action after an early Round 1 towel while cleanup continues', async () => {
+    const base = session('towelled')
+    const requestedAt = '2026-09-03T13:51:48Z'
+    const towelled: DemoSession = {
+      ...base,
+      updated_at: requestedAt,
+      run_started_at: '2026-09-03T13:51:45Z',
+      lanes: {
+        lakebase: {
+          ...base.lanes.lakebase,
+          state: 'verified',
+          elapsed_ms: 1_150,
+          attempts: 1,
+          status: 'Transaction verified',
+        },
+        competitor: {
+          ...base.lanes.competitor,
+          state: 'towelled',
+          elapsed_ms: null,
+          elapsed_at_snapshot_ms: 2_140,
+          attempts: 1,
+          status: 'Towel thrown · Transaction unverified',
+        },
+      },
+      towel: {
+        state: 'cleaning',
+        requested_at: requestedAt,
+        cutoff_ms: 2_140,
+        censored_lower_bounds_ms: { competitor: 2_140 },
+        lakebase_verified_ms: 1_150,
+        restore_started: false,
+        cleanup_failure: null,
+      },
+      comparison: {
+        kind: 'adjudicated_stoppage',
+        winner_lane_id: 'lakebase',
+        margin: null,
+        detail: 'Lakebase verified before the towel; Aurora remained unverified.',
+      },
+      remembered_result: 'TOWELED LIVE · LAKEBASE 1.15s · AURORA LOWER BOUND >2.14s',
+    }
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: towelled.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${towelled.id}`) return Promise.resolve(jsonResponse(towelled))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /throw in the towel/i })).not.toBeInTheDocument()
+    const nextActions = screen.getAllByRole('button', { name: /^a · next round$/i })
+    expect(nextActions).toHaveLength(1)
+    expect(nextActions[0]).toBeEnabled()
+
+    await user.click(nextActions[0])
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(window.location.hash).toBe('#setup/card')
+  })
+
   it('returns from a Round 2 towel result immediately while its cleanup lease stays active', async () => {
     const towelled = safeChangeTowelCleanupSession()
     window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
@@ -1108,6 +1258,34 @@ describe('backstage setup', () => {
     expect(towelled.towel?.state).toBe('cleaning')
     expect(towelled.round5_setup?.cleanup_retryable).toBe(true)
     expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
+  })
+
+  it('navigates when a failed Round 4 result renders an enabled Fight card action', async () => {
+    const failed: DemoSession = {
+      ...modelScoreSession('failed'),
+      failure: 'The model score could not be verified.',
+      updated_at: '2026-08-26T00:00:30Z',
+    }
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: failed.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${failed.id}`) return Promise.resolve(jsonResponse(failed))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    const exit = await screen.findByRole('button', { name: /a · next round/i })
+    expect(exit).toBeEnabled()
+    await user.click(exit)
+
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(window.location.hash).toBe('#setup/card')
   })
 
   it.each([
@@ -1558,6 +1736,41 @@ describe('backstage setup', () => {
       .map(([, , body]) => body)
     expect(base).toHaveLength(1)
     expect(base[0]).toMatch(/grid-template-columns:\s*auto\s+minmax\(\s*0\s*,\s*1fr\s*\)\s+auto/)
+  })
+
+  it('gives portrait setup and every terminal arena one reachable scroll owner', () => {
+    const css = readFileSync(join(import.meta.dirname, 'styles.css'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const setupStart = css.indexOf('@media (orientation: portrait) and (max-width: 900px)')
+    expect(setupStart).toBeGreaterThan(-1)
+    const setup = css.slice(setupStart, css.indexOf('@media', setupStart + 1))
+    expect(setup).toMatch(/\.game-screen:not\(\[data-scene="card"\]\)[^{]*\{[^}]*height:\s*100dvh[^}]*overflow-y:\s*auto/)
+    expect(setup).toMatch(/\.game-screen:not\(\[data-scene="card"\]\) \.game-scene[^{]*\{[^}]*position:\s*static/)
+
+    const arenaStart = css.indexOf('@media (max-width: 760px)')
+    expect(arenaStart).toBeGreaterThan(-1)
+    const arena = css.slice(arenaStart, css.indexOf('@media', arenaStart + 1))
+    for (const selector of ['.proof-screen', '.round4-screen', '.round5-screen']) {
+      expect(arena).toMatch(new RegExp(`${selector.replace('.', '\\.')}[^,{]*[,{][^}]*height:\\s*100dvh[^}]*overflow-y:\\s*auto`))
+    }
+
+    const roundSix = readFileSync(join(import.meta.dirname, 'round6.css'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const roundSixNarrow = roundSix.slice(roundSix.indexOf('@media (max-width: 760px)'))
+    expect(roundSixNarrow).toMatch(/\.round6-screen\s*\{[^}]*height:\s*100dvh[^}]*overflow-y:\s*auto/)
+  })
+
+  it('docks terminal proof actions before scrollable detail at every viewport height', () => {
+    const css = readFileSync(join(import.meta.dirname, 'styles.css'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+    const terminalFooter = css.match(/\.proof-footer:has\(\.proof-actions\)\s*\{([^}]*)\}/)?.[1] ?? ''
+    const terminalActions = css.match(/\.proof-footer:has\(\.proof-actions\) \.proof-actions\s*\{([^}]*)\}/)?.[1] ?? ''
+
+    expect(terminalFooter).toMatch(/align-content:\s*start/)
+    expect(terminalFooter).toMatch(/overflow-y:\s*auto/)
+    expect(terminalActions).toMatch(/position:\s*sticky/)
+    expect(terminalActions).toMatch(/top:\s*0/)
+    expect(terminalActions).toMatch(/order:\s*-1/)
   })
 
   it('keeps the minimal Explain to the Room cue inside a narrow viewport', () => {
@@ -2230,7 +2443,9 @@ describe('backstage setup', () => {
     })
     expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
     expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
-    expect(screen.getByText(/demo server offline/i)).toBeVisible()
+    expect(screen.getByText(/demo server connected/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(refusalOnScreen()).toMatch(/status stale/i)
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(4_000)
@@ -2238,6 +2453,51 @@ describe('backstage setup', () => {
     expect(api.allBoutStatuses).toHaveBeenCalledTimes(4)
     expect(laneLinesOnScreen()).not.toContain('BOUT IN PROGRESS')
     expect(api.boutStatus).not.toHaveBeenCalled()
+  })
+
+  it('keeps a stale board fail-closed after catalog refreshes succeed', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'wake_idle_app',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    let reads = 0
+    vi.mocked(api.allBoutStatuses).mockImplementation(async () => {
+      reads += 1
+      if (reads === 1) return allReadyBoutBoard()
+      throw new ApiError('Board unavailable', 503)
+    })
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_500)
+    })
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(refusalOnScreen()).toMatch(/status stale|board answers/i)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(25_500)
+    })
+    expect(screen.getByText(/demo server connected/i)).toBeVisible()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
   })
 
   it('shows another viewer the same active round with one broad request per mount', async () => {
@@ -2325,9 +2585,12 @@ describe('backstage setup', () => {
     expect(liveClock).toHaveTextContent('0.00s')
     await waitFor(() => expect(liveClock).not.toHaveTextContent('0.00s'))
 
-    const source = FakeEventSource.instances.at(-1)!
+    let source = FakeEventSource.instances.at(-1)!
     source.onerror?.()
     expect(await screen.findByRole('alert')).toHaveTextContent(/live evidence stream interrupted/i)
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(1))
+    source = FakeEventSource.instances.at(-1)!
+    source.open()
     source.emit({
       sequence: 8,
       event: 'lane_update',
@@ -2396,24 +2659,26 @@ describe('backstage setup', () => {
     expect(screen.getByLabelText('Aurora Serverless v2 result').querySelector('.lane-time')).toHaveTextContent('1.29s')
     expect(screen.getByRole('button', { name: /re-do round/i })).toBeInTheDocument()
 
-    await user.click(screen.getByRole('button', { name: /instant replay/i }))
-    const replay = await screen.findByRole('dialog', { name: /how this round was proved/i })
-    expect(replay).toHaveTextContent(/both control planes proved genuine scale zero/i)
-    expect(replay).toHaveTextContent(/unique nonce/i)
-    expect(replay).toHaveTextContent('0.84s')
-    expect(replay).toHaveTextContent('1.29s')
-    expect(replay).not.toHaveTextContent(/RDS\.DescribeDBClusters/i)
-    await user.click(within(replay).getByRole('button', { name: /01.*control planes.*view calls/i }))
-    const startCalls = within(replay).getByLabelText(/exact calls for step 01/i)
+    const replayTrigger = screen.getByRole('button', { name: /instant replay/i })
+    await user.click(replayTrigger)
+    const replay = await screen.findByRole('dialog', { name: /wake this idle app/i })
+    const replayStory = within(replay).getByLabelText('Three-beat replay story')
+    expect(replayStory).toHaveTextContent(/genuine scale zero/i)
+    expect(replayStory).toHaveTextContent(/exact run-owned transaction/i)
+    expect(within(replayStory).getAllByText('0.84s')).toHaveLength(1)
+    expect(within(replayStory).getAllByText('1.29s')).toHaveLength(1)
+    expect(within(replay).getByText(/RDS\.DescribeDBClusters/i)).not.toBeVisible()
+    await user.click(within(replay).getByText(/view full evidence/i))
+    const startCalls = within(replay).getByText(/both control planes proved genuine scale zero/i).closest('.replay-evidence-step')!
     expect(startCalls).toHaveTextContent(/databricks postgres get-endpoint <endpoint> -o json/i)
     expect(startCalls).toHaveTextContent(/RDS\.DescribeDBClusters/i)
     expect(startCalls).toHaveTextContent(/CloudWatch\.GetMetricStatistics/i)
-    await user.click(within(replay).getByRole('button', { name: /03.*unique nonce.*view calls/i }))
-    const transactionCalls = within(replay).getByLabelText(/exact calls for step 03/i)
+    const transactionCalls = within(replay).getByText(/committed a unique nonce/i).closest('.replay-evidence-step')!
     expect(transactionCalls).toHaveTextContent(/PostgreSQL wire—not a cloud API/i)
     expect(transactionCalls).toHaveTextContent(/INSERT INTO public\.anti_demo_probe/i)
-    expect(replay).not.toHaveTextContent(/RDS\.DescribeDBClusters/i)
-    await user.click(within(replay).getByRole('button', { name: /back to the ring/i }))
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: /wake this idle app/i })).not.toBeInTheDocument()
+    await waitFor(() => expect(replayTrigger).toHaveFocus())
 
     const explainTrigger = screen.getByRole('button', { name: /explain to the room/i })
     await user.click(explainTrigger)
@@ -2456,9 +2721,17 @@ describe('backstage setup', () => {
     expect(screen.queryByRole('dialog', { name: /for the/i })).not.toBeInTheDocument()
     await waitFor(() => expect(explainTrigger).toHaveFocus())
 
+    const costTrigger = screen.getByRole('button', { name: /what it cost/i })
+    await user.click(costTrigger)
+    expect(await screen.findByRole('dialog', { name: /bill does not stop/i })).toBeInTheDocument()
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: /bill does not stop/i })).not.toBeInTheDocument()
+    await waitFor(() => expect(costTrigger).toHaveFocus())
+
     expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
     stubReceiptCanvas()
-    await user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    const shareTrigger = screen.getByRole('button', { name: /share the receipt/i })
+    await user.click(shareTrigger)
     const receipt = await screen.findByRole('dialog', { name: /share the proof/i })
     const poster = within(receipt).getByLabelText(/verified result poster preview/i)
     expect(within(poster).getByLabelText(/lakebase receipt result/i)).toHaveTextContent('0.84s')
@@ -2469,7 +2742,9 @@ describe('backstage setup', () => {
     expect(receipt).not.toHaveTextContent(/caption copied with the post kit/i)
     expect(receipt).not.toHaveTextContent(/127\.0\.0\.1|localhost/i)
     expect(receipt).not.toHaveTextContent(/try the same round yourself/i)
-    await user.click(within(receipt).getByRole('button', { name: /^b · back$/i }))
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: /share the proof/i })).not.toBeInTheDocument()
+    await waitFor(() => expect(shareTrigger).toHaveFocus())
 
     await user.click(screen.getByRole('button', { name: /next round/i }))
     expect(screen.getByText(/· round \d+ of six/i)).toBeInTheDocument()
@@ -2550,6 +2825,10 @@ describe('backstage setup', () => {
     const user = userEvent.setup()
     render(<App />)
     await screen.findByRole('button', { name: /prepare fight card/i })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
     return user
   }
 
@@ -2717,6 +2996,36 @@ describe('backstage setup', () => {
     expect(screen.getByRole('button', { name: /^Round 5 ·/i })).toHaveAccessibleName(/cleanup in progress/i)
     expect(screen.getByText(/Round 5 will reopen automatically/i)).toBeVisible()
   })
+
+  it.each(FALLBACK_CATALOG.rounds.map((round, index) => [round.id, index + 1] as const))(
+    'disables an unselected %s tile when the broad board reports cleanup',
+    async (roundId, roundNumber) => {
+      const selectedRound = FALLBACK_CATALOG.rounds.find((round) => round.id !== roundId)!.id
+      await fightCardFor(
+        refusedCatalog([], 'unused', null),
+        selectedRound,
+        {
+          [roundId]: {
+            state: 'cleanup_in_progress',
+            can_start: false,
+            active_phase: roundId === 'survive_connection_spike'
+              ? 'round5_cleanup'
+              : roundId === 'wake_idle_app'
+                ? 'cooldown'
+                : 'towel_cleanup',
+            detail: 'Cleanup is still being verified. Other rounds remain available.',
+          },
+        },
+      )
+
+      const tile = screen.getByRole('button', { name: new RegExp(`^Round ${roundNumber} ·`, 'i') })
+      expect(tile).toHaveAttribute('aria-current', 'false')
+      expect(tile).toBeDisabled()
+      expect(tile).toHaveAccessibleName(/cleanup in progress/i)
+      expect(within(tile).getByText('CLEANUP IN PROGRESS')).toBeVisible()
+      expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
+    },
+  )
 
   it('keeps a live Round 5 bout distinct from backstage cleanup', async () => {
     await fightCardFor(
@@ -2939,36 +3248,35 @@ describe('backstage setup', () => {
     await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
 
     await user.click(await screen.findByRole('button', { name: /instant replay/i }))
-    const replay = screen.getByRole('dialog', { name: /how this round was proved/i })
+    const replay = screen.getByRole('dialog', { name: /move lakehouse data into live applications/i })
     expect(replay).toHaveTextContent(/instant replay · round 4/i)
 
-    // The scored lane clock is the end-to-end proof, and the untimed AWS lane
-    // must never be dressed up as a competing number.
-    expect(replay).toHaveTextContent(/Lakebase0\.84s/)
-    expect(replay).toHaveTextContent(/NOT TIMED/)
+    const replayStory = within(replay).getByLabelText('Three-beat replay story')
+    expect(replayStory).toHaveTextContent(/score 0\.81.*Delta version 11/i)
+    expect(replayStory).toHaveTextContent(/Managed Reverse ETL.*fresh app connection/i)
+    expect(within(replayStory).getAllByText('0.84s')).toHaveLength(1)
+    expect(replayStory).toHaveTextContent(/no AWS reverse-ETL path was built or timed.*no AWS race or margin/i)
+    expect(replay).not.toHaveTextContent(/Provider-specific calls will appear/i)
 
-    // A capability round released one lane, so there is no start gap to quote.
+    await user.click(within(replay).getByText(/view full evidence/i))
     expect(replay).toHaveTextContent(/Opponent lane/i)
     expect(replay).toHaveTextContent(/No AWS-native equivalent lane was configured or timed in this scoped proof/i)
     expect(replay).not.toHaveTextContent(/Start gap/i)
-    expect(replay).not.toHaveTextContent(/Difference between lane start times/i)
-    expect(replay).not.toHaveTextContent(/Provider-specific calls will appear/i)
 
     // The commit step carries the real Delta version the round advanced to.
-    await user.click(within(replay).getByRole('button', { name: /One exact row was committed/i }))
-    expect(within(replay).getByLabelText(/exact calls for step 02/i)).toHaveTextContent(/delta commit version = 11/)
+    const commitStep = within(replay).getByText(/One exact row was committed/i).closest('.replay-evidence-step')!
+    expect(commitStep).toHaveTextContent(/delta commit version = 11/)
 
     // Step 3 must carry the primary sync metric, not the end-to-end metric.
-    await user.click(within(replay).getByRole('button', { name: /Managed Sync was then polled/i }))
-    const syncStep = within(replay).getByLabelText(/exact calls for step 03/i)
+    const syncStep = within(replay).getByText(/Managed Sync was then polled/i).closest('.replay-evidence-step')!
     expect(syncStep).toHaveTextContent(/Reverse ETL sync \(primary\)640\.00 ms/)
     expect(syncStep).toHaveTextContent(/reports Delta version 11/)
     expect(syncStep).not.toHaveTextContent(/840\.00 ms/)
 
-    // Step 4 must carry the secondary end-to-end metric and the exact row.
-    await user.click(within(replay).getByRole('button', { name: /fresh application Postgres connection returning the exact row/i }))
-    const readStep = within(replay).getByLabelText(/exact calls for step 04/i)
-    expect(readStep).toHaveTextContent(/End-to-end proof \(secondary\)840\.00 ms/)
+    // Step 4 keeps the exact row and clock boundary without repeating 0.84s.
+    const readStep = within(replay).getByText(/fresh application Postgres connection returning the exact row/i).closest('.replay-evidence-step')!
+    expect(readStep).toHaveTextContent(/End-to-end clock boundary.*Delta commit → successful fresh application read/i)
+    expect(readStep).not.toHaveTextContent(/840\.00 ms/)
     expect(readStep).toHaveTextContent(/customer-42 · score 0\.81 · model risk-v1/)
     expect(readStep).toHaveTextContent(/Exact row verified/i)
   })
@@ -3054,33 +3362,36 @@ describe('backstage setup', () => {
     await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
 
     await user.click(await screen.findByRole('button', { name: /instant replay/i }))
-    const replay = screen.getByRole('dialog', { name: /how this round was proved/i })
+    const replay = screen.getByRole('dialog', { name: /move live application data into the lakehouse/i })
     expect(replay).toHaveTextContent(/instant replay · round 6/i)
 
-    expect(replay).toHaveTextContent(/Lakebase1\.23s/)
-    expect(replay).toHaveTextContent(/NOT TIMED/)
+    const replayStory = within(replay).getByLabelText('Three-beat replay story')
+    expect(replayStory).toHaveTextContent(/checkout committed.*RED-GLOVE.*CHICAGO.*\$84\.50/i)
+    expect(within(replayStory).getAllByText('1.23s')).toHaveLength(1)
+    expect(replayStory).toHaveTextContent(/separate checkout.*guardrail/i)
+    expect(replayStory).toHaveTextContent(/no AWS CDC stack was built or timed.*no AWS race or margin/i)
+
+    await user.click(within(replay).getByText(/view full evidence/i))
     expect(replay).toHaveTextContent(/Opponent lane/i)
     expect(replay).toHaveTextContent(/Aurora\/RDS require a separately configured CDC pipeline into Delta/i)
     expect(replay).not.toHaveTextContent(/Start gap/i)
     expect(replay).not.toHaveTextContent(/Provider-specific calls will appear/i)
 
     // The checkout commit is evidence, not the scored clock.
-    await user.click(within(replay).getByRole('button', { name: /One checkout order was committed/i }))
-    const checkoutStep = within(replay).getByLabelText(/exact calls for step 02/i)
+    const checkoutStep = within(replay).getByText(/One checkout order was committed/i).closest('.replay-evidence-step')!
     expect(checkoutStep).toHaveTextContent(/RED-GLOVE · CHICAGO · \$84\.50 · committed/)
     expect(checkoutStep).toHaveTextContent(/Checkout commit0\.04s/)
     expect(checkoutStep).toHaveTextContent(/round6-live-order-nonce/)
 
-    // The scored primary metric and the exact single insert live together.
-    await user.click(within(replay).getByRole('button', { name: /Delta history was then polled/i }))
-    const cdfStep = within(replay).getByLabelText(/exact calls for step 03/i)
-    expect(cdfStep).toHaveTextContent(/Analytics available \(primary\)1234\.00 ms/)
+    // The exact insert and clock boundary stay in evidence without repeating 1.23s.
+    const cdfStep = within(replay).getByText(/Delta history was then polled/i).closest('.replay-evidence-step')!
+    expect(cdfStep).toHaveTextContent(/Analytics clock boundary.*checkout commit → exact Delta answer read/i)
+    expect(cdfStep).not.toHaveTextContent(/1234\.00 ms/)
     expect(cdfStep).toHaveTextContent(/matching live orders = 1 exact order/)
     expect(cdfStep).toHaveTextContent(/0\/1A2B3C4D/)
 
     // The separate checkout is what backs the "without slowing checkout" claim.
-    await user.click(within(replay).getByRole('button', { name: /separate checkout order then had to commit/i }))
-    const guardrailStep = within(replay).getByLabelText(/exact calls for step 04/i)
+    const guardrailStep = within(replay).getByText(/separate checkout order then had to commit/i).closest('.replay-evidence-step')!
     expect(guardrailStep).toHaveTextContent(/round6-guardrail-nonce/)
     expect(guardrailStep).toHaveTextContent(/SEPARATE CHECKOUT COMMITTED/)
     expect(guardrailStep).toHaveTextContent(/differ from the measured order in both order id and proof nonce/i)
@@ -3235,7 +3546,7 @@ describe('backstage setup', () => {
     expect(screen.queryByText('V2 SYNC RUNNING')).not.toBeInTheDocument()
   })
 
-  it('coalesces SSE error refreshes, keeps EventSource open, and recovers a missed terminal event', async () => {
+  it('coalesces SSE error refreshes, replaces the failed stream, and recovers a missed terminal event', async () => {
     const refresh = deferred<ReturnType<typeof jsonResponse>>()
     const running = session('running')
     const terminal: DemoSession = {
@@ -3272,12 +3583,12 @@ describe('backstage setup', () => {
     source.onerror?.()
     expect(await screen.findByRole('alert')).toHaveTextContent(/live evidence stream interrupted/i)
     await waitFor(() => expect(fetchMock.mock.calls.filter((call) => call[0] === '/api/sessions/session-1')).toHaveLength(1))
-    expect(source.close).not.toHaveBeenCalled()
+    expect(source.close).toHaveBeenCalledTimes(1)
 
     refresh.resolve(jsonResponse(terminal))
     expect(await screen.findByText('LAKEBASE WINS BY 0.30s')).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByText(/live evidence stream interrupted/i)).not.toBeInTheDocument())
-    expect(source.close).not.toHaveBeenCalled()
+    expect(source.close).toHaveBeenCalledTimes(1)
   })
 
   it('freezes Round 2 clocks while the live proof is offline, then resumes from the stream and accepts the terminal receipt', async () => {
@@ -3331,7 +3642,20 @@ describe('backstage setup', () => {
     expect(lakebaseClock).toHaveTextContent(frozenLakebase!)
     expect(competitorClock).toHaveTextContent(frozenCompetitor!)
 
-    source.open()
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(1))
+    const reconnected = FakeEventSource.instances.at(-1)!
+    reconnected.open()
+    reconnected.emit({
+      sequence: 1,
+      event: 'lane_update',
+      occurred_at: running.updated_at,
+      payload: {
+        lane_id: 'lakebase',
+        state: 'connecting',
+        elapsed_ms: running.lanes.lakebase.elapsed_ms,
+        status: running.lanes.lakebase.status,
+      },
+    })
 
     await waitFor(() => {
       expect(lakebaseClock).toHaveAttribute('data-live', 'true')
@@ -3341,7 +3665,7 @@ describe('backstage setup', () => {
     })
     await waitFor(() => expect(lakebaseClock.textContent).not.toBe(frozenLakebase))
 
-    source.emit({
+    reconnected.emit({
       sequence: 9,
       event: 'run_finished',
       occurred_at: verified.updated_at,
@@ -3901,6 +4225,21 @@ describe('backstage setup', () => {
     }
     const verified: DemoSession = {
       ...session('verified'),
+      updated_at: '2026-08-17T00:00:13Z',
+      lanes: {
+        lakebase: {
+          ...session('running').lanes.lakebase,
+          state: 'verified',
+          elapsed_ms: 820,
+          status: 'Exact transaction verified',
+        },
+        competitor: {
+          ...session('running').lanes.competitor,
+          state: 'verified',
+          elapsed_ms: 12_000,
+          status: 'Exact transaction verified',
+        },
+      },
       remembered_result: 'LAKEBASE — 11.18 SECONDS SOONER',
     }
     const cooldownStarted: DemoSession = {
@@ -3983,7 +4322,8 @@ describe('backstage setup', () => {
     const main = screen.getByRole('main')
     expect(main).not.toHaveTextContent(/provider|update_time|polling|delivery lag|not a floor|forecast|ui tick/i)
 
-    await user.click(screen.getByRole('button', { name: /more details/i }))
+    const detailsTrigger = screen.getByRole('button', { name: /more details/i })
+    await user.click(detailsTrigger)
     const details = await screen.findByRole('dialog', { name: /how the clocks stop/i })
     expect(details).toHaveTextContent(/databricks postgres get-endpoint/i)
     expect(details).toHaveTextContent(/status\.current_state/i)
@@ -3995,7 +4335,9 @@ describe('backstage setup', () => {
     expect(details).toHaveTextContent(/one ui tick drives both live timers/i)
     expect(details).toHaveTextContent(/polling and delivery lag/i)
     expect(details).toHaveTextContent(/idle policy.*not idle speed/i)
-    await user.click(within(details).getByRole('button', { name: /back to the clocks/i }))
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: /how the clocks stop/i })).not.toBeInTheDocument()
+    await waitFor(() => expect(detailsTrigger).toHaveFocus())
     await user.click(screen.getByRole('button', { name: /hide play-by-play/i }))
     expect(screen.getByText(/play-by-play hidden/i)).toBeInTheDocument()
 
@@ -4341,8 +4683,7 @@ describe('backstage setup', () => {
     expect(within(aurora).getByText('1:10')).toBeInTheDocument()
   })
 
-  it('rejects a stale SSE refresh after cooldown completion and preserves frozen reset proof', async () => {
-    const refresh = deferred<ReturnType<typeof jsonResponse>>()
+  it('closes SSE after cooldown completion and preserves frozen reset proof', async () => {
     const running = session('running')
     const verified: DemoSession = {
       ...session('verified'),
@@ -4378,7 +4719,6 @@ describe('backstage setup', () => {
       if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
       if (input.endsWith('/run')) return Promise.resolve(jsonResponse(running))
       if (input.endsWith('/cooldown')) return Promise.resolve(jsonResponse(watching))
-      if (input === '/api/sessions/session-1') return refresh.promise
       throw new Error(`Unexpected request: ${input}`)
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -4400,8 +4740,7 @@ describe('backstage setup', () => {
     expect(screen.getByLabelText(/aurora serverless v2 return to idle/i)).toHaveTextContent('6:41')
 
     source.onerror?.()
-    await waitFor(() => expect(fetchMock.mock.calls.some((call) => call[0] === '/api/sessions/session-1')).toBe(true))
-    refresh.resolve(jsonResponse({ ...verified, updated_at: '2026-08-17T00:07:00Z', cooldown: null }))
+    expect(fetchMock.mock.calls.some((call) => call[0] === '/api/sessions/session-1')).toBe(false)
     await waitFor(() => expect(screen.getByRole('button', { name: /ring again/i })).toBeEnabled())
     expect(screen.getByLabelText(/lakebase return to idle/i)).toHaveTextContent('5:01')
     expect(screen.getByLabelText(/aurora serverless v2 return to idle/i)).toHaveTextContent('6:41')
@@ -4732,7 +5071,11 @@ describe('backstage setup', () => {
     // Only Lakebase was released, so a start gap computed from a single lane
     // would read as a perfect 0.000ms fairness number that nothing earned.
     await user.click(screen.getByRole('button', { name: /instant replay/i }))
-    const replay = await screen.findByRole('dialog', { name: /how this round was proved/i })
+    const replay = await screen.findByRole('dialog', { name: /wake this idle app/i })
+    const story = within(replay).getByLabelText('Three-beat replay story')
+    expect(story).toHaveTextContent(/Provisioned RDS cannot automatically scale to zero.*no RDS clock/i)
+    expect(story).toHaveTextContent(/Lakebase woke and completed the transaction/i)
+    await user.click(within(replay).getByText(/view full evidence/i))
     expect(replay).toHaveTextContent(/Opponent lane/i)
     expect(replay).toHaveTextContent(/no automatic scale-to-zero or connection-triggered wake/i)
     expect(replay).not.toHaveTextContent(/Start gap/i)
@@ -4838,7 +5181,9 @@ describe('backstage setup', () => {
     expect(within(receipt).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/unverified when stopped.*lower bound/i)
 
     await waitFor(() => {
-      const entries = JSON.parse(window.localStorage.getItem('lakebase-anti-demo:scorecard:v1') ?? '[]')
+      const entries = JSON.parse(
+        window.localStorage.getItem('lakebase-anti-demo:scorecard:v2') ?? '{"entries":[]}',
+      ).entries
       expect(entries).toEqual(expect.arrayContaining([
         expect.objectContaining({ session_id: 'session-1', competitor_ms: 90_000, competitor_censored: true }),
       ]))
@@ -4898,7 +5243,9 @@ describe('backstage setup', () => {
     })
 
     await waitFor(() => {
-      const entries = JSON.parse(window.localStorage.getItem('lakebase-anti-demo:scorecard:v1') ?? '[]')
+      const entries = JSON.parse(
+        window.localStorage.getItem('lakebase-anti-demo:scorecard:v2') ?? '{"entries":[]}',
+      ).entries
       expect(entries).toEqual([
         expect.objectContaining({
           session_id: 'session-1',

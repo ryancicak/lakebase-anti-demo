@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import { RoundFiveProof } from './App'
+import { RoundFiveProof, linkedInReceipt } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { applyRunEventSnapshot, selectRound4Session } from './round4'
@@ -517,9 +517,17 @@ it('keeps the Round 5 towel action visible and forwards the stop request', async
 })
 
 it('shows only exact Round 5 setup evidence after a towel with no false comparison', () => {
+  const towelled = towelledRoundFiveSession()
+  // Live progress publishes the exact setup stop before the peer finishes, but
+  // a towel can cancel the orchestrator before its final gate matrix is returned.
+  towelled.round5_setup!.lanes.lakebase = {
+    ...towelled.round5_setup!.lanes.lakebase!,
+    stop_gate_evidence: null,
+    verified: false,
+  }
   const { container } = render(
     <RoundFiveProof
-      session={towelledRoundFiveSession()}
+      session={towelled}
       roundNumber={5}
       error={null}
       liveEvidenceConnected
@@ -542,10 +550,57 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
   expect(competitor.querySelector('.lane-time')).toHaveTextContent('>4.50s')
   expect(competitor).toHaveTextContent(/UNVERIFIED WHEN STOPPED · LOWER BOUND/i)
   expect(arena).not.toHaveTextContent(/4500\.00 ms|91\.00s|92\.00s/i)
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(
-    /Bout stopped.*No winner · margin N\/A/i,
+  const verdict = screen.getByRole('status', { name: 'Round 5 setup status' })
+  expect(verdict).toHaveTextContent(
+    /Lakebase verified first.*RDS PostgreSQL \+ RDS Proxy unverified beyond 4\.50s/i,
+  )
+  expect(verdict).toHaveTextContent(
+    /No declared winner · comparison incomplete · margin N\/A/i,
   )
   expect(screen.getByLabelText('Ringside commentator')).toHaveTextContent(/Live setup call/i)
+
+  fireEvent.click(screen.getByRole('button', { name: /instant replay/i }))
+  const replay = screen.getByRole('dialog', { name: /get spike-ready/i })
+  const story = within(replay).getByLabelText('Three-beat replay story')
+  expect(within(story).getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent)).toEqual([
+    'Setup',
+    'Same test',
+    'Takeaway',
+  ])
+  expect(within(story).getByLabelText('Primary measured result')).toHaveTextContent(
+    /Lakebase built-in pool.*1\.23s.*New RDS Proxy path.*>4\.50s.*Unverified when stopped/i,
+  )
+  expect(story).toHaveTextContent(
+    /Lakebase produced exact proof.*RDS PostgreSQL \+ RDS Proxy did not.*no completed comparison or margin/i,
+  )
+  expect(story).not.toHaveTextContent(/neither side verified|neither setup|no verified result/i)
+  const evidence = within(replay).getByText(/view full evidence/i).closest('details')
+  expect(evidence).not.toHaveAttribute('open')
+  fireEvent.click(within(replay).getByText(/view full evidence/i))
+  const setupEvidence = within(replay).getByLabelText('Scored setup evidence')
+  expect(within(setupEvidence).getByLabelText('Lakebase setup result')).toHaveTextContent(
+    /SETUP STOP.*Setup state.*verified.*Stop gate.*EXACT STOP.*FINAL GATE MATRIX NOT RETURNED BEFORE TOWEL/i,
+  )
+  expect(within(setupEvidence).getByLabelText('Lakebase setup result')).not.toHaveTextContent(
+    /stop gate.*not verified/i,
+  )
+  expect(replay).toHaveTextContent(/Exact setup stop published before the towel.*final expected\/observed gate matrix was not returned/i)
+  expect(replay).toHaveTextContent(/Shared post-preflight monotonic T0.*Identical 128-connection spike is pass\/fail/i)
+  expect(replay).not.toHaveTextContent(/Non-executable round · No live fairness or timing contract/i)
+  fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
+  expect(screen.queryByRole('dialog', { name: /get spike-ready/i })).not.toBeInTheDocument()
+
+  fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
+  const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
+  expect(explanation).toHaveTextContent(
+    /Lakebase verified connection readiness first.*RDS PostgreSQL \+ RDS Proxy remained unverified.*shared spike never ran/i,
+  )
+  expect(explanation).toHaveTextContent(
+    /Lakebase setup verified at 1\.23s.*RDS PostgreSQL \+ RDS Proxy exceeded 4\.50s without verification.*shared 128-attempt spike did not run.*no completed comparison or margin was declared/i,
+  )
+  expect(explanation).not.toHaveTextContent(
+    /neither setup|neither readiness|no verified result/i,
+  )
 })
 
 it('offers Next Round while a towel cleanup continues backstage', () => {
@@ -572,11 +627,25 @@ it('offers Next Round while a towel cleanup continues backstage', () => {
   )
 
   expect(screen.getByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /instant replay/i })).not.toBeInTheDocument()
   const next = screen.getByRole('button', { name: /a · next round/i })
   fireEvent.click(next)
   expect(onContinue).toHaveBeenCalledOnce()
   expect(towelled.towel.state).toBe('cleaning')
   expect(towelled.round5_setup.cleanup_retryable).toBe(true)
+})
+
+it('keeps the one-sided Round 5 share copy aligned with the stopped receipt', () => {
+  const caption = linkedInReceipt(towelledRoundFiveSession(), 5)
+
+  expect(caption).toMatch(
+    /Lakebase reached verified connection readiness in 1\.23s.*RDS PostgreSQL \+ RDS Proxy was still unverified beyond 4\.50s/i,
+  )
+  expect(caption).toMatch(/shared spike did not run.*no winner or margin/i)
+  expect(caption).toMatch(/NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N\/A/i)
+  expect(caption).not.toMatch(
+    /neither setup|no verified result|both passed 128|readiness result declared/i,
+  )
 })
 
 it('stops Lakebase at its exact setup elapsed while AWS and the commentator continue', async () => {
@@ -822,7 +891,7 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
     /not timed|non-executable/i,
   )
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).toHaveTextContent(
-    /Lakebase verified a pooled path.*11s sooner.*EXACT SETUP MARGIN 11\.65s/i,
+    /Lakebase verified a pooled path.*11\.65s sooner.*EXACT SETUP MARGIN 11\.65s/i,
   )
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).toHaveTextContent(/Start gap 0\.750ms/i)
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).not.toHaveTextContent(/Start gap 1\.235ms/i)
@@ -884,8 +953,12 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
     />,
   )
 
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(/primary setup result.*setup not verified/i)
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(/both lanes did not reach the exact setup stop gate.*no timing comparison/i)
+  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(
+    /primary setup result.*one setup verified/i,
+  )
+  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(
+    /RDS PostgreSQL \+ RDS Proxy setup verified 24\.00s.*Lakebase not verified.*shared spike not run.*no declared winner.*comparison incomplete/i,
+  )
   expect(screen.queryByLabelText(/warm burst evidence|setup result|fair proof contract|managed component disclosure/i)).not.toBeInTheDocument()
   expect(screen.getByText('Technical details')).toBeInTheDocument()
   fireEvent.click(screen.getByText('Technical details'))
@@ -1086,7 +1159,9 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(/bout stopped/i)
+  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(
+    /RDS PostgreSQL \+ RDS Proxy verified first.*Lakebase unverified.*no declared winner.*comparison incomplete/i,
+  )
   expect(screen.queryByRole('button', { name: /ring again|re-do|redo/i })).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
 })
@@ -1194,16 +1269,25 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
   expect(replayControl).toBeInTheDocument()
   fireEvent.click(replayControl)
 
-  const replay = screen.getByRole('dialog', { name: /how this round was proved/i })
+  const replay = screen.getByRole('dialog', { name: /get spike-ready/i })
   expect(replay).toHaveTextContent(/instant replay · round 5/i)
 
-  // The scored clock is the setup elapsed, not the burst lane's empty elapsed_ms.
-  const lanes = replay.querySelector('.replay-lanes')!
-  expect(lanes).toHaveTextContent('12.35s')
-  expect(lanes).toHaveTextContent('24.00s')
-  expect(lanes).not.toHaveTextContent('N/A')
+  // The presenter surface has one three-beat story and one metric treatment.
+  const story = within(replay).getByLabelText('Three-beat replay story')
+  expect(story.querySelectorAll('.replay-beat')).toHaveLength(3)
+  expect(story.querySelectorAll('.replay-primary-metric')).toHaveLength(1)
+  expect(story).toHaveTextContent(/setup.*same test.*takeaway/i)
+  expect(story).toHaveTextContent(/12\.35s/)
+  expect(story).toHaveTextContent(/24\.00s/)
+  expect(story).toHaveTextContent(/128 fresh connection attempts.*64.*pass\/fail/i)
+  expect(story).toHaveTextContent(/already-ready, contract-matching Proxy.*was not tested/i)
+  expect(story).not.toHaveTextContent('N/A')
 
-  // The start gap must be the setup barrier, never the downstream burst skew.
+  const evidence = within(replay).getByText(/view full evidence/i).closest('details')!
+  expect(evidence).not.toHaveAttribute('open')
+  fireEvent.click(within(evidence).getByText(/view full evidence/i))
+
+  // The evidence keeps setup fairness, the full matrix, and component inventory.
   expect(replay).toHaveTextContent('0.750ms')
   expect(replay).not.toHaveTextContent('1.235ms')
   expect(within(replay).getByLabelText('Round 5 detailed proof')).toHaveTextContent(
@@ -1213,14 +1297,13 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
     /new Proxy \+ 8 supporting changes.*already-deployed Proxy would not pay this setup delay/i,
   )
 
-  // Every step is Round 5 specific, not the "adapter is not executable" placeholder.
-  const steps = within(replay).getAllByRole('button', { expanded: false })
-  expect(steps.length).toBeGreaterThanOrEqual(4)
+  // Every evidence step is Round 5 specific, with no nested accordion.
+  expect(within(replay).getAllByText(/setup workflows|setup clock|client spike/i).length).toBeGreaterThanOrEqual(3)
+  expect(replay.querySelectorAll('details')).toHaveLength(1)
   expect(replay).not.toHaveTextContent(/will appear when this round adapter is executable/i)
 
   // The nine journaled AWS mutations are the substance of the replay.
-  fireEvent.click(within(replay).getByRole('button', { name: /nine journaled resources/i }))
-  const calls = screen.getByLabelText('Exact calls for step 02')
+  const calls = within(replay).getByText(/nine journaled resources/i).closest('.replay-evidence-step')!
   for (const resource of [
     'proxy_security_group', 'proxy_default_egress', 'proxy_ingress', 'proxy_egress',
     'runner_egress', 'rds_ingress', 'rds_proxy', 'proxy_target_group', 'proxy_target',
@@ -1230,7 +1313,7 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
   expect(calls).toHaveTextContent(/built-in Lakebase pooled endpoint/i)
 
   fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
-  expect(screen.queryByRole('dialog', { name: /how this round was proved/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('dialog', { name: /get spike-ready/i })).not.toBeInTheDocument()
 })
 
 it('puts the sound toggle in the header of both Round 5 layouts', () => {

@@ -100,7 +100,10 @@ export function RoundSixProof({
   actions,
 }: RoundSixProofProps) {
   const toweled = state === 'towelled'
-  const verified = state === 'verified' || (toweled && elapsedMs !== null && censoredMs === null)
+  const answerVerified = elapsedMs !== null
+    && censoredMs === null
+    && (state === 'verified' || state === 'failed' || toweled)
+  const verified = separateCheckoutVerified && answerVerified
   const failed = state === 'failed'
   const statusLabel = state === 'review'
     ? 'UI REVIEW · NO RESULT'
@@ -109,7 +112,7 @@ export function RoundSixProof({
       : verified
         ? 'EXACT ANSWER VERIFIED'
       : failed
-        ? 'ANSWER NOT VERIFIED'
+        ? answerVerified ? 'EXACT ANSWER · GUARDRAIL NOT VERIFIED' : 'ANSWER NOT VERIFIED'
         : 'LIVE PROOF RUNNING'
 
   return (
@@ -153,9 +156,9 @@ export function RoundSixProof({
 
           <article className="round6-beat round6-answer">
             <span>3 · Analytics on Delta</span>
-            <div className="round6-answer-card" data-verified={verified}>
+            <div className="round6-answer-card" data-verified={answerVerified}>
               <small>Exact answer</small>
-              <strong>{verified ? '1 ORDER · $84.50 REVENUE · EXACT ✓' : 'WAITING FOR EXACT ANSWER'}</strong>
+              <strong>{answerVerified ? '1 ORDER · $84.50 REVENUE · EXACT ✓' : 'WAITING FOR EXACT ANSWER'}</strong>
             </div>
           </article>
         </div>
@@ -167,6 +170,14 @@ export function RoundSixProof({
         {verified && (
           <p className="round6-receipt" aria-label="Round 6 receipt">
             ORDER INCLUDED ✓ · COUNT VERIFIED ✓ · SEPARATE CHECKOUT COMMITTED ✓
+          </p>
+        )}
+
+        {toweled && !verified && (
+          <p className="round6-receipt" aria-label="Round 6 stopped result">
+            {answerVerified
+              ? 'PRIMARY PROOF OBSERVED · REQUIRED GUARDRAIL NOT VERIFIED · NO DECLARED WINNER · MARGIN N/A'
+              : 'NO EXACT VERIFIED RESULT · NO DECLARED WINNER · MARGIN N/A'}
           </p>
         )}
 

@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CompetitorId(StrEnum):
@@ -320,6 +320,8 @@ class CatalogResponse(BaseModel):
 
 
 class SessionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     competitor: CompetitorId
     primary_persona: str
     secondary_personas: list[str] = Field(default_factory=list, max_length=2)

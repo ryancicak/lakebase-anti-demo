@@ -384,8 +384,18 @@ _ROUND_FOUR_COMPARISON_DETAIL = (
     "Lakebase verified the scoped native Synced Tables capability; no AWS-native "
     "equivalent lane was timed. This is not a speed comparison."
 )
-_ROUND_FOUR_REMEMBERED_RESULT = "LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A"
-_ROUND_SIX_REMEMBERED_RESULT = "LAKEBASE NATIVE CDF WIN · AWS PIPELINE NOT BUILT · MARGIN N/A"
+def _round_four_remembered_result(elapsed_ms: float) -> str:
+    return (
+        f"ANALYTICS CHANGE → LIVE APP · {elapsed_ms / 1000:.2f}s · "
+        "AWS NOT TIMED · MARGIN N/A"
+    )
+
+
+def _round_six_remembered_result(elapsed_ms: float) -> str:
+    return (
+        f"EXACT DELTA ANSWER · {elapsed_ms / 1000:.2f}s · "
+        "AWS PIPELINE NOT BUILT · MARGIN N/A"
+    )
 
 _ROUND_FIVE_SCHEDULED_CLIENTS = 128
 _ROUND_FIVE_WARMUP_CONNECTIONS = 4
@@ -3709,6 +3719,8 @@ class RunManager:
         self,
         record: SessionRecord,
         session_state: SessionState,
+        *,
+        expected_phase: str = "run_committed",
     ) -> None:
         cleanup_ttl_seconds = self._running_lease_ttl
         if record.snapshot.round.id == RoundId.WAKE_IDLE_APP:
@@ -3729,7 +3741,7 @@ class RunManager:
                 record.lease = await self._lease_store_for_record(record).transition(
                     lease,
                     operator=record.operator or lease.operator,
-                    expected_phase="run_committed",
+                    expected_phase=expected_phase,
                     phase="cooldown",
                     session_state=session_state,
                     ttl=timedelta(seconds=cleanup_ttl_seconds),
@@ -5106,7 +5118,9 @@ class RunManager:
             )
             record.snapshot.state = SessionState.VERIFIED
             record.snapshot.failure = None
-            record.snapshot.remembered_result = _ROUND_SIX_REMEMBERED_RESULT
+            record.snapshot.remembered_result = _round_six_remembered_result(
+                result.analytics_available_ms
+            )
             record.snapshot.updated_at = datetime.now(UTC)
             record.armed_at_monotonic = None
             record.live_orders_result = result
@@ -5492,7 +5506,22 @@ class RunManager:
             if valid:
                 record.snapshot.state = SessionState.VERIFIED
                 record.snapshot.failure = None
-                record.snapshot.remembered_result = comparison.detail
+                if comparison.kind == ComparisonKind.TIE:
+                    record.snapshot.remembered_result = (
+                        "BOTH POOLED PATHS VERIFIED TOGETHER"
+                    )
+                else:
+                    assert comparison.winner_lane_id is not None
+                    assert comparison.margin is not None
+                    winner = (
+                        "LAKEBASE"
+                        if comparison.winner_lane_id == "lakebase"
+                        else record.snapshot.lanes["competitor"].name.upper()
+                    )
+                    record.snapshot.remembered_result = (
+                        f"{winner} VERIFIED A POOLED PATH · "
+                        f"{comparison.margin.value / 1000:.2f}s SOONER"
+                    )
                 setup_snapshot.state = RoundFiveSetupState.VERIFIED
             else:
                 record.snapshot.state = SessionState.FAILED
@@ -6398,7 +6427,9 @@ class RunManager:
             self._apply_model_score_result(record.snapshot, result.initial)
             record.snapshot.state = SessionState.VERIFIED
             record.snapshot.failure = None
-            record.snapshot.remembered_result = _ROUND_FOUR_REMEMBERED_RESULT
+            record.snapshot.remembered_result = _round_four_remembered_result(
+                result.initial.application_read_elapsed_ms
+            )
             record.snapshot.redo = RedoSnapshot(
                 state=RedoState.READY,
                 lanes=self._new_model_score_lanes(record.snapshot),
@@ -6806,8 +6837,12 @@ class RunManager:
                 lane.attempts = int(payload.get("attempts", lane.attempts))
                 lane.elapsed_ms = payload.get("elapsed_ms")  # type: ignore[assignment]
                 lane.status = str(payload.get("status", lane.status))
+                connection_closed_at = payload.get("connection_closed_at")
+                if isinstance(connection_closed_at, datetime):
+                    lane.connection_closed_at = connection_closed_at
                 if lane.state == LaneState.VERIFIED and lane.verified_at is None:
-                    lane.verified_at = datetime.now(UTC)
+                    lane.verified_at = lane.connection_closed_at or datetime.now(UTC)
+                record.snapshot.updated_at = datetime.now(UTC)
             await record.event_log.publish(
                 "lane_update",
                 {
@@ -7437,10 +7472,15 @@ class RunManager:
                 await self._await_towelled_run_task(run_task)
 
             if round_id == RoundId.WAKE_IDLE_APP:
-                # There is no owned artifact to settle. The verifier contexts
-                # above are the safety boundary; provider scale-to-zero is a
-                # lease-free backstage observation and must not block the ring.
-                pass
+                # The timed work is stopped, but the engines have not yet proved
+                # idle. Keep the same durable lease in the ordinary Round 1
+                # cooldown phase so the fight card cannot advertise READY while
+                # either endpoint is still ACTIVE.
+                await self._transition_bout_to_cleanup(
+                    record,
+                    SessionState.TOWELLED,
+                    expected_phase="towel_cleanup",
+                )
             elif round_id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY:
                 engine = record.safe_change_engine
                 if engine is None:
@@ -7507,7 +7547,12 @@ class RunManager:
 
         if settlement_error is None:
             await self._settle_towel_cost_window(record)
-        released = settlement_error is None and await self._release_bout(record)
+        round_one_cooldown_held = (
+            settlement_error is None and round_id == RoundId.WAKE_IDLE_APP
+        )
+        released = round_one_cooldown_held or (
+            settlement_error is None and await self._release_bout(record)
+        )
         if settlement_error is None and not released:
             settlement_error = "Ring release could not be confirmed; retry towel cleanup."
 
@@ -8186,7 +8231,10 @@ class RunManager:
     @staticmethod
     def _remembered_result(snapshot: SessionSnapshot) -> str:
         if snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
-            return _ROUND_FOUR_REMEMBERED_RESULT
+            elapsed_ms = snapshot.lanes["lakebase"].elapsed_ms
+            if elapsed_ms is None:
+                raise RuntimeError("Round 4 verified without a capability elapsed time")
+            return _round_four_remembered_result(elapsed_ms)
         if snapshot.lanes["competitor"].state == LaneState.NOT_SUPPORTED:
             assert snapshot.lanes["lakebase"].state == LaneState.VERIFIED
             return "LAKEBASE WINS — RDS CANNOT ENTER THE ROUND"

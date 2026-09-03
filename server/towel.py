@@ -140,16 +140,46 @@ def adjudicate_round_five_towel(
             "display_value": display,
         }
 
-    if exact_lanes:
-        exact = " and ".join(frozen[lane_id].name for lane_id in exact_lanes)
+    if len(exact_lanes) == 1:
+        verified_lane_id = exact_lanes[0]
+        unverified_lane_id = next(iter(expected_lanes - {verified_lane_id}))
+        verified_name = setup_lanes[verified_lane_id].name
+        unverified_name = setup_lanes[unverified_lane_id].name
+        lower_bound_ms = censored.get(unverified_lane_id)
+        unverified_result = (
+            f"{unverified_name} unverified beyond "
+            f"{_cutoff_display(lower_bound_ms).removeprefix('>')}"
+            if lower_bound_ms is not None
+            else f"{unverified_name} unverified without an exact lower bound"
+        )
         public_result = (
-            f"Toweled · Exact setup stop preserved for {exact} · "
-            "Downstream proof incomplete · No winner · Margin N/A"
+            f"Toweled · {verified_name} setup verified first · {unverified_result} · "
+            "Shared spike did not run · No declared winner · "
+            "Comparison incomplete · Margin N/A"
+        )
+        comparison_detail = (
+            f"{verified_name} reached its exact setup stop; {unverified_result.lower()}. "
+            "The shared spike did not run, so no winner or margin was declared."
+        )
+    elif exact_lanes:
+        exact = " and ".join(setup_lanes[lane_id].name for lane_id in exact_lanes)
+        public_result = (
+            f"Toweled · Exact setup stops preserved for {exact} · "
+            "Shared spike did not complete · No declared winner · "
+            "Comparison incomplete · Margin N/A"
+        )
+        comparison_detail = (
+            "Both setup lanes reached exact stops, but the shared spike did not complete; "
+            "no winner or margin was declared."
         )
     else:
         public_result = (
-            "Toweled · No exact setup stop verified · "
-            "Downstream proof incomplete · No winner · Margin N/A"
+            "Toweled · No exact setup stop verified · Shared spike did not run · "
+            "No declared winner · Comparison incomplete · Margin N/A"
+        )
+        comparison_detail = (
+            "Round 5 stopped before either exact setup gate and before the shared spike; "
+            "no winner or margin was declared."
         )
 
     return TowelAdjudication(
@@ -160,10 +190,7 @@ def adjudicate_round_five_towel(
             kind=ComparisonKind.NOT_COMPARABLE,
             winner_lane_id=None,
             margin=None,
-            detail=(
-                "Round 5 stopped before the complete setup and downstream proof; "
-                "no winner or speed margin was declared."
-            ),
+            detail=comparison_detail,
         ),
         public_result=public_result,
     )

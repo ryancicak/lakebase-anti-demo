@@ -23,6 +23,7 @@ from server.models import (
     SessionCreate,
     SessionState,
 )
+from server.receipts import derive_receipt
 
 
 def _result(order: LiveOrder, guardrail: LiveOrder) -> LiveOrdersResult:
@@ -110,7 +111,14 @@ async def test_a_won_round_six_removes_its_own_proof_rows() -> None:
     engine = _LiveOrdersEngine()
     manager = RunManager(live_orders_factory=lambda: engine)
 
-    await _drive(manager, engine, SessionState.VERIFIED)
+    created = await _drive(manager, engine, SessionState.VERIFIED)
+    verified = await manager.get(created.id)
+    assert verified.remembered_result == (
+        "EXACT DELTA ANSWER · 0.01s · AWS PIPELINE NOT BUILT · MARGIN N/A"
+    )
+    assert derive_receipt(verified, "run_finished").remembered_result == (
+        verified.remembered_result
+    )
     await _settled(engine)
 
     order, guardrail = engine.settled[0]

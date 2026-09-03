@@ -135,7 +135,12 @@ const runningLaneRank: Partial<Record<LaneSnapshot['state'], number>> = {
 function runningLaneRegresses(current: LaneSnapshot, incoming: LaneSnapshot): boolean {
   const currentRank = runningLaneRank[current.state]
   const incomingRank = runningLaneRank[incoming.state]
-  if (laneIsTerminal(current) && incomingRank !== undefined) return true
+  if (laneIsTerminal(current) && incoming.state !== current.state) return true
+  if (
+    laneIsTerminal(current)
+    && current.elapsed_ms !== null
+    && (incoming.elapsed_ms === null || incoming.elapsed_ms < current.elapsed_ms)
+  ) return true
   if (currentRank !== undefined && incomingRank !== undefined && incomingRank < currentRank) {
     return true
   }
@@ -193,9 +198,60 @@ export function preserveCooldownLaneLatches(
   return cooldown === incoming.cooldown ? incoming : { ...incoming, cooldown }
 }
 
+function mergeRunningLaneLatches(
+  current: DemoSession['lanes'],
+  incoming: DemoSession['lanes'],
+): DemoSession['lanes'] {
+  let changed = false
+  const lanes = { ...incoming }
+  for (const laneId of ['lakebase', 'competitor'] as const) {
+    const currentLane = current[laneId]
+    const incomingLane = lanes[laneId]
+    if (!runningLaneRegresses(currentLane, incomingLane)) continue
+    lanes[laneId] = currentLane
+    changed = true
+  }
+  return changed ? lanes : incoming
+}
+
+function preserveRunningLaneLatches(
+  current: DemoSession,
+  incoming: DemoSession,
+): DemoSession {
+  const lanes = mergeRunningLaneLatches(current.lanes, incoming.lanes)
+  const redoLanes = current.redo && incoming.redo
+    ? mergeRunningLaneLatches(current.redo.lanes, incoming.redo.lanes)
+    : incoming.redo?.lanes
+  const redo = incoming.redo && redoLanes && redoLanes !== incoming.redo.lanes
+    ? { ...incoming.redo, lanes: redoLanes }
+    : incoming.redo
+  return lanes === incoming.lanes && redo === incoming.redo
+    ? incoming
+    : { ...incoming, lanes, redo }
+}
+
+function anyRunningLaneRegresses(current: DemoSession, incoming: DemoSession): boolean {
+  const initialRegression = (['lakebase', 'competitor'] as const).some(
+    (laneId) => runningLaneRegresses(current.lanes[laneId], incoming.lanes[laneId]),
+  )
+  if (initialRegression) return true
+  if (!current.redo || !incoming.redo) return false
+  return (['lakebase', 'competitor'] as const).some(
+    (laneId) => runningLaneRegresses(
+      current.redo!.lanes[laneId],
+      incoming.redo!.lanes[laneId],
+    ),
+  )
+}
+
 export function acceptsReconciledSession(current: DemoSession, incoming: DemoSession): boolean {
   if (current.id !== incoming.id) return false
-  if (timestamp(incoming.updated_at) < timestamp(current.updated_at)) return false
+  const currentTimestamp = timestamp(current.updated_at)
+  const incomingTimestamp = timestamp(incoming.updated_at)
+  if (incomingTimestamp < currentTimestamp) return false
+  if (incomingTimestamp === currentTimestamp && anyRunningLaneRegresses(current, incoming)) {
+    return false
+  }
   const currentActiveRank = activeSessionRank[current.state]
   const incomingActiveRank = activeSessionRank[incoming.state]
   if (
@@ -225,16 +281,6 @@ export function acceptsReconciledSession(current: DemoSession, incoming: DemoSes
     && current.redo?.state === 'running'
     && incoming.redo?.state === 'ready'
   ) return false
-  if (
-    current.state === 'running'
-    && incoming.state === 'running'
-    && current.redo?.state === 'running'
-    && incoming.redo?.state === 'running'
-    && runningLaneRegresses(
-      current.redo.lanes.lakebase,
-      incoming.redo.lanes.lakebase,
-    )
-  ) return false
   return true
 }
 
@@ -245,7 +291,10 @@ export function selectRound4Session(
   if (!current || !candidate) return candidate
   if (current.id !== candidate.id) return candidate
   return acceptsReconciledSession(current, candidate)
-    ? preserveCooldownLaneLatches(current, candidate)
+    ? preserveRunningLaneLatches(
+        current,
+        preserveCooldownLaneLatches(current, candidate),
+      )
     : current
 }
 

@@ -18,6 +18,12 @@
  */
 
 import type { CompetitorId, LaneState, RoundId } from './api/types'
+import {
+  classifyEvidence,
+  resolveRoundContract,
+  type ContractComparison,
+  type RoundContractDecision,
+} from './outcome'
 
 /** Server-derived record of one sealed bout. Mirrors server/receipts.py. */
 export interface BoutReceipt {
@@ -41,6 +47,7 @@ export interface BoutReceipt {
   sealed_at: string
   remembered_result: string | null
   failure: string | null
+  cleanup_failure?: string | null
 }
 
 export type LaneReceiptState =
@@ -127,9 +134,25 @@ export interface LaneOutcome {
  * `unproven` no matter what state the other lane is in.
  */
 export function resultKind(lanes: LaneOutcome): ResultKind {
-  if (!lanes.lakebaseVerified) return 'unproven'
-  if (lanes.opponentVerified) return 'timed'
-  if (lanes.opponentBounded) return 'bounded'
+  const evidence = classifyEvidence({
+    lakebase: {
+      exactMs: lanes.lakebaseVerified ? 0 : null,
+      lowerBoundMs: null,
+      notSupported: false,
+    },
+    competitor: {
+      exactMs: lanes.opponentVerified ? 0 : null,
+      lowerBoundMs: lanes.opponentBounded ? 0 : null,
+      notSupported: !lanes.opponentVerified && !lanes.opponentBounded,
+    },
+    capabilityGap:
+      lanes.lakebaseVerified && !lanes.opponentVerified && !lanes.opponentBounded,
+  })
+  if (evidence.exactLane !== 'lakebase' && evidence.laneShape !== 'both_exact_verified') {
+    return 'unproven'
+  }
+  if (evidence.laneShape === 'both_exact_verified') return 'timed'
+  if (evidence.laneShape === 'exact_and_censored_lower_bound') return 'bounded'
   return 'capability'
 }
 
@@ -140,6 +163,7 @@ export interface BoutView {
   roundTitle: string
   opponent: string
   kind: ResultKind
+  contract: RoundContractDecision
   /** True when the number under that lane is a floor, not a time. */
   lakebaseIsLowerBound: boolean
   opponentIsLowerBound: boolean
@@ -161,19 +185,71 @@ export interface BoutView {
 
 /** Reduce one receipt to the facts a row needs. */
 export function boutView(receipt: BoutReceipt): BoutView {
-  const theirs = receipt.opponent_lane.state
-
-  const kind = resultKind({
-    // `unproven` includes a thrown towel, where both lanes are censored.
-    lakebaseVerified: receipt.lakebase.state === 'verified',
-    opponentVerified: theirs === 'verified',
-    opponentBounded: theirs === 'failed' || receipt.opponent_lane.lower_bound,
+  const lakebaseExact = receipt.lakebase.state === 'verified' && !receipt.lakebase.lower_bound
+    ? receipt.lakebase.ms
+    : null
+  const opponentExact = receipt.opponent_lane.state === 'verified'
+    && !receipt.opponent_lane.lower_bound
+    ? receipt.opponent_lane.ms
+    : null
+  const evidence = classifyEvidence({
+    lakebase: {
+      exactMs: lakebaseExact,
+      lowerBoundMs: receipt.lakebase.lower_bound ? receipt.lakebase.ms : null,
+      notSupported: receipt.lakebase.state === 'not_supported',
+    },
+    competitor: {
+      exactMs: opponentExact,
+      lowerBoundMs: receipt.opponent_lane.lower_bound ? receipt.opponent_lane.ms : null,
+      notSupported: receipt.opponent_lane.state === 'not_supported',
+    },
+    capabilityGap:
+      lakebaseExact !== null
+      && receipt.opponent_lane.state === 'not_supported'
+      && receipt.outcome === 'declared',
+    guardrailFailure:
+      (receipt.round_id === 'put_model_score_in_app'
+        || receipt.round_id === 'analyze_live_orders_without_slowing_checkout')
+      && lakebaseExact !== null
+      && receipt.outcome !== 'declared',
+    cleanupFailure: Boolean(receipt.cleanup_failure),
   })
 
-  // A margin survives only where both lanes verified, whatever the server sent.
-  // Belt and braces: the server already refuses to derive one otherwise, and this
-  // is the one claim on the page that must not be wrong.
-  const marginMs = kind === 'timed' ? receipt.margin_ms : null
+  let comparison: ContractComparison | null = null
+  if (lakebaseExact !== null && opponentExact !== null) {
+    if (lakebaseExact === opponentExact) {
+      comparison = { kind: 'tie', winnerLaneId: null, marginMs: null }
+    } else {
+      comparison = {
+        kind: 'measured',
+        winnerLaneId: lakebaseExact < opponentExact ? 'lakebase' : 'competitor',
+        marginMs: Math.abs(receipt.margin_ms ?? opponentExact - lakebaseExact),
+      }
+    }
+  }
+  const contract = resolveRoundContract({
+    roundId: receipt.round_id,
+    evidence,
+    comparison,
+    roundContractVerified: receipt.round_id === 'survive_connection_spike'
+      || receipt.round_id === 'put_model_score_in_app'
+      || receipt.round_id === 'analyze_live_orders_without_slowing_checkout'
+      ? receipt.outcome === 'declared'
+      : comparison !== null || evidence.exactLane !== null,
+    terminal: receipt.outcome !== 'pending',
+    recordNoEvidence: receipt.outcome === 'stopped_short',
+  })
+  const kind: ResultKind = contract.resultStatus === 'declared_capability'
+    ? 'capability'
+    : contract.resultStatus === 'declared_comparison'
+      ? 'timed'
+      : contract.resultStatus === 'adjudicated_stoppage'
+        ? contract.formalWinner !== 'lakebase'
+          ? 'unproven'
+          : evidence.laneShape === 'exact_and_censored_lower_bound'
+            ? 'bounded'
+            : 'capability'
+        : 'unproven'
 
   const sealed = Date.parse(receipt.sealed_at)
 
@@ -184,14 +260,16 @@ export function boutView(receipt: BoutReceipt): BoutView {
     roundTitle: receipt.round_title || roundTitle(receipt.round_id),
     opponent: receipt.opponent,
     kind,
+    contract,
     lakebaseIsLowerBound: receipt.lakebase.lower_bound,
     opponentIsLowerBound: receipt.opponent_lane.lower_bound,
-    marginMs,
+    marginMs: contract.marginMs,
     startSkewMs: receipt.start_skew_ms,
     hadSharedStart: receipt.start_skew_ms !== null && receipt.opponent_lane.ms !== null,
     // An attempt that failed before measuring anything is kept on disk as evidence
     // but is not a result, so it must not sit on the board as though it were one.
-    scoreable: receipt.has_measurements || receipt.outcome === 'declared',
+    scoreable: contract.scorecardEligible
+      && (receipt.has_measurements || receipt.outcome === 'declared'),
     sealedAt: Number.isNaN(sealed) ? 0 : sealed,
   }
 }
@@ -290,6 +368,8 @@ export function latestBout(bouts: readonly BoutView[]): BoutView | null {
 export type RoundStatus =
   | 'running'
   | 'lakebase_faster'
+  | 'competitor_faster'
+  | 'tie'
   | 'lakebase_finished'
   | 'uncontested'
   | 'no_result'
@@ -341,17 +421,21 @@ export interface LiveRound {
 }
 
 function statusOf(bout: BoutView): RoundStatus {
-  if (bout.receipt.outcome !== 'declared' && bout.kind === 'unproven') return 'no_result'
-  switch (bout.kind) {
-    case 'timed':
-      return 'lakebase_faster'
-    case 'bounded':
-      return 'lakebase_finished'
-    case 'capability':
-      return 'uncontested'
-    default:
-      return 'no_result'
+  if (bout.contract.resultStatus === 'declared_capability') return 'uncontested'
+  if (bout.contract.resultStatus === 'adjudicated_stoppage') {
+    return bout.contract.formalWinner === 'lakebase'
+      ? 'lakebase_finished'
+      : bout.contract.formalWinner === 'competitor'
+        ? 'competitor_faster'
+        : 'no_result'
   }
+  if (bout.contract.resultStatus !== 'declared_comparison') return 'no_result'
+  if (bout.contract.formalWinner === 'tie') return 'tie'
+  return bout.contract.formalWinner === 'lakebase'
+    ? 'lakebase_faster'
+    : bout.contract.formalWinner === 'competitor'
+      ? 'competitor_faster'
+      : 'no_result'
 }
 
 /**
@@ -464,6 +548,10 @@ export function winnerLabel(result: RoundResult): string {
     case 'lakebase_faster':
     case 'lakebase_finished':
       return 'LAKEBASE'
+    case 'competitor_faster':
+      return result.opponent?.toUpperCase() ?? 'OPPONENT'
+    case 'tie':
+      return 'TIE'
     case 'uncontested':
       return 'LAKEBASE · UNCONTESTED'
     case 'no_result':
@@ -552,11 +640,24 @@ export interface LedgerVerdict {
 
 export function ledgerVerdict(result: RoundResult): LedgerVerdict {
   const lakebase = { badge: 'LB', name: 'LAKEBASE' }
+  const opponent = { badge: 'OPP', name: result.opponent?.toUpperCase() ?? 'OPPONENT' }
   const figure = result.lakebaseMs === null ? null : summaryDuration(result.lakebaseMs)
 
   switch (result.status) {
     case 'lakebase_faster':
       return { winner: lakebase, outcome: null, figure, qualifier: null, laneNote: null }
+
+    case 'competitor_faster':
+      return {
+        winner: opponent,
+        outcome: null,
+        figure: result.opponentMs === null ? null : summaryDuration(result.opponentMs),
+        qualifier: result.stoppedShort ? 'STOPPED SHORT' : null,
+        laneNote: null,
+      }
+
+    case 'tie':
+      return { winner: null, outcome: 'TIE', figure, qualifier: null, laneNote: null }
 
     case 'lakebase_finished': {
       // Ours finished, theirs did not. The figure they carry is a floor, so the
@@ -653,6 +754,8 @@ export function ledgerDay(result: RoundResult, now: number = Date.now()): string
 export function roundsWithResult(results: readonly RoundResult[]): number {
   return results.filter((result) => (
     result.status === 'lakebase_faster'
+    || result.status === 'competitor_faster'
+    || result.status === 'tie'
     || result.status === 'lakebase_finished'
     || result.status === 'uncontested'
   )).length

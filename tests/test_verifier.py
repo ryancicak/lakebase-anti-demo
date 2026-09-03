@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 
 import pytest
 
@@ -66,6 +67,15 @@ async def test_verifier_starts_both_lanes_together_and_records_authoritative_tim
     assert result.launch_skew_ms is not None
     assert result.launch_skew_ms < 10
     assert {event[0] for event in events} == {"lakebase", "competitor"}
+    verified_events = {
+        lane: payload
+        for lane, state, payload in events
+        if state == LaneState.VERIFIED
+    }
+    assert set(verified_events) == {"lakebase", "competitor"}
+    for lane_id, payload in verified_events.items():
+        assert isinstance(payload["connection_closed_at"], datetime)
+        assert payload["connection_closed_at"] == result.lanes[lane_id].connection_closed_at
 
 
 async def test_correctness_failure_is_visible_and_not_retried() -> None:
