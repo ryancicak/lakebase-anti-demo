@@ -13,6 +13,10 @@ from .models import LaneState
 class FatalProbeError(RuntimeError):
     """A correctness failure that must never be hidden by retries."""
 
+    def __init__(self, message: str, *, sqlstate: str | None = None) -> None:
+        super().__init__(message)
+        self.sqlstate = sqlstate
+
 
 class VerifierStopped(RuntimeError):
     """The verifier settled its lane tasks after an explicit stop request."""

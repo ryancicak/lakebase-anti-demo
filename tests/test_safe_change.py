@@ -231,6 +231,7 @@ def make_engine(
     scope = SafeChangeOwnershipScope(
         run_id="ad-test-001",
         owner="operator@databricks.com",
+        expires_at="2030-01-01T00:00:00Z",
         aws_account_id="123456789012",
         aws_region="us-west-2",
     )

@@ -1657,6 +1657,33 @@ class RecordingActivation:
         self._adapter.running = False
 
 
+async def test_source_storage_refusal_happens_before_pipeline_activation() -> None:
+    contract = model_score_contract()
+
+    class StorageDenied(StoppedUntilStarted):
+        async def preflight_source(self, entity_id, on_progress=None):
+            assert entity_id == contract.entity_id
+            raise RuntimeError("STORAGE_ACCESS_DENIED")
+
+    adapter = StorageDenied(contract)
+    activation = RecordingActivation(adapter)
+    engine = ModelScoreEngine(
+        adapter,
+        contract=contract,
+        poll_interval_seconds=0,
+        now=lambda: NOW,
+        clock_ns=ticking_clock(),
+        activation=activation,
+    )
+
+    with pytest.raises(RuntimeError, match="STORAGE_ACCESS_DENIED"):
+        await engine.arm()
+
+    assert adapter.running is False
+    assert adapter.inspections_while_stopped == 0
+    assert activation.notices == []
+
+
 async def test_a_stopped_pipeline_is_started_before_the_arm_inspects_it() -> None:
     """The round survives a pipeline that was switched off to save money.
 

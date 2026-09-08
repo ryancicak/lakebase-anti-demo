@@ -437,6 +437,13 @@ else
   say "No $ENV_FILE (start from docs/bootstrap.env.example); missing inputs will be prompted for."
 fi
 
+if ((NEW_GENERATION == 1)) && [[ -n "${ANTI_DEMO_MANIFEST:-}" ]]; then
+  die "--new-generation cannot be combined with ANTI_DEMO_MANIFEST.
+       The flag must choose a new .anti-demo-v<N+1> path itself; an explicit
+       manifest can point at an older generation and would silently defeat the
+       fresh-install guarantee. Unset ANTI_DEMO_MANIFEST and re-run."
+fi
+
 # ---------------------------------------------------------------------------
 # 1a. Is this --apply a reset in disguise?
 # ---------------------------------------------------------------------------
@@ -1178,11 +1185,30 @@ else
     if [[ "$VERSIONING" == "Enabled" ]]; then
       ok "bucket versioning is enabled"
     else
-      warn "bucket versioning is '$VERSIONING'. This file is the only record of which
-        billed resources you own; without versioning a bad write is unrecoverable.
-        Enable it: aws s3api put-bucket-versioning --bucket $STATE_BUCKET
-        --versioning-configuration Status=Enabled"
+      die "S3 STATE BACKEND REFUSED: bucket versioning is '$VERSIONING'.
+        This file is the only record of which billed resources you own; without
+        versioning a bad write is unrecoverable. Enable it, then re-run:
+          aws s3api put-bucket-versioning --bucket $STATE_BUCKET \
+            --versioning-configuration Status=Enabled"
     fi
+    PUBLIC_BLOCK="$(aws s3api get-bucket-public-access-block --bucket "$STATE_BUCKET" \
+      --query 'PublicAccessBlockConfiguration.[BlockPublicAcls,IgnorePublicAcls,BlockPublicPolicy,RestrictPublicBuckets]' \
+      --output text 2>/dev/null | awk '{$1=$1; print tolower($0)}' || echo unknown)"
+    [[ "$PUBLIC_BLOCK" == "true true true true" ]] ||
+      die "S3 STATE BACKEND REFUSED: all four public-access blocks must be true on
+        bucket $STATE_BUCKET; observed '${PUBLIC_BLOCK:-unknown}'. State can contain
+        credentials and resource identifiers, so this backend never proceeds on
+        a warning."
+    ok "all four public-access blocks are enabled"
+    BUCKET_ENCRYPTION="$(aws s3api get-bucket-encryption --bucket "$STATE_BUCKET" \
+      --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+      --output text 2>/dev/null || echo unknown)"
+    case "$BUCKET_ENCRYPTION" in
+      AES256 | aws:kms | aws:kms:dsse) ok "default bucket encryption is $BUCKET_ENCRYPTION" ;;
+      *) die "S3 STATE BACKEND REFUSED: default bucket encryption is
+        '${BUCKET_ENCRYPTION:-unknown}' on $STATE_BUCKET. Configure SSE-S3, SSE-KMS,
+        or DSSE-KMS before storing Terraform state." ;;
+    esac
   else
     info "bucket $STATE_BUCKET does not exist or is not readable by this principal"
     if [[ "$MODE" == "apply" ]]; then
@@ -1522,10 +1548,10 @@ if [[ -f "$ANTI_DEMO_MANIFEST" ]]; then
       (server/lifecycle.py:5148) refuses on exactly this mismatch. Use the original
       principal, or clean up and re-provision."
   fi
-  # Advisory only, and now structurally so: server/lifecycle.py:_warn_if_expired
-  # and _expiry_check both report a passed TTL without failing, and the method
-  # that used to refuse on one no longer exists on DemoManifest to be called.
-  info "a passed expires_at is advisory here and does not block setup"
+  # Advisory by clock, structural by live inventory: the final 24 hours and a
+  # passed deadline are both reported, while per-resource checks decide what
+  # external account cleanup actually removed.
+  info "expires_at warns before external cleanup; live checks decide availability"
 else
   ok "no manifest yet; this will be a first provision (TTL ${TTL_HOURS}h)"
   if [[ "$MODE" == "deploy" ]]; then
@@ -1824,9 +1850,10 @@ aurora_floor_daily() {
 }
 
 cat <<SUMMARY
-  This provisions real, billed infrastructure. Nothing reaps it on a timer:
-  the expires-at tag is an ownership label, and only 'antidemo cleanup --yes' stops
-  the spend. Counts come from infra/aws (locals.tf v7_round_keys and
+  This provisions real, billed infrastructure. External account automation may
+  reap tagged AWS resources at expires-at, but that can leave a partial
+  installation; only 'antidemo cleanup --yes' verifies deliberate teardown.
+  Counts come from infra/aws (locals.tf v7_round_keys and
   v7_rds_round_keys); rates are the us-west-2 list prices in
   server/cost_model.py, which is authoritative for the app's own accounting.
 
@@ -2110,7 +2137,8 @@ if ((ASSUME_YES == 0)); then
   say "  leaves a half-created fleet that is fully billing, and the only record of"
   say "  what exists is the local Terraform state in"
   say "      $MANIFEST_DIR"
-  say "  Nothing reaps it on a timer. If you do interrupt, re-run this command --"
+  say "  External expiry may reap tagged AWS resources later but does not make an"
+  say "  interrupted installation coherent. If you do interrupt, re-run this command --"
   say "  'antidemo setup' resumes rather than duplicating -- or run"
   say "  './antidemo cleanup --yes' against this same generation to destroy it. Losing"
   say "  that directory means the resources still bill and only their AWS tags"
@@ -2142,11 +2170,13 @@ if [[ "$STATE_BACKEND" == "s3" ]]; then
     aws s3api put-bucket-encryption --bucket "$STATE_BUCKET" \
       --server-side-encryption-configuration \
       '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}' ||
-      warn "default encryption could not be set; state is still encrypted in transit"
+      die "the state bucket exists but default encryption could not be set; refusing
+        to write Terraform state into a bucket that did not accept its hardening"
     aws s3api put-public-access-block --bucket "$STATE_BUCKET" \
       --public-access-block-configuration \
       'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true' ||
-      warn "public access block could not be set; set it by hand before applying"
+      die "the state bucket exists but its public access block could not be set;
+        refusing to write Terraform state into a bucket that is not proven private"
     ok "SSE-S3 and public access block applied"
   fi
 
@@ -2225,7 +2255,8 @@ SETUP_STATUS=0
 if ((SETUP_STATUS != 0)); then
   die "'./antidemo setup' exited $SETUP_STATUS, and it does not undo what it created.
        Anything Terraform applied before the failure exists now and is billing now.
-       Nothing reaps it on a timer.
+       External expiry may later reap tagged AWS resources, but it does not
+       guarantee complete cleanup of this partial installation.
 
        Find out what is running:   ./antidemo cleanup --dry-run
        Continue where it stopped:  ./bootstrap.sh --apply   (resumes; does not duplicate)

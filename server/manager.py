@@ -64,6 +64,10 @@ from .model_score import (
     ModelScoreRunResult,
     ModelScoreUpdate,
 )
+from .model_score_live import (
+    DeltaStorageAccessDeniedError,
+    WorkspaceStatementExecutionError,
+)
 from .models import (
     Availability,
     BoutOperator,
@@ -118,7 +122,12 @@ from .round5_cleanup_owed import (
     clear_round5_cleanup_owed,
     record_round5_cleanup_owed,
 )
-from .round_availability import GRANT_REFUSAL_HEADLINE, grant_refusal
+from .round_availability import (
+    GRANT_REFUSAL_HEADLINE,
+    grant_refusal,
+    missing_delta_refusal,
+    storage_refusal,
+)
 from .safe_change import (
     SafeChangeArm,
     SafeChangeEngine,
@@ -231,16 +240,14 @@ def _redacted_link(error: BaseException) -> str:
 
 
 def _message_is_ours_to_quote(error: BaseException) -> bool:
-    """Whether this exception's own words may be shown to an operator.
+    """Whether this exception's words may enter operator-only diagnostics.
 
     Two kinds may, and the boundary is who wrote the sentence.
 
-    A `DatabricksError` may, because its message is the workspace answering a
-    question this app asked about its own authorization, and the answer *is* the
-    remedy: it names the table, the principal and the permission a workspace
-    admin has to grant. `server.round_construction.exception_diagnostic` already
-    took this position for messages this codebase raised about its own manifest;
-    this is the same bargain extended exactly as far as the evidence requires.
+    A `DatabricksError` may, because its message names the table, principal and
+    permission an operator must repair. The audience-facing arm and cost
+    messages never call this renderer directly; they use fixed wording and send
+    this detail only to the operator log and cached operator refusal.
 
     Anything else contributes its type name alone. That is not squeamishness:
     Rounds 1-3 and 5 reach Postgres and AWS on this same path, a psycopg or
@@ -269,12 +276,11 @@ def _redacted_exception_chain(error: BaseException) -> str:
 
 
 def operator_diagnosis(error: BaseException) -> str:
-    """The whole cause chain as one readable line, keeping the words we may keep.
+    """The whole cause chain for operator-only logs and refusal detail.
 
-    A traceback is not the answer -- this text reaches a screen an audience may
-    see -- but neither is a fixed string, which is what was there before and
-    what turned two refusals naming an exact table and an exact principal into
-    "could not be verified".
+    A traceback alone is not an actionable answer, but neither is a fixed
+    string. Audience-facing failure banners are deliberately built elsewhere
+    and never interpolate this value.
     """
 
     diagnosis = _walk_chain(error, _quotable_link)
@@ -307,6 +313,28 @@ def authorization_refusal(error: BaseException) -> BaseException | None:
     return None
 
 
+def storage_access_refusal(error: BaseException) -> DeltaStorageAccessDeniedError | None:
+    """The typed shared-Delta storage denial anywhere in a wrapped cause chain."""
+
+    failure = statement_execution_failure(error)
+    return failure if isinstance(failure, DeltaStorageAccessDeniedError) else None
+
+
+def statement_execution_failure(
+    error: BaseException,
+) -> WorkspaceStatementExecutionError | None:
+    """The typed Statement Execution failure anywhere in a wrapped cause chain."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, WorkspaceStatementExecutionError):
+            return current
+        current = current.__cause__ or current.__context__
+    return None
+
+
 def arm_failure_message(summary: str, error: BaseException) -> str:
     """What an operator reads when an arm is refused, with the reason attached.
 
@@ -314,10 +342,25 @@ def arm_failure_message(summary: str, error: BaseException) -> str:
     was doing, and it is what makes the rest legible. What follows is why.
     """
 
-    diagnosis = operator_diagnosis(error)
+    if storage_access_refusal(error) is not None:
+        return (
+            f"{summary} Shared lakehouse storage is unavailable backstage. "
+            "Rounds 4 and 6 are off the card; no run started."
+        )
+    if statement_execution_failure(error) is not None:
+        return (
+            f"{summary} A backstage data check failed; no run started. "
+            "The operator log has the provider diagnosis."
+        )
     if authorization_refusal(error) is not None:
-        return f"{summary} {GRANT_REFUSAL_HEADLINE} Databricks said: {diagnosis}"
-    return f"{summary} Diagnosis: {diagnosis}"
+        return (
+            f"{summary} {GRANT_REFUSAL_HEADLINE} No run started. "
+            "The operator log has the exact grant diagnosis."
+        )
+    return (
+        f"{summary} A backstage check failed; no run started. "
+        "The operator log has the diagnosis."
+    )
 
 
 #: The Postgres counterpart of `GRANT_REFUSAL_HEADLINE`, for the one Postgres
@@ -350,12 +393,20 @@ def cost_window_refusal(summary: str, error: BaseException) -> str:
     it can see and the outermost link here is routinely the least informative.
     """
 
-    diagnosis = operator_diagnosis(error)
     if privilege_refusal(error) is not None:
-        return f"{summary} {COST_LEDGER_GRANT_HEADLINE} Diagnosis: {diagnosis}"
+        return (
+            f"{summary} {COST_LEDGER_GRANT_HEADLINE} No run started. "
+            "The operator log has the exact grant diagnosis."
+        )
     if authorization_refusal(error) is not None:
-        return f"{summary} {GRANT_REFUSAL_HEADLINE} Databricks said: {diagnosis}"
-    return f"{summary} Diagnosis: {diagnosis}"
+        return (
+            f"{summary} {GRANT_REFUSAL_HEADLINE} No run started. "
+            "The operator log has the exact grant diagnosis."
+        )
+    return (
+        f"{summary} A backstage cost record could not be started; no run started. "
+        "The operator log has the diagnosis."
+    )
 
 
 class SessionNotFoundError(KeyError):
@@ -373,6 +424,19 @@ class AmbiguousRingQueryError(ValueError):
     question is wrong. It maps to 400, not 409 or 503, because the caller can
     fix it by naming what it meant.
     """
+
+
+class RoundStorageReadinessError(RuntimeError):
+    """A non-repairable missing Delta path attributed to one exact round."""
+
+    def __init__(self, round_id: RoundId, message: str) -> None:
+        if round_id not in {
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            RoundId.ANALYZE_LIVE_ORDERS,
+        }:
+            raise ValueError("Delta storage readiness applies only to Rounds 4 and 6")
+        super().__init__(message)
+        self.round_id = round_id
 
 
 _ROUND_ONE_TRANSACTION_WIRE_CALL = "PostgreSQL TLS connect → INSERT → COMMIT → SELECT"
@@ -683,6 +747,8 @@ class RunManager:
         posted_usage: Callable[[], PostedDatabricksUsage | None] | None = None,
         drift_report: Callable[[], ReconciliationReport | None] | None = None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
+        delta_storage_probe: Callable[[], Awaitable[None]] | None = None,
+        delta_storage_probe_interval_seconds: float = 60.0,
     ) -> None:
         self._records: dict[str, SessionRecord] = {}
         self._records_lock = asyncio.Lock()
@@ -731,6 +797,15 @@ class RunManager:
         # stop the *next* fight card being offered, and the session that was
         # refused is released long before that happens.
         self._grant_refusals: dict[RoundId, str] = {}
+        self._storage_refusals: dict[RoundId, str] = {}
+        self._delta_storage_probe = delta_storage_probe
+        if delta_storage_probe_interval_seconds < 0:
+            raise ValueError("Delta storage probe interval cannot be negative")
+        self._delta_storage_probe_interval_ns = int(
+            delta_storage_probe_interval_seconds * 1_000_000_000
+        )
+        self._delta_storage_probe_finished_ns: int | None = None
+        self._delta_storage_probe_task: asyncio.Task[None] | None = None
         self._clock_ns = clock_ns
         self._close_lock = asyncio.Lock()
         self._closed = False
@@ -937,6 +1012,93 @@ class RunManager:
         """
 
         return dict(self._grant_refusals)
+
+    @property
+    def storage_refusals(self) -> Mapping[RoundId, str]:
+        """Rounds whose latest readiness probe or arm proved storage inaccessible."""
+
+        return dict(self._storage_refusals)
+
+    async def refresh_delta_storage_readiness(self, *, force: bool = False) -> None:
+        """Refresh the cached shared-storage verdict once, with request coalescing.
+
+        Catalog and all-round status reads call this before advertising Round 4
+        or Round 6. The probe is read-only and cached so the polling fight card
+        cannot turn into a SQL warehouse keepalive. Concurrent browser polls join
+        the same task rather than issuing duplicate Statement Execution calls.
+        """
+
+        if self._closed or self._delta_storage_probe is None:
+            return
+        running = self._delta_storage_probe_task
+        if running is not None and not running.done():
+            await asyncio.shield(running)
+            return
+        now = time.monotonic_ns()
+        last = self._delta_storage_probe_finished_ns
+        if (
+            not force
+            and last is not None
+            and now - last < self._delta_storage_probe_interval_ns
+        ):
+            return
+        task = asyncio.create_task(
+            self._probe_delta_storage(),
+            name="round4-round6-storage-readiness",
+        )
+        self._delta_storage_probe_task = task
+        try:
+            await asyncio.shield(task)
+        finally:
+            if task.done() and self._delta_storage_probe_task is task:
+                self._delta_storage_probe_task = None
+
+    async def _probe_delta_storage(self) -> None:
+        try:
+            probe = self._delta_storage_probe
+            if probe is None:
+                return
+            await probe()
+        except asyncio.CancelledError:
+            raise
+        except DeltaStorageAccessDeniedError as exc:
+            diagnosis = operator_diagnosis(exc)
+            refusal = storage_refusal(diagnosis)
+            self._storage_refusals[RoundId.PUT_MODEL_SCORE_IN_APP] = refusal
+            self._storage_refusals[RoundId.ANALYZE_LIVE_ORDERS] = refusal
+            logger.error(
+                "Shared Delta storage readiness was refused; Rounds 4 and 6 are "
+                "disabled before Prepare. diagnosis=%s provider_category=%s "
+                "error_code=%s sqlstate=%s",
+                diagnosis,
+                exc.provider_category,
+                exc.error_code,
+                exc.sql_state or "unreported",
+                exc_info=True,
+            )
+        except RoundStorageReadinessError as exc:
+            diagnosis = operator_diagnosis(exc)
+            self._storage_refusals[exc.round_id] = missing_delta_refusal(diagnosis)
+            logger.error(
+                "Round %d Delta storage path is missing and has no safe runtime repair. "
+                "diagnosis=%s",
+                4 if exc.round_id == RoundId.PUT_MODEL_SCORE_IN_APP else 6,
+                diagnosis,
+                exc_info=True,
+            )
+        except Exception as exc:
+            # An inconclusive readiness read must not clear a prior denial or
+            # manufacture a new one. The exact arm preflight still fails closed.
+            logger.warning(
+                "Shared Delta storage readiness could not be refreshed: %s",
+                operator_diagnosis(exc),
+                exc_info=True,
+            )
+        else:
+            self._storage_refusals.pop(RoundId.PUT_MODEL_SCORE_IN_APP, None)
+            self._storage_refusals.pop(RoundId.ANALYZE_LIVE_ORDERS, None)
+        finally:
+            self._delta_storage_probe_finished_ns = time.monotonic_ns()
 
     def _standing_cost_disclosure(
         self,
@@ -1236,6 +1398,15 @@ class RunManager:
             if self._closed:
                 return
             self._closed = True
+            storage_probe = self._delta_storage_probe_task
+            if (
+                storage_probe is not None
+                and storage_probe is not asyncio.current_task()
+                and not storage_probe.done()
+            ):
+                storage_probe.cancel()
+                await asyncio.gather(storage_probe, return_exceptions=True)
+            self._delta_storage_probe_task = None
             async with self._records_lock:
                 records = tuple(self._records.values())
 
@@ -1905,6 +2076,13 @@ class RunManager:
                     started_at=cost_started_at,
                 )
             except Exception as exc:
+                logger.error(
+                    "Bout cost window open failed session=%s round=%s diagnosis=%s",
+                    record.snapshot.id,
+                    record.snapshot.round.id.value,
+                    operator_diagnosis(exc),
+                    exc_info=True,
+                )
                 if is_connection_spike:
                     await self._release_round5_lease(record)
                 await self._release_bout(record)
@@ -2007,6 +2185,13 @@ class RunManager:
                     started_at=started_at,
                 )
             except Exception as exc:
+                logger.error(
+                    "Redo cost window open failed session=%s round=%s diagnosis=%s",
+                    record.snapshot.id,
+                    record.snapshot.round.id.value,
+                    operator_diagnosis(exc),
+                    exc_info=True,
+                )
                 await self._release_bout(record)
                 raise InvalidStateError(
                     cost_window_refusal(
@@ -3078,6 +3263,12 @@ class RunManager:
         # is a false green, and false green is the direction that costs an
         # evening.
         self._grant_refusals.pop(record.snapshot.round.id, None)
+        if record.snapshot.round.id in {
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            RoundId.ANALYZE_LIVE_ORDERS,
+        }:
+            self._storage_refusals.pop(RoundId.PUT_MODEL_SCORE_IN_APP, None)
+            self._storage_refusals.pop(RoundId.ANALYZE_LIVE_ORDERS, None)
 
     def _cancel_lease_heartbeat(
         self,
@@ -4108,7 +4299,8 @@ class RunManager:
         before this one: a curated subset is exactly what lets a second gate
         stay hidden.
 
-        * The chain reaches the operator, readably, on the failure banner.
+        * The chain reaches the operator log and cached operator refusal.
+        * The failure banner gets fixed audience-safe wording.
         * The chain reaches the log, with a traceback, for the case where the
           readable form was cut short.
         * An authorization refusal is remembered, so `/api/catalog` stops
@@ -4119,18 +4311,30 @@ class RunManager:
         """
 
         message = arm_failure_message(summary, error)
+        statement_failure = statement_execution_failure(error)
         logger.error(
-            "Round %d arm failed session=%s round=%s diagnosis=%s",
+            "Round %d arm failed session=%s round=%s diagnosis=%s "
+            "provider_category=%s error_code=%s sqlstate=%s",
             round_number,
             record.snapshot.id,
             record.snapshot.round.id.value,
             operator_diagnosis(error),
+            statement_failure.provider_category if statement_failure is not None else "",
+            statement_failure.error_code if statement_failure is not None else "",
+            statement_failure.sql_state if statement_failure is not None else "",
             exc_info=True,
         )
         if authorization_refusal(error) is not None:
             self._grant_refusals[record.snapshot.round.id] = grant_refusal(
                 operator_diagnosis(error)
             )
+        if storage_access_refusal(error) is not None:
+            refusal = storage_refusal(operator_diagnosis(error))
+            # Both live Delta rounds share this installation's managed-storage
+            # bucket. A provider-level 403 against either one is evidence that
+            # the other must not be offered until a fresh arm proves access.
+            self._storage_refusals[RoundId.PUT_MODEL_SCORE_IN_APP] = refusal
+            self._storage_refusals[RoundId.ANALYZE_LIVE_ORDERS] = refusal
         return message
 
     async def _fail_arm(
@@ -4190,12 +4394,17 @@ class RunManager:
         only ever reaches the log.
         """
 
+        statement_failure = statement_execution_failure(error)
         logger.error(
-            "Round %d bout failed session=%s round=%s diagnosis=%s",
+            "Round %d bout failed session=%s round=%s diagnosis=%s "
+            "provider_category=%s error_code=%s sqlstate=%s",
             round_number,
             record.snapshot.id,
             record.snapshot.round.id.value,
             operator_diagnosis(error),
+            statement_failure.provider_category if statement_failure is not None else "",
+            statement_failure.error_code if statement_failure is not None else "",
+            statement_failure.sql_state if statement_failure is not None else "",
             exc_info=True,
         )
 
@@ -4363,7 +4572,12 @@ class RunManager:
                 await asyncio.sleep(self._arm_poll)
             raise TargetNotArmedError(last_status)
         except (TargetConfigurationError, TargetNotArmedError) as exc:
-            await self._fail(record, str(exc))
+            await self._fail_arm(
+                record,
+                "The start state could not be verified.",
+                exc,
+                round_number=1,
+            )
         except Exception as exc:
             await self._fail_arm(
                 record,
@@ -4421,7 +4635,12 @@ class RunManager:
                 },
             )
         except SafeChangeNotArmedError as exc:
-            await self._fail(record, str(exc))
+            await self._fail_arm(
+                record,
+                "The isolated-change start state could not be verified.",
+                exc,
+                round_number=2,
+            )
         except Exception as exc:
             await self._fail_arm(
                 record,
@@ -4491,7 +4710,12 @@ class RunManager:
                 },
             )
         except RecoveryNotArmedError as exc:
-            await self._fail(record, str(exc))
+            await self._fail_arm(
+                record,
+                "The recovery start state could not be verified.",
+                exc,
+                round_number=3,
+            )
         except Exception as exc:
             await self._fail_arm(
                 record,
@@ -4570,7 +4794,12 @@ class RunManager:
                 },
             )
         except ModelScoreError as exc:
-            await self._fail(record, str(exc))
+            await self._fail_arm(
+                record,
+                "The Managed Sync baseline could not be verified.",
+                exc,
+                round_number=4,
+            )
         except Exception as exc:
             await self._fail_arm(
                 record,
@@ -4712,7 +4941,12 @@ class RunManager:
                 {"state": SessionState.ARMED, "session": snapshot.model_dump(mode="json")},
             )
         except LiveOrdersError as exc:
-            await self._fail(record, str(exc))
+            await self._fail_arm(
+                record,
+                "The native CDF start state could not be verified.",
+                exc,
+                round_number=6,
+            )
         except Exception as exc:
             await self._fail_arm(
                 record,
@@ -6335,9 +6569,20 @@ class RunManager:
         except asyncio.CancelledError:
             raise
         except ModelScoreError as exc:
+            statement_failure = statement_execution_failure(exc)
+            if statement_failure is not None:
+                self._log_bout_refusal(record, exc, round_number=4)
             await self._await_model_score_terminal(
                 record,
-                self._finish_model_score_failure(record, str(exc)),
+                self._finish_model_score_failure(
+                    record,
+                    (
+                        "The live Managed Sync proof failed a backstage data check. "
+                        "The operator log has the provider diagnosis."
+                        if statement_failure is not None
+                        else str(exc)
+                    ),
+                ),
             )
             return
         except Exception as exc:
@@ -6515,9 +6760,20 @@ class RunManager:
         except asyncio.CancelledError:
             raise
         except ModelScoreError as exc:
+            statement_failure = statement_execution_failure(exc)
+            if statement_failure is not None:
+                self._log_bout_refusal(record, exc, round_number=4)
             await self._await_model_score_terminal(
                 record,
-                self._fail_model_score_redo(record, str(exc)),
+                self._fail_model_score_redo(
+                    record,
+                    (
+                        "The live Managed Sync re-do failed a backstage data check. "
+                        "The operator log has the provider diagnosis."
+                        if statement_failure is not None
+                        else str(exc)
+                    ),
+                ),
             )
             return
         except Exception as exc:
@@ -6789,9 +7045,11 @@ class RunManager:
                 (item for item in checks if isinstance(item, TargetNotArmedError)), None
             )
         if revalidation_error is not None:
+            self._log_bout_refusal(record, revalidation_error, round_number=1)
             await self._fail(
                 record,
-                f"Start state changed before the bell: {revalidation_error}",
+                "Start state changed before the bell; no timed transaction began. "
+                "The operator log has the diagnosis.",
             )
             return
         if not all(isinstance(item, dict) for item in checks):
@@ -6956,7 +7214,12 @@ class RunManager:
         except SafeChangeNotArmedError as exc:
             if record.snapshot.towel is not None:
                 return
-            await self._fail(record, str(exc))
+            self._log_bout_refusal(record, exc, round_number=2)
+            await self._fail(
+                record,
+                "The isolated-change start state changed before the proof. "
+                "The operator log has the diagnosis.",
+            )
             return
         except asyncio.CancelledError:
             raise
@@ -7064,7 +7327,12 @@ class RunManager:
         except RecoveryNotArmedError as exc:
             if stop_control is not None and stop_control.event.is_set():
                 return
-            await self._fail(record, str(exc))
+            self._log_bout_refusal(record, exc, round_number=3)
+            await self._fail(
+                record,
+                "The recovery start state changed before the proof. "
+                "The operator log has the diagnosis.",
+            )
             return
         except Exception as exc:
             if stop_control is not None and stop_control.event.is_set():
@@ -7803,19 +8071,25 @@ class RunManager:
                     != CooldownLaneState.CONFIRMED_ZERO
                 )
             ]
-            for task in asyncio.as_completed(tasks):
-                target, check, completed_at = await task
-                changed, snapshot = await self._apply_cooldown_observation(
-                    record,
-                    target.id,
-                    check,
-                    completed_at,
-                )
-                if changed:
-                    await record.event_log.publish(
-                        "cooldown_update",
-                        {"cooldown": snapshot.model_dump(mode="json")},
+            try:
+                for task in asyncio.as_completed(tasks):
+                    target, check, completed_at = await task
+                    changed, snapshot = await self._apply_cooldown_observation(
+                        record,
+                        target.id,
+                        check,
+                        completed_at,
                     )
+                    if changed:
+                        await record.event_log.publish(
+                            "cooldown_update",
+                            {"cooldown": snapshot.model_dump(mode="json")},
+                        )
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             async with record.lock:
                 cooldown = record.snapshot.cooldown

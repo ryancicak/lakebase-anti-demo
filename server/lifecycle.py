@@ -67,6 +67,7 @@ from .model_score_live import (
     SYNCED_TABLE_FAILED_STATES,
     SYNCED_TABLE_HEALTHY_STATES,
     latest_pipeline_update_state,
+    round4_source_repair_identity,
     synced_table_failure_is_a_stopped_pipeline,
 )
 from .models import RoundId
@@ -307,26 +308,13 @@ def _utc_tag(value: datetime) -> str:
 
 
 def _expiry_check(manifest: DemoManifest) -> Check:
-    """Report the TTL as advisory: loudly, but without failing the run.
+    """Report approaching/exceeded external expiry without replacing live checks."""
 
-    A passed TTL is worth saying on every doctor run, and the detail carries both
-    remedies so the line is actionable rather than just red. It is not a fault in
-    the environment, though: nothing reaps the tag, the resources are unaffected by
-    it, and making it blocking is what stopped `antidemo setup` from repairing an
-    otherwise healthy installation. The honest cost of this is recorded in README:
-    an abandoned install no longer announces itself through a failing check.
-    """
-    expiry_ok = manifest.expires_at > datetime.now(UTC)
+    warning = manifest.expiry_warning()
     return Check(
         "expiry",
-        expiry_ok,
-        manifest.expires_at.isoformat()
-        if expiry_ok
-        else (
-            f"{manifest.expires_at.isoformat()} HAS PASSED · nothing reaps this tag · "
-            "run 'antidemo renew --ttl-hours N' to move it forward or "
-            "'antidemo cleanup --yes' to stop the spend"
-        ),
+        warning is None,
+        manifest.expires_at.isoformat() if warning is None else warning,
         advisory=True,
     )
 
@@ -334,13 +322,11 @@ def _expiry_check(manifest: DemoManifest) -> Check:
 def _warn_if_expired(manifest: DemoManifest) -> None:
     """Report a passed TTL on a control path instead of refusing to run.
 
-    Every caller here is doing setup, repair, or reconciliation. An expired
-    `expires_at` is a wall-clock comparison against a value written once at
-    provision time and never advanced, so it cannot distinguish "abandoned" from
-    "in daily use"; refusing on it turned a stale timestamp into an outage and
-    left no recovery except teardown. The checks that follow each call site ask
-    the resources themselves. Cleanup paths deliberately never consulted expiry
-    and still do not.
+    Every caller here is doing setup, repair, or reconciliation. External account
+    automation may reap tagged AWS resources at the deadline, but the timestamp
+    alone cannot say which resources remain. Refusing solely on it turned a stale
+    timestamp into an outage; ignoring it concealed a real teardown signal. The
+    checks after each call site ask the resources themselves.
     """
     warning = manifest.expiry_warning()
     if warning is not None:
@@ -5043,6 +5029,197 @@ def _prepare_round4_source(manifest: DemoManifest, names: dict[str, str], wareho
     return _repair_round4_baseline(manifest, names, warehouse_id)
 
 
+def _ensure_round4_source_repair_job(
+    manifest: DemoManifest,
+    names: dict[str, str],
+    *,
+    setup_principal: str,
+    app_client_id: str,
+) -> str:
+    """Seal one fixed no-parameter owner job that can rebuild only the R4 source."""
+
+    profile = manifest.databricks.profile
+    job_name, notebook_path = round4_source_repair_identity(manifest)
+    folder = notebook_path.rsplit("/", 1)[0]
+    table = names["source_table"]
+    quoted_table = ".".join(
+        f"`{part.replace('`', '``')}`" for part in table.split(".")
+    )
+    source = f'''# Databricks notebook source
+# Fixed, no-parameter Round 4 source repair. Do not add widgets or runtime inputs.
+TABLE = {quoted_table!r}
+EXPECTED_OWNER = {setup_principal!r}
+EXPECTED_COLUMNS = [
+    ("entity_id", "string"),
+    ("score", "double"),
+    ("model_version", "string"),
+    ("proof_nonce", "string"),
+    ("updated_at", "timestamp"),
+]
+rows = spark.sql(f"DESCRIBE TABLE EXTENDED {{TABLE}}").collect()
+fields = {{str(row.col_name).strip(): str(row.data_type).strip() for row in rows if row.col_name}}
+actual_columns = []
+for row in rows:
+    name = str(row.col_name or "").strip()
+    if not name or name.startswith("#"):
+        break
+    actual_columns.append((name, str(row.data_type).lower()))
+if (
+    actual_columns != EXPECTED_COLUMNS
+    or fields.get("Owner") != EXPECTED_OWNER
+    or fields.get("Provider", "").lower() != "delta"
+    or fields.get("Type") != "MANAGED"
+):
+    raise RuntimeError(f"Refusing Round 4 repair: exact metadata contract changed for {{TABLE}}")
+source_missing = False
+try:
+    spark.sql(f"DESCRIBE HISTORY {{TABLE}} LIMIT 1").collect()
+except Exception as exc:
+    message = str(exc).upper()
+    if (
+        "DELTA_PATH_DOES_NOT_EXIST" not in message
+        and "DELTA_METADATA_ABSENT_EXISTING_CATALOG_TABLE" not in message
+    ):
+        raise
+    source_missing = True
+if source_missing:
+    spark.sql(f"""CREATE OR REPLACE TABLE {{TABLE}} (
+      entity_id STRING NOT NULL, score DOUBLE NOT NULL, model_version STRING NOT NULL,
+      proof_nonce STRING NOT NULL, updated_at TIMESTAMP NOT NULL
+    ) USING DELTA TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')""")
+    spark.sql(f"""INSERT INTO {{TABLE}} VALUES
+    ('customer-0001', 0.25D, 'risk-v0', 'round4-baseline', current_timestamp())""")
+    spark.sql(f"GRANT SELECT, MODIFY ON TABLE {{TABLE}} TO `{app_client_id}`")
+    check = spark.sql(
+        f"SELECT entity_id, score, model_version, proof_nonce FROM {{TABLE}}"
+    ).collect()
+    if (
+        len(check) != 1
+        or tuple(check[0]) != ('customer-0001', 0.25, 'risk-v0', 'round4-baseline')
+    ):
+        raise RuntimeError("Round 4 repair failed its exact baseline proof")
+    print("ROUND4_SOURCE_REPAIRED")
+else:
+    print("SOURCE_ALREADY_HEALTHY")
+'''
+    _databricks_api(profile, "post", "/api/2.0/workspace/mkdirs", body={"path": folder})
+    _databricks_api(
+        profile,
+        "post",
+        "/api/2.0/workspace/import",
+        body={
+            "path": notebook_path,
+            "format": "SOURCE",
+            "language": "PYTHON",
+            "overwrite": True,
+            "content": base64.b64encode(source.encode()).decode(),
+        },
+    )
+    settings = {
+        "name": job_name,
+        "run_as": {"service_principal_name": setup_principal},
+        "max_concurrent_runs": 1,
+        "timeout_seconds": 120,
+        "tasks": [
+            {
+                "task_key": "repair_exact_round4_source",
+                "timeout_seconds": 100,
+                "notebook_task": {"notebook_path": notebook_path, "source": "WORKSPACE"},
+                "environment_key": "default",
+            }
+        ],
+        "environments": [{"environment_key": "default", "spec": {"client": "1"}}],
+    }
+
+    def exact_job(job_id: str) -> Mapping[str, Any]:
+        job = _databricks_api(
+            profile,
+            "get",
+            f"/api/2.1/jobs/get?job_id={quote(job_id, safe='')}",
+        )
+        current_settings = job.get("settings")
+        if (
+            str(job.get("job_id") or "") != job_id
+            or job.get("creator_user_name") != setup_principal
+            or not isinstance(current_settings, Mapping)
+            or current_settings.get("name") != job_name
+        ):
+            raise RuntimeError(
+                "Round 4 source repair job ID, owner, or deterministic name changed"
+            )
+        return job
+
+    existing_id = str(getattr(manifest.round4, "source_repair_job_id", "") or "")
+    if existing_id and not existing_id.isdigit():
+        raise RuntimeError("Round 4 source repair job ID is not an integer")
+    if not existing_id:
+        listed = _databricks_api(
+            profile,
+            "get",
+            "/api/2.1/jobs/list"
+            f"?name={quote(job_name, safe='')}&limit=25",
+        )
+        jobs = listed.get("jobs")
+        matches = [
+            item
+            for item in jobs
+            if isinstance(item, Mapping)
+            and isinstance(item.get("settings"), Mapping)
+            and item["settings"].get("name") == job_name
+        ] if isinstance(jobs, list) else []
+        if len(matches) > 1:
+            raise RuntimeError(
+                "Round 4 source repair job name is not unique; refusing to adopt one"
+            )
+        if matches:
+            existing_id = str(matches[0].get("job_id") or "")
+            if not existing_id.isdigit():
+                raise RuntimeError(
+                    "Round 4 source repair job candidate has no integer job ID"
+                )
+            exact_job(existing_id)
+    if existing_id:
+        exact_job(existing_id)
+        _databricks_api(
+            profile,
+            "post",
+            "/api/2.1/jobs/reset",
+            body={"job_id": int(existing_id), "new_settings": settings},
+        )
+        job_id = existing_id
+    else:
+        created = _databricks_api(profile, "post", "/api/2.1/jobs/create", body=settings)
+        job_id = str(created.get("job_id") or "")
+    if not job_id.isdigit():
+        raise RuntimeError("Round 4 source repair job did not return an integer job ID")
+    _run(
+        [
+            "databricks",
+            "permissions",
+            "update",
+            "jobs",
+            job_id,
+            "--json",
+            json.dumps(
+                {
+                    "access_control_list": [
+                        {
+                            "service_principal_name": app_client_id,
+                            "permission_level": "CAN_MANAGE_RUN",
+                        }
+                    ]
+                }
+            ),
+            "-p",
+            profile,
+            "-o",
+            "json",
+        ],
+        capture=True,
+    )
+    return job_id
+
+
 ROUND4_BASELINE_ROW = ModelScoreRow(
     entity_id=ROUND4_BASELINE_ENTITY_ID,
     score=ROUND4_BASELINE_SCORE,
@@ -6505,6 +6682,12 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
             "so those rounds would be published as ready and then refused on a "
             "permission: " + "; ".join(measured_failures)
         )
+    source_repair_job_id = _ensure_round4_source_repair_job(
+        manifest,
+        names,
+        setup_principal=setup_principal,
+        app_client_id=app_client_id,
+    )
     contract = ModelScoreContract(
         pipeline_id=pipeline_id,
         source_table=names["source_table"],
@@ -6521,6 +6704,7 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
         synced_table_resource_name=resource_name,
         synced_table_uid=uid,
         pipeline_id=pipeline_id,
+        source_repair_job_id=source_repair_job_id,
         project_uid=project_uid,
         branch_uid=branch_uid,
         physical_database=ROUND4_DATABASE,
@@ -8035,11 +8219,10 @@ RENEW_JOURNAL_NAME = "renew.json"
 #
 # 72, not 24, because the TTL is measured from `created_at` and is never re-based:
 # the usable life of a 24-hour install is 24 hours minus however long provisioning
-# took, so it is already partway expired the first time anyone can use it. Nothing
-# reaps on the tag, so its only job is ownership attribution in a shared sandbox,
-# and a longer window costs nothing there. 72 hours covers a working session plus a
-# weekend while still expiring well before the schedule-driven account sweep, so the
-# tag keeps meaning something rather than becoming permanently stale.
+# took, so it is already partway expired the first time anyone can use it. External
+# account automation can reap AWS resources carrying the tag, so 72 hours leaves a
+# useful warning window after provisioning while still giving governance a finite
+# deadline. No local path auto-renews or treats the timestamp as proof of liveness.
 DEFAULT_TTL_HOURS = 72.0
 
 # The largest TTL either provision or renew will accept, unchanged.
@@ -9675,6 +9858,50 @@ def _delete_round4_resources(
         )
         _wait_round4_operation(manifest.databricks.profile, operation, timeout=700)
     _delete_round4_pipeline(manifest)
+    repair_job_id = str(getattr(manifest.round4, "source_repair_job_id", "") or "")
+    if repair_job_id:
+        if not repair_job_id.isdigit():
+            raise RuntimeError("Cleanup refused: Round 4 repair job ID is not an integer")
+        expected_job_name, _ = round4_source_repair_identity(manifest)
+        job = _databricks_api_optional(
+            manifest.databricks.profile,
+            f"/api/2.1/jobs/get?job_id={quote(repair_job_id, safe='')}",
+        )
+        if job is not None:
+            settings = job.get("settings")
+            if (
+                str(job.get("job_id") or "") != repair_job_id
+                or job.get("creator_user_name") != manifest.round4.setup_principal
+                or not isinstance(settings, Mapping)
+                or settings.get("name") != expected_job_name
+            ):
+                raise RuntimeError(
+                    "Cleanup refused: Round 4 repair job identity or owner changed"
+                )
+            _run(
+                [
+                    "databricks",
+                    "jobs",
+                    "delete",
+                    repair_job_id,
+                    "-p",
+                    manifest.databricks.profile,
+                ],
+                capture=True,
+            )
+        owner_key = str(manifest.installation_id or manifest.run_id)
+        _run(
+            [
+                "databricks",
+                "workspace",
+                "delete",
+                f"/Shared/lakebase-anti-demo/{owner_key}",
+                "--recursive",
+                "-p",
+                manifest.databricks.profile,
+            ],
+            capture=True,
+        )
     for key, schema_name in (
         ("online_schema", names["online_schema"]),
         ("storage_schema", names["storage_schema"]),

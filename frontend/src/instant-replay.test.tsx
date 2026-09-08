@@ -449,6 +449,9 @@ describe('InstantReplay', () => {
     expect(css).toMatch(
       /\.replay-primary-metric strong\[data-width="long"\]\s*\{[^}]*font-size:\s*clamp\(\s*18px\s*,\s*20cqi\s*,\s*28px\s*\)/,
     )
+    expect(css).toMatch(
+      /\.replay-primary-metric strong\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*normal/,
+    )
   })
 
   it('keeps calls hidden until the one evidence disclosure opens', () => {

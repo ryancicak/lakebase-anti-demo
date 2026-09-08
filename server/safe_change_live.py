@@ -10,7 +10,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 from urllib.parse import quote, urlencode
 
@@ -58,7 +58,7 @@ class ControlPlaneCommandError(SafeChangeControlPlaneError):
 
 
 class DataPlaneConnectionRefusedError(SafeChangeControlPlaneError):
-    """A data-plane connection was refused, named by SQLSTATE and not by DSN.
+    """A data-plane connection was refused without putting its DSN on the wire.
 
     psycopg spells a connect refusal as ``connection to server at "<host>"
     (<ip>), port <port> failed: FATAL: ... user "<role>"``. That sentence is the
@@ -68,19 +68,14 @@ class DataPlaneConnectionRefusedError(SafeChangeControlPlaneError):
     ``manager._message_is_ours_to_quote``. So the endpoint hostname, a routable
     address and the login role would reach a screen an audience may be watching.
 
-    The SQLSTATE is kept because it is the actionable half and the DSN is not:
-    ``28P01`` is a bad credential, ``3D000`` a missing database, ``08*`` a
-    transport fault worth retrying. Same trade ``lifecycle`` makes for the setup
-    connection and ``targets`` for the probe, both of which already answer a
-    non-retryable ``OperationalError`` with ``(SQLSTATE ...)`` and nothing else.
+    The SQLSTATE remains on the exception for operator diagnostics and retry
+    classification, but it is not interpolated into ``str(error)`` because lane
+    errors are serialized directly into the projected audience UI.
     """
 
     def __init__(self, label: str, sqlstate: str | None) -> None:
         self.sqlstate = sqlstate
-        super().__init__(
-            f"{label} data-plane connection was refused "
-            f"(SQLSTATE {sqlstate or 'unreported'})"
-        )
+        super().__init__(f"{label} data-plane connection was refused")
 
 
 @dataclass(frozen=True)
@@ -827,6 +822,7 @@ _AWS_REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+$")
 _AWS_ID = re.compile(r"^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _TAG_RUN_ID = "anti-demo-run-id"
 _TAG_OWNER = "owner"
+_TAG_EXPIRY = "expires-at"
 _TAG_SOURCE = "safe-change-source-id"
 _TAG_PROVIDER = "safe-change-provider"
 _TAG_MANAGED_BY = "managed-by"
@@ -1267,6 +1263,7 @@ class _AwsSafeChangeAdapter:
         return [
             {"Key": _TAG_RUN_ID, "Value": plan.scope.run_id},
             {"Key": _TAG_OWNER, "Value": plan.scope.owner},
+            {"Key": _TAG_EXPIRY, "Value": plan.scope.expires_at},
             {"Key": _TAG_SOURCE, "Value": plan.source_id},
             {"Key": _TAG_PROVIDER, "Value": plan.provider.value},
             {"Key": _TAG_MANAGED_BY, "Value": _SAFE_CHANGE_MANAGER},
@@ -1298,6 +1295,7 @@ class _AwsSafeChangeAdapter:
         marker_valid = (
             tags.get(_TAG_PROVIDER) == plan.provider.value
             and tags.get(_TAG_MANAGED_BY) == _SAFE_CHANGE_MANAGER
+            and tags.get(_TAG_EXPIRY) == plan.scope.expires_at
             and children_owned
         )
         return (
@@ -2538,6 +2536,7 @@ def build_safe_change_engine(
     scope = SafeChangeOwnershipScope(
         run_id=owned.run_id,
         owner=owned.owner,
+        expires_at=owned.expires_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         aws_account_id=account_id,
         aws_region=region,
     )

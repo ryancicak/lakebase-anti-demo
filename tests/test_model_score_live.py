@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -19,15 +20,166 @@ from server.model_score import (
     ModelScoreUpdate,
 )
 from server.model_score_live import (
+    DeltaPathDoesNotExistError,
+    DeltaStorageAccessDeniedError,
     LiveModelScoreAdapter,
     ModelScoreLiveConfig,
     ModelScoreLiveConfigurationError,
     ModelScoreLiveOperationError,
     SqlParameter,
+    WorkspaceStatementRunner,
 )
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
 _COMMITTED_AT = NOW - timedelta(seconds=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "java.nio.file.AccessDeniedException: S3 403 Forbidden",
+            DeltaStorageAccessDeniedError,
+        ),
+        (
+            "AmazonS3Exception: Access Denied while reading the managed Delta path",
+            DeltaStorageAccessDeniedError,
+        ),
+        (
+            "[DELTA_PATH_DOES_NOT_EXIST] s3://bucket/path does not exist",
+            DeltaPathDoesNotExistError,
+        ),
+        (
+            "[DELTA_METADATA_ABSENT_EXISTING_CATALOG_TABLE] "
+            "The catalog entry exists but Delta metadata is absent",
+            DeltaPathDoesNotExistError,
+        ),
+    ],
+)
+async def test_statement_runner_preserves_provider_failure_category(
+    message: str,
+    expected: type[Exception],
+) -> None:
+    response = SimpleNamespace(
+        status=SimpleNamespace(
+            state=model_score_live.StatementState.FAILED,
+            error=SimpleNamespace(error_code="BAD_REQUEST", message=message),
+            sql_state="42000",
+        )
+    )
+    workspace = SimpleNamespace(
+        statement_execution=SimpleNamespace(
+            execute_statement=lambda *args, **kwargs: response
+        )
+    )
+
+    with pytest.raises(expected) as caught:
+        await WorkspaceStatementRunner(workspace, "warehouse-1").execute("SELECT 1")
+
+    assert "BAD_REQUEST" in str(caught.value)
+    assert "SQLSTATE 42000" in str(caught.value)
+    assert "FAILED" not in str(caught.value)
+
+
+async def test_source_repair_can_only_run_the_sealed_job_without_parameters() -> None:
+    calls: list[tuple[str, str, object]] = []
+
+    class ApiClient:
+        def do(self, method, path, *, body=None):
+            calls.append((method, path, body))
+            if path == "/api/2.1/jobs/get?job_id=123":
+                return {
+                    "job_id": 123,
+                    "creator_user_name": "operator@databricks.com",
+                    "settings": {
+                        "name": "lakebase-anti-demo-owner-round4-source-repair",
+                        "run_as": {
+                            "service_principal_name": "operator@databricks.com",
+                        },
+                        "max_concurrent_runs": 1,
+                        "tasks": [
+                            {
+                                "task_key": "repair_exact_round4_source",
+                                "notebook_task": {
+                                    "notebook_path": (
+                                        "/Shared/lakebase-anti-demo/owner/"
+                                        "round4-source-repair"
+                                    ),
+                                    "source": "WORKSPACE",
+                                },
+                            }
+                        ],
+                    },
+                }
+            if method == "POST":
+                return {"run_id": 42}
+            return {
+                "state": {
+                    "life_cycle_state": "TERMINATED",
+                    "result_state": "SUCCESS",
+                }
+            }
+
+    adapter = LiveModelScoreAdapter(
+        replace(
+            live_config(),
+            source_repair_job_id="123",
+            source_repair_job_name="lakebase-anti-demo-owner-round4-source-repair",
+            source_repair_notebook_path=(
+                "/Shared/lakebase-anti-demo/owner/round4-source-repair"
+            ),
+        ),
+        workspace_client=SimpleNamespace(api_client=ApiClient()),
+        statement_runner=SimpleNamespace(),
+    )
+
+    await adapter._run_source_repair()
+
+    assert calls == [
+        ("GET", "/api/2.1/jobs/get?job_id=123", None),
+        ("POST", "/api/2.1/jobs/run-now", {"job_id": 123}),
+        ("GET", "/api/2.1/jobs/runs/get?run_id=42", None),
+    ]
+
+
+async def test_source_repair_refuses_a_retargeted_job_before_running_it() -> None:
+    calls: list[tuple[str, str, object]] = []
+
+    class ApiClient:
+        def do(self, method, path, *, body=None):
+            calls.append((method, path, body))
+            return {
+                "job_id": 123,
+                "creator_user_name": "someone-else@databricks.com",
+                "settings": {
+                    "name": "unrelated-job",
+                    "run_as": {"service_principal_name": "someone-else@databricks.com"},
+                    "max_concurrent_runs": 1,
+                    "tasks": [],
+                },
+            }
+
+    adapter = LiveModelScoreAdapter(
+        replace(
+            live_config(),
+            source_repair_job_id="123",
+            source_repair_job_name="lakebase-anti-demo-owner-round4-source-repair",
+            source_repair_notebook_path=(
+                "/Shared/lakebase-anti-demo/owner/round4-source-repair"
+            ),
+        ),
+        workspace_client=SimpleNamespace(api_client=ApiClient()),
+        statement_runner=SimpleNamespace(),
+    )
+
+    with pytest.raises(
+        ModelScoreLiveConfigurationError,
+        match="identity or no-parameter contract changed",
+    ):
+        await adapter._run_source_repair()
+
+    assert calls == [("GET", "/api/2.1/jobs/get?job_id=123", None)]
 
 
 def live_config() -> ModelScoreLiveConfig:
@@ -824,6 +976,7 @@ class FakePipelineApi:
     def __init__(self, running: bool = True) -> None:
         self.running = running
         self.calls: list[tuple[str, str]] = []
+        self.update_bodies: list[object] = []
 
     def __call__(self, profile, method, path, *, body=None, timeout=600):
         self.calls.append((method, path))
@@ -831,7 +984,7 @@ class FakePipelineApi:
             self.running = False
             return {}
         if method == "post" and path.endswith("/updates"):
-            assert body == {"full_refresh": False}, body
+            self.update_bodies.append(body)
             self.running = True
             return {"update_id": "update-1"}
         if "/pipelines/" in path:
@@ -893,9 +1046,99 @@ async def test_a_stopped_pipeline_is_started_without_a_full_refresh_and_waited_f
     await _activation(api).ensure_running(lambda status: _record(notices, status))
 
     assert ("post", "/api/2.0/pipelines/pipeline-1/updates") in api.calls
+    assert api.update_bodies == [{"full_refresh": False}]
     assert not any("synced_tables" in path for method, path in api.calls if method == "post")
     assert any("Starting it before the bell" in notice for notice in notices)
     assert any("pipeline is running" in notice for notice in notices)
+
+
+async def test_a_repaired_source_rebases_the_same_pipeline_once() -> None:
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    activation.require_full_refresh()
+
+    await activation.ensure_running(lambda status: _record([], status))
+
+    assert api.update_bodies == [{"full_refresh": True}]
+
+
+async def test_a_refused_rebase_keeps_full_refresh_latched_for_retry(monkeypatch) -> None:
+    api = FakePipelineApi(running=True)
+    activation = _activation(api)
+    activation.require_full_refresh()
+
+    def refused(*args, **kwargs):
+        assert kwargs["full_refresh"] is True
+        raise model_score_live.pipeline_power.PipelineUpdateConflictError(
+            "active update identity changed"
+        )
+
+    monkeypatch.setattr(model_score_live.pipeline_power, "start", refused)
+
+    with pytest.raises(
+        model_score_live.pipeline_power.PipelineUpdateConflictError,
+        match="identity changed",
+    ):
+        await activation.ensure_running(lambda status: _record([], status))
+
+    assert activation._full_refresh_required is True
+
+
+async def test_a_repaired_source_can_restart_after_an_older_failed_update() -> None:
+    """A stale failure is diagnosis, not proof that the next exact restart will fail."""
+
+    class RepairedAfterFailure(FakePipelineApi):
+        def __init__(self) -> None:
+            super().__init__(running=False)
+            self.requested = False
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if method == "post" and path.endswith("/updates"):
+                self.calls.append((method, path))
+                self.requested = True
+                self.running = True
+                return {"update_id": "new-update"}
+            if "/pipelines/" in path and not self.requested:
+                self.calls.append((method, path))
+                return {
+                    "state": "IDLE",
+                    "latest_updates": [{"state": "FAILED", "update_id": "old-update"}],
+                }
+            return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+    api = RepairedAfterFailure()
+    await _activation(api).ensure_running(lambda status: _record([], status))
+
+    assert ("post", "/api/2.0/pipelines/pipeline-1/updates") in api.calls
+
+
+async def test_the_newly_requested_failed_update_refuses_without_waiting_for_timeout() -> None:
+    """Only the update this arm requested may turn a prior failure into a fast refusal."""
+
+    class NewUpdateFails(FakePipelineApi):
+        def __init__(self) -> None:
+            super().__init__(running=False)
+            self.requested = False
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            self.calls.append((method, path))
+            if method == "post" and path.endswith("/updates"):
+                self.requested = True
+                return {"update_id": "new-update"}
+            if "/pipelines/" in path:
+                update_id = "new-update" if self.requested else "old-update"
+                return {
+                    "state": "IDLE",
+                    "latest_updates": [{"state": "FAILED", "update_id": update_id}],
+                }
+            return {
+                "data_synchronization_status": {
+                    "detailed_state": "SYNCED_TABLE_ONLINE_PIPELINE_FAILED"
+                }
+            }
+
+    with pytest.raises(ModelScoreLiveOperationError, match="will not wait for the timeout"):
+        await _activation(NewUpdateFails()).ensure_running(lambda status: _record([], status))
 
 
 async def test_a_pipeline_that_never_comes_back_refuses_the_arm_rather_than_hanging() -> None:

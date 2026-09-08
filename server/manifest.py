@@ -5,7 +5,7 @@ import ipaddress
 import json
 import os
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -49,6 +49,7 @@ LOCAL_OPERATOR_ENV_NAMES = (
 #: own validation -- because a floor that disagrees with itself across the
 #: Python/HCL boundary would be enforced by whichever side ran first.
 SERVERLESS_EGRESS_MIN_PREFIXLEN = 24
+EXPIRY_WARNING_WINDOW = timedelta(hours=24)
 
 # There is deliberately no default manifest path. A default pointed at
 # .anti-demo/manifest.json, which outlived the generation that wrote it: a bare
@@ -365,6 +366,7 @@ class Round4Resources(BaseModel):
     synced_table_resource_name: str = Field(min_length=1)
     synced_table_uid: str = Field(min_length=1)
     pipeline_id: str = Field(min_length=1)
+    source_repair_job_id: str = ""
     physical_database: str = Field(min_length=1)
     physical_schema: str = Field(min_length=1)
     physical_table: str = Field(min_length=1)
@@ -1150,27 +1152,33 @@ class DemoManifest(BaseModel):
     # at all, and the only thing keeping the method alive was tests asserting it
     # was *not* being called.
     #
-    # `expires_at` is an ownership label, not a lease: nothing reaps on it, and it
-    # is never re-based, so it cannot distinguish "abandoned" from "in daily use".
-    # `expiry_warning` below is the whole supported treatment -- it reports, and
-    # the caller carries on. `antidemo renew` moves the timestamp and the AWS tags
-    # that mirror it; `antidemo cleanup --yes` is what actually ends the spend.
-    def expiry_warning(self) -> str | None:
-        """Describe a passed TTL without deciding that anything must stop.
+    # `expires_at` is consumed by external account governance, not enforced by
+    # this process. It is never re-based automatically, so callers warn before
+    # the deadline and still ask each required resource for liveness. Turning the
+    # timestamp itself into a local gate recreated a partial outage; ignoring it
+    # claimed resources would survive an external reaper. Both are false.
+    def expiry_warning(self, *, now: datetime | None = None) -> str | None:
+        """Warn before external expiry without using the clock as a health check."""
 
-        An expired timestamp carries no information about whether the resources
-        are healthy: it is a wall-clock comparison against a value written once
-        at provision time.  Callers that need liveness ask the resources, not the
-        clock, so control paths warn with this text and continue.  `antidemo renew`
-        moves the timestamp forward; `antidemo cleanup --yes` is what ends the spend.
-        """
-        if self.expires_at > datetime.now(UTC):
+        observed = datetime.now(UTC) if now is None else now.astimezone(UTC)
+        remaining = self.expires_at.astimezone(UTC) - observed
+        if remaining > EXPIRY_WARNING_WINDOW:
             return None
+        if remaining.total_seconds() > 0:
+            hours = max(1, int((remaining.total_seconds() + 3599) // 3600))
+            return (
+                f"Demo AWS resources are tagged for external expiry at "
+                f"{self.expires_at.isoformat()} (about {hours}h remaining). Account "
+                "automation may reap tagged resources at or after that deadline: run "
+                "'antidemo renew --ttl-hours N' before it, or 'antidemo cleanup --yes' "
+                "to end the installation deliberately."
+            )
         return (
             f"Demo resources passed their declared expiry at {self.expires_at.isoformat()}. "
-            "Nothing reaps that tag, so this is an ownership signal only: run "
-            "'antidemo renew --ttl-hours N' to move it forward, or 'antidemo cleanup --yes' "
-            "to stop the spend."
+            "External account automation may already have reaped tagged AWS resources. "
+            "Run 'antidemo status' to inventory what remains; use "
+            "'antidemo renew --ttl-hours N' only for an intact installation, otherwise "
+            "run 'antidemo cleanup --yes' and provision fresh."
         )
 
 

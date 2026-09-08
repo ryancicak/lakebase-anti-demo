@@ -27,6 +27,7 @@ SHA = "a" * 64
 SCOPE = SafeChangeOwnershipScope(
     run_id="runtime-cost-123",
     owner="anti-demo",
+    expires_at="2030-01-01T00:00:00Z",
     aws_account_id="123456789012",
     aws_region="us-west-2",
 )

@@ -154,6 +154,7 @@ def scope() -> SafeChangeOwnershipScope:
     return SafeChangeOwnershipScope(
         run_id=RUN_ID,
         owner=OWNER,
+        expires_at="2030-01-01T00:00:00Z",
         aws_account_id=ACCOUNT,
         aws_region=REGION,
     )
@@ -846,6 +847,8 @@ async def test_aurora_creates_copy_on_write_clone_and_serverless_writer() -> Non
     assert restore["UseLatestRestorableTime"] is True
     assert restore["SourceDBClusterIdentifier"] == AURORA_SOURCE
     assert writer["DBInstanceClass"] == "db.serverless"
+    assert {"Key": "expires-at", "Value": aurora_plan.scope.expires_at} in restore["Tags"]
+    assert {"Key": "expires-at", "Value": aurora_plan.scope.expires_at} in writer["Tags"]
     assert connector.calls[-1]["host"] == (
         f"{aurora_plan.artifact_id}.cluster.us-west-2.rds.amazonaws.com"
     )
@@ -875,6 +878,7 @@ async def test_rds_creates_real_pitr_restore_and_uses_target_control_plane_host(
     assert evidence["capability"] == "native_pitr_restore"
     assert restore["UseLatestRestorableTime"] is True
     assert restore["SourceDBInstanceIdentifier"] == RDS_SOURCE
+    assert {"Key": "expires-at", "Value": rds_plan.scope.expires_at} in restore["Tags"]
     assert connector.calls[-1]["host"] == (
         f"{rds_plan.artifact_id}.rds.us-west-2.rds.amazonaws.com"
     )
@@ -895,6 +899,21 @@ async def test_aws_cleanup_revalidates_current_ownership_tags() -> None:
     for tag in session.rds.tags[target_arn]:
         if tag["Key"] == "owner":
             tag["Value"] = "someone-else@databricks.com"
+
+    with pytest.raises(UnsafeCleanupError, match="ownership mismatch"):
+        await adapter.delete_isolated(rds_plan, artifact, quiet_report)
+    assert rds_plan.artifact_id in session.rds.instances
+
+
+async def test_aws_cleanup_refuses_a_drifted_external_expiry_tag() -> None:
+    session = FakeAwsSession()
+    adapter = rds_adapter(session)
+    rds_plan = plan(SafeChangeProvider.RDS, RDS_SOURCE)
+    artifact = await adapter.create_isolated(rds_plan, quiet_report)
+    target_arn = str(artifact.metadata["instance_arn"])
+    for tag in session.rds.tags[target_arn]:
+        if tag["Key"] == "expires-at":
+            tag["Value"] = "2026-01-01T00:00:00Z"
 
     with pytest.raises(UnsafeCleanupError, match="ownership mismatch"):
         await adapter.delete_isolated(rds_plan, artifact, quiet_report)
@@ -1144,15 +1163,16 @@ async def test_aws_connection_retries_transient_endpoint_readiness() -> None:
     await connection.close()
 
 
-async def test_a_refused_connection_reaches_the_lane_named_by_sqlstate_not_by_dsn() -> None:
+async def test_a_refused_connection_keeps_sqlstate_off_the_audience_lane() -> None:
     """The other half of the same `except`: a refusal that will never improve.
 
     This is the one Round 2 path that puts a third-party exception message into
     `SafeChangeLaneResult.error`, and that field is quoted verbatim onto the SSE
     lane update, the bout record and the receipt without passing through
     `manager._message_is_ours_to_quote`. psycopg names the endpoint, a routable
-    address and the login role in a connect refusal, so what is asserted here is
-    that the SQLSTATE survives and the DSN does not.
+    address and the login role in a connect refusal, so the audience sentence
+    keeps none of those values. The SQLSTATE survives only as a structured
+    exception attribute for operator diagnostics.
 
     The host is assembled from fragments for the reason
     `test_no_live_identifiers_committed.test_the_guard_can_fail` gives: the
@@ -1184,9 +1204,12 @@ async def test_a_refused_connection_reaches_the_lane_named_by_sqlstate_not_by_ds
     # Refused on the first attempt: a bad credential is not a readiness problem.
     assert len(connector.calls) == 1
 
-    # What `_run_lane` turns into `SafeChangeLaneResult.error`, verbatim.
+    # What `_run_lane` turns into `SafeChangeLaneResult.error`, verbatim. The
+    # operator classifier can still read the structured attribute.
     lane_error = str(caught.value) or type(caught.value).__name__
-    assert "28P01" in lane_error, "the actionable half of the refusal was dropped"
+    assert caught.value.sqlstate == "28P01"
+    assert "28P01" not in lane_error
+    assert "SQLSTATE" not in lane_error
     assert host not in lane_error, (
         "the endpoint hostname reaches the screen, the bout record and the receipt"
     )

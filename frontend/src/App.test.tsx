@@ -1877,6 +1877,7 @@ describe('backstage setup', () => {
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
       if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input === '/api/sessions/session-1') return Promise.resolve(jsonResponse(session('running')))
       if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
       if (input.endsWith('/run')) return Promise.resolve(jsonResponse(session('running')))
       throw new Error(`Unexpected request: ${input}`)
@@ -2069,6 +2070,12 @@ describe('backstage setup', () => {
     expect(commentator).toHaveTextContent(
       /MISSED CALLS · 4 calls never reached this screen · The play-by-play picked up after them/i,
     )
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/sessions/session-1',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      )
+    })
 
     // A second hole adds to the first rather than replacing it: a long bout can
     // resume across the floor more than once, and the total is what was missed.
@@ -2126,6 +2133,47 @@ describe('backstage setup', () => {
 
     expect(await screen.findByText(/lakebase is still cooling/i)).toBeInTheDocument()
     expect(screen.getByText(/aurora auto-pauses after 5 idle minutes.*aws confirmation may add ~1–2 minutes.*bell not started/i)).toBeInTheDocument()
+  })
+
+  it('returns a failed preflight to the fight card with audience-safe wording', async () => {
+    const safeFailure = (
+      'The native CDF start state could not be verified. '
+      + 'Shared lakehouse storage is unavailable backstage. '
+      + 'Rounds 4 and 6 are off the card; no run started.'
+    )
+    const failed = { ...session('failed'), failure: safeFailure }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(session('draft')))
+      }
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('checking')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+
+    act(() => {
+      FakeEventSource.instances.at(-1)?.emit({
+        sequence: 3,
+        event: 'session_failed',
+        occurred_at: '2026-08-17T00:00:00Z',
+        payload: { state: 'failed', message: safeFailure, session: failed },
+      })
+    })
+
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(safeFailure)
+    expect(document.body).not.toHaveTextContent(/BAD_REQUEST|SQLSTATE|42000/)
+    expect(window.location.hash).toBe('#setup/card')
   })
 
   it('lets the ring owner leave a long Round 1 start-state check', async () => {

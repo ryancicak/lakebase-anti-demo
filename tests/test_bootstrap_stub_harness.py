@@ -344,7 +344,8 @@ def test_a_failed_provision_says_what_is_already_billing(tmp_path):
     that said so was printed before the confirmation -- half an hour and several
     thousand lines of Terraform output earlier, and skipped altogether under
     --yes. Left to `set -e`, the installer's last word was whatever Python
-    printed, and an operator who walked away from that has a fleet nothing reaps.
+    printed, and an operator who walked away could leave a partially provisioned
+    fleet until external expiry or deliberate cleanup.
 
     The block is lifted out of bootstrap.sh rather than restated, so this cannot
     pass against a copy of the code that no longer runs.
@@ -524,11 +525,16 @@ def test_apply_against_a_ready_install_refuses_before_writing_anything(tmp_path)
             f'{{"run_id": "{run_id}", "status": "ready"}}\n', encoding="utf-8"
         )
 
-    def run(*args):
+    def run(*args, extra_env: dict[str, str] | None = None):
+        environment = {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "HOME": str(home),
+            **(extra_env or {}),
+        }
         return subprocess.run(
             [shutil.which("bash") or "bash", str(tree / "bootstrap.sh"), *args],
             cwd=tree,
-            env={"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(home)},
+            env=environment,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -543,6 +549,18 @@ def test_apply_against_a_ready_install_refuses_before_writing_anything(tmp_path)
     # refusal that never needed one.
     assert "DATABRICKS_HOST" not in refused.stdout + refused.stderr, refused.stdout
     assert not (home / ".databrickscfg").exists(), "the refusal wrote a Databricks profile"
+
+    conflict = run(
+        "--apply",
+        "--new-generation",
+        extra_env={
+            "ANTI_DEMO_MANIFEST": str(tree / ".anti-demo-v10" / "manifest.json"),
+        },
+    )
+    assert conflict.returncode != 0
+    assert "--new-generation cannot be combined with ANTI_DEMO_MANIFEST" in (
+        conflict.stdout + conflict.stderr
+    )
 
     # The opt-in and the modes that are not a reset all have to get past it, or
     # the probe is an outage. Each then stops at the credential prompts, which is

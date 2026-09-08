@@ -175,11 +175,14 @@ def test_the_doctor_expiry_line_still_prints_but_no_longer_fails_the_run(capsys)
     expired = _expiry_check(expired_manifest())
     assert expired.ok is False
     assert expired.advisory is True
-    assert "HAS PASSED" in expired.detail
+    assert "passed their declared expiry" in expired.detail
+    assert "External account automation may already have reaped" in expired.detail
     assert "antidemo renew" in expired.detail
     assert "antidemo cleanup --yes" in expired.detail
 
-    live = _expiry_check(make_manifest())
+    live_manifest = make_manifest()
+    live_manifest.expires_at = datetime.now(UTC) + timedelta(hours=25)
+    live = _expiry_check(live_manifest)
     assert live.ok is True and live.advisory is True
 
     cli_module.print_checks([expired], False)
@@ -190,6 +193,24 @@ def test_the_doctor_expiry_line_still_prints_but_no_longer_fails_the_run(capsys)
 
     assert cli_module.checks_passed([expired]) is True
     assert cli_module.checks_passed([expired, Check("aws_identity", False, "nope")]) is False
+
+
+def test_expiry_warning_starts_before_external_reaping_and_uses_injected_utc() -> None:
+    manifest = make_manifest()
+    deadline = datetime(2030, 1, 2, 12, 0, tzinfo=UTC)
+    manifest.expires_at = deadline
+
+    assert manifest.expiry_warning(now=deadline - timedelta(hours=25)) is None
+    warning = manifest.expiry_warning(now=deadline - timedelta(hours=23, minutes=1))
+    assert warning is not None
+    assert "about 24h remaining" in warning
+    assert "Account automation may reap tagged resources" in warning
+    assert "before it" in warning
+
+    expired = manifest.expiry_warning(now=deadline + timedelta(seconds=1))
+    assert expired is not None
+    assert "may already have reaped tagged AWS resources" in expired
+    assert "only for an intact installation" in expired
 
 
 def test_setup_does_not_fail_on_an_advisory_doctor_finding(monkeypatch, tmp_path) -> None:

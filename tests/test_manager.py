@@ -12,6 +12,7 @@ import pytest
 from botocore.exceptions import ClientError
 from databricks.sdk.errors.platform import PermissionDenied
 
+from server import manager as manager_module
 from server import model_score_live
 from server.connection_spike import (
     ConnectionSpikeGates,
@@ -919,6 +920,7 @@ class FakeSafeChangeEngine:
         self.scope = SafeChangeOwnershipScope(
             run_id="ad-test-001",
             owner="operator@databricks.com",
+            expires_at="2030-01-01T00:00:00Z",
             aws_account_id="123456789012",
             aws_region="us-west-2",
         )
@@ -1788,7 +1790,7 @@ def test_round_five_diagnostic_keeps_aws_code_but_redacts_provider_message() -> 
     assert "should-not-be-logged" not in diagnostic
 
 
-def test_the_operator_diagnosis_keeps_databricks_words_and_still_drops_aws_ones() -> None:
+def test_operator_diagnosis_stays_detailed_while_the_audience_message_is_safe() -> None:
     """Both directions of the one boundary, because either alone is a defect.
 
     Drop everything and you get the 2026-08-23 incident: two `PermissionDenied`
@@ -1840,11 +1842,14 @@ def test_the_operator_diagnosis_keeps_databricks_words_and_still_drops_aws_ones(
     # A builtin's message is nobody's to quote, so the type stands alone.
     assert "arm_precondition_failed" not in diagnosis
 
-    # And the refusal is found through the wrapper rather than only at the head.
+    # The operator log retains the refusal through the wrapper rather than only
+    # at the head, while the projected failure banner does not expose its table.
     assert refusal is not None and str(refusal) == verbatim
     assert message.startswith("The Managed Sync baseline could not be verified. ")
     assert GRANT_REFUSAL_HEADLINE in message
-    assert verbatim in message
+    assert verbatim not in message
+    assert "example_catalog" not in message
+    assert "operator log" in message
     # Readable, not a traceback: one line, no frames, and bounded.
     assert "\n" not in message
     assert "Traceback" not in message
@@ -1871,6 +1876,7 @@ def test_a_diagnosis_that_runs_long_is_cut_rather_than_left_to_run_over() -> Non
     message = arm_failure_message("The native CDF start state could not be verified.", error)
     assert message.startswith("The native CDF start state could not be verified. ")
     assert GRANT_REFUSAL_HEADLINE in message
+    assert "xxx" not in message
 
 
 async def test_round_five_lease_loss_verifies_cleanup_and_forbids_comparison() -> None:
@@ -3485,9 +3491,10 @@ async def test_a_databricks_refusal_survives_the_arm_and_lifts_on_the_next_succe
     assert failed.failure.startswith("The Managed Sync baseline could not be verified. ")
     # Then who refused, that waiting will not help, and who can fix it.
     assert GRANT_REFUSAL_HEADLINE in failed.failure
-    # Then Databricks' own sentence, intact. This is the assertion the defect
-    # would have failed and an exception-type assertion would not.
-    assert verbatim in failed.failure
+    # Databricks' exact table and principal remain in the operator log and the
+    # cached operator detail, but never on the projected failure banner.
+    assert verbatim not in failed.failure
+    assert "operator log" in failed.failure
     # Readable on a screen an audience may see: one line, no frames.
     assert "\n" not in failed.failure
     assert "Traceback" not in failed.failure
@@ -3502,6 +3509,157 @@ async def test_a_databricks_refusal_survives_the_arm_and_lifts_on_the_next_succe
     await wait_for_state(manager, created.id, SessionState.ARMED)
 
     assert manager.grant_refusals == {}
+
+
+async def test_statement_provider_details_stay_in_logs_and_off_the_fight_card(
+    caplog,
+) -> None:
+    provider_message = (
+        "java.nio.file.AccessDeniedException: s3://private-bucket/physical/path "
+        "status code: 403"
+    )
+    denied = model_score_live.DeltaStorageAccessDeniedError(
+        state="FAILED",
+        error_code="BAD_REQUEST",
+        sql_state="42000",
+        provider_category="STORAGE_ACCESS_DENIED (403/AccessDenied)",
+        provider_message=provider_message,
+    )
+    engine = FakeModelScoreEngine()
+    engine.arm_error = denied
+    manager = RunManager(model_score_factory=lambda: engine)
+    created = await manager.create(round_four_request())
+
+    with caplog.at_level(logging.ERROR, logger="server.manager"):
+        await manager.start_arm(created.id)
+        failed = await wait_for_state(manager, created.id, SessionState.FAILED)
+
+    assert failed.failure is not None
+    assert "Shared lakehouse storage is unavailable backstage" in failed.failure
+    for technical in ("BAD_REQUEST", "SQLSTATE", "42000", "s3://", "AccessDenied"):
+        assert technical not in failed.failure
+    assert provider_message not in caplog.text
+    assert "provider_category=STORAGE_ACCESS_DENIED (403/AccessDenied)" in caplog.text
+    assert "error_code=BAD_REQUEST" in caplog.text
+    assert set(manager.storage_refusals) == {
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
+
+
+async def test_catalog_storage_probe_is_cached_single_flight_and_recovers() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+    denied = True
+
+    class Adapter:
+        async def probe_source_storage(self) -> None:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            if denied:
+                raise model_score_live.DeltaStorageAccessDeniedError(
+                    state="FAILED",
+                    error_code="BAD_REQUEST",
+                    sql_state="42000",
+                    provider_category="STORAGE_ACCESS_DENIED (403/AccessDenied)",
+                    provider_message="S3 403 Forbidden",
+                )
+
+    adapter = Adapter()
+    manager = RunManager(
+        delta_storage_probe=adapter.probe_source_storage,
+        delta_storage_probe_interval_seconds=60,
+    )
+    first = asyncio.create_task(manager.refresh_delta_storage_readiness())
+    await entered.wait()
+    second = asyncio.create_task(manager.refresh_delta_storage_readiness())
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert calls == 1
+    assert set(manager.storage_refusals) == {
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
+
+    # The ordinary cached read makes no second provider call and cannot
+    # accidentally clear the refusal from absence of new evidence.
+    await manager.refresh_delta_storage_readiness()
+    assert calls == 1
+    assert manager.storage_refusals
+
+    denied = False
+    release.clear()
+    release.set()
+    await manager.refresh_delta_storage_readiness(force=True)
+    assert calls == 2
+    assert manager.storage_refusals == {}
+
+
+async def test_missing_round6_delta_history_disables_only_round_six() -> None:
+    async def missing_history() -> None:
+        raise manager_module.RoundStorageReadinessError(
+            RoundId.ANALYZE_LIVE_ORDERS,
+            "The sealed native CDF Delta history path is missing",
+        )
+
+    manager = RunManager(
+        delta_storage_probe=missing_history,
+        delta_storage_probe_interval_seconds=0,
+    )
+
+    await manager.refresh_delta_storage_readiness()
+
+    assert set(manager.storage_refusals) == {RoundId.ANALYZE_LIVE_ORDERS}
+    assert "missing" in manager.storage_refusals[RoundId.ANALYZE_LIVE_ORDERS].lower()
+
+
+async def test_cancelling_cooldown_drains_its_inflight_observation_tasks() -> None:
+    manager = RunManager()
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.WAKE_IDLE_APP,
+        )
+    )
+    record = manager._records[created.id]
+    record.snapshot.cooldown = manager._new_cooldown(
+        record,
+        ResetMode.RETURN_TO_IDLE,
+    )
+    entered = {"lakebase": asyncio.Event(), "competitor": asyncio.Event()}
+    cancelled = {"lakebase": asyncio.Event(), "competitor": asyncio.Event()}
+    release = asyncio.Event()
+
+    def target(lane_id: str):
+        async def assert_armed(**kwargs):
+            del kwargs
+            entered[lane_id].set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled[lane_id].set()
+                raise
+            return {"state": "IDLE"}
+
+        return SimpleNamespace(id=lane_id, name=lane_id, assert_armed=assert_armed)
+
+    record.live_targets = (target("lakebase"), target("competitor"))
+    operation = asyncio.create_task(manager._monitor_cooldown(record))
+    await asyncio.gather(*(event.wait() for event in entered.values()))
+    operation.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+        await asyncio.sleep(0)
+        assert all(event.is_set() for event in cancelled.values())
+    finally:
+        release.set()
 
 
 @pytest.mark.parametrize("first_outcome", ["false", "exception"])
@@ -5948,7 +6106,10 @@ async def test_unexpected_arm_exception_fails_immediately_instead_of_polling() -
     await manager.start_arm(created.id)
     failed = await wait_for_state(manager, created.id, SessionState.FAILED)
 
-    assert failed.failure == "The start state could not be verified. Diagnosis: RuntimeError"
+    assert failed.failure == (
+        "The start state could not be verified. A backstage check failed; "
+        "no run started. The operator log has the diagnosis."
+    )
     assert manager.grant_refusals == {}
     assert resolver.broken.arm_calls == 1
     assert resolver.waiting.arm_calls == 1
@@ -6444,8 +6605,8 @@ async def cost_window_session(manager: RunManager):
     )
 
 
-# B1 · the bell's refusal must name the grant that caused it, not cost sealing.
-async def test_a_refused_ledger_write_reaches_the_bell_as_a_grant_and_a_sqlstate() -> None:
+# B1 · the bell's refusal must name the class of remedy without exposing internals.
+async def test_a_refused_ledger_write_reaches_the_bell_as_an_audience_safe_grant() -> None:
     """The 409 an audience reads has to point at what actually refused.
 
     Every way of failing to open a cost window used to arrive as one sentence
@@ -6477,7 +6638,8 @@ async def test_a_refused_ledger_write_reaches_the_bell_as_a_grant_and_a_sqlstate
     detail = str(refused.value)
     assert ledger.open_calls == 1
     assert COST_LEDGER_GRANT_HEADLINE in detail
-    assert "SQLSTATE 42501" in detail
+    assert "SQLSTATE" not in detail
+    assert "42501" not in detail
     # The remedy is a GRANT, and the sentence says so rather than sending the
     # reader at IAM or at the manifest seal.
     assert "A LAKEBASE GRANT, NOT AWS IAM" in detail
@@ -6492,10 +6654,12 @@ async def test_a_refused_ledger_write_reaches_the_bell_as_a_grant_and_a_sqlstate
     assert await manager._lease_store.current() is None
 
     # The other direction of the same boundary: our own precondition failures
-    # are ours to quote, and used to be replaced wholesale by the fixed string.
+    # are still diagnosed in the operator log, but the projected banner keeps
+    # the same bounded backstage wording.
     ours = InvalidStateError("The original cost receipt is unavailable")
     mine = cost_window_refusal("The bout cost window could not be opened.", ours)
-    assert "The original cost receipt is unavailable" in mine
+    assert "The original cost receipt is unavailable" not in mine
+    assert "operator log" in mine
     assert COST_LEDGER_GRANT_HEADLINE not in mine
 
 

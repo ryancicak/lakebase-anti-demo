@@ -1,9 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   LEGACY_SCORECARD_STORAGE_KEY,
   SCORECARD_STORAGE_KEY,
   loadScorecard,
   parseScorecardStorage,
+  saveScorecard,
   type ScorecardEntry,
 } from './scorecard-storage'
 
@@ -54,5 +55,13 @@ describe('scorecard storage schema', () => {
     ]))
     expect(loadScorecard()).toEqual([])
     expect(window.localStorage.getItem(SCORECARD_STORAGE_KEY)).toBeNull()
+  })
+
+  it('does not crash the application when browser storage rejects a write', () => {
+    vi.spyOn(window.localStorage, 'setItem').mockImplementation(() => {
+      throw new DOMException('Quota exceeded', 'QuotaExceededError')
+    })
+
+    expect(() => saveScorecard([validEntry])).not.toThrow()
   })
 })

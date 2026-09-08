@@ -206,17 +206,27 @@ class LiveOrdersEngine:
         self._settling_orders: set[LiveOrder] = set()
 
     async def arm(self, on_progress: ProgressCallback | None = None) -> LiveOrdersArm:
-        await self._emit(on_progress, LiveOrdersPhase.PREFLIGHT, "Checking native CDF")
-        feed = await self._bounded(self.adapter.inspect_feed(), "CDF preflight")
-        self._require_streaming(feed, LiveOrdersNotArmedError)
-        source = await self._bounded(
-            self.adapter.read_checkout(self.contract.baseline.order_id),
-            "checkout baseline read",
+        # Delta is the shared external dependency for Rounds 4 and 6. Read it
+        # first so a provider 403 is reported before any longer or mutating arm
+        # work, and before a generic native-CDF message can hide the real fault.
+        await self._emit(
+            on_progress,
+            LiveOrdersPhase.PREFLIGHT,
+            "Checking Delta history storage",
         )
         history = await self._bounded(
             self.adapter.read_history(self.contract.baseline),
-            "CDF baseline read",
+            "Delta history storage preflight",
         )
+        await self._emit(on_progress, LiveOrdersPhase.PREFLIGHT, "Checking native CDF")
+        feed, source = await asyncio.gather(
+            self._bounded(self.adapter.inspect_feed(), "CDF preflight"),
+            self._bounded(
+                self.adapter.read_checkout(self.contract.baseline.order_id),
+                "checkout baseline read",
+            ),
+        )
+        self._require_streaming(feed, LiveOrdersNotArmedError)
         if source != self.contract.baseline:
             raise LiveOrdersNotArmedError("The exact checkout baseline is not present")
         if (

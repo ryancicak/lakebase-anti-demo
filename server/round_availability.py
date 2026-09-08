@@ -181,6 +181,11 @@ _GRANT_HEADLINE = (
     "reads, and only a workspace admin can grant it."
 )
 
+_STORAGE_HEADLINE = (
+    f"{NOT_ON_THE_CARD} This round's lakehouse storage is unavailable backstage. "
+    "It stays off the card; the other available rounds are unaffected."
+)
+
 _ROUND5_RING_HEADLINE = (
     f"{NOT_ON_THE_CARD} Round 5's own backstage cleanup has not finished. The "
     "other rounds are unaffected."
@@ -249,6 +254,12 @@ GRANT_REFUSAL_HEADLINE = (
     "round reads, and only a workspace admin can grant it."
 )
 
+STORAGE_REFUSAL_HEADLINE = (
+    "SHARED DELTA STORAGE REFUSED THIS ROUND, AND THIS IS NOT A FAULT TO WAIT "
+    "OUT. The cloud provider returned 403/AccessDenied; no table will be "
+    "recreated while storage authorization is unresolved."
+)
+
 
 def grant_refusal(diagnosis: str) -> str:
     """The round-select screen's sentence for a round Databricks has refused.
@@ -263,6 +274,28 @@ def grant_refusal(diagnosis: str) -> str:
         f"THIS ROUND CANNOT ARM: {GRANT_REFUSAL_HEADLINE} It was refused the last "
         "time it was armed in this process, and it will be offered again as soon "
         f"as an arm succeeds. Databricks said: {diagnosis}"
+    )
+
+
+def storage_refusal(diagnosis: str) -> str:
+    """Operator detail retained after a Round 4/6 storage-denied arm."""
+
+    return (
+        f"THIS ROUND CANNOT ARM: {STORAGE_REFUSAL_HEADLINE} It will be offered "
+        "again after the cached read-only readiness probe proves both sealed "
+        "Delta paths readable. "
+        f"Diagnosis: {diagnosis}"
+    )
+
+
+def missing_delta_refusal(diagnosis: str) -> str:
+    """Operator detail for one sealed Delta path that no safe runtime repair owns."""
+
+    return (
+        "THIS ROUND CANNOT ARM: its sealed Delta history path is missing and this "
+        "runtime has no exact owner-scoped repair for it. No broader table or storage "
+        "repair was attempted. "
+        f"Diagnosis: {diagnosis}"
     )
 
 
@@ -321,6 +354,7 @@ class AvailabilitySignals:
     #: cleared by that round's next successful arm. Empty is the honest default
     #: and the ordinary one: nothing has been refused yet.
     grant_refusals: Mapping[RoundId, str] = field(default_factory=dict)
+    storage_refusals: Mapping[RoundId, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -440,6 +474,10 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
         if not signals.deployed_aws_path_sealed:
             return RoundRefusal(_AWS_LANE_DEPLOYED_HEADLINE, AWS_LANE_DEPLOYED_REFUSAL)
 
+    storage_refused = signals.storage_refusals.get(round_id)
+    if storage_refused:
+        return RoundRefusal(_STORAGE_HEADLINE, storage_refused)
+
     grant_refused = signals.grant_refusals.get(round_id)
     if grant_refused:
         # Below the two structural refusals and above every inferred one, and the
@@ -555,12 +593,15 @@ __all__ = [
     "AWS_BACKED_ROUNDS",
     "AWS_LANE_DEPLOYED_REFUSAL",
     "GRANT_REFUSAL_HEADLINE",
+    "STORAGE_REFUSAL_HEADLINE",
     "NOT_ON_THE_CARD",
     "ROUND5_DEPLOYED_REFUSAL",
     "AvailabilitySignals",
     "RoundRefusal",
     "apply",
     "grant_refusal",
+    "missing_delta_refusal",
+    "storage_refusal",
     "refusal",
     "resolve",
     "unavailable_round_ids",

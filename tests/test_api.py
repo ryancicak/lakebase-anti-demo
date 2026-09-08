@@ -17,7 +17,7 @@ from starlette.requests import Request
 import app as app_module
 from app import app
 from server import api as api_module
-from server import generation_lock, lifecycle, round_availability
+from server import generation_lock, lifecycle, model_score_live, round_availability
 from server.api import RecoveryRequest, operator_from_request, router
 from server.aws_auth import APP_AWS_BINDINGS, AwsAuthConfigurationError
 from server.aws_credential_probe import CredentialVerdict
@@ -29,7 +29,12 @@ from server.coordination import (
     InMemoryBoutLeaseStore,
     round_ring_key,
 )
-from server.manager import InvalidStateError, RunManager, SessionNotFoundError
+from server.manager import (
+    InvalidStateError,
+    RoundStorageReadinessError,
+    RunManager,
+    SessionNotFoundError,
+)
 from server.models import (
     Availability,
     BoutOperator,
@@ -704,13 +709,13 @@ async def test_the_catalog_stops_offering_a_round_databricks_has_already_refused
     assert "put_model_score_in_app" in ready_before
     assert "analyze_live_orders_without_slowing_checkout" in ready_before
 
-    # What an operator now reads when the arm is refused. Databricks' own words,
-    # naming the table, the principal and the permission, on the API rather than
-    # in a container log behind a WebSocket.
-    assert round_four_refusal in failures[RoundId.PUT_MODEL_SCORE_IN_APP]
-    assert round_six_refusal in failures[RoundId.ANALYZE_LIVE_ORDERS]
+    # The projected arm failure is audience-safe. Exact provider identifiers
+    # remain in the operator log and the catalog's operator-only reason.
+    assert round_four_refusal not in failures[RoundId.PUT_MODEL_SCORE_IN_APP]
+    assert round_six_refusal not in failures[RoundId.ANALYZE_LIVE_ORDERS]
     for failure in failures.values():
         assert round_availability.GRANT_REFUSAL_HEADLINE in failure
+        assert "operator log" in failure
         # Readable, not a traceback. This text reaches a screen an audience sees.
         assert "\n" not in failure and "Traceback" not in failure
 
@@ -1439,6 +1444,16 @@ def test_every_branch_that_refuses_a_round_also_writes_one_for_the_room() -> Non
                 }
             ),
         ),
+        "shared delta storage": (
+            RoundId.ANALYZE_LIVE_ORDERS,
+            signals(
+                storage_refusals={
+                    RoundId.ANALYZE_LIVE_ORDERS: round_availability.storage_refusal(
+                        "STORAGE_ACCESS_DENIED (403/AccessDenied)"
+                    )
+                }
+            ),
+        ),
         "round 5 principal": (
             round_five,
             signals(credentials=_Verdict("principal_mismatch")),
@@ -1459,6 +1474,218 @@ def test_every_branch_that_refuses_a_round_also_writes_one_for_the_room() -> Non
         assert refusal.headline.startswith(round_availability.NOT_ON_THE_CARD), name
         assert refusal.headline != refusal.detail, name
         assert refusal.detail, name
+
+
+def test_shared_delta_storage_refusal_only_removes_rounds_four_and_six() -> None:
+    rounds = sealed_catalog(
+        model_score_available=True,
+        connection_spike_available=True,
+        live_orders_available=True,
+    ).rounds
+    diagnosis = round_availability.storage_refusal(
+        "Statement Execution failed: BAD_REQUEST · SQLSTATE 42000 · "
+        "STORAGE_ACCESS_DENIED (403/AccessDenied)"
+    )
+    resolved = round_availability.apply(
+        rounds,
+        round_availability.AvailabilitySignals(
+            storage_refusals={
+                RoundId.PUT_MODEL_SCORE_IN_APP: diagnosis,
+                RoundId.ANALYZE_LIVE_ORDERS: diagnosis,
+            }
+        ),
+    )
+    states = {item.id: item.availability for item in resolved}
+
+    assert states[RoundId.PUT_MODEL_SCORE_IN_APP] == Availability.UNAVAILABLE
+    assert states[RoundId.ANALYZE_LIVE_ORDERS] == Availability.UNAVAILABLE
+    assert all(
+        state == Availability.READY
+        for round_id, state in states.items()
+        if round_id
+        not in {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+    )
+
+
+def test_readiness_degrades_only_delta_capabilities_after_storage_refusal(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        app.state,
+        "run_manager",
+        SimpleNamespace(
+            storage_refusals={
+                RoundId.PUT_MODEL_SCORE_IN_APP: "STORAGE_ACCESS_DENIED",
+                RoundId.ANALYZE_LIVE_ORDERS: "STORAGE_ACCESS_DENIED",
+            }
+        ),
+        raising=False,
+    )
+    payload = {
+        "status": "ready",
+        "degraded": False,
+        "degraded_detail": None,
+        "degraded_capabilities": [],
+    }
+
+    app_module._apply_delta_storage_refusals(payload)
+
+    assert payload["status"] == "degraded"
+    assert payload["degraded"] is True
+    assert payload["degraded_capabilities"] == [
+        "Round 4 Managed Sync source Delta access",
+        "Round 6 native CDF destination Delta access",
+    ]
+    assert "THE OTHER AVAILABLE ROUNDS REMAIN USABLE" in payload["degraded_detail"]
+
+    app.state.run_manager.storage_refusals = {
+        RoundId.ANALYZE_LIVE_ORDERS: "DELTA_PATH_DOES_NOT_EXIST",
+    }
+    selective = {
+        "status": "ready",
+        "degraded": False,
+        "degraded_detail": None,
+        "degraded_capabilities": [],
+    }
+    app_module._apply_delta_storage_refusals(selective)
+    assert selective["degraded_capabilities"] == [
+        "Round 6 native CDF destination Delta access"
+    ]
+    assert "ROUND 6" in selective["degraded_detail"]
+    assert "ROUND 4 AND 6" not in selective["degraded_detail"]
+
+
+async def test_catalog_probes_shared_storage_before_offering_rounds_four_and_six(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)
+    monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
+    calls = 0
+
+    async def denied() -> None:
+        nonlocal calls
+        calls += 1
+        raise model_score_live.DeltaStorageAccessDeniedError(
+            state="FAILED",
+            error_code="BAD_REQUEST",
+            sql_state="42000",
+            provider_category="STORAGE_ACCESS_DENIED (403/AccessDenied)",
+            provider_message="S3 403 Forbidden",
+        )
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = RunManager(
+        model_score_factory=lambda: object(),
+        connection_spike_factory=lambda competitor: object(),
+        live_orders_factory=lambda: object(),
+        delta_storage_probe=denied,
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        response = await client.get("/api/catalog")
+        cached = await client.get("/api/catalog")
+
+    assert response.status_code == 200
+    assert cached.status_code == 200
+    assert calls == 1
+    by_id = {item["id"]: item for item in response.json()["rounds"]}
+    assert by_id[RoundId.PUT_MODEL_SCORE_IN_APP.value]["availability"] == "unavailable"
+    assert by_id[RoundId.ANALYZE_LIVE_ORDERS.value]["availability"] == "unavailable"
+    assert all(
+        item["availability"] == "ready"
+        for round_id, item in by_id.items()
+        if round_id
+        not in {
+            RoundId.PUT_MODEL_SCORE_IN_APP.value,
+            RoundId.ANALYZE_LIVE_ORDERS.value,
+        }
+    )
+
+
+async def test_catalog_storage_probe_reads_both_sealed_delta_paths(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class SourceAdapter:
+        async def probe_source_storage(self) -> None:
+            calls.append("round4")
+
+    class DestinationAdapter:
+        async def read_history(self, baseline) -> None:
+            assert baseline == "round6-baseline"
+            calls.append("round6")
+
+    monkeypatch.setattr(
+        app_module,
+        "model_score_factory_from_manifest",
+        lambda manifest=None: lambda: SimpleNamespace(adapter=SourceAdapter()),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "live_orders_factory_from_manifest",
+        lambda manifest=None: lambda: SimpleNamespace(
+            adapter=DestinationAdapter(),
+            contract=SimpleNamespace(baseline="round6-baseline"),
+        ),
+    )
+
+    probe = app_module.delta_storage_probe_from_manifest(SimpleNamespace())
+    assert probe is not None
+    await probe()
+
+    assert calls == ["round4", "round6"]
+
+
+async def test_storage_probe_attributes_unrepairable_round6_delta_absence(
+    monkeypatch,
+) -> None:
+    def missing(message: str) -> model_score_live.DeltaPathDoesNotExistError:
+        return model_score_live.DeltaPathDoesNotExistError(
+            state="FAILED",
+            error_code="BAD_REQUEST",
+            sql_state="42000",
+            provider_category="DELTA_PATH_DOES_NOT_EXIST",
+            provider_message=message,
+        )
+
+    history_calls = 0
+
+    class SourceAdapter:
+        config = SimpleNamespace(source_repair_job_id="123")
+
+        async def probe_source_storage(self) -> None:
+            raise missing("DELTA_PATH_DOES_NOT_EXIST")
+
+    class DestinationAdapter:
+        async def read_history(self, baseline) -> None:
+            nonlocal history_calls
+            del baseline
+            history_calls += 1
+            raise missing("DELTA_METADATA_ABSENT_EXISTING_CATALOG_TABLE")
+
+    monkeypatch.setattr(
+        app_module,
+        "model_score_factory_from_manifest",
+        lambda manifest=None: lambda: SimpleNamespace(adapter=SourceAdapter()),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "live_orders_factory_from_manifest",
+        lambda manifest=None: lambda: SimpleNamespace(
+            adapter=DestinationAdapter(),
+            contract=SimpleNamespace(baseline=object()),
+        ),
+    )
+
+    probe = app_module.delta_storage_probe_from_manifest(SimpleNamespace())
+    assert probe is not None
+    with pytest.raises(RoundStorageReadinessError) as caught:
+        await probe()
+
+    assert history_calls == 1
+    assert caught.value.round_id == RoundId.ANALYZE_LIVE_ORDERS
 
 
 def test_round_five_cleanup_is_machine_readable_without_reclassifying_failures() -> None:

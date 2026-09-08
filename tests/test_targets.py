@@ -1129,8 +1129,10 @@ async def test_permanent_postgres_error_is_fatal_and_not_retryable(
         ),
     )
 
-    with pytest.raises(FatalProbeError, match="SQLSTATE 42P01"):
+    with pytest.raises(FatalProbeError, match="PostgreSQL configuration failed") as caught:
         await target.attempt("nonce", "expected", 1)
+    assert caught.value.sqlstate == "42P01"
+    assert "SQLSTATE" not in str(caught.value)
 
 
 # --- Aurora ACU sampling ---------------------------------------------------

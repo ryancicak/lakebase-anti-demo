@@ -436,6 +436,42 @@ class ModelScoreEngine:
             )
 
     async def arm(self, on_progress: ProgressCallback | None = None) -> ModelScoreArm:
+        await self._emit(
+            on_progress,
+            ModelScorePhase.PREFLIGHT,
+            "Checking Delta source storage before pipeline start",
+        )
+        preflight = getattr(self.adapter, "preflight_source", None)
+        if callable(preflight):
+            async def report_preflight(detail: str) -> None:
+                await self._emit(on_progress, ModelScorePhase.PREFLIGHT, detail)
+
+            try:
+                source = await self._await_adapter_operation(
+                    preflight(self.contract.entity_id, on_progress=report_preflight),
+                    wall_clock_seconds=max(self.read_timeout_seconds, 150.0),
+                )
+            except TimeoutError as exc:
+                raise ModelScoreTimeoutError(
+                    "Delta source storage preflight exceeded its wall-clock bound"
+                ) from exc
+            if source != self.contract.baseline and not self._is_owned_prior_proof(source):
+                raise ModelScoreNotArmedError(
+                    "The Delta source is readable, but its row is neither the exact "
+                    "baseline nor a matching demo-owned Round 4 proof"
+                )
+            if bool(getattr(self.adapter, "source_repaired", False)):
+                require_full_refresh = getattr(self.activation, "require_full_refresh", None)
+                if not callable(require_full_refresh):
+                    raise ModelScoreNotArmedError(
+                        "The repaired Delta source has no sealed Managed Sync rebase path"
+                    )
+                require_full_refresh()
+                await self._emit(
+                    on_progress,
+                    ModelScorePhase.PREFLIGHT,
+                    "Rebasing the preserved Managed Sync pipeline onto the repaired source",
+                )
         await self._ensure_pipeline_running(on_progress)
         await self._emit(on_progress, ModelScorePhase.PREFLIGHT, "Inspecting Managed Sync")
         status = await self._inspect_sync()

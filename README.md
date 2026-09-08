@@ -131,10 +131,13 @@ AWS performance claim.
 
 ## Cost and safety
 
-Nothing here expires on its own. Three separate things bill, they stop at three
-different times, and only the first of them is a cost you pay simply for having
-this installed. Read the middle column before the number. These rates came from
-one installation in `us-west-2`:
+This project runs no expiry timer of its own. External account automation may
+reap AWS resources carrying the generated `expires-at` tag, potentially leaving
+a partial installation; Databricks resources are not covered by that tag.
+Deliberate cleanup is still the only path that verifies the whole installation
+is gone. Three separate things bill, they stop at three different times, and only
+the first is a cost you pay simply for having this installed. Read the middle
+column before the number. These rates came from one installation in `us-west-2`:
 
 | What bills | When it bills | Approximate rate |
 | --- | --- | ---: |

@@ -928,10 +928,12 @@ Terraform for nothing.
 ./antidemo cleanup --yes        # destroy manifest-owned resources
 ```
 
-The `expires-at` tag is an ownership label. Nothing reaps on it. The default TTL
-is 72 hours (`server/lifecycle.py:DEFAULT_TTL_HOURS`, and `ANTI_DEMO_TTL_HOURS`
-overrides it), a passed expiry is a `WARN` line rather than a failure, and
-`antidemo renew --ttl-hours N` moves it.
+The `expires-at` tag is consumed by external account cleanup automation. The
+default TTL is 72 hours (`server/lifecycle.py:DEFAULT_TTL_HOURS`, and
+`ANTI_DEMO_TTL_HOURS` overrides it). The app warns during the final 24 hours;
+the clock alone does not disable every round because only live checks can say
+which resources were reaped. Run `antidemo renew --ttl-hours N` before expiry,
+or clean up deliberately.
 
 That default describes a *new* provision only. The TTL is written once, at
 `created_at + ttl_hours`, and is never re-based, so an existing installation

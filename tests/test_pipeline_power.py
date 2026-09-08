@@ -24,6 +24,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from databricks.sdk.errors.platform import ResourceConflict
 from test_lifecycle import attach_round4, make_manifest
 
 from server import pipeline_power
@@ -49,7 +50,7 @@ def _recording_api(calls: list[tuple[str, str, dict | None]]):
     def api(profile, method, path, *, body=None, timeout=600):
         del profile, timeout
         calls.append((method, path, body))
-        return {}
+        return {"update_id": "update-recorded"} if path.endswith("/updates") else {}
 
     return api
 
@@ -112,6 +113,114 @@ def test_stop_and_start_address_only_the_sealed_pipeline(tmp_path) -> None:
     # processed. A full refresh would re-seed the destination and change what
     # Round 4 measures.
     assert calls[1][2] == {"full_refresh": False}
+
+
+@pytest.mark.parametrize("full_refresh", [False, True])
+def test_start_joins_the_exact_active_update_after_resource_conflict(
+    tmp_path,
+    full_refresh: bool,
+) -> None:
+    manifest = _manifest_with_round4()
+    pipeline_id = manifest.round4.pipeline_id
+    update_id = "active-update"
+    calls: list[tuple[str, str, dict | None]] = []
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        del profile, timeout
+        calls.append((method, path, body))
+        if method == "post":
+            raise ResourceConflict("An active update already exists")
+        if path == f"/api/2.0/pipelines/{pipeline_id}":
+            return {
+                "pipeline_id": pipeline_id,
+                "latest_updates": [{"update_id": update_id, "state": "INITIALIZING"}],
+            }
+        return {
+            "update": {
+                "pipeline_id": pipeline_id,
+                "update_id": update_id,
+                "state": "RUNNING",
+                "full_refresh": full_refresh,
+            }
+        }
+
+    result = start(
+        manifest,
+        api,
+        full_refresh=full_refresh,
+        marker_path=tmp_path / "power.json",
+    )
+
+    assert result.update_id == update_id
+    assert calls == [
+        (
+            "post",
+            f"/api/2.0/pipelines/{pipeline_id}/updates",
+            {"full_refresh": full_refresh},
+        ),
+        ("get", f"/api/2.0/pipelines/{pipeline_id}", None),
+        (
+            "get",
+            f"/api/2.0/pipelines/{pipeline_id}/updates/{update_id}",
+            None,
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda update: update.update(pipeline_id="some-other-pipeline"),
+        lambda update: update.update(update_id="some-other-update"),
+        lambda update: update.update(full_refresh=True),
+        lambda update: update.pop("full_refresh"),
+    ],
+)
+def test_start_refuses_to_join_a_conflicting_update_with_a_different_contract(
+    tmp_path,
+    mutate,
+) -> None:
+    manifest = _manifest_with_round4()
+    pipeline_id = manifest.round4.pipeline_id
+    update_id = "active-update"
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        del profile, body, timeout
+        if method == "post":
+            raise ResourceConflict("An active update already exists")
+        if path == f"/api/2.0/pipelines/{pipeline_id}":
+            return {
+                "pipeline_id": pipeline_id,
+                "latest_updates": [{"update_id": update_id, "state": "INITIALIZING"}],
+            }
+        update = {
+            "pipeline_id": pipeline_id,
+            "update_id": update_id,
+            "state": "RUNNING",
+            "full_refresh": False,
+        }
+        mutate(update)
+        return {"update": update}
+
+    with pytest.raises(
+        pipeline_power.PipelineUpdateConflictError,
+        match="differs|omitted",
+    ):
+        start(manifest, api, marker_path=tmp_path / "power.json")
+
+
+def test_start_refuses_an_unidentified_update_before_writing_resume_intent(tmp_path) -> None:
+    manifest = _manifest_with_round4()
+    marker = tmp_path / "power.json"
+
+    with pytest.raises(PipelinePowerError, match="returned no update identity"):
+        start(
+            manifest,
+            lambda profile, method, path, **kwargs: {},
+            marker_path=marker,
+        )
+
+    assert not marker.exists()
 
 
 def test_a_power_request_outside_the_sealed_pipeline_is_refused() -> None:
@@ -232,6 +341,48 @@ def test_doctor_can_tell_a_deliberate_stop_from_a_failure(tmp_path) -> None:
     assert broken.stopped_deliberately is False
     assert "failure rather than a choice" in broken.summary()
     assert "FAILED" in broken.summary()
+
+
+def test_failed_cloud_update_outranks_stale_deliberate_stop(tmp_path) -> None:
+    manifest = _manifest_with_round4()
+    marker = tmp_path / "stopped.json"
+    stop(manifest, _recording_api([]), marker_path=marker)
+
+    observed = power_state(
+        manifest,
+        lambda identifier: {
+            "state": "IDLE",
+            "latest_updates": [{"state": "FAILED"}],
+        },
+        marker_path=marker,
+    )
+
+    assert observed.stopped_deliberately is True
+    assert observed.failed is True
+    assert observed.update_state == "FAILED"
+    assert observed.summary().startswith("FAILED")
+    assert "STOPPED ON PURPOSE" not in observed.summary()
+    assert "local stop/start history does not override" in observed.summary()
+
+
+def test_unreadable_cloud_state_never_turns_a_stale_stop_marker_into_zero_cost(
+    tmp_path,
+) -> None:
+    manifest = _manifest_with_round4()
+    marker = tmp_path / "stopped.json"
+    stop(manifest, _recording_api([]), marker_path=marker)
+
+    observed = power_state(
+        manifest,
+        lambda identifier: (_ for _ in ()).throw(TimeoutError(identifier)),
+        marker_path=marker,
+    )
+
+    assert observed.usd_per_day is None
+    assert "UNVERIFIED" in observed.summary()
+    assert "cloud state is unreadable" in observed.summary()
+    assert "$0.00/day" not in observed.summary()
+    assert "STOPPED ON PURPOSE" not in observed.summary()
 
 
 def test_every_state_reports_what_it_costs_per_day() -> None:

@@ -384,6 +384,35 @@ async def test_arm_requires_the_exact_baseline_in_source_and_history() -> None:
 
 
 @pytest.mark.asyncio
+async def test_arm_checks_delta_storage_before_other_round6_dependencies() -> None:
+    expected = contract()
+
+    class StorageDenied(FakeAdapter):
+        def __init__(self, value: LiveOrdersContract) -> None:
+            super().__init__(value)
+            self.calls: list[str] = []
+
+        async def read_history(self, order: LiveOrder) -> LiveOrderHistory | None:
+            self.calls.append("history")
+            raise RuntimeError("STORAGE_ACCESS_DENIED")
+
+        async def inspect_feed(self):
+            self.calls.append("feed")
+            return await super().inspect_feed()
+
+        async def read_checkout(self, order_id):
+            self.calls.append("checkout")
+            return await super().read_checkout(order_id)
+
+    adapter = StorageDenied(expected)
+
+    with pytest.raises(RuntimeError, match="STORAGE_ACCESS_DENIED"):
+        await LiveOrdersEngine(adapter, contract=expected).arm()
+
+    assert adapter.calls == ["history"]
+
+
+@pytest.mark.asyncio
 async def test_run_fails_closed_when_exact_order_never_reaches_delta() -> None:
     expected = contract()
     adapter = FakeAdapter(expected)

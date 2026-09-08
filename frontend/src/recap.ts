@@ -743,11 +743,15 @@ export function ledgerDay(result: RoundResult, now: number = Date.now()): string
   const sealed = new Date(result.sealedAt)
   const today = new Date(now)
   if (
-    sealed.getFullYear() === today.getFullYear()
-    && sealed.getMonth() === today.getMonth()
-    && sealed.getDate() === today.getDate()
+    sealed.getUTCFullYear() === today.getUTCFullYear()
+    && sealed.getUTCMonth() === today.getUTCMonth()
+    && sealed.getUTCDate() === today.getUTCDate()
   ) return null
-  return `${sealed.getDate()} ${sealed.toLocaleString('en-GB', { month: 'short' }).toUpperCase()}`
+  const month = [
+    'JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+    'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
+  ][sealed.getUTCMonth()]
+  return `${sealed.getUTCDate()} ${month}`
 }
 
 /** How many rounds the summary can state a result for. Never counts `unrun`. */

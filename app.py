@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,7 +48,7 @@ from server.lifecycle import (
     operator_ingress_drift_async,
 )
 from server.live_orders import LiveOrdersEngine
-from server.manager import InvalidStateError, RunManager
+from server.manager import InvalidStateError, RoundStorageReadinessError, RunManager
 from server.manifest import (
     MANIFEST_JSON_ENV,
     DemoManifest,
@@ -200,18 +200,11 @@ def _load_ready_manifest(*, require_v2: bool = False) -> DemoManifest:
         manifest = load_manifest()
     except Exception as exc:
         raise InvalidStateError("Demo setup is not ready: owned manifest is unavailable") from exc
-    # A passed TTL does not make an installation unserviceable. The timestamp is
-    # written once at provision time and never consulted by the resources
-    # themselves, so an expired value says nothing about whether they are healthy
-    # -- and an app that is answering requests is itself evidence the install is
-    # in use. Refusing here bricked long-lived installs two ways: a deployed app
-    # that restarted past expiry never came back, and every control action was
-    # gated because this function backs `require_ready_manifest`.
-    #
-    # The cost discipline that replaces it is unchanged and was always the real
-    # one: `antidemo cleanup --yes`. What is genuinely given up is that an abandoned
-    # install no longer announces itself by failing here; see the trade-off note
-    # in README.md. `antidemo renew --ttl-hours N` moves the timestamp forward.
+    # External account governance may reap AWS resources at `expires_at`, but the
+    # timestamp alone cannot say which resources remain. Refusing solely on the
+    # clock bricked intact long-lived installs; ignoring the deadline hid the
+    # teardown signal. Warn here, then let the live per-round checks selectively
+    # remove capabilities that are actually gone.
     expiry_warning = manifest.expiry_warning()
     if expiry_warning is not None:
         LOGGER.warning("%s", expiry_warning)
@@ -458,6 +451,51 @@ def model_score_factory_from_manifest(
         return factory
 
     return build_round(4, RoundId.PUT_MODEL_SCORE_IN_APP, build)
+
+
+def delta_storage_probe_from_manifest(
+    manifest: DemoManifest | None = None,
+) -> Callable[[], Awaitable[None]] | None:
+    """Build the read-only Round 4 and Round 6 probes used by catalog readiness."""
+
+    model_score_factory = model_score_factory_from_manifest(manifest)
+    live_orders_factory = live_orders_factory_from_manifest(manifest)
+    if model_score_factory is None:
+        return None
+
+    async def probe() -> None:
+        from server.model_score_live import DeltaPathDoesNotExistError
+
+        model_score = model_score_factory()
+        source_probe = getattr(model_score.adapter, "probe_source_storage", None)
+        if not callable(source_probe):
+            raise InvalidStateError("Round 4 adapter has no read-only Delta storage probe")
+        try:
+            await source_probe()
+        except DeltaPathDoesNotExistError as exc:
+            repair_job_id = str(
+                getattr(getattr(model_score.adapter, "config", None), "source_repair_job_id", "")
+                or ""
+            )
+            if not repair_job_id:
+                raise RoundStorageReadinessError(
+                    RoundId.PUT_MODEL_SCORE_IN_APP,
+                    "The sealed Round 4 Delta source path is missing and no repair job is sealed",
+                ) from exc
+            # This exact absence is the one Round 4's owner-scoped repair job is
+            # built for. Keep the round available and continue checking Round 6.
+        if live_orders_factory is None:
+            return
+        live_orders = live_orders_factory()
+        try:
+            await live_orders.adapter.read_history(live_orders.contract.baseline)
+        except DeltaPathDoesNotExistError as exc:
+            raise RoundStorageReadinessError(
+                RoundId.ANALYZE_LIVE_ORDERS,
+                "The sealed Round 6 native CDF Delta history path is missing",
+            ) from exc
+
+    return probe
 
 
 def _round5_coordination_refusal(
@@ -1146,6 +1184,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round5_readiness_status=lambda: readiness_gate.round5_status,
             round5_prearm_guard=readiness_gate.round5_prearm_guard,
             model_score_factory=model_score_factory_from_manifest(manifest),
+            delta_storage_probe=delta_storage_probe_from_manifest(manifest),
             connection_spike_factory=connection_spike_factory_from_manifest(
                 manifest, lease_store=round5_lease_store
             ),
@@ -1228,6 +1267,14 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         except OSError:
             LOGGER.warning("Could not claim the server launch record", exc_info=True)
             process_record = None
+        delta_storage_task = asyncio.create_task(
+            app.state.run_manager.refresh_delta_storage_readiness(force=True),
+            name="shared-delta-storage-readiness",
+        )
+        delta_storage_task.add_done_callback(
+            lambda task: task.exception() if not task.cancelled() else None
+        )
+        app.state.delta_storage_readiness_task = delta_storage_task
         return _Runtime(
             lease_store=lease_store,
             round5_lease_store=round5_lease_store,
@@ -1362,6 +1409,11 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         if callable(close_manager):
             await close_manager()
     finally:
+        delta_storage_task = getattr(app.state, "delta_storage_readiness_task", None)
+        if delta_storage_task is not None and not delta_storage_task.done():
+            delta_storage_task.cancel()
+            await asyncio.gather(delta_storage_task, return_exceptions=True)
+        app.state.delta_storage_readiness_task = None
         # After `close()`, not before it. `RunManager.close()` performs the
         # Round 4 pipeline stop this process owes and records that stop
         # durably, and uninstalling the store first -- which is what used to
@@ -1992,11 +2044,46 @@ def _readiness_response(
     _apply_round4_stop_recovery(payload)
     _apply_owed_pipeline_stop(payload)
     _apply_owed_round5_cleanup(payload)
+    _apply_delta_storage_refusals(payload)
     # Last, so it yields the one `degraded_detail` sentence to all seven ranked
     # claimants above. It still degrades and still lowers `status`: it is the
     # only signal down here that costs availability rather than spend.
     _apply_manifest_lifecycle(payload)
     return JSONResponse(payload, status_code=200 if ring_ready else 503)
+
+
+def _apply_delta_storage_refusals(payload: dict[str, Any]) -> None:
+    """Degrade only the two rounds sharing Delta storage after a proven 403."""
+
+    run_manager = getattr(app.state, "run_manager", None)
+    refusals = getattr(run_manager, "storage_refusals", None) or {}
+    if not refusals:
+        return
+    payload["degraded"] = True
+    if payload["status"] == "ready":
+        payload["status"] = "degraded"
+    capabilities: list[str] = []
+    if RoundId.PUT_MODEL_SCORE_IN_APP in refusals:
+        capabilities.append("Round 4 Managed Sync source Delta access")
+    if RoundId.ANALYZE_LIVE_ORDERS in refusals:
+        capabilities.append("Round 6 native CDF destination Delta access")
+    payload["degraded_capabilities"] = [
+        *payload["degraded_capabilities"],
+        *capabilities,
+    ]
+    if payload["degraded_detail"] is None:
+        disabled = " AND ".join(
+            str(number)
+            for number, round_id in (
+                (4, RoundId.PUT_MODEL_SCORE_IN_APP),
+                (6, RoundId.ANALYZE_LIVE_ORDERS),
+            )
+            if round_id in refusals
+        )
+        payload["degraded_detail"] = (
+            f"DELTA STORAGE IS UNAVAILABLE FOR ROUND {disabled} · "
+            "THE OTHER AVAILABLE ROUNDS REMAIN USABLE"
+        )
 
 
 def _apply_manifest_lifecycle(payload: dict[str, Any]) -> None:

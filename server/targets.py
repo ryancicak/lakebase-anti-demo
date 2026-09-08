@@ -1015,7 +1015,8 @@ class PsycopgPreparedTarget(PreparedTarget):
                 sqlstate is not None and sqlstate.startswith(fatal_prefixes)
             ):
                 raise FatalProbeError(
-                    f"PostgreSQL configuration failed (SQLSTATE {sqlstate})."
+                    "PostgreSQL configuration failed.",
+                    sqlstate=sqlstate,
                 ) from exc
             raise RuntimeError("PostgreSQL attempt failed") from exc
         if row is None or row[0] != expected_value:

@@ -108,11 +108,12 @@ clusters, and Round 5 creates a per-bout RDS Proxy.
 
 Consequences worth internalising before you run anything:
 
-- **Resources bill until they are destroyed.** The `expires-at` tag is an
-  ownership signal, not an automatic deletion service. Nothing reaps it for you,
-  and since it no longer gates the app either, an abandoned installation will not
-  announce itself — it will just keep billing quietly. `antidemo cleanup --yes` is the
-  only thing that stops it.
+- **Resources may be reaped at the declared expiry.** External account automation
+  consumes the `expires-at` tag and can remove tagged AWS resources without
+  removing the corresponding Databricks resources. The app warns during the last
+  24 hours and live readiness removes only capabilities whose dependencies are
+  proven gone. Renew deliberately before the deadline or run
+  `antidemo cleanup --yes`; neither happens automatically inside this project.
 - **In the sandbox this was built in, something else deletes the databases on a
   schedule — and in your account nothing will.** That account is swept by its own
   automation roughly every 14 days, on a Sunday around 02:00 UTC, deleting RDS and
@@ -134,11 +135,12 @@ Consequences worth internalising before you run anything:
   [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md#the-databases-are-reachable-from-the-internet)
   have the rules and the reasoning. Keep nothing in these databases you would mind
   losing or exposing.
-- **A passed `expires-at` is not a fault.** The app serves, the rounds run,
-  `setup` repairs, `cleanup` destroys, and `doctor` reports it as a `WARN` line.
-  Use `antidemo renew --ttl-hours N` to move it forward on an existing installation;
-  `antidemo setup --ttl-hours` applies only to a first provision and is refused
-  elsewhere with a pointer to `renew`.
+- **The clock alone does not prove health after `expires-at`.** The app keeps
+  serving so live inventory can selectively withhold rounds whose dependencies
+  were reaped; intact rounds may continue, and missing ones do not. `doctor`
+  reports the deadline as a `WARN` and the live checks report what remains. Use
+  `antidemo renew --ttl-hours N` before expiry on an intact installation;
+  `antidemo setup --ttl-hours` applies only to a first provision.
 - **Always finish with cleanup.** Inspect first, then destroy:
 
   ```bash

@@ -38,6 +38,7 @@ from server.safe_change_live import (
 SCOPE = SafeChangeOwnershipScope(
     run_id="ad-test-003",
     owner="operator@databricks.com",
+    expires_at="2030-01-01T00:00:00Z",
     aws_account_id="123456789012",
     aws_region="us-west-2",
 )

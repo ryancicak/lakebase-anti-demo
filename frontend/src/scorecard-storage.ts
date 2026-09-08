@@ -141,8 +141,13 @@ export function loadScorecard(): ScorecardEntry[] {
 }
 
 export function saveScorecard(entries: ScorecardEntry[]): void {
-  window.localStorage.setItem(SCORECARD_STORAGE_KEY, JSON.stringify({
-    version: SCORECARD_SCHEMA_VERSION,
-    entries,
-  }))
+  try {
+    window.localStorage.setItem(SCORECARD_STORAGE_KEY, JSON.stringify({
+      version: SCORECARD_SCHEMA_VERSION,
+      entries,
+    }))
+  } catch {
+    // Browser storage can reject writes in private mode or at quota. The
+    // server-side receipt remains authoritative and the live bout must render.
+  }
 }

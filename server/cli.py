@@ -795,11 +795,70 @@ def _pipeline_power(action: str) -> int:
 
     manifest = load_manifest()
     if action == "status":
+        pipeline_payload: dict[str, object] = {}
+
+        def observe(identifier: str) -> dict[str, object]:
+            pipeline_payload.update(_round4_get_pipeline(manifest, identifier))
+            return pipeline_payload
+
         power = power_state(
             manifest,
-            lambda identifier: _round4_get_pipeline(manifest, identifier),
+            observe,
         )
         print(f"PIPELINE {power.pipeline_id} · {power.summary()}")
+        if power.failed:
+            updates = pipeline_payload.get("latest_updates")
+            newest = (
+                next((item for item in updates if isinstance(item, dict)), {})
+                if isinstance(updates, list)
+                else {}
+            )
+            update_id = str(newest.get("update_id") or "")
+            if update_id:
+                from urllib.parse import quote
+
+                event_path = (
+                    f"/api/2.0/pipelines/{quote(power.pipeline_id, safe='')}/events"
+                    "?max_results=100&filter="
+                    + quote(f"update_id = '{update_id}'", safe="")
+                )
+                try:
+                    events = _databricks_api(
+                        manifest.databricks.profile,
+                        "get",
+                        event_path,
+                    )
+                except Exception:
+                    events = {}
+                for event in events.get("events", []) if isinstance(events, dict) else []:
+                    details = event.get("details") if isinstance(event, dict) else None
+                    error = (
+                        event.get("error")
+                        if isinstance(event, dict) and isinstance(event.get("error"), dict)
+                        else details.get("error")
+                        if isinstance(details, dict)
+                        else None
+                    )
+                    exceptions = error.get("exceptions") if isinstance(error, dict) else None
+                    if not isinstance(exceptions, list):
+                        continue
+                    for exception in exceptions:
+                        if not isinstance(exception, dict):
+                            continue
+                        error_class = str(exception.get("error_class") or "")
+                        if not error_class:
+                            continue
+                        sql_state = str(exception.get("sql_state") or "")
+                        parameters = exception.get("message_parameters")
+                        table = (
+                            str(parameters.get("tableName") or "")
+                            if isinstance(parameters, dict)
+                            else ""
+                        )
+                        suffix = f" · SQLSTATE {sql_state}" if sql_state else ""
+                        suffix += f" · source {table}" if table else ""
+                        print(f"SOURCE DIAGNOSIS {error_class}{suffix}")
+                        return 0
         return 0
     # `stop` and `start` both mutate a shared cloud resource, so they take the
     # same claim every other mutating verb takes. A stop landing in the middle of

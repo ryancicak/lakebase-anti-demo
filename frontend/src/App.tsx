@@ -2818,6 +2818,11 @@ function App() {
         if (typeof event.gap_before === 'number' && event.gap_before > 0) {
           const missed = event.gap_before
           setMissedCalls((current) => current + missed)
+          // A visible gap is also a state-consistency fault. The first retained
+          // event may be incremental and cannot reconstruct a terminal event
+          // that was evicted, so reconcile from the authoritative snapshot even
+          // though the replacement SSE connection itself is healthy.
+          reconcile()
         }
         lastSequence = event.sequence
         streamInterrupted = false

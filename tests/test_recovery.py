@@ -179,6 +179,7 @@ def build_engine(*, cancel_teardown_timeout_seconds: float = 5.0):
     scope = SafeChangeOwnershipScope(
         run_id="ad-test-003",
         owner="operator@databricks.com",
+        expires_at="2030-01-01T00:00:00Z",
         aws_account_id="123456789012",
         aws_region="us-west-2",
     )
@@ -528,6 +529,7 @@ async def test_default_recovery_order_is_deterministic_and_run_owned() -> None:
     different.scope = SafeChangeOwnershipScope(
         run_id="ad-test-004",
         owner=different.scope.owner,
+        expires_at=different.scope.expires_at,
         aws_account_id=different.scope.aws_account_id,
         aws_region=different.scope.aws_region,
     )

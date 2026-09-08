@@ -232,6 +232,7 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         deployed_aws_path_sealed=posture.egress_sealed,
         round5_runtime_role_sealed=posture.runtime_role_sealed,
         grant_refusals=getattr(run_manager, "grant_refusals", None) or {},
+        storage_refusals=getattr(run_manager, "storage_refusals", None) or {},
     )
 
     gate = getattr(request.app.state, "readiness_gate", None)
@@ -272,6 +273,12 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
 @router.get("/catalog", response_model=CatalogResponse)
 async def get_catalog(request: Request) -> CatalogResponse:
     run_manager = manager(request)
+    refresh_storage = getattr(run_manager, "refresh_delta_storage_readiness", None)
+    if callable(refresh_storage):
+        # Read-only, cached, and single-flight. The first catalog answer must not
+        # advertise Rounds 4 and 6 before their shared Delta path has answered;
+        # subsequent fight-card polls normally return from the cache.
+        await refresh_storage()
     sealed = catalog(
         model_score_available=run_manager.model_score_available,
         connection_spike_available=run_manager.connection_spike_available,

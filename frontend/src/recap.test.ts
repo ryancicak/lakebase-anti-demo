@@ -8,7 +8,9 @@ import {
   canShare,
   groupByRound,
   headlineBout,
+  ledgerDay,
   roundNumber,
+  summariseRounds,
   tally,
 } from './recap'
 
@@ -38,6 +40,17 @@ function receipt(overrides: Partial<BoutReceipt> = {}): BoutReceipt {
     ...overrides,
   }
 }
+
+describe('ledger day', () => {
+  it('uses UTC rather than host locale or timezone at a day boundary', () => {
+    const result = summariseRounds([
+      receipt({ sealed_at: '2030-09-01T00:30:00.000Z' }),
+    ])[0]
+
+    expect(ledgerDay(result, Date.parse('2030-09-01T23:30:00.000Z'))).toBeNull()
+    expect(ledgerDay(result, Date.parse('2030-09-02T00:30:00.000Z'))).toBe('1 SEP')
+  })
+})
 
 describe('boutView', () => {
   it('reads a two-verified-lane bout as timed and keeps its margin', () => {

@@ -200,6 +200,80 @@ class ModelScoreLiveOperationError(ModelScoreError):
     """A live Statement Execution or PostgreSQL operation was not exact."""
 
 
+class WorkspaceStatementExecutionError(ModelScoreLiveOperationError):
+    """A failed SQL statement with Databricks' bounded, structured diagnosis.
+
+    The service message can be thousands of characters and includes request
+    identifiers and physical paths, so it is retained as an attribute for
+    server-side diagnostics but never interpolated into ``str(error)``.  The
+    error code, SQLSTATE, and normalized provider category are safe and are the
+    pieces callers need to distinguish an access denial from absent Delta data.
+    """
+
+    def __init__(
+        self,
+        *,
+        state: str,
+        error_code: str,
+        sql_state: str,
+        provider_category: str,
+        provider_message: str,
+    ) -> None:
+        self.state = state or "UNKNOWN"
+        self.error_code = error_code or "UNKNOWN"
+        self.sql_state = sql_state
+        self.provider_category = provider_category
+        self.provider_message = provider_message
+        details = [self.error_code]
+        if self.sql_state:
+            details.append(f"SQLSTATE {self.sql_state}")
+        if self.provider_category:
+            details.append(self.provider_category)
+        super().__init__("Statement Execution failed: " + " · ".join(details))
+
+
+class DeltaStorageAccessDeniedError(WorkspaceStatementExecutionError):
+    """The cloud provider refused access to storage needed by a Delta read."""
+
+
+class DeltaPathDoesNotExistError(WorkspaceStatementExecutionError):
+    """Databricks reported a missing or non-Delta path without an access denial."""
+
+
+def _statement_failure(response: Any, state_name: str) -> WorkspaceStatementExecutionError:
+    status = getattr(response, "status", None)
+    error = getattr(status, "error", None)
+    error_code = _enum_value(getattr(error, "error_code", None))
+    sql_state = str(getattr(status, "sql_state", None) or "")
+    provider_message = str(getattr(error, "message", None) or "")
+    folded = provider_message.casefold()
+    if (
+        "accessdeniedexception" in folded
+        or "accessdenied" in folded
+        or "access denied" in folded
+        or "403 forbidden" in folded
+        or "status code: 403" in folded
+    ):
+        kind: type[WorkspaceStatementExecutionError] = DeltaStorageAccessDeniedError
+        category = "STORAGE_ACCESS_DENIED (403/AccessDenied)"
+    elif (
+        "delta_path_does_not_exist" in folded
+        or "delta_metadata_absent_existing_catalog_table" in folded
+    ):
+        kind = DeltaPathDoesNotExistError
+        category = "DELTA_PATH_DOES_NOT_EXIST"
+    else:
+        kind = WorkspaceStatementExecutionError
+        category = ""
+    return kind(
+        state=state_name,
+        error_code=error_code,
+        sql_state=sql_state,
+        provider_category=category,
+        provider_message=provider_message,
+    )
+
+
 @dataclass(frozen=True)
 class SqlParameter:
     name: str
@@ -244,8 +318,8 @@ class WorkspaceStatementRunner:
         )
         state = response.status.state if response.status else None
         if state != StatementState.SUCCEEDED:
-            state_name = getattr(state, "value", "UNKNOWN")
-            raise ModelScoreLiveOperationError(f"Statement Execution did not succeed: {state_name}")
+            state_name = _enum_value(state) or "UNKNOWN"
+            raise _statement_failure(response, state_name)
         if response.manifest is None and response.result is None:
             return []
         if response.manifest is None or response.result is None:
@@ -263,6 +337,28 @@ class WorkspaceStatementRunner:
         if any(len(row) != len(names) for row in rows):
             raise ModelScoreLiveOperationError("Statement Execution returned a malformed row")
         return [dict(zip(names, row, strict=True)) for row in rows]
+
+
+def round4_source_repair_identity(manifest: DemoManifest) -> tuple[str, str]:
+    """Return the deterministic job name and notebook path for this installation."""
+
+    owner_key = str(manifest.installation_id or manifest.run_id)
+    safe_characters = (
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+    )
+    if (
+        not owner_key
+        or len(owner_key) > 128
+        or any(character not in safe_characters for character in owner_key)
+    ):
+        raise ModelScoreLiveConfigurationError(
+            "Round 4 source repair owner identity is not safe for a workspace path"
+        )
+    folder = f"/Shared/lakebase-anti-demo/{owner_key}"
+    return (
+        f"lakebase-anti-demo-{owner_key[:8]}-round4-source-repair",
+        f"{folder}/round4-source-repair",
+    )
 
 
 @dataclass(frozen=True)
@@ -284,6 +380,9 @@ class ModelScoreLiveConfig:
     branch_uid: str
     branch: str
     endpoint_name: str
+    source_repair_job_id: str = ""
+    source_repair_job_name: str = ""
+    source_repair_notebook_path: str = ""
     database_user: str = ""
     expected_runtime_principal: str = ""
     port: int = 5432
@@ -334,6 +433,19 @@ class ModelScoreLiveConfig:
         if self.port < 1 or self.connect_timeout_seconds <= 0:
             raise ModelScoreLiveConfigurationError(
                 "Round 4 PostgreSQL port and connection timeout must be positive"
+            )
+        repair_identity = (
+            self.source_repair_job_id,
+            self.source_repair_job_name,
+            self.source_repair_notebook_path,
+        )
+        if any(repair_identity) and not all(repair_identity):
+            raise ModelScoreLiveConfigurationError(
+                "Round 4 source repair job ID, name, and notebook path must be sealed together"
+            )
+        if self.source_repair_job_id and not self.source_repair_job_id.isdigit():
+            raise ModelScoreLiveConfigurationError(
+                "Round 4 source repair job ID is not a sealed integer"
             )
 
     @property
@@ -387,12 +499,18 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         )
         self._connector = connector
         self._now = now
+        self._source_repaired = False
 
     @property
     def workspace(self) -> Any:
         """The bound control-plane client, for collaborators that must share it."""
 
         return self._workspace
+
+    async def probe_source_storage(self) -> None:
+        """Read one Delta history row without repairing or starting anything."""
+
+        await self._source_head()
 
     async def inspect_sync(self) -> ManagedSyncStatus:
         (
@@ -527,6 +645,155 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
                 )
             ),
         )
+
+    async def preflight_source(
+        self,
+        entity_id: str,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
+        *,
+        _allow_repair: bool = True,
+    ) -> ModelScoreRow | None:
+        """Prove the sealed source is the expected readable Delta table.
+
+        This deliberately runs before pipeline activation.  Starting a stopped
+        continuous pipeline is a billable mutation and can wait five minutes;
+        neither is justified when the source storage is already known to be
+        unreadable.  Metadata identity, history, CDF, and the owned row are all
+        checked here without changing the table or pipeline.
+        """
+
+        table = await self._get_json(
+            "/api/2.1/unity-catalog/tables/"
+            + quote(self.config.source_table_full_name, safe="")
+        )
+        parts = self.config.source_table_full_name.split(".")
+        expected_columns = (
+            ("entity_id", "STRING"),
+            ("score", "DOUBLE"),
+            ("model_version", "STRING"),
+            ("proof_nonce", "STRING"),
+            ("updated_at", "TIMESTAMP"),
+        )
+        columns = table.get("columns")
+        actual_columns = (
+            tuple(
+                (str(column.get("name") or ""), _enum_value(column.get("type_name")))
+                for column in columns
+                if isinstance(column, Mapping)
+            )
+            if isinstance(columns, Sequence) and not isinstance(columns, str | bytes)
+            else ()
+        )
+        if (
+            len(parts) != 3
+            or table.get("full_name") != self.config.source_table_full_name
+            or table.get("catalog_name") != parts[0]
+            or table.get("schema_name") != parts[1]
+            or table.get("name") != parts[2]
+            or table.get("owner") != self.config.setup_principal
+            or _enum_value(table.get("table_type")) != "MANAGED"
+            or _enum_value(table.get("data_source_format")) != "DELTA"
+            or actual_columns != expected_columns
+            or not str(table.get("table_id") or "")
+            or not str(table.get("storage_location") or "").startswith("s3://")
+        ):
+            raise ModelScoreLiveConfigurationError(
+                "Round 4 source table identity, ownership, schema, or Delta format changed"
+            )
+        try:
+            await self._source_head()
+        except DeltaPathDoesNotExistError:
+            if not _allow_repair or not self.config.source_repair_job_id:
+                raise
+            if on_progress is not None:
+                await on_progress(
+                    "The sealed Delta source path is missing. Running its fixed, "
+                    "owner-scoped repair before starting Managed Sync."
+                )
+            await self._run_source_repair()
+            self._source_repaired = True
+            if on_progress is not None:
+                await on_progress(
+                    "The bounded source repair finished. Rechecking the exact table and baseline."
+                )
+            return await self.preflight_source(
+                entity_id,
+                on_progress,
+                _allow_repair=False,
+            )
+        if not await self._cdf_enabled():
+            raise ModelScoreLiveConfigurationError(
+                "Round 4 source table does not have Delta Change Data Feed enabled"
+            )
+        return await self.read_source(entity_id)
+
+    @property
+    def source_repaired(self) -> bool:
+        return self._source_repaired
+
+    async def _run_source_repair(self) -> None:
+        """Run only the sealed no-parameter owner job and require its terminal success."""
+
+        try:
+            job_id = int(self.config.source_repair_job_id)
+        except ValueError as exc:
+            raise ModelScoreLiveConfigurationError(
+                "Round 4 source repair job ID is not a sealed integer"
+            ) from exc
+        job = await self._get_json(f"/api/2.1/jobs/get?job_id={job_id}")
+        settings = _required_mapping(job.get("settings"), "Round 4 source repair job settings")
+        run_as = _required_mapping(settings.get("run_as"), "Round 4 source repair run-as")
+        tasks = settings.get("tasks")
+        task = (
+            tasks[0]
+            if isinstance(tasks, Sequence)
+            and not isinstance(tasks, str | bytes)
+            and len(tasks) == 1
+            and isinstance(tasks[0], Mapping)
+            else {}
+        )
+        notebook = _mapping(task.get("notebook_task"))
+        if (
+            str(job.get("job_id") or "") != self.config.source_repair_job_id
+            or str(job.get("creator_user_name") or "") != self.config.setup_principal
+            or settings.get("name") != self.config.source_repair_job_name
+            or run_as.get("service_principal_name") != self.config.setup_principal
+            or settings.get("max_concurrent_runs") != 1
+            or task.get("task_key") != "repair_exact_round4_source"
+            or notebook.get("notebook_path") != self.config.source_repair_notebook_path
+            or _enum_value(notebook.get("source")) != "WORKSPACE"
+            or notebook.get("base_parameters")
+            or settings.get("parameters")
+        ):
+            raise ModelScoreLiveConfigurationError(
+                "Round 4 source repair job identity or no-parameter contract changed"
+            )
+        submitted = await asyncio.to_thread(
+            self._workspace.api_client.do,
+            "POST",
+            "/api/2.1/jobs/run-now",
+            body={"job_id": job_id},
+        )
+        run_id = _integer(_required_mapping(submitted, "Round 4 repair submission").get("run_id"))
+        deadline = asyncio.get_running_loop().time() + 120.0
+        while True:
+            run = await self._get_json(f"/api/2.1/jobs/runs/get?run_id={run_id}")
+            state = _mapping(run.get("state"))
+            life_cycle = _enum_value(state.get("life_cycle_state"))
+            result = _enum_value(state.get("result_state"))
+            if life_cycle in {"TERMINATED", "SKIPPED", "INTERNAL_ERROR"}:
+                if result == "SUCCESS":
+                    return
+                raise ModelScoreLiveOperationError(
+                    "The sealed Round 4 source repair job failed "
+                    f"(lifecycle {life_cycle or 'UNKNOWN'} · result {result or 'UNKNOWN'}): "
+                    f"{state.get('state_message') or 'no diagnosis'}"
+                )
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ModelScoreLiveOperationError(
+                    "The sealed Round 4 source repair job exceeded its 120s bound"
+                )
+            await asyncio.sleep(1.0)
 
     async def _get_json(self, path: str) -> Mapping[str, Any]:
         payload = await asyncio.to_thread(
@@ -976,6 +1243,7 @@ class Round4PipelineActivation:
         # after that second bout would then leave running a pipeline this
         # process is entirely responsible for. See :meth:`aclose`.
         self._started_by_process = False
+        self._full_refresh_required = False
         # The timestamp of the most recent resume this activation requested,
         # carried into any owed-stop record so scheduling a stop does not cost
         # the accrued figure its origin. See `pipeline_power.owed_stop_record`.
@@ -991,7 +1259,8 @@ class Round4PipelineActivation:
 
         self._generation += 1
         self._cancel_release()
-        if self._healthy(await self._read_signals()):
+        signals = await self._read_signals()
+        if self._healthy(signals) and not self._full_refresh_required:
             self._started_by_arm = False
             return
 
@@ -1003,11 +1272,17 @@ class Round4PipelineActivation:
             self._resumed_at = str(record.get("resumed_at") or "")
             self._persist(record)
 
-        pipeline_power.start(
+        full_refresh = self._full_refresh_required
+        requested = pipeline_power.start(
             self._manifest,
             self._api,
+            full_refresh=full_refresh,
             on_record=remember,
         )
+        # A refused/conflicting request made no rebase happen. Keep the request
+        # latched so a later retry cannot silently downgrade a required full
+        # refresh to an ordinary resume.
+        self._full_refresh_required = False
         # Set on the request rather than on the successful wait. The claim this
         # records is "this arm asked for the pipeline that is now up", and that
         # is true the moment the verb is issued -- an arm that then times out
@@ -1021,6 +1296,20 @@ class Round4PipelineActivation:
             if self._healthy(signals):
                 await notify("The Managed Sync pipeline is running. Verifying the baseline.")
                 return
+            if (
+                requested.update_id
+                and signals.update_id == requested.update_id
+                and classify_managed_sync_state(
+                    {signals.synced_table_state},
+                    signals.pipeline_state,
+                    signals.update_state,
+                )
+                is ManagedSyncState.FAILED
+            ):
+                raise ModelScoreLiveOperationError(
+                    "The Managed Sync pipeline start failed in the control plane "
+                    f"({signals.describe()}); Round 4 will not wait for the timeout"
+                )
             remaining = deadline - self._clock()
             if remaining <= 0:
                 break
@@ -1328,6 +1617,11 @@ class Round4PipelineActivation:
         if release is not None and not release.done():
             release.cancel()
 
+    def require_full_refresh(self) -> None:
+        """Request one rebase after the bounded source repair, never on a normal start."""
+
+        self._full_refresh_required = True
+
     def _persist(self, record: dict[str, Any]) -> None:
         """Push a power record at the durable store, if this process has one.
 
@@ -1394,6 +1688,7 @@ class PipelineSignals:
     update_state: str
     synced_table_state: str
     continuous_reported: bool
+    update_id: str = ""
 
     def describe(self) -> str:
         table = self.synced_table_state or "no synced-table state"
@@ -1447,9 +1742,18 @@ async def read_pipeline_signals(
         f"/api/2.0/database/synced_tables/{quote(synced_table_id, safe='')}",
     )
     status = _mapping(synced.get("data_synchronization_status"))
+    updates = pipeline.get("latest_updates")
+    newest = (
+        _mapping(updates[0])
+        if isinstance(updates, Sequence)
+        and not isinstance(updates, str | bytes)
+        and updates
+        else {}
+    )
     return PipelineSignals(
         pipeline_state=_enum_value(pipeline.get("state")),
         update_state=latest_pipeline_update_state(pipeline),
+        update_id=str(newest.get("update_id") or ""),
         synced_table_state=_enum_value(status.get("detailed_state")),
         continuous_reported=bool(_mapping(status.get("continuous_update_status"))),
     )
@@ -1599,6 +1903,12 @@ def build_model_score_engine(manifest: DemoManifest) -> ModelScoreEngine:
     is_databricks_app = os.environ.get("ANTI_DEMO_ENV", "").casefold() == "databricks-app" or bool(
         os.environ.get("DATABRICKS_APP_NAME", "")
     )
+    source_repair_job_id = str(getattr(resources, "source_repair_job_id", "") or "")
+    source_repair_job_name, source_repair_notebook_path = (
+        round4_source_repair_identity(manifest)
+        if source_repair_job_id
+        else ("", "")
+    )
     config = ModelScoreLiveConfig(
         profile="" if is_databricks_app else manifest.databricks.profile,
         warehouse_id=resources.warehouse_id,
@@ -1610,6 +1920,9 @@ def build_model_score_engine(manifest: DemoManifest) -> ModelScoreEngine:
         synced_table_id=resources.synced_table_id,
         synced_table_uid=resources.synced_table_uid,
         pipeline_id=resources.pipeline_id,
+        source_repair_job_id=source_repair_job_id,
+        source_repair_job_name=source_repair_job_name,
+        source_repair_notebook_path=source_repair_notebook_path,
         physical_database=resources.physical_database,
         physical_schema=resources.physical_schema,
         physical_table=resources.physical_table,

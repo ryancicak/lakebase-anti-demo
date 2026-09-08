@@ -79,6 +79,10 @@ case "$args" in
     echo '{}' ;;
   *"s3api get-bucket-location"*) echo "${STUB_BUCKET_REGION:-us-west-2}" ;;
   *"s3api get-bucket-versioning"*) echo "${STUB_BUCKET_VERSIONING:-Enabled}" ;;
+  *"s3api get-bucket-public-access-block"*)
+    echo "${STUB_BUCKET_PUBLIC_BLOCK:-true true true true}" ;;
+  *"s3api get-bucket-encryption"*)
+    echo "${STUB_BUCKET_ENCRYPTION:-AES256}" ;;
   *"s3api create-bucket"*)
     [[ "${STUB_CREATE_BUCKET_FAILS:-0}" == "1" ]] && { echo "An error occurred (BucketAlreadyExists)" >&2; exit 255; }
     echo '{"Location":"/stub"}' ;;
@@ -497,7 +501,13 @@ case_s3_bucket_states() {
   check "existing bucket detected" "bucket stub-state-bucket exists in us-west-2"
   STUB_BUCKET_EXISTS=1 STUB_BUCKET_VERSIONING=Suspended \
     run "$sb" --state-backend s3 --state-bucket stub-state-bucket
-  check "warns on unversioned bucket" "without versioning a bad write is unrecoverable"
+  check "refuses an unversioned bucket" "S3 STATE BACKEND REFUSED"
+  STUB_BUCKET_EXISTS=1 STUB_BUCKET_PUBLIC_BLOCK="true false true true" \
+    run "$sb" --state-backend s3 --state-bucket stub-state-bucket
+  check "refuses a bucket without all public blocks" "all four public-access blocks"
+  STUB_BUCKET_EXISTS=1 STUB_BUCKET_ENCRYPTION="NONE" \
+    run "$sb" --state-backend s3 --state-bucket stub-state-bucket
+  check "refuses a bucket without default encryption" "default bucket encryption"
   STUB_BUCKET_EXISTS=1 STUB_BUCKET_REGION=eu-west-1 \
     run "$sb" --state-backend s3 --state-bucket stub-state-bucket
   check "warns on cross-region bucket" "the bucket is in eu-west-1 but this install is us-west-2"

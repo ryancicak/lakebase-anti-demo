@@ -90,7 +90,7 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -99,6 +99,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from databricks.sdk.errors.platform import ResourceConflict
 
 from .coordination import (
     COORDINATION_SCHEMA,
@@ -108,6 +109,20 @@ from .coordination import (
 from .manifest import DemoManifest, manifest_path
 
 logger = logging.getLogger(__name__)
+
+
+_ACTIVE_UPDATE_STATES = frozenset(
+    {
+        "QUEUED",
+        "CREATED",
+        "WAITING_FOR_RESOURCES",
+        "INITIALIZING",
+        "RESETTING",
+        "SETTING_UP_TABLES",
+        "RUNNING",
+        "STOPPING",
+    }
+)
 
 #: The pipeline's metered rate: DBU per hour, from posted platform usage.
 #:
@@ -310,6 +325,10 @@ class PipelinePowerError(RuntimeError):
     """A stop or start could not be performed safely."""
 
 
+class PipelineUpdateConflictError(PipelinePowerError):
+    """A conflicting pipeline update could not be proven safe to join."""
+
+
 def owed_stop_sentence(owed_since: str) -> str:
     """The one sentence every surface says about a stop that was owed and lost.
 
@@ -353,6 +372,12 @@ class PipelinePower:
     #: without one of these is a failure, not a choice, and the two must never
     #: render the same way.
     stopped_deliberately: bool
+    #: Whether this snapshot actually read a non-empty state from the control plane.
+    cloud_state_observed: bool = True
+    #: The newest control-plane update outranks any older local intent marker.
+    update_state: str = ""
+    #: The control-plane update accepted for a start request, when available.
+    update_id: str = ""
     stopped_at: str = ""
     stopped_by: str = ""
     #: When a resume was requested and is still settling. Distinct from both of
@@ -378,6 +403,13 @@ class PipelinePower:
         return self.cloud_state.strip().upper() == "RUNNING"
 
     @property
+    def failed(self) -> bool:
+        return (
+            self.cloud_state.strip().upper() in {"DELETED", "FAILED"}
+            or self.update_state.strip().upper() == "FAILED"
+        )
+
+    @property
     def resuming(self) -> bool:
         return bool(self.resuming_since) and not self.running
 
@@ -394,13 +426,15 @@ class PipelinePower:
         return bool(self.stop_owed_since) and self.running
 
     @property
-    def usd_per_day(self) -> Decimal:
+    def usd_per_day(self) -> Decimal | None:
         """What this pipeline bills per day in the state it is actually in.
 
         A stopped pipeline has no continuous update to bill for, so the honest
         figure is zero rather than a smaller non-zero guess.
         """
 
+        if not self.cloud_state_observed:
+            return None
         return PIPELINE_USD_PER_DAY if self.running else Decimal(0)
 
     def _accrued_clause(self) -> str:
@@ -429,6 +463,32 @@ class PipelinePower:
         and is the only thing a stop still costs.
         """
 
+        if not self.cloud_state_observed:
+            local_intent = (
+                "the last local intent says stopped"
+                if self.stopped_deliberately
+                else "a local resume is recorded"
+                if self.resuming
+                else "no usable local power intent is recorded"
+            )
+            return (
+                "UNVERIFIED · cloud state is unreadable · current cost is unknown "
+                f"(up to ${PIPELINE_USD_PER_DAY:.2f}/day if it is still running) · "
+                f"{local_intent}; local history cannot prove current provider state"
+            )
+        if self.failed:
+            state = self.cloud_state or "UNKNOWN"
+            update = self.update_state or "NONE"
+            rate = (
+                f"${PIPELINE_USD_PER_DAY:.2f}/day while the pipeline still reports RUNNING"
+                if self.running
+                else "$0.00/day while it is not running"
+            )
+            return (
+                f"FAILED · pipeline {state} · newest update {update} · {rate} · "
+                "this is a failure rather than a choice; local stop/start history "
+                "does not override this control-plane failure"
+            )
         if self.running:
             rate = (
                 f"RUNNING · ${PIPELINE_USD_PER_DAY:.2f}/day {PIPELINE_RATE_TOLERANCE}"
@@ -908,11 +968,21 @@ def power_state(
     """
 
     pipeline_id = _sealed_pipeline_id(manifest)
+    cloud_state_observed = False
     try:
         payload = get_pipeline(pipeline_id)
         cloud_state = str((payload or {}).get("state") or "")
+        updates = (payload or {}).get("latest_updates")
+        newest = (
+            next((item for item in updates if isinstance(item, Mapping)), {})
+            if isinstance(updates, Sequence) and not isinstance(updates, str | bytes)
+            else {}
+        )
+        update_state = str(newest.get("state") or "")
+        cloud_state_observed = bool(cloud_state.strip())
     except Exception:
         cloud_state = ""
+        update_state = ""
     ledger = _read_ledger(pipeline_id, path=marker_path)
     in_effect = read_stop_marker(pipeline_id, path=marker_path, now=now)
     stopped = in_effect is not None and _intent(in_effect) == _INTENT_STOPPED
@@ -925,6 +995,8 @@ def power_state(
         pipeline_id=pipeline_id,
         cloud_state=cloud_state,
         stopped_deliberately=stopped,
+        cloud_state_observed=cloud_state_observed,
+        update_state=update_state,
         stopped_at=str((in_effect or {}).get("stopped_at") or "") if stopped else "",
         stopped_by=str((in_effect or {}).get("stopped_by") or "") if stopped else "",
         resuming_since=str((in_effect or {}).get("resumed_at") or "") if resuming else "",
@@ -1053,20 +1125,87 @@ def owed_stop_record(
     return record
 
 
+def _adopt_exact_active_update(
+    manifest: DemoManifest,
+    api: Callable[..., dict[str, Any]],
+    *,
+    pipeline_id: str,
+    full_refresh: bool,
+) -> str:
+    """Return the one conflicting update only when its immutable identity is exact."""
+
+    profile = manifest.databricks.profile
+    pipeline = api(
+        profile,
+        "get",
+        _require_pipeline_path(pipeline_id, f"/api/2.0/pipelines/{pipeline_id}"),
+    )
+    if not isinstance(pipeline, Mapping) or pipeline.get("pipeline_id") != pipeline_id:
+        raise PipelineUpdateConflictError(
+            "The active Round 4 update could not be joined because its pipeline identity "
+            "was not exact"
+        )
+    updates = pipeline.get("latest_updates")
+    newest = (
+        updates[0]
+        if isinstance(updates, Sequence)
+        and not isinstance(updates, str | bytes)
+        and updates
+        and isinstance(updates[0], Mapping)
+        else {}
+    )
+    update_id = str(newest.get("update_id") or "")
+    update_state = str(newest.get("state") or "").strip().upper()
+    if not update_id or update_state not in _ACTIVE_UPDATE_STATES:
+        raise PipelineUpdateConflictError(
+            "The conflicting Round 4 update is not an identifiable active update"
+        )
+    detail = api(
+        profile,
+        "get",
+        _require_pipeline_path(
+            pipeline_id,
+            f"/api/2.0/pipelines/{pipeline_id}/updates/{update_id}",
+        ),
+    )
+    update = detail.get("update") if isinstance(detail, Mapping) else None
+    if not isinstance(update, Mapping):
+        raise PipelineUpdateConflictError(
+            "The active Round 4 update omitted its exact update contract"
+        )
+    detail_state = str(update.get("state") or "").strip().upper()
+    if (
+        update.get("pipeline_id") != pipeline_id
+        or update.get("update_id") != update_id
+        or detail_state not in _ACTIVE_UPDATE_STATES
+        or not isinstance(update.get("full_refresh"), bool)
+        or update.get("full_refresh") is not full_refresh
+    ):
+        raise PipelineUpdateConflictError(
+            "The active Round 4 update differs from the requested pipeline or refresh mode"
+        )
+    logger.info(
+        "Joined existing Round 4 pipeline update %s after the control plane reported "
+        "a concurrent update",
+        update_id,
+    )
+    return update_id
+
+
 def start(
     manifest: DemoManifest,
     api: Callable[..., dict[str, Any]],
     *,
+    full_refresh: bool = False,
     marker_path: Path | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     on_record: Callable[[dict[str, Any]], None] | None = None,
 ) -> PipelinePower:
     """Restart the sealed pipeline and record that a resume is in progress.
 
-    ``full_refresh`` is explicitly false. A full refresh would re-seed the
-    destination from scratch, which is both slow and a change to the thing Round
-    4 measures; the resumed pipeline is supposed to pick up from the Delta
-    version it had already processed.
+    ``full_refresh`` is false for an ordinary resume. It is true only after the
+    fixed source-repair job rebuilt a missing Delta source and Managed Sync must
+    rebase its preserved destination onto that exact table.
 
     The record is **rewritten, not deleted.** Deleting it was a real defect
     rather than a tidiness question: the request returns immediately and the
@@ -1080,12 +1219,27 @@ def start(
 
     pipeline_id = _sealed_pipeline_id(manifest)
     profile = manifest.databricks.profile
-    api(
-        profile,
-        "post",
-        _require_pipeline_path(pipeline_id, f"/api/2.0/pipelines/{pipeline_id}/updates"),
-        body={"full_refresh": False},
-    )
+    try:
+        response = api(
+            profile,
+            "post",
+            _require_pipeline_path(pipeline_id, f"/api/2.0/pipelines/{pipeline_id}/updates"),
+            body={"full_refresh": full_refresh},
+        )
+    except ResourceConflict:
+        update_id = _adopt_exact_active_update(
+            manifest,
+            api,
+            pipeline_id=pipeline_id,
+            full_refresh=full_refresh,
+        )
+    else:
+        update_id = str(response.get("update_id") or "") if isinstance(response, Mapping) else ""
+    if not update_id:
+        raise PipelinePowerError(
+            "The Round 4 pipeline start returned no update identity, so it cannot be "
+            "polled safely"
+        )
     resumed_at = now().astimezone(UTC).isoformat()
     record = {
         "intent": _INTENT_RESUMING,
@@ -1102,6 +1256,7 @@ def start(
         pipeline_id=pipeline_id,
         cloud_state="",
         stopped_deliberately=False,
+        update_id=update_id,
         resuming_since=resumed_at,
     )
 

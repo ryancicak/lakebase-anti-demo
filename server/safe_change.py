@@ -123,6 +123,7 @@ class SafeChangeOwnershipScope:
 
     run_id: str
     owner: str
+    expires_at: str
     aws_account_id: str
     aws_region: str
 
@@ -131,6 +132,16 @@ class SafeChangeOwnershipScope:
             raise ValueError("run_id must be a lowercase deterministic resource identifier")
         if not self.owner.strip():
             raise ValueError("owner is required")
+        try:
+            expiry = datetime.fromisoformat(self.expires_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("expires_at must be an RFC 3339 UTC timestamp") from exc
+        if (
+            expiry.tzinfo is None
+            or expiry.utcoffset() is None
+            or expiry.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") != self.expires_at
+        ):
+            raise ValueError("expires_at must use canonical RFC 3339 UTC form")
         if _AWS_ACCOUNT_ID.fullmatch(self.aws_account_id) is None:
             raise ValueError("aws_account_id must be exactly 12 digits")
         if _AWS_REGION.fullmatch(self.aws_region) is None:

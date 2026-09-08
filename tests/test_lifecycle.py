@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import base64
 import json
 import re
 import threading
@@ -3177,6 +3178,7 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
         ("_grant_lakebase_app_projects", ()),
         ("_ensure_round4_app_roles", None),
         ("_grant_round4_uc_and_warehouse", None),
+        ("_ensure_round4_source_repair_job", "123"),
     ):
         monkeypatch.setattr(
             f"server.lifecycle.{helper}",
@@ -3213,6 +3215,8 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
 
     lifecycle._prepare_and_reseal_round4(manifest, timeout=1.0)
 
+    assert manifest.round4 is not None
+    assert manifest.round4.source_repair_job_id == "123"
     assert "coordination.test" in issued, (
         "a from-scratch install sealed Round 4 without issuing one coordination "
         "GRANT: `_prepare_and_reseal_round4` -> `_ensure_round4` no longer reaches "
@@ -3793,6 +3797,219 @@ def test_a_pipeline_that_outlived_its_synced_table_is_deleted_not_assumed_gone(
     # that is gone, and this is the last point at which anything still knows
     # the ID.
     assert looked == ["/api/2.0/pipelines/pipe-1", "/api/2.0/pipelines/pipe-1"]
+
+
+def test_round4_source_repair_rejects_an_extra_column_before_mutating(monkeypatch) -> None:
+    manifest = make_manifest()
+    names = _round4_names(manifest)
+    imported: dict[str, object] = {}
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        del profile, method, timeout
+        if path == "/api/2.0/workspace/import":
+            imported.update(body)
+        if path == "/api/2.1/jobs/create":
+            return {"job_id": 123}
+        return {}
+
+    monkeypatch.setattr("server.lifecycle._databricks_api", api)
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="{}"),
+    )
+    job_id = lifecycle._ensure_round4_source_repair_job(
+        manifest,
+        names,
+        setup_principal=manifest.databricks.user,
+        app_client_id="app-client",
+    )
+    source = base64.b64decode(str(imported["content"])).decode()
+
+    class Row:
+        def __init__(self, name: str, data_type: str) -> None:
+            self.col_name = name
+            self.data_type = data_type
+
+    rows = [
+        Row("entity_id", "string"),
+        Row("score", "double"),
+        Row("model_version", "string"),
+        Row("proof_nonce", "string"),
+        Row("updated_at", "timestamp"),
+        Row("unexpected", "string"),
+        Row("", ""),
+        Row("# Detailed Table Information", ""),
+        Row("Owner", manifest.databricks.user),
+        Row("Provider", "delta"),
+        Row("Type", "MANAGED"),
+    ]
+
+    class Spark:
+        @staticmethod
+        def sql(statement: str):
+            assert statement.startswith("DESCRIBE TABLE EXTENDED")
+            return SimpleNamespace(collect=lambda: rows)
+
+    with pytest.raises(RuntimeError, match="exact metadata contract changed"):
+        exec(source, {"spark": Spark()})
+
+    assert job_id == "123"
+    assert "[:5]" not in source
+    assert "CREATE OR REPLACE TABLE" in source
+    assert "DROP TABLE" not in source
+
+
+def test_round4_source_repair_treats_an_already_healthy_source_as_success(monkeypatch) -> None:
+    manifest = make_manifest()
+    names = _round4_names(manifest)
+    imported: dict[str, object] = {}
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        del profile, method, timeout
+        if path == "/api/2.0/workspace/import":
+            imported.update(body)
+        if path == "/api/2.1/jobs/create":
+            return {"job_id": 123}
+        return {}
+
+    monkeypatch.setattr("server.lifecycle._databricks_api", api)
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="{}"),
+    )
+    lifecycle._ensure_round4_source_repair_job(
+        manifest,
+        names,
+        setup_principal=manifest.databricks.user,
+        app_client_id="app-client",
+    )
+    source = base64.b64decode(str(imported["content"])).decode()
+
+    class Row:
+        def __init__(self, name: str, data_type: str) -> None:
+            self.col_name = name
+            self.data_type = data_type
+
+    metadata = [
+        Row("entity_id", "string"),
+        Row("score", "double"),
+        Row("model_version", "string"),
+        Row("proof_nonce", "string"),
+        Row("updated_at", "timestamp"),
+        Row("", ""),
+        Row("# Detailed Table Information", ""),
+        Row("Owner", manifest.databricks.user),
+        Row("Provider", "delta"),
+        Row("Type", "MANAGED"),
+    ]
+    statements: list[str] = []
+
+    class Spark:
+        @staticmethod
+        def sql(statement: str):
+            statements.append(statement)
+            if statement.startswith("DESCRIBE TABLE EXTENDED"):
+                return SimpleNamespace(collect=lambda: metadata)
+            if statement.startswith("DESCRIBE HISTORY"):
+                return SimpleNamespace(collect=lambda: [SimpleNamespace(version=1)])
+            raise AssertionError(f"healthy source must not be mutated: {statement}")
+
+    exec(source, {"spark": Spark()})
+
+    assert len(statements) == 2
+    assert statements[0].startswith("DESCRIBE TABLE EXTENDED")
+    assert statements[1].startswith("DESCRIBE HISTORY")
+
+
+def test_round4_source_repair_adopts_the_exact_job_left_by_an_interrupted_setup(
+    monkeypatch,
+) -> None:
+    manifest = make_manifest()
+    names = _round4_names(manifest)
+    owner_key = manifest.run_id
+    job_name = f"lakebase-anti-demo-{owner_key[:8]}-round4-source-repair"
+    calls: list[tuple[str, str, object]] = []
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        del profile, timeout
+        calls.append((method, path, body))
+        if path.startswith("/api/2.1/jobs/list"):
+            return {
+                "jobs": [
+                    {
+                        "job_id": 123,
+                        "settings": {"name": job_name},
+                    }
+                ]
+            }
+        if path == "/api/2.1/jobs/get?job_id=123":
+            return {
+                "job_id": 123,
+                "creator_user_name": manifest.databricks.user,
+                "settings": {"name": job_name},
+            }
+        return {}
+
+    monkeypatch.setattr("server.lifecycle._databricks_api", api)
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="{}"),
+    )
+
+    job_id = lifecycle._ensure_round4_source_repair_job(
+        manifest,
+        names,
+        setup_principal=manifest.databricks.user,
+        app_client_id="app-client",
+    )
+
+    assert job_id == "123"
+    assert not any(path == "/api/2.1/jobs/create" for _, path, _ in calls)
+    resets = [
+        body
+        for method, path, body in calls
+        if method == "post" and path == "/api/2.1/jobs/reset"
+    ]
+    assert len(resets) == 1
+    assert resets[0]["job_id"] == 123
+    assert resets[0]["new_settings"]["name"] == job_name
+
+
+def test_round4_cleanup_removes_the_installation_workspace_folder(monkeypatch) -> None:
+    manifest = make_manifest()
+    attach_round4(manifest)
+    manifest.round4.source_repair_job_id = "123"
+    calls: list[list[str]] = []
+    monkeypatch.setattr("server.lifecycle._delete_round4_pipeline", lambda candidate: None)
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda profile, path: {
+            "job_id": 123,
+            "creator_user_name": manifest.round4.setup_principal,
+            "settings": {
+                "name": (
+                    f"lakebase-anti-demo-{manifest.run_id[:8]}-round4-source-repair"
+                )
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda arguments, **kwargs: calls.append(arguments) or SimpleNamespace(stdout="{}"),
+    )
+    names = _round4_names(manifest)
+
+    _delete_round4_resources(manifest, (names, None, {}))
+
+    assert [
+        "databricks",
+        "workspace",
+        "delete",
+        f"/Shared/lakebase-anti-demo/{manifest.run_id}",
+        "--recursive",
+        "-p",
+        manifest.databricks.profile,
+    ] in calls
 
 
 def test_a_pipeline_that_survives_its_own_deletion_refuses_the_teardown(monkeypatch) -> None:
