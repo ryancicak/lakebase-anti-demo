@@ -111,8 +111,8 @@ expect "an invisible catalog is refused before anything is spent" \
   "FAIL Round 4 needs Unity Catalog 'customer_catalog'" \
   "$(run_block 0 '' customer_catalog something_else)"
 
-expect "the refusal names the variable that fixes it" \
-  "Set ROUND4_CATALOG to a catalog it can create schemas in" \
+expect "the refusal does not invent a sixth public input" \
+  "sealed installation no longer matches the accessible workspace context" \
   "$(run_block 0 '' customer_catalog something_else)"
 
 # The compiled-in default is `main`, which is likely but not guaranteed, so on a

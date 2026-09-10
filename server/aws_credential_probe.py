@@ -354,6 +354,10 @@ class ProbeExpectations:
     #: role's principal would then report `principal_mismatch` for the two
     #: callers the design exists to admit.
     runtime_role_trusted_principal_arns: tuple[str, ...] = ()
+    #: The role those principals must assume before any permission probe. Kept
+    #: separate from the trusted set because one proves who may enter and the
+    #: other is the exact role whose attached policies drive every AWS lane.
+    runtime_role_arn: str | None = None
 
 
 def probe_once(
@@ -430,6 +434,7 @@ def probe_once(
 
     runtime_trusted = expectations.runtime_role_trusted_principal_arns
     trusted = expectations.round5_trusted_principal_arn
+    permission_session = session
     if runtime_trusted:
         # Round 5's control role trusts the runtime role; the runtime role
         # trusts these. So the question this process has to answer is "may I
@@ -454,6 +459,34 @@ def probe_once(
                 account=account,
                 arn=arn,
             )
+        if not expectations.runtime_role_arn:
+            raise RuntimeError("runtime trusted principals are sealed without a runtime role ARN")
+        try:
+            response = session.client("sts", region_name=expectations.region).assume_role(
+                RoleArn=expectations.runtime_role_arn,
+                RoleSessionName="anti-demo-credential-probe",
+                DurationSeconds=900,
+            )
+            credentials = response.get("Credentials") or {}
+            if any(
+                not credentials.get(key)
+                for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
+            ):
+                raise RuntimeError("STS did not return the sealed runtime role")
+            permission_session = session_factory(
+                aws_access_key_id=credentials["AccessKeyId"],
+                aws_secret_access_key=credentials["SecretAccessKey"],
+                aws_session_token=credentials["SessionToken"],
+                region_name=expectations.region,
+            )
+        except (BotoCoreError, ClientError) as exc:
+            state, code = _classify(exc)
+            return CredentialVerdict(
+                state=state,
+                detail=_permission_failure_detail(state, code, expectations.region),
+                account=account,
+                arn=arn,
+            )
     elif trusted:
         verdict = principal_matches(arn, trusted)
         if verdict is False:
@@ -472,7 +505,7 @@ def probe_once(
             )
 
     try:
-        session.client("rds", region_name=expectations.region).describe_db_instances(
+        permission_session.client("rds", region_name=expectations.region).describe_db_instances(
             MaxRecords=20
         )
     except (BotoCoreError, ClientError) as exc:
@@ -704,11 +737,13 @@ def expectations_from_manifest(manifest: Any) -> ProbeExpectations:
     round5 = getattr(manifest, "round5", None)
     trusted = getattr(round5, "control_role_trusted_principal_arn", None)
     runtime_trusted = getattr(manifest.aws, "runtime_role_trusted_principal_arns", None)
+    runtime_role = getattr(manifest.aws, "runtime_role_arn", None)
     return ProbeExpectations(
         region=manifest.aws.region,
         account_id=manifest.aws.account_id,
         round5_trusted_principal_arn=str(trusted) if trusted else None,
         runtime_role_trusted_principal_arns=tuple(str(arn) for arn in (runtime_trusted or ())),
+        runtime_role_arn=str(runtime_role) if runtime_role else None,
     )
 
 

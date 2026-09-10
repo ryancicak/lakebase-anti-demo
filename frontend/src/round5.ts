@@ -1,13 +1,34 @@
 import type { DemoSession, LaneId, LaneSnapshot, RoundFiveSetupState } from './api/types'
 
 export const ROUND_FIVE_ID = 'survive_connection_spike' as const
-export const ROUND_FIVE_DISPLAY_TITLE = 'Get spike-ready'
+export const ROUND_FIVE_DISPLAY_TITLE = 'Ready a pooled application path'
+export const ROUND_FIVE_DISPLAY_TITLE_UPPER = 'READY A POOLED APPLICATION PATH'
 export const ROUND_FIVE_SCHEDULED_CLIENTS = 128
 export const ROUND_FIVE_WARMUPS = 4
 export const ROUND_FIVE_CONCURRENCY = 64
 export const ROUND_FIVE_WITNESS_CLIENTS = 64
 export const ROUND_FIVE_RUNNER = 'Python 3.12 + psycopg 3.3.4'
 export const ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS = 10
+export const ROUND_FIVE_BOUNDED_CHECK = '128 attempts, maximum 64 concurrent'
+
+const ROUND_FIVE_FIGHT_CARD_FOCUS: Record<string, string> = {
+  data_engineer: 'Lakebase includes a pool for up to 10,000 client connections. Data services get one application access path without a separate pooling handoff.',
+  software_engineer: 'Lakebase gives the app team a built-in pool for up to 10,000 client connections. The selected AWS path adds a pooling service that someone must configure, secure, and own.',
+  data_analyst: 'Lakebase can pool up to 10,000 client connections for the applications behind the data. Analysts get a more direct path to available application data without another access handoff.',
+  architect_it: 'Lakebase starts with a built-in pool for up to 10,000 client connections. The selected AWS path adds RDS Proxy, while direct connections and other pooling designs remain valid choices.',
+  data_scientist_ml: 'Lakebase gives model-serving applications a built-in pool for up to 10,000 client connections. The team can focus on serving behavior instead of adding a connection service first.',
+  dba: "Lakebase's built-in pool accepts up to 10,000 client connections and fans them into bounded PostgreSQL backends. The selected AWS path adds a pool the database team must configure and operate.",
+  sre: 'Lakebase absorbs up to 10,000 client connections through its built-in pool while protecting bounded backend slots. The selected AWS path adds a managed pooling service to monitor, secure, and support.',
+  executive: 'Lakebase gives teams a built-in application path for up to 10,000 client connections. The decision is how quickly a scalable path is ready and who carries the work.',
+  infosec: 'Lakebase includes a built-in pool for up to 10,000 client connections. The selected AWS path adds an identity, secrets, network policy, and an external service that needs a clear owner.',
+  application_owner: 'Lakebase gives the application a built-in pool for up to 10,000 client connections. The app team starts with a connection path instead of another launch dependency.',
+}
+
+export function roundFiveFightCardOpening(personaId: string): string {
+  const focus = ROUND_FIVE_FIGHT_CARD_FOCUS[personaId]
+    ?? 'Lakebase includes a built-in pool for up to 10,000 client connections. Teams still decide who owns the application path around it.'
+  return focus
+}
 
 export interface RoundFiveLaneResult {
   scheduled: number | null

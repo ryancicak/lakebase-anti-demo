@@ -19,7 +19,7 @@ from server.capacity import (
     NO_SUSPENSION_ROUNDS,
     RDS_CLASS_MEMORY_GIB,
     RDS_INSTANCE_CLASS,
-    ROUND5_PEAK_CLIENTS_PER_LANE,
+    ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE,
     ObservedCapacity,
     build_capacity_disclosure,
     capacity_parity,
@@ -193,13 +193,14 @@ class TestMaxConnections:
 
     def test_configured_class_clears_the_round5_contract(self) -> None:
         headroom = max_connections_for_memory_gib(rds_memory_gib(RDS_INSTANCE_CLASS) or 0)
-        assert headroom >= ROUND5_PEAK_CLIENTS_PER_LANE
-        assert headroom / ROUND5_PEAK_CLIENTS_PER_LANE > 3
+        assert ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE == 64
+        assert headroom >= ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE
+        assert headroom / ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE > 7
 
-    def test_previous_class_did_not_clear_the_contract(self) -> None:
-        """db.t4g.micro sat under the 128-client contract, not merely below Lakebase."""
+    def test_smallest_approved_class_clears_actual_concurrency(self) -> None:
+        """The 128 attempts are capped at 64 concurrent clients, so phases never sum."""
 
-        assert max_connections_for_memory_gib(1.0) < ROUND5_PEAK_CLIENTS_PER_LANE
+        assert max_connections_for_memory_gib(1.0) >= ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE
 
     def test_ceiling_is_applied(self) -> None:
         assert max_connections_for_memory_gib(100000.0) == 5000
@@ -224,16 +225,12 @@ class TestCapacityParity:
         """
 
         # The receipt case, and the reason its wording is pinned this precisely.
-        # Receipt `F9D4023E` ran the full 128-client Round 5 burst against RDS
-        # Proxy on a live `db.t4g.micro` and logged 128 attempts / 128 successes
-        # / 0 errors, because proxy multiplexing seated them. The 112 figure is
-        # the parameter-group formula against nominal memory, so the refusal is
-        # sound only as a statement about a nominal budget -- never as a claim
-        # that the box was observed unable to serve the contract. The memory
-        # ratio here agrees (0.5 CU against 1 GiB), so the connection budget is
-        # the only thing that can fail, which is what "does not match" being
-        # absent pins.
-        micro_under_the_burst = dict(
+        # Receipt `F9D4023E` ran 128 attempts at maximum 64 concurrent against
+        # RDS Proxy on a live `db.t4g.micro` and logged 128 successes. The 112
+        # figure is the nominal direct-connection budget. It clears the actual
+        # maximum concurrency because the separate 64-client witness starts only
+        # after the attempt phase closes.
+        micro_clears_bounded_check = dict(
             lakebase_max_cu=0.5,
             aurora_max_acu=None,
             rds_instance_class="db.t4g.micro",
@@ -283,7 +280,7 @@ class TestCapacityParity:
                 (),
             ),
             (
-                "shrunken rds lane in the round that bursts",
+                "shrunken rds lane in the bounded-check round",
                 dict(
                     lakebase_max_cu=2.0,
                     aurora_max_acu=None,
@@ -291,8 +288,8 @@ class TestCapacityParity:
                     round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
                 ),
                 False,
-                ("128-client",),
-                (),
+                ("1 GiB",),
+                ("maximum 64 concurrent clients",),
             ),
             (
                 # The gate being round-scoped must not make it unreachable.
@@ -354,16 +351,11 @@ class TestCapacityParity:
                 (),
             ),
             (
-                "memory-matched but under the burst budget",
-                micro_under_the_burst,
-                False,
-                (
-                    "128-client",
-                    "nominal connection budget",
-                    "not an observed limit",
-                    "RDS Proxy multiplexing may still seat the burst",
-                ),
-                ("does not match", "allows about"),
+                "smallest matched class clears the bounded check",
+                micro_clears_bounded_check,
+                True,
+                ("matched memory ceiling",),
+                ("maximum 64 concurrent clients", "does not match"),
             ),
         )
 
@@ -375,16 +367,18 @@ class TestCapacityParity:
             for fragment in absent:
                 assert fragment not in result.detail, f"{name}: unwanted {fragment!r}"
 
-    def test_the_connection_budget_binds_only_the_round_that_bursts(self) -> None:
-        """The 128-client contract is Round 5's, and only Round 5's.
+    def test_the_connection_budget_binds_only_the_bounded_round(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A synthetic budget above the smallest class binds only Round 5.
 
-        A db.t4g.micro seats about 112 connections, under Round 5's burst. In
-        Round 2 or Round 3 nothing comes near that number, so refusing the class
-        there rejects a lane on a requirement the round never has to meet. The
-        memory mismatch is still a failure -- that one is about parity and holds
-        everywhere -- but it must be the only one named.
+        The production value is 64 and every approved class clears it. Raising
+        the constant to 113 keeps this branch non-vacuous without pretending the
+        scored and witness phases overlap.
         """
 
+        assert ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE == 64
+        monkeypatch.setattr(capacity, "ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE", 113)
         for round_id in (
             RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
             RoundId.RECOVER_DELETED_ORDER,
@@ -398,7 +392,16 @@ class TestCapacityParity:
             )
             assert not result.ok, round_id
             assert "1 GiB" in result.detail, round_id
-            assert "128-client" not in result.detail, round_id
+            assert "maximum 113 concurrent clients" not in result.detail, round_id
+
+        round_five = capacity_parity(
+            lakebase_max_cu=0.5,
+            aurora_max_acu=None,
+            rds_instance_class="db.t4g.micro",
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+        assert not round_five.ok
+        assert "maximum 113 concurrent clients" in round_five.detail
 
     def test_every_approved_class_matches_its_own_memory_ceiling(self) -> None:
         """Memory matching is checked per class, independent of the class chosen."""
@@ -410,12 +413,9 @@ class TestCapacityParity:
                 rds_instance_class=instance_class,
                 round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
             )
-            expected_ok = (
-                max_connections_for_memory_gib(memory) >= ROUND5_PEAK_CLIENTS_PER_LANE
-            )
-            assert result.ok is expected_ok, f"{instance_class} at {memory} GiB"
-            if result.ok:
-                assert "does not match" not in result.detail
+            assert max_connections_for_memory_gib(memory) >= 64
+            assert result.ok, f"{instance_class} at {memory} GiB"
+            assert "does not match" not in result.detail
 
 
 class TestFloors:
@@ -770,6 +770,20 @@ class TestTheNoteMayNotOutClaimTheVerdict:
             assert "not vendor defaults" in disclosure.note
             assert "shortest supported setting" in disclosure.note
 
+    @pytest.mark.parametrize("competitor", [AURORA, RDS])
+    def test_round_five_separates_client_capacity_from_measured_concurrency(
+        self, competitor: CompetitorId
+    ) -> None:
+        disclosure = build_capacity_disclosure(
+            RoundId.SURVIVE_CONNECTION_SPIKE,
+            competitor,
+        )
+        assert "443 direct PostgreSQL slots" in disclosure.note
+        assert "approximately 399 active backend connections" in disclosure.note
+        assert "up to 10,000 client connections per pooled compute endpoint" in disclosure.note
+        assert "not exercised by this 64-concurrent bout" in disclosure.note
+        assert "10,000 backend" not in disclosure.note
+
     def test_the_failures_travel_on_the_result_rather_than_being_reparsed(
         self,
     ) -> None:
@@ -1025,15 +1039,16 @@ class TestEachRoundIsComparedAgainstItsOwnEndpoint:
         detail = lifecycle._capacity_parity(_v7_manifest(monkeypatch)).detail
         assert "Lakebase floor not reported" in detail
 
-    def test_the_burst_budget_binds_round_five_alone(
+    def test_the_bounded_client_budget_binds_round_five_alone(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Defect 2, already fixed in capacity.py and pinned from this end too: the
-        # round context has to reach `capacity_parity` for the rule to be scoped at
-        # all. A class that seats fewer than 128 clients fails on r5 and on r5 only.
+        # The real cap is 64 and clears every approved class. Lift it just above
+        # the smallest class to prove the round context still scopes the gate.
         narrow = "db.t4g.micro"
         memory = RDS_CLASS_MEMORY_GIB[narrow]
-        assert max_connections_for_memory_gib(memory) < ROUND5_PEAK_CLIENTS_PER_LANE
+        assert ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE == 64
+        monkeypatch.setattr(capacity, "ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE", 113)
+        assert max_connections_for_memory_gib(memory) < 113
         # Memory-matched on both sides, so the only thing that can fail is the
         # client budget.
         for round_id, expected in (

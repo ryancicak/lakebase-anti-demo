@@ -13,6 +13,7 @@ HARNESS = REPO / "tests" / "bootstrap_stub_harness.sh"
 # rather than silently going unrun.
 EXPECTED_CASES = {
     "case_check_clean",
+    "case_multiple_warehouses_are_derived",
     "case_banned_files",
     "case_print_env",
     "case_s3_refuses_existing",
@@ -23,6 +24,12 @@ EXPECTED_CASES = {
     "case_deploy_refusals",
     "case_deploy_runner_guard",
     "case_deploy_happy",
+    "case_deploy_fresh_pair_propagation",
+    "case_deploy_credential_isolation",
+    "case_incomplete_aws_pair_refused",
+    "case_exact_five_inputs_required",
+    "case_runtime_identity_refusals",
+    "case_five_input_full_acceptance",
     "case_deploy_seal_only",
     "case_deploy_record_merge",
     "case_deploy_seal_snapshot",

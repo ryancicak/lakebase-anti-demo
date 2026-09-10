@@ -19,6 +19,7 @@
         "rds:DescribeDBSnapshots",
         "rds:DescribeDBSubnetGroups",
         "rds:DescribeEvents",
+        "rds:DescribeGlobalClusters",
         "rds:DescribeOrderableDBInstanceOptions",
         "rds:ListTagsForResource"
       ],

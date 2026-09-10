@@ -21,7 +21,7 @@ Three properties are what make it worth putting on screen at all:
    down, so it is paid once for every descent. At one descent a day the 5x is
    irrelevant; a workload that parks twenty times a day pays it twenty times.
    Cost tracks *how often you descend*, not how long you sat idle -- which is
-   why this is the cost face of Round 5's spike-readiness story rather than an
+   why this is the cost face of Round 5's pooled-path setup story rather than an
    isolated aside.
 
 2. **The dollars are small and are reported as small.** Per descent these are

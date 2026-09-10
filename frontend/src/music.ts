@@ -68,9 +68,9 @@ const THEMES: readonly ListeningTheme[] = [
   {
     id: 'survive_connection_spike',
     round: 5,
-    title: 'Get spike-ready',
+    title: 'Ready a pooled application path',
     musicTitle: 'Hold the Line',
-    concept: 'D minor over a dominant A pedal at 84 BPM. The spike is a swell, not an acceleration — four decibels louder, identical note count.',
+    concept: 'D minor over a dominant A pedal at 84 BPM. The bounded connection check is a swell, not an acceleration — four decibels louder, identical note count.',
   },
   {
     id: 'analyze_live_orders_without_slowing_checkout',

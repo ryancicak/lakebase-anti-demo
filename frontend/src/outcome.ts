@@ -95,7 +95,7 @@ function oneLowerBoundLane(
 /**
  * Classify only the evidence shape. Round semantics deliberately do not live
  * here: an exact setup stop plus a lower bound decides R3, but cannot decide R5
- * until the shared spike contract also passes.
+ * until the bounded connection check also passes.
  */
 export function classifyEvidence(input: EvidenceInput): ClassifiedEvidence {
   const lakebaseExact = input.lakebase.exactMs !== null

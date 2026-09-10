@@ -214,6 +214,11 @@ output "round5_runner_instance_id" {
   value       = aws_instance.round5_runner.id
 }
 
+output "round5_runner_instance_type" {
+  description = "Capacity-validated EC2 shape of the neutral Round 5 runner."
+  value       = aws_instance.round5_runner.instance_type
+}
+
 output "round5_runner_instance_arn" {
   description = "ARN of the neutral SSM-managed Round 5 runner."
   value       = aws_instance.round5_runner.arn

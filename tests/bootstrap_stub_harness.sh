@@ -65,11 +65,16 @@ case "$args" in
     echo "An error occurred (DryRunOperation) when calling the operation: Request would have succeeded" >&2
     exit 254 ;;
   *"sts get-caller-identity"*)
-    # A deploy-only run must never reach this. Setting STUB_STS_FAILS is how the
-    # seal-only case proves it: an installation provisioned through an SSO
-    # profile has no usable credentials here, and that must not block a redeploy.
     [[ "${STUB_STS_FAILS:-0}" == "1" ]] && { echo "Unable to locate credentials" >&2; exit 255; }
-    echo "{\"UserId\":\"AIDASTUB\",\"Account\":\"${STUB_ACCOUNT:-111122223333}\",\"Arn\":\"${STUB_ARN:-arn:aws:iam::111122223333:user/stub}\"}" ;;
+    account="${STUB_ACCOUNT:-111122223333}"
+    if [[ -n "${STUB_ARN:-}" ]]; then
+      arn="$STUB_ARN"
+    elif [[ "${AWS_ACCESS_KEY_ID:-}" == ASIA* || -n "${AWS_SESSION_TOKEN:-}" ]]; then
+      arn="arn:aws:sts::$account:assumed-role/AWSReservedSSO_stub/operator"
+    else
+      arn="arn:aws:iam::$account:user/stub"
+    fi
+    echo "{\"UserId\":\"AIDASTUB\",\"Account\":\"$account\",\"Arn\":\"$arn\"}" ;;
   *"describe-vpcs"*"Vpcs[0].VpcId"*)
     [[ "${STUB_NO_DEFAULT_VPC:-0}" == "1" ]] && { echo "None"; exit 0; }
     echo "vpc-0stub" ;;
@@ -120,6 +125,10 @@ case "$args" in
     # but whose process never came up: curl -f sees 502 and exits non-zero.
     [[ "${STUB_APP_NOT_SERVING:-0}" == "1" ]] && exit 22
     echo '{"status":"ok","database_connections":"sealed"}' ;;
+  *"/readyz"*)
+    echo '{"status":"ready","credentials_state":"ok","degraded":false,"ring_ready":true}' ;;
+  *"/api/catalog"*)
+    echo '{"rounds":[{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"}]}' ;;
   *"checkip.amazonaws.com"*) echo "203.0.113.7" ;;
   *) echo '{}' ;;
 esac
@@ -131,7 +140,12 @@ args="$*"
 case "$args" in
   *"current-user me"*) echo "{\"userName\":\"${STUB_DB_USER:-stub@example.com}\",\"id\":\"42\"}" ;;
   *"postgres list-projects"*) echo '{"projects":[]}' ;;
-  *"warehouses list"*) echo '[{"id":"whstub","name":"Stub WH","warehouse_type":"PRO"}]' ;;
+  *"warehouses list"*)
+    if [[ -n "${STUB_WAREHOUSES:-}" ]]; then
+      printf '%s\n' "$STUB_WAREHOUSES"
+    else
+      echo '[{"id":"whstub","name":"Stub WH","warehouse_type":"PRO"}]'
+    fi ;;
   *"catalogs get"*)
     [[ "${STUB_CATALOG_MISSING:-0}" == "1" ]] && { echo "does not exist" >&2; exit 1; }
     echo '{"name":"stubcat"}' ;;
@@ -165,6 +179,18 @@ JSON
       echo "Error: Secret value must be specified in a create request!" >&2
       exit 1
     fi
+    # Record only which resource received how many bytes. This proves a fake
+    # 20/40-character pair reached both writes without putting either value in
+    # the harness output or its scratch files.
+    for arg in "$@"; do
+      case "$arg" in
+        manifest-json | aws-access-key-id | aws-secret-access-key)
+          printf '%s=%s\n' "$arg" "${#body}" \
+            >>"${STUB_STATE_DIR:-/tmp}/secret-write-lengths"
+          break
+          ;;
+      esac
+    done
     exit 0 ;;
   *"api post /api/2.0/secrets/put"*)
     # The REST endpoint underneath, which accepts "string_value": "" where the
@@ -252,21 +278,18 @@ STUB
   chmod +x "$dir"/bin/*
 }
 
+DEFAULT_STUB_ACCESS_KEY="AKIA""0000000000000000"
+
 write_env() {
   cat >"$1" <<EOF
-DATABRICKS_HOST=https://dbc-stub-0000.cloud.databricks.com
-DATABRICKS_CLIENT_ID=stub-client
-DATABRICKS_CLIENT_SECRET=stub-secret
-ANTI_DEMO_OWNER=stub@example.com
+${OMIT_DATABRICKS_HOST:+#}DATABRICKS_HOST=https://dbc-stub-0000.cloud.databricks.com
+${OMIT_DATABRICKS_CLIENT_ID:+#}DATABRICKS_CLIENT_ID=stub-client
+${OMIT_DATABRICKS_CLIENT_SECRET:+#}DATABRICKS_CLIENT_SECRET=stub-secret
 EOF
-  # NO_AWS_KEYS reproduces an installation provisioned through an SSO profile:
-  # the operator has no static keys to hand a deploy-only run, which is the
-  # normal case for a seal republish.
   if [[ "${NO_AWS_KEYS:-0}" != "1" ]]; then
     cat >>"$1" <<EOF
-AWS_ACCESS_KEY_ID=${ONLY_KEY_ID:-AKIASTUB}
-${OMIT_SECRET_KEY:+#}AWS_SECRET_ACCESS_KEY=stubsecret
-AWS_DEFAULT_REGION=us-west-2
+${OMIT_ACCESS_KEY:+#}AWS_ACCESS_KEY_ID=${ONLY_KEY_ID:-$DEFAULT_STUB_ACCESS_KEY}
+${OMIT_SECRET_KEY:+#}AWS_SECRET_ACCESS_KEY=${ONLY_SECRET_KEY:-0000000000000000000000000000000000000000}
 EOF
   fi
   printf '%s\n' "${EXTRA_ENV:-}" >>"$1"
@@ -288,9 +311,17 @@ path.write_text(json.dumps({
     "expires_at": "2099-01-01T00:00:00Z",
     "aws": {"account_id": "111122223333", "region": "us-west-2",
             "auth_mode": "environment", "profile": None,
-            "terraform_state": str(path.parent / "terraform.tfstate")},
+            "terraform_state": str(path.parent / "terraform.tfstate"),
+            "runtime_role_arn": "arn:aws:iam::111122223333:role/anti-demo-runtime",
+            "runtime_role_trusted_principal_arns": [
+                "arn:aws:iam::111122223333:user/stub"
+            ]},
     "databricks": {"user": "stub@example.com", "profile": "stub"},
     "round4": {"storage_catalog": "stubcat"},
+    "round5": {
+        "control_role_trusted_principal_arn":
+            "arn:aws:iam::111122223333:role/anti-demo-runtime"
+    },
 }, indent=2) + "\n", encoding="utf-8")
 PY
 }
@@ -354,6 +385,12 @@ case_check_clean() {
   check "advertises the s3 opt-in" "opt in with --state-backend s3"
   check "reads app.yaml resource keys" "app.yaml requires"
   check "no manifest means first provision" "this will be a first provision"
+  check "derives the permanent IAM user" \
+    "derived persistent app principal arn:aws:iam::111122223333:user/stub"
+  check "derives nonempty runtime trust" \
+    "runtime trust resolved automatically for account 111122223333"
+  check "uses a region without a sixth input" \
+    "region us-west-2 selected by the documented safe default"
   check_absent "no credential leaked" "stubsecret"
   check_absent "no client secret leaked" "stub-secret"
 
@@ -368,6 +405,82 @@ case_check_clean() {
   else
     printf '  %sok%s   check mode wrote no bootstrap.json\n' "$GREEN" "$RESET"
     PASS=$((PASS + 1))
+  fi
+}
+
+case_multiple_warehouses_are_derived() {
+  printf '\n%s== multiple warehouses need no sixth input ==%s\n' "$BOLD" "$RESET"
+  local sb gen status
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_WAREHOUSES='[
+    {"id":"z-classic","name":"Classic","warehouse_type":"CLASSIC","state":"RUNNING"},
+    {"id":"b-serverless","name":"Serverless B","enable_serverless_compute":true,"state":"STOPPED"},
+    {"id":"a-serverless","name":"Serverless A","enable_serverless_compute":true,"state":"RUNNING"}
+  ]' run "$sb"
+  status=$?
+  check "selects serverless then running deterministically" \
+    "derived SQL warehouse deterministically from 3 visible candidates: a-serverless"
+  check_absent "does not request a warehouse variable" "Set DATABRICKS_WAREHOUSE_ID"
+  if ((status == 0)); then
+    printf '  %sok%s   multi-warehouse five-input path exits zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s multi-warehouse five-input path exited %s\n' "$RED" "$RESET" "$status"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+case_five_input_full_acceptance() {
+  printf '\n%s== exact five inputs drive provision, publication, and readiness ==%s\n' "$BOLD" "$RESET"
+  local sb gen source status
+  gen="$(mktemp -d)/gen"
+  source="$gen/ready-source.json"
+  write_manifest "$source"
+  python3 - "$source" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+doc = json.loads(p.read_text())
+doc["aws"]["runtime_role_arn"] = "arn:aws:iam::111122223333:role/anti-demo-runtime"
+doc["aws"]["runtime_role_trusted_principal_arns"] = [
+    "arn:aws:iam::111122223333:user/stub"
+]
+p.write_text(json.dumps(doc, indent=2) + "\n")
+PY
+  sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$gen"$'/antidemo-apply-stub' sandbox)"
+  cat >"$gen/antidemo-apply-stub" <<STUB
+#!/usr/bin/env bash
+set -eu
+printf '%s\\n' "\$ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS" >"$gen/applied-runtime-trust"
+cp "$source" "\$ANTI_DEMO_MANIFEST"
+STUB
+  chmod +x "$gen/antidemo-apply-stub"
+  STUB_STATE_DIR="$sb" run "$sb" --apply --deploy-app --yes
+  status=$?
+  check "provision receives exact nonempty derived trust" \
+    "runtime trust resolved automatically for account 111122223333"
+  if [[ "$(cat "$gen/applied-runtime-trust" 2>/dev/null)" == \
+    "arn:aws:iam::111122223333:user/stub" ]]; then
+    printf '  %sok%s   Terraform/setup boundary received the exact derived principal\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s Terraform/setup boundary did not receive exact derived principal\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+  check "publishes the access key secret" "rotated aws-access-key-id"
+  check "publishes the secret-key secret" "rotated aws-secret-access-key"
+  check "reaches platform readiness verification" "compute ACTIVE, deployment SUCCEEDED"
+  check "reaches serving verification" "GET /api/health -> 200"
+  check "reaches all-six readiness verification" \
+    "GET /readyz is ready and all six catalog rounds are ready"
+  check_absent "never logs the access key" "AKIA""0000000000000000"
+  check_absent "never logs the client secret" "stub-secret"
+  if ((status == 0)); then
+    printf '  %sok%s   full five-input acceptance exits zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s full five-input acceptance exited %s\n' "$RED" "$RESET" "$status"
+    FAIL=$((FAIL + 1))
   fi
 }
 
@@ -580,7 +693,7 @@ case_deploy_runner_guard() {
   gen="$(mktemp -d)/gen"
   write_manifest "$gen/manifest.json"
   tmp="$gen/manifest.next"
-  jq '.round5 = {"harness_sha256": ("0" * 64)}' "$gen/manifest.json" >"$tmp"
+  jq '.round5.harness_sha256 = ("0" * 64)' "$gen/manifest.json" >"$tmp"
   mv "$tmp" "$gen/manifest.json"
   sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
 
@@ -624,7 +737,9 @@ case_deploy_happy() {
   sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
   STUB_STATE_DIR="$sb" run "$sb" --deploy-only --yes
   check "publishes the seal" "published the seal to"
-  check "rotates the aws key when one is supplied" "rotated aws-access-key-id"
+  check "rotates the aws key ID when one is supplied" "rotated aws-access-key-id"
+  check "rotates the matching aws secret" "rotated aws-secret-access-key"
+  check_absent "does not contradict those writes" "no AWS access key is published"
   check "empty session token is explained" "holds the empty string"
   # This is the configuration the installer is designed around -- an access key
   # and secret from a permanent IAM user, and no session token -- so this run
@@ -677,48 +792,228 @@ case_deploy_happy() {
   fi
 }
 
-# A seal republish on an installation that was provisioned through an SSO
-# profile. There are no static keys to supply, so the run must reach Databricks
-# without authenticating to AWS at all, publish the seal, and leave the app's
-# AWS credential secrets exactly as they are.
+# The exact fresh-scope regression: both active env assignments survive
+# `source`, both values are published, then the old code consulted the
+# pre-publication `EXISTING_KEYS` snapshot and announced that the access key did
+# not exist. The length-only write record is the positive control -- deleting
+# the writes cannot make this pass just by deleting the false warning.
+case_deploy_fresh_pair_propagation() {
+  printf '\n%s== fresh 20/40 AWS pair reaches both app secrets ==%s\n' "$BOLD" "$RESET"
+  local sb gen access_id secret temporary_id
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  access_id="AKIA""1111111111111111"
+  secret="2222222222222222222222222222222222222222"
+  sb="$(ONLY_KEY_ID="$access_id" ONLY_SECRET_KEY="$secret" \
+    EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+
+  STUB_STATE_DIR="$sb" STUB_SECRET_KEYS="manifest-json" \
+    run "$sb" --deploy-only --yes
+
+  check "the active key ID is published" "rotated aws-access-key-id"
+  check "the active secret is published" "rotated aws-secret-access-key"
+  check_absent "the post-write state is not stale" "no AWS access key is published"
+  check_absent "the key ID is never logged" "$access_id"
+  check_absent "the secret is never logged" "$secret"
+  if grep -qxF "aws-access-key-id=20" "$sb/secret-write-lengths" \
+    && grep -qxF "aws-secret-access-key=40" "$sb/secret-write-lengths"; then
+    printf '  %sok%s   both writes received the complete fake pair, by length only\n' \
+      "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s fake pair did not reach both writes by the expected lengths\n' \
+      "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # Credential classification may inspect the ID's shape, but even a refusal
+  # must not render the supplied ID. This was previously interpolated into the
+  # temporary-session error verbatim.
+  temporary_id="ASIA""5555555555555555"
+  sb="$(ONLY_KEY_ID="$temporary_id" ONLY_SECRET_KEY="$secret" \
+    EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  run "$sb" --deploy-only --yes
+  check "temporary credentials are still refused" \
+    "REFUSING TO PUBLISH A CREDENTIAL THAT EXPIRES"
+  check_absent "the refused temporary key ID is withheld" "$temporary_id"
+  check_absent "the refused temporary secret is withheld" "$secret"
+}
+
+case_deploy_credential_isolation() {
+  printf '\n%s== deploy-only isolates and verifies the app credential ==%s\n' "$BOLD" "$RESET"
+  local sb gen status
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+
+  AWS_ACCESS_KEY_ID="ASIA-STUB" \
+    AWS_SECRET_ACCESS_KEY="9999999999999999999999999999999999999999" \
+    AWS_SESSION_TOKEN="operator-sso-session" \
+    AWS_PROFILE="operator-sso" \
+    AWS_DEFAULT_PROFILE="operator-sso" \
+    STUB_STATE_DIR="$sb" run "$sb" --deploy-only --yes
+  status=$?
+  check "the file pair wins over ambient SSO" \
+    "app credential principal arn:aws:iam::111122223333:user/stub matches the sealed runtime-role trust"
+  check_absent "ambient SSO is never selected" "REFUSING TO PUBLISH A CREDENTIAL THAT EXPIRES"
+  check "the permanent access key is published" "rotated aws-access-key-id"
+  check "the permanent secret key is published" "rotated aws-secret-access-key"
+  if ((status == 0)); then
+    printf '  %sok%s   ambient SSO isolation deploy exits zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s ambient SSO isolation deploy exited %d\n' "$RED" "$RESET" "$status"
+    FAIL=$((FAIL + 1))
+  fi
+
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_ARN="arn:aws:iam::111122223333:user/not-the-sealed-app" \
+    STUB_STATE_DIR="$sb" run "$sb" --deploy-only --yes
+  status=$?
+  check "principal mismatch is refused" \
+    "REFUSING TO PUBLISH AN AWS APP CREDENTIAL OUTSIDE THE SEALED ROLE CHAIN"
+  check "mismatch states the pre-write boundary" \
+    "No Databricks secret, workspace source, or app restart was changed"
+  check_absent "mismatch never publishes the seal" "published the seal to"
+  check_absent "mismatch never restarts the app" "restart requested"
+  if [[ ! -e "$sb/secret-write-lengths" && $status -ne 0 ]]; then
+    printf '  %sok%s   principal mismatch made zero secret writes\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s principal mismatch wrote a secret or exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+case_incomplete_aws_pair_refused() {
+  printf '\n%s== incomplete AWS pairs stop before every side effect ==%s\n' "$BOLD" "$RESET"
+  local sb gen status access_id secret
+  gen="$(mktemp -d)/gen"
+  access_id="AKIA""3333333333333333"
+  secret="4444444444444444444444444444444444444444"
+
+  sb="$(OMIT_ACCESS_KEY=1 ONLY_SECRET_KEY="$secret" \
+    EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  run "$sb" --apply --yes
+  status=$?
+  check "secret-only names the absent key ID" \
+    "AWS_SECRET_ACCESS_KEY is set, but AWS_ACCESS_KEY_ID is empty or absent"
+  check "secret-only states the side-effect boundary" \
+    "Nothing was provisioned, deployed, or published"
+  check_absent "secret-only never reaches a cloud step" "AWS identity"
+  check_absent "secret-only never logs the supplied half" "$secret"
+  if ((status != 0)); then
+    printf '  %sok%s   secret-only exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s secret-only exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  sb="$(OMIT_SECRET_KEY=1 ONLY_KEY_ID="$access_id" \
+    EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  run "$sb" --deploy-only --yes
+  status=$?
+  check "key-ID-only names the absent secret" \
+    "AWS_ACCESS_KEY_ID is set, but AWS_SECRET_ACCESS_KEY is empty or absent"
+  check "key-ID-only states the side-effect boundary" \
+    "Nothing was provisioned, deployed, or published"
+  check_absent "key-ID-only never reaches Databricks" "Databricks service principal profile"
+  check_absent "key-ID-only never logs the supplied half" "$access_id"
+  if ((status != 0)); then
+    printf '  %sok%s   key-ID-only exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s key-ID-only exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+case_exact_five_inputs_required() {
+  printf '\n%s== every one of the exact five inputs is required before mutation ==%s\n' "$BOLD" "$RESET"
+  local sb gen status before after name
+  for name in \
+    DATABRICKS_HOST DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET \
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+    gen="$(mktemp -d)/gen"
+    case "$name" in
+      DATABRICKS_HOST) sb="$(OMIT_DATABRICKS_HOST=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)" ;;
+      DATABRICKS_CLIENT_ID) sb="$(OMIT_DATABRICKS_CLIENT_ID=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)" ;;
+      DATABRICKS_CLIENT_SECRET) sb="$(OMIT_DATABRICKS_CLIENT_SECRET=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)" ;;
+      AWS_ACCESS_KEY_ID) sb="$(OMIT_ACCESS_KEY=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)" ;;
+      AWS_SECRET_ACCESS_KEY) sb="$(OMIT_SECRET_KEY=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)" ;;
+    esac
+    before="$(shasum -a 256 "$sb/home/.databrickscfg")"
+    run "$sb" --apply --yes
+    status=$?
+    after="$(shasum -a 256 "$sb/home/.databrickscfg")"
+    if ((status != 0)) && [[ "$before" == "$after" && ! -e "$gen/manifest.json" ]]; then
+      printf '  %sok%s   %s missing: refused before file/cloud mutation\n' "$GREEN" "$RESET" "$name"
+      PASS=$((PASS + 1))
+    else
+      printf '  %sFAIL%s %s missing: status=%s profile_unchanged=%s manifest_absent=%s\n' \
+        "$RED" "$RESET" "$name" "$status" "$([[ "$before" == "$after" ]] && echo true || echo false)" \
+        "$([[ ! -e "$gen/manifest.json" ]] && echo true || echo false)"
+      FAIL=$((FAIL + 1))
+    fi
+    check_absent "$name missing never reaches Databricks" "Databricks service principal profile"
+  done
+}
+
+case_runtime_identity_refusals() {
+  printf '\n%s== runtime identity is derived and refused safely when ineligible ==%s\n' "$BOLD" "$RESET"
+  local sb gen status
+  gen="$(mktemp -d)/gen"
+
+  sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nAWS_EXPECTED_ACCOUNT_ID=999900001111' sandbox)"
+  STUB_ACCOUNT=111122223333 run "$sb" --apply --yes
+  status=$?
+  check "account mismatch is named" "AWS_EXPECTED_ACCOUNT_ID"
+  check "account mismatch is before Terraform" "Refusing before Terraform"
+  check_absent "account mismatch never provisions" "Running Terraform apply"
+  ((status != 0)) && { printf '  %sok%s   account mismatch exits non-zero\n' "$GREEN" "$RESET"; PASS=$((PASS + 1)); } ||
+    { printf '  %sFAIL%s account mismatch exited zero\n' "$RED" "$RESET"; FAIL=$((FAIL + 1)); }
+
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/root.json" sandbox)"
+  STUB_ARN='arn:aws:iam::111122223333:root' run "$sb" --apply --yes
+  status=$?
+  check "root identity is unsupported" "unsupported principal"
+  check_absent "root never provisions" "Running Terraform apply"
+  ((status != 0)) && { printf '  %sok%s   root exits non-zero\n' "$GREEN" "$RESET"; PASS=$((PASS + 1)); } ||
+    { printf '  %sFAIL%s root exited zero\n' "$RED" "$RESET"; FAIL=$((FAIL + 1)); }
+
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/assumed.json" sandbox)"
+  STUB_ARN='arn:aws:sts::111122223333:assumed-role/stub/session' run "$sb" --apply --yes
+  status=$?
+  check "assumed role without token is refused" "temporary session requires"
+  check_absent "assumed role never provisions" "Running Terraform apply"
+  ((status != 0)) && { printf '  %sok%s   assumed role exits non-zero\n' "$GREEN" "$RESET"; PASS=$((PASS + 1)); } ||
+    { printf '  %sFAIL%s assumed role exited zero\n' "$RED" "$RESET"; FAIL=$((FAIL + 1)); }
+}
+
+# Deploy-only obeys the same five-input contract. A seal-only path would retain
+# unknown or expired app credentials, so it is intentionally refused before
+# Databricks or the filesystem is touched.
 case_deploy_seal_only() {
-  printf '\n%s== deploy-only without AWS keys (seal republish) ==%s\n' "$BOLD" "$RESET"
-  local sb gen
+  printf '\n%s== deploy-only still requires the five inputs ==%s\n' "$BOLD" "$RESET"
+  local sb gen status
   gen="$(mktemp -d)/gen"
   write_manifest "$gen/manifest.json"
 
   sb="$(NO_AWS_KEYS=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
-  STUB_STS_FAILS=1 \
-    STUB_SECRET_KEYS='manifest-json aws-access-key-id aws-secret-access-key aws-session-token' \
-    run "$sb" --deploy-only --yes
-  check "succeeds with no AWS credentials at all" "compute ACTIVE, deployment SUCCEEDED"
-  check_absent "never reaches the AWS identity step" "Unable to locate credentials"
-  check_absent "and does not print the AWS identity header" "AWS identity"
-  check "says it is republishing the seal only" "republishes the seal only"
-  check "still publishes the seal" "published the seal to"
-  check "leaves the access key alone" "aws-access-key-id already exists"
-  check "leaves the session token alone" "aws-session-token already exists"
-  check "warns the AWS credentials may be expired" "AWS credentials were not refreshed"
-
-  # The same run when the scope has no AWS secrets at all must refuse: a
-  # valueFrom whose resource is missing fails the container at startup, so
-  # "leave it alone" is not available.
-  sb="$(NO_AWS_KEYS=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
-  STUB_SECRET_KEYS='manifest-json' run "$sb" --deploy-only --yes
-  local status=$?
-  check "refuses when the scope lacks the AWS secrets" "does not have it"
+  run "$sb" --deploy-only --yes
+  status=$?
+  check "names the first missing AWS input" "AWS_ACCESS_KEY_ID is not set"
+  check "states the pre-mutation boundary" "Nothing was changed"
+  check_absent "never reaches Databricks" "Databricks service principal profile"
+  check_absent "never publishes the seal" "published the seal to"
   if ((status != 0)); then
-    printf '  %sok%s   %s\n' "$GREEN" "$RESET" "and exits non-zero"
+    printf '  %sok%s   %s\n' "$GREEN" "$RESET" "exits non-zero"
     PASS=$((PASS + 1))
   else
-    printf '  %sFAIL%s %s\n' "$RED" "$RESET" "and exits non-zero"
+    printf '  %sFAIL%s %s\n' "$RED" "$RESET" "exits non-zero"
     FAIL=$((FAIL + 1))
   fi
-
-  # Half a pair would sign requests with a mismatched credential.
-  sb="$(OMIT_SECRET_KEY=1 EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
-  run "$sb" --deploy-only --yes
-  check "refuses half an AWS key pair" "only one half of the AWS key pair"
 }
 
 # --deploy-only resolves a strict subset of the derived values: it never
@@ -895,7 +1190,7 @@ case_deploy_failures() {
   check "detects an app that never starts" "The app did not come up"
   check "surfaces the real startup error" "InvalidStateError"
   check "names the lifespan cause" "raises inside the FastAPI lifespan"
-  check "exits non-zero" "the deploy reported success but the app is not serving"
+  check "exits non-zero" "the deploy did not reach verified full six-round readiness"
 
   STUB_APP_MISSING=1 run "$sb" --deploy-only --yes
   check "no app means no deploy" "service principal is unresolved"
@@ -1136,6 +1431,8 @@ case_no_regression() {
 
 CASES=(
   case_check_clean
+  case_multiple_warehouses_are_derived
+  case_five_input_full_acceptance
   case_banned_files
   case_print_env
   case_s3_refuses_existing
@@ -1146,6 +1443,11 @@ CASES=(
   case_deploy_refusals
   case_deploy_runner_guard
   case_deploy_happy
+  case_deploy_fresh_pair_propagation
+  case_deploy_credential_isolation
+  case_incomplete_aws_pair_refused
+  case_exact_five_inputs_required
+  case_runtime_identity_refusals
   case_deploy_seal_only
   case_deploy_record_merge
   case_deploy_seal_snapshot

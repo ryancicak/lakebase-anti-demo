@@ -845,6 +845,7 @@ def test_round5_outputs_require_static_proxy_role_and_secret_bindings() -> None:
         "rds_proxy_secret_arn": "round5_rds_proxy_secret_arn",
         "runner_permissions_boundary_arn": "round5_runner_permissions_boundary_arn",
         "runner_instance_id": "round5_runner_instance_id",
+        "runner_instance_type": "round5_runner_instance_type",
         "runner_instance_profile_arn": "round5_runner_instance_profile_arn",
         "runner_role_arn": "round5_runner_role_arn",
         "runner_subnet_id": "round5_runner_subnet_id",
@@ -865,6 +866,8 @@ def test_round5_outputs_require_static_proxy_role_and_secret_bindings() -> None:
     assert "secret_name_prefix" not in required
     with pytest.raises(RuntimeError, match="rds_proxy_secret_arn"):
         _required_round5_outputs({**outputs, "round5_rds_proxy_secret_arn": None})
+
+
 
 
 def test_round5_provisioning_tags_use_installation_scope_before_v7_commit() -> None:
@@ -936,10 +939,17 @@ def test_round5_inventory_distinguishes_static_terraform_role_from_bout_roles(
                             {"Key": key, "Value": value}
                             for key, value in static_tags.items()
                         ],
-                    }
+                    },
+                    {
+                        "Arn": "arn:aws:iam::123456789012:role/unrelated-account-role",
+                        "RoleName": "unrelated-account-role",
+                    },
                 ],
                 "IsTruncated": False,
             }
+
+        def list_role_tags(self, **kwargs):
+            raise AssertionError(f"must not inspect unrelated role tags: {kwargs}")
 
         def list_role_policies(self, **kwargs):
             return {"PolicyNames": policy_names}

@@ -95,6 +95,34 @@ def _assert_aws_identity(session: boto3.Session, expected_account_id: str) -> No
         )
 
 
+def _runtime_aws_session(
+    auth_mode: AwsAuthMode,
+    profile: str | None,
+    region: str,
+) -> boto3.Session:
+    source = boto3.Session(**session_arguments(auth_mode, profile, region))
+    role_arn = os.environ.get("ANTI_DEMO_RUNTIME_ROLE_ARN", "").strip()
+    if not role_arn:
+        return source
+    response = source.client("sts", region_name=region).assume_role(
+        RoleArn=role_arn,
+        RoleSessionName="anti-demo-target",
+        DurationSeconds=3600,
+    )
+    credentials = response.get("Credentials") or {}
+    if any(
+        not credentials.get(key)
+        for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
+    ):
+        raise TargetConfigurationError("STS did not return the sealed runtime role")
+    return boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        region_name=region,
+    )
+
+
 def _assert_arn_binding(arn: str, region: str, account_id: str, label: str) -> None:
     parts = arn.split(":", 5)
     if len(parts) != 6 or parts[0] != "arn" or parts[3] != region or parts[4] != account_id:
@@ -384,9 +412,7 @@ class AuroraCredentialProvider:
         self.expected_postgres_major = os.environ.get("EXPECTED_POSTGRES_MAJOR", "17")
 
     def _session(self):
-        return boto3.Session(
-            **session_arguments(self.auth_mode, self.profile, self.region)
-        )
+        return _runtime_aws_session(self.auth_mode, self.profile, self.region)
 
     def _require(self) -> None:
         auth, self.region, self.expected_account_id = _required_aws_environment()
@@ -882,9 +908,7 @@ class RdsCredentialProvider:
         return instance
 
     def _qualify_sync(self) -> dict[str, object]:
-        session = boto3.Session(
-            **session_arguments(self.auth_mode, self.profile, self.region)
-        )
+        session = _runtime_aws_session(self.auth_mode, self.profile, self.region)
         instance = self._instance_sync(session)
         engine = str(instance.get("Engine") or "").lower()
         return {
@@ -911,9 +935,7 @@ class RdsCredentialProvider:
             raise TargetConfigurationError("RDS credential validation failed") from exc
 
     def _connection_material_sync(self) -> ConnectionMaterial:
-        session = boto3.Session(
-            **session_arguments(self.auth_mode, self.profile, self.region)
-        )
+        session = _runtime_aws_session(self.auth_mode, self.profile, self.region)
         instance = self._instance_sync(session)
         instance_secret_arn = str(
             (instance.get("MasterUserSecret") or {}).get("SecretArn") or ""

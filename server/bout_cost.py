@@ -74,7 +74,7 @@ ROUND_ORDER: tuple[tuple[RoundId, int, str], ...] = (
     (RoundId.MAKE_SCHEMA_CHANGE_SAFELY, 2, "Schema change, safely"),
     (RoundId.RECOVER_DELETED_ORDER, 3, "Recover a deleted order"),
     (RoundId.PUT_MODEL_SCORE_IN_APP, 4, "Lakehouse data into the app"),
-    (RoundId.SURVIVE_CONNECTION_SPIKE, 5, "Survive the connection spike"),
+    (RoundId.SURVIVE_CONNECTION_SPIKE, 5, "Ready a pooled application path"),
     (RoundId.ANALYZE_LIVE_ORDERS, 6, "Live app data into the lakehouse"),
 )
 
@@ -306,8 +306,9 @@ def _connection_spike_round(
                 "The band is the spread between two real bouts of this round, 42% apart, "
                 "not modelling slack. Their descents held 0.5 ACU for 5 and 15 minutes "
                 "for reasons that were not established. Neither bout has a receipt, so "
-                "it is not established that the 128-client burst fully landed, which "
-                "makes these a lower bound on a contract-satisfying Round 5 rather than "
+                "it is not established that the 128-attempt, maximum-64-concurrent "
+                "check fully landed, which makes these a lower bound on a fully verified "
+                "Round 5 rather than "
                 "a certain equal."
             ),
             bouts=list(measurement.bouts),

@@ -100,7 +100,7 @@ const BOUT: BoutCostSnapshot = {
     {
       round_id: 'survive_connection_spike',
       round_number: 5,
-      label: 'Survive the connection spike',
+      label: 'Ready a pooled application path',
       provenance: 'measured',
       band_kind: 'observed_spread',
       usd_display: '$0.044197 – $0.055549',

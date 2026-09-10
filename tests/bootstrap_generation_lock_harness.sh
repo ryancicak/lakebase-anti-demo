@@ -163,7 +163,7 @@ expect "a SIGKILLed holder does not wedge the next run" "HELD=1" "$KILLED_OUT"
 line_of() { grep -Fn -- "$1" "$REPO/bootstrap.sh" | head -1 | cut -d: -f1 || true; }
 ACQUIRE="$(line_of 'generation_lock acquire')"
 for anchor in 'if ((GENERATION_LOCK_HELD == 1)) && [[ "$MODE" != "check" ]]; then' \
-  './antidemo "${SETUP_ARGS[@]}"' \
+  '"${ANTI_DEMO_EXECUTABLE:-./antidemo}" "${SETUP_ARGS[@]}"' \
   'cp "$ANTI_DEMO_MANIFEST" "$SEAL_SNAPSHOT"' \
   'DEPLOY_RECORD="$DEPLOY_RECORD" \' \
   'databricks apps deploy "$APP_NAME"'; do

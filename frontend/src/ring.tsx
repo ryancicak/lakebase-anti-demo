@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import type {
   CatalogResponse,
   CompetitorId,
@@ -19,14 +20,14 @@ import { NO_EQUIVALENT_NATIVE_PATH } from './recap'
  */
 
 /** Which act the ring plays for a round. Keyed by the catalog's own round ids. */
-export type RingAct = 'wake' | 'branch' | 'recover' | 'inbound' | 'spike' | 'outbound'
+export type RingAct = 'wake' | 'branch' | 'recover' | 'inbound' | 'pool' | 'outbound'
 
 const ROUND_ACTS: Record<string, RingAct> = {
   wake_idle_app: 'wake',
   make_schema_change_safely: 'branch',
   recover_deleted_order: 'recover',
   put_model_score_in_app: 'inbound',
-  survive_connection_spike: 'spike',
+  survive_connection_spike: 'pool',
   analyze_live_orders_without_slowing_checkout: 'outbound',
 }
 
@@ -191,6 +192,79 @@ export function opponentBadge(competitorId: CompetitorId): string {
 }
 
 /**
+ * HOW BIG EACH ACT IS DRAWN, and why it is a table rather than one number.
+ *
+ * The ring was drawn at a single `1.32` for every act. On this stage -- roughly
+ * 2080x460, far longer than it is tall -- that reads as furniture with two small
+ * figures somewhere in it, and once Round 5 was drawn large the rest looked
+ * unfinished beside it. Every act now names its own size.
+ *
+ * The ceiling is the top rope at y=168: a fighter whose head crosses it stops
+ * reading as a man in a ring. At the floor line of 374 that is 88 * s < 206, so
+ * 2.3 is the most any upright act can take. The acts below 2.3 are limited by
+ * their own furniture instead, not by preference:
+ *
+ *   wake      2.3  lies down, so height is free; the beds grow with him
+ *   branch    2.3  its props are a plinth and two copies, all clear of the body
+ *   recover   2.3  one card dead centre, far from either corner
+ *   inbound   2.1  the courier stands beside the fighter and must not merge
+ *   pool      2.3  approved; nothing between the corners
+ *   outbound  2.0  a four-deep queue is the closest any prop comes to a corner
+ *
+ * Nothing else in the drawing scales: the ropes, floor, apron, posts and crowd
+ * are the house, and the house staying put is what makes the figures read as
+ * bigger rather than the whole picture read as zoomed.
+ */
+const ACT_FIGHTER_SCALE: Record<RingAct, number> = {
+  wake: 2.3,
+  branch: 2.3,
+  recover: 2.3,
+  inbound: 2.1,
+  pool: 2.3,
+  outbound: 2,
+}
+
+/** The artwork's original figure size. Every prop was drawn against it. */
+const BASE_FIGHTER_SCALE = 1.32
+
+/**
+ * How far each act stands its fighters in off their own posts, as a fraction of
+ * the floor it gained. Bigger figures and bigger props need more room between
+ * them; the two acts with a prop close to a corner stand further out, and Round 1
+ * stands furthest because its bodies occupy floor rather than air.
+ */
+const ACT_INSET_FRACTION: Record<RingAct, number> = {
+  wake: 0.3,
+  branch: 0.4,
+  recover: 0.4,
+  inbound: 0.34,
+  pool: 0.4,
+  outbound: 0.24,
+}
+
+/**
+ * A zoom about one point, as an SVG transform.
+ *
+ * Every act's props were hand-placed against a `1.32` figure, and their value is
+ * in those relationships -- a blanket over a body, a copy at arm's length, a
+ * queue that reaches the gate. Re-deriving each rect at a new size would break
+ * them one at a time. Zooming the whole group about a fixed anchor keeps every
+ * relationship exact and moves the artwork's own decisions up with the figures.
+ *
+ * The anchor is always on the floor line, so props grow upward off the boards
+ * rather than sinking through them, and it is the corner's own centre for corner
+ * furniture and the ring's centre for anything shared. Because a corner's anchor
+ * IS its fighter's centre, the corner lights still land under the figures.
+ *
+ * It goes on a WRAPPER, never on a node that carries a CSS animation: a keyframe
+ * `transform` replaces an SVG `transform` attribute outright instead of composing
+ * with it.
+ */
+function zoomAbout(scale: number, anchorX: number, anchorY: number): string {
+  return `translate(${anchorX},${anchorY}) scale(${scale}) translate(${-anchorX},${-anchorY})`
+}
+
+/**
  * A sparse, static house. Depth, not a second thing competing for attention.
  *
  * Seeded off the drawn width so a longer floor gets a longer house rather than a
@@ -244,6 +318,7 @@ export function FightRing(props: {
    * flips `meet` from height-driven to width-driven at some viewports, which
    * silently shrinks the fighters -- the exact fault this is avoiding.
    */
+  const arenaRef = useRef<HTMLDivElement | null>(null)
   const stageRef = useRef<HTMLDivElement | null>(null)
   const [viewWidth, setViewWidth] = useState(1000)
   useEffect(() => {
@@ -287,16 +362,22 @@ export function FightRing(props: {
    *
    * The binding constraint is Round 6: its queue starts at 308 in centre-space,
    * which is the nearest any centre prop comes to the home corner. 0.4 clears it
-   * at every width the stage takes.
+   * at every width the stage takes AT THE ORIGINAL FIGURE SIZE -- once the act is
+   * drawn large the same queue lands on the fighter, so the acts with a prop that
+   * close to a corner take a smaller fraction and stand further out. Round 1 goes
+   * the other way: its figures lie DOWN, so a big sprite is 200 units of floor
+   * wide rather than tall, and the pair need more room between them.
    */
-  const inset = Math.round(dx * 0.4)
-
   const crowd = useMemo(() => crowdSeats(viewWidth), [viewWidth])
   const roundIndex = props.rounds.findIndex((round) => round.id === props.selectedRoundId)
   const round = props.rounds[roundIndex] ?? props.rounds[0]
   const act = ringAct(round.id)
+  const inset = Math.round(dx * ACT_INSET_FRACTION[act])
   const lane = blueCornerLane(round, props.competitor)
   const opponentIndex = props.competitors.findIndex((item) => item.id === props.competitor)
+  const selectedStatus = props.roundStatuses?.[round.id] ?? null
+  const poolMotionActive = act === 'pool'
+    && (!props.statusRequired || selectedStatus?.state === 'ready')
 
   // Who sleeps is a fact about the pairing. No corner is staged quicker than
   // another, because this screen holds no receipt that would license it.
@@ -321,7 +402,7 @@ export function FightRing(props: {
    * the pose was. Every other act leaves the figures upright, where the pools
    * already land within a unit of them.
    */
-  const LIE_DOWN_SHIFT = 57
+  const LIE_DOWN_SHIFT = Math.round(57 * (ACT_FIGHTER_SCALE.wake / BASE_FIGHTER_SCALE))
 
   /**
    * Which corners actually lie down. The engine that cannot pause has no bed
@@ -330,10 +411,87 @@ export function FightRing(props: {
   const nearLiesDown = act === 'wake'
   const farLiesDown = act === 'wake' && lane === 'race'
 
+  /**
+   * How big the fighters are drawn, and where their feet land.
+   *
+   * Every act but Round 5 keeps the artwork's own `1.32`. Round 5 is the one act
+   * with no bed, no centre prop and nothing between the corners, and at 1.32 the
+   * pair read as small -- the fault the rejected rail versions were accused of.
+   * The scale is raised only for `pool`, and the feet are pinned to the same
+   * floor line at every scale, so a taller sprite grows upward off the boards
+   * rather than sinking through them:
+   *
+   *   1.32 -> 374 - 116 = 258, the y the drawing has always used
+   *   2.30 -> 374 - 202 = 172, which brings the head just under the top rope
+   *
+   * 2.3 is the ceiling rather than a preference: the top rope sits at 168, and a
+   * fighter whose head crosses it stops reading as a man in a ring.
+   *
+   * Round 5's x is derived from the corner's own light pool, because a wider
+   * sprite drawn from the same left edge walks its centre out of that pool.
+   * Every other act keeps its literal untouched: the derived form lands a pixel
+   * off the drawing's own 241 / 701 at 1.32, and shifting five acts by a pixel
+   * is not part of this change.
+   */
+  const SPRITE_MID = 23.5
+  const SPRITE_HALF = 28
+  const SPRITE_FOOT = 88
+  const FLOOR_LINE = 374
+  const fighterScale = ACT_FIGHTER_SCALE[act]
+  const fighterY = Math.round(FLOOR_LINE - SPRITE_FOOT * fighterScale)
+  const nearFighterCentre = 272 + inset
+  const farFighterCentre = viewWidth - 268 - inset
+  const nearFighterX = Math.round(nearFighterCentre - SPRITE_MID * fighterScale)
+  const farFighterX = Math.round(farFighterCentre - SPRITE_MID * fighterScale)
+
+  /**
+   * How much this act's furniture grows, and the two zooms that carry it.
+   *
+   * Corner furniture zooms about its own corner's centre so it stays under, over
+   * or beside the fighter it belongs to. Shared furniture zooms about the ring's
+   * centre so it stays equidistant from both corners as the stage lengthens.
+   */
+  const propZoom = fighterScale / BASE_FIGHTER_SCALE
+  const zoomNear = zoomAbout(propZoom, nearFighterCentre, FLOOR_LINE)
+  const zoomFar = zoomAbout(propZoom, farFighterCentre, FLOOR_LINE)
+  const zoomCentre = zoomAbout(propZoom, mid, FLOOR_LINE)
+
+  /**
+   * Where each bag hangs: measured out from its own fighter's centre, past the
+   * edge of his own sprite, so raising the scale never walks a boxer into his
+   * bag. The far offset is the larger of the two because the far bag arrives
+   * inside a rig, and the rig is 68 units wide on the side facing its fighter.
+   *
+   * Then clamped to its own half of the ring. The corners close on the centre as
+   * the stage narrows -- `inset` is a fraction of `dx`, so a short ring puts the
+   * two fighters much closer together -- and at 320px the near bag and the far
+   * rig overlapped by 12 units. Each prop stops at the centre line with
+   * clearance instead, measured from the widest edge each one actually has: 28
+   * for a bare bag, 68 for the rig around one.
+   */
+  const BAG_HALF = 28
+  const RIG_HALF = 68
+  const CENTRE_CLEARANCE = 20
+  const nearBagX = Math.min(
+    Math.round(nearFighterCentre + SPRITE_HALF * fighterScale + 80),
+    Math.round(mid - BAG_HALF - CENTRE_CLEARANCE),
+  )
+  const farBagX = Math.max(
+    Math.round(farFighterCentre - SPRITE_HALF * fighterScale - 124),
+    Math.round(mid + RIG_HALF + CENTRE_CLEARANCE),
+  )
+
   function rollOpponent(step: number) {
     if (props.competitors.length < 2) return
     const next = (opponentIndex + step + props.competitors.length) % props.competitors.length
     props.onCompetitor(props.competitors[next].id)
+  }
+
+  function chooseRound(roundId: RoundId) {
+    props.onRound(roundId)
+    if (window.innerWidth <= 760) {
+      arenaRef.current?.scrollIntoView({ block: 'start', inline: 'nearest' })
+    }
   }
 
   return (
@@ -349,8 +507,17 @@ export function FightRing(props: {
       {/* The stage and the two corner plates share one shrink-to-fit box, so the
           plates are exactly as wide as the drawn ring and each one sits under
           its own fighter. The tiles below stay full width. */}
-      <div className="ring-arena">
-      <div ref={stageRef} className={`ring-stage act-${act}${wakeMode}`} data-far={lane}>
+      <div ref={arenaRef} className="ring-arena">
+      <div
+        ref={stageRef}
+        className={`ring-stage act-${act}${wakeMode}`}
+        data-far={lane}
+        data-pool-motion={poolMotionActive ? 'active' : 'paused'}
+        style={{
+          '--lie-shift': `${LIE_DOWN_SHIFT}px`,
+          '--lie-shift-half': `${Math.round(LIE_DOWN_SHIFT / 2)}px`,
+        } as CSSProperties}
+      >
         <svg viewBox={`0 0 ${viewWidth} 460`} preserveAspectRatio="xMidYMid meet" aria-hidden="true" focusable="false">
           <defs>
             <radialGradient id="ringPool">
@@ -416,8 +583,12 @@ export function FightRing(props: {
           {act === 'wake' && (
             <g>
               {/* The bed travels with the sleeper: the frame has to stay under
-                  him and the blanket over him, so both take the same inset. */}
-              <g className="px bed-near" transform={`translate(${inset},0)`}>
+                  him and the blanket over him, so both take the same inset, and
+                  both grow with him -- a big sleeper in a small bed is worse than
+                  a small one, because the bed is what makes him read as asleep.
+                  The zoom is anchored on his own corner so the frame stays
+                  underneath him at every size. */}
+              <g className="px bed-near" transform={`${zoomNear} translate(${inset},0)`}>
                 <rect x="138" y="300" width="18" height="82" fill="#3b4680" />
                 <rect x="138" y="348" width="172" height="16" fill="#5a6699" />
                 <rect x="138" y="364" width="172" height="8" fill="#2b376c" />
@@ -425,7 +596,7 @@ export function FightRing(props: {
                 <rect x="294" y="372" width="12" height="14" fill="#2b376c" />
                 <rect x="158" y="332" width="42" height="16" fill="#e6dfc6" />
               </g>
-              <g className="px bed-far" transform={`translate(${dx - inset},0)`}>
+              <g className="px bed-far" transform={`${zoomFar} translate(${dx - inset},0)`}>
                 <rect x="594" y="300" width="18" height="82" fill="#3b4680" />
                 <rect x="594" y="348" width="172" height="16" fill="#5a6699" />
                 <rect x="594" y="364" width="172" height="8" fill="#2b376c" />
@@ -436,7 +607,73 @@ export function FightRing(props: {
             </g>
           )}
 
-          <g transform={`translate(${241 + inset},258) scale(1.32)`}>
+          {/* Round 5, drawn as boxing rather than as wiring.
+              ------------------------------------------------
+              Each fighter faces one heavy bag stencilled `10K`, in his own half,
+              close enough to hit. The 10,000 is the LOAD, so it is stencilled on
+              the thing being hit, the way weight is stencilled on real gym kit --
+              never printed as a counter, because a counter on a screen with no
+              receipt behind it reads as a measurement.
+
+              The corner difference is the whole claim and it is STRUCTURAL, not
+              a label: the near bag hangs straight off the fighter's own top
+              rope, and the far bag needs a free-standing rig stood up on the
+              boards before it can hang at all. Nothing here says which pooling
+              product is which, because the identity rail below already names
+              both corners and the artwork is not where a product claim belongs.
+
+              WHAT MUST NOT COME BACK is the previous pass: labelled client
+              origins outside the ropes, converging rails into the gloves, and
+              `BUILT-IN POOL` / `RDS PROXY` plates on the floor. Two labelled
+              ends with a line between them is the grammar of an architecture
+              drawing however few lines it uses, and it demoted both fighters to
+              endpoints. `round5-ring.test.tsx` pins the absence. */}
+          {act === 'pool' && (
+            <g className="r5-ring-detail px">
+              {/* Nothing was brought in for this one. The rope it hangs from is
+                  the ring's own, so the rope and the bag swing together and
+                  there is no frame to draw. */}
+              {/* The translate lives on a PARENT of the swinging group, never on
+                  the group itself. A CSS `transform` keyframe replaces an SVG
+                  `transform` attribute outright rather than composing with it, so
+                  a bag carrying both is drawn at the origin the moment the swing
+                  runs -- which put both bags on top of the red post. The wrapper
+                  positions, the inner group rotates. */}
+              <g transform={`translate(${nearBagX},0)`}>
+                <g className="r5-bag r5-bag-near">
+                  <rect x="-3" y="172" width="7" height="26" fill="#5a6699" />
+                  <rect x="-28" y="198" width="56" height="120" fill="#8a6a4a" />
+                  <rect x="-28" y="198" width="56" height="12" fill="#a8907c" />
+                  <text x="0" y="266" textAnchor="middle" fill="#f1ebd7" fontFamily="inherit" fontSize="17">10K</text>
+                  <rect x="-28" y="306" width="56" height="12" fill="#6f5741" />
+                </g>
+              </g>
+              {/* The same load, and a rig standing on the boards to hold it. The
+                  frame is a sibling of the bag rather than its parent, so the bag
+                  swings inside equipment that stays still -- a rig that rocked
+                  with the bag would read as one prop instead of two facts. */}
+              <g className="r5-rig" transform={`translate(${farBagX},0)`}>
+                <rect x="-52" y="160" width="104" height="10" fill="#3b4680" />
+                <rect x="-56" y="170" width="10" height="150" fill="#2b376c" />
+                <rect x="46" y="170" width="10" height="150" fill="#2b376c" />
+                <rect x="-68" y="314" width="34" height="10" fill="#222d5c" />
+                <rect x="34" y="314" width="34" height="10" fill="#222d5c" />
+              </g>
+              {/* The same bag, to the unit: the load is identical in both
+                  corners, and only what holds it up differs. */}
+              <g transform={`translate(${farBagX},0)`}>
+                <g className="r5-bag r5-bag-far">
+                  <rect x="-3" y="172" width="7" height="26" fill="#5a6699" />
+                  <rect x="-28" y="198" width="56" height="120" fill="#8a6a4a" />
+                  <rect x="-28" y="198" width="56" height="12" fill="#a8907c" />
+                  <text x="0" y="266" textAnchor="middle" fill="#f1ebd7" fontFamily="inherit" fontSize="17">10K</text>
+                  <rect x="-28" y="306" width="56" height="12" fill="#6f5741" />
+                </g>
+              </g>
+            </g>
+          )}
+
+          <g transform={`translate(${nearFighterX},${fighterY}) scale(${fighterScale})`}>
             <g className="g-bob px" id="ring-home">
               <rect x="12" y="0" width="24" height="12" fill="#e6dfc6" />
               <rect x="16" y="4" width="4" height="4" fill="#10152f" />
@@ -456,7 +693,7 @@ export function FightRing(props: {
           </g>
 
           {lane !== 'none' && (
-            <g transform={`translate(${701 + dx - inset},258) scale(1.32)`}>
+            <g transform={`translate(${farFighterX},${fighterY}) scale(${fighterScale})`}>
               <g id="ring-away">
                 <g className="g-bob px">
                   <rect x="10" y="0" width="28" height="6" fill="#74a5ff" />
@@ -488,11 +725,24 @@ export function FightRing(props: {
             <g className="px vacant">
               {/* The empty corner's furniture travels with the corner it belongs
                   to, so the stool and towel stay under the blue post rather than
-                  stranded mid-floor once the ring is longer. */}
+                  stranded mid-floor once the ring is longer.
+
+                  The stool grows with the act -- a doll's stool beside a
+                  full-size courier reads as a drawing mistake rather than as an
+                  empty corner -- but it grows IN PLACE, about its own centre.
+                  Zooming it about the far corner instead pushed it off the right
+                  edge of the stage, because it sits outboard of that corner and a
+                  zoom moves everything away from its anchor.
+
+                  The towel does not grow at all. It hangs on the top rope, and
+                  the ropes are house: enlarged about the floor line it climbed to
+                  y=150 and sat on top of the round's own refusal caption. */}
               <g transform={`translate(${dx},0)`}>
-                <rect x="838" y="352" width="42" height="6" fill="#2b376c" />
-                <rect x="842" y="358" width="6" height="16" fill="#222d5c" />
-                <rect x="870" y="358" width="6" height="16" fill="#222d5c" />
+                <g transform={zoomAbout(propZoom, 859, FLOOR_LINE)}>
+                  <rect x="838" y="352" width="42" height="6" fill="#2b376c" />
+                  <rect x="842" y="358" width="6" height="16" fill="#222d5c" />
+                  <rect x="870" y="358" width="6" height="16" fill="#222d5c" />
+                </g>
                 <rect x="884" y="240" width="28" height="34" fill="#3b4680" />
               </g>
               {/* Centred in the empty upper third of the frame, not floated over
@@ -514,19 +764,19 @@ export function FightRing(props: {
                   outright over an SVG `transform` attribute, so an inset written
                   on the animated node is silently discarded the moment the
                   animation runs. A wrapper composes with it instead. */}
-              <g transform={`translate(${inset},0)`}>
+              <g transform={`${zoomNear} translate(${inset},0)`}>
                 <g className="bl-sleep bl-near px">
                   <rect x="194" y="326" width="96" height="30" fill="#6d7690" />
                   <rect x="194" y="326" width="96" height="7" fill="#a3accb" />
                 </g>
               </g>
-              <g transform={`translate(${dx - inset},0)`}>
+              <g transform={`${zoomFar} translate(${dx - inset},0)`}>
                 <g className="bl-sleep bl-far px">
                   <rect x="652" y="326" width="96" height="30" fill="#6d7690" />
                   <rect x="652" y="326" width="96" height="7" fill="#a3accb" />
                 </g>
               </g>
-              <g transform={`translate(${inset},0)`}>
+              <g transform={`${zoomNear} translate(${inset},0)`}>
                 <g className="zzz-near px" fill="#c8d2ee">
                   <rect x="196" y="304" width="12" height="5" /><rect x="204" y="309" width="5" height="5" />
                   <rect x="196" y="314" width="12" height="5" />
@@ -534,7 +784,7 @@ export function FightRing(props: {
                   <rect x="216" y="292" width="16" height="6" />
                 </g>
               </g>
-              <g transform={`translate(${dx - inset},0)`}>
+              <g transform={`${zoomFar} translate(${dx - inset},0)`}>
                 <g className="zzz-far px" fill="#c8d2ee">
                   <rect x="654" y="304" width="12" height="5" /><rect x="662" y="309" width="5" height="5" />
                   <rect x="654" y="314" width="12" height="5" />
@@ -546,7 +796,7 @@ export function FightRing(props: {
           )}
 
           {act === 'recover' && (
-            <g transform={`translate(${dx / 2},0)`}>
+            <g transform={`${zoomCentre} translate(${dx / 2},0)`}>
               <g className="ghost px">
                 <rect x="462" y="256" width="76" height="92" fill="none" stroke="#4f5d90" strokeWidth="3" strokeDasharray="7 7" />
               </g>
@@ -568,79 +818,83 @@ export function FightRing(props: {
             </g>
           )}
 
-          {act === 'spike' && (
-            <g>
-              <g className="px gate-near" transform={`translate(${inset},0)`}>
-                <rect x="352" y="286" width="56" height="8" fill="#f8d83b" />
-                <rect x="352" y="294" width="8" height="52" fill="#f8d83b" />
-                <rect x="400" y="294" width="8" height="52" fill="#f8d83b" />
-              </g>
-              <g transform={`translate(${dx - inset},0)`}>
-              <g className="gate-far px" fill="#4a83e8">
-                {[
-                  { x: 592, y: 286, w: 19, h: 8 }, { x: 611, y: 286, w: 19, h: 8 }, { x: 630, y: 286, w: 18, h: 8 },
-                  { x: 592, y: 294, w: 8, h: 18 }, { x: 592, y: 312, w: 8, h: 17 }, { x: 592, y: 329, w: 8, h: 17 },
-                  { x: 640, y: 294, w: 8, h: 18 }, { x: 640, y: 312, w: 8, h: 17 }, { x: 640, y: 329, w: 8, h: 17 },
-                ].map((bolt, i) => (
-                  <rect key={i} className="bolt" style={{ animationDelay: `${i * 0.42}s` }}
-                    x={bolt.x} y={bolt.y} width={bolt.w} height={bolt.h} />
-                ))}
-              </g>
-              </g>
-              <g className="px" fill="#f1ebd7">
-                {[0, 0.24, 0.48, 0.72, 0.96].map((delay, i) => (
-                  <rect key={i} className="pip" style={{ animationDelay: `${delay}s` }}
-                    x={[366, 380, 394, 373, 387][i] + inset} y="384" width="7" height="7" />
-                ))}
-                {[0, 0.32, 0.64].map((delay, i) => (
-                  <rect key={`f${i}`} className="pip-far" style={{ animationDelay: `${delay}s` }}
-                    x={[606, 620, 634][i] + dx - inset} y="384" width="7" height="7" />
-                ))}
-              </g>
-            </g>
-          )}
-
           {act === 'branch' && (
             <g>
-              {/* The original, dead centre on a plinth. It has no animation:
-                  not moving is the whole of its job. Centre of the drawn width,
-                  so it stays equidistant from both copies as the ring lengthens. */}
-              <g className="px" transform={`translate(${dx / 2},0)`}>
+              {/* WHY THESE ARE TABLES AND WHAT CHANGES ABOUT THEM.
+                  The act used to draw three documents of loose horizontal lines,
+                  and the migration as a fourth yellow line appearing. A new LINE
+                  reads as more data -- another order, another row of the same
+                  shape -- which is the one thing this round is not about. A new
+                  COLUMN cannot be read that way: the shape of the table itself is
+                  different afterwards, which is what a schema change is.
+
+                  So all three are drawn as the same little table: a header band
+                  and three rows across two columns. The copies gain a third
+                  column, header cell and all, in the yellow this file already
+                  uses for "the thing that just happened". The original never gains
+                  it, and that absence IS the round's claim -- the source is
+                  untouched and stays two columns wide for the whole loop.
+
+                  The original, dead centre on a plinth, has no animation at all:
+                  not moving is the whole of its job. Centre of the drawn width, so
+                  it stays equidistant from both copies as the ring lengthens. */}
+              <g className="px" transform={`${zoomCentre} translate(${dx / 2},0)`}>
                 <rect x="461" y="342" width="82" height="10" fill="#2b376c" />
                 <rect x="471" y="254" width="62" height="88" fill="#1d2861" stroke="#f1ebd7" strokeWidth="3" />
-                <rect x="483" y="272" width="38" height="5" fill="#c8d2ee" />
-                <rect x="483" y="288" width="26" height="5" fill="#c8d2ee" />
-                <rect x="483" y="304" width="32" height="5" fill="#c8d2ee" />
-                <rect x="483" y="320" width="20" height="5" fill="#c8d2ee" />
+                <rect x="479" y="262" width="46" height="8" fill="#f1ebd7" />
+                <rect x="479" y="280" width="19" height="6" fill="#c8d2ee" />
+                <rect x="502" y="280" width="19" height="6" fill="#c8d2ee" />
+                <rect x="479" y="296" width="19" height="6" fill="#c8d2ee" />
+                <rect x="502" y="296" width="19" height="6" fill="#c8d2ee" />
+                <rect x="479" y="312" width="19" height="6" fill="#c8d2ee" />
+                <rect x="502" y="312" width="19" height="6" fill="#c8d2ee" />
               </g>
-              <g transform={`translate(${inset},0)`}>
+              <g transform={`${zoomNear} translate(${inset},0)`}>
                 <g className="copy copy-near px">
-                  <rect x="334" y="266" width="62" height="80" fill="#1d2861" stroke="#8f9dcb" strokeWidth="3" />
-                  <rect x="346" y="282" width="38" height="5" fill="#8f9dcb" />
-                  <rect x="346" y="296" width="26" height="5" fill="#8f9dcb" />
-                  <rect x="346" y="310" width="32" height="5" fill="#8f9dcb" />
-                  <rect className="new-row" x="346" y="326" width="42" height="5" fill="#f8d83b" />
+                  <rect x="334" y="266" width="70" height="80" fill="#1d2861" stroke="#8f9dcb" strokeWidth="3" />
+                  <rect x="342" y="274" width="54" height="8" fill="#8f9dcb" />
+                  <rect x="342" y="292" width="16" height="6" fill="#8f9dcb" />
+                  <rect x="362" y="292" width="16" height="6" fill="#8f9dcb" />
+                  <rect x="342" y="308" width="16" height="6" fill="#8f9dcb" />
+                  <rect x="362" y="308" width="16" height="6" fill="#8f9dcb" />
+                  <rect x="342" y="324" width="16" height="6" fill="#8f9dcb" />
+                  <rect x="362" y="324" width="16" height="6" fill="#8f9dcb" />
+                  <g className="new-col">
+                    <rect x="382" y="274" width="14" height="8" fill="#f8d83b" />
+                    <rect x="382" y="292" width="14" height="6" fill="#f8d83b" />
+                    <rect x="382" y="308" width="14" height="6" fill="#f8d83b" />
+                    <rect x="382" y="324" width="14" height="6" fill="#f8d83b" />
+                  </g>
                 </g>
               </g>
               {lane !== 'none' && (
-                <g transform={`translate(${dx - inset},0)`}>
+                <g transform={`${zoomFar} translate(${dx - inset},0)`}>
                   <g className="copy copy-far px">
-                    <rect x="609" y="266" width="62" height="80" fill="#1d2861" stroke="#8f9dcb" strokeWidth="3" />
-                    <rect x="621" y="282" width="38" height="5" fill="#8f9dcb" />
-                    <rect x="621" y="296" width="26" height="5" fill="#8f9dcb" />
-                    <rect x="621" y="310" width="32" height="5" fill="#8f9dcb" />
-                    <rect className="new-row" x="621" y="326" width="42" height="5" fill="#f8d83b" />
+                    <rect x="601" y="266" width="70" height="80" fill="#1d2861" stroke="#8f9dcb" strokeWidth="3" />
+                    <rect x="609" y="274" width="54" height="8" fill="#8f9dcb" />
+                    <rect x="609" y="292" width="16" height="6" fill="#8f9dcb" />
+                    <rect x="629" y="292" width="16" height="6" fill="#8f9dcb" />
+                    <rect x="609" y="308" width="16" height="6" fill="#8f9dcb" />
+                    <rect x="629" y="308" width="16" height="6" fill="#8f9dcb" />
+                    <rect x="609" y="324" width="16" height="6" fill="#8f9dcb" />
+                    <rect x="629" y="324" width="16" height="6" fill="#8f9dcb" />
+                    <g className="new-col">
+                      <rect x="649" y="274" width="14" height="8" fill="#f8d83b" />
+                      <rect x="649" y="292" width="14" height="6" fill="#f8d83b" />
+                      <rect x="649" y="308" width="14" height="6" fill="#f8d83b" />
+                      <rect x="649" y="324" width="14" height="6" fill="#f8d83b" />
+                    </g>
                   </g>
                 </g>
               )}
-              <g transform={`translate(${inset},0)`}>
+              <g transform={`${zoomNear} translate(${inset},0)`}>
                 <g className="whack whack-near px" fill="#f8d83b">
                   <rect x="322" y="290" width="9" height="7" /><rect x="328" y="274" width="7" height="12" />
                   <rect x="322" y="322" width="9" height="7" /><rect x="328" y="332" width="7" height="12" />
                 </g>
               </g>
               {lane !== 'none' && (
-                <g transform={`translate(${dx - inset},0)`}>
+                <g transform={`${zoomFar} translate(${dx - inset},0)`}>
                   <g className="whack whack-far px" fill="#f8d83b">
                     <rect x="674" y="290" width="9" height="7" /><rect x="668" y="274" width="7" height="12" />
                     <rect x="674" y="322" width="9" height="7" /><rect x="668" y="332" width="7" height="12" />
@@ -650,12 +904,30 @@ export function FightRing(props: {
             </g>
           )}
 
+          {/* Round 4 is the one act whose props do NOT all belong to the floor.
+              The window and the box arriving through it sit high on the wall, so
+              they cannot be zoomed about the floor line with everything else --
+              that sends them up through the top rope and into the round's own
+              refusal caption at y=150.
+
+              Leaving them at their original size was worse: a full-size courier
+              beside a doll's-house window reads as a mistake. So they grow about
+              their OWN centre instead, in place. The window keeps its height on
+              the wall and its top lands at 174, just under the top rope, and the
+              box's flight scales with it because the translate is inside the same
+              zoom -- it still arrives through the window it is aimed at.
+
+              Drawn FIRST, so the courier paints over it: he is standing in front
+              of a window, and the overlap is the depth cue that says so. */}
           {act === 'inbound' && (
-            <g transform={`translate(${dx / 2},0)`}>
-              <g className="px">
-                <rect x="466" y="192" width="148" height="62" fill="#101838" stroke="#8f9dcb" strokeWidth="4" />
-                <rect x="466" y="192" width="148" height="9" fill="#8f9dcb" />
+            <g>
+              <g transform={`translate(${dx / 2},0)`}>
+                <g className="px" transform={zoomAbout(propZoom, 540, 223)}>
+                  <rect x="466" y="192" width="148" height="62" fill="#101838" stroke="#8f9dcb" strokeWidth="4" />
+                  <rect x="466" y="192" width="148" height="9" fill="#8f9dcb" />
+                </g>
               </g>
+              <g transform={`${zoomCentre} translate(${dx / 2},0)`}>
               <g className="px">
                 <rect x="524" y="292" width="10" height="84" fill="#8f9dcb" />
                 <rect x="470" y="368" width="64" height="9" fill="#8f9dcb" />
@@ -682,16 +954,26 @@ export function FightRing(props: {
                 <rect x="374" y="236" width="9" height="9" /><rect x="360" y="248" width="9" height="9" />
                 <rect x="462" y="236" width="9" height="9" /><rect x="476" y="248" width="9" height="9" />
               </g>
-              <g className="flyby px">
-                <rect x="512" y="204" width="58" height="46" fill="#2b376c" stroke="#f8d83b" strokeWidth="4" />
-                <rect x="524" y="218" width="34" height="7" fill="#f8d83b" />
-                <rect x="524" y="231" width="22" height="7" fill="#c8d2ee" />
+              </g>
+              {/* Last, so the box paints over the window it arrives through, and
+                  zoomed on the same anchor as that window so the two stay a matched
+                  pair. The zoom sits on a WRAPPER: `ring-flyby` writes a CSS
+                  transform on `.flyby` itself, which would replace an SVG
+                  transform attribute on the same node rather than compose with it. */}
+              <g transform={`translate(${dx / 2},0)`}>
+                <g transform={zoomAbout(propZoom, 540, 223)}>
+                  <g className="flyby px">
+                    <rect x="512" y="204" width="58" height="46" fill="#2b376c" stroke="#f8d83b" strokeWidth="4" />
+                    <rect x="524" y="218" width="34" height="7" fill="#f8d83b" />
+                    <rect x="524" y="231" width="22" height="7" fill="#c8d2ee" />
+                  </g>
+                </g>
               </g>
             </g>
           )}
 
           {act === 'outbound' && (
-            <g transform={`translate(${dx / 2},0)`}>
+            <g transform={`${zoomCentre} translate(${dx / 2},0)`}>
               <g className="px">
                 {[
                   { c: 'q1', fill: '#e6dfc6', body: '#a8907c' },
@@ -763,6 +1045,21 @@ export function FightRing(props: {
 
       </div>
 
+      {/* The artwork is `aria-hidden`, so the one thing Round 5's stage says that
+          the identity rail and the round title do not has to be said in text.
+          ONE static sentence, outside the stage and read once: no `aria-live`, no
+          per-frame announcement, and no figure a reader could mistake for a
+          measurement -- the bags are a drawing of the load, not a result. The
+          other acts carry no summary because their story is already in the round
+          title, and inventing copy for them is not this change. */}
+      {act === 'pool' && (
+        <p className="sr-only">
+          Both corners face an identical heavy bag marked 10K. The Lakebase bag hangs
+          from the ring&apos;s own rope; the {props.opponentLabel} bag hangs from a rig
+          stood up beside it.
+        </p>
+      )}
+
       {/* Fighter identity in DOM text, legible during animation as well as at
           rest: the trunk badges ride the sprite and the full names sit still.
           A sibling of the stage rather than a child of it -- the stage clips its
@@ -825,7 +1122,7 @@ export function FightRing(props: {
               aria-current={item.id === round.id ? 'true' : 'false'}
               aria-label={`Round ${index + 1} · ${item.title} · ${words} · ${stateNote}`}
               disabled={!selectable}
-              onClick={() => props.onRound(item.id)}
+              onClick={() => chooseRound(item.id)}
             >
               <span className="ring-key-n">{index + 1}</span>
               <span className="ring-key-t">{item.title}</span>

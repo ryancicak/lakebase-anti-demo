@@ -68,7 +68,7 @@ Three earlier objections to restarting at all, and what became of them:
 * *This demo's failures are the product, so resurrecting a crashed server hides
   why it went down.* This one was over-stated, and the correction matters. The
   failures that are the product are measurements -- a cold start, a lane that
-  cannot scale to zero, a competitor that folds under a connection spike -- and
+  cannot scale to zero, a selected pooling path that fails a bounded check -- and
   every one of them is rendered on screen by a *running* server. A uvicorn
   process dying of an unhandled exception or an OOM kill is not a finding about
   Aurora; it is an outage that erases the findings. What survives the correction

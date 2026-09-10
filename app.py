@@ -323,6 +323,16 @@ def _bind_deployed_runtime(manifest: DemoManifest) -> None:
         "AWS_REGION": manifest.aws.region,
         "AWS_DEFAULT_REGION": manifest.aws.region,
         "AWS_EXPECTED_ACCOUNT_ID": manifest.aws.account_id,
+        # Every AWS-backed round starts from the permanent app-user pair and
+        # immediately exchanges it for this sealed least-privilege role. The
+        # generic manifest binder already exported this value for CLI paths, but
+        # the deployed binder intentionally rebuilds its environment from a
+        # closed allow-list and omitted it. As a result, the credential sentry
+        # proved the role while Round 1's target factory silently used the base
+        # user and failed at DescribeDBClusters. Keep the role in the same
+        # mandatory binding set as the account and region so a deployment cannot
+        # advertise AWS rounds without giving their refreshable sessions the hop.
+        "ANTI_DEMO_RUNTIME_ROLE_ARN": manifest.aws.runtime_role_arn or "",
         "AURORA_CLUSTER_ID": resources.aurora_cluster_id,
         "AURORA_SECRET_ARN": resources.aurora_secret_arn,
         "AURORA_DATABASE": manifest.databricks.database,

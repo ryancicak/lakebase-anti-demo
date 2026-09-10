@@ -21,6 +21,8 @@ import {
   OUTCOME_COPY_SHA256,
   PERSONA_IDS,
   PRIORITY_KEYS,
+  ROUND_FIVE_PERSONA_OUTCOME_RECORDS,
+  ROUND_FIVE_PERSONA_OUTCOMES_SHA256,
   ROUND_IDS,
   VERIFIED_CORPUS_RECORDS,
   VERIFIED_CORPUS_SHA256,
@@ -30,6 +32,7 @@ import {
   classifyOutcome,
   classifyRingsideOutcome,
   getOutcomeRecord,
+  getRoundFivePersonaOutcomeRecord,
   getVerifiedRecord,
   interpolateProof,
   priorityKeyFor,
@@ -356,7 +359,7 @@ function oneSidedRoundFiveSetupTowel(): DemoSession {
     kind: 'not_comparable',
     winner_lane_id: null,
     margin: null,
-    detail: 'The shared spike did not run, so no winner or margin was declared.',
+    detail: 'The bounded check did not run, so no winner or margin was declared.',
   }
   session.remembered_result = 'Lakebase setup verified first; comparison incomplete.'
   return session
@@ -386,6 +389,7 @@ function incompleteSetup(): DemoSession {
   for (const laneId of ['lakebase', 'competitor'] as const) {
     session.lanes[laneId].state = 'failed'
     session.lanes[laneId].elapsed_ms = null
+    session.lanes[laneId].evidence = undefined
     const setupLane = session.round5_setup!.lanes[laneId]!
     setupLane.state = 'failed'
     setupLane.verified = false
@@ -467,15 +471,21 @@ describe('canonical Ringside sources', () => {
   it('preserves the exact approved files and hashes', () => {
     const verified = sourceText('verified-corpus.jsonl')
     const outcomes = sourceText('outcome-copy.jsonl')
+    const roundFivePersonaOutcomes = sourceText('round5-persona-outcomes.jsonl')
     expect(sha256(verified)).toBe(VERIFIED_CORPUS_SHA256)
     expect(sha256(outcomes)).toBe(OUTCOME_COPY_SHA256)
+    expect(sha256(roundFivePersonaOutcomes)).toBe(ROUND_FIVE_PERSONA_OUTCOMES_SHA256)
     expect(parsedSource('verified-corpus.jsonl')).toHaveLength(420)
     expect(parsedSource('outcome-copy.jsonl')).toHaveLength(29)
+    expect(parsedSource('round5-persona-outcomes.jsonl')).toHaveLength(50)
   })
 
   it('loads the canonical JSONL directly without a generated copy layer', () => {
     expect(VERIFIED_CORPUS_RECORDS).toEqual(parsedSource('verified-corpus.jsonl'))
     expect(OUTCOME_COPY_RECORDS).toEqual(parsedSource('outcome-copy.jsonl'))
+    expect(ROUND_FIVE_PERSONA_OUTCOME_RECORDS).toEqual(
+      parsedSource('round5-persona-outcomes.jsonl'),
+    )
   })
 
   it('contains the complete 6 × 10 × 7 Cartesian product', () => {
@@ -529,7 +539,7 @@ describe('canonical Ringside sources', () => {
       ['recover_deleted_order', 'cleanup_failed'],
       ['put_model_score_in_app', 'cleanup_failed'],
       ['survive_connection_spike', 'setup_incomplete'],
-      ['survive_connection_spike', 'spike_contract_failed'],
+      ['survive_connection_spike', 'bounded_check_failed'],
       ['survive_connection_spike', 'cleanup_failed'],
       ['analyze_live_orders_without_slowing_checkout', 'cleanup_failed'],
       ['analyze_live_orders_without_slowing_checkout', 'checkout_guardrail_unverified'],
@@ -543,6 +553,28 @@ describe('canonical Ringside sources', () => {
     ])
     for (const record of OUTCOME_COPY_RECORDS) {
       expect(getOutcomeRecord(record.round_id, record.outcome_id)).toBe(record)
+    }
+  })
+
+  it('contains every Round 5 persona outcome override exactly once', () => {
+    const outcomeIds = [
+      'one_sided_setup_verified_towel',
+      'setup_incomplete',
+      'bounded_check_failed',
+      'cleanup_failed',
+      'no_result',
+    ] as const
+    const expected = new Set(
+      outcomeIds.flatMap((outcomeId) => (
+        PERSONA_IDS.map((personaId) => `${outcomeId}/${personaId}`)
+      )),
+    )
+    const actual = new Set(ROUND_FIVE_PERSONA_OUTCOME_RECORDS.map(
+      (record) => `${record.outcome_id}/${record.persona_id}`,
+    ))
+    expect(actual).toEqual(expected)
+    for (const record of ROUND_FIVE_PERSONA_OUTCOME_RECORDS) {
+      expect(getRoundFivePersonaOutcomeRecord(record.outcome_id, record.persona_id)).toBe(record)
     }
   })
 })
@@ -576,7 +608,7 @@ describe('one generic evidence classifier with six round contracts', () => {
     ['R5 both setups unverified at towel', noVerifiedRoundFiveSetupTowel(), 'setup_incomplete'],
     ['R4 identity incomplete', roundFourPartial, 'score_identity_unverified'],
     ['R5 setup incomplete', incompleteSetup(), 'setup_incomplete'],
-    ['R5 spike failed', failedSpike(), 'spike_contract_failed'],
+    ['R5 bounded check failed', failedSpike(), 'bounded_check_failed'],
     ['R5 cleanup failed', failedCleanup(), 'cleanup_failed'],
     ['R6 guardrail incomplete', roundSixPartial, 'checkout_guardrail_unverified'],
     ...ROUND_IDS.map((roundId) => [`${roundId} no result`, noResult(roundId), 'no_result'] as [string, DemoSession, RingsideOutcomeId]),
@@ -599,7 +631,11 @@ describe('one generic evidence classifier with six round contracts', () => {
       const cue = buildRingsideCue(session, 'software_engineer', 'performance')
       expect(cue.outcome.copy_mode).toBe('OUTCOME_OVERRIDE')
       expect(cue.sayRecord.id).toMatch(/outcome|no-result/)
-      expect(cue.askRecord.id).toMatch(/outcome|no-result/)
+      if (session.round.id === 'survive_connection_spike') {
+        expect(cue.askRecord.id).toMatch(/^r5\.ask\./)
+      } else {
+        expect(cue.askRecord.id).toMatch(/outcome|no-result/)
+      }
       expect(cue.proofRecord.id).toBe(cue.outcome.proof_template_id)
     }
   })
@@ -618,7 +654,7 @@ describe('one generic evidence classifier with six round contracts', () => {
     ['R4 guardrail', roundFourPartial, 'guardrail_failure', 'guardrail_failure', null, null],
     ['R5 verified-first', oneSidedRoundFiveSetupTowel(), 'exact_and_censored_lower_bound', 'comparison_incomplete', null, null],
     ['R5 both bounds', noVerifiedRoundFiveSetupTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
-    ['R5 spike guardrail', failedSpike(), 'guardrail_failure', 'guardrail_failure', null, null],
+    ['R5 bounded-check guardrail', failedSpike(), 'guardrail_failure', 'guardrail_failure', null, null],
     ['R5 cleanup before result', failedCleanup(), 'cleanup_failure', 'cleanup_failure', null, null],
     ['R5 cleanup after result', verifiedCleanupFailure(), 'cleanup_failure', 'cleanup_failure', 'lakebase', 11_650],
     ['R6 guardrail', roundSixPartial, 'guardrail_failure', 'guardrail_failure', null, null],
@@ -689,7 +725,13 @@ describe('one generic evidence classifier with six round contracts', () => {
       expect(classified.shareable).toBe(false)
       expect(classified.headline).toMatch(/RESULT RETAINED · CLEANUP FAILED · SHARING BLOCKED/)
       expect(cue.outcome.outcome_id).toBe('cleanup_failed')
-      expect(cue.say).toMatch(/sharing is blocked.*same round remains fenced/i)
+      if (roundId === 'survive_connection_spike') {
+        expect(cue.say).toMatch(/up to 10,000 client connections/i)
+        expect(cue.say).not.toMatch(/cleanup|fenced|128 attempts|maximum 64 concurrent/i)
+      } else {
+        expect(cue.say).toMatch(/cleanup did not verify.*fenced/i)
+      }
+      expect(cue.show).toMatch(/sharing is blocked.*same round remains fenced/i)
       expect(receipt.verdict).toBe(classified.headline)
       expect(scorecard?.contract_status).toBe('cleanup_failure')
       expect(scorecard?.remembered_result).toBe(classified.headline)
@@ -813,9 +855,9 @@ describe('Ringside output behavior', () => {
   it('states a one-sided Round 5 towel consistently for every audience track', () => {
     const session = oneSidedRoundFiveSetupTowel()
     const classified = classifyOutcome(session)
-    const expectedProof = 'Lakebase setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The shared 128-attempt spike did not run; no completed comparison or margin was declared.'
+    const expectedProof = 'Lakebase pooled-path setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The recurring 128-attempt check at maximum 64 concurrent did not run.'
     expect(classified.headline).toBe(
-      'LAKEBASE SETUP VERIFIED 2.63s · AURORA SERVERLESS V2 + RDS PROXY UNVERIFIED BEYOND 60.84s · SHARED SPIKE NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A',
+      'LAKEBASE SETUP VERIFIED 2.63s · AURORA SERVERLESS V2 + RDS PROXY UNVERIFIED BEYOND 60.84s · BOUNDED CHECK NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A',
     )
     expect(classified.formalWinner).toBeNull()
     expect(classified.marginMs).toBeNull()
@@ -827,15 +869,125 @@ describe('Ringside output behavior', () => {
         expect(cue.outcome.outcome_id).toBe('one_sided_setup_verified_towel')
         expect(cue.outcome.copy_mode).toBe('OUTCOME_OVERRIDE')
         expect(cue.say).toBe(
-          'Lakebase verified connection readiness first. Aurora Serverless v2 + RDS Proxy remained unverified at the stop, and the shared spike never ran.',
+          getRoundFivePersonaOutcomeRecord(
+            'one_sided_setup_verified_towel',
+            personaId,
+          ).meaning,
         )
         expect(cue.ask).toBe(
-          'What must the shared spike verify before Round 5 can declare a winner?',
+          getVerifiedRecord('survive_connection_spike', personaId, priorityKey).question,
         )
         expect(cue.show).toBe(expectedProof)
         expect(`${cue.say} ${cue.show}`).not.toMatch(
           /neither setup|neither readiness|no verified result/i,
         )
+      }
+    }
+  })
+
+  it('keeps every Round 5 persona, priority, competitor, and outcome cue truthful', () => {
+    const outcomeSessions = [
+      oneSidedRoundFiveSetupTowel(),
+      incompleteSetup(),
+      failedSpike(),
+      failedCleanup(),
+      noResult('survive_connection_spike'),
+    ]
+    const forbidden = /\b(?:spike|survive|readiness|contract test)\b|[–—]|customer customer/i
+    const bluntTenThousandDisclaimer = /(?:did|does) not (?:load-)?test.{0,32}10,000|10,000.{0,48}(?:not tested|not exercised|were not tested)|not (?:a )?10,000-client/i
+    const sayProofJargon = /\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i
+
+    for (const competitorId of ['aurora_serverless_v2', 'rds_postgres'] as const) {
+      const session = verifiedSession('survive_connection_spike', competitorId)
+      for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
+        for (const priorityKey of PRIORITY_KEYS) {
+          const cue = buildRingsideCue(session, personaId, priorityKey)
+          expect(cue.say).toMatch(/\bup to 10,000 client connections\b/i)
+          expect(cue.say).not.toMatch(sayProofJargon)
+          expect(cue.show).toContain(
+            'This bout verified pooled-path setup and 128 attempts at maximum 64 concurrent.',
+          )
+          expect(cue.show).toMatch(/separate 64-client multiplexing phase passed/i)
+          expect(cue.show).toMatch(/direct AWS connections and alternative pools were not compared/i)
+          expect(cue.show).not.toMatch(/10,000|ten thousand/i)
+          expect(`${cue.say} ${cue.ask}`).not.toMatch(forbidden)
+          expect(`${cue.say} ${cue.ask} ${cue.show}`).not.toMatch(bluntTenThousandDisclaimer)
+        }
+      }
+    }
+
+    for (const session of outcomeSessions) {
+      for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
+        for (const priorityKey of PRIORITY_KEYS) {
+          const cue = buildRingsideCue(session, personaId, priorityKey)
+          expect(cue.say).toMatch(/\bup to 10,000 client connections\b/i)
+          expect(cue.say).not.toMatch(sayProofJargon)
+          expect(cue.ask).toMatch(/\?$/)
+          expect(cue.show).not.toBe('')
+          expect(cue.show).toMatch(/128[- ]attempt/i)
+          expect(cue.show).toMatch(/maximum 64 concurrent/i)
+          expect(cue.show).not.toMatch(/10,000|ten thousand/i)
+          expect(`${cue.say} ${cue.ask}`).not.toMatch(forbidden)
+          expect(`${cue.say} ${cue.ask} ${cue.show}`).not.toMatch(bluntTenThousandDisclaimer)
+          expect(cue.say.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
+          expect(cue.ask.trim().split(/\s+/).length).toBeLessThanOrEqual(14)
+        }
+      }
+    }
+  })
+
+  it('keeps Round 5 authored copy concise, natural, distinct, and non-vacuous', () => {
+    const roundFiveVerified = VERIFIED_CORPUS_RECORDS.filter(
+      (record) => record.round_id === 'survive_connection_spike',
+    )
+    expect(new Set(roundFiveVerified.map((record) => record.meaning))).toHaveLength(10)
+    expect(new Set(roundFiveVerified.map((record) => record.question))).toHaveLength(70)
+    expect(new Set(
+      ROUND_FIVE_PERSONA_OUTCOME_RECORDS.map((record) => record.meaning),
+    )).toHaveLength(10)
+
+    for (const record of roundFiveVerified) {
+      expect(record.meaning.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
+      expect(record.question.trim().split(/\s+/).length).toBeLessThanOrEqual(14)
+      expect(record.meaning).toMatch(/\bup to 10,000 client connections\b/i)
+      expect(record.meaning).not.toMatch(
+        /\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i,
+      )
+      expect(record.question).toMatch(/\?$/)
+      expect(record.question).not.toMatch(/^Which .+,.+,\s*(?:and\s+)?(?:which\s+)?owner/i)
+      expect(record.question).not.toMatch(/What tradeoff matters most\?|separately value/i)
+      expect(`${record.meaning} ${record.question}`).not.toMatch(
+        /\b(?:spike|survive|readiness|contract test)\b|[–—]|customer customer/i,
+      )
+    }
+    for (const record of ROUND_FIVE_PERSONA_OUTCOME_RECORDS) {
+      expect(record.meaning.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
+      expect(record.meaning).toMatch(/\bup to 10,000 client connections\b/i)
+      expect(record.meaning).not.toMatch(
+        /\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i,
+      )
+      expect(record.meaning).not.toMatch(
+        /\b(?:spike|survive|readiness|contract test)\b|[–—]|customer customer/i,
+      )
+    }
+
+    const roleLeads = new Map(
+      roundFiveVerified.map((record) => [record.persona_id, record.meaning]),
+    )
+    expect(roleLeads.size).toBe(10)
+    const meaningfulWords = (text: string) => new Set(
+      text.toLowerCase().match(/[a-z]+/g)?.filter(
+        (word) => !['the', 'a', 'an', 'and', 'for', 'to', 'of', 'its', 'with', 'up'].includes(word),
+      ) ?? [],
+    )
+    const entries = [...roleLeads.entries()]
+    for (let left = 0; left < entries.length; left += 1) {
+      for (let right = left + 1; right < entries.length; right += 1) {
+        const leftWords = meaningfulWords(entries[left][1])
+        const rightWords = meaningfulWords(entries[right][1])
+        const overlap = [...leftWords].filter((word) => rightWords.has(word)).length
+        const union = new Set([...leftWords, ...rightWords]).size
+        expect(overlap / union).toBeLessThan(0.5)
       }
     }
   })

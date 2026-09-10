@@ -120,6 +120,9 @@ def app_environment() -> dict[str, str]:
         "AWS_AUTH_MODE": "environment",
         "AWS_REGION": "us-west-2",
         "AWS_EXPECTED_ACCOUNT_ID": "123456789012",
+        "ANTI_DEMO_RUNTIME_ROLE_ARN": (
+            "arn:aws:iam::123456789012:role/anti-demo-runtime"
+        ),
         "AURORA_CLUSTER_ID": "anti-demo-aurora",
         "AURORA_SECRET_ARN": "arn:aws:secretsmanager:us-west-2:123456789012:secret:a",
         "RDS_INSTANCE_ID": "anti-demo-rds",

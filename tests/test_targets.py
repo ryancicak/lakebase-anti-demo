@@ -346,6 +346,74 @@ async def test_rds_provider_uses_profileless_session_for_environment_auth(
     assert calls == [{"region_name": REGION}]
 
 
+async def test_deployed_aurora_arm_uses_sealed_runtime_role_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The live Round 1 regression: its first RDS call must be role-scoped.
+
+    The deployed binder supplies ``ANTI_DEMO_RUNTIME_ROLE_ARN`` and every fresh
+    target session must exchange the app user's permanent pair before touching
+    RDS. The source fake deliberately has no RDS client, so deleting either the
+    binding or the assume hop makes this test fail at the exact call that failed
+    in production.
+    """
+
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+    monkeypatch.setenv("AWS_AUTH_MODE", "environment")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA" + "0" * 16)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "p" * 40)
+    configure_aurora(monkeypatch)
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    role_arn = f"arn:aws:iam::{ACCOUNT_ID}:role/anti-demo-runtime"
+    monkeypatch.setenv("ANTI_DEMO_RUNTIME_ROLE_ARN", role_arn)
+    calls: list[dict[str, str]] = []
+    assume_requests: list[dict[str, object]] = []
+    assumed = FakeAuroraSession()
+
+    class SourceSts:
+        def assume_role(self, **kwargs):
+            assume_requests.append(kwargs)
+            return {
+                "Credentials": {
+                    "AccessKeyId": "ASIA" + "1" * 16,
+                    "SecretAccessKey": "s" * 40,
+                    "SessionToken": "temporary-session-token",
+                }
+            }
+
+    class SourceSession:
+        def client(self, service: str, **_kwargs):
+            assert service == "sts", "the base app user must never call AWS providers directly"
+            return SourceSts()
+
+    def session_factory(**kwargs):
+        calls.append(kwargs)
+        return SourceSession() if "aws_access_key_id" not in kwargs else assumed
+
+    monkeypatch.setattr("server.targets.boto3.Session", session_factory)
+
+    evidence = await AuroraCredentialProvider().assert_armed()
+
+    assert evidence["state"] == "SCALE_ZERO"
+    assert calls == [
+        {"region_name": REGION},
+        {
+            "aws_access_key_id": "ASIA" + "1" * 16,
+            "aws_secret_access_key": "s" * 40,
+            "aws_session_token": "temporary-session-token",
+            "region_name": REGION,
+        },
+    ]
+    assert assume_requests == [
+        {
+            "RoleArn": role_arn,
+            "RoleSessionName": "anti-demo-target",
+            "DurationSeconds": 3600,
+        }
+    ]
+
+
 async def test_rds_managed_secret_supplies_credentials_but_not_target_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

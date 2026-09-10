@@ -77,6 +77,7 @@ import {
 } from './round4'
 import {
   ROUND_FIVE_CONCURRENCY,
+  ROUND_FIVE_ID,
   ROUND_FIVE_DISPLAY_TITLE,
   ROUND_FIVE_RUNNER,
   ROUND_FIVE_SCHEDULED_CLIENTS,
@@ -85,6 +86,7 @@ import {
   ROUND_FIVE_WITNESS_CLIENTS,
   isRoundFive,
   roundFiveCountDisplay,
+  roundFiveFightCardOpening,
   roundFiveLaneResult,
   roundFiveP99Display,
   roundFiveSetupLaneResult,
@@ -194,7 +196,7 @@ const FINALE_BEATS: FinaleBeat[] = [
   { number: '02', roundId: 'make_schema_change_safely', title: 'Change safely', flow: 'Branch → isolated schema', proof: 'Changed copy verified · source untouched', accent: 'blue' },
   { number: '03', roundId: 'recover_deleted_order', title: 'Recover exactly', flow: 'Delete → exact row restored', proof: 'Recovered row verified · deletion preserved', accent: 'yellow' },
   { number: '04', roundId: 'put_model_score_in_app', title: 'Delta → live app', flow: 'Analytics → operational data', proof: 'Managed reverse ETL · app read verified', accent: 'red' },
-  { number: '05', roundId: 'survive_connection_spike', title: 'Get spike-ready', flow: 'Pooling → connection readiness', proof: 'Declared-start setup · identical spike passed · existing Proxy starts ready', accent: 'blue' },
+  { number: '05', roundId: 'survive_connection_spike', title: 'Ready a pooled application path', flow: 'Included pool → selected managed AWS pool', proof: 'Declared-start setup · bounded check passed · new Proxy path disclosed', accent: 'blue' },
   { number: '06', roundId: 'analyze_live_orders_without_slowing_checkout', title: 'Live app → Delta', flow: 'Checkout → exact answer', proof: 'Native change feed · separate checkout verified', accent: 'yellow' },
 ]
 
@@ -1404,14 +1406,14 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
     const unfinishedName = session.round5_setup?.lanes?.[unfinishedLane]?.name
       ?? session.lanes[unfinishedLane].name
     const lines = [
-      `${exactName} reached verified connection readiness in ${laneReceiptTime(exact)}. ${unfinishedName} was still unverified ${lowerBound === null ? 'without an exact lower bound' : `beyond ${laneReceiptTime(lowerBound)}`}. The shared spike did not run, so Round 5 declared no winner or margin. 🥊`,
+      `${exactName} reached verified connection readiness in ${laneReceiptTime(exact)}. ${unfinishedName} was still unverified ${lowerBound === null ? 'without an exact lower bound' : `beyond ${laneReceiptTime(lowerBound)}`}. The bounded connection check did not run, so Round 5 declared no winner or margin. 🥊`,
       '',
       `${exactLane === 'lakebase' ? '🔴' : '🔵'} ${exactName} · ${laneReceiptTime(exact)} · exact setup verified`,
       `${unfinishedLane === 'lakebase' ? '🔴' : '🔵'} ${unfinishedName} · ${lowerBoundLabel} · unverified${lowerBound === null ? '' : ' lower bound'}`,
       '',
       `ROUND ${roundNumber} · ${ROUND_FIVE_DISPLAY_TITLE}`,
       classified.headline,
-      `Receipt ${receiptId(session)} · Setup evidence only; the shared 128-attempt spike did not run · One live run, not a benchmark.`,
+      `Receipt ${receiptId(session)} · Setup evidence only; the 128-attempt, maximum-64-concurrent check did not run · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
     lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
@@ -1438,7 +1440,7 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       roundFiveSetupFairness(session),
       roundFiveIntegrityDetail(session),
       'Declared start · Lakebase built-in pooling · AWS best-practice RDS Proxy provisioned for this bout · An already-deployed Proxy would not pay this setup delay.',
-      `Receipt ${receiptId(session)} · Readiness setup is scored; the identical 128-connection spike is pass/fail only · One live run, not a benchmark.`,
+      `Receipt ${receiptId(session)} · Readiness setup is scored; the bounded 128-attempt, maximum-64-concurrent check is pass/fail only · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
     lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
@@ -2145,7 +2147,7 @@ function finaleCaption(session: DemoSession): string {
     '02 · Branch safely → isolated schema change, source untouched',
     '03 · Recover exactly → deleted row restored, source deletion preserved',
     '04 · Analytics Delta → verified live application row',
-    '05 · Built-in pooling → readiness verified, identical connection spike passed',
+    '05 · Built-in pooling → readiness verified, bounded connection check passed',
     `06 · Live checkout → exact Delta answer in ${finaleElapsed(session)}`,
     '',
     'Rounds 4 and 6 are capability proofs; the added AWS data-movement stacks were not built or timed. Round 5 scores declared-start readiness, not burst speed; an existing RDS Proxy would start ready.',
@@ -3813,7 +3815,9 @@ function Setup(props: {
   const secondaryPersonas = props.secondary.map((id) => props.catalog.personas.find((persona) => persona.id === id)!).filter(Boolean)
   const selectedOpening = selectedRound.id === recommendedRound.id
     ? props.recommendation.presenter_opening
-    : `This round: ${selectedRound.title}. Read it through the ${primaryPersona.role} lens; stop only when the application verifies the outcome.`
+    : selectedRound.id === ROUND_FIVE_ID
+      ? roundFiveFightCardOpening(primaryPersona.id)
+      : `This round: ${selectedRound.title}. Read it through the ${primaryPersona.role} lens; stop only when the application verifies the outcome.`
   const sceneNumber = { opponent: 1, lead: 2, lenses: 3, card: 4 }[props.scene]
   const sceneLabel = { opponent: 'Choose opponent', lead: 'Lead voice', lenses: 'Supporting lenses', card: 'Fight card' }[props.scene]
   const refusal = prepareRefusal({
@@ -4425,7 +4429,7 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
         </div>
       </section>
       <section className="round5-explain-phase" aria-label="Warm burst evidence">
-        <h3>Phase 2 · Identical 128-connection spike (pass/fail) · launch skew {typeof burstSkew === 'number' ? `${burstSkew.toFixed(3)} ms` : 'N/A'}</h3>
+        <h3>Phase 2 · Bounded 128-attempt, maximum-64-concurrent check (pass/fail) · launch skew {typeof burstSkew === 'number' ? `${burstSkew.toFixed(3)} ms` : 'N/A'}</h3>
         <div className="round5-explain-grid">
           <RoundFiveBurstCard lane={session.lanes.lakebase} corner="red" />
           <RoundFiveBurstCard lane={session.lanes.competitor} corner="blue" />
@@ -4722,7 +4726,7 @@ export function RoundFiveProof({
                   <span>{hasComparison ? 'Verified readiness comparison' : 'Contract gate · no comparison'}</span>
                   <strong>{verdict}</strong>
                 </div>
-                <p className="final-fairness">Readiness setup is scored · Identical 128-connection spike is pass/fail, not a speed comparison</p>
+                <p className="final-fairness">Readiness setup is scored · Bounded 128-attempt, maximum-64-concurrent check is pass/fail, not a speed comparison</p>
                 {/* A verified Round 5 keeps its win and can still fail to tidy
                     up, which is the case this screen used to render as a bare
                     "settling backstage" line whether cleanup was still trying
@@ -5772,7 +5776,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         ],
       },
       {
-        summary: `The identical ${ROUND_FIVE_SCHEDULED_CLIENTS}-client spike then ran against both ready lanes as a pass/fail check. It validates the setup score; it is not a second speed comparison.`,
+        summary: `The bounded ${ROUND_FIVE_SCHEDULED_CLIENTS}-attempt, maximum-${ROUND_FIVE_CONCURRENCY}-concurrent check then ran against both ready lanes. It validates the setup score; it is not a second speed comparison.`,
         shared: [
           ...burstContract,
           { label: 'Witness check', code: `${ROUND_FIVE_WITNESS_CLIENTS} witnessed clients must prove pooling reused backends`, note: 'Unique backend PIDs and peak backend sessions must both stay below the witnessed client count.' },
@@ -7031,7 +7035,7 @@ function scorecardProofLabel(entry: ScorecardEntry): string {
   if (entry.round_id === 'make_schema_change_safely' || entry.cooldown?.mode === 'delete_isolated_environment') return 'Copy + change → verified'
   if (entry.round_id === 'wake_idle_app') return 'Wake → verified'
   if (entry.round_id === 'put_model_score_in_app') return 'Delta score → exact app read'
-  if (entry.round_id === 'survive_connection_spike') return 'Exact setup stops → shared spike'
+  if (entry.round_id === 'survive_connection_spike') return 'Exact setup stops → bounded check'
   // Round 6 landed here and read "Non-executable round · no proof", which is
   // false twice over: it is the finale, it runs, and its proof is the exact
   // order arriving in Delta with the count verified. What it has no proof *of*
@@ -7403,7 +7407,7 @@ function proofCommentary(
       : verified.length === 2 && session.state === 'verified'
         ? `Both pooled paths and the identical spike verified · ${roundFiveVerifiedVerdict(session)}`
       : verified.length === 2
-        ? 'Both readiness clocks stopped · Identical 128-connection spike validation in progress · No comparison until every gate verifies'
+        ? 'Both readiness clocks stopped · Bounded 128-attempt, maximum-64-concurrent check validation in progress · No comparison until every gate verifies'
       : verified.length === 1 && other?.state === 'running'
         ? `${stopped.name} reached readiness${stopped.elapsedMs === null ? '' : ` at ${preciseDuration(stopped.elapsedMs)}`} · ${other.name} readiness clock still running · No comparison yet`
       : verified.length === 1
@@ -7413,7 +7417,7 @@ function proofCommentary(
             : active.length > 0
               ? 'Scored readiness setup in progress · Each clock stops independently at its exact application transaction'
               : 'Untimed shared preflight in progress · Both setup clocks are sealed'
-    const verdict = `${readinessUpdate} · RDS Proxy is AWS best practice; if already deployed, this setup delay does not apply`
+    const verdict = `${readinessUpdate} · RDS Proxy is the managed AWS option selected for this reference path; if already deployed, this setup delay does not apply`
     return {
       lanes: setupLanes.map((lane) => lane.line),
       verdict,
@@ -7888,7 +7892,7 @@ function fairnessCopy(roundId: RoundId): string {
     return 'Same exact row · One deletion barrier · Eligibility + recovery + verified read timed · Source remains deleted'
   }
   if (roundId === 'survive_connection_spike') {
-    return 'Shared post-preflight monotonic T0 · Each setup clock stops at its own exact application transaction · Identical 128-connection spike is pass/fail'
+    return 'Shared post-preflight monotonic T0 · Each setup clock stops at its own exact application transaction · Bounded 128-attempt, maximum-64-concurrent check is pass/fail'
   }
   return 'Non-executable round · No live fairness or timing contract'
 }

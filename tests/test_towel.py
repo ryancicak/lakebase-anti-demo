@@ -82,7 +82,7 @@ def test_round_five_towel_uses_only_shared_t0_setup_evidence() -> None:
     assert result.public_result == (
         "Toweled · Lakebase setup verified first · "
         "RDS PostgreSQL + RDS Proxy unverified beyond 223.27s · "
-        "Shared spike did not run · No declared winner · "
+        "Bounded check did not run · No declared winner · "
         "Comparison incomplete · Margin N/A"
     )
     assert "Neither setup" not in result.public_result
@@ -117,7 +117,7 @@ def test_round_five_towel_will_not_time_a_lane_that_never_published_progress() -
         assert lane.elapsed_ms is None
         assert lane.evidence == {"censored": True, "display_value": "NOT TIMED"}
     assert result.public_result == (
-        "Toweled · No exact setup stop verified · Shared spike did not run · "
+        "Toweled · No exact setup stop verified · Bounded check did not run · "
         "No declared winner · Comparison incomplete · Margin N/A"
     )
 
@@ -153,7 +153,7 @@ def test_round_five_towel_preserves_a_competitor_first_exact_stop_without_a_winn
     assert result.comparison.margin is None
     assert result.public_result == (
         "Toweled · RDS PostgreSQL + RDS Proxy setup verified first · "
-        "Lakebase unverified beyond 10.00s · Shared spike did not run · "
+        "Lakebase unverified beyond 10.00s · Bounded check did not run · "
         "No declared winner · Comparison incomplete · Margin N/A"
     )
 
@@ -185,7 +185,7 @@ def test_round_five_towel_does_not_compare_two_exact_setups_without_the_spike() 
     assert result.comparison.margin is None
     assert result.public_result == (
         "Toweled · Exact setup stops preserved for Lakebase and "
-        "RDS PostgreSQL + RDS Proxy · Shared spike did not complete · "
+        "RDS PostgreSQL + RDS Proxy · Bounded check did not complete · "
         "No declared winner · Comparison incomplete · Margin N/A"
     )
 

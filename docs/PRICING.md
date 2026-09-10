@@ -149,6 +149,9 @@ quantities, which move with every read, so they are named rather than fixed.
 | Aurora | AWS-managed credentials | AWS | assumed | 4 of 9 | `$0.40`/secret-month |
 | RDS Proxy | Terraform-managed proxy secrets | AWS | assumed | 2 of 9 | `$0.40`/secret-month |
 | Neutral runner | `m6i.large` burst runner | AWS | assumed | 1 | `$0.096`/instance-hour |
+
+The capacity-safe Round 5 default adds approximately `$0.096` per runner-hour
+over the former `m6i.large`. This is an hourly delta, not a monthly forecast.
 | Neutral runner | gp3 root volume | AWS | assumed | 20 GB | `$0.08`/GB-month |
 | Neutral runner | public IPv4 | AWS | assumed | 1 | `$0.005`/address-hour |
 | Lakebase | always-on minimum compute | Databricks | measured | none posted | `$0.26`/DBU |

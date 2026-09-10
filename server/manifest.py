@@ -1224,6 +1224,7 @@ def apply_manifest_environment(manifest: DemoManifest) -> None:
         "AWS_AUTH_MODE": manifest.aws.auth_mode,
         "AWS_REGION": manifest.aws.region,
         "AWS_EXPECTED_ACCOUNT_ID": manifest.aws.account_id,
+        "ANTI_DEMO_RUNTIME_ROLE_ARN": manifest.aws.runtime_role_arn or "",
         "DATABRICKS_PROFILE": manifest.databricks.profile,
         "LAKEBASE_ENDPOINT_NAME": manifest.databricks.endpoint_name,
         "LAKEBASE_DATABASE": manifest.databricks.database,
@@ -1245,6 +1246,8 @@ def apply_manifest_environment(manifest: DemoManifest) -> None:
     else:
         os.environ.pop("AWS_PROFILE", None)
         os.environ.pop("AWS_DEFAULT_PROFILE", None)
+    if manifest.aws.runtime_role_arn is None:
+        os.environ.pop("ANTI_DEMO_RUNTIME_ROLE_ARN", None)
     if "@" in manifest.owner:
         values.update(
             {

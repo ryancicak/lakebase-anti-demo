@@ -119,33 +119,16 @@ and names the variable, the file it belongs in, and the export that also works.
 | `AWS_ACCESS_KEY_ID` | an IAM user with the policies in [`docs/iam/`](iam/README.md) |
 | `AWS_SECRET_ACCESS_KEY` | the same |
 
-`AWS_DEFAULT_REGION` is a sixth only when it has to be. When it is unset,
-bootstrap reads `aws configure get region` — the region this laptop's AWS CLI is
-already configured with, which is a fact about the machine rather than a decision
-about the install — shape-checks it, and says where it came from. It is prompted
-for only when there is no configured region to find.
+There is no sixth region input. Bootstrap first reads a configured AWS CLI
+region, shape-checks it, and says where it came from. If there is none, it uses
+the documented safe default `us-west-2`.
 
-### One optional seventh, and why it is not a seventh required input
-
-`ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS` is a comma-separated list of the exact IAM
-user and role ARNs that should be allowed to assume a shared
-[`anti-demo-runtime` role](iam/README.md#the-runtime-role-and-the-fortnightly-sweep).
-Leave it unset — the default — and nothing changes: no role is created, and the
-laptop and the deployed app each authenticate as themselves, which is why Round 5
-cannot run in the deployed app.
-
-Set it on a fresh install and one role is created that both principals assume, so
-`sts:GetCallerIdentity` returns the same sealed identity either way. It is read
-**at first provision only**. The ARNs Terraform actually creates are then sealed
-into the manifest, and from that point the variable may only agree with the seal:
-contradict it and `antidemo setup`, `antidemo doctor` and `antidemo renew` all refuse. This
-is the same resolve-then-seal rule the Round 4 catalog follows, for the same
-reason — an environment variable must not be able to silently re-decide something
-an installation already committed to.
-
-It adds no other input. The role's name is fixed, so its ARN is derivable before
-Terraform runs; `ROUND5_APP_PRINCIPAL_ARN` is overridden with it automatically
-rather than being something you supply.
+There is no runtime-principal input either. Bootstrap calls STS with the
+persistent AWS pair in an isolated environment, verifies the account, accepts
+only a stable IAM user or role identity, and passes that exact ARN into
+Terraform's shared runtime-role trust. The role ARN and trusted set are sealed
+from Terraform outputs, so later runs verify the original decision instead of
+asking the user to reproduce internal plumbing.
 
 A personal access token is not accepted and neither is `databricks auth login`
 interactive state. The mechanism is OAuth M2M: `bootstrap.sh` writes a
@@ -161,15 +144,14 @@ is then passed to every `antidemo` command.
 | `ROUND5_APP_PRINCIPAL_ARN` | the caller's own IAM user/role ARN; for an assumed role, resolved through `iam:GetRole`. Overridden with the runtime role's ARN when one is configured — see below |
 | `ANTI_DEMO_MANIFEST` | the highest existing `.anti-demo-v*/manifest.json`, or a new `.anti-demo-v7` |
 | `DATABRICKS_PROFILE` | `anti-demo-<workspace subdomain>`, written from the OAuth credentials |
-| `DATABRICKS_WAREHOUSE_ID` | the workspace's only SQL warehouse; you are asked to choose if there are several |
+| `DATABRICKS_WAREHOUSE_ID` | selected deterministically from visible warehouses: serverless, then running, then name and ID |
 | `DATABRICKS_APP_CLIENT_ID` | the Databricks App's service principal, by adopting or creating the app |
 | `AWS_REGION` | mirrored from `AWS_DEFAULT_REGION`, because `server/cli.py` reads only the former |
 | operator ingress `/32` | `checkip.amazonaws.com`, the same source `antidemo setup` uses |
 
-`AWS_PROFILE` and `AWS_DEFAULT_PROFILE` are unset for the run. A named profile
-and ambient keys together are refused outright by
-`server/aws_auth.py:select_setup_auth`, and a stale `AWS_SESSION_TOKEN`
-inherited from an SSO session is also cleared unless you supplied one.
+`AWS_PROFILE` and `AWS_DEFAULT_PROFILE` are unset on the public path. A stale
+`AWS_SESSION_TOKEN` inherited from an SSO session is also cleared; the
+documented permanent pair carries no token.
 
 ## What it validates before spending anything
 
@@ -425,42 +407,6 @@ independently recomputes the source digest before its first Databricks secret
 write or workspace sync and exits non-zero if the source is still ahead of the
 seal.
 
-Normal uptime and app restarts do not create harness drift: source, manifest,
-and EC2 hashes remain stable until runner source changes. Aurora cold wake time
-is inherently variable, so direct-wake verification uses 100 seconds of the
-120-second SSM command boundary and reserves 20 seconds for result serialization
-and command completion. This protects application reliability across long
-uptimes; it cannot prevent an external scheduled EphemeralNuke or other owner
-from deleting the underlying infrastructure.
-
-1. Build the frontend: `cd frontend && npm ci && npm run build`. `frontend/dist`
-   is not committed and the app serves 503 without it.
-2. Create four app resources on the app that `bootstrap.sh` created or adopted,
-   with these exact resource keys, because `app.yaml` binds them by key:
-   - `anti-demo-manifest-json` — the **contents** of the sealed manifest, as a
-     secret. This is the one people get wrong: `app.yaml` binds
-     `ANTI_DEMO_MANIFEST_JSON` to the secret, not to the file, so the secret has
-     to be rewritten and the app restarted every time setup or resume changes
-     the seal. `antidemo renew` prints this reminder; `antidemo setup` does not.
-   - `aws-access-key-id`, `aws-secret-access-key`, `aws-session-token` — the
-     same AWS credentials. All three bindings are required to *resolve*, because
-     Databricks Apps has no optional binding: an `env` entry is a `name` plus
-     either `value` or `valueFrom`, and a `valueFrom` naming a resource that does
-     not exist fails the app at startup with `error resolving resource`. A
-     keys-only installation therefore creates `aws-session-token` as a secret
-     holding the **empty string**, which both `botocore` and this repository read
-     as "no session token". See [the session token](#the-aws-session-token).
-3. Grant the app's service principal: `CAN_USE` on the warehouse, `SELECT`/
-   `MODIFY` on the Round 4 source table, read on the target Postgres, and
-   connect plus table privileges on `anti_demo_coordination.ring_lease`. README
-   has the full list.
-4. Sync the working tree and deploy the app.
-
-Reading the manifest from that secret is not gated on expiry, and there is no
-longer any code that could gate it: the refusing `assert_not_expired` has been
-deleted from `DemoManifest`, and `_warn_if_expired` and `_expiry_check` are both
-advisory. The app does fail closed if the selected round's seal is incomplete:
-v5 for Round 5, live-validated v6 for Round 6.
 
 ## The AWS credential the deployed app runs on
 
@@ -491,106 +437,18 @@ secret from an IAM user is accepted end to end.
 
 ### What the deployed app does with the key
 
-The app holds whatever the supplied key holds, so it is worth knowing that
-**provisioning and running are two different privilege sets**:
+Provisioning and running have different privilege sets. The supplied permanent
+pair identifies the principal and creates the shared `anti-demo-runtime` role on
+a fresh install. Terraform attaches the reviewed operator policies to that role
+and seals its exact trust set. Every AWS-backed round assumes the shared role;
+Round 5 then makes its existing second hop into the sealed control role.
 
-- **Provisioning** genuinely needs the broad set — it creates IAM roles,
-  security groups and an EC2 instance. That is the three-document operator set
-  in [`docs/iam/`](iam/README.md).
-- **The deployed app** needs far less: RDS catalog reads, point-in-time restores
-  into the `adsc-*` and `adrc-*` per-bout prefixes, deletes scoped to those same
-  prefixes, `secretsmanager:GetSecretValue` on `rds!*`, and two metric reads.
-  That is [`docs/iam/anti-demo-app-runtime.json`](iam/anti-demo-app-runtime.json),
-  and `python -m server.aws_permissions` prints the same set derived from the
-  round modules' own call sites rather than from a list anybody maintains.
-
-If you supply one key for both, it must hold the broad set, and the deployed app
-will hold the broad set too — including `iam:CreateRole` and `ec2:RunInstances`.
-That is the simple path and it works. If you would rather the app held less,
-create a second IAM user on `anti-demo-app-runtime.json`, and put *that* user's
-key in `.env.bootstrap` before running `--deploy-only`. Two consequences to know
-before you do:
-
-- **Provisioning must still run as the broad key.** Run `--apply` with it, then
-  swap the two AWS values in `.env.bootstrap` and run `--deploy-only`.
-- **Round 5 will report `principal_mismatch`.** Its control role's trust policy
-  seals exactly one principal, sealed at provision from whoever provisioned. An
-  app authenticating as a different principal is not that one, so `/readyz`
-  reads `degraded` with Round 5 off the card and the other five unaffected.
-  On a **default** install nothing is lost that was working, because Round 5 is
-  not on a default install's deployed card in any case; the health surface just
-  says `degraded` rather than `ready`. On an install that sealed a shared runtime
-  role, this split *does* cost you a working round — see
-  [Default limit: Round 5 is not on a default install's card](#default-limit-round-5-is-not-on-a-default-installs-card).
-  **The same applies to a local `./antidemo serve`,** which authenticates
-  as whatever `.env.bootstrap` or the shell supplies: seal the installation to one
-  of the two principals and the other loses Round 5 locally too. The mismatch is
-  reported and served through rather than refused — see
-  [what a mismatch does at launch](#what-a-round-5-principal-mismatch-does-at-launch).
-
-Using a single key for both avoids that entirely: the provisioning principal and
-the app principal are then the same ARN, `principal_matches` agrees, and
-`/readyz` reads `credentials_state: ok`.
-
-## Default limit: Round 5 is not on a default install's card
-
-**This is intended, it is not a broken install, and there is nothing to wait for
-or grant.** Five rounds on the card instead of six is the correct outcome for a
-default install, and the app says so itself — Round 5's catalog entry carries
-the reason in full, headed:
-
-> THIS ROUND IS NOT ON TONIGHT'S CARD. Round 5 is run by the operator, from the
-> operator's own machine, as the one identity its controls were sealed to.
-
-Round 5 assumes a control role whose trust policy names **exactly one**
-principal, fixed when the installation was sealed, and a default install seals no
-shared role for the app and the operator to reach it through. Nothing running
-inside the app can edit a sealed trust policy, so the app withholds the round.
-
-**The refusal is one thing rather than two, and the difference matters if you are
-reading an older copy of this page.** `docs/iam/anti-demo-app-runtime.json` grants
-`sts:AssumeRole` on `role/*-r5-exec-*` — the Round 5 execution role and nothing
-else in the account. Earlier revisions said the app principal held no
-`sts:AssumeRole` at all and was therefore refused twice over; that is no longer
-true. What refuses the round in the deployed app is the shared trust, and it is
-enforced in code rather than only by IAM: `server/round_availability.py` withholds
-Round 5 from a deployed app whenever no runtime role is sealed, whatever the
-grant says.
-
-Run Round 5 from a local checkout, attended, as the principal that provisioned:
-
-```bash
-./antidemo serve      # then drive Round 5 from localhost:8000
-```
-
-The mechanism that puts Round 5 on the deployed card exists, is switched off by
-default, and **has been exercised**: `anti_demo_runtime_principal_arns` in
-`infra/aws/variables.tf` creates a shared `anti-demo-runtime` role trusted by
-both the operator's principal and the app's, and makes *that* role the control
-role's single trusted principal. The deployed app then reaches its runner in two
-STS hops — ambient credentials into the runtime role, runtime role into the
-sealed execution role — rather than having to be the trusted principal itself.
-An installation configured this way has declared four Round 5 bouts from the
-deployed app, both lanes verified and `cleanup_failure` null on each; the
-[README](../README.md#what-has-been-proven-and-what-has-not) has the figures and
-the receipt codes.
-
-Two conditions come with it, and neither is optional. The variable defaults to
-`[]`, and because the trust policy is sealed at first provision, turning it on is
-a **fresh install rather than a repair**. And a trusted role does not open a
-security group: the deployed app also needs the Databricks serverless egress
-prefixes sealed into the manifest and applied to the database security groups,
-or all four AWS-backed rounds are refused at the network instead. Unless you need
-Round 5 in front of a remote audience, leaving it off is still the right call.
-
-### What `/readyz` says about this, and why not to read too much into it
-
-An install in exactly this correct state reports `status: degraded` and
-`credentials_state: principal_mismatch`. Both are accurate and neither is an
-error. `degraded` here means "fewer rounds than the maximum are available", which
-for a default install is the permanent, intended steady state. Judge the install
-by whether the five rounds are `ready` in `/api/catalog`, not by the one word in
-`/readyz`.
+This keeps the public contract flat while allowing a repaired or rotated
+installation to use a dedicated app IAM user whose only direct permission is
+`sts:AssumeRole` on the exact shared role. The app does not need direct RDS,
+EC2, Secrets Manager, or IAM permissions on that user. `/readyz` proves the
+source credential, the assume hop, and an RDS catalog read through the role
+before reporting `credentials_state: ok`; all six rounds remain on the card.
 
 ## Serve-time credentials: the same file, carried to `./antidemo serve`
 
@@ -690,85 +548,30 @@ aws-session-token`.
 
 ## Round 4's Unity Catalog
 
-`ROUND4_CATALOG` selects it, exactly as `DATABRICKS_CDF_CATALOG` selects Round
-6's. The default in `server/lifecycle.py:ROUND4_DEFAULT_CATALOG` is `main`, the
-catalog Databricks itself creates when a workspace is enabled for Unity Catalog,
-so it is the one name with a real chance of already existing in a workspace this
-repository has never seen. That makes it a *likely* default, not a guaranteed
-one: where `main` is absent or invisible to the principal, the installer refuses
-before any Unity Catalog write and names `ROUND4_CATALOG` as the variable to set.
-Round 4 deliberately does not create the catalog itself, because cleanup deletes
-only the three schemas it made and has no catalog delete — a created catalog
-would be an orphan nothing reaps.
+The five-input path uses Unity Catalog `main`, which Databricks creates when the
+workspace is enabled for Unity Catalog. Bootstrap verifies it before spending
+anything and then seals it into the manifest. Round 4 deliberately does not
+create a catalog: cleanup deletes only the schemas it made, so creating a
+catalog here would leave an orphan. A workspace without a visible, usable
+`main` does not meet the documented prerequisite.
 
-The variable is read **only on a first provision**.
-`server/lifecycle.py:_round4_catalog` then prefers the manifest's sealed
-`round4.storage_catalog`, because the catalog reaches `CREATE SCHEMA`, `GRANT`
-and cleanup `DELETE SCHEMA` statements: a later run that fell back to a
-compiled-in default would act on a catalog it did not provision. A value that
-contradicts the seal is refused by name rather than silently ignored or silently
-obeyed, and `bootstrap.sh` refuses the same mismatch before spending anything.
+On every later run, `server/lifecycle.py:_round4_catalog` prefers the manifest's
+sealed value. A later default or environment change cannot silently redirect
+`CREATE SCHEMA`, `GRANT`, or cleanup `DELETE SCHEMA` statements.
 
-## What needs more than the five inputs
+## There is no sixth setup input
 
-Stated plainly, because "five inputs" is the claim this document leads with and
-these are the exceptions to it.
+The workspace still needs the capabilities listed in the README: Lakebase,
+Unity Catalog `main`, and at least one SQL warehouse visible to the service
+principal. Those are workspace prerequisites, not values copied into
+`.env.bootstrap`. Bootstrap verifies them, chooses a warehouse deterministically,
+creates or adopts the Databricks App, derives its service-principal identity,
+and seals every resulting ID.
 
-**`ROUND4_CATALOG` is required on any workspace without a usable `main`.** Round 4
-needs a Unity Catalog it can create a schema in, and the compiled-in default
-(`server/lifecycle.py:ROUND4_DEFAULT_CATALOG`) is `main` — the catalog Databricks
-creates for a Unity Catalog-enabled workspace, so on most workspaces there is
-nothing to set. It is a likely default rather than a certain one, and the
-installer does not gamble on it: a run that falls back to it says in as many
-words that nobody chose it for this workspace and that it is sealed on first
-provision, and if `main` is absent or invisible to the principal the run refuses
-early — before any Unity Catalog write and before anything is spent — naming
-`ROUND4_CATALOG` as the variable to set and the `databricks catalogs list` that
-shows the candidates. An **existing installation is unaffected either way**: the
-catalog sealed into the manifest outranks both the variable and the default, so a
-generation provisioned into some other catalog keeps working untouched and a
-variable that contradicts the seal is refused rather than obeyed. It is read on a
-first provision only and then sealed — see
-[Round 4's Unity Catalog](#round-4s-unity-catalog).
-
-**`DATABRICKS_WAREHOUSE_ID` is required when the workspace has more than one SQL
-warehouse.** With exactly one, bootstrap selects it and prints its ID *and its
-name*. With several, it prints every candidate's ID, name, type and state, and
-gives the line to paste into `.env.bootstrap`. Round 4 seals the choice into its
-contract, so it refuses to guess. An API failure from `databricks warehouses
-list` is now reported as an API failure: it used to fall back to an empty list
-and report "no SQL warehouse is visible", which sent operators off to create a
-warehouse they already had.
-
-**`ROUND5_APP_PRINCIPAL_ARN` is derived in the common case and required in one.**
-`sts:GetCallerIdentity` returns a stable ARN directly for an IAM user or role,
-and bootstrap adopts that string verbatim — it is not an input for anybody using
-long-lived keys, which is what `docs/bootstrap.env.example` asks for. For an
-assumed role it is resolved through `iam:GetRole`, and when *that* fails it stays
-required and is not guessed at. That refusal is deliberate and worth being
-explicit about: Round 5's control-role trust policy is generated from this value
-and sealed into the manifest at first provision, so a wrong ARN provisions
-perfectly and then fails Round 5 at click time, in front of an audience. There is
-no string transformation from the STS `assumed-role` form to the IAM form — the
-path is dropped and cannot be recovered — so the only safe options are the
-authoritative lookup or an explicit value. The error now prints the exact
-`aws iam list-roles` query that produces the answer.
-
-**That hazard is confined to first provision, and on a sealed installation the
-variable cannot cause it at all.** Once a manifest exists, the sealed value
-outranks the environment: `server/lifecycle.py` resolves the principal from the
-seal and a contradicting `ROUND5_APP_PRINCIPAL_ARN` is refused by `antidemo
-setup`, `doctor` and `renew` rather than quietly re-deciding anything. On an
-installation that seals a shared runtime role the variable is not consulted for
-the trust policy in the first place — the runtime role's ARN is, and bootstrap
-overrides the variable with it automatically. Earlier revisions of this page
-described the variable as a standing pinning hazard for the life of an install.
-It is not; it is a first-provision input like the others.
-
-**Round 4 also requires `DATABRICKS_APP_CLIENT_ID`, which bootstrap derives** by
-creating or adopting the Databricks App. Setup seals that exact service principal
-into the Round 4 contract and cannot publish a v2 manifest without it. Driving
-`./antidemo` without bootstrap means supplying it yourself.
+Unsupported or ambiguous AWS identities are refused instead of asking for a
+principal ARN. A permanent IAM user or role is the supported five-input path;
+temporary assumed-role credentials are not suitable for an unattended deployed
+app.
 
 **Grants on the app's service principal are manual.** The deploy cannot grant them
 to itself. [docs/DEPLOY.md](DEPLOY.md#coordination-database-grants--the-complete-runtime-set)

@@ -217,8 +217,9 @@ ownership, and the next useful question.
 4. **Move lakehouse data into an app** — Best for Data Engineers, Data Scientists,
    Analysts, and Application Owners discussing governed score delivery and
    freshness.
-5. **Get spike-ready** — Best for Software Engineers, SREs, DBAs, and Architects
-   discussing connection readiness, pooling, credentials, and ownership.
+5. **Ready a pooled application path** — Best for Software Engineers, SREs,
+   DBAs, and Architects discussing pooled-path setup, client fan-in, protected
+   backend slots, credentials, observability, and ownership.
 6. **Move app data into the lakehouse** — Best for Data Engineers, Analysts, SREs,
    and Application Owners discussing order-to-answer freshness and checkout
    protection.

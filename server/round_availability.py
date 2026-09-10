@@ -191,6 +191,7 @@ _ROUND5_RING_HEADLINE = (
     "other rounds are unaffected."
 )
 
+
 _ABSENT_OPPONENT_HEADLINE = (
     f"{NOT_ON_THE_CARD} The opponent it races is not set up in the account "
     "right now."
@@ -241,6 +242,7 @@ _ROUND5_UNSETTLED_REFUSAL = (
     "ROUND 5 CANNOT ARM: its own backstage cleanup has not reported ready, so "
     "arming it would be refused before the bell. The other rounds are unaffected."
 )
+
 
 #: The one sentence every Databricks authorization refusal carries, on both
 #: surfaces that report one. `server.manager` puts it on the bout's failure

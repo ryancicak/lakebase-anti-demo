@@ -2540,6 +2540,15 @@ def build_safe_change_engine(
         aws_account_id=account_id,
         aws_region=region,
     )
+    runtime_session = None
+    if owned.aws.runtime_role_arn is not None:
+        # Imported here to keep lifecycle's own lazy imports of this module
+        # acyclic. The shared helper performs the exact sealed assume-role hop;
+        # passing the resulting session to both adapters prevents either from
+        # rebuilding a direct, under-privileged app-user session.
+        from .lifecycle import _aws_session
+
+        runtime_session = _aws_session(owned)
     lakebase = LakebaseSafeChangeAdapter(
         LakebaseSafeChangeConfig(
             profile=dbx_profile,
@@ -2584,6 +2593,7 @@ def build_safe_change_engine(
                 else owned.aws.resources.aurora_writer_instance_id
             ),
         ),
+        session=runtime_session,
         session_factory=session_factory,
         connector=connector,
         sleep=sleep,
@@ -2596,6 +2606,7 @@ def build_safe_change_engine(
             security_group_id=rds_security_group_id,
             source_instance_id=rds_id,
         ),
+        session=runtime_session,
         session_factory=session_factory,
         connector=connector,
         sleep=sleep,

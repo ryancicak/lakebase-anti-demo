@@ -23,7 +23,7 @@ export const OUTCOME_IDS = [
   'one_sided_setup_verified_towel',
   'score_identity_unverified',
   'setup_incomplete',
-  'spike_contract_failed',
+  'bounded_check_failed',
   'cleanup_failed',
   'checkout_guardrail_unverified',
   'no_result',
@@ -59,6 +59,14 @@ export interface OutcomeCopyRecord {
   readonly meaning_decision: CopyDecision | null
   readonly question_decision: CopyDecision | null
   readonly proof_decision: CopyDecision
+}
+
+export interface RoundFivePersonaOutcomeRecord {
+  readonly outcome_id: RingsideOutcomeId
+  readonly persona_id: PersonaId
+  readonly meaning_record_id: string
+  readonly meaning: string
+  readonly meaning_decision: CopyDecision
 }
 
 export interface AuthoredText {

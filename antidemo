@@ -148,7 +148,7 @@ if [[ "${1:-}" == "serve" ]] \
 !! which is why it is being said here instead.
 !!
 !! Lost:   Round 1 (wake idle app), Round 2 (safe schema change),
-!!         Round 3 (recover deleted order), Round 5 (connection spike).
+!!         Round 3 (recover deleted order), Round 5 (pooled application path).
 !!         Each races a live Aurora or RDS opponent and cannot arm without AWS.
 !! Kept:   Round 4 and Round 6. Both reach Lakebase and no AWS at all.
 !!

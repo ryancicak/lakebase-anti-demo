@@ -1481,12 +1481,11 @@ const R4: RoundCue = {
  * ROUND 5 — "Hold the Line"
  * survive_connection_spike · D minor over its dominant · 84 BPM
  * --------------------------------------------------------------------------
- * DRAMATIC READ: sixty-four connections arrive at once and nothing flinches.
- * The proof is not speed, it is that the shape of the thing does not change
- * under load.
+ * DRAMATIC READ: the bounded connection check reaches its 64-client maximum
+ * concurrency and the musical shape does not change under load.
  *
  * So the cue is built on one note that never moves: A2, the dominant, for all
- * thirty-two bars, never re-voiced, never transposed. The spike is bars 17-24
+ * thirty-two bars, never re-voiced, never transposed. The load is bars 17-24
  * and it is a SWELL, not an acceleration — the dynamics climb about 4 dB and
  * the pad thickens from two notes to three, while the number of events per
  * bar stays exactly what it was. The melody quotes Round 1 note for note
@@ -1498,7 +1497,7 @@ const R5: RoundCue = {
   id: 'r5',
   round: 5,
   roundId: 'survive_connection_spike',
-  title: 'Get spike-ready',
+  title: 'Ready a pooled application path',
   musicTitle: 'Hold the Line',
   key: 'D minor over a dominant A pedal',
   bpm: 84,
@@ -1506,14 +1505,14 @@ const R5: RoundCue = {
   introBars: 4,
   loopBars: 32,
   drumScale: 0.95,
-  concept: 'One pedal note for ninety seconds. The spike is a swell, not an acceleration — the event count per bar never changes.',
+  concept: 'One pedal note for ninety seconds. The bounded check is a swell, not an acceleration — the event count per bar never changes.',
   dramatic: 'Round 1 material held over the dominant so it never resolves. Bars 17-24 are the load: four decibels louder, one voice thicker, exactly the same number of notes.',
   safety: 'Nothing accelerates, ever. The swell is carried by the triangle and the low pad, not by anything bright, and it releases into the four quietest bars of the cue.',
   landmarks: [
     { id: 'intro', label: 'Intro — the pedal, alone', part: 'intro', bar: 0 },
     { id: 'a', label: 'A — baseline: the hook, unresolved', part: 'loop', bar: 0 },
     { id: 'b', label: "A' — the pad joins, still no motion in the bass", part: 'loop', bar: 8 },
-    { id: 'c', label: 'B — THE SPIKE: louder and thicker, not faster', part: 'loop', bar: 16 },
+    { id: 'c', label: 'B — THE LOAD: louder and thicker, not faster', part: 'loop', bar: 16 },
     { id: 'd', label: 'C — released, and the pedal is still there', part: 'loop', bar: 24 },
   ],
   blocks: [
@@ -1529,7 +1528,7 @@ const R5: RoundCue = {
   },
   dynamics: {
     intro: [[0, 0.52], [4, 0.74]],
-    // The spike, as a curve: up over four bars, held for four, released over
+    // The load, as a curve: up over four bars, held for four, released over
     // four. Nothing in the note data changes across it.
     loop: [[0, 0.66], [8, 0.72], [16, 0.86], [20, 1.06], [24, 0.9], [27, 0.66], [32, 0.66]],
   },
@@ -1566,7 +1565,7 @@ const R5: RoundCue = {
         R,
         bar('. . . . | . . . . | C4 . . . | . . . .'),
         bar('. . . . | x . . . | . . . . | . . . .'),
-        // B — the spike. Same rhythm as A, four decibels up.
+        // B — the load. Same rhythm as A, four decibels up.
         bar('D4 . . . | . . . . | A3 . . . | C4 . . .'),
         R,
         bar('. . x . | . . . . | . . . . | . . . .'),
@@ -1592,7 +1591,7 @@ const R5: RoundCue = {
         'arp', 'arp', 'arp', 'arp', 'arp', 'arp', 'arp', 'arp',
         'arp', 'arp', 'silent', 'silent', 'arp', 'silent', 'silent', 'silent',
       ],
-      // Two notes per pad in the baseline, three in the spike: the texture
+      // Two notes per pad in the baseline, three under load: the texture
       // thickens without a single extra event.
       arp: {
         8: [['D3', 'A3']],

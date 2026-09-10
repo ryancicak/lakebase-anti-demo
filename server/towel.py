@@ -154,31 +154,31 @@ def adjudicate_round_five_towel(
         )
         public_result = (
             f"Toweled · {verified_name} setup verified first · {unverified_result} · "
-            "Shared spike did not run · No declared winner · "
+            "Bounded check did not run · No declared winner · "
             "Comparison incomplete · Margin N/A"
         )
         comparison_detail = (
             f"{verified_name} reached its exact setup stop; {unverified_result.lower()}. "
-            "The shared spike did not run, so no winner or margin was declared."
+            "The bounded check did not run, so no winner or margin was declared."
         )
     elif exact_lanes:
         exact = " and ".join(setup_lanes[lane_id].name for lane_id in exact_lanes)
         public_result = (
             f"Toweled · Exact setup stops preserved for {exact} · "
-            "Shared spike did not complete · No declared winner · "
+            "Bounded check did not complete · No declared winner · "
             "Comparison incomplete · Margin N/A"
         )
         comparison_detail = (
-            "Both setup lanes reached exact stops, but the shared spike did not complete; "
+            "Both setup lanes reached exact stops, but the bounded check did not complete; "
             "no winner or margin was declared."
         )
     else:
         public_result = (
-            "Toweled · No exact setup stop verified · Shared spike did not run · "
+            "Toweled · No exact setup stop verified · Bounded check did not run · "
             "No declared winner · Comparison incomplete · Margin N/A"
         )
         comparison_detail = (
-            "Round 5 stopped before either exact setup gate and before the shared spike; "
+            "Round 5 stopped before either exact setup gate and before the bounded check; "
             "no winner or margin was declared."
         )
 

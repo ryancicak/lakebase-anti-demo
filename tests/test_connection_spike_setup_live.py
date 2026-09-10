@@ -225,6 +225,7 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
         ssm_document_name="AWS-RunShellScript",
         native_role="anti_demo_burst",
         frozen_constants=SimpleNamespace(
+                runner_instance_type="m6i.large",
             rds_proxy_max_connections_percent=90,
             rds_proxy_borrow_timeout_seconds=120,
         ),

@@ -47,6 +47,13 @@ AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 ```
 
+Use a permanent IAM user pair (the normal 20-character access key ID and
+40-character secret, with no session token). Bootstrap asks STS who that pair
+belongs to, verifies the AWS account, and seals the exact stable IAM principal
+into the shared runtime-role trust automatically. It also derives the region,
+workspace, app, warehouse, secret scope, and every resource identifier; none is
+a sixth setup value.
+
 Check your machine and accounts. This command does not provision cloud
 resources:
 
@@ -120,12 +127,20 @@ For setup options and troubleshooting, see
 | 2 | Change a schema safely | Lakebase branches, Aurora clones, and RDS restores to a point in time. |
 | 3 | Recover a deleted order | Each lane restores and reads the same row. |
 | 4 | Move lakehouse data into an app | Delta data moves through managed reverse ETL into Lakebase. |
-| 5 | Get ready for a connection spike | Lakebase uses its pooled host. The AWS lane creates and tests an RDS Proxy. |
+| 5 | Ready a pooled application path | Lakebase verifies its included pool. The selected AWS reference path provisions RDS Proxy. Both run 128 attempts, maximum 64 concurrent, plus a separate witness. |
 | 6 | Move app data into the lakehouse | A committed Lakebase row moves through change data capture into Delta. |
 
 Rounds 1, 2, 3, and 5 compare 2 lanes. Rounds 4 and 6 run only on Lakebase
 because the matching AWS integration stacks are not built or timed. They make no
 AWS performance claim.
+
+Round 5 scores pooled-path setup from a database-only declared start. Its recurring
+validation runs 128 attempts, maximum 64 concurrent, plus separate multiplexing
+proof. Lakebase separately documents a built-in PgBouncer `max_client_conn` product
+limit of [up to 10,000 client connections](https://docs.databricks.com/aws/en/oltp/projects/connection-pooling).
+Client connections are not PostgreSQL backend sessions or simultaneous transactions.
+Direct AWS connections, an existing Proxy, and sustained load remain outside the
+selected-path comparison.
 
 [ROUNDS.md](ROUNDS.md) defines the timing and fairness rules for every round.
 

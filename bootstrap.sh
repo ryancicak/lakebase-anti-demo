@@ -30,6 +30,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
+ANTI_DEMO_EXECUTABLE="${ANTI_DEMO_EXECUTABLE:-./antidemo}"
 
 ENV_FILE=".env.bootstrap"
 MODE="check"
@@ -206,33 +207,14 @@ The five inputs, from --env-file or interactive prompts:
   AWS_ACCESS_KEY_ID
   AWS_SECRET_ACCESS_KEY
 
-Everything else is derived: the AWS region (from `aws configure get region` when
-it is not supplied), the AWS account ID, the Round 5 app principal ARN, the
-manifest path, the Databricks CLI profile, the SQL warehouse, the Databricks App
-and its service principal client ID. It also syncs .venv from uv.lock and builds
-frontend/dist, because ./antidemo refuses to run without the first and the UI answers
-503 without the second.
+Everything else is derived: the AWS region (configured CLI region, or the safe
+us-west-2 default), AWS account, stable app principal and runtime trust,
+manifest, Databricks profile, SQL warehouse, Databricks App and service
+principal, workspace resources and secret scope.
 
-  AWS_DEFAULT_REGION         only when the AWS CLI has no configured region
-                             (AWS_REGION is accepted as a synonym)
-
-Optional overrides, for when derivation cannot be unambiguous:
-
-  ANTI_DEMO_OWNER            ownership tag on every AWS resource
-  DATABRICKS_WAREHOUSE_ID    required if the workspace has more than one warehouse
-  DATABRICKS_APP_NAME        Databricks App to create or adopt (default lakebase-anti-demo)
-  DATABRICKS_APP_CLIENT_ID   skip app derivation and use this client ID
-  ROUND5_APP_PRINCIPAL_ARN   required if the AWS identity is an assumed role
-  DATABRICKS_CDF_CATALOG     Round 6 destination catalog (default main)
-  ROUND4_CATALOG             Round 4 source catalog; an existing installation's
-                             sealed catalog wins and this must agree with it
-  ANTI_DEMO_MANIFEST         override the derived manifest path
-  AWS_SESSION_TOKEN          only for temporary credentials
-  ANTI_DEMO_TTL_HOURS        first-provision expiry, default 72
-  ANTI_DEMO_TF_BACKEND       local (default) or s3
-  ANTI_DEMO_TF_STATE_BUCKET  S3 bucket for Terraform state
-  ANTI_DEMO_TF_STATE_KEY     object key, default anti-demo/<installation>/terraform.tfstate
-  ANTI_DEMO_SECRET_SCOPE     Databricks secret scope for the app's seal
+AWS_SESSION_TOKEN remains optional implementation plumbing, but the documented
+unattended app path is a permanent pair with no token. Advanced and test-only
+overrides remain internal controls; none is a public setup input.
 
 Start from docs/bootstrap.env.example. Never commit .env.bootstrap — .gitignore
 already excludes .env.* . Full walkthrough in docs/BOOTSTRAP.md.
@@ -424,6 +406,26 @@ fi
 # Below the tool gate on purpose: see the note above it. Nothing between here
 # and the end of this section may be depended on by that gate.
 
+# A provisioning profile is an input only when the selected bootstrap file names
+# it. Never inherit a caller's ambient profile beside an app credential pair:
+# that silently changes which account Terraform mutates. The persistent pair
+# below remains the deployed app's identity; this profile is the operator path.
+#
+# Deploy-only is stricter. Its purpose is to publish the exact app credential in
+# this file, not whichever operator session happens to own the terminal. An SSO
+# login exports a complete ASIA pair and token, so merely sourcing a file that
+# omits AWS_SESSION_TOKEN leaves that token live; a missing or commented key line
+# can leave the whole SSO pair live. Clear every ambient AWS credential selector
+# before sourcing the deploy file. Provision/check modes retain their documented
+# environment-input path.
+if ((DEPLOY_ONLY == 1)); then
+  unset \
+    AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN \
+    AWS_PROFILE AWS_DEFAULT_PROFILE AWS_ROLE_ARN AWS_ROLE_SESSION_NAME \
+    AWS_WEB_IDENTITY_TOKEN_FILE
+else
+  unset AWS_PROFILE AWS_DEFAULT_PROFILE
+fi
 if [[ -f "$ENV_FILE" ]]; then
   # Sourced rather than parsed so an operator can use shell quoting, but read
   # with `set -a` off so only explicit exports leak; every value is re-read
@@ -436,6 +438,48 @@ if [[ -f "$ENV_FILE" ]]; then
 else
   say "No $ENV_FILE (start from docs/bootstrap.env.example); missing inputs will be prompted for."
 fi
+AWS_OPERATOR_PROFILE="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-}}"
+unset AWS_PROFILE AWS_DEFAULT_PROFILE
+
+# A half-pair is never an invitation to prompt for the other half. It can come
+# from either input surface -- the env file or the calling environment -- and
+# using it would sign with a mismatched credential. The pair is one atomic input,
+# regardless of which mode this run is in.
+#
+# Refuse immediately after sourcing, before the local build, every cloud read,
+# the generation directory, Terraform, or Databricks secret publication. Values
+# are deliberately never interpolated into the message. The variable names are
+# sufficient to fix the file and safe to paste into an incident report.
+AWS_ACCESS_KEY_ID_INPUT="${AWS_ACCESS_KEY_ID:-}"
+AWS_SECRET_ACCESS_KEY_INPUT="${AWS_SECRET_ACCESS_KEY:-}"
+if [[ -n "$AWS_ACCESS_KEY_ID_INPUT" && -z "$AWS_SECRET_ACCESS_KEY_INPUT" ]]; then
+  die "INCOMPLETE AWS CREDENTIAL PAIR.
+
+       AWS_ACCESS_KEY_ID is set, but AWS_SECRET_ACCESS_KEY is empty or absent.
+       Nothing was provisioned, deployed, or published.
+
+       In $ENV_FILE, both assignment lines must be active shell assignments:
+
+         AWS_ACCESS_KEY_ID=<access key ID>
+         AWS_SECRET_ACCESS_KEY=<matching secret access key>
+
+       Replace both values together if either one may have been exposed. This
+       message never prints either value."
+elif [[ -z "$AWS_ACCESS_KEY_ID_INPUT" && -n "$AWS_SECRET_ACCESS_KEY_INPUT" ]]; then
+  die "INCOMPLETE AWS CREDENTIAL PAIR.
+
+       AWS_SECRET_ACCESS_KEY is set, but AWS_ACCESS_KEY_ID is empty or absent.
+       Nothing was provisioned, deployed, or published.
+
+       In $ENV_FILE, both assignment lines must be active shell assignments:
+
+         AWS_ACCESS_KEY_ID=<access key ID>
+         AWS_SECRET_ACCESS_KEY=<matching secret access key>
+
+       Replace both values together if either one may have been exposed. This
+       message never prints either value."
+fi
+unset AWS_ACCESS_KEY_ID_INPUT AWS_SECRET_ACCESS_KEY_INPUT
 
 if ((NEW_GENERATION == 1)) && [[ -n "${ANTI_DEMO_MANIFEST:-}" ]]; then
   die "--new-generation cannot be combined with ANTI_DEMO_MANIFEST.
@@ -619,30 +663,34 @@ REQUIRED=(
   "DATABRICKS_CLIENT_SECRET:$DATABRICKS_CLIENT_SECRET"
 )
 
-# Provisioning needs AWS credentials because Terraform runs. A deploy-only run
-# does not: it talks to Databricks alone, and the account and region it would
-# report are already sealed in the manifest. Demanding keys there made the whole
-# path unusable for an installation provisioned through an SSO profile, which
-# has no static keys to give.
-#
-# The keys stay *optional* rather than absent in deploy mode, because the app's
-# aws-access-key-id and aws-secret-access-key secrets do need refreshing
-# whenever they expire, and that is a deploy, not a provision. Supplying them
-# rotates them; omitting them leaves whatever the scope already holds.
+# The same five values are required in every mode, including deploy-only. This
+# prevents a weaker redeploy path from silently preserving unknown or expired
+# app credentials. They all resolve before the local build, profile write,
+# generation directory, cloud read, Terraform or secret publication.
 AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}"
 AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}"
 AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-}}"
+AWS_ACCESS_KEY_ID="$(prompt_value AWS_ACCESS_KEY_ID 'AWS_ACCESS_KEY_ID' "$AWS_ACCESS_KEY_ID")"
+AWS_SECRET_ACCESS_KEY="$(prompt_secret AWS_SECRET_ACCESS_KEY 'AWS_SECRET_ACCESS_KEY' "$AWS_SECRET_ACCESS_KEY")"
+REQUIRED+=(
+  "AWS_ACCESS_KEY_ID:$AWS_ACCESS_KEY_ID"
+  "AWS_SECRET_ACCESS_KEY:$AWS_SECRET_ACCESS_KEY"
+)
 if ((RUN_AWS_SECTIONS == 1)); then
-  AWS_ACCESS_KEY_ID="$(prompt_value AWS_ACCESS_KEY_ID 'AWS_ACCESS_KEY_ID' "$AWS_ACCESS_KEY_ID")"
-  AWS_SECRET_ACCESS_KEY="$(prompt_secret AWS_SECRET_ACCESS_KEY 'AWS_SECRET_ACCESS_KEY' "$AWS_SECRET_ACCESS_KEY")"
   # A region the AWS CLI already has configured is not an input, it is a fact
   # about this laptop, and asking for it is what made a five-input install a
   # six-input one. `aws configure get region` reads ~/.aws/config only; it does
   # not authenticate, does not consult the environment keys above, and prints
-  # nothing when there is no answer -- in which case it is still prompted for.
+  # nothing when there is no answer -- in which case the safe default is used.
   if [[ -z "$AWS_DEFAULT_REGION" ]]; then
-    CONFIGURED_REGION="$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
-      aws configure get region 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "$AWS_OPERATOR_PROFILE" ]]; then
+      CONFIGURED_REGION="$(env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY \
+        -u AWS_SESSION_TOKEN aws configure get region --profile "$AWS_OPERATOR_PROFILE" \
+        2>/dev/null | tr -d '[:space:]' || true)"
+    else
+      CONFIGURED_REGION="$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
+        aws configure get region 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
     # Shape-checked before it is adopted: anything else is a stub, an error
     # message or a stray line, and a bad region here becomes a confusing
     # endpoint-resolution failure several calls later.
@@ -651,23 +699,15 @@ if ((RUN_AWS_SECTIONS == 1)); then
       info "region $AWS_DEFAULT_REGION taken from the AWS CLI configuration (aws configure get region)"
     fi
   fi
-  AWS_DEFAULT_REGION="$(prompt_value AWS_DEFAULT_REGION 'AWS_DEFAULT_REGION' "$AWS_DEFAULT_REGION")"
+  if [[ -z "$AWS_DEFAULT_REGION" ]]; then
+    AWS_DEFAULT_REGION="us-west-2"
+    info "region us-west-2 selected by the documented safe default"
+  fi
   REQUIRED+=(
-    "AWS_ACCESS_KEY_ID:$AWS_ACCESS_KEY_ID"
-    "AWS_SECRET_ACCESS_KEY:$AWS_SECRET_ACCESS_KEY"
     "AWS_DEFAULT_REGION:$AWS_DEFAULT_REGION"
   )
-elif [[ -n "$AWS_ACCESS_KEY_ID" || -n "$AWS_SECRET_ACCESS_KEY" ]]; then
-  # Half a key pair is worse than none: it would publish one new secret beside
-  # one stale one and the app would sign requests with a mismatched pair.
-  [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" ]] ||
-    die "deploy-only was given only one half of the AWS key pair. Supply both
-         AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to rotate the app's credentials,
-         or neither to leave the ones already in the scope untouched."
-  info "AWS keys were supplied, so this run will rotate the app's AWS credential secrets"
 else
-  info "no AWS keys supplied; this run republishes the seal only and leaves the
-        app's AWS credential secrets as they are"
+  info "AWS keys were supplied, so this run will rotate the app's AWS credential secrets"
 fi
 
 for pair in "${REQUIRED[@]}"; do
@@ -686,23 +726,31 @@ esac
 # server/cli.py reads AWS_REGION, not AWS_DEFAULT_REGION. Terraform and boto3
 # read either. Bind both to the one value so no layer disagrees.
 AWS_REGION="$AWS_DEFAULT_REGION"
-export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_DEFAULT_REGION
+APP_AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+APP_AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+APP_AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}"
+export AWS_REGION AWS_DEFAULT_REGION
 
-# A named profile and ambient keys together are refused outright by
-# server/aws_auth.py:select_setup_auth. Keys win here, so the profile
-# variables must not survive into any child process.
-if [[ -n "${AWS_PROFILE:-}" || -n "${AWS_DEFAULT_PROFILE:-}" ]]; then
-  info "unsetting inherited AWS_PROFILE/AWS_DEFAULT_PROFILE; this run is keys-only"
-fi
-unset AWS_PROFILE AWS_DEFAULT_PROFILE
-
-if [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
-  export AWS_SESSION_TOKEN
-  info "using the supplied AWS_SESSION_TOKEN (temporary credentials)"
+if [[ -n "$AWS_OPERATOR_PROFILE" ]]; then
+  # Keep the app pair in unexported shell variables for identity derivation and
+  # Databricks secret publication. Every provisioning child sees only the
+  # explicitly configured profile, so Terraform never inherits the app user's
+  # intentionally narrow credentials.
+  export -n AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+  export AWS_PROFILE="$AWS_OPERATOR_PROFILE"
+  unset AWS_DEFAULT_PROFILE
+  info "using explicit AWS profile '$AWS_OPERATOR_PROFILE' for provisioning; the app credential pair is isolated"
 else
-  # A stale token inherited from an SSO session signs requests with the wrong
-  # identity and fails in a way that looks like a bad access key.
-  unset AWS_SESSION_TOKEN
+  unset AWS_PROFILE AWS_DEFAULT_PROFILE
+  export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+  if [[ -n "$APP_AWS_SESSION_TOKEN" ]]; then
+    export AWS_SESSION_TOKEN="$APP_AWS_SESSION_TOKEN"
+    info "using the supplied AWS_SESSION_TOKEN (temporary credentials)"
+  else
+    # A stale token inherited from an SSO session signs requests with the wrong
+    # identity and fails in a way that looks like a bad access key.
+    unset AWS_SESSION_TOKEN
+  fi
 fi
 
 if [[ "$DATABRICKS_HOST" != https://* ]]; then
@@ -864,6 +912,9 @@ info "not syncing .venv or building frontend/dist; assuming both already exist"
   warn "frontend/dist is missing and this run was told not to build it; the UI answers 503."
 fi
 
+# The stable bounded protocol keeps the original neutral runner shape.
+ROUND5_RUNNER_INSTANCE_TYPE="m6i.large"
+
 # ---------------------------------------------------------------------------
 # 2. AWS identity
 # ---------------------------------------------------------------------------
@@ -879,20 +930,54 @@ step "AWS identity"
 
 AWS_ACCOUNT_ID=""
 CALLER_ARN=""
-if CALLER_JSON="$(aws sts get-caller-identity --output json 2>&1)"; then
+APP_AWS_ACCOUNT_ID=""
+APP_CALLER_ARN=""
+if APP_CALLER_JSON="$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
+  AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID" \
+  AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY" \
+  ${APP_AWS_SESSION_TOKEN:+AWS_SESSION_TOKEN="$APP_AWS_SESSION_TOKEN"} \
+  aws sts get-caller-identity --output json 2>&1)"; then
+  APP_AWS_ACCOUNT_ID="$(printf '%s' "$APP_CALLER_JSON" | jq -r '.Account // empty' 2>/dev/null || true)"
+  APP_CALLER_ARN="$(printf '%s' "$APP_CALLER_JSON" | jq -r '.Arn // empty' 2>/dev/null || true)"
+else
+  fail "The persistent app AWS credential pair was rejected by sts:GetCallerIdentity.
+      The credential values are withheld. Replace the pair together and retry."
+fi
+
+if [[ -n "$AWS_OPERATOR_PROFILE" ]]; then
+  CALLER_JSON="$(aws sts get-caller-identity --output json 2>&1)" || {
+    fail "AWS profile '$AWS_OPERATOR_PROFILE' could not authenticate for provisioning.
+      Refresh that profile's SSO session and retry. The app credential pair was not used."
+    CALLER_JSON=""
+  }
+else
+  CALLER_JSON="$APP_CALLER_JSON"
+fi
+
+if [[ -n "$CALLER_JSON" ]]; then
   AWS_ACCOUNT_ID="$(printf '%s' "$CALLER_JSON" | jq -r '.Account // empty' 2>/dev/null || true)"
   CALLER_ARN="$(printf '%s' "$CALLER_JSON" | jq -r '.Arn // empty' 2>/dev/null || true)"
   if [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
     AWS_IDENTITY_OK=1
     ok "account $AWS_ACCOUNT_ID, region $AWS_REGION"
-    ok "principal $CALLER_ARN"
+    ok "provisioning principal $CALLER_ARN"
   else
     fail "sts:GetCallerIdentity returned account '$AWS_ACCOUNT_ID', which is not 12 digits."
   fi
-else
-  fail "AWS credentials rejected by sts:GetCallerIdentity. The error was: ${CALLER_JSON}
-      Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, and note that this run is
-      deliberately keys-only: any AWS_PROFILE you had set has been unset."
+fi
+if [[ "$APP_AWS_ACCOUNT_ID" != "$AWS_ACCOUNT_ID" ]]; then
+  fail "The persistent app credential resolves to account ${APP_AWS_ACCOUNT_ID:-unknown},
+      but provisioning resolves to account ${AWS_ACCOUNT_ID:-unknown}. Refusing before
+      Terraform: app runtime trust cannot cross this account boundary."
+fi
+if [[ -n "${AWS_EXPECTED_ACCOUNT_ID:-}" && "$AWS_ACCOUNT_ID" != "$AWS_EXPECTED_ACCOUNT_ID" ]]; then
+  fail "Provisioning resolves to account $AWS_ACCOUNT_ID, but AWS_EXPECTED_ACCOUNT_ID is
+      $AWS_EXPECTED_ACCOUNT_ID. Refusing before Terraform."
+fi
+if [[ "$APP_AWS_ACCESS_KEY_ID" == ASIA* || -n "$APP_AWS_SESSION_TOKEN" ]]; then
+  fail "Full-demo setup requires a persistent app IAM credential. The supplied pair is
+      temporary (key ID withheld), so it cannot be sealed into a deployed app. Create a
+      dedicated IAM user key with no AWS_SESSION_TOKEN and retry."
 fi
 else
   # Placeholders so the recorded-state writer and the manifest cross-checks have
@@ -900,85 +985,98 @@ else
   # it is read; until then nothing in this mode consults them.
   AWS_ACCOUNT_ID=""
   CALLER_ARN=""
+  APP_AWS_ACCOUNT_ID=""
+  APP_CALLER_ARN=""
 fi
 
-# ROUND5_APP_PRINCIPAL_ARN is the stable IAM principal that the deployed app
-# uses before sts:AssumeRole. server/lifecycle.py:_terraform_variables refuses
-# anything that is not an exact iam role or user ARN in this account, and it
-# does so before Terraform starts, so deriving it here is the difference
-# between a clear message and a confusing one ten minutes in.
+# The persistent app principal and provisioning principal are normalized to
+# stable IAM ARNs and become the shared runtime role's trust automatically.
+# No README input is needed. Assumed-role sessions are resolved through
+# iam:GetRole because their STS ARN omits the role path.
 #
 # --deploy-only never reaches Terraform, and the value it would need is already
 # sealed in the manifest, so an ambiguous identity must not block a redeploy.
 if ((RUN_AWS_SECTIONS == 0)); then
   ROUND5_APP_PRINCIPAL_ARN="${ROUND5_APP_PRINCIPAL_ARN:-}"
+  ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS="${ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS:-}"
   OPERATOR_IP=""
   info "deploy-only: skipping the Round 5 principal derivation and the ingress probe"
 elif ((AWS_IDENTITY_OK == 0)); then
   ROUND5_APP_PRINCIPAL_ARN="${ROUND5_APP_PRINCIPAL_ARN:-}"
+  ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS="${ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS:-}"
   OPERATOR_IP=""
   skipped "the Round 5 principal and the ingress probe need a working AWS identity"
-elif [[ -z "${ROUND5_APP_PRINCIPAL_ARN:-}" ]]; then
-  case "$CALLER_ARN" in
+else
+  case "$APP_CALLER_ARN" in
     arn:aws:iam::*:user/* | arn:aws:iam::*:role/*)
-      # The common case, and the one that keeps this off the input list: a
-      # long-lived IAM user or role has a stable ARN and STS returns it
-      # verbatim. Round 5's control-role trust policy is sealed from this value
-      # at first provision, so a wrong answer here does not fail now -- it fails
-      # at click time, on stage. That is why nothing is inferred, reformatted or
-      # defaulted: this branch adopts the exact string STS returned, and every
-      # other shape is refused below rather than guessed at.
-      ROUND5_APP_PRINCIPAL_ARN="$CALLER_ARN"
-      ok "derived ROUND5_APP_PRINCIPAL_ARN from the caller identity: $CALLER_ARN"
-      info "Round 5's control role trusts exactly this principal, and the trust policy is
-        sealed at first provision. If the app will run as something else, set
-        ROUND5_APP_PRINCIPAL_ARN now -- after the seal it cannot be changed without a
-        cleanup and re-provision."
+      ROUND5_APP_PRINCIPAL_ARN="$APP_CALLER_ARN"
       ;;
     arn:aws:sts::*:assumed-role/*)
-      ROLE_NAME="$(printf '%s' "$CALLER_ARN" | awk -F/ '{print $2}')"
-      ROLE_ARN="$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text 2>/dev/null || true)"
-      if [[ "$ROLE_ARN" == arn:aws:iam::* ]]; then
-        ROUND5_APP_PRINCIPAL_ARN="$ROLE_ARN"
-        ok "resolved the assumed role to its IAM ARN via iam:GetRole: $ROLE_ARN"
-      else
-        ROUND5_APP_PRINCIPAL_ARN=""
-        fail "ROUND5_APP_PRINCIPAL_ARN cannot be derived and must be supplied.
-      This identity is a temporary assumed role and iam:GetRole could not resolve it to a
-      stable IAM ARN:
-          caller     $CALLER_ARN
-          role name  $ROLE_NAME
-      The STS 'assumed-role' form is not an IAM ARN and it drops the role's path, so it
-      cannot be converted by string surgery. Round 5's control role is created with a trust
-      policy naming this principal exactly, and that policy is sealed into the manifest at
-      first provision -- a wrong value provisions cleanly and then fails Round 5 in front of
-      an audience. So this is required rather than guessed.
-      Find it with:
-          aws iam list-roles --query \"Roles[?RoleName=='$ROLE_NAME'].Arn\" --output text
-      and set ROUND5_APP_PRINCIPAL_ARN in $ENV_FILE. For an SSO role it is the
-      arn:aws:iam::${AWS_ACCOUNT_ID}:role/aws-reserved/sso.amazonaws.com/<region>/<name>
-      form, never the assumed-role form."
-      fi
+      ROUND5_APP_PRINCIPAL_ARN=""
+      fail "The persistent app credential resolved to an assumed-role session but no
+      eligible persistent IAM principal can be sealed. A temporary session requires
+      AWS_SESSION_TOKEN, and temporary app credentials are refused for a full demo."
       ;;
     *)
       ROUND5_APP_PRINCIPAL_ARN=""
-      fail "ROUND5_APP_PRINCIPAL_ARN cannot be derived from '$CALLER_ARN', which is neither an
-      IAM user, an IAM role, nor an assumed role. Set it explicitly in $ENV_FILE to the IAM
-      role or user ARN the deployed app authenticates as."
+      fail "The persistent app credential resolved to unsupported principal
+      '${APP_CALLER_ARN:-unknown}'. Root, federated-user, service, and ambiguous session
+      identities cannot be sealed as app runtime trust."
       ;;
   esac
-else
-  ok "using the supplied ROUND5_APP_PRINCIPAL_ARN"
-fi
-
-if ((RUN_AWS_SECTIONS == 1 && AWS_IDENTITY_OK == 1)); then
   case "$ROUND5_APP_PRINCIPAL_ARN" in
     "" ) ;; # already reported above; do not report the consequence twice
     "arn:aws:iam::${AWS_ACCOUNT_ID}:role/"* | "arn:aws:iam::${AWS_ACCOUNT_ID}:user/"*) ;;
-    *) fail "ROUND5_APP_PRINCIPAL_ARN must be an IAM role or user ARN in account $AWS_ACCOUNT_ID,
-      and it is '$ROUND5_APP_PRINCIPAL_ARN'. server/lifecycle.py:_terraform_variables refuses
-      the same value before Terraform starts." ;;
+    *) fail "The derived app runtime principal is not an IAM role or user ARN in account
+      $AWS_ACCOUNT_ID. Refusing before Terraform." ;;
   esac
+
+  OPERATOR_STABLE_ARN="$CALLER_ARN"
+  if [[ "$CALLER_ARN" == arn:aws:sts::*:assumed-role/* ]]; then
+    ROLE_REMAINDER="${CALLER_ARN#*:assumed-role/}"
+    ROLE_NAME="${ROLE_REMAINDER%%/*}"
+    OPERATOR_STABLE_ARN="$(aws iam get-role --role-name "$ROLE_NAME" \
+      --query 'Role.Arn' --output text 2>/dev/null || true)"
+  fi
+  case "$OPERATOR_STABLE_ARN" in
+    "arn:aws:iam::${AWS_ACCOUNT_ID}:role/"* | "arn:aws:iam::${AWS_ACCOUNT_ID}:user/"*) ;;
+    *) fail "The provisioning identity cannot be resolved to an exact stable IAM role or
+      user ARN in account $AWS_ACCOUNT_ID. Refusing before Terraform." ;;
+  esac
+
+  RUNTIME_PRINCIPALS="$ROUND5_APP_PRINCIPAL_ARN"
+  if [[ "$OPERATOR_STABLE_ARN" != "$ROUND5_APP_PRINCIPAL_ARN" ]]; then
+    RUNTIME_PRINCIPALS="$RUNTIME_PRINCIPALS,$OPERATOR_STABLE_ARN"
+  fi
+  [[ -z "${ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS:-}" ]] ||
+    RUNTIME_PRINCIPALS="$RUNTIME_PRINCIPALS,$ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS"
+  ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS="$RUNTIME_PRINCIPALS"
+  ok "derived persistent app principal $ROUND5_APP_PRINCIPAL_ARN"
+  ok "runtime trust resolved automatically for account $AWS_ACCOUNT_ID"
+
+  # The five-input path uses one permanent source pair. On the first install it
+  # carries the documented bootstrap policies and Terraform creates this role.
+  # On later runs the same source may be an assume-only dedicated app user; if
+  # the sealed fixed-name role already exists and admits it, use that role for
+  # all provisioning reads and writes without asking for a sixth input.
+  if [[ -z "$AWS_OPERATOR_PROFILE" ]]; then
+    RUNTIME_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/anti-demo-runtime"
+    RUNTIME_SESSION_JSON="$(aws sts assume-role \
+      --role-arn "$RUNTIME_ROLE_ARN" \
+      --role-session-name anti-demo-bootstrap \
+      --duration-seconds 3600 \
+      --output json 2>/dev/null || true)"
+    RUNTIME_ACCESS_KEY_ID="$(printf '%s' "$RUNTIME_SESSION_JSON" | jq -r '.Credentials.AccessKeyId // empty' 2>/dev/null || true)"
+    RUNTIME_SECRET_ACCESS_KEY="$(printf '%s' "$RUNTIME_SESSION_JSON" | jq -r '.Credentials.SecretAccessKey // empty' 2>/dev/null || true)"
+    RUNTIME_SESSION_TOKEN="$(printf '%s' "$RUNTIME_SESSION_JSON" | jq -r '.Credentials.SessionToken // empty' 2>/dev/null || true)"
+    if [[ -n "$RUNTIME_ACCESS_KEY_ID" && -n "$RUNTIME_SECRET_ACCESS_KEY" && -n "$RUNTIME_SESSION_TOKEN" ]]; then
+      export AWS_ACCESS_KEY_ID="$RUNTIME_ACCESS_KEY_ID"
+      export AWS_SECRET_ACCESS_KEY="$RUNTIME_SECRET_ACCESS_KEY"
+      export AWS_SESSION_TOKEN="$RUNTIME_SESSION_TOKEN"
+      ok "using the existing sealed runtime role for provisioning (temporary values withheld)"
+    fi
+    unset RUNTIME_SESSION_JSON RUNTIME_ACCESS_KEY_ID RUNTIME_SECRET_ACCESS_KEY RUNTIME_SESSION_TOKEN
+  fi
 
   OPERATOR_IP="$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]' || true)"
   if [[ "$OPERATOR_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -1057,8 +1155,8 @@ if [[ "$DEFAULT_VPC" == vpc-* ]]; then
   AMI_ID="$(aws ssm get-parameter --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
     --query 'Parameter.Value' --output text 2>/dev/null || true)"
   if [[ "$AMI_ID" == ami-* ]]; then
-    probe "ec2:RunInstances (m6i.large)" aws ec2 run-instances --dry-run \
-      --image-id "$AMI_ID" --instance-type m6i.large --count 1
+    probe "ec2:RunInstances ($ROUND5_RUNNER_INSTANCE_TYPE)" aws ec2 run-instances --dry-run \
+      --image-id "$AMI_ID" --instance-type "$ROUND5_RUNNER_INSTANCE_TYPE" --count 1
   fi
 else
   fail "No default VPC in $AWS_REGION, and this is not a permissions problem — the demo has
@@ -1356,9 +1454,7 @@ fi
 
 OWNER="${ANTI_DEMO_OWNER:-${DATABRICKS_PRINCIPAL:-unknown-owner}}"
 if [[ "$OWNER" != *@* ]]; then
-  warn "owner '$OWNER' has no @, so the UI will show no operator email
-        (server/manifest.py:apply_manifest_environment keys that off an @).
-        Set ANTI_DEMO_OWNER to a human email to fix the ringside identity."
+  info "ownership derived from the Databricks service principal; no human email was inferred"
 fi
 [[ ${#OWNER} -ge 3 ]] ||
   fail "ANTI_DEMO_OWNER must be at least 3 characters (infra/aws/variables.tf:owner)"
@@ -1380,8 +1476,7 @@ elif ! WAREHOUSES="$(databricks warehouses list "${DATABRICKS_ARGS[@]}" 2>&1)"; 
   # produced "no SQL warehouse is visible" and sent the operator to create a second one.
   fail "'databricks warehouses list' failed, so the SQL warehouse could not be resolved:
         $(printf '%s' "$WAREHOUSES" | tail -2)
-      This is an API or permission failure rather than an empty workspace. Set
-      DATABRICKS_WAREHOUSE_ID in $ENV_FILE to skip the lookup."
+      This is an API or permission failure rather than an empty workspace."
 else
   WAREHOUSE_COUNT="$(printf '%s' "$WAREHOUSES" | jq 'length' 2>/dev/null || echo 0)"
   if [[ "$WAREHOUSE_COUNT" == "1" ]]; then
@@ -1392,18 +1487,19 @@ else
   elif [[ "$WAREHOUSE_COUNT" == "0" ]]; then
     fail "No SQL warehouse is visible to this principal, and Round 4 requires one
       (server/lifecycle.py:3713). Create one, grant the service principal CAN_USE on it,
-      and either set DATABRICKS_WAREHOUSE_ID or re-run once it is the only one."
+      and re-run."
   else
-    # Named as well as identified. An operator who is shown four bare hex IDs
-    # cannot tell which is the serverless one they meant, and the ID is not what
-    # anyone recognises a warehouse by.
-    WAREHOUSE_TABLE="$(printf '%s' "$WAREHOUSES" |
-      jq -r '.[] | "        \(.id)  \(.name)  \(.warehouse_type // "-")  \(.state // "-")"')"
-    fail "This workspace has $WAREHOUSE_COUNT SQL warehouses and Round 4 seals exactly one into
-      its contract, so guessing would bind the demo to an arbitrary warehouse. Pick one:
-$WAREHOUSE_TABLE
-      Then set it in $ENV_FILE:
-          DATABRICKS_WAREHOUSE_ID=$(printf '%s' "$WAREHOUSES" | jq -r '.[0].id')"
+    DATABRICKS_WAREHOUSE_ID="$(printf '%s' "$WAREHOUSES" | jq -r '
+      sort_by(
+        (if (.enable_serverless_compute // false) then 0 else 1 end),
+        (if (.state // "") == "RUNNING" then 0 else 1 end),
+        (.name // ""),
+        .id
+      )[0].id')"
+    WAREHOUSE_NAME="$(printf '%s' "$WAREHOUSES" | jq -r --arg id "$DATABRICKS_WAREHOUSE_ID" '
+      .[] | select(.id == $id) | .name // "-"')"
+    ok "derived SQL warehouse deterministically from $WAREHOUSE_COUNT visible candidates: $DATABRICKS_WAREHOUSE_ID ($WAREHOUSE_NAME)"
+    info "serverless, then running, then name and ID is the stable selection order; the seal fixes this choice"
   fi
 fi
 
@@ -1420,16 +1516,12 @@ elif databricks catalogs get "$CDF_CATALOG" "${DATABRICKS_ARGS[@]}" >/dev/null 2
   # in it. Writing into somebody's default catalog unasked is the one outcome
   # here that cannot be taken back by a cleanup.
   if [[ -z "${DATABRICKS_CDF_CATALOG:-}" ]]; then
-    info "nobody chose catalog '$CDF_CATALOG' for Round 6 -- it is the compiled-in default,
-        and it exists here as it does in most Unity Catalog workspaces. Round 6 will
-        create a schema in it and a cleanup will delete that schema. Set
-        DATABRICKS_CDF_CATALOG in $ENV_FILE to write somewhere you picked."
+    info "Round 6 derived catalog '$CDF_CATALOG' from the documented Unity Catalog default"
   fi
 else
   fail "Round 6 needs Unity Catalog '$CDF_CATALOG' and this principal cannot see it.
-      '$CDF_CATALOG' is the default; set DATABRICKS_CDF_CATALOG in $ENV_FILE to a catalog
-      this principal can write to (server/round6_lifecycle.py:723). List them with:
-          databricks catalogs list -p $DATABRICKS_PROFILE"
+      The five-input contract requires a workspace whose documented default catalog is
+      visible and writable by this service principal (server/round6_lifecycle.py:723)."
 fi
 
 # The app's own service principal client ID is sealed into the Round 4 contract,
@@ -1442,8 +1534,8 @@ elif [[ -z "${DATABRICKS_APP_CLIENT_ID:-}" ]]; then
   if APP_JSON="$(databricks apps get "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>/dev/null)"; then
     DATABRICKS_APP_CLIENT_ID="$(printf '%s' "$APP_JSON" | jq -r '.service_principal_client_id // empty')"
     [[ -n "$DATABRICKS_APP_CLIENT_ID" ]] ||
-      die "App '$APP_NAME' exists but exposes no service_principal_client_id.
-           Set DATABRICKS_APP_CLIENT_ID explicitly."
+      die "App '$APP_NAME' exists but exposes no service_principal_client_id, so its
+           runtime identity cannot be derived from the five-input contract."
     ok "adopted the existing app '$APP_NAME'"
   elif [[ "$MODE" == "apply" ]]; then
     info "creating Databricks App '$APP_NAME' to obtain its service principal"
@@ -1593,9 +1685,8 @@ else
   # an operator who did not choose it should find that out here and not from a
   # Round 4 failure later.
   info "Round 4 will provision into catalog '$ROUND4_CATALOG', which is the compiled-in
-        default from server/lifecycle.py:ROUND4_DEFAULT_CATALOG -- nobody chose it for this
-        workspace. It is sealed on first provision and cannot be changed afterwards without
-        a cleanup. Set ROUND4_CATALOG in $ENV_FILE to override it."
+        default from server/lifecycle.py:ROUND4_DEFAULT_CATALOG. Bootstrap verified and
+        seals this derived choice on first provision."
 fi
 if ((DATABRICKS_OK == 0)); then
   :
@@ -1604,15 +1695,11 @@ elif databricks catalogs get "$ROUND4_CATALOG" "${DATABRICKS_ARGS[@]}" >/dev/nul
 elif ((ROUND4_FROM_DEFAULT == 1)); then
   fail "Round 4 needs a Unity Catalog it can create a schema in, and the compiled-in default
       '$ROUND4_DEFAULT_CATALOG' is not visible to this principal. That default is only the
-      catalog Databricks creates for a Unity Catalog-enabled workspace, so it is a likely
-      name rather than a guaranteed one -- nobody chose it here, and ROUND4_CATALOG is
-      required. Set it in $ENV_FILE to a catalog this principal can CREATE SCHEMA in:
-          databricks catalogs list -p $DATABRICKS_PROFILE
-      It is read on a first provision only and then sealed into the manifest."
+      catalog Databricks creates for a Unity Catalog-enabled workspace. This workspace does
+      not meet the documented five-input prerequisite."
 else
   fail "Round 4 needs Unity Catalog '$ROUND4_CATALOG' and this principal cannot see it.
-      Set ROUND4_CATALOG to a catalog it can create schemas in:
-          databricks catalogs list -p $DATABRICKS_PROFILE"
+      The sealed installation no longer matches the accessible workspace context."
 fi
 
 # The state key is per-installation so two generations cannot collide in one
@@ -1859,7 +1946,7 @@ cat <<SUMMARY
 
   AWS, always on
     ${COUNT_RDS_INSTANCES} x RDS PostgreSQL db.t4g.medium, 20 GiB gp3   \$${RATE_RDS_T4G_MEDIUM_HOUR}/h each
-    ${COUNT_RUNNERS} x EC2 m6i.large Round 5 runner, 20 GiB gp3      \$${RATE_EC2_M6I_LARGE_HOUR}/h
+    ${COUNT_RUNNERS} x EC2 m6i.large Round 5 runner, 20 GiB gp3     \$${RATE_EC2_M6I_LARGE_HOUR}/h
     ${COUNT_RUNNERS} x public IPv4 address on that runner            \$${RATE_PUBLIC_IPV4_HOUR}/h
                                                      -> ~\$$(fixed_daily)/day fixed
     storage and $((COUNT_TF_SECRETS + COUNT_MANAGED_MASTER_SECRETS)) Secrets Manager secrets       -> ~\$$(metered_daily)/day
@@ -1907,6 +1994,7 @@ export AWS_REGION='$AWS_REGION'
 export AWS_DEFAULT_REGION='$AWS_DEFAULT_REGION'
 export AWS_EXPECTED_ACCOUNT_ID='$AWS_ACCOUNT_ID'
 export ROUND5_APP_PRINCIPAL_ARN='$ROUND5_APP_PRINCIPAL_ARN'
+export ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS='$ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS'
 export DATABRICKS_WAREHOUSE_ID='$DATABRICKS_WAREHOUSE_ID'
 export DATABRICKS_APP_CLIENT_ID='${DATABRICKS_APP_CLIENT_ID:-}'
 export DATABRICKS_CDF_CATALOG='$CDF_CATALOG'
@@ -2201,6 +2289,7 @@ PY
 fi
 
 export ANTI_DEMO_MANIFEST DATABRICKS_PROFILE ROUND5_APP_PRINCIPAL_ARN
+export ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS
 export DATABRICKS_WAREHOUSE_ID DATABRICKS_APP_CLIENT_ID
 export DATABRICKS_CDF_CATALOG="$CDF_CATALOG"
 export ROUND4_CATALOG
@@ -2235,7 +2324,7 @@ cat <<'DURATION'
   Re-running after an interruption resumes; it does not duplicate.
 
 DURATION
-say "  ./antidemo ${SETUP_ARGS[*]}"
+say "  $ANTI_DEMO_EXECUTABLE ${SETUP_ARGS[*]}"
 say ""
 # `antidemo setup` is itself idempotent and resumable: it provisions, resumes an
 # interrupted provision, or reconciles and resets a ready one, deciding from
@@ -2251,7 +2340,7 @@ say ""
 # output further up, and it is skipped entirely under --yes. This is the moment
 # it is needed.
 SETUP_STATUS=0
-./antidemo "${SETUP_ARGS[@]}" || SETUP_STATUS=$?
+"${ANTI_DEMO_EXECUTABLE:-./antidemo}" "${SETUP_ARGS[@]}" || SETUP_STATUS=$?
 if ((SETUP_STATUS != 0)); then
   die "'./antidemo setup' exited $SETUP_STATUS, and it does not undo what it created.
        Anything Terraform applied before the failure exists now and is billing now.
@@ -2460,15 +2549,21 @@ put_empty_secret() {
   rm -f "$payload"
 }
 
-# Which keys the scope already holds. A republish of the seal must not overwrite
+# Which keys the scope is known to hold. A republish of the seal must not overwrite
 # a working AWS credential with an empty string just because this run had no
 # keys to give, and a missing resource must not be left missing, because
 # Databricks Apps fails a valueFrom whose resource does not exist. Knowing which
-# case applies is the difference between the two.
+# case applies is the difference between the two. Successful writes are added
+# to this set below; leaving it as the pre-write snapshot produced the false
+# sequence "rotated aws-access-key-id" followed by "no AWS access key is
+# published" on a fresh scope.
 EXISTING_KEYS=""
 EXISTING_KEYS="$(databricks secrets list-secrets "$SECRET_SCOPE" "${DATABRICKS_ARGS[@]}" -o json 2>/dev/null |
   jq -r 'if type=="array" then .[] else (.secrets // [])[] end | .key' 2>/dev/null | tr '\n' ' ' || true)"
 scope_has_key() { [[ " $EXISTING_KEYS " == *" $1 "* ]]; }
+remember_scope_key() {
+  scope_has_key "$1" || EXISTING_KEYS="${EXISTING_KEYS}${EXISTING_KEYS:+ }$1"
+}
 
 # ---------------------------------------------------------------------------
 # The app's AWS credential: the one the operator supplied, published as given
@@ -2523,9 +2618,10 @@ fi
 if ((CREDENTIAL_IS_TEMPORARY == 1 && ALLOW_TEMPORARY_CREDENTIAL == 0)); then
   die "REFUSING TO PUBLISH A CREDENTIAL THAT EXPIRES INTO THE DEPLOYED APP.
 
-       The AWS key this run would publish is '$AWS_ACCESS_KEY_ID', which is a temporary
-       STS session, not a permanent IAM key pair. Databricks Apps injects secrets into
-       the container once, at start, so the app would hold this session for its whole
+       The AWS access key this run would publish has a temporary-credential shape,
+       which means it is an STS session, not a permanent IAM key pair. Its value is
+       deliberately withheld. Databricks Apps injects secrets into the container once,
+       at start, so the app would hold this session for its whole
        life and there is no way to hand a running container a replacement. It would
        serve correctly today and answer 'credentials_state: rejected' tomorrow, with
        Rounds 1, 2, 3 and 5 off the card and Rounds 4 and 6 still working -- which
@@ -2548,6 +2644,59 @@ if ((CREDENTIAL_IS_TEMPORARY == 1 && ALLOW_TEMPORARY_CREDENTIAL == 0)); then
        --i-know-this-expires and this becomes a warning."
 fi
 
+# Prove the credential before the first secret write. Shape checks distinguish
+# permanent from temporary credentials, but they cannot distinguish the sealed
+# app user from another permanent IAM user in the same account. STS can. Use
+# only the pair selected above, with every profile/role selector removed, and
+# require its account and principal ARN to be one of the exact principals sealed
+# into the runtime-role trust. Also require Round 5 to trust that runtime role,
+# so a matching app user cannot be published beside a broken role chain.
+#
+# The identity document is non-secret. Credential values stay in process
+# environment and are never rendered, put in argv, or included in a refusal.
+PUBLISH_IDENTITY_JSON=""
+if ((ROTATE_AWS == 1)); then
+  if ! PUBLISH_IDENTITY_JSON="$(
+    env \
+      -u AWS_PROFILE -u AWS_DEFAULT_PROFILE -u AWS_SECURITY_TOKEN \
+      -u AWS_ROLE_ARN -u AWS_ROLE_SESSION_NAME -u AWS_WEB_IDENTITY_TOKEN_FILE \
+      AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+      AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+      AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}" \
+      aws sts get-caller-identity --region "$AWS_REGION" --output json 2>/dev/null
+  )"; then
+    die "REFUSING TO PUBLISH AN UNVERIFIED AWS APP CREDENTIAL.
+
+         STS could not authenticate the credential selected from $ENV_FILE.
+         No Databricks secret, workspace source, or app restart was changed.
+         Credential values are deliberately withheld."
+  fi
+  PUBLISH_ACCOUNT="$(printf '%s' "$PUBLISH_IDENTITY_JSON" | jq -er '.Account')"
+  PUBLISH_PRINCIPAL="$(printf '%s' "$PUBLISH_IDENTITY_JSON" | jq -er '.Arn')"
+  if ! jq -e \
+    --arg account "$PUBLISH_ACCOUNT" \
+    --arg principal "$PUBLISH_PRINCIPAL" \
+    '
+      .aws.account_id == $account
+      and (.aws.runtime_role_arn | type == "string" and length > 0)
+      and (
+        .aws.runtime_role_trusted_principal_arns
+        | type == "array" and index($principal) != null
+      )
+      and .round5.control_role_trusted_principal_arn == .aws.runtime_role_arn
+    ' "$SEAL_SNAPSHOT" >/dev/null; then
+    die "REFUSING TO PUBLISH AN AWS APP CREDENTIAL OUTSIDE THE SEALED ROLE CHAIN.
+
+         The selected credential resolved to account $PUBLISH_ACCOUNT and
+         principal $PUBLISH_PRINCIPAL, but the manifest does not seal that exact
+         principal into the runtime-role trust and that runtime role into Round 5.
+         No Databricks secret, workspace source, or app restart was changed.
+         Credential values are deliberately withheld."
+  fi
+  ok "app credential principal $PUBLISH_PRINCIPAL matches the sealed runtime-role trust in account $PUBLISH_ACCOUNT"
+fi
+unset PUBLISH_IDENTITY_JSON PUBLISH_ACCOUNT PUBLISH_PRINCIPAL
+
 # Publishing a credential this run does not own would be worse than leaving a
 # stale one: an empty access key breaks every AWS call the app makes, whereas a
 # stale one at least still works until it expires.
@@ -2555,6 +2704,7 @@ publish_or_keep() {
   local key="$1" value="$2"
   if ((ROTATE_AWS == 1)); then
     printf '%s' "$value" | put_secret_stdin "$key"
+    remember_scope_key "$key"
     ok "rotated $key"
   elif scope_has_key "$key"; then
     info "$key already exists and no replacement was supplied, so it is left as it is"
@@ -2566,11 +2716,10 @@ publish_or_keep() {
   fi
 }
 
-# What the scope already holds, by shape only. The access key id is not a
-# secret -- it is what sts:GetCallerIdentity echoes back -- and its first four
-# characters are the whole diagnosis. Read so that a run which publishes nothing
-# can still say whether what is already there will outlive the demo, which is
-# the question the old "cannot be read back, so cannot say" warning gave up on.
+# What the scope already holds, by shape only. The first four characters settle
+# whether the credential is permanent or temporary, but the complete value is
+# still withheld from every message. Read so that a run which publishes nothing
+# can still say whether what is already there will outlive the demo.
 published_app_key_id() {
   scope_has_key aws-access-key-id || return 0
   databricks secrets get-secret "$SECRET_SCOPE" aws-access-key-id \
@@ -2584,6 +2733,7 @@ for key in "${APP_RESOURCE_KEYS[@]}"; do
       # The snapshot, not the live file: these are the exact bytes the two
       # servability checks above passed and the exact bytes $SEAL_SHA names.
       put_secret_stdin "$SECRET_MANIFEST_KEY" <"$SEAL_SNAPSHOT"
+      remember_scope_key "$SECRET_MANIFEST_KEY"
       ok "published the seal to $SECRET_SCOPE/$SECRET_MANIFEST_KEY ($(wc -c <"$SEAL_SNAPSHOT" | tr -d ' ') bytes)"
       ;;
     aws-access-key-id)
@@ -2597,6 +2747,7 @@ for key in "${APP_RESOURCE_KEYS[@]}"; do
         info "$key already exists and the AWS keys were not rotated, so it is left as it is"
       elif [[ -n "${AWS_SESSION_TOKEN:-}" ]]; then
         printf '%s' "$AWS_SESSION_TOKEN" | put_secret_stdin "$key"
+        remember_scope_key "$key"
         ok "published $key"
       else
         # Databricks Apps has no optional binding, and a valueFrom whose
@@ -2611,6 +2762,7 @@ for key in "${APP_RESOURCE_KEYS[@]}"; do
         # dropping the binding is not the alternative -- the app would not
         # start. See put_empty_secret.
         put_empty_secret "$key"
+        remember_scope_key "$key"
         info "no AWS_SESSION_TOKEN, so $key holds the empty string, which both
         botocore and server/aws_auth.py read as absent"
       fi
@@ -2629,7 +2781,8 @@ done
 # whether what is in the scope has expired. That premise was wrong -- a
 # Databricks-backed scope reads back to whoever can write it -- and the cost of
 # believing it was that the one fact worth reporting was never looked up. The
-# access key id is not a secret, and its prefix settles the question outright.
+# access-key prefix settles the question outright. The full ID remains withheld
+# because installer output is routinely copied into logs, issues, and chat.
 #
 # Whether this run touched the credential at all is separate from what the
 # credential now is, and both are worth saying. A `--deploy-only` with the AWS
@@ -2662,12 +2815,12 @@ fi
 case "$PUBLISHED_KEY_ID" in
   __absent__) ;;
   AKIA*)
-    ok "the app's AWS credential is the permanent key $PUBLISHED_KEY_ID"
+    ok "the app's AWS credential is a permanent access key (key ID withheld)"
     info "permanent keys carry no expiry, so this app keeps working without anyone
         re-authenticating. Nothing here needs revisiting until you rotate it yourself."
     ;;
   ASIA*)
-    warn "THE APP'S AWS CREDENTIAL IS THE TEMPORARY SESSION $PUBLISHED_KEY_ID AND WILL
+    warn "THE APP'S AWS CREDENTIAL IS A TEMPORARY SESSION (KEY ID WITHHELD) AND WILL
         STOP WORKING WHEN IT EXPIRES -- typically within hours. Databricks Apps injects
         secrets at container start, so a running app cannot be handed a replacement:
         when this dies, Rounds 1, 2, 3 and 5 leave the card and Rounds 4 and 6 keep
@@ -2685,7 +2838,7 @@ case "$PUBLISHED_KEY_ID" in
             curl -s \"\$APP_URL/readyz\" | jq .credentials_principal"
     ;;
   *)
-    warn "the app's AWS access key '$PUBLISHED_KEY_ID' has an unfamiliar shape; expected
+    warn "the app's AWS access key has an unfamiliar shape (key ID withheld); expected
         a permanent key beginning AKIA. Confirm it with 'aws sts get-caller-identity'."
     ;;
 esac
@@ -2904,6 +3057,7 @@ APP_MESSAGE="$(printf '%s' "$APP_STATE_JSON" | jq -r '.compute_status.message //
 DEPLOY_MESSAGE="$(printf '%s' "$APP_STATE_JSON" | jq -r '.active_deployment.status.message // empty')"
 
 SERVING=0
+ALL_ROUNDS_READY=0
 if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" && -n "$APP_URL" ]]; then
   # compute ACTIVE and deployment SUCCEEDED describe the platform's view: the
   # container was scheduled and the build finished. Neither says the process
@@ -2920,9 +3074,7 @@ if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" && -n "$APP
     -d 'grant_type=client_credentials&scope=all-apis' \
     "$DATABRICKS_HOST/oidc/v1/token" 2>/dev/null | jq -r '.access_token // empty')"
   if [[ -z "$APP_TOKEN" ]]; then
-    warn "could not mint a token to probe $APP_URL, so the HTTP check was skipped.
-        Check the app in a browser before trusting this deploy."
-    SERVING=1
+    warn "could not mint a token to probe $APP_URL, so readiness could not be verified."
   else
     HTTP_DEADLINE=$((SECONDS + 180))
     while ((SECONDS < HTTP_DEADLINE)); do
@@ -2936,11 +3088,33 @@ if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" && -n "$APP
       printf '  ...   front door not answering yet\n'
       sleep 10
     done
+    if ((SERVING == 1)); then
+      READINESS_DEADLINE=$((SECONDS + 300))
+      while ((SECONDS < READINESS_DEADLINE)); do
+        READY_BODY="$(curl -fsS --max-time 30 -H "Authorization: Bearer $APP_TOKEN" \
+          "$APP_URL/readyz" 2>/dev/null || true)"
+        CATALOG_BODY="$(curl -fsS --max-time 30 -H "Authorization: Bearer $APP_TOKEN" \
+          "$APP_URL/api/catalog" 2>/dev/null || true)"
+        if printf '%s' "$READY_BODY" | jq -e '
+          .status == "ready" and .credentials_state == "ok" and
+          .degraded == false and .ring_ready == true' >/dev/null 2>&1 &&
+          printf '%s' "$CATALOG_BODY" | jq -e '
+            (.rounds | length) == 6 and
+            all(.rounds[]; .availability == "ready")' >/dev/null 2>&1; then
+          ALL_ROUNDS_READY=1
+          ok "GET /readyz is ready and all six catalog rounds are ready"
+          break
+        fi
+        printf '  ...   waiting for full six-round readiness\n'
+        sleep 10
+      done
+    fi
     unset APP_TOKEN
   fi
 fi
 
-if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" ]] && ((SERVING == 1)); then
+if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" ]] &&
+  ((SERVING == 1)) && ((ALL_ROUNDS_READY == 1)); then
   ok "compute ACTIVE, deployment SUCCEEDED"
   [[ -n "$DEPLOY_MESSAGE" ]] && info "$DEPLOY_MESSAGE"
 
@@ -2996,10 +3170,15 @@ PY
 else
   say ""
   if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" ]]; then
-    say "  ${BOLD}The deploy succeeded and the app is not serving.${RESET}"
-    say "  Databricks reports compute ACTIVE and the deployment SUCCEEDED, so the"
-    say "  container was scheduled and built. It is the process inside it that is"
-    say "  not answering, which means the logs below are the only useful evidence."
+    if ((SERVING == 1)); then
+      say "  ${BOLD}The deploy is serving but full six-round readiness was not verified.${RESET}"
+      say "  Inspect /readyz and /api/catalog; this is not a READY TO RING result."
+    else
+      say "  ${BOLD}The deploy succeeded and the app is not serving.${RESET}"
+      say "  Databricks reports compute ACTIVE and the deployment SUCCEEDED, so the"
+      say "  container was scheduled and built. It is the process inside it that is"
+      say "  not answering, which means the logs below are the only useful evidence."
+    fi
   else
     say "  ${BOLD}The app did not come up.${RESET} compute=$FINAL_COMPUTE deployment=$FINAL_DEPLOY"
   fi
@@ -3018,7 +3197,7 @@ else
   say "  Databricks Apps installs with pip on 3.11 whenever a requirements.txt is in"
   say "  the deployed tree, whatever pyproject.toml asks for, and only uses uv and"
   say "  honours requires-python when that file is absent and uv.lock is present."
-  die "the deploy reported success but the app is not serving"
+  die "the deploy did not reach verified full six-round readiness"
 fi
 fi # DEPLOY_APP
 

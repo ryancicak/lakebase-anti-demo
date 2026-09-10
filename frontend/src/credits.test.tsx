@@ -250,7 +250,7 @@ describe('the cut act list', () => {
       'Make this schema change safely',
       'Recover this deleted order',
       'Move lakehouse data into live applications',
-      'Get spike-ready',
+      'Ready a pooled application path',
       'Move live application data into the lakehouse',
     ]) {
       expect(screen.queryByText(title)).not.toBeInTheDocument()

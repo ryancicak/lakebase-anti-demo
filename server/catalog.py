@@ -25,6 +25,9 @@ from .models import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
+ROUND5_BOUNDED_PROTOCOL = "connection-spike-v1"
+ROUND5_PROTOCOLS = frozenset({ROUND5_BOUNDED_PROTOCOL})
+
 
 COMPETITORS = [
     Competitor(
@@ -77,7 +80,7 @@ MODEL_SCORE_METRICS = [
 CONNECTION_SPIKE_METRICS = [
     MetricSpec(
         id="setup_elapsed_ms",
-        label="Setup elapsed",
+        label="Pooled-path setup time",
         role=MetricRole.PRIMARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
@@ -231,19 +234,20 @@ ROUNDS = [
     ),
     RoundDefinition(
         id=RoundId.SURVIVE_CONNECTION_SPIKE,
-        title="Get spike-ready",
-        capability="Built-in connection pooling",
+        title="Ready a pooled application path",
+        capability="Included pooling compared with a selected AWS managed pooling path",
         scorecard_by_corner={
             Corner.COST: (
-                "Published rates include the AWS opponent's added RDS Proxy minimum"
+                "Published rates include the new RDS Proxy selected for the AWS reference path"
             ),
             Corner.SIMPLICITY: (
-                "Lakebase adds 0 per-bout pooling infrastructure mutations; the selected "
-                "AWS opponent performs 9 journaled competitor mutations"
+                "Included Lakebase pooled endpoint versus 9 journaled mutations for the "
+                "selected AWS managed pooling path"
             ),
             Corner.PERFORMANCE: (
-                "Primary setup elapsed; secondary successful clients, errors, and "
-                "application p99 under burst"
+                "Primary pooled-path setup time; secondary "
+                "128 attempts, maximum 64 concurrent, errors, application p99, "
+                "and a separate witness"
             ),
         },
         competitors=[CompetitorId.RDS_POSTGRES, CompetitorId.AURORA_SERVERLESS_V2],
@@ -252,32 +256,41 @@ ROUNDS = [
         comparison_kind=ComparisonKind.MEASURED,
         non_claims=[
             (
-                "Lakebase native pooling adds 0 separate per-bout pooling components and "
-                "0 per-bout pooling infrastructure mutations; baseline native-login, "
-                "ordinary-role, and runner-credential preparation is disclosed outside "
-                "the per-bout setup clock."
+                "From a database-only declared start, Lakebase verifies its included pooled "
+                "endpoint with 0 separately provisioned per-bout pooling components and 0 "
+                "per-bout pooling infrastructure mutations. Baseline native-login, "
+                "ordinary-role, and runner-credential preparation remains outside the clock."
             ),
             (
-                "The selected AWS opponent lane performs 9 journaled competitor mutations: "
-                "1 per-bout Proxy security group, 1 default-egress change, 4 exact security-"
-                "group rules, 1 RDS Proxy, 1 target-group configuration, and 1 target "
-                "registration; its setup clock stops at the exact application transaction."
+                "The selected AWS managed pooling path provisions a new RDS Proxy and performs "
+                "9 journaled competitor mutations: 1 per-bout Proxy security group, 1 "
+                "default-egress change, 4 exact security-group rules, 1 RDS Proxy, 1 "
+                "target-group configuration, and 1 target registration. Its setup clock "
+                "stops at the exact application transaction."
             ),
             (
                 "The IAM service role, runner permission, and dedicated proxy credential "
                 "secret or secrets are sealed install-time prerequisites outside the setup "
-                "clock. The selected AWS design still requires added RDS Proxy, Secrets "
-                "Manager, IAM, and network configuration; RDS Proxy and Secrets Manager "
-                "remain billable AWS services; the receipt estimates them separately and "
-                "makes no savings claim."
+                "clock. RDS Proxy is the AWS managed pooling option selected for this reference "
+                "path, not a universal Aurora or RDS requirement. Direct connections, an "
+                "existing RDS Proxy, PgBouncer, and application pooling were not compared."
+            ),
+            (
+                "Phase 2 makes 128 fresh attempts at maximum 64 concurrent, then separately "
+                "holds 64 witness clients to verify multiplexing. The phases are sequential "
+                "and never overlap."
             ),
             (
                 "Application p99 is nearest-rank p99 derived from raw, unrounded "
-                "successful-client latencies."
+                "successful-client latencies. Pooled-path setup time is the primary result "
+                "and is never added to that secondary p99."
             ),
             (
-                "Setup elapsed is the primary result and is never added to the "
-                "secondary burst p99."
+                "Lakebase's built-in PgBouncer product limit is up to 10,000 client "
+                "connections, not PostgreSQL backend sessions or simultaneous transactions. "
+                "The recurring bout measures 128 attempts at maximum 64 concurrent, followed "
+                "by separate multiplexing proof. Direct AWS connections, an existing Proxy, "
+                "sustained throughput, and storm resilience remain outside this comparison."
             ),
             "This is one live proof session, not a benchmark.",
         ],
@@ -312,6 +325,7 @@ def catalog(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
+    round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
 ) -> CatalogResponse:
     return CatalogResponse(
         competitors=COMPETITORS,
@@ -323,6 +337,7 @@ def catalog(
                 model_score_available=model_score_available,
                 connection_spike_available=connection_spike_available,
                 live_orders_available=live_orders_available,
+                round5_protocol=round5_protocol,
             )
             for item in ROUNDS
         ],
@@ -345,7 +360,10 @@ def round_by_id(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
+    round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
 ) -> RoundDefinition:
+    if round5_protocol not in ROUND5_PROTOCOLS:
+        raise ValueError(f"Unknown Round 5 protocol: {round5_protocol}")
     item = next(item for item in ROUNDS if item.id == round_id)
     if item.id == RoundId.PUT_MODEL_SCORE_IN_APP:
         return item.model_copy(
@@ -385,6 +403,7 @@ def recommend_round(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
+    round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
 ) -> tuple[RoundDefinition, str]:
     for preferred in primary.recommended_rounds:
         if preferred == "inherit_primary_round":
@@ -395,6 +414,7 @@ def recommend_round(
                 model_score_available=model_score_available,
                 connection_spike_available=connection_spike_available,
                 live_orders_available=live_orders_available,
+                round5_protocol=round5_protocol,
             )
         except ValueError:
             continue
@@ -463,7 +483,8 @@ def build_presenter_pack(
         remembered_metric = "Managed Sync exact-version proof and fresh Postgres exact-row read"
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
         remembered_metric = (
-            "Primary setup elapsed; secondary burst successes, errors, and nearest-rank p99"
+            "Primary pooled-path setup time; secondary 128 attempts at maximum 64 concurrent, "
+            "errors, nearest-rank p99, and a separate 64-client witness"
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
         remembered_metric = "One exact live order in Delta with checkout still verified"
@@ -496,10 +517,11 @@ def build_presenter_pack(
         )
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
         stop_condition = (
-            "Lakebase stops after its built-in pooled transaction verifies. The AWS clock "
-            "stops only after the new RDS Proxy is ready and its exact application "
-            "transaction verifies; burst, witness, and cleanup gates must still pass "
-            "before any setup winner or margin is declared."
+            "Lakebase stops after its included pooled endpoint verifies an exact transaction. "
+            "The selected AWS managed pooling path stops only after its new RDS Proxy and "
+            "exact transaction verify; the 128-attempt maximum-64-concurrent check, separate "
+            "64-client witness, and cleanup gates must still pass before any setup winner or "
+            "margin is declared."
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
         stop_condition = (

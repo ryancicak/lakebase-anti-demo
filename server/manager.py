@@ -23,6 +23,8 @@ from .capacity import (
     observed_rds_instance_class,
 )
 from .catalog import (
+    ROUND5_BOUNDED_PROTOCOL,
+    ROUND5_PROTOCOLS,
     build_presenter_pack,
     competitor_by_id,
     persona_by_id,
@@ -749,6 +751,7 @@ class RunManager:
         clock_ns: Callable[[], int] = time.monotonic_ns,
         delta_storage_probe: Callable[[], Awaitable[None]] | None = None,
         delta_storage_probe_interval_seconds: float = 60.0,
+        round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
     ) -> None:
         self._records: dict[str, SessionRecord] = {}
         self._records_lock = asyncio.Lock()
@@ -786,6 +789,9 @@ class RunManager:
         self._recovery_factory = recovery_factory or self._build_recovery_engine
         self._model_score_factory = model_score_factory
         self._connection_spike_factory = connection_spike_factory
+        if round5_protocol not in ROUND5_PROTOCOLS:
+            raise ValueError(f"Unknown Round 5 protocol: {round5_protocol}")
+        self._round5_protocol = round5_protocol
         self._live_orders_factory = live_orders_factory
         self._readiness_check = readiness_check or (lambda: None)
         self._readiness_status = readiness_status
@@ -996,6 +1002,11 @@ class RunManager:
     @property
     def connection_spike_available(self) -> bool:
         return self._connection_spike_factory is not None
+
+
+    @property
+    def round5_protocol(self) -> str:
+        return self._round5_protocol
 
     @property
     def live_orders_available(self) -> bool:
@@ -1594,6 +1605,7 @@ class RunManager:
                 model_score_available=self.model_score_available,
                 connection_spike_available=self.connection_spike_available,
                 live_orders_available=self.live_orders_available,
+                round5_protocol=self.round5_protocol,
             )
         else:
             selected_round = round_by_id(
@@ -1601,6 +1613,7 @@ class RunManager:
                 model_score_available=self.model_score_available,
                 connection_spike_available=self.connection_spike_available,
                 live_orders_available=self.live_orders_available,
+                round5_protocol=self.round5_protocol,
             )
             if request.competitor not in selected_round.competitors:
                 raise ValueError("The selected round does not support this competitor")
@@ -2053,7 +2066,7 @@ class RunManager:
                     and not self._round_five_has_timed_setup(record.connection_spike_engine)
                 )
             ):
-                raise InvalidStateError("The connection-spike proof must be armed again")
+                raise InvalidStateError("The Round 5 pooled-path proof must be armed again")
             if is_live_orders and (
                 record.live_orders_engine is None or record.live_orders_arm is None
             ):
@@ -4961,7 +4974,7 @@ class RunManager:
         has_timed_setup = self._round_five_has_timed_setup(engine)
         setup_operation = getattr(engine, "setup", None) if has_timed_setup else None
         if engine is None or (arm is None and not has_timed_setup):
-            await self._fail(record, "The connection-spike proof must be armed again.")
+            await self._fail(record, "The Round 5 pooled-path proof must be armed again.")
             return
         async with record.lock:
             started_at = datetime.now(UTC)
@@ -5138,7 +5151,9 @@ class RunManager:
             if record.snapshot.towel is not None:
                 return
             for lane in record.snapshot.lanes.values():
-                lane.status = "Executing the frozen 128-client secondary burst"
+                lane.status = (
+                    "Executing the frozen 128-attempt, maximum-64-concurrent check"
+                )
                 lane.activity = LaneActivity(phase="burst")
             burst_snapshot = self._public_snapshot_locked(record)
         await publish_lane_snapshots(
@@ -5160,7 +5175,7 @@ class RunManager:
                     else list(record.snapshot.lanes.values())
                 )
                 for lane in lanes:
-                    lane.status = "Executing and validating the secondary burst"
+                    lane.status = "Executing and validating the bounded connection check"
                     lane.activity = LaneActivity(phase=phase)
                 affected_lane_ids = (
                     (str(lane_id),)

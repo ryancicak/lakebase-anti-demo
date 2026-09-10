@@ -1,8 +1,10 @@
 import type { PersonaId, RoundId } from '../api/types'
 import outcomeSource from './outcome-copy.jsonl?raw'
+import roundFivePersonaOutcomeSource from './round5-persona-outcomes.jsonl?raw'
 import type {
   OutcomeCopyRecord,
   PriorityKey,
+  RoundFivePersonaOutcomeRecord,
   RingsideOutcomeId,
   VerifiedCorpusRecord,
 } from './types'
@@ -12,8 +14,9 @@ import {
 } from './types'
 import verifiedSource from './verified-corpus.jsonl?raw'
 
-export const VERIFIED_CORPUS_SHA256 = '55bd71d5058e8388f358f8d0d34ab65f0326a6e0607ee8b5b774d53fa3820769'
-export const OUTCOME_COPY_SHA256 = 'b2e12cb141630d72bd2718c50c2266d28829a9be4752c3b14b65c0a8428bf276'
+export const VERIFIED_CORPUS_SHA256 = 'e53d5ca576277e0f3e54f3d31212cf08955a121f5cfeb3cd79490db57c94f29f'
+export const OUTCOME_COPY_SHA256 = '6a9290423c6b24f0382a95d791d9a1384ecce28d804fcc13913051dafbf4c5fb'
+export const ROUND_FIVE_PERSONA_OUTCOMES_SHA256 = 'd481b8be6e27e219136ca0152d1992a81cb8a92cf552ce2bdcd842937e316c48'
 
 export const PERSONA_IDS = [
   'data_engineer',
@@ -118,10 +121,43 @@ function outcomeRecord(value: unknown, index: number): OutcomeCopyRecord {
   return value as unknown as OutcomeCopyRecord
 }
 
+function roundFivePersonaOutcomeRecord(
+  value: unknown,
+  index: number,
+): RoundFivePersonaOutcomeRecord {
+  const label = `Round 5 persona outcome record ${index + 1}`
+  if (!isObject(value)) throw new Error(`${label} is not an object.`)
+  const outcomeId = requireString(value, 'outcome_id', label)
+  const personaId = requireString(value, 'persona_id', label)
+  const allowedOutcomeIds: ReadonlySet<string> = new Set([
+    'one_sided_setup_verified_towel',
+    'setup_incomplete',
+    'bounded_check_failed',
+    'cleanup_failed',
+    'no_result',
+  ])
+  if (!allowedOutcomeIds.has(outcomeId)) {
+    throw new Error(`${label} has unsupported outcome_id ${outcomeId}.`)
+  }
+  if (!personaIds.has(personaId)) {
+    throw new Error(`${label} has unknown persona_id ${personaId}.`)
+  }
+  requireString(value, 'meaning_record_id', label)
+  requireString(value, 'meaning', label)
+  if (value.meaning_decision !== 'KEEP' && value.meaning_decision !== 'REWRITE') {
+    throw new Error(`${label} has an invalid meaning_decision.`)
+  }
+  return value as unknown as RoundFivePersonaOutcomeRecord
+}
+
 export const VERIFIED_CORPUS_RECORDS = parseJsonl(verifiedSource, 'Verified Ringside corpus')
   .map(verifiedRecord)
 export const OUTCOME_COPY_RECORDS = parseJsonl(outcomeSource, 'Ringside outcome corpus')
   .map(outcomeRecord)
+export const ROUND_FIVE_PERSONA_OUTCOME_RECORDS = parseJsonl(
+  roundFivePersonaOutcomeSource,
+  'Round 5 persona outcome corpus',
+).map(roundFivePersonaOutcomeRecord)
 
 const verifiedByKey = new Map<string, VerifiedCorpusRecord>()
 for (const record of VERIFIED_CORPUS_RECORDS) {
@@ -135,6 +171,15 @@ for (const record of OUTCOME_COPY_RECORDS) {
   const key = `${record.round_id}\0${record.outcome_id}`
   if (outcomeByKey.has(key)) throw new Error(`Duplicate Ringside outcome record: ${key}.`)
   outcomeByKey.set(key, record)
+}
+
+const roundFivePersonaOutcomeByKey = new Map<string, RoundFivePersonaOutcomeRecord>()
+for (const record of ROUND_FIVE_PERSONA_OUTCOME_RECORDS) {
+  const key = `${record.outcome_id}\0${record.persona_id}`
+  if (roundFivePersonaOutcomeByKey.has(key)) {
+    throw new Error(`Duplicate Round 5 persona outcome record: ${key}.`)
+  }
+  roundFivePersonaOutcomeByKey.set(key, record)
 }
 
 export function getVerifiedRecord(
@@ -155,5 +200,16 @@ export function getOutcomeRecord(
 ): OutcomeCopyRecord {
   const record = outcomeByKey.get(`${roundId}\0${outcomeId}`)
   if (!record) throw new Error(`Missing Ringside outcome record: ${roundId} × ${outcomeId}.`)
+  return record
+}
+
+export function getRoundFivePersonaOutcomeRecord(
+  outcomeId: RingsideOutcomeId,
+  personaId: PersonaId,
+): RoundFivePersonaOutcomeRecord {
+  const record = roundFivePersonaOutcomeByKey.get(`${outcomeId}\0${personaId}`)
+  if (!record) {
+    throw new Error(`Missing Round 5 persona outcome record: ${outcomeId} × ${personaId}.`)
+  }
   return record
 }

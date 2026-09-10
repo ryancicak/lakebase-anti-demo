@@ -1496,19 +1496,19 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
 
     const roundFive = await screen.findByRole('button', {
-      name: /round 5 · get spike-ready.*ready/i,
+      name: /round 5 · ready a pooled application path.*ready/i,
     })
     expect(roundFive).toBeEnabled()
     await user.click(roundFive)
 
-    expect(screen.getByRole('heading', { name: /get spike-ready/i })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /ready a pooled application path/i })).toBeInTheDocument()
     expect(screen.getByText('Aurora + RDS Proxy')).toBeInTheDocument()
     expect(screen.queryByText('RDS PostgreSQL')).not.toBeInTheDocument()
     // The fight card no longer prints the stop boundary in prose -- the owner
     // removed the explanatory panels -- but the boundary itself still governs
     // the round and rides onto the receipt, so it is pinned at its source.
     expect(stopCondition('survive_connection_spike', 'aurora_serverless_v2')).toMatch(
-      /each clock stops at a verified pooled application path.*RDS Proxy is AWS best practice.*already deployed.*setup delay does not apply.*identical spike must pass on both lanes/i,
+      /pooled-path setup clock.*database-only declared start.*included pool.*selected AWS managed pooling path.*new RDS Proxy.*128-attempt.*maximum-64-concurrent.*64-client witness/i,
     )
     expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
 
@@ -3962,7 +3962,7 @@ describe('backstage setup', () => {
       expect(finale).toHaveTextContent(/six rounds/i)
       const rows = within(finale).getByLabelText(/all six round summaries/i)
       expect(rows.children).toHaveLength(6)
-      expect(finale).toHaveTextContent(/get spike-ready.*existing proxy starts ready/i)
+      expect(finale).toHaveTextContent(/ready a pooled application path.*bounded check passed.*new proxy path disclosed/i)
 
       // The fight card's own fighters, named once with their own chips.
       const corners = within(finale).getByLabelText('Corners')

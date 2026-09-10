@@ -1907,7 +1907,7 @@ def _verify_aws_identity(
         )
 
 
-def _aws_session(manifest: DemoManifest) -> boto3.Session:
+def _aws_source_session(manifest: DemoManifest) -> boto3.Session:
     selection = validate_runtime_auth(
         manifest.aws.auth_mode,
         manifest.aws.profile,
@@ -1915,6 +1915,36 @@ def _aws_session(manifest: DemoManifest) -> boto3.Session:
     )
     return boto3.Session(
         **session_arguments(selection.mode, selection.profile, manifest.aws.region)
+    )
+
+
+
+def _aws_session(manifest: DemoManifest) -> boto3.Session:
+    source = _aws_source_session(manifest)
+    runtime_role = manifest.aws.runtime_role_arn
+    if runtime_role is None:
+        return source
+    identity = source.client("sts", region_name=manifest.aws.region).get_caller_identity()
+    current = str(identity.get("Arn") or "")
+    expected_marker = f":assumed-role/{runtime_role.rsplit('/', 1)[-1]}/"
+    if expected_marker in current:
+        return source
+    response = source.client("sts", region_name=manifest.aws.region).assume_role(
+        RoleArn=runtime_role,
+        RoleSessionName="anti-demo-runtime",
+        DurationSeconds=3600,
+    )
+    credentials = response.get("Credentials") or {}
+    if any(
+        not credentials.get(key)
+        for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
+    ):
+        raise RuntimeError("STS did not return the sealed anti-demo runtime role")
+    return boto3.Session(
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        region_name=manifest.aws.region,
     )
 
 
@@ -4131,7 +4161,8 @@ def _round5_runner_refresh_session(manifest: DemoManifest) -> boto3.Session:
         manifest,
         "aurora_serverless_v2",
     )
-    ambient = _aws_session(manifest)
+    # This helper performs the runtime-role hop itself immediately below.
+    ambient = _aws_source_session(manifest)
     identity = ambient.client("sts", region_name=config.region).get_caller_identity()
     account = str(identity.get("Account") or "")
     principal = str(identity.get("Arn") or "")
@@ -7412,10 +7443,13 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
         page = iam.list_roles(**arguments)
         for role in page.get("Roles", []):
             role_name = str(role.get("RoleName") or "")
+            identity = str(role.get("Arn") or role_name)
+            candidate_role = identity in static_iam_roles or matching_name(role_name)
+            if not candidate_role and sealed is not None:
+                continue
             tags = role.get("Tags")
             if tags is None and role_name:
                 tags = iam.list_role_tags(RoleName=role_name).get("Tags", [])
-            identity = str(role.get("Arn") or role_name)
             if identity in static_iam_roles:
                 if tags_for(tags or []) != expected_static_iam_tags:
                     raise RuntimeError(

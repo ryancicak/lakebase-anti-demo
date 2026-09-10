@@ -187,6 +187,7 @@ def deployed_manifest():
         aws=SimpleNamespace(
             region="us-west-2",
             account_id="123456789012",
+            runtime_role_arn="arn:aws:iam::123456789012:role/anti-demo-runtime",
             resources=SimpleNamespace(
                 aurora_cluster_id="owned-aurora",
                 aurora_secret_arn=(
@@ -2217,6 +2218,9 @@ async def test_databricks_app_startup_derives_sealed_runtime_bindings(
     def validate_aws(environment) -> None:
         events.append("aws_preflight")
         assert environment["AWS_AUTH_MODE"] == "environment"
+        assert environment["ANTI_DEMO_RUNTIME_ROLE_ARN"] == (
+            "arn:aws:iam::123456789012:role/anti-demo-runtime"
+        )
         assert environment["LAKEBASE_USER"] == APP_CLIENT_ID
         assert environment["ANTI_DEMO_COORDINATION_USER"] == APP_CLIENT_ID
         assert environment["AURORA_CLUSTER_ID"] == "owned-aurora"

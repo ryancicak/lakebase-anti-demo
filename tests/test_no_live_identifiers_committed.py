@@ -380,6 +380,13 @@ ALLOWED: dict[str, frozenset[str]] = {
         {
             "AIDAEXAMPLEEXAMPLE",
             "AKIAEXAMPLEEXAMPLE",
+            # Deterministic credential sentinels used only by the stub harness.
+            # Repeated digits make their test-only origin visually explicit.
+            "AKIA" "0000000000000000",
+            "AKIA" "1111111111111111",
+            "AKIA" "3333333333333333",
+            "ASIA" "5555555555555555",
+            "ASIAEXAMPLEEXAMPLE",
         }
     ),
     "Lakebase endpoint slugs invented for the posted-usage tests. Real ones are "

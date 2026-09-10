@@ -137,6 +137,44 @@ def test_a_working_key_pair_is_proven_with_two_read_only_calls() -> None:
     assert calls == ["sts.get_caller_identity", "rds.describe_db_instances"]
 
 
+def test_runtime_role_permissions_are_probed_after_the_sealed_assume_hop() -> None:
+    source = f"arn:aws:iam::{ACCOUNT}:user/app-runtime"
+    runtime = f"arn:aws:iam::{ACCOUNT}:role/anti-demo-runtime"
+    expectations = ProbeExpectations(
+        region=REGION,
+        account_id=ACCOUNT,
+        round5_trusted_principal_arn=runtime,
+        runtime_role_trusted_principal_arns=(source,),
+        runtime_role_arn=runtime,
+    )
+    calls: list[str] = []
+    answers = {
+        "sts.get_caller_identity": {"Account": ACCOUNT, "Arn": source},
+        "sts.assume_role": {
+            "Credentials": {
+                "AccessKeyId": "ASIAEXAMPLEEXAMPLE",
+                "SecretAccessKey": "temporary-secret",
+                "SessionToken": "temporary-token",
+            }
+        },
+        "rds.describe_db_instances": {"DBInstances": []},
+    }
+
+    verdict = probe_once(
+        expectations,
+        session_factory=factory(answers, calls),
+        environ=dict(KEYS),
+    )
+
+    assert verdict.state == "ok"
+    assert verdict.arn == source
+    assert calls == [
+        "sts.get_caller_identity",
+        "sts.assume_role",
+        "rds.describe_db_instances",
+    ]
+
+
 def test_the_session_the_probe_builds_for_each_auth_mode() -> None:
     """Exactly which kwargs reach boto3, in both modes, asserted as a whole.
 

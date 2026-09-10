@@ -18,6 +18,7 @@
  */
 
 import type { CompetitorId, LaneState, RoundId } from './api/types'
+import { ROUND_FIVE_DISPLAY_TITLE_UPPER } from './round5'
 import {
   classifyEvidence,
   resolveRoundContract,
@@ -77,7 +78,7 @@ const ROUND_TITLES: Record<RoundId, string> = {
   make_schema_change_safely: 'MAKE A SCHEMA CHANGE SAFELY',
   recover_deleted_order: 'RECOVER A DELETED ORDER',
   put_model_score_in_app: 'PUT A MODEL SCORE IN THE APP',
-  survive_connection_spike: 'SURVIVE A CONNECTION SPIKE',
+  survive_connection_spike: ROUND_FIVE_DISPLAY_TITLE_UPPER,
   analyze_live_orders_without_slowing_checkout: 'ANALYZE LIVE ORDERS',
 }
 

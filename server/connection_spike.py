@@ -54,7 +54,7 @@ class ConnectionSpikeContract:
             and self.witness_clients_per_lane == WITNESS_CLIENTS_PER_LANE
         )
         if not frozen:
-            raise ValueError("The Round 5 connection-spike contract is frozen")
+            raise ValueError("The Round 5 bounded-check contract is frozen")
 
     @property
     def sha256(self) -> str:

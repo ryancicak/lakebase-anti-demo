@@ -2153,6 +2153,9 @@ async def test_round_five_publishes_exact_lakebase_stop_while_competitor_continu
     class HoldingSetupEngine:
         has_timed_setup = True
 
+        async def preflight(self):
+            return SimpleNamespace(sufficient=True)
+
         async def setup(self, bout_id, fencing_token, on_progress):
             assert bout_id and fencing_token > 0
             await on_progress(
@@ -2333,7 +2336,7 @@ async def test_round_five_publishes_exact_lakebase_stop_while_competitor_continu
         assert toweled.remembered_result == (
             "Toweled · Lakebase setup verified first · "
             "RDS PostgreSQL + RDS Proxy unverified beyond 223.27s · "
-            "Shared spike did not run · No declared winner · "
+            "Bounded check did not run · No declared winner · "
             "Comparison incomplete · Margin N/A"
         )
 
@@ -2390,6 +2393,9 @@ async def test_the_round_five_towel_floor_never_measures_from_the_run_origin() -
 
     class HoldingSetupEngine:
         has_timed_setup = True
+
+        async def preflight(self):
+            return SimpleNamespace(sufficient=True)
 
         async def setup(self, _bout_id, _fencing_token, on_progress):
             await on_progress(
@@ -2543,6 +2549,9 @@ def test_no_round_five_towel_branch_names_the_preflight_inclusive_origin() -> No
 async def test_round_five_setup_failure_retains_absorbed_exact_stop(caplog) -> None:
     class FailingSetupEngine:
         has_timed_setup = True
+
+        async def preflight(self):
+            return SimpleNamespace(sufficient=True)
 
         async def setup(self, _bout_id, _fencing_token, on_progress):
             await on_progress(
@@ -5777,7 +5786,7 @@ async def test_v7_round_five_status_includes_its_lingering_cleanup_only() -> Non
         phase="round5_cleanup",
         session_state=SessionState.VERIFIED,
         round_id=RoundId.SURVIVE_CONNECTION_SPIKE.value,
-        round_title="Survive the connection spike",
+        round_title="Ready a pooled application path",
         competitor_id=CompetitorId.AURORA_SERVERLESS_V2.value,
         competitor_name="Aurora Serverless v2",
         ttl=timedelta(minutes=1),

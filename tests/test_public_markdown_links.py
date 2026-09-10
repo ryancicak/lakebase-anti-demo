@@ -81,6 +81,7 @@ evidence of anything.
 from __future__ import annotations
 
 import ast
+import json
 import posixpath
 import re
 import subprocess
@@ -1307,6 +1308,7 @@ def test_repeated_headings_get_githubs_numeric_suffixes() -> None:
     [
         "frontend/src/ringside-cues/verified-corpus.jsonl",
         "frontend/src/ringside-cues/outcome-copy.jsonl",
+        "frontend/src/ringside-cues/round5-persona-outcomes.jsonl",
         "RINGSIDE.md",
     ],
 )
@@ -1326,3 +1328,111 @@ def test_ringside_audience_copy_avoids_unexplained_contract_test(
         f"{relative_path} contains audience-facing 'contract test' jargon:\n"
         + "\n".join(findings)
     )
+
+
+ROUND_FIVE_AUDIENCE_FILES = (
+    "README.md",
+    "ROUNDS.md",
+    "RINGSIDE.md",
+    "server/catalog.py",
+    "server/bout_cost.py",
+    "server/towel.py",
+    "frontend/src/App.tsx",
+    "frontend/src/catalog.ts",
+    "frontend/src/instant-replay.ts",
+    "frontend/src/music.ts",
+    "frontend/src/recap.ts",
+    "frontend/src/round-score.ts",
+    "frontend/src/round5.ts",
+    "frontend/src/ringside-cues/verified-corpus.jsonl",
+    "frontend/src/ringside-cues/outcome-copy.jsonl",
+    "frontend/src/ringside-cues/round5-persona-outcomes.jsonl",
+)
+
+
+def test_round_five_audience_surfaces_use_the_pooled_path_claim() -> None:
+    texts = {
+        relative_path: (PROJECT_ROOT / relative_path).read_text()
+        for relative_path in ROUND_FIVE_AUDIENCE_FILES
+    }
+    joined = "\n".join(texts.values())
+
+    assert "Ready a pooled application path" in joined
+    assert "READY A POOLED APPLICATION PATH" in joined
+    assert not re.search(
+        r"Get spike-ready|Get ready for a connection spike|"
+        r"Survive (?:a|the) connection spike|(?:shared|connection|client) spike",
+        joined,
+        re.IGNORECASE,
+    )
+    assert not re.search(
+        r"(?:AWS|Aurora|RDS).{0,40}(?:requires|required).{0,40}RDS Proxy|"
+        r"RDS Proxy is AWS best practice",
+        joined,
+        re.IGNORECASE | re.DOTALL,
+    )
+@pytest.mark.parametrize("relative_path", ROUND_FIVE_AUDIENCE_FILES)
+def test_round_five_audience_numbers_keep_the_measured_boundary(
+    relative_path: str,
+) -> None:
+    text = (PROJECT_ROOT / relative_path).read_text()
+    for match in re.finditer(r"\b128\b", text):
+        window = text[max(0, match.start() - 80) : match.end() + 220]
+        if not re.search(r"\battempts?\b", window, re.IGNORECASE):
+            continue
+        if re.search(r"\b(?:retired|historical|legacy|compatibility)\b", window, re.I):
+            continue
+        assert re.search(
+            r"\bmax(?:imum)?(?:[- ]64[- ]concurrent| 64 concurrent)\b|"
+            r"\bmax concurrency\b.{0,30}\b64 concurrent\b",
+            window,
+            re.IGNORECASE,
+        ), (
+            f"bounded proof omitted its concurrency cap in {relative_path}: {window}"
+        )
+
+    persona_jsonl = {
+        "frontend/src/ringside-cues/verified-corpus.jsonl",
+        "frontend/src/ringside-cues/outcome-copy.jsonl",
+        "frontend/src/ringside-cues/round5-persona-outcomes.jsonl",
+    }
+    if relative_path in persona_jsonl:
+        for line in text.splitlines():
+            record = json.loads(line)
+            meaning = record.get("meaning")
+            if isinstance(meaning, str) and "10,000" in meaning:
+                assert re.search(r"\bup to 10,000 client connections\b", meaning, re.I)
+                assert not re.search(
+                    r"\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|"
+                    r"128 attempts?|maximum 64 concurrent)\b",
+                    meaning,
+                    re.I,
+                )
+            proof = record.get("proof_template")
+            if (
+                isinstance(proof, str)
+                and record.get("round_id") == "survive_connection_spike"
+            ):
+                assert "128" in proof
+                assert re.search(r"\bmax(?:imum)? 64 concurrent\b", proof, re.I)
+                assert re.search(
+                    r"\battempts?\b",
+                    proof,
+                    re.I,
+                )
+        return
+
+    if relative_path == "frontend/src/round5.ts":
+        for line in text.splitlines():
+            if "10,000" not in line:
+                continue
+            assert re.search(r"\bclient(?:s| connections?|-connection)?\b", line, re.I)
+        return
+
+    for match in re.finditer(r"\b10,000\b", text):
+        window = text[max(0, match.start() - 180) : match.end() + 260]
+        assert re.search(r"\bclient(?:s| connections?|-connection|-client)?\b", window, re.I), (
+            window
+        )
+        if re.search(r"\bproduct limit\b", window, re.I):
+            assert re.search(r"PgBouncer|product limit", window, re.I), window

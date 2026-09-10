@@ -553,7 +553,7 @@ def _round_five_lines(competitor_id: CompetitorId) -> list[CostLineItem]:
             "shared",
             "Neutral m6i.large runner",
             "instance-hour",
-            0.096,
+            0.192,
             AWS_EC2_PRICES,
             AWS_EC2_AS_OF,
             cadence="month",

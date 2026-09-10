@@ -742,8 +742,9 @@ class TestRoundFiveHasAnAuroraLane:
 
     `infra/aws/locals.tf:98` binds a dedicated Aurora cluster to the Round 5
     stack and `server/connection_spike_live.py` points the proxy at it when the
-    operator arms Aurora, so the 128-client burst lands on a real database. The
-    estimator emitted the proxy line and stopped, which read as $0.00 rather than
+    operator arms Aurora, so the 128 attempts at maximum 64 concurrent land on a
+    real database. The estimator emitted the proxy line and stopped, which read
+    as $0.00 rather than
     as a gap and could not even be counted in `estimate.unavailable`.
     """
 

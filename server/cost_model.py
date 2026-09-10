@@ -1029,8 +1029,8 @@ V7_MEASURED_AURORA_ACU_SECONDS: dict[RoundId, AuroraAcuMeasurement] = {
             "CloudWatch integrals over the two bouts CloudTrail confirms ran the "
             "Aurora lane. The band is the observed spread between them, not "
             "modelling slack; the point is their mean. Neither bout has a receipt, "
-            "so it is not established that the 128-client burst fully landed, "
-            "making these a lower bound on a contract-satisfying Round 5"
+            "so it is not established that the 128-attempt, maximum-64-concurrent "
+            "check fully landed, making these a lower bound on a fully verified Round 5"
         ),
     ),
 }
@@ -1401,7 +1401,7 @@ def _connection_spike_database_lines(
     binds a dedicated Aurora cluster and a dedicated RDS instance to the Round 5
     stack, ``server/connection_spike_live.py`` accepts either competitor, and its
     proxy registration hands the proxy ``DBClusterIdentifiers`` when Aurora is
-    armed -- so the 128-client burst always lands on a real database.  Pricing
+    armed -- so the 128-attempt bounded check always lands on a real database.  Pricing
     only the proxy priced the pipe and not the thing on the end of it, and
     CloudTrail confirms two Round 5 bouts did run the Aurora lane: their measured
     compute is $0.023830 and $0.033916, missing from the estimate entirely.
@@ -1410,18 +1410,18 @@ def _connection_spike_database_lines(
     oversight:
 
     * A provisioned RDS instance is already running and already billed around the
-      clock, so the burst adds no incremental instance-hours.  Its zero is a
+      clock, so the bounded check adds no incremental instance-hours.  Its zero is a
       property of the lane, exactly the argument :func:`_baseline_wake_lines`
       makes for Round 1, and it is a real result rather than a missing number.
-    * Aurora's minimum capacity is 0 ACU, so every unit of capacity the burst
+    * Aurora's minimum capacity is 0 ACU, so every unit of capacity the bounded check
       forces it to allocate is marginal and chargeable -- and it keeps being
-      chargeable through the auto-pause descent after the burst has gone.
+      chargeable through the auto-pause descent after the check has finished.
     """
 
     if telemetry.competitor_id is not CompetitorId.AURORA_SERVERLESS_V2:
         return [
             _line(
-                f"{rates.rds_compute_label} connection spike · already-running instance",
+                f"{rates.rds_compute_label} bounded connection check · already-running instance",
                 cloud=Cloud.AWS,
                 kind=CostKind.COMPUTE,
                 scope=EstimateScope.BOUT,
@@ -1431,7 +1431,7 @@ def _connection_spike_database_lines(
                     provenance=Provenance.ASSUMED,
                     basis=(
                         "a provisioned RDS instance bills continuously, so absorbing a "
-                        "burst adds no incremental instance-hours; only the proxy is "
+                        "bounded check adds no incremental instance-hours; only the proxy is "
                         "marginal"
                     ),
                 ),
@@ -1440,7 +1440,7 @@ def _connection_spike_database_lines(
         ]
     return [
         _line(
-            "Aurora Serverless v2 connection spike compute",
+            "Aurora Serverless v2 bounded connection check compute",
             cloud=Cloud.AWS,
             kind=CostKind.COMPUTE,
             scope=EstimateScope.BOUT,
@@ -2573,7 +2573,8 @@ V7_RESTORE_SAMPLES: tuple[LakebaseSample, ...] = (
 )
 
 # Round 5's only isolable bout.  `F9D4023E` was complete and contract-satisfying
-# -- 128 attempts, 128 successes, zero errors on both lanes -- and burned 82
+# -- 128 attempts at maximum 64 concurrent, 128 successes, zero errors on both
+# lanes -- and burned 82
 # CU-seconds, making Round 5 the *cheapest* round on Databricks rather than the
 # dearest.  One sample cannot be cross-validated, which is why this rate is
 # published separately and its sample count travels with it.
@@ -2604,8 +2605,8 @@ def v7_lakebase_burn_model() -> LakebaseBurnModel:
             calibrate_from_samples(
                 V7_CONNECTION_SPIKE_SAMPLES,
                 basis=(
-                    "connection-spike bout, whose clock measures the competitor's "
-                    "proxy build while Lakebase idles"
+                    "pooled-path setup bout, whose clock measures the selected AWS "
+                    "Proxy build while Lakebase idles"
                 ),
             ),
         )

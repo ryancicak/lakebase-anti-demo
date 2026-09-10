@@ -133,14 +133,14 @@ function verifiedSession(roundId: RoundId): DemoSession {
     session.lanes.lakebase = {
       ...session.lanes.lakebase,
       elapsed_ms: null,
-      status: 'Connection spike passed',
+      status: 'Bounded check passed',
       evidence: burstEvidence,
     }
     session.lanes.competitor = {
       ...session.lanes.competitor,
       name: 'Aurora Serverless v2 + RDS Proxy',
       elapsed_ms: null,
-      status: 'Connection spike passed',
+      status: 'Bounded check passed',
       evidence: burstEvidence,
     }
     session.fairness = {
@@ -317,7 +317,7 @@ describe('replayStory', () => {
     ['make_schema_change_safely', /isolated environment/i, /same migration.*source was unchanged/i, /production cleanup was not tested/i],
     ['recover_deleted_order', /aged to a recovery point.*deleted/i, /exact deleted order.*source read still proved it absent/i, /not a production failover/i],
     ['put_model_score_in_app', /score 0\.81.*Delta version 11/i, /Managed Reverse ETL.*fresh app connection/i, /no AWS race or margin/i],
-    ['survive_connection_spike', /built-in pool.*new RDS Proxy/i, /128 fresh connection attempts.*64.*pass\/fail/i, /already-ready, contract-matching Proxy/i],
+    ['survive_connection_spike', /included pool.*selected AWS path.*RDS Proxy and dependencies/i, /128 attempts, maximum 64 concurrent.*separate 64-client multiplexing witness.*pass\/fail/i, /score is pooled-path setup.*direct AWS connections and existing pools remain outside this selected-path comparison/i],
     ['analyze_live_orders_without_slowing_checkout', /checkout committed.*RED-GLOVE.*CHICAGO.*\$84\.50/i, /exact order once.*separate checkout/i, /no AWS race or margin/i],
   ] as const)(
     'maps %s to Setup, Same test, and Takeaway',
@@ -339,17 +339,17 @@ describe('replayStory', () => {
         laneId: 'lakebase',
         label: 'Lakebase built-in pool',
         value: '2.64s',
-        note: 'Ready',
+        note: 'Included pool verified',
       },
       {
         laneId: 'competitor',
-        label: 'New RDS Proxy path',
+        label: 'Selected AWS managed pool',
         value: '693.05s',
-        note: 'Provisioned and ready',
+        note: 'New RDS Proxy provisioned',
       },
     ])
-    expect(story.beats[1].body).toMatch(/not a second speed comparison/i)
-    expect(story.beats[2].body).toMatch(/newly provisioned Proxy is the scored difference/i)
+    expect(story.beats[1].body).toMatch(/not another speed comparison/i)
+    expect(story.beats[2].body).toMatch(/score is pooled-path setup/i)
   })
 
   it('keeps Rounds 4 and 6 as capability proofs without an AWS race', () => {
@@ -367,7 +367,7 @@ describe('replayStory', () => {
   it.each([
     ['one exact recovery', partialRecovery(), 'partial', /did not.*no completed comparison or margin/i],
     ['no-result recovery', noResultRecovery(), 'no-result', /without an exact verified result/i],
-    ['one exact Round 5 setup', partialRoundFive(), 'partial', /shared spike did not run/i],
+    ['one exact Round 5 setup', partialRoundFive(), 'partial', /bounded check did not run/i],
     ['Round 4 identity failure', guardrailFailure('put_model_score_in_app'), 'partial', /exact row identity did not verify/i],
     ['Round 6 checkout failure', guardrailFailure('analyze_live_orders_without_slowing_checkout'), 'partial', /checkout guardrail did not verify/i],
   ] as const)('adapts %s without claiming completed proof', (_name, session, state, copy) => {

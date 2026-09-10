@@ -44,20 +44,20 @@ Round 4 is **Move lakehouse data into live applications**:
 - RDS/Aurora alone are OLTP sinks and do not move lakehouse data. The same outcome requires an added stack for source/target connectors, IAM/secrets, network access, mappings/upserts, checkpoints/retries, and monitoring. That stack is not built or timed, so no cross-platform speed margin is claimed.
 - Re-do changes this bout's score from v1 to v2 in the lakehouse, then verifies the same customer record updates in the live app.
 
-Round 5 is **Get spike-ready** (the capability under test is surviving a connection spike; the
-round is named for the outcome it actually scores, which is readiness setup):
+Round 5 is **Ready a pooled application path**. It scores pooled-path setup and then
+runs a bounded connection check as a pass/fail guard:
 
 - This is a two-phase proof. Phase 1 is the primary score: both setup workflows share one monotonic T0, launch within 10 ms, and run under one 30-minute deadline. Each lane stops only at its exact public setup gate. The UI never adds setup elapsed time to burst p99.
 - Lakebase uses its returned `read_write_pooled_host`: 0 separately provisioned per-bout pooling components and 0 per-bout pooling infrastructure mutations. Its baseline still discloses native-login, ordinary-role, and runner-credential preparation.
 - The selected Aurora/RDS lane performs 9 timed, journaled competitor mutations: 1 per-bout Proxy security group, 1 default-egress change, 4 exact security-group rules, 1 RDS Proxy, 1 target-group configuration, and 1 target registration. Its setup clock stops at the exact application transaction. The Proxy is configured for 90% maximum connections and a 120-second connection-borrow timeout.
 - IAM service role, runner permission, and dedicated proxy credential secret(s) are sealed install-time prerequisites outside the setup clock. They are required configuration, not timed mutations. The AWS design still adds RDS Proxy, Secrets Manager, IAM, and network configuration; RDS Proxy and Secrets Manager are incremental billable services.
-- Phase 2 is a warm burst that validates the setup result. One neutral, SSM-managed `m6i.large` runner uses Python 3.12, psycopg 3.3.4, prepared statements disabled, and TLS `verify-full` with the same explicit `sslrootcert` in both lanes. Each lane gets four warmups and 128 attempts with exactly 64 maximum concurrent attempts and no more than 10 ms burst-launch skew.
+- Phase 2 is a warm burst that validates the setup result. One neutral, SSM-managed `m6i.large` runner uses Python 3.12, psycopg 3.3.4, prepared statements disabled, and TLS `verify-full` with the same explicit `sslrootcert` in both lanes. Each lane gets four warmups and 128 attempts, maximum 64 concurrent and no more than 10 ms burst-launch skew.
 - Every fresh burst connection uses a parameterized `SELECT` for one run-unique probe UUID/value, returns the exact response plus `pg_backend_pid()`, and commits. Successful raw latencies produce nearest-rank p99. Those counts and p99 values are secondary evidence, never the primary score and never part of the setup margin.
 - The downstream witness holds 64 clients per lane and uses a direct `pg_stat_activity` observer. All clients must verify; both unique returned backend PIDs and peak observed sessions must remain below 64. The direct RDS path is limited to observation and run-owned cleanup; all tested application connections use the new per-bout Proxy.
 - A winner and setup margin appear only when both primary setup lanes and every burst, witness, fairness, exact-transaction, and cleanup gate validate. Setup failure or a setup towel displays no winner and no margin.
 - Cleanup closes clients, deletes only run-owned probes and the 9 journaled competitor mutations, verifies a clean baseline, and releases the runner flock. **Ring Again** creates a new bout after that clean baseline and never reuses the Proxy.
 - If Round 5 cleanup fails, the failed bout remains fenced with no winner or margin. The UI exposes only idempotent **Retry Cleanup**—never Ring Again or continuation—until the retry verifies the clean baseline and releases the bout.
-- Either selected AWS engine requires the added RDS Proxy, Secrets Manager, IAM, and network configuration described above; only the selected lane is executed and scored.
+- RDS Proxy is the managed AWS pooling option selected for this reference path, not a universal Aurora or RDS requirement. Direct connections, an existing Proxy, PgBouncer, and application pooling are not compared.
 
 Round 6 is **Move live application data into the lakehouse**:
 
@@ -227,7 +227,7 @@ Production code has no simulation mode. Deterministic fakes exist only inside au
 - No secrets in UI, logs, committed files, or test snapshots.
 - Audience view works at 1920x1080 without scrolling.
 - Cleanup confirms no demo-owned AWS or Databricks resources remain.
-- Round 5 declares a setup winner and margin only when both setup lanes, both 128-attempt result sets, both launch-skew gates, both 64-client witnesses, exact transactions, and run-owned cleanup evidence verify under the frozen contract.
+- Round 5 declares a setup winner and margin only when both setup lanes, both bounded result sets (128 attempts, maximum 64 concurrent), both launch-skew gates, both 64-client witnesses, exact transactions, and run-owned cleanup evidence verify under the frozen contract.
 
 ## Explicitly out of scope for V1
 

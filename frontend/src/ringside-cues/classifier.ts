@@ -14,6 +14,7 @@ import {
 } from '../outcome'
 import {
   getOutcomeRecord,
+  getRoundFivePersonaOutcomeRecord,
   getVerifiedRecord,
 } from './corpus'
 import type {
@@ -232,7 +233,7 @@ function outcomeIdFor(
           : oneExact
             ? 'one_sided_setup_verified_towel'
             : evidence.laneShape === 'both_exact_verified'
-              ? 'spike_contract_failed'
+              ? 'bounded_check_failed'
               : session.round5_setup
                 ? 'setup_incomplete'
                 : 'no_result'
@@ -275,7 +276,7 @@ function oneSidedRoundFiveHeadline(
     : `${unfinishedName} UNVERIFIED BEYOND ${required(seconds(lowerBoundMs), 'lower bound')}`
   return (
     `${exactName} SETUP VERIFIED ${required(seconds(exactMs), 'exact setup time')} · ${unfinished} · `
-    + 'SHARED SPIKE NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A'
+    + 'BOUNDED CHECK NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A'
   )
 }
 
@@ -512,13 +513,13 @@ function proofValues(
         LAKEBASE_SETUP_STATUS: setupStatus(session, 'lakebase'),
         PROXY_SETUP_STATUS: setupStatus(session, 'competitor'),
       }
-    case 'spike_contract_failed': {
+    case 'bounded_check_failed': {
       const failed = (['lakebase', 'competitor'] as const)
         .filter((laneId) => !roundFiveLaneResult(session.lanes[laneId]).contractVerified)
         .map((laneId) => session.lanes[laneId].name)
       return {
         FAILED_GATE: failed.length > 0
-          ? `${failed.join(' and ')} spike proof`
+          ? `${failed.join(' and ')} bounded-check proof`
           : 'the shared comparison or fairness gate',
       }
     }
@@ -582,11 +583,24 @@ export function buildRingsideCue(
   const classified = classifyOutcome(session)
   const { outcome } = classified
   const values = proofValues(session, classified)
+  const personaVerified = getVerifiedRecord(session.round.id, personaId, priorityKey)
   const verified = outcome.copy_mode === 'INHERIT_VERIFIED_CORPUS'
-    ? getVerifiedRecord(session.round.id, personaId, priorityKey)
+    ? personaVerified
+    : null
+  const roundFivePersonaOutcome = (
+    session.round.id === 'survive_connection_spike'
+    && outcome.copy_mode === 'OUTCOME_OVERRIDE'
+  )
+    ? getRoundFivePersonaOutcomeRecord(outcome.outcome_id, personaId)
     : null
   const sayRecord = verified
     ? authoredText(verified.meaning_record_id, verified.meaning, verified.meaning_decision)
+    : roundFivePersonaOutcome
+      ? authoredText(
+          roundFivePersonaOutcome.meaning_record_id,
+          roundFivePersonaOutcome.meaning,
+          roundFivePersonaOutcome.meaning_decision,
+        )
     : authoredText(
         required(outcome.meaning_record_id, 'meaning_record_id'),
         interpolateProof(required(outcome.meaning, 'meaning'), values),
@@ -594,6 +608,12 @@ export function buildRingsideCue(
       )
   const askRecord = verified
     ? authoredText(verified.question_record_id, verified.question, verified.question_decision)
+    : roundFivePersonaOutcome
+      ? authoredText(
+          personaVerified.question_record_id,
+          personaVerified.question,
+          personaVerified.question_decision,
+        )
     : authoredText(
         required(outcome.question_record_id, 'question_record_id'),
         required(outcome.question, 'question'),

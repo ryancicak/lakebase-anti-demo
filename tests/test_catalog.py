@@ -84,13 +84,16 @@ def test_round_five_is_named_for_the_outcome_it_scores() -> None:
     frontend/src/round5.ts overrides the server title at every other render
     site, so a stale value here reaches the audience on exactly one screen.
     """
-    assert round_by_id(RoundId.SURVIVE_CONNECTION_SPIKE).title == "Get spike-ready"
+    assert (
+        round_by_id(RoundId.SURVIVE_CONNECTION_SPIKE).title
+        == "Ready a pooled application path"
+    )
     assert (
         round_by_id(
             RoundId.SURVIVE_CONNECTION_SPIKE,
             connection_spike_available=True,
         ).title
-        == "Get spike-ready"
+        == "Ready a pooled application path"
     )
 
 
@@ -116,7 +119,7 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
     ]
     assert ready.metric_specs[0].role.value == "primary"
     assert ready.metric_specs[1].role.value == "secondary"
-    assert "0 separate per-bout pooling components" in ready.non_claims[0]
+    assert "0 separately provisioned per-bout pooling components" in ready.non_claims[0]
     assert "0 per-bout pooling infrastructure mutations" in ready.non_claims[0]
     assert "native-login, ordinary-role, and runner-credential preparation" in ready.non_claims[0]
     assert "9 journaled competitor mutations" in ready.non_claims[1]
@@ -129,16 +132,27 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
     assert "exact application transaction" in ready.non_claims[1]
     assert "sealed install-time prerequisites outside the setup clock" in ready.non_claims[2]
     assert "IAM service role, runner permission" in ready.non_claims[2]
-    assert "added RDS Proxy, Secrets Manager, IAM, and network configuration" in ready.non_claims[2]
-    assert "RDS Proxy and Secrets Manager remain billable" in ready.non_claims[2]
+    assert "AWS managed pooling option selected for this reference path" in ready.non_claims[2]
+    assert "not a universal Aurora or RDS requirement" in ready.non_claims[2]
+    assert "Direct connections" in ready.non_claims[2]
     assert ready.scorecard_by_corner[Corner.COST] == (
-        "Published rates include the AWS opponent's added RDS Proxy minimum"
+        "Published rates include the new RDS Proxy selected for the AWS reference path"
     )
     assert ready.scorecard_by_corner[Corner.SIMPLICITY] == (
-        "Lakebase adds 0 per-bout pooling infrastructure mutations; the selected "
-        "AWS opponent performs 9 journaled competitor mutations"
+        "Included Lakebase pooled endpoint versus 9 journaled mutations for the "
+        "selected AWS managed pooling path"
     )
-    assert all("aurora" not in claim.lower() for claim in ready.non_claims)
+    assert not any(
+        "requires rds proxy" in claim.lower() or "rds proxy is required" in claim.lower()
+        for claim in ready.non_claims
+    )
+    assert "128 fresh attempts at maximum 64 concurrent" in ready.non_claims[3]
+    assert "phases are sequential" in ready.non_claims[3]
+    assert "10,000 client connections" in ready.non_claims[5]
+    assert "not PostgreSQL backend sessions or simultaneous transactions" in ready.non_claims[5]
+    assert "recurring bout measures 128 attempts at maximum 64 concurrent" in ready.non_claims[5]
+    assert "followed by separate multiplexing proof" in ready.non_claims[5]
+    assert "did not exercise that limit" not in ready.non_claims[5]
     assert "never added" in ready.non_claims[4]
     assert ready.redo is None
     presenter = build_presenter_pack(
@@ -148,7 +162,7 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
         [Corner.PERFORMANCE],
         CompetitorId.RDS_POSTGRES,
     )
-    assert "Primary setup elapsed" in presenter.remembered_metric
+    assert "Primary pooled-path setup time" in presenter.remembered_metric
     assert "setup winner or margin" in presenter.stop_condition
 
 

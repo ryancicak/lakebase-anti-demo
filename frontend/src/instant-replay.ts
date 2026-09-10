@@ -1,6 +1,9 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
 import { classifyOutcome } from './ringside-cues'
 import { metricValue, modelScoreEvidence } from './round4'
+import {
+  ROUND_FIVE_BOUNDED_CHECK,
+} from './round5'
 import { preciseDuration } from './time'
 
 export type ReplayBeatId = 'setup' | 'same-test' | 'takeaway'
@@ -133,7 +136,7 @@ function incompleteTakeaway(session: DemoSession): string | null {
     session.round.id === 'survive_connection_spike'
     && outcome.evidence.laneShape === 'both_exact_verified'
   ) {
-    return 'Both readiness times were observed, but the common spike did not pass its full check. No result or margin was declared.'
+    return 'Both pooled-path setup times were observed, but the bounded check did not fully pass. No result or margin was declared.'
   }
   if (outcome.evidence.exactLane) {
     const exact = laneName(session, outcome.evidence.exactLane)
@@ -152,7 +155,7 @@ function incompleteTestSuffix(session: DemoSession): string {
     session.round.id === 'survive_connection_spike'
     && outcome.evidence.exactLane
   ) {
-    return ' The shared spike did not run, so the common pass/fail proof did not complete.'
+    return ' The bounded check did not run, so the common pass/fail proof did not complete.'
   }
   if (outcome.status === 'guardrail_failure') {
     return ' A required guardrail did not verify.'
@@ -317,14 +320,14 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       session,
       'lakebase',
       'Lakebase built-in pool',
-      'Ready',
+      'Included pool verified',
     ) ?? lowerBoundMetric(session, 'lakebase', 'Lakebase built-in pool'),
     exactMetric(
       session,
       'competitor',
-      'New RDS Proxy path',
-      'Provisioned and ready',
-    ) ?? lowerBoundMetric(session, 'competitor', 'New RDS Proxy path'),
+      'Selected AWS managed pool',
+      'New RDS Proxy provisioned',
+    ) ?? lowerBoundMetric(session, 'competitor', 'Selected AWS managed pool'),
   ].filter((metric): metric is ReplayMetric => metric !== null)
   return {
     ...state,
@@ -334,18 +337,18 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       {
         id: 'setup',
         title: 'Setup',
-        body: 'Lakebase checked its built-in pool. The AWS path provisioned a new RDS Proxy and its supporting resources.',
+        body: 'From a database-only start, Lakebase verified its included pool; the selected AWS path provisioned RDS Proxy and dependencies.',
       },
       {
         id: 'same-test',
         title: 'Same test',
-        body: `Both paths had to pass 128 fresh connection attempts, with at most 64 running at once. The spike is pass/fail, not a second speed comparison.${incompleteTestSuffix(session)}`,
+        body: `Both ran ${ROUND_FIVE_BOUNDED_CHECK}, then a separate 64-client multiplexing witness. This was pass/fail validation, not another speed comparison.${incompleteTestSuffix(session)}`,
       },
       {
         id: 'takeaway',
         title: 'Takeaway',
         body: incompleteTakeaway(session)
-          ?? 'Readiness setup for a newly provisioned Proxy is the scored difference. An already-ready, contract-matching Proxy would not pay this provisioning interval and was not tested.',
+          ?? 'The score is pooled-path setup. Direct AWS connections and existing pools remain outside this selected-path comparison.',
       },
     ],
   }

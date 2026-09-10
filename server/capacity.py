@@ -64,6 +64,8 @@ LAKEBASE_POSTGRES_MAJOR = 17
 # Published Databricks maximum connections per Lakebase compute size. Unlike the
 # AWS side this is a documented table rather than a parameter-group formula.
 LAKEBASE_MAX_CONNECTIONS_BY_CU: dict[float, int] = {0.5: 105, 1.0: 218, 2.0: 443}
+LAKEBASE_POOL_MAX_CLIENT_CONN = 10_000
+LAKEBASE_POOL_BACKEND_RATIO = 0.9
 
 # Documented memory per vendor capacity unit.
 CU_MEMORY_GB = 2.0
@@ -119,10 +121,11 @@ RDS_SCORED_ROUNDS = frozenset(
 # instead of needing the copy edited to match.
 NO_SUSPENSION_ROUNDS: frozenset[RoundId] = frozenset()
 
-# Peak concurrent client connections one Round 5 lane must absorb: the frozen
-# contract drives max_concurrent_attempts_per_lane plus witness_clients_per_lane
-# (server/manifest.py:Round5FrozenConstants).
-ROUND5_PEAK_CLIENTS_PER_LANE = 128
+# Actual maximum concurrent clients in one Round 5 lane. The 128 scored attempts
+# run with a 64-client cap, then close before the separate 64-client witness
+# phase begins. Adding those sequential phases produced the former, false
+# 128-client "peak" and must never be used as a capacity requirement.
+ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE = 64
 
 
 def max_connections_for_memory_gib(memory_gib: float) -> int:
@@ -189,11 +192,11 @@ def capacity_parity(
     deliberate, published asymmetry into a red check. Passing floors in is
     optional; omitting them says so rather than inventing a number.
 
-    ``round_id`` scopes the Round 5 client-budget rule. The 128-client contract
-    belongs to :data:`RoundId.SURVIVE_CONNECTION_SPIKE` alone — no other round
-    puts a burst anywhere near it — so applying it to every lane would refuse an
-    instance class that no round in question ever has to seat. ``None`` means no
-    round context was supplied and the burst rule does not apply.
+    ``round_id`` scopes the Round 5 client-budget rule. Its 64-client maximum
+    concurrency belongs to :data:`RoundId.SURVIVE_CONNECTION_SPIKE` alone, so
+    applying it to every lane would refuse an instance class that no round in
+    question ever has to seat. ``None`` means no round context was supplied and
+    the bounded-check rule does not apply.
     """
 
     if lakebase_max_cu is None:
@@ -235,13 +238,14 @@ def capacity_parity(
             headroom = max_connections_for_memory_gib(rds_gib)
             if (
                 round_id is RoundId.SURVIVE_CONNECTION_SPIKE
-                and headroom < ROUND5_PEAK_CLIENTS_PER_LANE
+                and headroom < ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE
             ):
                 failures.append(
                     f"RDS {rds_instance_class} has a nominal connection budget of about "
-                    f"{headroom}, under the {ROUND5_PEAK_CLIENTS_PER_LANE}-client Round 5 "
-                    "contract (derived from instance memory, not an observed limit — RDS "
-                    "Proxy multiplexing may still seat the burst)"
+                    f"{headroom}, under the maximum "
+                    f"{ROUND5_MAX_CONCURRENT_CLIENTS_PER_LANE} concurrent clients in "
+                    "the bounded Round 5 contract (derived from instance memory, not "
+                    "an observed limit — RDS Proxy multiplexing may still seat it)"
                 )
 
     parts.append(
@@ -497,6 +501,18 @@ def build_capacity_disclosure(
         aurora_min_acu=aurora_min_acu,
         round_id=round_id,
     )
+    note = _disclosure_note(parity)
+    if round_id is RoundId.SURVIVE_CONNECTION_SPIKE:
+        direct_slots = lakebase.max_connections
+        if direct_slots is not None:
+            pooled_backends = round(direct_slots * LAKEBASE_POOL_BACKEND_RATIO)
+            note = (
+                f"{note} At this lane's maximum compute, Lakebase has {direct_slots} direct "
+                f"PostgreSQL slots and approximately {pooled_backends} active backend "
+                "connections per user/database pool. Built-in pooled endpoint product "
+                f"limit: up to {LAKEBASE_POOL_MAX_CLIENT_CONN:,} client connections per "
+                "pooled compute endpoint; not exercised by this 64-concurrent bout."
+            )
     return CapacityDisclosure(
         lanes=[lakebase, competitor],
         matched=parity.ok,
@@ -504,7 +520,7 @@ def build_capacity_disclosure(
             f"{lakebase.product} {lakebase.configured} ({lakebase.memory}) · "
             f"{competitor.product} {competitor.configured} ({competitor.memory})"
         ),
-        note=_disclosure_note(parity),
+        note=note,
     )
 
 

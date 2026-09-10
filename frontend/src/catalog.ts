@@ -132,27 +132,27 @@ const modelScoreRound: RoundDefinition = {
 const connectionSpikeRound: RoundDefinition = {
   id: 'survive_connection_spike',
   title: ROUND_FIVE_DISPLAY_TITLE,
-  capability: 'Built-in connection pooling',
+  capability: 'Included pooling compared with a selected AWS managed pooling path',
   scorecard_by_corner: {
-    cost: 'Published rates include the AWS opponent’s added RDS Proxy minimum',
-    simplicity: 'Built-in pooling vs an AWS best-practice RDS Proxy from the declared start',
-    performance: 'Readiness setup is primary; the identical connection spike is pass/fail validation',
+    cost: 'Published rates include the new RDS Proxy selected for the AWS reference path',
+    simplicity: 'Included Lakebase pooled endpoint vs the newly provisioned selected AWS managed pooling path',
+    performance: 'Pooled-path setup time is primary; 128 attempts, maximum 64 concurrent, plus a separate witness are pass/fail validation',
   },
   competitors: ['aurora_serverless_v2', 'rds_postgres'],
   availability: 'ready',
   metric_specs: [
-    { id: 'setup_elapsed_ms', label: 'Setup elapsed', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'setup_elapsed_ms', label: 'Pooled-path setup time', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
     { id: 'successful_clients', label: 'Successful clients', role: 'secondary', unit: 'count', direction: 'higher_is_better' },
-    { id: 'application_p99_ms', label: 'Warm-burst application p99', role: 'secondary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'application_p99_ms', label: 'Bounded-check application p99', role: 'secondary', unit: 'milliseconds', direction: 'lower_is_better' },
     { id: 'error_clients', label: 'Client errors', role: 'guardrail', unit: 'count', direction: 'lower_is_better' },
   ],
   comparison_kind: 'measured',
   non_claims: [
-    'RDS Proxy is AWS best practice for connection spikes. If it is already deployed, its setup delay does not apply. This round compares declared-start readiness, not burst performance.',
-    'Lakebase uses its built-in pooled host: 0 separate per-bout pooling components and 0 per-bout pooling infrastructure mutations.',
-    'The selected Aurora or RDS lane performs 9 journaled competitor mutations: 1 per-bout Proxy security group, 1 default-egress change, 4 exact security-group rules, 1 RDS Proxy, 1 target-group configuration, and 1 target registration.',
-    'IAM service role, runner permission, and dedicated proxy credential secret or secrets are sealed install-time prerequisites outside the setup clock. The AWS design still requires added RDS Proxy, Secrets Manager, IAM, and network configuration.',
-    'Warm-burst p99 is secondary validation and is never combined with primary setup elapsed time.',
+    'From a database-only declared start, Lakebase verifies its included pooled endpoint without new pooling infrastructure; the selected AWS reference path provisions RDS Proxy and dependencies.',
+    'Both paths then run 128 attempts, maximum 64 concurrent, followed by a separate 64-client witness. The sequential phases are never summed.',
+    'RDS Proxy is the AWS managed pooling option selected for this reference path, not a universal requirement. Direct connections, an existing Proxy, PgBouncer, and application pooling were not compared.',
+    'Built-in Lakebase PgBouncer product limit: up to 10,000 pooled client connections. The recurring bout measures 128 attempts at maximum 64 concurrent, followed by separate multiplexing proof. Direct AWS connections, an existing Proxy, sustained throughput, and storm resilience remain outside this comparison.',
+    'Application p99 is secondary validation and is never combined with primary pooled-path setup time.',
     'Setup failure or a setup towel produces no winner and no margin.',
     'This is one live proof session, not a benchmark.',
   ],
@@ -267,7 +267,7 @@ export function stopCondition(roundId: RoundId, competitor?: CompetitorId): stri
     return 'The clock stops only after the committed Delta version is synchronized and a fresh application connection reads the exact operational Postgres row.'
   }
   if (roundId === 'survive_connection_spike') {
-    return 'Each clock stops at a verified pooled application path from the declared start. RDS Proxy is AWS best practice; if it is already deployed, this setup delay does not apply. The identical spike must pass on both lanes.'
+    return 'Each pooled-path setup clock stops at an exact application transaction from the database-only declared start. Lakebase verifies its included pool; the selected AWS managed pooling path provisions a new RDS Proxy. The 128-attempt, maximum-64-concurrent check and separate 64-client witness must then pass.'
   }
   if (roundId === 'analyze_live_orders_without_slowing_checkout') {
     return 'The clock stops when the exact committed order appears once in Delta. The result waits for a separate checkout to commit.'

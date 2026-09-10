@@ -50,6 +50,48 @@ def _setup_verify_material(lane_id: str) -> tuple[dict[str, object], dict[str, o
     return request, stored
 
 
+
+def test_bounded_main_emits_an_object_instead_of_nested_lifecycle_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    encoded_request = _encode_request({"protocol": runner.PROTOCOL})
+    expected = {
+        "protocol": runner.PROTOCOL,
+        "run_id": "run-1",
+        "lanes": [],
+        "contracts_verified": True,
+    }
+
+    monkeypatch.setattr(runner.sys, "argv", ["connection_spike_runner.py", encoded_request])
+    monkeypatch.setattr(
+        runner,
+        "_decode_request",
+        lambda unused: ("run-1", (), (), "a" * 64),
+    )
+    monkeypatch.setattr(runner, "_validate_runtime", lambda: None)
+    monkeypatch.setattr(runner, "_validate_trust_bundle", lambda unused: None)
+    monkeypatch.setattr(runner, "RUN_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(runner, "LOCK_PATH", tmp_path / "runner.lock")
+
+    async def bounded_lifecycle(*unused):
+        return expected, False
+
+    monkeypatch.setattr(runner, "_lifecycle", bounded_lifecycle)
+
+    assert runner.main() == 0
+    payloads = [
+        line.removeprefix("RESULT_GZIP_BASE64:")
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("RESULT_GZIP_BASE64:")
+    ]
+    assert len(payloads) == 1
+    decoded = json.loads(gzip.decompress(base64.urlsafe_b64decode(payloads[0])))
+    assert decoded == expected
+    assert isinstance(decoded, dict)
+
+
 class _VerifiedCursor:
     nonce = ""
 
