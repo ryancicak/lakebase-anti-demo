@@ -9,13 +9,27 @@ declared resource or an actual API call.
 Files 1–3 are required. File 4 is only for the opt-in S3 state backend — see
 [the fourth file](#4--terraform-state-in-s3-opt-in) before you attach it.
 
-**The deployed Databricks App does not use this principal.** It authenticates as
-a separate, much narrower IAM user — see
-[the app's own principal](#the-deployed-apps-own-principal) — which can run the
-rounds and clean up after them and can do nothing else. An earlier version of
-this page said the operator principal drove the app as well; it does not, and
-attaching the operator set to the app would hand a public-facing process the
-ability to create IAM roles and launch EC2 instances.
+**The separation below is the intended design, and `bootstrap.sh` does not yet
+implement it.** `docs/bootstrap.env.example` offers one AWS pair, and
+`bootstrap.sh` publishes that same pair to the app:
+
+```bash
+APP_AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+APP_AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+```
+
+So today the operator principal *is* the app's principal, and the app therefore
+holds the operator set. Read the rest of this page as the target state and as the
+description of what each document grants — not as a claim about the current
+runtime. A reader who takes it literally will decline to attach the operator
+policies to the pair in `.env.bootstrap` and then find that
+`./bootstrap.sh --apply` cannot provision.
+
+The reason the separation is worth building: attaching the operator set to the
+app hands a public-facing process the ability to create IAM roles and launch EC2
+instances, which
+[the app's own principal](#the-deployed-apps-own-principal) is scoped to avoid.
+Until `bootstrap.sh` accepts a second pair, that exposure is real and accepted.
 
 ## Why several files and not one
 

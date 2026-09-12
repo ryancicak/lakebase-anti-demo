@@ -27,9 +27,17 @@ You need:
 - An AWS Databricks workspace with Lakebase enabled
 - A Databricks service principal with OAuth M2M credentials
 - A SQL warehouse and a Unity Catalog you can create schemas in
-- An AWS account with permission to create RDS, Aurora, EC2, IAM, KMS grants,
-  and Secrets Manager entries, in a region that still has its default VPC —
-  the demo discovers that network and cannot be given another one
+- An AWS region that still has its default VPC — the demo discovers that network
+  and cannot be given another one
+- **The IAM user pair you put in `.env.bootstrap` must itself hold** permission to
+  create RDS, Aurora, EC2, IAM, KMS grants, and Secrets Manager entries. It is
+  not enough for the account to allow it or for your console login to have it:
+  bootstrap authenticates as that pair and nothing else. An administrator pair
+  already qualifies. For a least-privilege operator instead, attach the three
+  policies in [`docs/iam/`](docs/iam/README.md) with
+  `scripts/attach-operator-policies.sh --user <name>` first — bootstrap cannot
+  grant its own permissions, because creating and attaching IAM policies is more
+  privilege than the set being granted
 
 Copy the environment template:
 

@@ -1159,12 +1159,34 @@ if [[ "$DEFAULT_VPC" == vpc-* ]]; then
       --image-id "$AMI_ID" --instance-type "$ROUND5_RUNNER_INSTANCE_TYPE" --count 1
   fi
 else
-  fail "No default VPC in $AWS_REGION, and this is not a permissions problem — the demo has
+  # `DEFAULT_VPC` is "None" both when the region genuinely has no default VPC and
+  # when `ec2:DescribeVpcs` was denied, because the query above swallows the
+  # error. Those need different advice: the first is a real dead end, the second
+  # is already reported in the denied-probe list and resolves with the operator
+  # policies. Claiming "not a permissions problem" while the probe is sitting in
+  # PERMISSION_FAILURES sends an operator to change regions or write Terraform
+  # for a network that is present and healthy.
+  VPC_PROBE_DENIED=0
+  if ((${#PERMISSION_FAILURES[@]} > 0)); then
+    for denied in "${PERMISSION_FAILURES[@]}"; do
+      if [[ "$denied" == "ec2:DescribeVpcs" ]]; then
+        VPC_PROBE_DENIED=1
+        break
+      fi
+    done
+  fi
+  if ((VPC_PROBE_DENIED)); then
+    warn "default-VPC discovery could not run: ec2:DescribeVpcs was denied above, so
+      whether $AWS_REGION has a default VPC is unknown. Fix the denied probes first --
+      this is not reported as a separate failure because it has the same single cause."
+  else
+    fail "No default VPC in $AWS_REGION, and this is not a permissions problem — the demo has
       no way to bring its own network. infra/aws/locals.tf:network_input_mode requires
       vpc_id, subnet_ids and runner_subnet_id together, and
       server/lifecycle.py:_terraform_variables passes none of the three, so default-VPC
       discovery is the only supported network mode. Either pick a region that still has
       its default VPC, or land a Terraform change that plumbs those variables through."
+  fi
 fi
 
 if [[ "$STATE_BACKEND" == "s3" ]]; then
