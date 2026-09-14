@@ -107,7 +107,7 @@ describe('CapacityDisclosure', () => {
         })}
       />,
     )
-    expect(screen.getByText('Max connections · not published')).toBeTruthy()
+    expect(screen.getByText('Direct PostgreSQL slots · not published')).toBeTruthy()
   })
 
   it('colours the Lakebase corner red and the opponent corner blue', () => {

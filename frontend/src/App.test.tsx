@@ -1502,7 +1502,7 @@ describe('backstage setup', () => {
     await user.click(roundFive)
 
     expect(screen.getByRole('heading', { name: /ready a pooled application path/i })).toBeInTheDocument()
-    expect(screen.getByText('Aurora + RDS Proxy')).toBeInTheDocument()
+    expect(screen.getByText('Aurora + RDS Proxy reference path')).toBeInTheDocument()
     expect(screen.queryByText('RDS PostgreSQL')).not.toBeInTheDocument()
     // The fight card no longer prints the stop boundary in prose -- the owner
     // removed the explanatory panels -- but the boundary itself still governs
@@ -3962,7 +3962,11 @@ describe('backstage setup', () => {
       expect(finale).toHaveTextContent(/six rounds/i)
       const rows = within(finale).getByLabelText(/all six round summaries/i)
       expect(rows.children).toHaveLength(6)
-      expect(finale).toHaveTextContent(/ready a pooled application path.*bounded check passed.*new proxy path disclosed/i)
+      // Round 5 is the fan-in protocol now: the summary row names the held-client
+      // target and the hold, not the bounded protocol's attempt count.
+      expect(finale).toHaveTextContent(
+        /ready a pooled application path.*10,000 clients held \/ lane.*multiplexing proved/i,
+      )
 
       // The fight card's own fighters, named once with their own chips.
       const corners = within(finale).getByLabelText('Corners')
@@ -4027,7 +4031,7 @@ describe('backstage setup', () => {
       )
       expect(downloadClick).toHaveBeenCalledTimes(1)
       expect(writeText).toHaveBeenCalledWith(expect.stringMatching(
-        /Six proof contracts.*01 · Wake from zero.*05 · Built-in pooling.*06 · Live checkout.*1\.23s.*not a benchmark/is,
+        /Six proof contracts.*01 · Wake from zero.*05 · Both pooled paths.*06 · Live checkout.*1\.23s.*not a benchmark/is,
       ))
       expect(finale).toHaveTextContent(/ready.*downloaded png.*copied caption/i)
       expect(fetchMock.mock.calls.some((call) => String(call[0]).endsWith('/cooldown'))).toBe(false)

@@ -1,6 +1,7 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
 import { metricValue, modelScoreEvidence } from '../round4'
 import {
+  ROUND_FIVE_FANIN_PROTOCOL,
   roundFiveHasComparison,
   roundFiveLaneResult,
   roundFiveSetupLaneResult,
@@ -61,6 +62,28 @@ function roundSixElapsed(session: DemoSession): number | null {
     ?? verifiedElapsed(session, 'lakebase')
 }
 
+/**
+ * Round 5's scored quantity, which is not the same measurement in both protocols.
+ *
+ * Under the bounded protocol the score *was* pooled-path setup, so the setup stop
+ * is the exact time. Under the fan-in protocol the score is shared-T0 time to
+ * exactly 10,000 authenticated held clients, and setup is supporting evidence --
+ * the AWS lane spends most of its setup provisioning an RDS Proxy, which is the
+ * finding rather than the result.
+ *
+ * Returning setup under fan-in was wrong twice over: the replay labelled the value
+ * "time to 10,000" while showing a setup duration, and the declared margin comes
+ * from `time_to_10000_ms`, so the lane times on screen did not add up to the margin
+ * printed beside them.
+ */
+function roundFiveExactPrimaryMs(session: DemoSession, laneId: LaneId): number | null {
+  if (session.round5_setup?.protocol === ROUND_FIVE_FANIN_PROTOCOL) {
+    return roundFiveLaneResult(session.lanes[laneId]).timeToTargetMs
+      ?? verifiedElapsed(session, laneId)
+  }
+  return roundFiveExactSetupMs(session, laneId)
+}
+
 function roundFiveExactSetupMs(session: DemoSession, laneId: LaneId): number | null {
   const strict = roundFiveSetupLaneResult(session, laneId)
   if (strict.verified) return strict.setupElapsedMs
@@ -119,14 +142,14 @@ function comparisonFor(session: DemoSession): ContractComparison | null {
 function sessionEvidence(session: DemoSession) {
   const roundFive = session.round.id === 'survive_connection_spike'
   const lakebaseExactMs = roundFive
-    ? roundFiveExactSetupMs(session, 'lakebase')
+    ? roundFiveExactPrimaryMs(session, 'lakebase')
     : session.round.id === 'put_model_score_in_app'
       ? verifiedElapsed(session, 'lakebase') === null ? null : roundFourElapsed(session)
       : session.round.id === 'analyze_live_orders_without_slowing_checkout'
         ? verifiedElapsed(session, 'lakebase') === null ? null : roundSixElapsed(session)
         : verifiedElapsed(session, 'lakebase')
   const competitorExactMs = roundFive
-    ? roundFiveExactSetupMs(session, 'competitor')
+    ? roundFiveExactPrimaryMs(session, 'competitor')
     : verifiedElapsed(session, 'competitor')
   const roundFourGuardrailFailed = session.round.id === 'put_model_score_in_app'
     && lakebaseExactMs !== null

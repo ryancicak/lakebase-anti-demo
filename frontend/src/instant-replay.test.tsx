@@ -119,38 +119,71 @@ function verifiedSession(roundId: RoundId): DemoSession {
   }
 
   if (roundId === 'survive_connection_spike') {
-    const successfulLatencyMs = Array.from({ length: 128 }, (_, index) => 10 + index / 100)
-    const burstEvidence = {
-      scheduled_clients: 128,
-      terminal_clients: 128,
-      successful_clients: 128,
-      error_clients: 0,
-      successful_latency_ms: successfulLatencyMs,
-      witness_verified_clients: 64,
-      unique_backend_pids: 8,
-      peak_backend_sessions: 16,
-    }
+    // The fan-in protocol: exactly 10,000 authenticated clients held per lane, a
+    // 30-second hold, 64 sparse samples and zero retries. `elapsed_ms` carries the
+    // scored quantity here -- shared-T0 time to 10,000 -- because that is the
+    // primary result, with pooled-path setup as supporting evidence.
+    const fanInEvidence = (elapsedMs: number, authMethod: string) => ({
+      protocol: 'round5-fanin-v2',
+      schema_version: 2,
+      initiated_clients: 10_000,
+      authenticated_clients: 10_000,
+      held_clients_at_gate: 10_000,
+      terminal_failures: 0,
+      retries: 0,
+      disconnected_during_hold: 0,
+      time_to_target_ms: elapsedMs,
+      hold_elapsed_ms: 30_000.001,
+      sampled_queries_attempted: 64,
+      sampled_queries_succeeded: 64,
+      sampled_queries_failed: 0,
+      // Backends must be far fewer than clients: that gap is the multiplexing
+      // proof, and it is why 10,000 client connections is not 10,000 sessions.
+      unique_backend_pids: 19,
+      current_backend_sessions: 5,
+      peak_backend_sessions: 37,
+      // The observer watches from its own role over its own direct connection, so
+      // what it counts cannot be an artefact of the pool it is measuring.
+      preexisting_client_role_sessions: 0,
+      observer_role: 'anti_demo_observer',
+      client_role: 'anti_demo_burst',
+      observer_direct: true,
+      auth_method: authMethod,
+      // One socket and one local endpoint per client: 9,999 distinct sockets under
+      // 10,000 authenticated clients would mean a client was counted twice.
+      distinct_socket_fds: 10_000,
+      distinct_local_endpoints: 10_000,
+      telemetry_verified: true,
+      telemetry_failures: [],
+    })
     session.lanes.lakebase = {
       ...session.lanes.lakebase,
-      elapsed_ms: null,
-      status: 'Bounded check passed',
-      evidence: burstEvidence,
+      elapsed_ms: 12_350,
+      status: '10,000 authenticated held clients',
+      evidence: fanInEvidence(12_350, 'tls-cleartext-password'),
     }
     session.lanes.competitor = {
       ...session.lanes.competitor,
       name: 'Aurora Serverless v2 + RDS Proxy',
-      elapsed_ms: null,
-      status: 'Bounded check passed',
-      evidence: burstEvidence,
+      elapsed_ms: 24_000,
+      status: '10,000 authenticated held clients',
+      evidence: fanInEvidence(24_000, 'scram-sha-256'),
     }
     session.fairness = {
       same_client: true,
       same_transaction: true,
       same_nonce: true,
       launch_skew_ms: 0.155,
-      warmup_connections: 4,
-      concurrency: 64,
-      runner: 'Python 3.12 + psycopg 3.3.4',
+      protocol: 'round5-fanin-v2',
+      // Zero warmups under fan-in: every one of the 10,000 clients is scored, so a
+      // warmed connection would be a client that did not have to race.
+      warmup_connections: 0,
+      concurrency: 10_000,
+      target_clients_per_lane: 10_000,
+      sampled_queries_per_lane: 64,
+      hold_seconds: 30,
+      max_retries: 0,
+      runner: 'Python 3.12 event-driven TLS/native-password',
       tls: 'verify-full',
       timeout: '30 seconds',
     }
@@ -163,6 +196,8 @@ function verifiedSession(roundId: RoundId): DemoSession {
     session.round5_setup = {
       state: 'verified',
       workflow_launch_skew_ms: 1.761,
+      protocol: 'round5-fanin-v2',
+      schema_version: 2,
       setup_validated: true,
       downstream_validated: true,
       cleanup_retryable: false,
@@ -187,10 +222,12 @@ function verifiedSession(roundId: RoundId): DemoSession {
         },
       },
     }
+    // The scored quantity under fan-in is shared-T0 time to 10,000 held clients,
+    // not pooled-path setup. 24.00s - 12.35s.
     session.comparison = {
       kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: { spec_id: 'setup_elapsed_ms', value: 690_410 },
+      margin: { spec_id: 'time_to_10000_ms', value: 11_650 },
     }
   }
 
@@ -317,7 +354,9 @@ describe('replayStory', () => {
     ['make_schema_change_safely', /isolated environment/i, /same migration.*source was unchanged/i, /production cleanup was not tested/i],
     ['recover_deleted_order', /aged to a recovery point.*deleted/i, /exact deleted order.*source read still proved it absent/i, /not a production failover/i],
     ['put_model_score_in_app', /score 0\.81.*Delta version 11/i, /Managed Reverse ETL.*fresh app connection/i, /no AWS race or margin/i],
-    ['survive_connection_spike', /included pool.*selected AWS path.*RDS Proxy and dependencies/i, /128 attempts, maximum 64 concurrent.*separate 64-client multiplexing witness.*pass\/fail/i, /score is pooled-path setup.*direct AWS connections and existing pools remain outside this selected-path comparison/i],
+    // Fan-in: setup is supporting evidence and the shared-T0 time to 10,000 held
+    // clients is the primary result.
+    ['survive_connection_spike', /included pool.*selected RDS Proxy separately/i, /raced both from one T0 to exactly 10,000 authenticated held clients.*held 30s.*multiplexing/i, /fan-in time is primary.*setup supports it.*client count is not backend count/i],
     ['analyze_live_orders_without_slowing_checkout', /checkout committed.*RED-GLOVE.*CHICAGO.*\$84\.50/i, /exact order once.*separate checkout/i, /no AWS race or margin/i],
   ] as const)(
     'maps %s to Setup, Same test, and Takeaway',
