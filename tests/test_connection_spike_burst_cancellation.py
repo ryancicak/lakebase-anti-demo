@@ -31,14 +31,13 @@ from test_connection_spike_live import (
     FakeRds,
     FakeSessionFactory,
     FakeSts,
+    fanin_request,
     live_config,
 )
 
-from server.connection_spike import build_schedule
 from server.connection_spike_live import (
     ConnectionSpikeCleanupError,
     LiveConnectionSpikeAdapter,
-    _serialize_schedule,
 )
 
 REGION = "us-west-2"
@@ -135,12 +134,10 @@ def _adapter(ssm: _Ssm, *, bound: float = BOUND) -> LiveConnectionSpikeAdapter:
     )
 
 
-def _schedule() -> list[dict[str, object]]:
-    return _serialize_schedule(
-        SimpleNamespace(  # type: ignore[arg-type]
-            schedule=build_schedule(("lakebase", "competitor"), scheduled_at_ns=0)
-        )
-    )
+def _request() -> dict[str, object]:
+    """The fan-in request this adapter dispatches, built by the real builder."""
+
+    return fanin_request(RUN_ID)
 
 
 async def test_a_wedged_cancel_command_cannot_stall_the_burst_cancellation() -> None:
@@ -154,7 +151,7 @@ async def test_a_wedged_cancel_command_cannot_stall_the_burst_cancellation() -> 
 
     ssm = _Ssm()
     adapter = _adapter(ssm)
-    task = asyncio.create_task(adapter.execute(RUN_ID, _schedule()))
+    task = asyncio.create_task(adapter.execute(RUN_ID, _request()))
     try:
         await _until(ssm.sent.is_set, "the runner command to be sent")
         task.cancel()
@@ -227,7 +224,7 @@ async def test_a_wedged_cancel_cannot_stall_a_cancellation_during_dispatch() -> 
 
     ssm.send_command = gated_send  # type: ignore[method-assign]
     adapter = _adapter(ssm)
-    task = asyncio.create_task(adapter.execute(RUN_ID, _schedule()))
+    task = asyncio.create_task(adapter.execute(RUN_ID, _request()))
     try:
         # Cancel while the dispatch itself is still on the worker thread.
         await _until(lambda: adapter._pending is not None, "the command to be dispatched")
@@ -250,7 +247,7 @@ async def test_the_orphan_risk_log_names_the_state_that_may_still_be_held(
     ssm = _Ssm()
     adapter = _adapter(ssm)
     caplog.set_level(logging.ERROR, logger="server.safe_change")
-    task = asyncio.create_task(adapter.execute(RUN_ID, _schedule()))
+    task = asyncio.create_task(adapter.execute(RUN_ID, _request()))
     try:
         await _until(ssm.sent.is_set, "the runner command to be sent")
         task.cancel()
@@ -292,7 +289,7 @@ async def test_a_cancellation_that_settles_promptly_is_confirmed_not_abandoned(
     ssm = _Ssm(wedge_cancel=False, settles=True)
     adapter = _adapter(ssm, bound=PATIENCE)
     caplog.set_level(logging.ERROR, logger="server.safe_change")
-    task = asyncio.create_task(adapter.execute(RUN_ID, _schedule()))
+    task = asyncio.create_task(adapter.execute(RUN_ID, _request()))
     await _until(ssm.sent.is_set, "the runner command to be sent")
     task.cancel()
 

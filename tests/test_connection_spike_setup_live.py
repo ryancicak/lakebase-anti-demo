@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from runner import round5_fanin as runner_fanin
 from server.connection_spike_journal import CreationScope, JournalEvent, ResourceSpec
 from server.connection_spike_live import (
     ConnectionSpikeLiveConfigurationError,
@@ -230,7 +231,7 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
         ssm_document_name="AWS-RunShellScript",
         native_role="anti_demo_burst",
         frozen_constants=SimpleNamespace(
-                runner_instance_type="m6i.large",
+                runner_instance_type="c7i.2xlarge",
             rds_proxy_max_connections_percent=90,
             rds_proxy_borrow_timeout_seconds=120,
         ),
@@ -606,11 +607,21 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
     monkeypatch.setattr(orchestrator, "_wait_proxy_available", wait_proxy_available)
     monkeypatch.setattr(orchestrator, "_verify_journaled_resources", verify_journaled_resources)
 
+    measured = SimpleNamespace(sufficient=True, failures=())
+
+    async def preflight_capacity(run_id, **digests):
+        # The arm records what this machine measured, so the stand-in has to answer.
+        # Sufficient, because this test is about the setup phase's two stops; a runner
+        # that cannot hold the clients is covered where that refusal is the subject.
+        del run_id, digests
+        return measured
+
     adapter = SimpleNamespace(
         config=SimpleNamespace(
             targets=(SimpleNamespace(lane_id="lakebase"), SimpleNamespace(lane_id="competitor"))
         ),
         check=lambda: _value(None),
+        preflight_capacity=preflight_capacity,
     )
     engine = LiveConnectionSpikeEngine(adapter, setup_orchestrator=orchestrator)
     with pytest.raises(ConnectionSpikeLiveOperationError, match="before both timed setup stops"):
@@ -624,7 +635,14 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
     setup = await engine.setup("bout-two-phase", 11, capture_progress)
     arm = await engine.check()
 
-    assert arm.schedule.lane_ids == ("lakebase", "competitor")
+    # A fan-in arm is the four digests plus the capacity that justified attempting
+    # 10,000 clients per lane. Compared against the runner's own functions, because an
+    # arm whose digests this side computed differently is an arm the runner refuses.
+    assert arm.contract_sha256 == runner_fanin.contract_sha256()
+    assert arm.config_sha256 == runner_fanin.config_sha256()
+    assert arm.generator_sha256 == runner_fanin.generator_sha256()
+    assert arm.capacity_model_sha256 == runner_fanin.capacity_model_sha256()
+    assert arm.preflight is measured
     assert setup.deadline_ns - setup.t0_ns == 30 * 60 * 1_000_000_000
     assert setup.t0_ns >= 6_000_000_000
     assert setup.launch_skew_ms <= 10

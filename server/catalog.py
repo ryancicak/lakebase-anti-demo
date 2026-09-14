@@ -25,8 +25,16 @@ from .models import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
+#: The protocol Round 5 runs. The bounded 128-attempt protocol is retired: it measured
+#: pooled-path setup and a capped burst, which is not the claim Round 5 makes, and both
+#: lanes now hold exactly 10,000 authenticated clients from a shared start.
+#:
+#: `ROUND5_BOUNDED_PROTOCOL` survives as a name only so that a stored scorecard written
+#: under it can still be recognised and labelled as a legacy result rather than silently
+#: relabelled with 10,000-client copy it never attempted. It is not selectable.
 ROUND5_BOUNDED_PROTOCOL = "connection-spike-v1"
-ROUND5_PROTOCOLS = frozenset({ROUND5_BOUNDED_PROTOCOL})
+ROUND5_FANIN_PROTOCOL = "round5-fanin-v2"
+ROUND5_PROTOCOLS = frozenset({ROUND5_FANIN_PROTOCOL})
 
 
 COMPETITORS = [
@@ -325,7 +333,7 @@ def catalog(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
-    round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
+    round5_protocol: str = ROUND5_FANIN_PROTOCOL,
 ) -> CatalogResponse:
     return CatalogResponse(
         competitors=COMPETITORS,
@@ -360,7 +368,7 @@ def round_by_id(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
-    round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
+    round5_protocol: str = ROUND5_FANIN_PROTOCOL,
 ) -> RoundDefinition:
     if round5_protocol not in ROUND5_PROTOCOLS:
         raise ValueError(f"Unknown Round 5 protocol: {round5_protocol}")
@@ -403,7 +411,7 @@ def recommend_round(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
-    round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
+    round5_protocol: str = ROUND5_FANIN_PROTOCOL,
 ) -> tuple[RoundDefinition, str]:
     for preferred in primary.recommended_rounds:
         if preferred == "inherit_primary_round":

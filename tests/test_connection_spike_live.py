@@ -2,20 +2,28 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from runner import connection_spike_runner as runner
-from server.connection_spike import build_schedule
+from server.connection_fanin import (
+    ConnectionSpikeContract as FanInContract,
+)
+from server.connection_fanin import (
+    capacity_model_sha256 as fanin_capacity_model_sha256,
+)
+from server.connection_fanin import (
+    fanin_config_sha256,
+    fanin_generator_sha256,
+    fanin_run_request,
+)
 from server.connection_spike_live import (
     ConnectionSpikeLiveConfig,
     ConnectionSpikeLiveConfigurationError,
     ConnectionSpikeTarget,
     LiveConnectionSpikeAdapter,
     _proxy_target_set_matches,
-    _serialize_schedule,
 )
 
 ACCOUNT = "123456789012"
@@ -166,7 +174,7 @@ class FakeEc2:
                         {
                             "InstanceId": INSTANCE_ID,
                             "State": {"Name": "running"},
-                            "InstanceType": "m6i.large",
+                            "InstanceType": "c7i.2xlarge",
                             "SubnetId": "subnet-sealed",
                             "IamInstanceProfile": {
                                 "Arn": f"arn:aws:iam::{ACCOUNT}:instance-profile/runner"
@@ -256,6 +264,32 @@ def live_config() -> ConnectionSpikeLiveConfig:
     )
 
 
+def fanin_request(run_id: str) -> dict[str, object]:
+    """The request the adapter dispatches, built by the builder the adapter uses.
+
+    Not a hand-written dict. These tests are about what happens to a command in flight --
+    cancellation, settlement, flock release -- and a hand-written request would let them
+    keep passing while the real one became undispatchable.
+    """
+
+    return fanin_run_request(
+        run_id=run_id,
+        contract_sha256=FanInContract().sha256,
+        config_sha256=fanin_config_sha256(),
+        generator_sha256=fanin_generator_sha256(),
+        capacity_model_sha256=fanin_capacity_model_sha256(),
+        trust_bundle_sha256="a" * 64,
+        lakebase_credential_sha256="c" * 64,
+        lakebase_observer_credential_sha256="d" * 64,
+        competitor_credential_sha256="b" * 64,
+        competitor_observer_credential_sha256="e" * 64,
+        competitor_credential_id="rds",
+        targets=[
+            target.runner_value() for target in live_config().targets
+        ],
+    )
+
+
 async def test_sts_role_enforcement_and_exact_command_cancellation_cleanup() -> None:
     available_target = FakeRds().describe_db_proxy_targets(DBProxyName="sealed-proxy")["Targets"]
     assert _proxy_target_set_matches(
@@ -300,11 +334,7 @@ async def test_sts_role_enforcement_and_exact_command_cancellation_cleanup() -> 
         session_factory=factory,
         sleep=poll,
     )
-    schedule = build_schedule(("lakebase", "competitor"), scheduled_at_ns=0)
-    serialized = _serialize_schedule(
-        SimpleNamespace(schedule=schedule)  # type: ignore[arg-type]
-    )
-    task = asyncio.create_task(adapter.execute("test-run", serialized))
+    task = asyncio.create_task(adapter.execute("test-run", fanin_request("test-run")))
     await asyncio.wait_for(ssm.sent.wait(), timeout=1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -325,14 +355,15 @@ async def test_sts_role_enforcement_and_exact_command_cancellation_cleanup() -> 
         ("assumed", "ec2"),
     ]
     assert len(ssm.send_calls) == 1
-    assert ssm.send_calls[0]["TimeoutSeconds"] == 120
+    assert ssm.send_calls[0]["TimeoutSeconds"] == 660
     assert len(ssm.send_calls[0]["Parameters"]["commands"]) == 1
     command = ssm.send_calls[0]["Parameters"]["commands"][0]
     assert len(command.encode()) < 24_000
-    decoded_run_id, decoded_targets, decoded_attempts, decoded_trust = runner._decode_request(
+    decoded_run_id, decoded_targets, decoded_trust, decoded = runner._decode_fanin_request(
         command.rsplit(" ", 1)[1]
     )
     assert decoded_run_id == "test-run"
+    assert decoded["action"] == "run"
     assert {target.lane_id for target in decoded_targets} == {
         "lakebase",
         "competitor",
@@ -341,7 +372,16 @@ async def test_sts_role_enforcement_and_exact_command_cancellation_cleanup() -> 
         "lakebase": "lakebase",
         "competitor": "rds",
     }
-    assert len(decoded_attempts) == 264
+    # Both credentials per lane survive the round trip. The observer one is what proves
+    # multiplexing, so a request that reached the runner without it would run 10,000
+    # clients with nothing watching the backend sessions behind them.
+    assert {target.lane_id: target.observer_sha256 for target in decoded_targets} == {
+        "lakebase": "d" * 64,
+        "competitor": "e" * 64,
+    }
+    # The shape the capacity model was calibrated on. An empty value here is not a
+    # missing field on the wire, it is a capacity gate the runner fails by name.
+    assert decoded["runner_instance_type"] == "c7i.2xlarge"
     assert decoded_trust == "a" * 64
     assert ssm.cancel_calls == [{"CommandId": "command-exact-1", "InstanceIds": [INSTANCE_ID]}]
 

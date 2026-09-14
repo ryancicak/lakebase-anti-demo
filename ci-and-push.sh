@@ -185,22 +185,18 @@ else
 fi
 
 git add -A \
-  README.md \
   ci-and-push.sh \
-  runner/connection_spike_runner.py \
-  runner/round5_fanin.py \
-  server/cli.py \
+  frontend/src/round5.ts \
+  server/catalog.py \
   server/connection_fanin.py \
   server/connection_spike_live.py \
-  server/lifecycle.py \
+  server/manager.py \
   server/manifest.py \
-  tests/conftest.py \
-  tests/test_fanin_request.py \
-  tests/test_manifest.py \
+  tests/test_connection_spike_background_cleanup.py \
+  tests/test_connection_spike_burst_cancellation.py \
+  tests/test_connection_spike_live.py \
   tests/test_connection_spike_setup_live.py \
-  tests/test_lifecycle.py \
-  tests/test_operator_ingress.py \
-  tests/test_server_launch.py
+  tests/test_fanin_digest_mirrors.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -216,28 +212,56 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Let the publish gate run beside a live installation, and actually push
+Run Round 5 as the 10,000-client fan-in bout it was built to be
 
-Two defects in this script, both found by using it.
+Round 5 has had every piece of this for weeks with nothing joining them. The runner
+could execute a dual-lane fan-in bout, the finaliser could score one, the request
+builders could describe one, and the adapter dispatched a bounded 128-attempt v1
+schedule -- so the v2 finaliser was reading a v1 payload, and the protocol the round
+claims had never once run. Four things had to change together; each alone is inert.
 
-It refused to run at all when a .anti-demo* directory was present, telling the
-operator to remove it. That directory holds the only record of what a live
-installation created, so deleting it orphans billing AWS resources -- and the
-normal reason to run this script is that you have just installed something and
-want to publish the fix. It now moves the directory outside the tree for the
-duration and restores it from a trap, so an interrupted or failing run still puts
-it back. More than one is refused rather than guessed at.
+The instance shape. connection_fanin.RUNNER_INSTANCE_TYPE is what the capacity model
+was calibrated against, and three surfaces still restated m6i.large: the live config
+default, its own guard, and the sealed frozen constant. Terraform already provisions
+the larger shape, so the runner topology preflight refused every dispatch while
+reporting a sealed-contract mismatch -- which reads as a tampered installation rather
+than as two constants that disagreed. The frozen constant now names both shapes so an
+installation sealed before the fan-in protocol still loads and keeps serving its other
+rounds, and a test asserts the three surfaces agree with the runner.
 
-It also exited zero without pushing whenever the working tree was clean, on the
-assumption that clean means nothing to publish. Running the gates and then running
-it again to push therefore pushed nothing, reported success, and left the commits
-local. A clean tree now checks whether HEAD is ahead of origin/main and pushes
-what is unpublished.
+The SSM window. 120 seconds is an agreement with the setup phase about how long a
+runner may hold a transaction open. A fan-in bout is bounded instead by the runner's
+own 600-second budget for a full ramp, hold and sampling, so a fan-in dispatch gets a
+window derived from that constant. Had it kept the 120-second one, SSM would have ended
+bouts the runner was still measuring, and the failure arrives as "the command did not
+complete", saying nothing about the 10,000 clients that were up at the time.
 
-The staging list is explicit so an unrelated edit cannot ride along, which makes
-the opposite error possible: it was left pointing at a previous commit's files, so
-every gate passed and git commit then found nothing staged. A tracked modification
-outside the list is now refused by name.
+The observer digest. Multiplexing is the claim, and it is proved by watching the pool
+from a second role on its own direct connection, so the request names an observer
+credential per lane and the runner refuses a request without one. It is sealed per lane
+at install time and not re-minted per bout, so it now travels on the lane binding
+beside the client digest, from the manifest through to the per-bout runtime target.
+
+The dispatch. `execute` took a v1 schedule and built the request itself, which is why
+the only protocol it could ever send was the one its builder knew; it now takes the
+complete request. `check()` measures capacity on the runner and refuses by name -- a
+small shape, an fd limit, an event loop already under pressure each send an operator
+somewhere different -- then arms with the four digests and that measurement. `run()`
+builds the request from the arm it was handed, refusing a lane whose seal names no
+client or observer digest rather than leaving it to the runner, whose token for that
+says nothing about which lane or why.
+
+catalog.py makes the fan-in protocol the only selectable one and manager.py defaults to
+it. connection-spike-v1 survives as a name in one place on each side, so a scorecard
+stored under it is labelled an earlier protocol rather than silently relabelled with
+10,000-client copy it never attempted. The bounded schedule serializer is deleted, and
+the two cancellation modules that drove `execute` with one now drive it with a real
+fan-in request -- keeping the fixture would have let them pass against a shape the
+server can no longer send, which is exactly how the two sides drifted apart.
+
+The server's four digests are asserted equal to the runner's own functions. When those
+copies disagree every bout dies at the decoder with `fanin_digest_mismatch`, a token
+that names the symptom and not which of the four surfaces drifted.
 MSG
 pass "committed"
 

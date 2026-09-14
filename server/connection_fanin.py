@@ -1067,6 +1067,7 @@ def fanin_preflight_request(
 def fanin_run_request(
     *,
     run_id: str,
+    runner_instance_type: str = RUNNER_INSTANCE_TYPE,
     contract_sha256: str,
     config_sha256: str,
     generator_sha256: str,
@@ -1103,6 +1104,12 @@ def fanin_run_request(
         "schema_version": FANIN_SCHEMA_VERSION,
         "action": "run",
         "run_id": run_id,
+        # The runner re-measures capacity before it opens a socket and compares the
+        # instance type it was told against the shape the model was calibrated on. An
+        # absent value there is not a missing field, it is a failed capacity gate
+        # reported as `runner_capacity_insufficient_runner_instance_type`, which reads
+        # like a small machine rather than like a request that forgot to say.
+        "runner_instance_type": runner_instance_type,
         "contract_sha256": contract_sha256,
         "config_sha256": config_sha256,
         "generator_sha256": generator_sha256,
@@ -1122,3 +1129,24 @@ def fanin_run_request(
         },
         "targets": [dict(target) for target in targets],
     }
+
+def fanin_generator_sha256(generator: object | None = None) -> str:
+    """The digest of the generator the runner will execute.
+
+    Mirrors runner.round5_fanin.generator_sha256, which hashes that file's own bytes.
+    The server needs it to arm a bout, because the runner compares the digest in the
+    request against the file it is about to run and refuses a mismatch: a generator that
+    still answers while differing from the armed contract produces numbers that look
+    exactly like a measurement.
+
+    The path is resolved rather than hardcoded so this stays correct if the runner
+    directory moves, and passing an explicit path keeps it testable.
+    """
+
+    import hashlib as _hashlib
+    from pathlib import Path as _Path
+
+    path = _Path(generator) if generator is not None else (
+        _Path(__file__).resolve().parents[1] / "runner" / "round5_fanin.py"
+    )
+    return _hashlib.sha256(path.read_bytes()).hexdigest()

@@ -23,7 +23,7 @@ from .capacity import (
     observed_rds_instance_class,
 )
 from .catalog import (
-    ROUND5_BOUNDED_PROTOCOL,
+    ROUND5_FANIN_PROTOCOL,
     ROUND5_PROTOCOLS,
     build_presenter_pack,
     competitor_by_id,
@@ -751,7 +751,7 @@ class RunManager:
         clock_ns: Callable[[], int] = time.monotonic_ns,
         delta_storage_probe: Callable[[], Awaitable[None]] | None = None,
         delta_storage_probe_interval_seconds: float = 60.0,
-        round5_protocol: str = ROUND5_BOUNDED_PROTOCOL,
+        round5_protocol: str = ROUND5_FANIN_PROTOCOL,
     ) -> None:
         self._records: dict[str, SessionRecord] = {}
         self._records_lock = asyncio.Lock()

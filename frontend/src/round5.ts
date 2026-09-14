@@ -13,6 +13,9 @@ export const ROUND_FIVE_WITNESS_CLIENTS = ROUND_FIVE_SAMPLED_QUERIES
 export const ROUND_FIVE_HOLD_SECONDS = 0
 export const ROUND_FIVE_RUNNER = 'Python 3.12 async psycopg'
 export const ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS = 10
+// Recognition only. Round 5 runs the fan-in protocol; this name survives so a
+// scorecard stored under the retired bounded protocol is labelled as an earlier
+// protocol rather than silently relabelled with 10,000-client copy it never attempted.
 export const ROUND_FIVE_PROTOCOL = 'connection-spike-v1'
 export const ROUND_FIVE_SCHEMA_VERSION = 1
 export const ROUND_FIVE_FANIN_PROTOCOL = 'round5-fanin-v2'

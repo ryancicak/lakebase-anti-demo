@@ -30,26 +30,40 @@ from .connection_fanin import (
     FANIN_SCHEMA_VERSION,
     PROGRESS_PREFIX,
     RUNNER_LANE_COUNT,
+    RUNTIME_LANE_IDS,
+    CapacityPreflight,
     ConnectionSpikeLaneResult,
     FanInError,
     FanInProgress,
+    evaluate_capacity_preflight,
+    fanin_config_sha256,
+    fanin_generator_sha256,
+    fanin_preflight_request,
+    fanin_run_request,
+)
+from .connection_fanin import (
+    RUN_TIMEOUT_SECONDS as FANIN_RUN_TIMEOUT_SECONDS,
+)
+from .connection_fanin import (
+    RUNNER_INSTANCE_TYPE as FANIN_RUNNER_INSTANCE_TYPE,
 )
 from .connection_fanin import ConnectionSpikeArm as FanInArm
+from .connection_fanin import ConnectionSpikeContract as FanInContract
 from .connection_fanin import ConnectionSpikeRunResult as FanInRunResult
+from .connection_fanin import (
+    capacity_model_sha256 as fanin_capacity_model_sha256,
+)
 from .connection_fanin import compare_lanes as compare_fanin_lanes
 from .connection_fanin import finalize_lane as finalize_fanin_lane
 from .connection_spike import (
     AttemptProof,
-    ConnectionSpikeArm,
     ConnectionSpikeContract,
-    ConnectionSpikeRunResult,
     PublicSetupEvidence,
     SetupLaneObservation,
     SetupLaneStatus,
     SetupPhaseArm,
     SetupStopGateEvidence,
     arm_setup_phase,
-    build_schedule,
 )
 from .connection_spike_journal import (
     ROUND5_CREATION_JOURNAL_TABLE,
@@ -71,7 +85,20 @@ from .safe_change import DEFAULT_CANCEL_TEARDOWN_SECONDS, abandon_on_cancel
 
 logger = logging.getLogger(__name__)
 
-RUNNER_PROTOCOL = "connection-spike-v1"
+def _dispatch_timeout_seconds(request: Mapping[str, object], default: float) -> float:
+    """How long this particular dispatch is given, chosen by what it is.
+
+    A fan-in dispatch -- preflight or bout -- is bounded by the runner's own budget and
+    needs the longer window. Everything else keeps the 120-second contract it shares with
+    the setup phase. Read from the request rather than from adapter state so a caller
+    cannot get the window wrong by sending one protocol while configured for another.
+    """
+
+    if request.get("protocol") == FANIN_PROTOCOL:
+        return FANIN_SSM_TIMEOUT_SECONDS
+    return default
+
+
 SETUP_RUNNER_PROTOCOL = "connection-spike-setup-v1"
 #: The line the runner prints when it refuses, and the shape of the token after
 #: it. `runner/connection_spike_runner.py` raises `RunnerContractError` with a
@@ -92,6 +119,20 @@ SSM_TIMEOUT_SECONDS = 120.0
 #: `SSM_TIMEOUT_SECONDS` because it is a cross-boundary contract rather than a local
 #: preference: changing it means changing the runner in the same commit.
 SETUP_SSM_TIMEOUT_SECONDS = SSM_TIMEOUT_SECONDS
+#: The window a fan-in dispatch gets, which cannot be the 120-second one above.
+#:
+#: That number is an agreement with the setup phase about how long a runner may hold a
+#: transaction open. A fan-in bout is a different kind of work with a different bound:
+#: the runner budgets itself `RUN_TIMEOUT_SECONDS` for a full ramp to 10,000 clients per
+#: lane, a hold, and sampling, and ends the bout itself when it expires. Derived from
+#: that constant rather than restated, so the two cannot drift into an SSM timeout that
+#: kills a bout the runner was still measuring -- a failure that arrives as "the command
+#: did not complete" and says nothing about the 10,000 clients that were up at the time.
+#:
+#: The margin covers what SSM adds around the script: agent pickup, and the status and
+#: stdout propagation the server can only read afterwards.
+FANIN_SSM_MARGIN_SECONDS = 60.0
+FANIN_SSM_TIMEOUT_SECONDS = FANIN_RUN_TIMEOUT_SECONDS + FANIN_SSM_MARGIN_SECONDS
 #: How long a cancelled setup command is given to confirm it has settled.
 #:
 #: Ten seconds could not have worked, and a live towel thrown during Round 5
@@ -311,6 +352,13 @@ class ConnectionSpikeTarget:
     rds_proxy_borrow_timeout_seconds: int = 0
     database_user: str = ""
     credential_sha256: str = ""
+    #: The digest of the credential a second role uses to watch this lane's pool from
+    #: its own direct connection. Multiplexing is what Round 5 claims, and it is proved
+    #: by observing the backend session count while 10,000 clients are held, so the
+    #: fan-in request names one per lane and the runner refuses a request without it.
+    #: Sealed at install time and not re-minted per bout, which is why it lives on the
+    #: lane binding beside the client digest rather than on a bout's setup result.
+    observer_credential_sha256: str = ""
 
     def __post_init__(self) -> None:
         if _LANE_ID.fullmatch(self.lane_id) is None:
@@ -326,6 +374,13 @@ class ConnectionSpikeTarget:
         if self.credential_sha256 and re.fullmatch(r"[0-9a-f]{64}", self.credential_sha256) is None:
             raise ConnectionSpikeLiveConfigurationError(
                 f"Round 5 {self.lane_id} credential digest is invalid"
+            )
+        if (
+            self.observer_credential_sha256
+            and re.fullmatch(r"[0-9a-f]{64}", self.observer_credential_sha256) is None
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                f"Round 5 {self.lane_id} observer credential digest is invalid"
             )
         if not self.endpoint_host or not self.credential_host:
             raise ConnectionSpikeLiveConfigurationError(
@@ -384,7 +439,7 @@ class ConnectionSpikeLiveConfig:
     runner_subnet_id: str
     runner_security_group_id: str
     targets: tuple[ConnectionSpikeTarget, ...]
-    runner_instance_type: str = "m6i.large"
+    runner_instance_type: str = FANIN_RUNNER_INSTANCE_TYPE
     ssm_document_name: str = "AWS-RunShellScript"
     runner_path: str = RUNNER_PATH
     runner_harness_sha256: str = ""
@@ -421,7 +476,7 @@ class ConnectionSpikeLiveConfig:
             not self.runner_instance_profile_arn
             or not self.runner_subnet_id
             or not self.runner_security_group_id
-            or self.runner_instance_type != "m6i.large"
+            or self.runner_instance_type != FANIN_RUNNER_INSTANCE_TYPE
         ):
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 runner topology bindings are incomplete"
@@ -3890,34 +3945,45 @@ class LiveConnectionSpikeAdapter:
     async def execute(
         self,
         run_id: str,
-        schedule: Sequence[Mapping[str, object]],
+        request: Mapping[str, object],
         *,
         targets: Sequence[ConnectionSpikeTarget] | None = None,
     ) -> dict[str, object]:
+        """Dispatch one complete runner request and return its verified payload.
+
+        The request arrives built. An adapter that assembled it here could only ever
+        send the one protocol its builder knew, which is how Round 5 came to dispatch a
+        bounded schedule to a runner whose result the finaliser read as a fan-in bout.
+        """
+
         if self._dispatch_lock.locked():
             raise ConnectionSpikeLiveOperationError(
                 "A Round 5 runner command is already active in this app replica"
             )
         await self._dispatch_lock.acquire()
         try:
-            return await self._execute_reserved(run_id, schedule, targets=targets)
+            return await self._execute_reserved(run_id, request, targets=targets)
         finally:
             self._dispatch_lock.release()
 
     async def _execute_reserved(
         self,
         run_id: str,
-        schedule: Sequence[Mapping[str, object]],
+        request: Mapping[str, object],
         *,
         targets: Sequence[ConnectionSpikeTarget] | None = None,
     ) -> dict[str, object]:
         self._validate_run_id(run_id)
-        request = self._runner_request(run_id, schedule, targets=targets)
+        self._validate_request(run_id, request)
+        is_preflight = request.get("action") == "preflight"
+        timeout_seconds = _dispatch_timeout_seconds(request, self.config.command_timeout_seconds)
         clients = await self._assumed_clients(run_id)
         await self._preflight_runner(clients)
         await self._preflight_targets(clients.rds, targets=targets)
         started_at = datetime.now(UTC)
-        send_task = asyncio.create_task(self._send_command(clients.ssm, request))
+        send_task = asyncio.create_task(
+            self._send_command(clients.ssm, request, timeout_seconds=timeout_seconds)
+        )
         pending = _PendingCommand(run_id=run_id, send_task=send_task, clients=clients)
         self._pending = pending
         try:
@@ -3951,13 +4017,19 @@ class LiveConnectionSpikeAdapter:
         if self._pending == pending:
             self._pending = None
         try:
-            invocation = await self._wait_for_terminal(active)
+            invocation = await self._wait_for_terminal(active, timeout_seconds=timeout_seconds)
             output = str(invocation.get("StandardOutputContent") or "")
             self._require_settlement(run_id, output)
             if invocation.get("Status") != "Success":
                 raise ConnectionSpikeLiveOperationError(
                     "Round 5 runner command did not succeed after cleanup"
                 )
+            if is_preflight:
+                # No CloudWatch witness. The witness corroborates a bout's backend
+                # session count against a second source; a preflight opens no
+                # connection, so there is nothing for it to corroborate and asking
+                # would add a metric read that only ever returns nothing.
+                return self._parse_preflight_output(run_id, output)
             result = self._parse_runner_output(run_id, output)
             witness = await self._cloudwatch_witness(
                 clients.cloudwatch,
@@ -3976,7 +4048,7 @@ class LiveConnectionSpikeAdapter:
         except TimeoutError as exc:
             await self._cancel_and_settle(active)
             raise ConnectionSpikeLiveOperationError(
-                "Round 5 SSM command exceeded its 120-second boundary"
+                f"Round 5 SSM command exceeded its {timeout_seconds:.0f}-second boundary"
             ) from exc
         finally:
             if self._active == active:
@@ -4209,47 +4281,39 @@ class LiveConnectionSpikeAdapter:
                     f"Round 5 {target.lane_id} RDS Proxy binding changed"
                 )
 
-    def _runner_request(
-        self,
-        run_id: str,
-        schedule: Sequence[Mapping[str, object]],
-        *,
-        targets: Sequence[ConnectionSpikeTarget] | None = None,
-    ) -> dict[str, object]:
-        effective_targets = tuple(targets or self.config.targets)
-        value: dict[str, object] = {
-            "protocol": RUNNER_PROTOCOL,
-            "run_id": run_id,
-            "schedule": [dict(item) for item in schedule],
-            "targets": [target.runner_value() for target in effective_targets],
-            "trust_bundle_path": self.config.trust_bundle_path,
-            "trust_bundle_sha256": self.config.trust_bundle_sha256,
-        }
-        if all(target.credential_sha256 for target in effective_targets):
-            by_lane = {target.lane_id: target for target in effective_targets}
-            competitor = by_lane["competitor"]
-            value["baseline_auth"] = {
-                "lakebase": {
-                    "credential_sha256": by_lane["lakebase"].credential_sha256,
-                },
-                "competitor": {
-                    "credential_id": (
-                        "aurora" if competitor.competitor_id == "aurora_serverless_v2" else "rds"
-                    ),
-                    "credential_sha256": competitor.credential_sha256,
-                },
-            }
+    def _validate_request(self, run_id: str, request: Mapping[str, object]) -> None:
+        """Refuse a request this adapter must not send, before it costs a dispatch.
+
+        The run id is checked against the request rather than trusted alongside it: the
+        adapter tracks the active command by run id and the runner echoes it back in the
+        payload, so a request naming a different one would produce a result this adapter
+        correctly rejects as belonging to another run, after paying for the bout.
+        """
+
+        if request.get("protocol") != FANIN_PROTOCOL:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 dispatches only the fan-in protocol"
+            )
+        if request.get("run_id") != run_id:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 runner request names a different run than the dispatch"
+            )
         try:
-            encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+            encoded = json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
         except (TypeError, ValueError) as exc:
             raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 schedule is not JSON serializable"
+                "Round 5 runner request is not JSON serializable"
             ) from exc
         if len(encoded) > 512_000:
             raise ConnectionSpikeLiveConfigurationError("Round 5 runner request is too large")
-        return value
 
-    async def _send_command(self, ssm: Any, request: Mapping[str, object]) -> str:
+    async def _send_command(
+        self,
+        ssm: Any,
+        request: Mapping[str, object],
+        *,
+        timeout_seconds: float,
+    ) -> str:
         encoded = base64.urlsafe_b64encode(
             gzip.compress(
                 json.dumps(
@@ -4269,10 +4333,10 @@ class LiveConnectionSpikeAdapter:
             ssm.send_command,
             InstanceIds=[self.config.runner_instance_id],
             DocumentName=self.config.ssm_document_name,
-            TimeoutSeconds=int(self.config.command_timeout_seconds),
+            TimeoutSeconds=int(timeout_seconds),
             Parameters={
                 "commands": [command],
-                "executionTimeout": [str(int(self.config.command_timeout_seconds))],
+                "executionTimeout": [str(int(timeout_seconds))],
             },
             CloudWatchOutputConfig={"CloudWatchOutputEnabled": False},
         )
@@ -4283,8 +4347,15 @@ class LiveConnectionSpikeAdapter:
             )
         return command_id
 
-    async def _wait_for_terminal(self, active: _ActiveCommand) -> Mapping[str, object]:
-        async with asyncio.timeout(self.config.command_timeout_seconds):
+    async def _wait_for_terminal(
+        self,
+        active: _ActiveCommand,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Mapping[str, object]:
+        async with asyncio.timeout(
+            self.config.command_timeout_seconds if timeout_seconds is None else timeout_seconds
+        ):
             while True:
                 invocation = await self._get_invocation(active)
                 if invocation.get("Status") in _TERMINAL:
@@ -4368,7 +4439,7 @@ class LiveConnectionSpikeAdapter:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 runner returned an unexpected result shape"
             )
-        if result.get("protocol") != RUNNER_PROTOCOL or result.get("run_id") != run_id:
+        if result.get("protocol") != FANIN_PROTOCOL or result.get("run_id") != run_id:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 runner result does not match the active run"
             )
@@ -4417,10 +4488,142 @@ class LiveConnectionSpikeAdapter:
             }
         return witness
 
+    def _parse_preflight_output(self, run_id: str, output: str) -> dict[str, object]:
+        """Read the runner's measured capacity, and re-derive the verdict here.
+
+        The runner reports both what it measured and whether that is sufficient. Only
+        the measurements are taken. Re-evaluating them through the server's own copy of
+        the capacity model means a runner cannot report itself adequate for 10,000
+        clients per lane on a projection this side does not make, and a disagreement
+        surfaces as a model digest mismatch, naming the drift rather than hiding it
+        behind a bout that fails at 6,000 clients for no stated reason.
+        """
+
+        prefix = "PREFLIGHT_RESULT:"
+        candidates = [
+            line.removeprefix(prefix) for line in output.splitlines() if line.startswith(prefix)
+        ]
+        if len(candidates) != 1:
+            code = _runner_error_code(output)
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner did not return exactly one capacity preflight"
+                + (f": the runner refused with {code}" if code else "")
+            )
+        try:
+            raw = json.loads(candidates[0])
+        except json.JSONDecodeError as exc:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner returned malformed capacity preflight JSON"
+            ) from exc
+        if not isinstance(raw, Mapping):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner returned an unexpected capacity preflight shape"
+            )
+        if raw.get("protocol") != FANIN_PROTOCOL or raw.get("action") != "preflight":
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 capacity preflight does not match the fan-in protocol"
+            )
+        expected_model = fanin_capacity_model_sha256()
+        if raw.get("capacity_model_sha256") != expected_model:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner measured capacity against a different capacity model "
+                "than this server projects with, so its verdict cannot be re-derived"
+            )
+        return dict(raw)
+
+    @staticmethod
+    def _capacity_from_preflight(raw: Mapping[str, object]) -> CapacityPreflight:
+        """Project the runner's measurements through the server's capacity model."""
+
+        def integer(name: str) -> int:
+            value = raw.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConnectionSpikeLiveOperationError(
+                    f"Round 5 capacity preflight omitted the measured {name}"
+                )
+            return value
+
+        def number(name: str) -> float:
+            value = raw.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConnectionSpikeLiveOperationError(
+                    f"Round 5 capacity preflight omitted the measured {name}"
+                )
+            return float(value)
+
+        try:
+            return evaluate_capacity_preflight(
+                instance_type=str(raw.get("instance_type") or ""),
+                cpu_count=integer("cpu_count"),
+                physical_memory_bytes=integer("physical_memory_bytes"),
+                available_memory_bytes=integer("available_memory_bytes"),
+                baseline_rss_bytes=integer("baseline_rss_bytes"),
+                fd_soft_limit=integer("fd_soft_limit"),
+                fd_hard_limit=integer("fd_hard_limit"),
+                open_fds=integer("open_fds"),
+                ephemeral_port_first=integer("ephemeral_port_first"),
+                ephemeral_port_last=integer("ephemeral_port_last"),
+                event_loop_p99_ms=number("event_loop_p99_ms"),
+                cpu_calibration_ms=number("cpu_calibration_ms"),
+                event_loop_microbatch_p99_ms=number("event_loop_microbatch_p99_ms"),
+                event_loop_selector_fanout_peak_ms=number("event_loop_selector_fanout_peak_ms"),
+                event_loop_selector_fanout_baseline_peak_ms=number(
+                    "event_loop_selector_fanout_baseline_peak_ms"
+                ),
+                event_loop_selector_fanout_peak_deferred=integer(
+                    "event_loop_selector_fanout_peak_deferred"
+                ),
+            )
+        except ValueError as exc:
+            raise ConnectionSpikeLiveOperationError(
+                f"Round 5 capacity preflight measurements are not usable: {exc}"
+            ) from exc
+
+    async def preflight_capacity(
+        self,
+        run_id: str,
+        *,
+        contract_sha256: str,
+        config_sha256: str,
+        generator_sha256: str,
+        capacity_model_sha256: str,
+    ) -> CapacityPreflight:
+        """Measure on the runner whether 10,000 clients per lane can be held at all."""
+
+        raw = await self.execute(
+            run_id,
+            fanin_preflight_request(
+                run_id=run_id,
+                runner_instance_type=self.config.runner_instance_type,
+                contract_sha256=contract_sha256,
+                config_sha256=config_sha256,
+                generator_sha256=generator_sha256,
+                capacity_model_sha256=capacity_model_sha256,
+            ),
+        )
+        return self._capacity_from_preflight(raw)
+
     @staticmethod
     def _validate_run_id(run_id: str) -> None:
         if _RUN_ID.fullmatch(run_id) is None:
             raise ConnectionSpikeLiveConfigurationError("Round 5 run ID is invalid")
+
+
+def _competitor_observer_digest(manifest: DemoManifest, competitor_id: str) -> str:
+    """The sealed observer credential digest for the selected competitor lane.
+
+    Returned empty for a seal minted before observer credentials were sealed. That is a
+    truthful state rather than a broken one: the installation keeps serving every other
+    round, and Round 5 refuses by name when the request would have to omit it.
+    """
+
+    resources = manifest.require_round5_resources()
+    name = (
+        "aurora_observer_credential_sha256"
+        if competitor_id == "aurora_serverless_v2"
+        else "rds_observer_credential_sha256"
+    )
+    return str(getattr(resources, name, "") or "")
 
 
 def _competitor_manifest_bindings(
@@ -4519,6 +4722,9 @@ def connection_spike_live_config_from_manifest(
                 endpoint_host=resources.lakebase_pooled_host,
                 credential_host=resources.lakebase_direct_host,
                 credential_sha256=resources.lakebase_credential_sha256,
+                observer_credential_sha256=(
+                    resources.lakebase_observer_credential_sha256 or ""
+                ),
             ),
             ConnectionSpikeTarget(
                 lane_id="competitor",
@@ -4531,6 +4737,7 @@ def connection_spike_live_config_from_manifest(
                 competitor_target_id=target_id,
                 competitor_resource_id=resource_id,
                 credential_sha256=credential_sha256,
+                observer_credential_sha256=_competitor_observer_digest(manifest, competitor_id),
             ),
         ),
         ssm_document_name=resources.ssm_document_name,
@@ -4621,24 +4828,6 @@ def connection_spike_setup_config_from_manifest(
             resources.frozen_constants.rds_proxy_max_connections_percent
         ),
         proxy_borrow_timeout_seconds=(resources.frozen_constants.rds_proxy_borrow_timeout_seconds),
-    )
-
-
-def _serialize_schedule(arm: ConnectionSpikeArm) -> tuple[dict[str, object], ...]:
-    return tuple(
-        {
-            "lane_id": attempt.lane_id,
-            "kind": attempt.kind.value,
-            "ordinal": attempt.ordinal,
-            "worker_slot": attempt.worker_slot,
-            "proof": {
-                "row_uuid": str(attempt.proof.row_uuid),
-                "value": attempt.proof.value,
-                "attempt_id": str(attempt.proof.attempt_id),
-            },
-            "scheduled_at_ns": attempt.scheduled_at_ns,
-        }
-        for attempt in arm.schedule.attempts
     )
 
 
@@ -4848,7 +5037,7 @@ class LiveConnectionSpikeEngine:
         self._adapter = adapter
         self._setup_orchestrator = setup_orchestrator
         self._run_id_factory = run_id_factory
-        self._armed: ConnectionSpikeArm | None = None
+        self._armed: FanInArm | None = None
         self._active_run_id: str | None = None
         self._setup_result: ConnectionSpikeSetupResult | None = None
         self._setup_bout_id: str | None = None
@@ -4886,32 +5075,108 @@ class LiveConnectionSpikeEngine:
             if self._setup_task is setup_task:
                 self._setup_task = None
 
-    async def check(self) -> ConnectionSpikeArm:
+    async def check(self) -> FanInArm:
+        """Arm one fan-in bout, refusing before a runner that cannot hold it.
+
+        The arm is not a formality. It fixes the four digests the runner compares against
+        the files it is about to execute, and it records the capacity measured on that
+        machine, so a bout can only be scored against the contract that was armed for it.
+        """
+
         if self._setup_orchestrator is None:
             await self._adapter.check()
         elif self._setup_result is None:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 burst cannot arm before both timed setup stops"
             )
-        contract = ConnectionSpikeContract()
-        arm = ConnectionSpikeArm(
+        contract = FanInContract()
+        config_sha256 = fanin_config_sha256()
+        generator_sha256 = fanin_generator_sha256()
+        capacity_model_sha256 = fanin_capacity_model_sha256()
+        preflight = await self._adapter.preflight_capacity(
+            self._run_id_factory(),
+            contract_sha256=contract.sha256,
+            config_sha256=config_sha256,
+            generator_sha256=generator_sha256,
+            capacity_model_sha256=capacity_model_sha256,
+        )
+        if not preflight.sufficient:
+            # Named failures, because each one sends the operator somewhere different: a
+            # small instance shape, a file-descriptor limit, an event loop already under
+            # pressure. A bare "insufficient" would send them to all three.
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner cannot hold 10,000 clients per lane: "
+                + ", ".join(preflight.failures)
+            )
+        arm = FanInArm(
             arm_id=secrets.token_urlsafe(18),
             contract_sha256=contract.sha256,
-            # The remote runner owns the monotonic clock domain. Zero proves all
-            # immutable work was constructed before its positive release stamp.
-            schedule=build_schedule(
-                tuple(target.lane_id for target in self._adapter.config.targets),
-                scheduled_at_ns=0,
-            ),
+            config_sha256=config_sha256,
+            generator_sha256=generator_sha256,
+            capacity_model_sha256=capacity_model_sha256,
+            preflight=preflight,
         )
         self._armed = arm
         return arm
 
+    def _fanin_request(
+        self,
+        run_id: str,
+        arm: FanInArm,
+        targets: Sequence[ConnectionSpikeTarget],
+    ) -> dict[str, object]:
+        """Build the bout request from the arm, refusing a lane that cannot be proved."""
+
+        by_lane = {target.lane_id: target for target in targets}
+        missing = sorted(set(RUNTIME_LANE_IDS) - set(by_lane))
+        if missing:
+            raise ConnectionSpikeLiveConfigurationError(
+                f"Round 5 is a two-lane round; no binding for {', '.join(missing)}"
+            )
+        lakebase = by_lane["lakebase"]
+        competitor = by_lane["competitor"]
+        unproved = [
+            lane.lane_id
+            for lane in (lakebase, competitor)
+            if not lane.credential_sha256 or not lane.observer_credential_sha256
+        ]
+        if unproved:
+            # Round 5's claim is that one pooled endpoint multiplexes 10,000 clients onto
+            # a small backend session count. The observer credential is how that is
+            # watched, from a second role on its own direct connection, so a lane without
+            # one could report 10,000 clients with nothing checking the sessions behind
+            # them. Refused here by name rather than left to the runner, whose token for
+            # it -- `baseline_auth_invalid` -- says nothing about which lane or why.
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 cannot prove multiplexing for "
+                + ", ".join(unproved)
+                + ": the seal names no client or observer credential digest, which an "
+                "installation sealed before the fan-in protocol will not have. Re-run "
+                "setup to reseal Round 5."
+            )
+        return fanin_run_request(
+            run_id=run_id,
+            runner_instance_type=self._adapter.config.runner_instance_type,
+            contract_sha256=arm.contract_sha256,
+            config_sha256=arm.config_sha256,
+            generator_sha256=arm.generator_sha256,
+            capacity_model_sha256=arm.capacity_model_sha256,
+            trust_bundle_sha256=self._adapter.config.trust_bundle_sha256,
+            lakebase_credential_sha256=lakebase.credential_sha256,
+            lakebase_observer_credential_sha256=lakebase.observer_credential_sha256,
+            competitor_credential_sha256=competitor.credential_sha256,
+            competitor_observer_credential_sha256=competitor.observer_credential_sha256,
+            competitor_credential_id=(
+                "aurora" if competitor.competitor_id == "aurora_serverless_v2" else "rds"
+            ),
+            targets=[lane.runner_value() for lane in (lakebase, competitor)],
+        )
+
     async def run(
         self,
-        arm: ConnectionSpikeArm,
+        arm: FanInArm,
         on_progress: ProgressCallback | None = None,
-    ) -> ConnectionSpikeRunResult:
+    ) -> FanInRunResult:
         if arm is not self._armed:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 arm is stale or belongs to another run"
@@ -4921,9 +5186,10 @@ class LiveConnectionSpikeEngine:
         try:
             await self._report(on_progress, "dispatching", "Dispatching the isolated runner")
             targets = self._runtime_targets()
+            effective = tuple(targets if targets is not None else self._adapter.config.targets)
             raw = await self._adapter.execute(
                 run_id,
-                _serialize_schedule(arm),
+                self._fanin_request(run_id, arm, effective),
                 targets=targets,
             )
             result = _finalize_raw_result(arm, raw)
@@ -4932,7 +5198,7 @@ class LiveConnectionSpikeEngine:
         finally:
             self._active_run_id = None
 
-    async def stop_and_begin_cleanup(self, arm: ConnectionSpikeArm) -> None:
+    async def stop_and_begin_cleanup(self, arm: FanInArm) -> None:
         """Settle active commands and start Round 5 cleanup idempotently.
 
         The method does not wait for AWS to prove every resource absent.  That
@@ -5034,7 +5300,7 @@ class LiveConnectionSpikeEngine:
             raise ConnectionSpikeCleanupError("Round 5 cleanup has not been started")
         await self._setup_orchestrator.wait_for_cleanup_complete(self._cleanup_bout_id)
 
-    async def cancel_and_cleanup(self, arm: ConnectionSpikeArm) -> None:
+    async def cancel_and_cleanup(self, arm: FanInArm) -> None:
         """Compatibility boundary that starts and then fully awaits cleanup."""
 
         await self.stop_and_begin_cleanup(arm)
@@ -5102,6 +5368,11 @@ class LiveConnectionSpikeEngine:
                 endpoint_host=setup.lakebase.endpoint_host,
                 credential_host=lakebase.credential_host,
                 credential_sha256=setup.lakebase.credential_sha256,
+                # From the configured lane, not from the setup result. Timed setup
+                # replaces the endpoint a lane is scored against; the observer role and
+                # its credential are sealed once at install time and are the same in
+                # every bout, so a setup result has nothing to say about them.
+                observer_credential_sha256=lakebase.observer_credential_sha256,
             ),
             ConnectionSpikeTarget(
                 lane_id="competitor",
@@ -5112,6 +5383,7 @@ class LiveConnectionSpikeEngine:
                 competitor_target_id=competitor.competitor_target_id,
                 competitor_resource_id=competitor.competitor_resource_id,
                 credential_sha256=setup.competitor.credential_sha256,
+                observer_credential_sha256=competitor.observer_credential_sha256,
             ),
         )
 

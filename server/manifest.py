@@ -505,7 +505,11 @@ class Round5FrozenConstants(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    runner_instance_type: Literal["m6i.large"] = "m6i.large"
+    #: Both shapes are nameable so that an installation sealed before the fan-in
+    #: protocol still loads and keeps serving its other rounds. Only the larger shape
+    #: can hold 10,000 clients per lane, so Round 5 refuses the smaller one by name
+    #: rather than by letting a capacity gate fail deep inside a bout.
+    runner_instance_type: Literal["m6i.large", "c7i.2xlarge"] = "c7i.2xlarge"
     warmup_attempts_per_lane: Literal[4] = 4
     scored_attempts_per_lane: Literal[128] = 128
     max_concurrent_attempts_per_lane: Literal[64] = 64

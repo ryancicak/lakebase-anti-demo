@@ -18,16 +18,39 @@ from server.connection_spike_live import (
 async def test_engine_returns_verified_result_before_starting_slow_cleanup(monkeypatch) -> None:
     expected = object()
 
-    class Adapter:
-        config = SimpleNamespace(
-            targets=(
-                SimpleNamespace(lane_id="lakebase"),
-                SimpleNamespace(lane_id="competitor"),
-            )
+    def lane(lane_id: str, competitor_id: str = "") -> SimpleNamespace:
+        """A lane binding complete enough to be dispatchable.
+
+        Both digests, because the engine refuses a lane it cannot prove multiplexing for
+        rather than sending a request the runner would reject as `baseline_auth_invalid`.
+        """
+
+        return SimpleNamespace(
+            lane_id=lane_id,
+            competitor_id=competitor_id,
+            credential_sha256="c" * 64,
+            observer_credential_sha256="d" * 64,
+            runner_value=lambda: {
+                "lane_id": lane_id,
+                "secret_arn": "",
+                "endpoint_host": f"{lane_id}.example.test",
+                "credential_host": f"{lane_id}-direct.example.test",
+            },
         )
 
-        async def execute(self, run_id, schedule, *, targets=None):
-            del run_id, schedule, targets
+    class Adapter:
+        config = SimpleNamespace(
+            targets=(lane("lakebase"), lane("competitor", "rds_postgres")),
+            runner_instance_type=live.FANIN_RUNNER_INSTANCE_TYPE,
+            trust_bundle_sha256="a" * 64,
+        )
+
+        async def preflight_capacity(self, run_id, **digests):
+            del run_id, digests
+            return SimpleNamespace(sufficient=True, failures=())
+
+        async def execute(self, run_id, request, *, targets=None):
+            del run_id, request, targets
             return {}
 
     orchestrator = SimpleNamespace()
