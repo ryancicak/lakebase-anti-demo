@@ -50,13 +50,43 @@ step "0/6  Preconditions"
 [[ -d frontend/node_modules ]] || die "missing frontend/node_modules (run npm ci in frontend/)"
 pass "toolchains present"
 
-# A leftover .anti-demo* directory makes tests/test_no_live_identifiers_committed.py
-# compare the tree against a previous install's output, which fails on tokens the
-# tree legitimately contains. It must also be absent for a genuine first provision.
-if compgen -G ".anti-demo*" >/dev/null; then
-  die "a .anti-demo* directory exists; remove it before a first-run test and before CI"
+# An installation directory makes tests/test_no_live_identifiers_committed.py compare
+# the tree against a live install's output, which fails on identifiers the tree
+# legitimately contains -- so CI cannot run beside one. Refusing outright was wrong:
+# the normal reason to run this is that you have just installed something and want to
+# publish the fix, and the manifest inside is the only record of what is billing, so
+# "delete it first" is the one instruction that must never be given. Park it outside
+# the tree instead and restore it from a trap, so an interrupted or failing run still
+# puts it back.
+PARKED_INSTALL=""
+PARKED_AT=""
+restore_parked_install() {
+  if [[ -n "$PARKED_INSTALL" && -d "$PARKED_AT" && ! -e "$PARKED_INSTALL" ]]; then
+    mv "$PARKED_AT" "$PARKED_INSTALL" \
+      && printf '  restored %s\n' "$PARKED_INSTALL"
+  elif [[ -n "$PARKED_INSTALL" && -d "$PARKED_AT" ]]; then
+    printf '  %sWARN%s %s and %s both exist; left both for you to reconcile\n' \
+      "$RED" "$RESET" "$PARKED_AT" "$PARKED_INSTALL" >&2
+  fi
+}
+trap restore_parked_install EXIT INT TERM
+
+INSTALL_DIRS=()
+while IFS= read -r candidate; do
+  [[ -n "$candidate" ]] && INSTALL_DIRS+=("$candidate")
+done < <(find . -maxdepth 1 -type d -name '.anti-demo*' -print 2>/dev/null | sed 's|^\./||')
+
+if ((${#INSTALL_DIRS[@]} > 1)); then
+  die "more than one installation directory (${INSTALL_DIRS[*]}); park or remove all but one"
+elif ((${#INSTALL_DIRS[@]} == 1)); then
+  PARKED_INSTALL="$REPO/${INSTALL_DIRS[0]}"
+  PARKED_AT="${TMPDIR:-/tmp}/anti-demo-parked-$$"
+  [[ -e "$PARKED_AT" ]] && die "$PARKED_AT already exists"
+  mv "$PARKED_INSTALL" "$PARKED_AT" || die "could not park $PARKED_INSTALL"
+  pass "parked ${INSTALL_DIRS[0]} outside the tree for the duration (restored on exit)"
+else
+  pass "no live-artefact directory present"
 fi
-pass "no live-artefact directory present"
 
 step "1/6  Publication guards"
 nocreds UV_PROJECT_ENVIRONMENT=.venv-3.12 UV_PYTHON=3.12 \
@@ -99,7 +129,23 @@ printf '\n%sAll CI jobs passed locally.%s\n' "$GREEN" "$RESET"
 
 step "Commit"
 if [[ -z "$(git status --porcelain)" ]]; then
-  printf '  nothing to commit; working tree is clean\n'
+  # A clean tree is not the same as nothing to publish. Exiting here meant that
+  # running the gates, then running this again to push, silently pushed nothing --
+  # the gates passed, the script said "clean", and the commits stayed local.
+  UNPUSHED="$(git rev-list --count origin/main..HEAD 2>/dev/null || echo 0)"
+  if [[ "$UNPUSHED" == "0" ]]; then
+    printf '  nothing to commit and nothing unpushed; already published\n'
+    exit 0
+  fi
+  printf '  tree is clean, and %s commit(s) are not on origin/main yet:\n' "$UNPUSHED"
+  git log --oneline origin/main..HEAD | sed 's/^/    /'
+  if ((DO_PUSH)); then
+    step "Push"
+    git push origin "HEAD:main"
+    pass "pushed $UNPUSHED commit(s) to origin/main; CI runs on push"
+  else
+    printf '  --no-push given; push with: git push origin HEAD:main\n'
+  fi
   exit 0
 fi
 git status --short
@@ -163,52 +209,28 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Seal the deployed app's egress prefixes before the first apply
+Let the publish gate run beside a live installation, and actually push
 
-`--apply --deploy-app` provisioned an app that could not reach the databases it
-had just created. The published Databricks serverless egress prefixes were sealed
-only by `_refresh_serverless_egress_cidrs`, which runs from
-`reconcile_infrastructure` and therefore only under `antidemo setup`. A first
-provision never reconciles, so Terraform built all four database security groups
-admitting exactly one address -- the provisioning laptop's /32 -- while the
-deployed app leaves from a published Databricks prefix.
+Two defects in this script, both found by using it.
 
-Every round that opens an Aurora or RDS connection failed. The backstage cleanup
-that resets the recovery environments timed out against both data planes and
-escalated, and /readyz refused readiness and named the cause exactly. Nothing in
-any output named the repair, so the symptom read as a crashed deployment.
+It refused to run at all when a .anti-demo* directory was present, telling the
+operator to remove it. That directory holds the only record of what a live
+installation created, so deleting it orphans billing AWS resources -- and the
+normal reason to run this script is that you have just installed something and
+want to publish the fix. It now moves the directory outside the tree for the
+duration and restores it from a trap, so an interrupted or failing run still puts
+it back. More than one is refused rather than guessed at.
 
-`provision` now seals those prefixes before its first apply, which is what makes
-the security groups Terraform *creates* admit the app. A feed that cannot be read
-warns and names the repair rather than failing the provision, matching the
-reconcile path: a third party's CDN must not be able to stop an install. Terraform
-needed no change -- all four ingress blocks already concatenated the sealed list
-beside the operator, and only the timing of the seal was wrong.
+It also exited zero without pushing whenever the working tree was clean, on the
+assumption that clean means nothing to publish. Running the gates and then running
+it again to push therefore pushed nothing, reported success, and left the commits
+local. A clean tree now checks whether HEAD is ahead of origin/main and pushes
+what is unpublished.
 
-tests/test_operator_ingress.py covers this feature in 45 tests, and every one of
-them drives the reconcile seam, which is why a first run was never exercised. The
-two new tests read the seal as `_terraform_apply` receives it, because the
-ordering is the whole defect; a seal written afterwards leaves the groups wrong
-until something re-applies them.
-
-conftest refuses the feed for the whole suite, since `provision` now touches the
-network and no test may. Refused at the transport rather than at
-`fetch_serverless_egress_cidrs`, whose real parsing is under test against a fake
-body.
-
-`antidemo setup` ended on "READY TO RING -- <run> -- http://127.0.0.1:8000/"
-whether or not anything was going to serve there. `--deploy-app` runs setup with
---no-serve and then deploys the App, so the last address printed before the App
-URL pointed at a page that had never been served, in the shape of a line that
-reads as "your install is ready, here is where it lives". The message now depends
-on whether a server will exist and names './antidemo serve' when one will not.
-
-README's install section led with the local server and reached --deploy-app as an
-afterthought at the end, which is backwards for the supported path. Install is now
-one command, uninstall is its own section, and the local server follows as an
-alternative. The uninstall commands also carry the ANTI_DEMO_MANIFEST export they
-always required: without it cleanup refuses to guess a generation and stops, which
-the previous copy did not mention.
+The staging list is explicit so an unrelated edit cannot ride along, which makes
+the opposite error possible: it was left pointing at a previous commit's files, so
+every gate passed and git commit then found nothing staged. A tracked modification
+outside the list is now refused by name.
 MSG
 pass "committed"
 
