@@ -100,6 +100,9 @@ def verified_fanin_lane(lane_id: str) -> ConnectionSpikeLaneResult:
             multiplexing=True,
             identity=True,
             observer_separation=True,
+            # A pooled lane may start with the warm pool that proving it ready created;
+            # these fixtures start clean, so the gate simply passes.
+            clean_start=True,
             fairness=True,
             telemetry=True,
             cleanup=True,

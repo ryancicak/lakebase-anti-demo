@@ -53,6 +53,11 @@ TARGET_CLIENTS_PER_LANE = 10_000
 # Revisit once a diagnostic's normalized CPU evidence justifies the housekeeping
 # headroom.
 RUNNER_INSTANCE_TYPE = "c7i.2xlarge"
+#: The lanes this protocol knows. A bout runs one or both: each lane holds its 10,000 clients
+#: on its own clock, so one lane is a complete measurement for that lane. `RUNNER_LANE_COUNT`
+#: stays the capacity-planning figure, because the runner must be able to hold both at once
+#: even when a given bout only asks for one.
+LANE_IDS = frozenset({"lakebase", "competitor"})
 RUNNER_LANE_COUNT = 2
 WORKER_COUNT = 4
 MIN_RUNNER_CPU_COUNT = WORKER_COUNT
@@ -88,6 +93,15 @@ CONNECT_TIMEOUT_SECONDS = 20.0
 OBSERVER_READY_TIMEOUT_SECONDS = 120.0
 OBSERVER_RETRY_SECONDS = 0.5
 OBSERVER_QUIESCE_TIMEOUT_SECONDS = 120.0
+#: Consecutive identical readings that count as a settled baseline.
+#:
+#: Three, half a second apart, so a pool being actively borrowed from cannot look settled
+#: between two samples while a genuinely idle warm pool clears the gate in about a second.
+OBSERVER_QUIESCE_STABLE_READINGS = 3
+#: The ceiling on that baseline, mirroring `connection_fanin.MAX_PREEXISTING_CLIENT_SESSIONS`
+#: and derived the same way, from the most connections this protocol has in flight to one
+#: lane at once.
+MAX_PREEXISTING_CLIENT_SESSIONS = LANE_CONNECT_CONCURRENCY * WORKER_COUNT
 OBSERVER_SAMPLE_MAX_RETRIES = 2
 OBSERVER_SAMPLE_RETRY_SECONDS = 0.25
 RUN_TIMEOUT_SECONDS = 600.0
@@ -954,6 +968,43 @@ class ControlledGC:
         self.active = False
 
 
+#: How many entries of an unbounded diagnostic map survive into the returned envelope.
+#:
+#: These maps are read to find what cost the most, never to enumerate everything, so the
+#: expensive entries are the ones worth carrying. Four workers multiply whatever is kept, and
+#: the whole envelope has to fit in the roughly 24,000 characters SSM will hand back, so this
+#: is deliberately small. What is dropped is counted rather than silently omitted.
+DIAGNOSTIC_MAP_LIMIT = 5
+
+
+def bounded_diagnostic_map(value: object) -> object:
+    """Keep the most expensive entries of a numeric-valued map, and count the rest.
+
+    Returns anything that is not such a map unchanged, so this can be applied across a
+    diagnostic dict without knowing which of its values are maps.
+    """
+
+    if not isinstance(value, Mapping) or not value:
+        return value
+    try:
+        ordered = sorted(value.items(), key=lambda item: float(item[1]), reverse=True)
+    except (TypeError, ValueError):
+        # Not a numeric map, so there is no "most expensive" to keep. Bound it by key order
+        # instead, which is at least stable, and still say how much was left out.
+        ordered = sorted(value.items(), key=lambda item: str(item[0]))
+    kept = dict(ordered[:DIAGNOSTIC_MAP_LIMIT])
+    dropped = len(ordered) - len(kept)
+    if dropped:
+        kept["_entries_omitted"] = dropped
+    return kept
+
+
+def bounded_worker_diagnostics(value: Mapping[str, object]) -> dict[str, object]:
+    """Bound every unbounded map in one worker's diagnostics."""
+
+    return {key: bounded_diagnostic_map(item) for key, item in value.items()}
+
+
 def canonical_json(value: Mapping[str, object]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
@@ -1039,6 +1090,8 @@ def config_sha256() -> str:
         "observer_role": OBSERVER_ROLE,
         "observer_ready_timeout_seconds": OBSERVER_READY_TIMEOUT_SECONDS,
         "observer_quiesce_timeout_seconds": OBSERVER_QUIESCE_TIMEOUT_SECONDS,
+        "observer_quiesce_stable_readings": OBSERVER_QUIESCE_STABLE_READINGS,
+        "max_preexisting_client_sessions": MAX_PREEXISTING_CLIENT_SESSIONS,
         "observer_retry_seconds": OBSERVER_RETRY_SECONDS,
         "observer_sample_max_retries": OBSERVER_SAMPLE_MAX_RETRIES,
         "observer_sample_retry_seconds": OBSERVER_SAMPLE_RETRY_SECONDS,
@@ -1808,8 +1861,28 @@ class DirectObserver:
         self.evidence = ObserverEvidence(lane_id, CLIENT_ROLE, OBSERVER_ROLE)
         self._sample_lock = asyncio.Lock()
 
+    #: The libpq connection fields `connect_runner_database` accepts. Selected rather
+    #: than filtered, because the descriptor this observer is handed also carries the
+    #: credential digest and the trust bundle path, and a removal list has to be updated
+    #: every time one more of those is added. Omitting `sslrootcert` from a filter is
+    #: what crashed the first fan-in bout ever dispatched.
+    _CONNECT_FIELDS = ("host", "port", "dbname", "user", "username", "password")
+
     def _connect_database(self) -> dict[str, object]:
-        return {key: value for key, value in self.database.items() if key != "credential_sha256"}
+        return {
+            key: self.database[key] for key in self._CONNECT_FIELDS if key in self.database
+        }
+
+    def _trust_bundle_path(self) -> Path | None:
+        """The sealed bundle this observer verifies against, from its own descriptor.
+
+        `sslmode` is verify-full, so without this the observer would verify against the
+        system trust store: workable for a public CA and wrong for Amazon RDS, and wrong
+        in principle for the one connection whose purpose is independent evidence.
+        """
+
+        value = self.database.get("sslrootcert")
+        return Path(str(value)) if value else None
 
     def _connection_state(self) -> str:
         if self.connection is None:
@@ -1824,7 +1897,7 @@ class DirectObserver:
         self.connection = await connect_runner_database(
             self._connect_database(),
             application_name=f"{self.application_name}-observer",
-            trust_bundle_path=None,
+            trust_bundle_path=self._trust_bundle_path(),
             tls_mode=TLS_MODE,
             connect_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
         )
@@ -1858,6 +1931,13 @@ class DirectObserver:
                     )
                 )
         quiesce_deadline = loop.time() + OBSERVER_QUIESCE_TIMEOUT_SECONDS
+        # Wait for the count to settle, not for it to vanish. A pooled lane starts with the
+        # backend sessions that proving it ready created, and it is entitled to: what this
+        # has to establish is that the number is stable and small enough to attribute the
+        # bout's own sessions against, which is why the baseline is recorded on the lane
+        # result rather than required to be zero.
+        stable_readings = 0
+        previous: int | None = None
         while True:
             async with self.connection.cursor() as cursor:
                 await cursor.execute(
@@ -1878,9 +1958,19 @@ class DirectObserver:
                 raise FanInProtocolError("observer_role_invalid")
             self.evidence.role_verified = True
             self.evidence.preexisting = int(row[1])
+            if self.evidence.preexisting > MAX_PREEXISTING_CLIENT_SESSIONS:
+                # Above the ceiling nothing is attributable, so this refuses immediately
+                # rather than waiting out a deadline it has no reason to think will help.
+                raise FanInProtocolError(f"{self.lane_id}_preexisting_client_sessions")
             if self.evidence.preexisting == 0:
                 break
+            stable_readings = stable_readings + 1 if self.evidence.preexisting == previous else 0
+            previous = self.evidence.preexisting
+            if stable_readings >= OBSERVER_QUIESCE_STABLE_READINGS:
+                break
             if loop.time() >= quiesce_deadline:
+                # Still moving at the deadline. That is a lane in use, not a warm pool,
+                # and its sessions cannot be told apart from the ones about to be opened.
                 raise FanInProtocolError(f"{self.lane_id}_preexisting_client_sessions")
             await asyncio.sleep(
                 min(
@@ -2484,9 +2574,13 @@ async def _hold_and_sample(
             remaining = hold_started_ns / 1_000_000_000 + target_offset - time.monotonic()
             if remaining > 0:
                 await asyncio.sleep(remaining)
-            await _sample_group(lanes[0], group)
-            await asyncio.sleep(0.25)
-            await _sample_group(lanes[1], group)
+            # The 250ms offset is between lanes, not after each one: with two lanes this is
+            # first lane, wait, second lane, exactly as before, and with one lane there is
+            # nothing to stagger against.
+            for lane_index, sampled_lane in enumerate(lanes):
+                if lane_index:
+                    await asyncio.sleep(0.25)
+                await _sample_group(sampled_lane, group)
             hold_elapsed = (time.monotonic_ns() - hold_started_ns) / 1_000_000
             loop_lag = await _event_loop_calibration()
             telemetry = await _telemetry_off_loop(
@@ -2695,16 +2789,24 @@ def aggregate_worker_results(
     if len(worker_cpus) != WORKER_COUNT or min(worker_cpus) < 0:
         raise FanInProtocolError("fanin_worker_affinity_mismatch")
 
-    worker_lanes: dict[str, list[Mapping[str, object]]] = {
-        "lakebase": [],
-        "competitor": [],
-    }
+    # Collected from what the workers report rather than seeded with both names. Seeding left
+    # an empty list for a lane that did not run, and the aggregation then compared four
+    # workers' views of nothing.
+    worker_lanes: dict[str, list[Mapping[str, object]]] = {}
     for result in ordered:
         lanes = result.get("lanes")
         if not isinstance(lanes, list):
             raise FanInProtocolError("fanin_worker_lanes_invalid")
         indexed = {str(lane.get("lane_id")): lane for lane in lanes if isinstance(lane, Mapping)}
-        if set(indexed) != set(worker_lanes):
+        # The first worker establishes which lanes this bout ran; every other worker must
+        # report exactly those. Comparing against a pre-seeded pair would have required both
+        # lanes of every bout, and comparing against nothing would accept any worker
+        # reporting any lane, so the set is taken once and then enforced.
+        if not indexed or not set(indexed) <= LANE_IDS:
+            raise FanInProtocolError("fanin_worker_lanes_invalid")
+        if not worker_lanes:
+            worker_lanes = {lane_id: [] for lane_id in indexed}
+        elif set(indexed) != set(worker_lanes):
             raise FanInProtocolError("fanin_worker_lanes_invalid")
         for lane_id in worker_lanes:
             worker_lanes[lane_id].append(indexed[lane_id])
@@ -2799,8 +2901,77 @@ def aggregate_worker_results(
             "observer_role",
             "client_role",
         )
-        if any(len({str(value[field]) for value in values}) != 1 for field in exact_fields):
-            raise FanInProtocolError("fanin_worker_lane_identity_mismatch")
+        # Before comparing, rule out the reading that produces a false disagreement. A worker
+        # that authenticated nobody has an empty auth-method set, and an empty set reads as
+        # the empty string, so it disagrees with every sibling that connected. That is a
+        # connect failure wearing an identity failure's name.
+        silent = sorted(
+            str(value["lane_id"]) + ":" + str(index)
+            for index, value in enumerate(values)
+            if not int(value["authenticated_clients"])
+        )
+        if silent:
+            print(
+                "LANE_IDENTITY_DIAGNOSTIC_JSON:"
+                + canonical_json(
+                    {
+                        "lane_id": lane_id,
+                        "reason": "worker_authenticated_none",
+                        "authenticated_by_worker": [
+                            int(value["authenticated_clients"]) for value in values
+                        ],
+                        # Whether anything was attempted at all separates "the lane never
+                        # started" from "every attempt failed", and the codes say which
+                        # failure it was: a refusal, an expired connect timeout on an endpoint
+                        # still waking, or a rejected credential.
+                        "initiated_by_worker": [
+                            int(value["initiated_clients"]) for value in values
+                        ],
+                        "terminal_failures_by_worker": [
+                            int(value["terminal_failures"]) for value in values
+                        ],
+                        "failure_codes_by_worker": [
+                            dict(value.get("failure_codes") or {}) for value in values
+                        ],
+                        "observer_connection_state_by_worker": [
+                            str(value.get("observer_connection_state") or "") for value in values
+                        ],
+                    }
+                ).decode("utf-8"),
+                flush=True,
+            )
+            raise FanInProtocolError(f"fanin_worker_authenticated_none_{lane_id}"[:64])
+        disagreed = sorted(
+            field for field in exact_fields if len({str(value[field]) for value in values}) != 1
+        )
+        if disagreed:
+            # The per-worker values, once, so a genuine disagreement does not cost another
+            # twelve-minute reproduction to characterise. Auth methods are the fixed
+            # vocabulary this file defines and the counts are integers, so nothing here names
+            # a host, an ARN or a credential.
+            print(
+                "LANE_IDENTITY_DIAGNOSTIC_JSON:"
+                + canonical_json(
+                    {
+                        "lane_id": lane_id,
+                        "reason": "workers_disagreed",
+                        "fields": disagreed,
+                        "auth_method_by_worker": [str(value["auth_method"]) for value in values],
+                        "authenticated_by_worker": [
+                            int(value["authenticated_clients"]) for value in values
+                        ],
+                    }
+                ).decode("utf-8"),
+                flush=True,
+            )
+            # The field, not just the fact. Ten candidates share this gate and they send an
+            # operator to ten different places; two live bouts died here with both setup
+            # gates verified and no way to tell which one moved without another twelve-minute
+            # Proxy build. Field names are the same fixed snake_case vocabulary the refusal
+            # contract already allows, so they are safe to repeat, and the token stays inside
+            # the encoder's 64-character bound.
+            token = "fanin_worker_lane_identity_mismatch_" + "_".join(disagreed)
+            raise FanInProtocolError(token[:64].rstrip("_"))
         initiated = sum(int(value["initiated_clients"]) for value in values)
         authenticated = sum(int(value["authenticated_clients"]) for value in values)
         held = sum(int(value["held_clients_at_gate"]) for value in values)
@@ -2965,7 +3136,10 @@ def aggregate_worker_results(
                 {
                     "worker_index": index,
                     "worker_cpu": int(result["worker_cpu"]),
-                    **dict(result.get("runtime_diagnostics", {})),
+                    # Bounded here rather than at the source: a worker's own diagnostics are
+                    # complete in its own process and in the queue, and it is only the
+                    # four-way multiplication into one SSM response that has to fit.
+                    **bounded_worker_diagnostics(result.get("runtime_diagnostics", {})),
                 }
                 for index, result in enumerate(ordered)
             ],
@@ -3013,14 +3187,25 @@ async def execute_fanin(
     ):
         raise FanInProtocolError("fanin_digest_mismatch")
     raw_targets = request.get("targets")
-    if not isinstance(raw_targets, list) or len(raw_targets) != 2:
+    # One lane or two. A lane holds 10,000 clients on its own clock, and requiring two made
+    # the fast lane wait through the slow lane's eleven-minute Proxy build, suspend at its
+    # idle floor, and arrive cold. The count is the request's to decide.
+    if (
+        not isinstance(raw_targets, list)
+        or not 1 <= len(raw_targets) <= RUNNER_LANE_COUNT
+    ):
         raise FanInProtocolError("fanin_targets_invalid")
     targets = {
         str(value.get("lane_id") or ""): value
         for value in raw_targets
         if isinstance(value, Mapping)
     }
-    if set(targets) != {"lakebase", "competitor"}:
+    # The lanes this request names, checked against the runtime set rather than against a
+    # literal pair. A lane holds its 10,000 clients on its own clock, so one lane is a
+    # complete bout for that lane; what must never happen is a lane this runner does not
+    # know, or a duplicate hiding one behind the other.
+    lane_order = sorted(targets)
+    if not lane_order or len(lane_order) != len(raw_targets) or not set(lane_order) <= LANE_IDS:
         raise FanInProtocolError("fanin_targets_invalid")
     ssl_context = ssl.create_default_context(cafile=str(trust_bundle_path))
     ssl_context.check_hostname = True
@@ -3029,7 +3214,7 @@ async def execute_fanin(
     lanes: list[LaneRuntime] = []
     observers: list[DirectObserver] = []
     key_cache = ScramKeyCache()
-    for lane_id in ("lakebase", "competitor"):
+    for lane_id in lane_order:
         target = targets[lane_id]
         database = dict(target.get("database") or {})
         observer_database = dict(target.get("observer_database") or {})

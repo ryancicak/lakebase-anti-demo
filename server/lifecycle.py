@@ -4162,8 +4162,16 @@ def _round5_runner_refresh_session(manifest: DemoManifest) -> boto3.Session:
         manifest,
         "aurora_serverless_v2",
     )
-    # This helper performs the runtime-role hop itself immediately below.
+    # This helper performs the runtime-role hop itself immediately below, and builds the
+    # hopped session by calling this factory again with the credentials STS returned. A
+    # factory that ignores its arguments would therefore hand back the ambient principal
+    # and silently undo the hop, which is what it used to do: the second assume then ran
+    # as the operator, the control role trusts only the runtime role, and AWS denied it.
     ambient = _aws_source_session(manifest)
+
+    def source_session(**kwargs: object) -> boto3.Session:
+        return ambient if not kwargs.get("aws_access_key_id") else boto3.Session(**kwargs)  # type: ignore[arg-type]
+
     identity = ambient.client("sts", region_name=config.region).get_caller_identity()
     account = str(identity.get("Account") or "")
     principal = str(identity.get("Arn") or "")
@@ -4173,7 +4181,7 @@ def _round5_runner_refresh_session(manifest: DemoManifest) -> boto3.Session:
         )
     try:
         source = _control_role_source_session(
-            lambda **_kwargs: ambient,
+            source_session,
             region=config.region,
             expected_account_id=config.expected_account_id,
             runtime_role_arn=config.runtime_role_arn,

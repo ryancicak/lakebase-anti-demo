@@ -142,7 +142,19 @@ OBSERVER_CREDENTIAL_PATHS = {
     lane_id: CREDENTIAL_ROOT / f"{lane_id}-observer.json" for lane_id in BASELINE_CREDENTIAL_PATHS
 }
 RUNTIME_LANE_IDS = frozenset({"lakebase", "competitor"})
-FANIN_WORKER_READY_TIMEOUT_SECONDS = 60.0
+#: How long the parent waits for all four workers to report ready.
+#:
+#: A worker reports ready only once its observer has connected and seen the lane quiet, and
+#: the observer owns both of those budgets. Derived from them rather than chosen, because a
+#: barrier shorter than the work it waits for does not bound anything: it just relabels a
+#: slow observer as a missing worker, and `fanin_worker_ready_timeout` sends the operator
+#: looking for a dead process instead of a cold database.
+#:
+#: The margin covers process spawn, CPU pinning and the queue write. Ceiling, not cost: an
+#: observer on a warm lane connects and quiesces in well under a second.
+FANIN_WORKER_READY_TIMEOUT_SECONDS = (
+    fanin.OBSERVER_READY_TIMEOUT_SECONDS + fanin.OBSERVER_QUIESCE_TIMEOUT_SECONDS + 60.0
+)
 FANIN_WORKER_RAMP_TIMEOUT_SECONDS = fanin.RUN_TIMEOUT_SECONDS + 60.0
 FANIN_WORKER_RESULT_TIMEOUT_SECONDS = fanin.HOLD_SECONDS + 180.0
 AWS_CREDENTIAL_IDS = frozenset({"rds", "aurora"})
@@ -179,12 +191,23 @@ class RunnerCancelled(RuntimeError):
 
 
 def _secrets_manager_region(values: Sequence[object], error: str) -> str:
+    """The one region every ARN here names, or "" when there are no ARNs to name one.
+
+    The purpose is to refuse a request whose secrets straddle two regions. An empty list
+    straddles nothing: the Lakebase lane holds its credential outside Secrets Manager and
+    carries no ARN, so a request naming only that lane has none, and treating that as a
+    disagreement rejected the lane as `target_invalid`. Callers that require a region still
+    get one or a refusal; callers that only need agreement get agreement.
+    """
+
     regions: set[str] = set()
     for value in values:
         match = _SECRET_ARN.fullmatch(str(value or ""))
         if match is None:
             raise RunnerContractError(error)
         regions.add(match.group("region"))
+    if not regions:
+        return ""
     if len(regions) != 1:
         raise RunnerContractError(error)
     return regions.pop()
@@ -280,7 +303,14 @@ def _decode_fanin_request(
     ):
         raise RunnerContractError("trust_bundle_contract_invalid")
     raw_auth = request.get("baseline_auth")
-    if not isinstance(raw_auth, dict) or set(raw_auth) != RUNTIME_LANE_IDS:
+    # A subset, because a request may run one lane. Checked against the targets below, so
+    # authentication for a lane that is not run, or a lane run without authentication, is
+    # still refused: what is relaxed is the count, never the correspondence.
+    if (
+        not isinstance(raw_auth, dict)
+        or not raw_auth
+        or not set(raw_auth) <= RUNTIME_LANE_IDS
+    ):
         raise RunnerContractError("baseline_auth_invalid")
     client_hashes: dict[str, str] = {}
     observer_hashes: dict[str, str] = {}
@@ -310,7 +340,7 @@ def _decode_fanin_request(
         observer_hashes[lane_id] = str(raw["observer_credential_sha256"])
         credential_ids[lane_id] = str(credential_id)
     raw_targets = request.get("targets")
-    if not isinstance(raw_targets, list) or len(raw_targets) != 2:
+    if not isinstance(raw_targets, list) or not 1 <= len(raw_targets) <= len(RUNTIME_LANE_IDS):
         raise RunnerContractError("targets_invalid")
     targets: list[Target] = []
     for raw in raw_targets:
@@ -338,7 +368,11 @@ def _decode_fanin_request(
                 observer_sha256=observer_hashes[str(lane_id)],
             )
         )
-    if {target.lane_id for target in targets} != RUNTIME_LANE_IDS:
+    lane_ids = {target.lane_id for target in targets}
+    if len(lane_ids) != len(targets) or lane_ids != set(raw_auth):
+        # Exact correspondence, both ways: a duplicated lane, a lane with no credentials, or
+        # credentials for a lane that is not being run are all refused here rather than
+        # discovered as a missing key partway through a ramp.
         raise RunnerContractError("targets_invalid")
     _secrets_manager_region(
         [target.secret_arn for target in targets if target.secret_arn],
@@ -2286,6 +2320,32 @@ def _encode_result(result: Mapping[str, object]) -> str:
         )
     ).decode("ascii")
     if len(encoded_result) > 23_500:
+        # The size and the biggest contributors, because "too large" without a number cost a
+        # twelve-minute Proxy build to characterise. Integers and this repository's own key
+        # names only: nothing here names a host, an ARN or a credential.
+        try:
+            contributors = sorted(
+                (
+                    (len(_canonical_json({key: value})), key)
+                    for key, value in result.items()
+                ),
+                reverse=True,
+            )[:5]
+            print(
+                "RESULT_SIZE_JSON:"
+                + _canonical_json(
+                    {
+                        "encoded_length": len(encoded_result),
+                        "budget": 23_500,
+                        "largest_keys": [name for _size, name in contributors],
+                        "largest_key_bytes": [size for size, _name in contributors],
+                    }
+                ).decode("utf-8"),
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001
+            # A diagnostic must never replace the refusal it is describing.
+            pass
         raise RunnerContractError("result_too_large")
     return encoded_result
 

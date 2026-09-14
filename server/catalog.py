@@ -87,29 +87,47 @@ MODEL_SCORE_METRICS = [
 
 CONNECTION_SPIKE_METRICS = [
     MetricSpec(
-        id="setup_elapsed_ms",
-        label="Pooled-path setup time",
+        # The scored result: from one shared start, how long each lane takes to hold
+        # 10,000 authenticated clients. Setup time used to sit here, which meant the
+        # margin shown under "time to 10,000" was the time to build an RDS Proxy.
+        id="time_to_target_ms",
+        label="Time to 10,000 clients",
         role=MetricRole.PRIMARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
     ),
     MetricSpec(
-        id="successful_clients",
-        label="Successful clients",
-        role=MetricRole.SECONDARY,
-        unit=MetricUnit.COUNT,
-        direction=MetricDirection.HIGHER_IS_BETTER,
-    ),
-    MetricSpec(
-        id="application_p99_ms",
-        label="Application p99",
+        # Still the finding, just not the same measurement. Lakebase verifies an
+        # included pool; the AWS path has to provision a Proxy first, and that is most
+        # of its clock.
+        id="setup_elapsed_ms",
+        label="Pooled-path setup time",
         role=MetricRole.SECONDARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
     ),
     MetricSpec(
-        id="error_clients",
-        label="Client errors",
+        # The multiplexing evidence, read by a second role on its own direct connection
+        # while the clients are held. 10,000 clients in front of a small number of
+        # backend sessions is the whole claim.
+        id="peak_backend_sessions",
+        label="Peak backend sessions",
+        role=MetricRole.SECONDARY,
+        unit=MetricUnit.COUNT,
+        direction=MetricDirection.LOWER_IS_BETTER,
+    ),
+    MetricSpec(
+        # Exact, not "higher is better". 9,999 held clients is a failed bout, and a
+        # direction that rewards more would let a lane pass by being close.
+        id="held_clients_at_gate",
+        label="Clients held at the gate",
+        role=MetricRole.GUARDRAIL,
+        unit=MetricUnit.COUNT,
+        direction=MetricDirection.EXACT,
+    ),
+    MetricSpec(
+        id="terminal_failures",
+        label="Client failures",
         role=MetricRole.GUARDRAIL,
         unit=MetricUnit.COUNT,
         direction=MetricDirection.LOWER_IS_BETTER,
@@ -253,9 +271,9 @@ ROUNDS = [
                 "selected AWS managed pooling path"
             ),
             Corner.PERFORMANCE: (
-                "Primary pooled-path setup time; secondary "
-                "128 attempts, maximum 64 concurrent, errors, application p99, "
-                "and a separate witness"
+                "Primary time to hold 10,000 authenticated clients per lane from a shared "
+                "start; secondary pooled-path setup time and peak backend sessions, with "
+                "held clients and failures as guardrails"
             ),
         },
         competitors=[CompetitorId.RDS_POSTGRES, CompetitorId.AURORA_SERVERLESS_V2],
@@ -284,20 +302,24 @@ ROUNDS = [
                 "existing RDS Proxy, PgBouncer, and application pooling were not compared."
             ),
             (
-                "Phase 2 makes 128 fresh attempts at maximum 64 concurrent, then separately "
-                "holds 64 witness clients to verify multiplexing. The phases are sequential "
-                "and never overlap."
+                "Phase 2 opens exactly 10,000 authenticated client connections per lane from "
+                "one shared start, holds them for 30 seconds, and answers 64 sparse queries "
+                "per lane with no retries. 9,999 held clients is a failed lane, not a near "
+                "miss. Both lanes run in the same process on one isolated runner, four "
+                "pinned workers each, so neither lane can be given a quieter machine."
             ),
             (
-                "Application p99 is nearest-rank p99 derived from raw, unrounded "
-                "successful-client latencies. Pooled-path setup time is the primary result "
-                "and is never added to that secondary p99."
+                "Multiplexing is read during the hold by a second database role on its own "
+                "direct connection, never inferred from the client count. Connect latency "
+                "p50, p95 and p99 are nearest-rank over raw, unrounded per-client "
+                "measurements. Pooled-path setup time is reported separately and is never "
+                "added to the time to 10,000."
             ),
             (
                 "Lakebase's built-in PgBouncer product limit is up to 10,000 client "
                 "connections, not PostgreSQL backend sessions or simultaneous transactions. "
-                "The recurring bout measures 128 attempts at maximum 64 concurrent, followed "
-                "by separate multiplexing proof. Direct AWS connections, an existing Proxy, "
+                "The bout holds exactly that many per lane and proves multiplexing while "
+                "they are held. Direct AWS connections, an existing Proxy, "
                 "sustained throughput, and storm resilience remain outside this comparison."
             ),
             "This is one live proof session, not a benchmark.",
@@ -491,8 +513,9 @@ def build_presenter_pack(
         remembered_metric = "Managed Sync exact-version proof and fresh Postgres exact-row read"
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
         remembered_metric = (
-            "Primary pooled-path setup time; secondary 128 attempts at maximum 64 concurrent, "
-            "errors, nearest-rank p99, and a separate 64-client witness"
+            "Primary time to hold 10,000 authenticated clients per lane from one shared "
+            "start; secondary pooled-path setup time, peak backend sessions, and "
+            "nearest-rank connect p99"
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
         remembered_metric = "One exact live order in Delta with checkout still verified"
@@ -527,9 +550,10 @@ def build_presenter_pack(
         stop_condition = (
             "Lakebase stops after its included pooled endpoint verifies an exact transaction. "
             "The selected AWS managed pooling path stops only after its new RDS Proxy and "
-            "exact transaction verify; the 128-attempt maximum-64-concurrent check, separate "
-            "64-client witness, and cleanup gates must still pass before any setup winner or "
-            "margin is declared."
+            "exact transaction verify. Each lane then holds exactly 10,000 authenticated "
+            "clients for a 30-second hold and answers 64 sparse queries with no retries; "
+            "9,999 fails. Multiplexing, fairness, and cleanup gates must all pass before any "
+            "winner or margin is declared."
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
         stop_condition = (

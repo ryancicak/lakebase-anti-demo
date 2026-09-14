@@ -296,10 +296,34 @@ async def get_catalog(request: Request) -> CatalogResponse:
     )
 
 
+#: What the card says while one ring is shared by every round.
+#:
+#: Kept separate from the isolated wording because they are different facts, not different
+#: phrasings of one. With a shared ring the operator's only move is to wait for the round
+#: that holds it, so the sentence names that round instead of offering the others.
+_SHARED_RING_DETAIL = (
+    "BOUT IN PROGRESS · This installation runs one bout at a time, and {holder} holds "
+    "the ring. Every round reopens when it finishes."
+)
+_SHARED_RING_DETAIL_UNNAMED = (
+    "BOUT IN PROGRESS · This installation runs one bout at a time and a bout is already "
+    "running. Every round reopens when it finishes."
+)
+def _shared_ring_detail(holder: str | None) -> str:
+    """`holder` is the lease's own round title, which is the card's name for that round."""
+
+    if not holder:
+        return _SHARED_RING_DETAIL_UNNAMED
+    return _SHARED_RING_DETAIL.format(holder=holder)
+
+
 def _fight_card_round_status(
     round_id: RoundId,
     availability: object,
     bout: BoutStatus,
+    *,
+    rounds_share_one_ring: bool = False,
+    ring_holder: str | None = None,
 ) -> FightCardRoundStatus:
     active_phase = bout.phase if bout.active else None
     if bout.active and active_phase == "cooldown_failed":
@@ -313,7 +337,14 @@ def _fight_card_round_status(
         detail = _CLEANUP_DETAIL[round_id]
     elif bout.active:
         state = FightCardState.BOUT_IN_PROGRESS
-        detail = "BOUT IN PROGRESS · This round is already in use. Other rounds remain available."
+        detail = (
+            _shared_ring_detail(ring_holder)
+            if rounds_share_one_ring
+            else (
+                "BOUT IN PROGRESS · This round is already in use. "
+                "Other rounds remain available."
+            )
+        )
     elif getattr(availability, "availability_reason_code", None) == "cleanup_in_progress":
         state = FightCardState.CLEANUP_IN_PROGRESS
         detail = _CLEANUP_DETAIL[round_id]
@@ -349,12 +380,29 @@ async def get_all_bout_statuses(request: Request) -> AllBoutStatus:
         bouts = await run_manager.all_bout_statuses()
         live_catalog = await get_catalog(request)
         availability = {item.id: item for item in live_catalog.rounds}
+        # Without per-round fences one bout locks the installation, and every round then
+        # reports itself in progress. The fact the card was missing is which round actually
+        # holds the ring, and the lease already carries it: `round_id` is None on a global
+        # lease by construction, but `round_title` is set from the holding session's own
+        # round. Any active status will do, because on a shared ring they are all the same
+        # lease seen six times.
+        shared_ring = not run_manager.round_isolation
+        holder = (
+            next(
+                (bouts[round_id].round_title for round_id in RoundId if bouts[round_id].active),
+                None,
+            )
+            if shared_ring
+            else None
+        )
         return AllBoutStatus(
             rounds={
                 round_id: _fight_card_round_status(
                     round_id,
                     availability[round_id],
                     bouts[round_id],
+                    rounds_share_one_ring=shared_ring,
+                    ring_holder=holder,
                 )
                 for round_id in RoundId
             },

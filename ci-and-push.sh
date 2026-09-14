@@ -186,17 +186,19 @@ fi
 
 git add -A \
   ci-and-push.sh \
-  frontend/src/round5.ts \
+  runner/connection_spike_runner.py \
+  runner/round5_fanin.py \
+  server/api.py \
   server/catalog.py \
   server/connection_fanin.py \
   server/connection_spike_live.py \
+  server/lifecycle.py \
   server/manager.py \
-  server/manifest.py \
-  tests/test_connection_spike_background_cleanup.py \
-  tests/test_connection_spike_burst_cancellation.py \
-  tests/test_connection_spike_live.py \
-  tests/test_connection_spike_setup_live.py \
-  tests/test_fanin_digest_mirrors.py
+  tests/test_catalog.py \
+  tests/test_connection_fanin.py \
+  tests/test_connection_spike.py \
+  tests/test_fanin_observer_connect.py \
+  tests/test_runner_result_credential_scan.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -212,56 +214,75 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Run Round 5 as the 10,000-client fan-in bout it was built to be
+Let Round 5 actually reach 10,000 clients, and say why when it does not
 
-Round 5 has had every piece of this for weeks with nothing joining them. The runner
-could execute a dual-lane fan-in bout, the finaliser could score one, the request
-builders could describe one, and the adapter dispatched a bounded 128-attempt v1
-schedule -- so the v2 finaliser was reading a v1 payload, and the protocol the round
-claims had never once run. Four things had to change together; each alone is inert.
+Seven live bouts against the sealed installation, each one finding a fault that could not be
+reached until the fan-in protocol was dispatched for the first time. Every fix here is one of
+those, in the order they surfaced.
 
-The instance shape. connection_fanin.RUNNER_INSTANCE_TYPE is what the capacity model
-was calibrated against, and three surfaces still restated m6i.large: the live config
-default, its own guard, and the sealed frozen constant. Terraform already provisions
-the larger shape, so the runner topology preflight refused every dispatch while
-reporting a sealed-contract mismatch -- which reads as a tampered installation rather
-than as two constants that disagreed. The frozen constant now names both shapes so an
-installation sealed before the fan-in protocol still loads and keeps serving its other
-rounds, and a test asserts the three surfaces agree with the runner.
+The observer could not open its connection. `execute_fanin` puts `sslrootcert` into the
+observer descriptor, the observer is the only path through `connect_runner_database`, and that
+function's allowlist is exactly the six libpq fields, so every worker died on
+`ValueError: runner database descriptor contains unsupported fields` before a single client
+connected. The same three lines also passed `trust_bundle_path=None` while asking for
+verify-full, so had it survived it would have verified against the system trust store instead
+of the sealed bundle: workable for a public CA, wrong for Amazon RDS, and wrong in principle
+for the one connection whose job is independent evidence.
 
-The SSM window. 120 seconds is an agreement with the setup phase about how long a
-runner may hold a transaction open. A fan-in bout is bounded instead by the runner's
-own 600-second budget for a full ramp, hold and sampling, so a fan-in dispatch gets a
-window derived from that constant. Had it kept the 120-second one, SSM would have ended
-bouts the runner was still measuring, and the failure arrives as "the command did not
-complete", saying nothing about the 10,000 clients that were up at the time.
+The worker ready barrier was 60 seconds against work allowed 240. A worker reports ready only
+after its observer connects and sees the lane quiet, and the observer owns both budgets. Its
+two sibling constants were already derived from the fan-in module; this was the only bare
+literal, and it reported a slow observer as a missing worker.
 
-The observer digest. Multiplexing is the claim, and it is proved by watching the pool
-from a second role on its own direct connection, so the request names an observer
-credential per lane and the runner refuses a request without one. It is sealed per lane
-at install time and not re-minted per bout, so it now travels on the lane binding
-beside the client digest, from the manifest through to the per-bout runtime target.
+The quiesce gate demanded zero pre-existing client-role sessions, which a pooled lane cannot
+give: setup proves the new RDS Proxy is ready by running a transaction through it, and a proxy
+holds its pool. The baseline is now recorded and bounded by
+`MAX_PREEXISTING_CLIENT_SESSIONS`, derived from the most connections this protocol has in
+flight to one lane at once, and a lane over the ceiling fails its own `clean_start` gate rather
+than being reported as an observer that was not separate.
 
-The dispatch. `execute` took a v1 schedule and built the request itself, which is why
-the only protocol it could ever send was the one its builder knew; it now takes the
-complete request. `check()` measures capacity on the runner and refuses by name -- a
-small shape, an fd limit, an event loop already under pressure each send an operator
-somewhere different -- then arms with the four digests and that measurement. `run()`
-builds the request from the arm it was handed, refusing a lane whose seal names no
-client or observer digest rather than leaving it to the runner, whose token for that
-says nothing about which lane or why.
+The result guard threw away a completed bout. It matched the substring "password" in flattened
+JSON, and `auth_method` legitimately holds `tls-cleartext-password`, one of the protocol's two
+supported methods. The structural scan written for exactly this was already in the file and
+unused here. It also now refuses a credential-named key, which the substring version caught and
+a values-only scan would have lost.
 
-catalog.py makes the fan-in protocol the only selectable one and manager.py defaults to
-it. connection-spike-v1 survives as a name in one place on each side, so a scorecard
-stored under it is labelled an earlier protocol rather than silently relabelled with
-10,000-client copy it never attempted. The bounded schedule serializer is deleted, and
-the two cancellation modules that drove `execute` with one now drive it with a real
-fan-in request -- keeping the fixture would have let them pass against a shape the
-server can no longer send, which is exactly how the two sides drifted apart.
+The returned envelope could exceed what SSM will hand back. Four workers' diagnostics each
+carry maps keyed by callback identity, phase name and GC generation, so the payload grew with
+how varied the run was rather than with what it measured, and a finished bout was lost to
+`result_too_large`. Those maps are bounded to their most expensive entries with the remainder
+counted, and an overflow now reports its size and largest contributors.
 
-The server's four digests are asserted equal to the runner's own functions. When those
-copies disagree every bout dies at the decoder with `fanin_digest_mismatch`, a token
-that names the symptom and not which of the four surfaces drifted.
+Round 5 no longer requires two lanes. This is the change Ryan asked for in as many words: a
+shared start barrier makes the AWS path's Proxy build a precondition for Lakebase's
+measurement, and it is not Lakebase's fault that a Proxy takes eleven minutes. Under the
+barrier Lakebase verified in 3.4 seconds, waited, suspended at its 60-second idle floor, and
+arrived cold; the ramp also advanced both lanes in lockstep so it could not pass a failing
+lane. A request may now name one lane or two, the executor runs the lanes it is given, sampling
+keeps its 250ms offset between however many there are, and the aggregator collects the lanes
+that ran instead of pre-seeding both. `_secrets_manager_region` returns "" for no ARNs rather
+than refusing, because the Lakebase lane holds its credential outside Secrets Manager.
+
+Three diagnostics, because every one of the failures above cost an eleven-minute Proxy build to
+characterise. The burst log recorded only an exception class; a refused command discarded the
+runner's own token; and the lane-identity gate reported ten fields under one word. All three
+now name what happened, and a worker that authenticated nobody refuses by that name instead of
+appearing as workers who disagreed about an auth method.
+
+Copy that described the retired protocol is corrected where it is read aloud or scored: the
+metric set makes time-to-10,000 primary and setup time secondary, the presenter's remembered
+metric and stop condition match the bout, the burst lane status no longer says 128 attempts,
+and the fight card stops telling a room that other rounds remain available while refusing all
+six. The cost disclosures keep their 128-attempt wording on purpose, because they describe two
+specific past bouts that really did run that protocol.
+
+Measured and reproducible across seven bouts: Lakebase pooled-path setup 3.33 to 3.49 seconds,
+the AWS path 653 to 746 seconds. One bout reached the full 10,000 with all four workers at
+2,500 and the observer open. The ramp is currently capped below that by
+`telemetry_failures: ['event_loop_pressure']` at a peak event-loop p99 of 98.65 ms against a
+50 ms ceiling, with memory, file descriptors, CPU and ephemeral ports all far inside their
+limits. That gate is doing its job and the number it is protecting is not yet earned, so no
+time-to-10,000 is claimed here.
 MSG
 pass "committed"
 

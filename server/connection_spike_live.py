@@ -4021,8 +4021,10 @@ class LiveConnectionSpikeAdapter:
             output = str(invocation.get("StandardOutputContent") or "")
             self._require_settlement(run_id, output)
             if invocation.get("Status") != "Success":
+                code = _runner_error_code(output)
                 raise ConnectionSpikeLiveOperationError(
                     "Round 5 runner command did not succeed after cleanup"
+                    + (f": the runner refused with {code}" if code else "")
                 )
             if is_preflight:
                 # No CloudWatch witness. The witness corroborates a bout's backend
@@ -4448,11 +4450,14 @@ class LiveConnectionSpikeAdapter:
         }
         if result_lane_ids != {target.lane_id for target in self.config.targets}:
             raise ConnectionSpikeLiveOperationError("Round 5 runner result omitted a sealed lane")
-        forbidden = ("password", "secret_access_key", "session_token", "access_key_id")
-        flattened = json.dumps(result, sort_keys=True).lower()
-        if any(name in flattened for name in forbidden):
+        # The structural scan, not a substring sweep over flattened JSON. This payload
+        # legitimately contains the word "password" in `auth_method`:
+        # `tls-cleartext-password` is one of the protocol's two supported methods and is a
+        # label, not a secret. A flattened match refused every successful bout on that
+        # basis, after paying for it.
+        if _runner_result_has_forbidden_credential(result):
             raise ConnectionSpikeLiveOperationError(
-                "Round 5 runner result contained a forbidden credential field"
+                "Round 5 runner result contained credential material and was discarded"
             )
         return result
 
@@ -4866,6 +4871,24 @@ _FORBIDDEN_CREDENTIAL_ASSIGNMENT = re.compile(
     r"\s*[=:]\s*\S",
     re.IGNORECASE,
 )
+#: A key whose *name* is credential material. Needed alongside the assignment pattern above,
+#: which only sees strings: a bare secret arriving as `{"session_token": "AQoDX..."}` carries
+#: no `=` and would otherwise pass. Matched as a whole word against the key so
+#: `credential_sha256` and `master_secret_arn` stay readable -- a digest is evidence and an ARN
+#: is a control-plane reference, and refusing either would refuse every honest payload.
+_FORBIDDEN_CREDENTIAL_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "pgpassword",
+        "secret",
+        "secret_access_key",
+        "session_token",
+        "access_key_id",
+        "token",
+        "secretstring",
+    }
+)
 
 
 def _runner_result_has_forbidden_credential(raw: object) -> bool:
@@ -4888,8 +4911,13 @@ def _runner_result_has_forbidden_credential(raw: object) -> bool:
 
     if isinstance(raw, Mapping):
         for key, value in raw.items():
+            name = str(key).casefold()
             if isinstance(value, str) and str(key) in _CREDENTIAL_LABEL_KEYS:
                 continue
+            # The key alone is enough. A value under this name is credential material
+            # whether or not it happens to look like an assignment.
+            if name in _FORBIDDEN_CREDENTIAL_KEYS:
+                return True
             if _runner_result_has_forbidden_credential(value):
                 return True
         return False

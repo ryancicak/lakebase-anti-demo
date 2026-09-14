@@ -16,6 +16,7 @@ from runner import round5_fanin as runner
 from server.connection_fanin import (
     FANIN_PROTOCOL,
     FANIN_SCHEMA_VERSION,
+    MAX_PREEXISTING_CLIENT_SESSIONS,
     CapacityPreflight,
     ConnectionSpikeArm,
     ConnectionSpikeContract,
@@ -298,7 +299,10 @@ def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() ->
         ({"sampled_queries_succeeded": 63, "sampled_queries_failed": 1},
          "sampled_queries"),
         ({"peak_backend_sessions": 10_000}, "multiplexing"),
-        ({"preexisting_client_role_sessions": 1}, "observer_separation"),
+        # Above the ceiling nothing is attributable, so the lane fails by its own name
+        # rather than as an observer that was not separate.
+        ({"preexisting_client_role_sessions": MAX_PREEXISTING_CLIENT_SESSIONS + 1},
+         "clean_start"),
         ({"observer_role": "anti_demo_burst"}, "observer_separation"),
         ({"observer_direct": False}, "observer_separation"),
         ({"connect_latency_p95_ms": None}, "identity"),
@@ -322,6 +326,43 @@ def test_exact_stop_gate_rejects_every_mutation(
     result = finalize(raw)
     assert not result.verified
     assert failed_gate in result.gates.failures
+
+
+def test_a_warm_pool_inside_the_ceiling_still_verifies() -> None:
+    """The other half of the bound, and the reason it exists.
+
+    Setup proves the new RDS Proxy is ready by running an application transaction through
+    it, which leaves a backend session open as the client role, and a proxy holds its pool.
+    A lane is therefore entitled to start warm. What it may not do is start with enough
+    sessions to account for the multiplexing being claimed, which is what the ceiling
+    bounds: at most the connections this protocol has in flight to one lane at once, two
+    orders of magnitude under the 10,000 clients the multiplexing gate compares against.
+    """
+
+    lane = finalize(raw_lane("lakebase", preexisting=1))
+    assert lane.gates.clean_start
+    assert lane.verified
+    # Recorded, not merely tolerated, so the room can see what the lane started with.
+    assert lane.preexisting_client_role_sessions == 1
+
+
+def test_a_lane_at_the_ceiling_still_verifies_and_one_over_does_not() -> None:
+    """The boundary itself, so the ceiling cannot drift by one in either direction."""
+
+    assert finalize(raw_lane("lakebase", preexisting=MAX_PREEXISTING_CLIENT_SESSIONS)).verified
+    over = finalize(raw_lane("lakebase", preexisting=MAX_PREEXISTING_CLIENT_SESSIONS + 1))
+    assert not over.gates.clean_start
+    assert not over.verified
+    assert "clean_start" in over.gates.failures
+
+
+def test_the_ceiling_is_not_zero() -> None:
+    """Stated directly, because a ceiling of zero would satisfy every other assertion.
+
+    Zero is what it used to be, and it is what made a pooled lane impossible to start.
+    """
+
+    assert MAX_PREEXISTING_CLIENT_SESSIONS >= 1
 
 
 def test_backend_sessions_are_evidence_not_client_count() -> None:

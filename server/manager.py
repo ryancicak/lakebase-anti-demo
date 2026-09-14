@@ -5152,7 +5152,7 @@ class RunManager:
                 return
             for lane in record.snapshot.lanes.values():
                 lane.status = (
-                    "Executing the frozen 128-attempt, maximum-64-concurrent check"
+                    "Opening 10,000 client connections from the shared start"
                 )
                 lane.activity = LaneActivity(phase="burst")
             burst_snapshot = self._public_snapshot_locked(record)
@@ -5175,7 +5175,7 @@ class RunManager:
                     else list(record.snapshot.lanes.values())
                 )
                 for lane in lanes:
-                    lane.status = "Executing and validating the bounded connection check"
+                    lane.status = "Holding 10,000 clients and verifying multiplexing"
                     lane.activity = LaneActivity(phase=phase)
                 affected_lane_ids = (
                     (str(lane_id),)
@@ -5194,10 +5194,11 @@ class RunManager:
             raise
         except Exception as exc:
             logger.error(
-                "Round 5 burst failed session=%s competitor=%s diagnostic=%s",
+                "Round 5 burst failed session=%s competitor=%s diagnosis=%s",
                 record.snapshot.id,
                 record.snapshot.competitor.id,
-                _redacted_exception_chain(exc),
+                operator_diagnosis(exc),
+                exc_info=True,
             )
             message = "The live Round 5 proof failed unexpectedly."
             await self._finish_connection_spike_failure(

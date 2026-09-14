@@ -45,6 +45,20 @@ READY_CALLBACK_BATCH_LIMIT = 0
 SELECTOR_EVENT_BATCH_LIMIT = 0
 PARTITION_CLIENTS_PER_LANE = TARGET_CLIENTS_PER_LANE // WORKER_COUNT
 MAX_IN_FLIGHT_CONNECTS_PER_LANE = LANE_CONNECT_CONCURRENCY * WORKER_COUNT
+#: The largest client-role session count a lane may already hold when a bout starts.
+#:
+#: Not zero, because a pooled lane cannot be both proven ready and empty: the setup phase
+#: verifies the new RDS Proxy by running an application transaction through it, and a proxy
+#: holds its pool. Requiring zero made the competitor lane unsatisfiable by construction and
+#: killed a live bout with both setup gates verified.
+#:
+#: What matters is attribution, and this preserves it by bound rather than by emptiness. The
+#: ceiling is the most connections this protocol will have in flight to one lane at once, so
+#: nothing warm can legitimately exceed it, and it is two orders of magnitude below the
+#: 10,000-client claim: the multiplexing gate compares peak backend sessions against the
+#: target, and a baseline of at most this many cannot change that verdict. The observed
+#: count is recorded on every lane result either way, so the room can see it.
+MAX_PREEXISTING_CLIENT_SESSIONS = MAX_IN_FLIGHT_CONNECTS_PER_LANE
 # No-endpoint preflight readiness probe. Deliberately the whole-runner in-flight
 # bound, four times what one worker loop can have handshaking at once.
 SELECTOR_FANOUT_PROBE_SOCKETS = LANE_CONNECT_CONCURRENCY * WORKER_COUNT * RUNNER_LANE_COUNT
@@ -371,6 +385,8 @@ def fanin_config_sha256() -> str:
         "observer_role": "anti_demo_observer",
         "observer_ready_timeout_seconds": 120.0,
         "observer_quiesce_timeout_seconds": 120.0,
+        "observer_quiesce_stable_readings": 3,
+        "max_preexisting_client_sessions": MAX_PREEXISTING_CLIENT_SESSIONS,
         "observer_retry_seconds": 0.5,
         "observer_sample_max_retries": 2,
         "observer_sample_retry_seconds": 0.25,
@@ -494,6 +510,11 @@ class ConnectionSpikeGates:
     fairness: bool
     telemetry: bool
     cleanup: bool
+    #: Whether this lane started inside `MAX_PREEXISTING_CLIENT_SESSIONS`. Named separately
+    #: from `observer_separation` because the operator's next move differs: a dirty lane is
+    #: waited out or cleaned, a non-separate observer is a contract fault. Required rather
+    #: than defaulted, so a caller cannot construct a passing verdict by omitting it.
+    clean_start: bool
     failures: tuple[str, ...] = ()
 
     @property
@@ -506,6 +527,7 @@ class ConnectionSpikeGates:
             and self.multiplexing
             and self.identity
             and self.observer_separation
+            and self.clean_start
             and self.fairness
             and self.telemetry
             and self.cleanup
@@ -901,7 +923,10 @@ def finalize_lane(
         and bool(client_role)
         and bool(observer_role)
         and client_role != observer_role
-        and preexisting == 0
+        # Nothing about the baseline. Observer separation is whether the observer is
+        # its own role on its own direct connection; a lane that starts with a warm
+        # pool has its own gate below, so it reports as a dirty lane rather than as an
+        # observer that was not separate.
     )
     identity = (
         digests_valid
@@ -916,6 +941,10 @@ def finalize_lane(
         and model_sha256 == expected_capacity_model_sha256
         and raw.get("identity_verified") is True
     )
+    # A pooled lane may start with the backend sessions that proving it ready created,
+    # bounded so the bout's own sessions stay attributable against them. The observed count
+    # is on the lane result either way, so this bounds evidence rather than replacing it.
+    clean_start = preexisting <= MAX_PREEXISTING_CLIENT_SESSIONS
     fairness = launch_skew <= MAX_LAUNCH_SKEW_MS and raw.get("fairness_verified") is True
     telemetry = (
         raw.get("telemetry_verified") is True
@@ -939,6 +968,7 @@ def finalize_lane(
         (multiplexing, "multiplexing"),
         (identity, "identity"),
         (observer_separation, "observer_separation"),
+        (clean_start, "clean_start"),
         (fairness, "fairness"),
         (telemetry, "telemetry"),
         (cleanup_verified, "cleanup"),
@@ -1018,6 +1048,7 @@ def finalize_lane(
             multiplexing=multiplexing,
             identity=identity,
             observer_separation=observer_separation,
+            clean_start=clean_start,
             fairness=fairness,
             telemetry=telemetry,
             cleanup=cleanup_verified,
