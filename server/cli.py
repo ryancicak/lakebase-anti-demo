@@ -518,6 +518,26 @@ def _generation_checks() -> list[Check]:
     return checks
 
 
+def _setup_completion_line(run_id: str, url: str, *, will_serve: bool) -> str:
+    """What `antidemo setup` says when it is done, given whether anything serves.
+
+    This used to name `url` unconditionally, which made the line a lie in the one
+    case an operator meets first: `bootstrap.sh --apply --deploy-app` runs setup
+    with `--no-serve` and then deploys the App, so nothing ever listened on
+    127.0.0.1 and the last address printed before the App URL pointed nowhere.
+    Read as "your install is ready, here is where it lives", which is what a
+    "READY TO RING" line invites, it sends a first-time operator to a dead page.
+    """
+
+    if will_serve:
+        return f"READY TO RING — {run_id} — {url}"
+    return (
+        f"READY TO RING — {run_id} — provisioned; nothing is serving locally. "
+        f"Start the local UI with './antidemo serve', or open the App URL if you "
+        f"deployed one."
+    )
+
+
 def _app_is_online(host: str, port: int) -> bool:
     probe_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     try:
@@ -1054,8 +1074,13 @@ def main() -> int:
             # here, and the server that follows must not inherit a claim it would
             # then hold for hours.
             url = f"http://{args.host}:{args.port}/"
-            print(f"READY TO RING — {manifest.run_id} — {url}", flush=True)
-            if args.no_serve or _app_is_online(args.host, args.port):
+            already_serving = _app_is_online(args.host, args.port)
+            will_serve = already_serving or not args.no_serve
+            print(
+                _setup_completion_line(manifest.run_id, url, will_serve=will_serve),
+                flush=True,
+            )
+            if args.no_serve or already_serving:
                 return 0
             return _serve(args.host, args.port)
         if args.command == "provision":

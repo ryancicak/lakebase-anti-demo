@@ -1673,6 +1673,142 @@ def test_interrupted_first_provision_leaves_a_findable_owned_record(
     assert json.loads(isolated_lifecycle_manifest.read_text(encoding="utf-8")) == record
 
 
+# RFC5737 documentation space, in the shape the feed publishes. It has to be
+# documentation space for the reason tests/test_operator_ingress.py gives: every
+# prefix Databricks actually publishes is globally routable, and
+# tests/test_no_live_identifiers_committed.py refuses a routable IPv4 literal in
+# any file it can see.
+PUBLISHED_EGRESS = ("192.0.2.0/24", "198.51.100.0/25")
+
+
+def _stub_provision_dependencies(monkeypatch, apply_hook) -> None:
+    """Everything `provision` needs so only the seal under test is real."""
+
+    monkeypatch.setattr(
+        "server.lifecycle.select_setup_auth",
+        lambda environment, requested: SimpleNamespace(mode="profile", profile="sandbox-admin"),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._verify_databricks_identity",
+        lambda profile: "operator@databricks.com",
+    )
+    monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle._terraform_init", lambda candidate: None)
+    monkeypatch.setattr("server.lifecycle._run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "server.lifecycle._terraform_plan",
+        lambda candidate, targets=(): Path("/tmp/anti-demo-test-create.tfplan"),
+    )
+    monkeypatch.setattr("server.lifecycle._terraform_apply", apply_hook)
+
+
+def test_a_first_provision_seals_the_app_egress_before_its_first_apply(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    """`--apply --deploy-app` used to ship an app that could not reach its databases.
+
+    The published egress prefixes were sealed only by `_refresh_serverless_egress_cidrs`,
+    which runs from `reconcile_infrastructure` and therefore only under `antidemo
+    setup`. A first provision never reconciles, so Terraform built all four database
+    security groups admitting exactly one address -- the provisioning laptop's /32 --
+    and the deployed app, which leaves from a Databricks prefix, could not open an
+    Aurora or RDS connection. /readyz reported the degradation correctly and no
+    output told anyone to run the repair.
+
+    Ordering is the whole assertion, so this reads the manifest as `_terraform_apply`
+    receives it rather than afterwards: a seal written after the apply leaves the
+    groups on disk wrong until something re-applies them.
+    """
+
+    at_apply: dict[str, object] = {}
+
+    def capture_apply(candidate: DemoManifest, plan_path: Path) -> None:
+        del plan_path
+        at_apply["cidrs"] = candidate.aws.serverless_egress_cidrs
+        at_apply["published_at"] = candidate.aws.serverless_egress_published_at
+        at_apply["variables"] = lifecycle._terraform_variables(candidate)
+        raise RuntimeError("stop the test at the first apply")
+
+    _stub_provision_dependencies(monkeypatch, capture_apply)
+    monkeypatch.setattr(
+        "server.lifecycle.fetch_serverless_egress_cidrs",
+        lambda region, **_kwargs: (PUBLISHED_EGRESS, 1_700_000_000),
+    )
+    # `_terraform_variables` binds the app principal and refuses one from another
+    # account. Only read here, and only so the tfvars can be rendered at all.
+    monkeypatch.setenv(
+        "ROUND5_APP_PRINCIPAL_ARN", "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    )
+
+    with pytest.raises(RuntimeError, match="stop the test at the first apply"):
+        lifecycle.provision(
+            databricks_profile="fe-vm-test",
+            aws_profile="sandbox-admin",
+            aws_region="us-west-2",
+            expected_account="123456789012",
+            owner="operator@databricks.com",
+            operator_cidr="203.0.113.10/32",
+            ttl_hours=72,
+            zero_timeout_seconds=1,
+        )
+
+    assert at_apply["cidrs"] == PUBLISHED_EGRESS
+    # Sealed together or not at all, so the list can be aged and re-polled.
+    assert at_apply["published_at"] == 1_700_000_000
+    # And it actually reaches Terraform, beside the operator rather than instead
+    # of it -- a group that admitted only the app would lock out the laptop
+    # running the demo.
+    rendered = " ".join(at_apply["variables"])
+    sealed_hcl = json.dumps(list(PUBLISHED_EGRESS), separators=(",", ":"))
+    assert f"serverless_egress_cidrs={sealed_hcl}" in rendered
+    assert "operator_cidr=203.0.113.10/32" in rendered
+
+
+def test_a_first_provision_survives_a_feed_it_cannot_read(
+    monkeypatch, isolated_lifecycle_manifest, capsys
+) -> None:
+    """A third party's CDN must not be able to stop a provision.
+
+    Same asymmetry `_refresh_serverless_egress_cidrs` carries: the install then
+    admits only the operator, which is exactly right for a local install and
+    repairable for a deployed one -- so the warning has to name the repair.
+    """
+
+    at_apply: dict[str, object] = {}
+
+    def capture_apply(candidate: DemoManifest, plan_path: Path) -> None:
+        del plan_path
+        at_apply["cidrs"] = candidate.aws.serverless_egress_cidrs
+        at_apply["published_at"] = candidate.aws.serverless_egress_published_at
+        raise RuntimeError("stop the test at the first apply")
+
+    _stub_provision_dependencies(monkeypatch, capture_apply)
+
+    def unreachable_feed(region, **_kwargs):
+        raise OSError("the feed is unreachable")
+
+    monkeypatch.setattr("server.lifecycle.fetch_serverless_egress_cidrs", unreachable_feed)
+
+    with pytest.raises(RuntimeError, match="stop the test at the first apply"):
+        lifecycle.provision(
+            databricks_profile="fe-vm-test",
+            aws_profile="sandbox-admin",
+            aws_region="us-west-2",
+            expected_account="123456789012",
+            owner="operator@databricks.com",
+            operator_cidr="203.0.113.10/32",
+            ttl_hours=72,
+            zero_timeout_seconds=1,
+        )
+
+    # Neither half sealed: the manifest refuses a list without its timestamp.
+    assert at_apply["cidrs"] is None
+    assert at_apply["published_at"] is None
+    output = capsys.readouterr().out
+    assert "Could not read the Databricks serverless egress feed" in output
+    assert lifecycle.OPERATOR_INGRESS_REPAIR_COMMAND in output
+
+
 async def test_reset_clears_legacy_anchor_and_never_stages_recovery_points(
     monkeypatch,
 ) -> None:

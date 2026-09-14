@@ -9,10 +9,11 @@
 #
 # Usage:  ./ci-and-push.sh [--branch NAME] [--no-push]
 #
-# By default this commits to `main`. eebc8a73 is exactly origin/main's tip, so a
-# feature branch would be main under another name; these changes are also small,
-# self-contained and verified green locally. Pass --branch NAME if you would
-# rather review them as a pull request.
+# By default this commits to `main`, and it refuses unless the checkout is already
+# at origin/main's tip -- so a feature branch would be main under another name.
+# Pass --branch NAME to review the change as a pull request instead. It never
+# touches a local `main` that has diverged from the published one; see the landing
+# logic below.
 set -euo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -137,36 +138,77 @@ else
   fi
 fi
 
-git add -A README.md docs/iam/README.md bootstrap.sh scripts/attach-operator-policies.sh ci-and-push.sh
+git add -A \
+  README.md \
+  ci-and-push.sh \
+  server/cli.py \
+  server/lifecycle.py \
+  server/manifest.py \
+  tests/conftest.py \
+  tests/test_lifecycle.py \
+  tests/test_operator_ingress.py \
+  tests/test_server_launch.py
+
+# The list above is explicit so an unrelated edit cannot ride along. That makes
+# the opposite mistake possible -- staging a subset and committing half a change
+# -- and it has already happened once: the list was left pointing at a previous
+# commit's files, so every gate passed and `git commit` then found nothing staged.
+# Refuse when a tracked modification is left behind, naming it.
+LEFT_BEHIND="$(git diff --name-only)"
+if [[ -n "$LEFT_BEHIND" ]]; then
+  printf '  %sFAIL%s these tracked files are modified but not in this script'"'"'s staging list:\n' \
+    "$RED" "$RESET" >&2
+  printf '    %s\n' $LEFT_BEHIND >&2
+  die "add them to the list above, or revert them; refusing to commit part of a change"
+fi
+
 git commit --file - <<'MSG'
-Make a first-time install work without side work
+Seal the deployed app's egress prefixes before the first apply
 
-bootstrap.sh reported "No default VPC in $AWS_REGION, and this is not a
-permissions problem" whenever ec2:DescribeVpcs was denied, because the discovery
-query swallows the error into "None". The advice that follows -- change region or
-plumb Terraform network variables -- is wrong for a healthy default VPC, so the
-verdict now consults PERMISSION_FAILURES and reports the network as unknown
-rather than absent, with no second failure for one cause.
+`--apply --deploy-app` provisioned an app that could not reach the databases it
+had just created. The published Databricks serverless egress prefixes were sealed
+only by `_refresh_serverless_egress_cidrs`, which runs from
+`reconcile_infrastructure` and therefore only under `antidemo setup`. A first
+provision never reconciles, so Terraform built all four database security groups
+admitting exactly one address -- the provisioning laptop's /32 -- while the
+deployed app leaves from a published Databricks prefix.
 
-The README's prerequisite said "an AWS account with permission to ...", which
-reads as satisfied by an administrator console login. bootstrap authenticates as
-the pair in .env.bootstrap and nothing else, so that pair must hold the
-permissions itself. Says so, and points at the least-privilege alternative.
+Every round that opens an Aurora or RDS connection failed. The backstage cleanup
+that resets the recovery environments timed out against both data planes and
+escalated, and /readyz refused readiness and named the cause exactly. Nothing in
+any output named the repair, so the symptom read as a crashed deployment.
 
-docs/iam/README.md described a narrow app principal separate from the operator
-and warned against attaching the operator set to the app. bootstrap.sh:729-731
-publishes one pair to both, and bootstrap.env.example offers only one, so a
-reader who followed that page declined the attachment and could not provision.
-The separation is now marked as the target state rather than the current runtime.
+`provision` now seals those prefixes before its first apply, which is what makes
+the security groups Terraform *creates* admit the app. A feed that cannot be read
+warns and names the repair rather than failing the provision, matching the
+reconcile path: a third party's CDN must not be able to stop an install. Terraform
+needed no change -- all four ingress blocks already concatenated the sealed list
+beside the operator, and only the timing of the seal was wrong.
 
-scripts/attach-operator-policies.sh replaces eight hand-transcribed commands from
-that page. It derives the account from sts:GetCallerIdentity rather than trusting
-a flag, refuses if a placeholder survives rendering, and is idempotent on both
-the policies and the attachments. bootstrap cannot do this itself: creating and
-attaching IAM policies is more privilege than the operator set it would grant.
+tests/test_operator_ingress.py covers this feature in 45 tests, and every one of
+them drives the reconcile seam, which is why a first run was never exercised. The
+two new tests read the seal as `_terraform_apply` receives it, because the
+ordering is the whole defect; a seal written afterwards leaves the groups wrong
+until something re-applies them.
 
-ci-and-push.sh runs the four CI jobs locally with cloud credentials unset the way
-CI asserts, and refuses to commit unless all of them pass.
+conftest refuses the feed for the whole suite, since `provision` now touches the
+network and no test may. Refused at the transport rather than at
+`fetch_serverless_egress_cidrs`, whose real parsing is under test against a fake
+body.
+
+`antidemo setup` ended on "READY TO RING -- <run> -- http://127.0.0.1:8000/"
+whether or not anything was going to serve there. `--deploy-app` runs setup with
+--no-serve and then deploys the App, so the last address printed before the App
+URL pointed at a page that had never been served, in the shape of a line that
+reads as "your install is ready, here is where it lives". The message now depends
+on whether a server will exist and names './antidemo serve' when one will not.
+
+README's install section led with the local server and reached --deploy-app as an
+afterthought at the end, which is backwards for the supported path. Install is now
+one command, uninstall is its own section, and the local server follows as an
+alternative. The uninstall commands also carry the ANTI_DEMO_MANIFEST export they
+always required: without it cleanup refuses to guess a generation and stops, which
+the previous copy did not mention.
 MSG
 pass "committed"
 

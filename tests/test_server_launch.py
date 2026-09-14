@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from server import server_launch
-from server.cli import _parser, _serve_log_path
+from server.cli import _parser, _serve_log_path, _setup_completion_line
 from server.server_launch import (
     DEFAULT_LOG_KEEP,
     DEFAULT_LOG_MAX_BYTES,
@@ -824,6 +824,39 @@ def test_a_background_server_with_nowhere_to_log_is_refused(
 # --------------------------------------------------------------------------
 # The property that must not regress
 # --------------------------------------------------------------------------
+
+
+def test_setup_does_not_advertise_a_local_url_when_nothing_will_serve() -> None:
+    """`bootstrap.sh --apply --deploy-app` runs setup with `--no-serve`.
+
+    The completion line named http://127.0.0.1:8000/ regardless, so the last
+    address printed before the App URL pointed at a page that had never been
+    served. "READY TO RING — <run> — <url>" reads as "your install is ready, here
+    is where it lives", which is exactly the wrong thing to tell a first-time
+    operator at that moment.
+    """
+
+    serving = _setup_completion_line("ad-1", "http://127.0.0.1:8000/", will_serve=True)
+    assert "http://127.0.0.1:8000/" in serving
+
+    quiet = _setup_completion_line("ad-1", "http://127.0.0.1:8000/", will_serve=False)
+    assert "127.0.0.1" not in quiet
+    assert "8000" not in quiet
+    # It still has to say what to do next, or it trades a wrong address for a
+    # dead end.
+    assert "./antidemo serve" in quiet
+    # And it stays the line the run ends on, so the operator can still tell which
+    # generation finished.
+    assert quiet.startswith("READY TO RING — ad-1")
+
+
+def test_setup_still_names_the_url_when_something_is_already_serving() -> None:
+    """`--no-serve` against a live local server is the one case where the address
+    is true: the process it would have started is already up, and printing where
+    to find it is the whole point of the line."""
+
+    line = _setup_completion_line("ad-2", "http://127.0.0.1:9000/", will_serve=True)
+    assert line == "READY TO RING — ad-2 — http://127.0.0.1:9000/"
 
 
 def test_the_daemon_closes_every_inherited_descriptor_before_it_spawns() -> None:

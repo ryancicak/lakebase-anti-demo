@@ -7938,6 +7938,48 @@ def _complete_provision(manifest: DemoManifest, zero_timeout_seconds: float) -> 
     return manifest
 
 
+def _seal_initial_serverless_egress(region: str) -> tuple[tuple[str, ...] | None, int | None]:
+    """The published app egress prefixes for an installation that has none yet.
+
+    `_refresh_serverless_egress_cidrs` cannot do this job. It re-polls an existing
+    seal and refuses to rewrite ingress on resources this manifest cannot prove it
+    owns -- and at provision time there is no manifest, no resource and nothing to
+    own. So the first seal happens here, before the first apply, which is what
+    makes the security groups Terraform *creates* admit the deployed app.
+
+    Sealing it only at reconcile time is what made `--apply --deploy-app` ship an
+    app that could not reach its own databases: the groups were built with the
+    provisioning laptop's single `/32`, the app leaves from a published Databricks
+    prefix, and every round that opens an Aurora or RDS connection failed until
+    somebody ran a reconcile nothing told them to run.
+
+    A feed that cannot be read warns rather than fails, matching the reconcile
+    path for the reason given there: a third party's CDN being briefly unreachable
+    must not be able to stop a provision. The installation then admits only the
+    operator, which is correct for a local install and repairable with
+    `OPERATOR_INGRESS_REPAIR_COMMAND` for a deployed one.
+
+    Counts rather than addresses, for the reason `_sealed_ingress_summary` gives.
+    """
+
+    try:
+        cidrs, published_at = fetch_serverless_egress_cidrs(region)
+    except Exception as exc:
+        print(
+            f"WARN  Could not read the Databricks serverless egress feed "
+            f"({type(exc).__name__}). Provisioning continues and the databases will "
+            f"admit only this host. A local install is unaffected; a deployed app "
+            f"cannot reach them until you run '{OPERATOR_INGRESS_REPAIR_COMMAND}'.",
+            flush=True,
+        )
+        return None, None
+    print(
+        f"SEAL  deployed app ingress: {len(cidrs)} published {region} egress prefix(es)",
+        flush=True,
+    )
+    return cidrs, published_at
+
+
 def provision(
     *,
     databricks_profile: str,
@@ -7969,6 +8011,9 @@ def provision(
     print("CHECK explicit AWS account binding", flush=True)
     _verify_aws_identity(auth.profile, aws_region, expected_account, auth.mode)
     cidr = _validate_operator_cidr(operator_cidr or detect_operator_cidr())
+    # Before the first apply, so the groups Terraform creates admit the deployed
+    # app. See `_seal_initial_serverless_egress`.
+    egress_cidrs, egress_published_at = _seal_initial_serverless_egress(aws_region)
     run_id = _new_run_id()
     installation_id = str(uuid4())
     compact_installation_id = installation_id.replace("-", "")
@@ -7990,6 +8035,8 @@ def provision(
             account_id=expected_account,
             region=aws_region,
             operator_cidr=cidr,
+            serverless_egress_cidrs=egress_cidrs,
+            serverless_egress_published_at=egress_published_at,
             terraform_state=str(state_path),
         ),
         databricks=DatabricksManifest(

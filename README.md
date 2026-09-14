@@ -62,67 +62,70 @@ into the shared runtime-role trust automatically. It also derives the region,
 workspace, app, warehouse, secret scope, and every resource identifier; none is
 a sixth setup value.
 
-Check your machine and accounts. This command does not provision cloud
-resources:
+Check your machine and accounts. This command provisions nothing:
 
 ```bash
 ./bootstrap.sh
 ```
 
-Provision the demo:
-
-```bash
-./bootstrap.sh --apply
-```
-
-The installer prints the expected cost and waits for you to type `PROVISION`.
-
-Start the local app. `--apply` must have finished first: it is what provisions
-`.venv`, which `./antidemo` refuses to run without, and `frontend/dist`, which
-the UI answers 503 without. Neither is committed.
-
-Ask for the derived environment on its own before you use it:
-
-```bash
-./bootstrap.sh --print-env
-```
-
-Export lines on stdout mean it worked, and then this is the launch:
-
-```bash
-eval "$(./bootstrap.sh --print-env)"
-./antidemo serve
-```
-
-**No output means the `eval` does nothing and says nothing.** It evaluates an
-empty string, sets no variable and reports no error, and `./antidemo serve` then
-stops on a missing `ANTI_DEMO_MANIFEST` and recommends the command that just
-failed. `--print-env` re-runs the whole preflight and prints its exports last,
-so anything wrong with the account it checks — a credential that cannot read
-the account, a region with no default VPC — suppresses all of them, whether or
-not the installation it would have pointed at is fine.
-
-Serving needs one variable out of it. Set that directly instead, from the
-highest-numbered generation directory on disk:
-
-```bash
-export ANTI_DEMO_MANIFEST="$PWD/$(ls -d .anti-demo-v*/ | sort -V | tail -1)manifest.json"
-unset AWS_PROFILE AWS_DEFAULT_PROFILE
-./antidemo serve
-```
-
-`sort -V` is doing real work there: generations must be compared as numbers,
-because `.anti-demo-v10` sorts *before* `.anti-demo-v7` as text. The `unset`
-mirrors what `--print-env` emits — this installation authenticates from the two
-AWS keys, and a named profile alongside them is refused rather than ignored.
-
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
-
-To deploy it as a Databricks App, use this provisioning command instead:
+Then install, and deploy it as a Databricks App:
 
 ```bash
 ./bootstrap.sh --apply --deploy-app
 ```
+
+That is the whole installation. It prints the expected cost and waits for you to
+type `PROVISION`, then `DEPLOY`; add `--yes` to skip both prompts and run
+unattended. When it finishes it prints the App URL and verifies that the App
+serves all six rounds before claiming success.
+
+## Uninstall
+
+Cleanup acts on one installation, and it will not guess which. Select it, then
+destroy it:
+
+```bash
+export ANTI_DEMO_MANIFEST="$PWD/$(ls -d .anti-demo-v*/ | sort -V | tail -1)manifest.json"
+./antidemo cleanup --dry-run
+./antidemo cleanup --yes
+```
+
+Without that `export`, cleanup stops and says no manifest is selected rather than
+acting on a previous generation's state. `sort -V` is doing real work: generations
+must compare as numbers, because `.anti-demo-v10` sorts *before* `.anti-demo-v7`
+as text.
+
+`--dry-run` inventories what is still billing and deletes nothing. It is worth
+reading, but it returns before the destroy path's own authorization gates, so a
+clean dry run is not a promise that `--yes` will complete. `--yes` deletes the
+AWS resources, the Lakebase projects, the Round 4 pipeline and its synced table,
+and the deployed Databricks App.
+
+Confirm it succeeds before closing your terminal. See
+[Stopping the spend](docs/BOOTSTRAP.md#stopping-the-spend) if it does not, and
+read [Cost and safety](#cost-and-safety) for what bills until then.
+
+## Run it locally instead
+
+The App is the intended way to run this. A local server is supported for
+development and needs `--apply` to have finished first, since that is what
+provisions `.venv` and `frontend/dist`:
+
+```bash
+./bootstrap.sh --apply
+eval "$(./bootstrap.sh --print-env)"
+./antidemo serve
+```
+
+If that `eval` prints nothing it also *sets* nothing and reports no error, and
+`./antidemo serve` then stops on a missing `ANTI_DEMO_MANIFEST`. `--print-env`
+re-runs the whole preflight and emits its exports last, so anything wrong with
+the account suppresses all of them. The `export` under
+[Uninstall](#uninstall) sets the one variable serving actually needs; add
+`unset AWS_PROFILE AWS_DEFAULT_PROFILE`, because this installation authenticates
+from the two AWS keys and refuses a named profile alongside them.
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000).
 
 For setup options and troubleshooting, see
 [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md).
@@ -221,16 +224,12 @@ you are done presenting:
 databricks apps stop <app-name>
 ```
 
-Destroy the installation when you finish:
+Destroy the installation when you finish — the commands are under
+[Uninstall](#uninstall).
 
-```bash
-./antidemo cleanup --dry-run
-./antidemo cleanup --yes
-```
-
-Both modes read across RDS, EC2, Secrets Manager and IAM to find what is still
-billing, so both need those reads granted. If AWS refuses one, the command says
-which call it was and stops, and the inventory it had already printed is a
+Both cleanup modes read across RDS, EC2, Secrets Manager and IAM to find what is
+still billing, so both need those reads granted. If AWS refuses one, the command
+says which call it was and stops, and the inventory it had already printed is a
 partial report rather than an all-clear.
 
 One of those reads, `secretsmanager:ListSecrets`, comes from the operator policy
@@ -238,9 +237,6 @@ set in `docs/iam/` and not from the app-runtime policy, so running `--dry-run` a
 the app's own principal stops partway through on `AccessDeniedException` and marks
 its report incomplete. Attach the three required operator policies and the
 inventory is complete.
-
-Confirm cleanup succeeds before closing your terminal. See
-[Stopping the spend](docs/BOOTSTRAP.md#stopping-the-spend) if it does not.
 
 ## What has been proven and what has not
 

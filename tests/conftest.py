@@ -449,6 +449,46 @@ def seal_operator_ingress_probe(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def seal_serverless_egress_feed(monkeypatch):
+    """No test may reach the published Databricks egress feed.
+
+    `provision` seals those prefixes before its first Terraform apply -- that is
+    what makes the security groups it creates admit the deployed app -- so every
+    ordinary provisioning test, which stubs Terraform and nothing else, would
+    otherwise make a real request to databricks.com. That is slow, it makes the
+    suite depend on a third party's uptime, and CI has no reason to hold egress.
+
+    Sealed at the transport rather than at `fetch_serverless_egress_cidrs`, because
+    `tests/test_operator_ingress.py` exercises that function's real parsing against
+    a fake body. Those tests patch this same attribute inside the test body, which
+    takes precedence over this fixture and is undone either way.
+
+    Only the feed URL is refused; anything else falls through to the real opener,
+    which is where it stood before this fixture existed. A test that wants a
+    provision to seal prefixes stubs `fetch_serverless_egress_cidrs` and says so.
+    """
+    from server import lifecycle
+
+    real_urlopen = lifecycle.urllib.request.urlopen
+
+    def refuse_the_feed(url, *args, **kwargs):
+        target = getattr(url, "full_url", url)
+        if isinstance(target, str) and target.startswith(lifecycle.SERVERLESS_EGRESS_FEED_URL):
+            raise AssertionError(
+                f"Blocked a real request to the Databricks serverless egress feed: {target}\n"
+                f"\n"
+                f"  attempted by: {_attempting_test()}\n"
+                f"\n"
+                f"  Stub server.lifecycle.fetch_serverless_egress_cidrs, or patch\n"
+                f"  lifecycle.urllib.request.urlopen with a fake body if the parsing\n"
+                f"  itself is what the test is about."
+            )
+        return real_urlopen(url, *args, **kwargs)
+
+    monkeypatch.setattr(lifecycle.urllib.request, "urlopen", refuse_the_feed)
+
+
+@pytest.fixture(autouse=True)
 def seal_installation_presence_sweep(monkeypatch):
     """No test may sweep the real AWS account, and none may inherit a verdict.
 

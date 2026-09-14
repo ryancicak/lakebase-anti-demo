@@ -116,8 +116,12 @@ class AwsManifest(BaseModel):
     #: Never written by hand and never carried in this repository: `tests/
     #: test_no_live_identifiers_committed.py` refuses any globally routable IPv4
     #: literal in a tracked *or* untracked file, and every published prefix is
-    #: routable. `server.lifecycle._refresh_serverless_egress_cidrs` fetches them
-    #: at reconcile time, which is the only way they can reach a manifest.
+    #: routable. Two functions fetch them, and between them they are the only way
+    #: these values can reach a manifest: `server.lifecycle.
+    #: _seal_initial_serverless_egress` at provision time, so the security groups
+    #: Terraform creates admit the deployed app, and `server.lifecycle.
+    #: _refresh_serverless_egress_cidrs` at reconcile time, which re-polls the feed
+    #: and reseals whatever it finds.
     serverless_egress_cidrs: tuple[str, ...] | None = None
     #: The feed's own `timestampSeconds` for the snapshot the list above came
     #: from. Sealing it is what makes staleness *detectable* rather than guessed:

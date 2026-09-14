@@ -656,9 +656,16 @@ def test_the_obligation_needs_no_network_call_of_its_own(
     import inspect
 
     source = inspect.getsource(lifecycle)
-    assert source.count("fetch_serverless_egress_cidrs(") == 2  # the def, and the one caller
+    # The def and its two mutator-path callers: the reconcile-time reseal, and the
+    # provision-time first seal that makes the groups Terraform *creates* admit
+    # the deployed app. Both run under the CLI generation lock; neither is on a
+    # serving path. A third caller is what this count exists to catch.
+    assert source.count("fetch_serverless_egress_cidrs(") == 3
     assert "fetch_serverless_egress_cidrs(" in inspect.getsource(
         lifecycle._refresh_serverless_egress_cidrs
+    )
+    assert "fetch_serverless_egress_cidrs(" in inspect.getsource(
+        lifecycle._seal_initial_serverless_egress
     )
 
 
