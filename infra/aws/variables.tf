@@ -203,3 +203,14 @@ variable "anti_demo_runtime_max_session_seconds" {
     error_message = "anti_demo_runtime_max_session_seconds must be between 3600 and 43200."
   }
 }
+
+variable "round5_runner_instance_type" {
+  description = "Neutral runner shape for the frozen dual-10,000-client Round 5 protocol."
+  type        = string
+  default     = "c7i.2xlarge"
+
+  validation {
+    condition     = contains(["m6i.xlarge", "c7i.2xlarge"], var.round5_runner_instance_type)
+    error_message = "Round 5 dual-10,000 capacity requires m6i.xlarge or c7i.2xlarge. Smaller overrides are refused before provisioning; do not lower client count, memory/FD reserves, hold time, or telemetry."
+  }
+}

@@ -146,7 +146,7 @@ resource "aws_iam_instance_profile" "round5_runner" {
 
 resource "aws_instance" "round5_runner" {
   ami                         = data.aws_ssm_parameter.round5_runner_ami.value
-  instance_type               = "m6i.large"
+  instance_type               = var.round5_runner_instance_type
   subnet_id                   = local.selected_runner_subnet_id
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.round5_runner.id]

@@ -40,7 +40,7 @@ TARGET_CLIENTS_PER_LANE = 10_000
 # and four other call sites), so changing it changes user-facing cost receipts.
 # Revisit once a diagnostic's normalized CPU evidence justifies the housekeeping
 # headroom.
-RUNNER_INSTANCE_TYPE = "m6i.xlarge"
+RUNNER_INSTANCE_TYPE = "c7i.2xlarge"
 RUNNER_LANE_COUNT = 2
 WORKER_COUNT = 4
 MIN_RUNNER_CPU_COUNT = WORKER_COUNT

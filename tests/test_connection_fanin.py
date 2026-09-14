@@ -54,8 +54,8 @@ def test_auth_method_label_is_not_mistaken_for_credential_material() -> None:
 
 def passing_preflight() -> CapacityPreflight:
     return evaluate_capacity_preflight(
-        instance_type="m6i.xlarge",
-        cpu_count=4,
+        instance_type="c7i.2xlarge",
+        cpu_count=8,
         physical_memory_bytes=15 * 1024**3,
         available_memory_bytes=14 * 1024**3,
         baseline_rss_bytes=100 * 1024**2,
@@ -247,8 +247,8 @@ def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() 
     assert "available_memory_projection" in tight.failures
 
     pressured = evaluate_capacity_preflight(
-        instance_type="m6i.xlarge",
-        cpu_count=4,
+        instance_type="c7i.2xlarge",
+        cpu_count=8,
         physical_memory_bytes=15 * 1024**3,
         available_memory_bytes=14 * 1024**3,
         baseline_rss_bytes=100 * 1024**2,
@@ -264,22 +264,27 @@ def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() 
     assert pressured.failures == ("event_loop_microbatch_pressure",)
 
 
-def test_preprovision_capacity_refuses_large_and_accepts_xlarge() -> None:
+def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() -> None:
     large = evaluate_runner_provisioning_capacity("m6i.large")
     assert not large.sufficient
     assert large.selected.vcpu_count == 2
     assert "physical_memory_projection" in large.failures
     with pytest.raises(
         ValueError,
-        match=r"use m6i\.xlarge.*No client-count, memory-reserve",
+        match=r"use c7i\.2xlarge.*No client-count, memory-reserve",
     ):
         require_runner_provisioning_capacity("m6i.large")
 
-    xlarge = require_runner_provisioning_capacity("m6i.xlarge")
-    assert xlarge.sufficient
-    assert xlarge.selected.vcpu_count == 4
-    assert xlarge.usable_memory_bytes > xlarge.required_memory_bytes
-    assert xlarge.projected_fds == 20_256
+    selected = require_runner_provisioning_capacity("c7i.2xlarge")
+    assert selected.sufficient
+    assert selected.selected.vcpu_count == 8
+    # m6i.xlarge still clears the memory and FD model, so the table must keep
+    # evaluating it -- but require_ refuses any shape that is not the selected one,
+    # because provisioning a merely-adequate shape is how the sealed contract and
+    # the built instance drift apart.
+    assert evaluate_runner_provisioning_capacity("m6i.xlarge").sufficient
+    assert selected.usable_memory_bytes > selected.required_memory_bytes
+    assert selected.projected_fds == 20_256
 
 
 @pytest.mark.parametrize(
@@ -2011,9 +2016,28 @@ def test_callback_profiling_cpu_overhead_is_bounded() -> None:
             diagnostics.restore_ready_batch_limit()
             loop.close()
 
-    baseline_ms = min(measure(probed=False) for _ in range(3))
-    profiled_ms = min(measure(probed=True) for _ in range(3))
-    assert profiled_ms / baseline_ms < 2.5
+    callbacks = 10_000
+    baseline_ms = min(measure(probed=False, callbacks=callbacks) for _ in range(3))
+    profiled_ms = min(measure(probed=True, callbacks=callbacks) for _ in range(3))
+
+    # Budgeted per callback rather than as a ratio. The ratio was the wrong shape:
+    # the baseline is a few milliseconds for 10,000 bare callbacks, so it measures
+    # how fast this machine dispatches a no-op, and dividing by it turns a fixed
+    # instrumentation cost into a number that swings with the hardware. It does
+    # swing -- the probe reads a thread CPU clock per callback, which is close to
+    # free on Apple silicon and materially slower on the x86 Linux runner CI uses,
+    # so the same code measured 2.2x locally and 3.4x there.
+    #
+    # What the fan-in actually needs is that profiling not perturb the ramp it is
+    # instrumenting. At one microsecond per callback, 10,000 clients pay ten
+    # milliseconds against a ramp measured in seconds, which is inside the noise of
+    # a single connect. Two microseconds is the ceiling; past that the
+    # instrumentation is shaping the measurement rather than observing it.
+    overhead_us_per_callback = (profiled_ms - baseline_ms) * 1_000 / callbacks
+    assert overhead_us_per_callback < 2.0, (
+        f"callback profiling costs {overhead_us_per_callback:.2f}us per callback "
+        f"(baseline {baseline_ms:.2f}ms, profiled {profiled_ms:.2f}ms)"
+    )
 
 
 def test_malformed_counts_and_monotonic_times_fail_closed() -> None:

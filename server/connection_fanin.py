@@ -17,9 +17,11 @@ from enum import StrEnum
 FANIN_PROTOCOL = "round5-fanin-v2"
 FANIN_SCHEMA_VERSION = 2
 TARGET_CLIENTS_PER_LANE = 10_000
-# Mirrors runner.round5_fanin. c7i.2xlarge stays evaluatable but unselected
-# because the shape is wired into the cost model and user-facing receipts.
-RUNNER_INSTANCE_TYPE = "m6i.xlarge"
+# Mirrors runner.round5_fanin. Selected because m6i.xlarge has exactly WORKER_COUNT
+# vCPUs, leaving nothing for the parent process, the SSM agent, or kernel packet
+# processing across 20,000 sockets -- the starvation docs/ROUND5_10K_PROTOCOL.md
+# records. c7i.2xlarge keeps four cores free for that housekeeping.
+RUNNER_INSTANCE_TYPE = "c7i.2xlarge"
 RUNNER_LANE_COUNT = 2
 WORKER_COUNT = 4
 MIN_RUNNER_CPU_COUNT = WORKER_COUNT
@@ -130,13 +132,12 @@ class RunnerProvisioningCapacity:
 RUNNER_INSTANCE_CAPACITIES = {
     "m6i.large": RunnerInstanceCapacity("m6i.large", 2, 8 * 1024**3),
     "m6i.xlarge": RunnerInstanceCapacity("m6i.xlarge", 4, 16 * 1024**3),
-    # Evaluatable but not yet selected. WORKER_COUNT stays 4 because each worker
+    # The selected shape. WORKER_COUNT stays 4 because each worker
     # is one asyncio event loop and a loop cannot span cores; the extra four
     # vCPUs exist so the parent, the off-loop telemetry threads, and kernel
     # packet processing for 20,000 sockets stop competing with the pinned
     # workers. Same 16 GiB as the xlarge, which the memory model already clears
-    # with roughly 7 GiB to spare. Selecting it requires the Terraform variable,
-    # the manifest Literal, and a reseal -- see docs/ROUND5_10K_PROTOCOL.md.
+    # with roughly 7 GiB to spare. See docs/ROUND5_10K_PROTOCOL.md.
     "c7i.2xlarge": RunnerInstanceCapacity("c7i.2xlarge", 8, 16 * 1024**3),
 }
 

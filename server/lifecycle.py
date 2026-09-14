@@ -43,6 +43,7 @@ from .capacity import (
     capacity_parity,
     rds_lane_is_scored,
 )
+from .connection_fanin import RUNNER_INSTANCE_TYPE as ROUND5_RUNNER_INSTANCE_TYPE
 from .manifest import (
     PROJECT_ROOT,
     AuroraEnvironmentSeal,
@@ -3879,7 +3880,7 @@ def _round5_topology_check(
         if (
             runner.get("InstanceId") != sealed.runner_instance_id
             or (runner.get("State") or {}).get("Name") != "running"
-            or runner.get("InstanceType") != "m6i.large"
+            or runner.get("InstanceType") != ROUND5_RUNNER_INSTANCE_TYPE
             or not runner.get("PublicIpAddress")
             or runner.get("SubnetId") != sealed.runner_subnet_id
             or runner.get("VpcId") != sealed.vpc_id
