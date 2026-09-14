@@ -896,7 +896,7 @@ describe('Ringside output behavior', () => {
   it('states a one-sided Round 5 towel consistently for every audience track', () => {
     const session = oneSidedRoundFiveSetupTowel()
     const classified = classifyOutcome(session)
-    const expectedProof = 'Lakebase pooled-path setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The recurring 128-attempt check at maximum 64 concurrent did not run.'
+    const expectedProof = 'Lakebase pooled-path setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The shared-T0 10,000-client fan-in did not run.'
     expect(classified.headline).toBe(
       'LAKEBASE SETUP VERIFIED 2.63s · AURORA SERVERLESS V2 + RDS PROXY UNVERIFIED BEYOND 60.84s · BOUNDED CHECK NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A',
     )
@@ -946,11 +946,16 @@ describe('Ringside output behavior', () => {
           expect(cue.say).toMatch(/\bup to 10,000 client connections\b/i)
           expect(cue.say).not.toMatch(sayProofJargon)
           expect(cue.show).toContain(
-            'This bout verified pooled-path setup and 128 attempts at maximum 64 concurrent.',
+            'Both paths connected and held 10,000 clients from the same start.',
           )
-          expect(cue.show).toMatch(/separate 64-client multiplexing phase passed/i)
-          expect(cue.show).toMatch(/direct AWS connections and alternative pools were not compared/i)
-          expect(cue.show).not.toMatch(/10,000|ten thousand/i)
+          expect(cue.show).toMatch(/64 sparse SELECT 1 checks per lane passed/i)
+          expect(cue.show).toMatch(/transaction throughput were not measured/i)
+          // Under the bounded protocol the proof line was forbidden from naming
+          // 10,000, because 10,000 was a product limit the bout never approached
+          // and the round measured 128 attempts. The fan-in protocol measures
+          // exactly 10,000 held clients, so naming it is now required and staying
+          // silent would be the inaccuracy.
+          expect(cue.show).toMatch(/\b10,000 clients\b/i)
           expect(`${cue.say} ${cue.ask}`).not.toMatch(forbidden)
           expect(`${cue.say} ${cue.ask} ${cue.show}`).not.toMatch(bluntTenThousandDisclaimer)
         }
@@ -965,9 +970,16 @@ describe('Ringside output behavior', () => {
           expect(cue.say).not.toMatch(sayProofJargon)
           expect(cue.ask).toMatch(/\?$/)
           expect(cue.show).not.toBe('')
-          expect(cue.show).toMatch(/128[- ]attempt/i)
-          expect(cue.show).toMatch(/maximum 64 concurrent/i)
-          expect(cue.show).not.toMatch(/10,000|ten thousand/i)
+          // Inverted with the protocol: the bounded round measured 128 attempts and
+          // was forbidden from naming 10,000, which it never approached. The fan-in
+          // round measures exactly 10,000 held clients, so the proof line must name
+          // that and must not describe the attempt count it no longer runs.
+          // Not every outcome names the target: a bout whose setup never verified
+          // reports that, and inventing a client count for it would be worse than
+          // silence. What holds across all of them is that none may still describe
+          // the attempt count this protocol no longer runs. `cue.say` above already
+          // requires the 10,000-client framing on every cue.
+          expect(cue.show).not.toMatch(/128[- ]attempts?|maximum 64 concurrent/i)
           expect(`${cue.say} ${cue.ask}`).not.toMatch(forbidden)
           expect(`${cue.say} ${cue.ask} ${cue.show}`).not.toMatch(bluntTenThousandDisclaimer)
           expect(cue.say.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
