@@ -1413,13 +1413,23 @@ def test_round_five_audience_numbers_keep_the_measured_boundary(
                 isinstance(proof, str)
                 and record.get("round_id") == "survive_connection_spike"
             ):
-                assert "128" in proof
-                assert re.search(r"\bmax(?:imum)? 64 concurrent\b", proof, re.I)
-                assert re.search(
-                    r"\battempts?\b",
-                    proof,
-                    re.I,
-                )
+                # This guard inverted with the protocol. The bounded round had to
+                # disclose its own limits -- 128 attempts at maximum 64 concurrent
+                # -- because "connection spike" invited a reader to imagine
+                # thousands. The fan-in round actually holds 10,000 per lane, so the
+                # boundary that now needs stating is that a client connection is not
+                # a backend session, and naming an attempt count it never runs would
+                # be the inaccuracy.
+                assert not re.search(
+                    r"\b128\b|\bmax(?:imum)? 64 concurrent\b", proof, re.I
+                ), f"Round 5 proof still describes the bounded protocol in {relative_path}: {proof}"
+                if "10,000" in proof:
+                    assert re.search(
+                        r"\b10,000[- ]client\b|\b10,000 clients\b", proof, re.I
+                    ), (
+                        f"Round 5 proof names 10,000 without saying clients in "
+                        f"{relative_path}: {proof}"
+                    )
         return
 
     if relative_path == "frontend/src/round5.ts":
