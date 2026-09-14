@@ -4584,9 +4584,15 @@ def _prepare_and_reassert_round5_aws_credentials(
     runner_instance_id: str,
     common: dict[str, Any],
     lanes: tuple[tuple[str, str, str, str], ...],
-) -> dict[str, str]:
-    """Prepare ordinary source roles, then populate stable Proxy secrets."""
-    digests: dict[str, str] = {}
+) -> dict[str, dict[str, str]]:
+    """Prepare ordinary source roles, then populate stable Proxy secrets.
+
+    Returns both digests per lane. The observer one is not optional decoration: the
+    fan-in protocol proves multiplexing from a second role on its own connection, so its
+    request names an observer credential for each lane and the runner refuses a request
+    without one.
+    """
+    digests: dict[str, dict[str, str]] = {}
     for lane_id, direct_host, master_secret_arn, destination_secret_arn in lanes:
         prepared = _round5_setup_request(
             ssm,
@@ -4602,8 +4608,13 @@ def _prepare_and_reassert_round5_aws_credentials(
             },
         )
         credential_sha256 = str(prepared.get("credential_sha256") or "")
+        observer_credential_sha256 = str(prepared.get("observer_credential_sha256") or "")
         if re.fullmatch(r"[0-9a-f]{64}", credential_sha256) is None:
             raise RuntimeError(f"Round 5 runner returned an invalid {lane_id} credential digest")
+        if re.fullmatch(r"[0-9a-f]{64}", observer_credential_sha256) is None:
+            raise RuntimeError(
+                f"Round 5 runner returned an invalid {lane_id} observer credential digest"
+            )
         _round5_setup_request(
             ssm,
             runner_instance_id=runner_instance_id,
@@ -4619,7 +4630,10 @@ def _prepare_and_reassert_round5_aws_credentials(
                 "credential_sha256": credential_sha256,
             },
         )
-        digests[lane_id] = credential_sha256
+        digests[lane_id] = {
+            "client": credential_sha256,
+            "observer": observer_credential_sha256,
+        }
     return digests
 
 
@@ -4690,7 +4704,19 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
         session, runner_instance_id=outputs["runner_instance_id"], timeout=timeout
     )
 
-    if manifest.round5_ready:
+    # A seal minted before the observer digests existed verifies clean but cannot run
+    # the fan-in protocol, because its request names an observer credential per lane.
+    # Treat that as material to re-mint rather than as a seal to confirm, or the
+    # installation stays permanently on the bounded protocol with nothing reporting why.
+    _observer_sealed = manifest.round5_ready and all(
+        getattr(manifest.round5, name, None)
+        for name in (
+            "lakebase_observer_credential_sha256",
+            "aurora_observer_credential_sha256",
+            "rds_observer_credential_sha256",
+        )
+    )
+    if manifest.round5_ready and _observer_sealed:
         sealed = manifest.require_round5_resources()
         for field in (
             "aurora_direct_host",
@@ -4867,8 +4893,13 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             ),
         )
         lakebase_credential_sha256 = str(lakebase_result.get("credential_sha256") or "")
-        aurora_credential_sha256 = aws_digests["aurora"]
-        rds_credential_sha256 = aws_digests["rds"]
+        lakebase_observer_credential_sha256 = str(
+            lakebase_result.get("observer_credential_sha256") or ""
+        )
+        aurora_credential_sha256 = aws_digests["aurora"]["client"]
+        rds_credential_sha256 = aws_digests["rds"]["client"]
+        aurora_observer_credential_sha256 = aws_digests["aurora"]["observer"]
+        rds_observer_credential_sha256 = aws_digests["rds"]["observer"]
         if not all(
             re.fullmatch(r"[0-9a-f]{64}", digest)
             for digest in (
@@ -4910,6 +4941,9 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             "lakebase_credential_sha256": lakebase_credential_sha256,
             "aurora_credential_sha256": aurora_credential_sha256,
             "rds_credential_sha256": rds_credential_sha256,
+            "lakebase_observer_credential_sha256": lakebase_observer_credential_sha256,
+            "aurora_observer_credential_sha256": aurora_observer_credential_sha256,
+            "rds_observer_credential_sha256": rds_observer_credential_sha256,
             "bout_name_prefix": outputs["bout_name_prefix"],
             "ownership_tags": ownership_tags.model_dump(mode="json"),
             "credential_root": "/var/lib/lakebase-anti-demo/credentials",

@@ -208,6 +208,11 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
         rds_resource_id="db-RESOURCE",
         rds_direct_host="rds-direct.test",
         rds_credential_sha256="f" * 64,
+        # A complete seal names an observer credential per lane; the fan-in
+        # request requires one and the runner refuses a request without it.
+        lakebase_observer_credential_sha256="f" * 64,
+        aurora_observer_credential_sha256="f" * 64,
+        rds_observer_credential_sha256="f" * 64,
         rds_proxy_secret_arn=(
             f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:rds-proxy"
         ),

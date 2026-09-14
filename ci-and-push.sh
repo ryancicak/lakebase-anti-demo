@@ -196,6 +196,8 @@ git add -A \
   server/manifest.py \
   tests/conftest.py \
   tests/test_fanin_request.py \
+  tests/test_manifest.py \
+  tests/test_connection_spike_setup_live.py \
   tests/test_lifecycle.py \
   tests/test_operator_ingress.py \
   tests/test_server_launch.py

@@ -698,6 +698,27 @@ class Round5Resources(BaseModel):
     lakebase_credential_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     aurora_credential_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     rds_credential_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    #: The observer role's credential digests, one per lane.
+    #:
+    #: The fan-in protocol proves multiplexing by watching the pool from a second role
+    #: on its own direct connection, so its request names an observer credential for
+    #: both lanes and the runner refuses a request without them. The setup phase has
+    #: always minted these and returned their digests; nothing sealed them, which is why
+    #: the fan-in request could not be built from the manifest.
+    #:
+    #: Optional with no default value on purpose. An installation sealed before these
+    #: existed stays loadable and keeps serving; it simply cannot run the fan-in
+    #: protocol until the next reseal fills them in, which is a truthful state rather
+    #: than a broken one.
+    lakebase_observer_credential_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    aurora_observer_credential_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    rds_observer_credential_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     bout_name_prefix: str = Field(min_length=1, max_length=48)
     # Legacy per-bout secret discovery prefix, load-compatible for migration.
     secret_name_prefix: str | None = Field(default=None, min_length=1, max_length=128)

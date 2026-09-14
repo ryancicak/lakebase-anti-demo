@@ -431,6 +431,11 @@ def _round5_resources() -> Round5Resources:
         lakebase_credential_sha256="f" * 64,
         aurora_credential_sha256="8" * 64,
         rds_credential_sha256="9" * 64,
+        # A complete seal names an observer credential per lane; the fan-in
+        # request requires one and the runner refuses a request without it.
+        lakebase_observer_credential_sha256="9" * 64,
+        aurora_observer_credential_sha256="9" * 64,
+        rds_observer_credential_sha256="9" * 64,
         bout_name_prefix="anti-demo-r5-bout",
         ownership_tags=Round5OwnershipTags(
             anti_demo_run_id="ad-test-v3",

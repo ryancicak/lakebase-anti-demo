@@ -1021,7 +1021,13 @@ def test_round5_aws_credentials_are_prepared_before_static_secrets_are_reasserte
         payload = kwargs["payload"]
         requests.append(payload)
         return (
-            {"credential_sha256": ("a" if payload["lane_id"] == "aurora" else "b") * 64}
+            {
+                # The runner returns both digests from prepare_rds_baseline. The observer
+                # one is what the fan-in request needs per lane, and dropping it is why
+                # the manifest could never name one.
+                "credential_sha256": ("a" if payload["lane_id"] == "aurora" else "b") * 64,
+                "observer_credential_sha256": ("c" if payload["lane_id"] == "aurora" else "d") * 64,
+            }
             if payload["action"] == "prepare_rds_baseline"
             else {}
         )
@@ -1055,7 +1061,12 @@ def test_round5_aws_credentials_are_prepared_before_static_secrets_are_reasserte
     ]
     assert requests[1]["destination_secret_arn"] == "proxy-secret-a"
     assert requests[3]["destination_secret_arn"] == "proxy-secret-r"
-    assert digests == {"aurora": "a" * 64, "rds": "b" * 64}
+    # Both digests per lane. The observer one is what the fan-in request needs, and it
+    # was previously read from the runner's response and then dropped on the floor.
+    assert digests == {
+        "aurora": {"client": "a" * 64, "observer": "c" * 64},
+        "rds": {"client": "b" * 64, "observer": "d" * 64},
+    }
 
 
 def test_the_cleanup_runner_idle_probe_is_a_command_ssm_would_accept(monkeypatch) -> None:
