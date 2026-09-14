@@ -240,8 +240,17 @@ inventory is complete.
 
 ## What has been proven and what has not
 
-This project is experimental. No one has completed the documented install from
-start to finish on a fresh machine and fresh accounts.
+This project is experimental, and the boundary of what has been observed is stated
+here rather than implied.
+
+**The documented install has been completed end to end.** On 2026-09-14, from a
+checkout holding no `.venv`, no `frontend/dist`, no `node_modules` and no
+installation state, `./bootstrap.sh --apply --deploy-app --yes` reached a deployed
+App serving all six rounds in **32 minutes 48 seconds**, unattended, with no manual
+step. Verified from outside the installer: `/readyz` answered 200 with
+`status: ready`, `degraded: false`, and every round reporting `availability: ready`.
+That is one run on one machine against one pair of accounts, which is the claim: it
+works, not that it always will.
 
 The author's live runs as of 2026-08-25:
 
@@ -251,9 +260,9 @@ The author's live runs as of 2026-08-25:
 | Round 2 | 10 verified schema-change bouts — 7 against Aurora, 3 against RDS |
 | Round 3 | 8 verified recovery bouts — 3 against Aurora, 5 against RDS |
 | Round 4 | 2 verified Lakebase bouts; no AWS lane was timed |
-| Round 5 | 6 verified setup and burst bouts across Aurora and RDS |
+| Round 5 | 6 verified setup and bounded-check bouts across Aurora and RDS. The exact 10,000-client fan-in protocol is implemented and sealed but has never completed a scored run, so no 10,000-connection timing is claimed anywhere |
 | Round 6 | 7 receipt-backed bouts and 1 earlier log-derived bout; no AWS lane was timed |
-| Deployed app | All 6 rounds have run; a default install exposes 5 because Round 5 needs extra IAM setup |
+| Deployed app | All 6 rounds have run. The 2026-09-14 install above exposed all six from a single command, with no separate Round 5 IAM step |
 
 Receipts contain live endpoints and run IDs, so they are not committed. The
 deployment record and known gaps are in

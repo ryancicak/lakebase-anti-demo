@@ -30,7 +30,19 @@ from typing import Any
 
 import psycopg
 
-from runner.external_io import connect_runner_database
+# The generator is installed beside external_io.py on the instance, not inside a
+# `runner` package, and run_connection_spike.sh execs the interpreter with -I so the
+# script directory is not on sys.path either. Try the package, then the sibling.
+try:
+    from .external_io import connect_runner_database
+except ImportError:
+    import sys as _external_sys
+    from pathlib import Path as _ExternalPath
+
+    _external_directory = str(_ExternalPath(__file__).resolve().parent)
+    if _external_directory not in _external_sys.path:
+        _external_sys.path.insert(0, _external_directory)
+    from external_io import connect_runner_database
 
 PROTOCOL = "round5-fanin-v2"
 SCHEMA_VERSION = 2

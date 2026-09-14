@@ -29,10 +29,28 @@ from uuid import UUID
 import psycopg
 from psycopg import sql
 
-from runner.external_io import (
-    connect_runner_database,
-    secrets_manager_for_runner_operation,
-)
+# Same isolated-import problem `round5_fanin` solves below, and for the same reason:
+# run_connection_spike.sh execs the interpreter with -I, which implies -P, so the
+# script's own directory is not on sys.path. An absolute `runner.external_io` import
+# also assumes a package that does not exist on the instance, where these files are
+# installed side by side under /opt/lakebase-anti-demo/round5. Try the package, then
+# the sibling.
+try:
+    from .external_io import (
+        connect_runner_database,
+        secrets_manager_for_runner_operation,
+    )
+except ImportError:
+    import sys as _external_sys
+    from pathlib import Path as _ExternalPath
+
+    _external_directory = str(_ExternalPath(__file__).resolve().parent)
+    if _external_directory not in _external_sys.path:
+        _external_sys.path.insert(0, _external_directory)
+    from external_io import (
+        connect_runner_database,
+        secrets_manager_for_runner_operation,
+    )
 
 WORKER_CRASH_PREFIX = "WORKER_CRASH_JSON:"
 WORKER_RESULT_QUEUE_PROFILE_PREFIX = "WORKER_RESULT_QUEUE_PROFILE_JSON:"

@@ -187,7 +187,10 @@ fi
 git add -A \
   README.md \
   ci-and-push.sh \
+  runner/connection_spike_runner.py \
+  runner/round5_fanin.py \
   server/cli.py \
+  server/connection_spike_live.py \
   server/lifecycle.py \
   server/manifest.py \
   tests/conftest.py \

@@ -125,6 +125,12 @@ SETUP_RUNNER_PATH = RUNNER_PATH
 TRUST_BUNDLE_PATH = "/opt/lakebase-anti-demo/round5/round5-ca.pem"
 RUNNER_ASSETS = (
     "connection_spike_runner.py",
+    # The fan-in protocol split the harness into three files, and the installer only
+    # ever copied one. A module missing from this tuple is not a soft failure: the
+    # runner dies on ModuleNotFoundError inside an SSM command, and the operator sees
+    # "Round 5 runner configuration command failed" with no mention of an import.
+    "round5_fanin.py",
+    "external_io.py",
     "run_connection_spike.sh",
     "requirements-round5.txt",
 )
