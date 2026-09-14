@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -1024,3 +1024,101 @@ def finalize_lane(
             failures=tuple(failures),
         ),
     )
+
+#: Where the sealed CA bundle lives on the runner. Mirrors
+#: `runner.connection_spike_runner.TRUST_BUNDLE_PATH`; the decoder compares the request
+#: against its own constant, so a drift here is refused rather than silently trusted.
+TRUST_BUNDLE_PATH = "/opt/lakebase-anti-demo/round5/round5-ca.pem"
+
+#: The two lanes a fan-in request must name, no more and no fewer.
+RUNTIME_LANE_IDS = frozenset({"lakebase", "competitor"})
+
+
+def fanin_preflight_request(
+    *,
+    run_id: str,
+    runner_instance_type: str,
+    contract_sha256: str,
+    config_sha256: str,
+    generator_sha256: str,
+    capacity_model_sha256: str,
+) -> dict[str, object]:
+    """The capacity-preflight request, which carries exactly nine keys.
+
+    The runner compares the key set for equality, not containment, so an extra field is
+    a refusal rather than something ignored. That is deliberate: a preflight is what
+    decides whether 10,000 clients per lane can be held at all, and a request carrying
+    fields the runner does not understand is a request built by a different version.
+    """
+
+    return {
+        "protocol": FANIN_PROTOCOL,
+        "schema_version": FANIN_SCHEMA_VERSION,
+        "action": "preflight",
+        "run_id": run_id,
+        "runner_instance_type": runner_instance_type,
+        "contract_sha256": contract_sha256,
+        "config_sha256": config_sha256,
+        "generator_sha256": generator_sha256,
+        "capacity_model_sha256": capacity_model_sha256,
+    }
+
+
+def fanin_run_request(
+    *,
+    run_id: str,
+    contract_sha256: str,
+    config_sha256: str,
+    generator_sha256: str,
+    capacity_model_sha256: str,
+    trust_bundle_sha256: str,
+    lakebase_credential_sha256: str,
+    lakebase_observer_credential_sha256: str,
+    competitor_credential_sha256: str,
+    competitor_observer_credential_sha256: str,
+    competitor_credential_id: str,
+    targets: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """The bout request: two lanes, one shared start, no retries.
+
+    `baseline_auth` is asymmetric on purpose and the runner enforces it. The competitor
+    lane carries `credential_id` because Aurora and RDS are two separately sealed
+    credentials and the runner has to know which one it is holding; the Lakebase lane
+    has exactly one, so passing an id there is refused as an over-specified request.
+
+    Digests are passed in rather than recomputed here so that the caller proves it is
+    sending the arm it armed. Recomputing them inside this function would make a stale
+    arm indistinguishable from a current one, which is the whole thing the seal exists
+    to catch.
+    """
+
+    if len(targets) != RUNNER_LANE_COUNT:
+        raise FanInError("targets_invalid")
+    lane_ids = {str(target.get("lane_id") or "") for target in targets}
+    if lane_ids != set(RUNTIME_LANE_IDS):
+        raise FanInError("targets_invalid")
+
+    return {
+        "protocol": FANIN_PROTOCOL,
+        "schema_version": FANIN_SCHEMA_VERSION,
+        "action": "run",
+        "run_id": run_id,
+        "contract_sha256": contract_sha256,
+        "config_sha256": config_sha256,
+        "generator_sha256": generator_sha256,
+        "capacity_model_sha256": capacity_model_sha256,
+        "trust_bundle_path": TRUST_BUNDLE_PATH,
+        "trust_bundle_sha256": trust_bundle_sha256,
+        "baseline_auth": {
+            "lakebase": {
+                "credential_sha256": lakebase_credential_sha256,
+                "observer_credential_sha256": lakebase_observer_credential_sha256,
+            },
+            "competitor": {
+                "credential_sha256": competitor_credential_sha256,
+                "observer_credential_sha256": competitor_observer_credential_sha256,
+                "credential_id": competitor_credential_id,
+            },
+        },
+        "targets": [dict(target) for target in targets],
+    }

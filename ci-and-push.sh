@@ -190,10 +190,12 @@ git add -A \
   runner/connection_spike_runner.py \
   runner/round5_fanin.py \
   server/cli.py \
+  server/connection_fanin.py \
   server/connection_spike_live.py \
   server/lifecycle.py \
   server/manifest.py \
   tests/conftest.py \
+  tests/test_fanin_request.py \
   tests/test_lifecycle.py \
   tests/test_operator_ingress.py \
   tests/test_server_launch.py
