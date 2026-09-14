@@ -14,9 +14,9 @@ import {
 } from './types'
 import verifiedSource from './verified-corpus.jsonl?raw'
 
-export const VERIFIED_CORPUS_SHA256 = 'f2ddca355ee2e101250c4bf2c05121ebf56d0649c7cda60bca94726a3d6359c8'
-export const OUTCOME_COPY_SHA256 = '1dfdc0255607765a5f518b077c9cc6983a79a8b60ec72657057d9943a87772ab'
-export const ROUND_FIVE_PERSONA_OUTCOMES_SHA256 = '6c651d047288d8fb48bacc043964e3393a9ab267cae6a56dc98870fd43c9281c'
+export const VERIFIED_CORPUS_SHA256 = '3b434bdeb807868731146ea20a60f1158ecc73acad62dd36b557c4cf70747c51'
+export const OUTCOME_COPY_SHA256 = 'fd10a7136d2f47f10fb6919953647c4d079d5fffbb2d183d2b8d0728e81f9949'
+export const ROUND_FIVE_PERSONA_OUTCOMES_SHA256 = 'fc06b33d84ca8611682a5d51eedaffb590fe029bfe46effa5770d34014b71384'
 
 export const PERSONA_IDS = [
   'data_engineer',

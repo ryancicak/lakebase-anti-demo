@@ -1704,8 +1704,14 @@ export function receiptPresentation(
       lakebaseStatus: recurringFanIn ? '10,000 CLIENTS AUTHENTICATED + HELD · 30S HOLD VERIFIED' : 'LEGACY SCORECARD · CURRENT FAN-IN NOT RECORDED',
       competitorStatus: recurringFanIn ? '10,000 CLIENTS AUTHENTICATED + HELD · 30S HOLD VERIFIED' : 'LEGACY SCORECARD · CURRENT FAN-IN NOT RECORDED',
       competitorCapabilityGap: false,
+      // The receipt says what both lanes did before it says which one won. A
+      // reader who sees only "LAKEBASE REACHED 10,000 · 1.00s SOONER" cannot tell
+      // whether the other lane got there at all, and under this protocol both
+      // reaching 10,000 is the precondition for there being a margin to report.
       verdictLabel: classified.contractComplete
-        ? recurringFanIn ? 'EXACT FAN-IN RESULT DECLARED · ALL GATES PASSED' : 'LEGACY RESULT DECODED · CURRENT FAN-IN NOT RECORDED'
+        ? recurringFanIn
+          ? 'BOTH PATHS CONNECTED AND HELD 10,000 CLIENTS FROM THE SAME START · ALL GATES PASSED'
+          : 'LEGACY RESULT DECODED · CURRENT FAN-IN NOT RECORDED'
         : 'EXACT FAN-IN COMPARISON INCOMPLETE',
       verdict: classified.headline,
       fairness: roundFiveFairness(session),

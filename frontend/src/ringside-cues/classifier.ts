@@ -340,9 +340,19 @@ function outcomeHeadline(
     && decision.status === 'declared_comparison'
   ) {
     const winner = winnerName(session, decision.formalWinner)
-    if (winner === 'TIE') return 'BOTH POOLED PATHS VERIFIED TOGETHER'
+    // Under fan-in the verdict names what was reached, not that a path verified:
+    // both paths verified, and the result is which one got 10,000 clients there
+    // first. "VERIFIED A POOLED PATH" was the bounded round's verdict, where
+    // finishing setup was the whole achievement.
+    const fanIn = session.round5_setup?.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    if (winner === 'TIE') {
+      return fanIn
+        ? 'BOTH PATHS REACHED 10,000 TOGETHER'
+        : 'BOTH POOLED PATHS VERIFIED TOGETHER'
+    }
+    const verb = fanIn ? 'REACHED 10,000' : 'VERIFIED A POOLED PATH'
     return winner
-      ? `${winner} VERIFIED A POOLED PATH · ${decision.marginMs === null ? 'MARGIN N/A' : `${seconds(decision.marginMs)} SOONER`}`
+      ? `${winner} ${verb} · ${decision.marginMs === null ? 'MARGIN N/A' : `${seconds(decision.marginMs)} SOONER`}`
       : 'NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A'
   }
   if (decision.status === 'adjudicated_stoppage') {

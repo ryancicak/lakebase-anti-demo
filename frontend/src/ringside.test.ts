@@ -54,7 +54,6 @@ function verifiedSession(
   const round = FALLBACK_CATALOG.rounds.find((candidate) => candidate.id === roundId)!
   const competitor = FALLBACK_CATALOG.competitors.find((candidate) => candidate.id === competitorId)!
   const primary = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'software_engineer')!
-  const successfulLatencyMs = Array.from({ length: 128 }, (_, index) => 10 + index / 100)
   const session: DemoSession = {
     id: `fixture-${roundId}`,
     state: 'verified',
@@ -896,7 +895,7 @@ describe('Ringside output behavior', () => {
   it('states a one-sided Round 5 towel consistently for every audience track', () => {
     const session = oneSidedRoundFiveSetupTowel()
     const classified = classifyOutcome(session)
-    const expectedProof = 'Lakebase pooled-path setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The shared-T0 10,000-client fan-in did not run.'
+    const expectedProof = 'Lakebase pooled-path setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The 10,000-client fan-in never started.'
     expect(classified.headline).toBe(
       'LAKEBASE SETUP VERIFIED 2.63s · AURORA SERVERLESS V2 + RDS PROXY UNVERIFIED BEYOND 60.84s · BOUNDED CHECK NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A',
     )
