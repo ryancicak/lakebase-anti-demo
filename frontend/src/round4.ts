@@ -132,10 +132,35 @@ const runningLaneRank: Partial<Record<LaneSnapshot['state'], number>> = {
   verifying: 2,
 }
 
+/**
+ * The live fan-in counters, which only ever climb inside one bout.
+ *
+ * Round 5 ramps to 10,000 clients per lane over tens of seconds, and the ring shows
+ * that climbing. A refresh or an SSE reconnect can deliver a snapshot taken earlier
+ * than the one already on screen, with the same lane state and the same elapsed
+ * time, differing only here. Without this the counter visibly rewinds mid-ramp,
+ * which reads as clients dropping.
+ */
+function liveClientCount(lane: LaneSnapshot): number | null {
+  const evidence = asRecord(lane.evidence)
+  for (const key of ['held_clients', 'authenticated_clients'] as const) {
+    const value = evidence[key]
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value
+  }
+  return null
+}
+
 function runningLaneRegresses(current: LaneSnapshot, incoming: LaneSnapshot): boolean {
   const currentRank = runningLaneRank[current.state]
   const incomingRank = runningLaneRank[incoming.state]
   if (laneIsTerminal(current) && incoming.state !== current.state) return true
+  // Checked before the state and elapsed comparisons below, because a stale
+  // mid-ramp snapshot agrees with the current one on both of those.
+  const currentClients = liveClientCount(current)
+  if (currentClients !== null) {
+    const incomingClients = liveClientCount(incoming)
+    if (incomingClients !== null && incomingClients < currentClients) return true
+  }
   if (
     laneIsTerminal(current)
     && current.elapsed_ms !== null

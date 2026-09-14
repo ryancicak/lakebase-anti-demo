@@ -147,26 +147,53 @@ function verifiedSession(
   }
 
   if (roundId === 'survive_connection_spike') {
-    const laneEvidence = {
-      scheduled_clients: 128,
-      terminal_clients: 128,
-      successful_clients: 128,
-      error_clients: 0,
-      successful_latency_ms: successfulLatencyMs,
-      witness_verified_clients: 64,
-      unique_backend_pids: 8,
-      peak_backend_sessions: 16,
-    }
-    session.lanes.lakebase.evidence = laneEvidence
-    session.lanes.competitor.evidence = laneEvidence
+    // The fan-in protocol. Round 5 has no bounded variant any more, so a fixture
+    // shaped like the 128-attempt burst would be testing a protocol that no longer
+    // exists.
+    const fanInEvidence = (timeToTargetMs: number, authMethod: string) => ({
+      protocol: 'round5-fanin-v2',
+      schema_version: 2,
+      initiated_clients: 10_000,
+      authenticated_clients: 10_000,
+      held_clients_at_gate: 10_000,
+      terminal_failures: 0,
+      retries: 0,
+      disconnected_during_hold: 0,
+      time_to_target_ms: timeToTargetMs,
+      hold_elapsed_ms: 30_000.001,
+      sampled_queries_attempted: 64,
+      sampled_queries_succeeded: 64,
+      sampled_queries_failed: 0,
+      unique_backend_pids: 19,
+      current_backend_sessions: 5,
+      peak_backend_sessions: 37,
+      preexisting_client_role_sessions: 0,
+      observer_role: 'anti_demo_observer',
+      client_role: 'anti_demo_burst',
+      observer_direct: true,
+      auth_method: authMethod,
+      distinct_socket_fds: 10_000,
+      distinct_local_endpoints: 10_000,
+      telemetry_verified: true,
+      telemetry_failures: [],
+    })
+    session.lanes.lakebase.elapsed_ms = 12_350
+    session.lanes.competitor.elapsed_ms = 24_000
+    session.lanes.lakebase.evidence = fanInEvidence(12_350, 'tls-cleartext-password')
+    session.lanes.competitor.evidence = fanInEvidence(24_000, 'scram-sha-256')
     session.fairness = {
       same_client: true,
       same_transaction: true,
       same_nonce: true,
       launch_skew_ms: 2,
-      warmup_connections: 4,
-      concurrency: 64,
-      runner: 'Python 3.12 + psycopg 3.3.4',
+      protocol: 'round5-fanin-v2',
+      warmup_connections: 0,
+      concurrency: 10_000,
+      target_clients_per_lane: 10_000,
+      sampled_queries_per_lane: 64,
+      hold_seconds: 30,
+      max_retries: 0,
+      runner: 'Python 3.12 event-driven TLS/native-password',
       tls: 'verify-full',
       timeout: '30m',
     }
@@ -179,6 +206,8 @@ function verifiedSession(
     session.round5_setup = {
       state: 'verified',
       workflow_launch_skew_ms: 2,
+      protocol: 'round5-fanin-v2',
+      schema_version: 2,
       setup_validated: true,
       downstream_validated: true,
       cleanup_retryable: false,
@@ -206,7 +235,8 @@ function verifiedSession(
     session.comparison = {
       kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: { spec_id: 'setup_elapsed_ms', value: 11_650, display_value: '11.65s' },
+      // Fan-in scores shared-T0 time to 10,000, not pooled-path setup.
+      margin: { spec_id: 'time_to_10000_ms', value: 11_650, display_value: '11.65s' },
       detail: 'fixture',
     }
   }
@@ -405,8 +435,19 @@ function incompleteSetup(): DemoSession {
 function failedSpike(): DemoSession {
   const session = verifiedSession('survive_connection_spike')
   session.state = 'failed'
-  session.lanes.competitor.state = 'failed'
-  session.lanes.competitor.evidence = undefined
+  // Both lanes reached 10,000 and therefore both have a fan-in time -- this is the
+  // guardrail failure, not a lane that never arrived. Clearing the competitor's
+  // evidence instead would leave it with no time to 10,000 at all, which is a
+  // one-sided result: under this protocol a lane cannot have a fan-in time without
+  // having reached the target.
+  for (const laneId of ['lakebase', 'competitor'] as const) {
+    session.lanes[laneId].evidence = {
+      ...(session.lanes[laneId].evidence as Record<string, unknown>),
+      // One sampled query failed, so the sparse-query check did not pass.
+      sampled_queries_succeeded: 63,
+      sampled_queries_failed: 1,
+    }
+  }
   session.round5_setup!.state = 'failed'
   session.round5_setup!.downstream_validated = false
   return session

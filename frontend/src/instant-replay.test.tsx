@@ -376,19 +376,21 @@ describe('replayStory', () => {
     expect(story.metrics).toEqual([
       {
         laneId: 'lakebase',
-        label: 'Lakebase built-in pool',
-        value: '2.64s',
-        note: 'Included pool verified',
+        label: 'Lakebase time to 10,000',
+        value: '12.35s',
+        note: 'Exact authenticated held-client gate',
       },
       {
         laneId: 'competitor',
-        label: 'Selected AWS managed pool',
-        value: '693.05s',
-        note: 'New RDS Proxy provisioned',
+        label: 'Selected AWS path time to 10,000',
+        value: '24.00s',
+        note: 'Exact authenticated held-client gate',
       },
     ])
-    expect(story.beats[1].body).toMatch(/not another speed comparison/i)
-    expect(story.beats[2].body).toMatch(/score is pooled-path setup/i)
+    // The primary metric is the fan-in time, and the takeaway has to say that
+    // setup supports it rather than scoring it.
+    expect(story.beats[1].body).toMatch(/exactly 10,000 authenticated held clients/i)
+    expect(story.beats[2].body).toMatch(/fan-in time is primary.*setup supports it/i)
   })
 
   it('keeps Rounds 4 and 6 as capability proofs without an AWS race', () => {
@@ -406,7 +408,7 @@ describe('replayStory', () => {
   it.each([
     ['one exact recovery', partialRecovery(), 'partial', /did not.*no completed comparison or margin/i],
     ['no-result recovery', noResultRecovery(), 'no-result', /without an exact verified result/i],
-    ['one exact Round 5 setup', partialRoundFive(), 'partial', /bounded check did not run/i],
+    ['one exact Round 5 setup', partialRoundFive(), 'partial', /shared-T0 10,000-client fan-in did not run/i],
     ['Round 4 identity failure', guardrailFailure('put_model_score_in_app'), 'partial', /exact row identity did not verify/i],
     ['Round 6 checkout failure', guardrailFailure('analyze_live_orders_without_slowing_checkout'), 'partial', /checkout guardrail did not verify/i],
   ] as const)('adapts %s without claiming completed proof', (_name, session, state, copy) => {
@@ -460,8 +462,8 @@ describe('InstantReplay', () => {
     const story = screen.getByLabelText('Three-beat replay story')
     expect(story.querySelectorAll('.replay-beat')).toHaveLength(3)
     expect(story.querySelectorAll('.replay-primary-metric')).toHaveLength(1)
-    expect(within(story).getAllByText('2.64s')).toHaveLength(1)
-    expect(within(story).getAllByText('693.05s')).toHaveLength(1)
+    expect(within(story).getAllByText('12.35s')).toHaveLength(1)
+    expect(within(story).getAllByText('24.00s')).toHaveLength(1)
     expect(screen.getAllByText(/view full evidence/i)).toHaveLength(1)
     expect(document.querySelectorAll('details')).toHaveLength(1)
     expect(document.querySelector('details details')).toBeNull()
@@ -533,7 +535,7 @@ describe('InstantReplay', () => {
 
   it.each([
     ['put_model_score_in_app', '0.84s'],
-    ['survive_connection_spike', '693.05s'],
+    ['survive_connection_spike', '24.00s'],
     ['analyze_live_orders_without_slowing_checkout', '1.23s'],
   ] as const)('renders %s proof values from its session', (roundId, expected) => {
     const session = verifiedSession(roundId)
