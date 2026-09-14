@@ -3,14 +3,81 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import inspect
 import json
+import queue
+import threading
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from runner import connection_spike_runner as runner
-from server.connection_spike_live import SSM_TIMEOUT_SECONDS
+from server.connection_spike_live import SETUP_SSM_TIMEOUT_SECONDS
+
+
+def test_production_preflight_executes_four_process_affinity_probe() -> None:
+    source = inspect.getsource(runner.main)
+    assert "shard_preflight = shard_process_preflight()" in source
+    assert 'RunnerContractError("fanin_shard_preflight_failed")' in source
+
+
+class _FakeValue:
+    def __init__(self, value: int) -> None:
+        self.value = value
+        self._lock = threading.Lock()
+
+    def get_lock(self):
+        return self._lock
+
+
+class _FakeProcess:
+    def __init__(self, *, name: str, crash: bool = False, **unused) -> None:
+        self.name = name
+        self.exitcode = None
+        self.alive = True
+        self.crash = crash
+        self.terminated = False
+
+    def start(self) -> None:
+        if self.crash:
+            self.exitcode = 1
+            self.alive = False
+
+    def join(self, unused_timeout: float) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.alive = False
+        self.exitcode = -15
+
+
+class _FakeProcessContext:
+    def __init__(self, *, crash_first: bool = False) -> None:
+        self.processes: list[_FakeProcess] = []
+        self.crash_first = crash_first
+
+    def Queue(self):
+        return queue.Queue()
+
+    def Event(self):
+        return threading.Event()
+
+    def Value(self, unused_kind: str, value: int):
+        return _FakeValue(value)
+
+    def Process(self, **kwargs):
+        process = _FakeProcess(
+            name=kwargs["name"],
+            crash=self.crash_first and not self.processes,
+        )
+        self.processes.append(process)
+        return process
 
 
 def _encode_request(request: dict[str, object]) -> str:
@@ -50,15 +117,14 @@ def _setup_verify_material(lane_id: str) -> tuple[dict[str, object], dict[str, o
     return request, stored
 
 
-
 def test_bounded_main_emits_an_object_instead_of_nested_lifecycle_tuple(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    encoded_request = _encode_request({"protocol": runner.PROTOCOL})
+    encoded_request = _encode_request({"protocol": runner.BOUNDED_PROTOCOL})
     expected = {
-        "protocol": runner.PROTOCOL,
+        "protocol": runner.BOUNDED_PROTOCOL,
         "run_id": "run-1",
         "lanes": [],
         "contracts_verified": True,
@@ -68,7 +134,7 @@ def test_bounded_main_emits_an_object_instead_of_nested_lifecycle_tuple(
     monkeypatch.setattr(
         runner,
         "_decode_request",
-        lambda unused: ("run-1", (), (), "a" * 64),
+        lambda unused: ("run-1", (), "a" * 64, ()),
     )
     monkeypatch.setattr(runner, "_validate_runtime", lambda: None)
     monkeypatch.setattr(runner, "_validate_trust_bundle", lambda unused: None)
@@ -166,12 +232,10 @@ def test_runtime_competitor_selects_fixed_physical_credential_slot(
         "dbname": "anti_demo",
         "username": runner.BASELINE_ROLE,
         "password": "never-emitted",
-        "master_secret_arn": (
-            "arn:aws:secretsmanager:us-west-2:123456789012:secret:aurora-master"
-        ),
+        "master_secret_arn": ("arn:aws:secretsmanager:us-west-2:123456789012:secret:aurora-master"),
     }
     request = {
-        "protocol": runner.PROTOCOL,
+        "protocol": runner.BOUNDED_PROTOCOL,
         "run_id": "run-1",
         "trust_bundle_path": str(runner.TRUST_BUNDLE_PATH),
         "trust_bundle_sha256": "a" * 64,
@@ -193,9 +257,7 @@ def test_runtime_competitor_selects_fixed_physical_credential_slot(
             },
             {
                 "lane_id": "competitor",
-                "secret_arn": (
-                    "arn:aws:secretsmanager:us-west-2:123456789012:secret:bout-proxy"
-                ),
+                "secret_arn": ("arn:aws:secretsmanager:us-west-2:123456789012:secret:bout-proxy"),
                 "endpoint_host": "proxy.example.test",
                 "credential_host": "aurora.example.test",
             },
@@ -220,6 +282,10 @@ def test_runtime_competitor_selects_fixed_physical_credential_slot(
     legacy = next(target for target in legacy_targets if target.lane_id == "competitor")
     assert legacy.baseline_credential_id == "rds"
 
+    request["protocol"] = runner.PROTOCOL
+    with pytest.raises(runner.RunnerContractError, match="^protocol_invalid$"):
+        runner._decode_request(_encode_request(request))
+
 
 async def test_aurora_backstage_verify_retries_resume_timeout_only(
     monkeypatch: pytest.MonkeyPatch,
@@ -232,8 +298,7 @@ async def test_aurora_backstage_verify_retries_resume_timeout_only(
             "username": runner.BASELINE_ROLE,
             "password": "never-emitted",
             "master_secret_arn": (
-                "arn:aws:secretsmanager:us-west-2:123456789012:"
-                f"secret:{lane_id}-master"
+                f"arn:aws:secretsmanager:us-west-2:123456789012:secret:{lane_id}-master"
             ),
         }
         for lane_id in ("aurora", "rds")
@@ -254,9 +319,7 @@ async def test_aurora_backstage_verify_retries_resume_timeout_only(
             "username": runner.BASELINE_ROLE,
             "trust_bundle_path": str(runner.TRUST_BUNDLE_PATH),
             "trust_bundle_sha256": "a" * 64,
-            "credential_sha256": runner.hashlib.sha256(
-                runner._canonical_json(stored)
-            ).hexdigest(),
+            "credential_sha256": runner.hashlib.sha256(runner._canonical_json(stored)).hexdigest(),
         }
 
     def read_root_json(path, keys):
@@ -559,15 +622,14 @@ async def test_non_aurora_setup_verify_remains_single_attempt(
 
 
 def test_aurora_verify_budget_preserves_the_ssm_completion_margin() -> None:
-    assert SSM_TIMEOUT_SECONDS == runner.SSM_COMMAND_TIMEOUT_SECONDS == 120.0
+    assert SETUP_SSM_TIMEOUT_SECONDS == runner.SSM_COMMAND_TIMEOUT_SECONDS == 120.0
     assert runner.SETUP_VERIFY_DEADLINE_SECONDS == 100.0
     assert runner.SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS == 20.0
     assert (
-        runner.SETUP_VERIFY_DEADLINE_SECONDS
-        + runner.SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS
-        == SSM_TIMEOUT_SECONDS
+        runner.SETUP_VERIFY_DEADLINE_SECONDS + runner.SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS
+        == SETUP_SSM_TIMEOUT_SECONDS
     )
-    assert runner.SETUP_VERIFY_DEADLINE_SECONDS < SSM_TIMEOUT_SECONDS
+    assert runner.SETUP_VERIFY_DEADLINE_SECONDS < SETUP_SSM_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize(
@@ -617,9 +679,7 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
                 "VersionStage": "AWSCURRENT",
             }
             return {
-                "SecretString": json.dumps(
-                    {"username": "master", "password": "admin-not-emitted"}
-                )
+                "SecretString": json.dumps({"username": "master", "password": "admin-not-emitted"})
             }
 
     assert await runner._read_master_database(
@@ -644,6 +704,7 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
         "password": "same-baseline-password",
         "master_secret_arn": request["master_secret_arn"],
     }
+
     def read_root_json(path, keys):
         assert path == runner.BASELINE_CREDENTIAL_PATHS[credential_id]
         assert keys == runner.RDS_BASELINE_KEYS
@@ -713,14 +774,16 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
     monkeypatch.setattr(runner, "_connect", connect)
     monkeypatch.setattr(runner, "_read_master_database", master)
     monkeypatch.setattr(
-        runner.boto3,
-        "Session",
-        lambda: SimpleNamespace(
-            client=lambda name, *, region_name: (
-                Secrets()
-                if name == "secretsmanager" and region_name == "us-west-2"
-                else pytest.fail("runner secret client was not region-bound")
-            )
+        runner,
+        "secrets_manager_for_runner_operation",
+        lambda arns: (
+            Secrets()
+            if set(arns)
+            == {
+                request["master_secret_arn"],
+                request["destination_secret_arn"],
+            }
+            else pytest.fail("runner secret client was not descriptor-bound")
         ),
     )
 
@@ -891,3 +954,258 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
         "SETUP_SETTLED:nonce-1",
         "RUNNER_FLOCK_RELEASED:bout-1",
     ]
+
+
+async def test_sharded_fanin_cancellation_terminates_every_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeProcessContext()
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+    cancelled = asyncio.Event()
+    cancelled.set()
+
+    with pytest.raises(runner.RunnerCancelled, match="fanin_cancelled"):
+        await runner._execute_sharded_fanin({}, cancelled)
+
+    assert len(context.processes) == runner.fanin.WORKER_COUNT
+    assert all(process.terminated for process in context.processes)
+    assert not any(process.is_alive() for process in context.processes)
+
+
+async def test_sharded_fanin_detects_crash_and_cleans_remaining_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeProcessContext(crash_first=True)
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+
+    with pytest.raises(runner.RunnerContractError, match="worker_crashed"):
+        await runner._execute_sharded_fanin({}, asyncio.Event())
+
+    assert len(context.processes) == runner.fanin.WORKER_COUNT
+    assert not any(process.is_alive() for process in context.processes)
+
+
+def test_worker_normal_completion_does_not_wait_for_unset_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def complete(
+        unused_request,
+        *,
+        await_release,
+        await_hold,
+        **unused,
+    ):
+        del unused_request, unused
+        await await_release()
+        await await_hold()
+        return {"worker_index": 0}
+
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 0)
+    monkeypatch.setattr(runner.fanin, "execute_fanin", complete)
+    control_queue: queue.Queue = queue.Queue()
+    result_queue: queue.Queue = queue.Queue()
+    release_event = threading.Event()
+    hold_event = threading.Event()
+    cancel_event = threading.Event()
+    release_event.set()
+    hold_event.set()
+    baseline_threads = set(threading.enumerate())
+    started = time.monotonic()
+
+    runner._fanin_worker_process(
+        {},
+        0,
+        control_queue,
+        result_queue,
+        release_event,
+        _FakeValue(1),
+        hold_event,
+        _FakeValue(2),
+        cancel_event,
+    )
+
+    assert time.monotonic() - started < 1.0
+    assert result_queue.get_nowait() == ("ok", 0, {"worker_index": 0})
+    assert result_queue.empty()
+    assert set(threading.enumerate()) == baseline_threads
+
+
+def test_worker_cancellation_is_bounded_and_publishes_one_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def await_cancel(
+        unused_request,
+        *,
+        cancelled,
+        await_release,
+        **unused,
+    ):
+        del unused_request, unused
+        await await_release()
+        await cancelled.wait()
+        raise runner.RunnerCancelled("fanin_cancelled")
+
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 0)
+    monkeypatch.setattr(runner.fanin, "execute_fanin", await_cancel)
+    control_queue: queue.Queue = queue.Queue()
+    result_queue: queue.Queue = queue.Queue()
+    release_event = threading.Event()
+    release_event.set()
+    cancel_event = threading.Event()
+    trigger = threading.Timer(0.02, cancel_event.set)
+    baseline_threads = set(threading.enumerate())
+    started = time.monotonic()
+    trigger.start()
+    runner._fanin_worker_process(
+        {},
+        0,
+        control_queue,
+        result_queue,
+        release_event,
+        _FakeValue(1),
+        threading.Event(),
+        _FakeValue(0),
+        cancel_event,
+    )
+    trigger.join()
+
+    assert time.monotonic() - started < 1.0
+    assert result_queue.get_nowait() == ("error", 0, "fanin_cancelled")
+    assert result_queue.empty()
+    assert set(threading.enumerate()) == baseline_threads
+
+
+def test_worker_event_lifecycle_never_blocks_in_default_executor() -> None:
+    source = inspect.getsource(runner._fanin_worker_process)
+    assert "to_thread(cancel_event.wait" not in source
+    assert "to_thread(release_event.wait" not in source
+    assert "to_thread(hold_event.wait" not in source
+
+
+def test_worker_crash_envelope_retains_sanitized_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def crash(*unused, **unused_keywords):
+        raise IndexError("list index out of range")
+
+    context = {
+        "worker_id": 2,
+        "worker_cpu": 2,
+        "phase": "hold_sample",
+        "operation": "sample_group_2",
+        "wave": 26,
+        "partition_start": 5_000,
+        "partition_end_exclusive": 7_500,
+        "lanes": {
+            "lakebase": {"initiated": 2_500, "authenticated": 2_500, "held": 2_500},
+            "competitor": {"initiated": 2_500, "authenticated": 2_500, "held": 2_500},
+        },
+    }
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 2)
+    monkeypatch.setattr(runner.fanin, "execute_fanin", crash)
+    monkeypatch.setattr(runner.fanin, "worker_crash_context", lambda: context)
+    control_queue: queue.Queue = queue.Queue()
+    result_queue: queue.Queue = queue.Queue()
+
+    runner._fanin_worker_process(
+        {},
+        2,
+        control_queue,
+        result_queue,
+        threading.Event(),
+        _FakeValue(1),
+        threading.Event(),
+        _FakeValue(1),
+        threading.Event(),
+    )
+
+    result = result_queue.get_nowait()
+    assert result[:3] == ("error", 2, "IndexError")
+    envelope = result[3]
+    assert envelope["phase"] == "hold_sample"
+    assert envelope["operation"] == "sample_group_2"
+    assert envelope["partition_start"] == 5_000
+    assert envelope["partition_end_exclusive"] == 7_500
+    assert envelope["lanes"] == context["lanes"]
+    assert envelope["error_type"] == "IndexError"
+    assert all(set(frame) == {"file", "function", "line"} for frame in envelope["frames"])
+    flattened = json.dumps(envelope).lower()
+    assert "password" not in flattened
+    assert "host" not in flattened
+    assert "secret" not in flattened
+
+
+async def test_parent_capacity_failure_names_observed_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = runner.Target(
+        lane_id="lakebase",
+        secret_arn="unused",
+        endpoint_host="lakebase.example.test",
+        credential_host="lakebase.example.test",
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_baseline_database",
+        lambda unused: {"user": runner.fanin.CLIENT_ROLE, "password": "unused"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_observer_database",
+        lambda unused: {"user": runner.fanin.OBSERVER_ROLE, "password": "unused"},
+    )
+
+    async def insufficient(unused_instance_type):
+        return {"sufficient": False, "failures": ["event_loop_microbatch_pressure"]}
+
+    async def must_not_spawn(*unused_args, **unused_kwargs):
+        raise AssertionError("workers must not spawn after a failed parent preflight")
+
+    monkeypatch.setattr(runner.fanin, "capacity_preflight", insufficient)
+    monkeypatch.setattr(runner, "_execute_sharded_fanin", must_not_spawn)
+
+    with pytest.raises(
+        runner.RunnerContractError,
+        match="runner_capacity_insufficient_event_loop_microbatch_pressure",
+    ):
+        await runner._execute_fanin_request(
+            {"runner_instance_type": "m6i.xlarge"},
+            (target,),
+            asyncio.Event(),
+        )
+
+
+async def test_sharded_worker_ready_timeout_is_not_capacity_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _FakeProcessContext()
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+    monkeypatch.setattr(runner, "FANIN_WORKER_READY_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(runner.RunnerContractError, match="fanin_worker_ready_timeout"):
+        await runner._execute_sharded_fanin({}, asyncio.Event())
+
+    assert all(process.terminated for process in context.processes)
+    assert not any(process.is_alive() for process in context.processes)
+
+
+def test_fanin_workers_are_pinned_to_distinct_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    affinity = {0, 1, 2, 3}
+    pinned: list[set[int]] = []
+    monkeypatch.setattr(
+        runner.os,
+        "sched_getaffinity",
+        lambda unused_pid: pinned[-1] if pinned else affinity,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner.os,
+        "sched_setaffinity",
+        lambda unused_pid, cpus: pinned.append(set(cpus)),
+        raising=False,
+    )
+
+    assert runner._pin_fanin_worker(2) == 2
+    assert pinned == [{2}]

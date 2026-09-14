@@ -1,0 +1,2023 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import gc
+import inspect
+import ssl
+import struct
+import time
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+from runner import round5_fanin as runner
+from server.connection_fanin import (
+    FANIN_PROTOCOL,
+    FANIN_SCHEMA_VERSION,
+    CapacityPreflight,
+    ConnectionSpikeArm,
+    ConnectionSpikeContract,
+    FanInError,
+    capacity_model_sha256,
+    compare_lanes,
+    evaluate_capacity_preflight,
+    evaluate_runner_provisioning_capacity,
+    fanin_config_sha256,
+    finalize_lane,
+    require_runner_provisioning_capacity,
+)
+from server.connection_spike_live import (
+    ConnectionSpikeLiveOperationError,
+    LiveConnectionSpikeAdapter,
+    _finalize_raw_result,
+    _runner_result_has_forbidden_credential,
+)
+
+SHA = "a" * 64
+
+
+def test_auth_method_label_is_not_mistaken_for_credential_material() -> None:
+    assert not _runner_result_has_forbidden_credential(
+        {
+            "lanes": [
+                {"auth_method": "tls-cleartext-password"},
+                {"auth_method": "scram-sha-256"},
+            ]
+        }
+    )
+    assert _runner_result_has_forbidden_credential(
+        {"lane": {"innocuous_name": "password=must-never-escape"}}
+    )
+
+
+def passing_preflight() -> CapacityPreflight:
+    return evaluate_capacity_preflight(
+        instance_type="m6i.xlarge",
+        cpu_count=4,
+        physical_memory_bytes=15 * 1024**3,
+        available_memory_bytes=14 * 1024**3,
+        baseline_rss_bytes=100 * 1024**2,
+        fd_soft_limit=65_535,
+        fd_hard_limit=65_535,
+        open_fds=7,
+        ephemeral_port_first=20_000,
+        ephemeral_port_last=49_999,
+        event_loop_p99_ms=0.1,
+        cpu_calibration_ms=50.0,
+    )
+
+
+def raw_lane(
+    lane_id: str,
+    *,
+    held: int = 10_000,
+    time_to_target_ms: float | None = 12_500.0,
+    peak_backends: int = 37,
+    preexisting: int = 0,
+    observer_role: str = "anti_demo_observer",
+    client_role: str = "anti_demo_burst",
+    config_digest: str | None = None,
+) -> dict[str, object]:
+    return {
+        "lane_id": lane_id,
+        "initiated_clients": 10_000,
+        "authenticated_clients": held,
+        "held_clients_at_gate": held,
+        "terminal_failures": 0,
+        "failure_codes": {},
+        "retries": 0,
+        "disconnected_during_hold": 0,
+        "time_to_target_ns": (
+            int(time_to_target_ms * 1_000_000)
+            if time_to_target_ms is not None
+            else None
+        ),
+        "time_to_target_ms": time_to_target_ms,
+        "hold_elapsed_ms": 30_000.001,
+        "sampled_queries_attempted": 64,
+        "sampled_queries_succeeded": 64,
+        "sampled_queries_failed": 0,
+        "preexisting_client_role_sessions": preexisting,
+        "observer_role": observer_role,
+        "client_role": client_role,
+        "observer_direct": True,
+        "current_backend_sessions": 5,
+        "peak_backend_sessions": peak_backends,
+        "unique_backend_pids": 19,
+        "distinct_socket_fds": held,
+        "distinct_local_endpoints": held,
+        "socket_identity_sha256": SHA,
+        "connect_latency_p50_ms": 80.0,
+        "connect_latency_p95_ms": 150.0,
+        "connect_latency_p99_ms": 201.455,
+        "endpoint_host_sha256": SHA,
+        "credential_sha256": SHA,
+        "observer_credential_sha256": SHA,
+        "tls_mode": "verify-full",
+        "auth_method": (
+            "tls-cleartext-password"
+            if lane_id == "lakebase"
+            else "scram-sha-256"
+        ),
+        "config_sha256": config_digest or fanin_config_sha256(),
+        "generator_sha256": SHA,
+        "capacity_model_sha256": capacity_model_sha256(),
+        "telemetry_samples": 49,
+        "telemetry_physical_memory_bytes": 15 * 1024**3,
+        "telemetry_min_available_memory_bytes": 7 * 1024**3,
+        "telemetry_peak_rss_bytes": 7 * 1024**3,
+        "telemetry_fd_soft_limit": 65_535,
+        "telemetry_peak_open_fds": 20_264,
+        "telemetry_ephemeral_port_count": 28_232,
+        "telemetry_min_ephemeral_port_reserve": 18_232,
+        "telemetry_peak_event_loop_p99_ms": 4.5,
+        "telemetry_peak_raw_event_loop_p99_ms": 72.929,
+        "telemetry_peak_external_event_loop_p99_ms": 72.929,
+        "telemetry_raw_event_loop_warning_count": 1,
+        "telemetry_raw_event_loop_ceiling_breaches": 0,
+        "telemetry_peak_cpu_capacity_fraction": 0.31,
+        "telemetry_failures": [],
+        "launch_skew_ms": 0.25,
+        "achieved_elapsed_ms": 42_500.0,
+        "identity_verified": True,
+        "fairness_verified": True,
+        "telemetry_verified": True,
+    }
+
+
+def finalize(raw: dict[str, object]):
+    return finalize_lane(
+        raw,
+        expected_lane_id=str(raw["lane_id"]),
+        expected_config_sha256=fanin_config_sha256(),
+        expected_generator_sha256=SHA,
+        expected_capacity_model_sha256=capacity_model_sha256(),
+        cleanup_verified=True,
+    )
+
+
+def worker_result(index: int, *, release_ns: int = 123) -> dict[str, object]:
+    lanes = []
+    for lane_id in ("lakebase", "competitor"):
+        lane = raw_lane(
+            lane_id,
+            held=runner.PARTITION_CLIENTS_PER_LANE,
+            time_to_target_ms=40_000.0 + index,
+            config_digest=runner.config_sha256(),
+        )
+        lane.update(
+            {
+                "initiated_clients": runner.PARTITION_CLIENTS_PER_LANE,
+                "sampled_queries_attempted": 16,
+                "sampled_queries_succeeded": 16,
+                "distinct_socket_fds": runner.PARTITION_CLIENTS_PER_LANE,
+                "distinct_local_endpoints": runner.PARTITION_CLIENTS_PER_LANE,
+                "generator_sha256": runner.generator_sha256(),
+                "capacity_model_sha256": runner.capacity_model_sha256(),
+                "connect_latency_samples_ms": [10.0 + index, 20.0 + index],
+                "observer_backend_pids": [index + 1],
+                "first_launch_ns": release_ns + index * 100,
+                "telemetry_peak_rss_bytes": 512 * 1024**2,
+                "telemetry_peak_open_fds": 5_064,
+                "telemetry_peak_cpu_capacity_fraction": 0.1,
+            }
+        )
+        lanes.append(lane)
+    telemetry = {
+        key: value
+        for key, value in lanes[0].items()
+        if key.startswith("telemetry_")
+    }
+    return {
+        "schema_version": runner.SCHEMA_VERSION,
+        "protocol": runner.PROTOCOL,
+        "run_id": "run",
+        "contract_sha256": runner.contract_sha256(),
+        "config_sha256": runner.config_sha256(),
+        "generator_sha256": runner.generator_sha256(),
+        "capacity_model_sha256": runner.capacity_model_sha256(),
+        "release_ns": release_ns,
+        "worker_index": index,
+        "worker_count": runner.WORKER_COUNT,
+        "worker_cpu": index,
+        "partition_target_clients": runner.PARTITION_CLIENTS_PER_LANE,
+        "lanes": lanes,
+        "telemetry": telemetry,
+        "runtime_diagnostics": {"loop_samples": 10},
+    }
+
+
+def test_contract_and_runner_digests_are_exactly_the_same() -> None:
+    contract = ConnectionSpikeContract()
+    assert contract.sha256 == runner.contract_sha256()
+    assert fanin_config_sha256() == runner.config_sha256()
+    assert capacity_model_sha256() == runner.capacity_model_sha256()
+    assert contract.protocol == FANIN_PROTOCOL
+    assert contract.schema_version == FANIN_SCHEMA_VERSION
+    with pytest.raises(ValueError, match="frozen"):
+        replace(contract, target_clients_per_lane=9_999)
+    with pytest.raises(ValueError, match="frozen"):
+        replace(contract, initial_wave_size=251)
+
+
+def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() -> None:
+    sufficient = passing_preflight()
+    assert sufficient.sufficient
+    assert sufficient.projected_fds == 20_263
+    assert sufficient.model_sha256 == capacity_model_sha256()
+
+    tight = evaluate_capacity_preflight(
+        instance_type="m6i.large",
+        cpu_count=2,
+        physical_memory_bytes=int(7.6 * 1024**3),
+        available_memory_bytes=int(7.2 * 1024**3),
+        baseline_rss_bytes=100 * 1024**2,
+        fd_soft_limit=65_535,
+        fd_hard_limit=65_535,
+        open_fds=7,
+        ephemeral_port_first=32_768,
+        ephemeral_port_last=60_999,
+        event_loop_p99_ms=0.1,
+        cpu_calibration_ms=50.0,
+    )
+    assert not tight.sufficient
+    assert "physical_memory_projection" in tight.failures
+    assert "available_memory_projection" in tight.failures
+
+    pressured = evaluate_capacity_preflight(
+        instance_type="m6i.xlarge",
+        cpu_count=4,
+        physical_memory_bytes=15 * 1024**3,
+        available_memory_bytes=14 * 1024**3,
+        baseline_rss_bytes=100 * 1024**2,
+        fd_soft_limit=65_535,
+        fd_hard_limit=65_535,
+        open_fds=7,
+        ephemeral_port_first=20_000,
+        ephemeral_port_last=49_999,
+        event_loop_p99_ms=0.1,
+        event_loop_microbatch_p99_ms=50.001,
+        cpu_calibration_ms=50.0,
+    )
+    assert pressured.failures == ("event_loop_microbatch_pressure",)
+
+
+def test_preprovision_capacity_refuses_large_and_accepts_xlarge() -> None:
+    large = evaluate_runner_provisioning_capacity("m6i.large")
+    assert not large.sufficient
+    assert large.selected.vcpu_count == 2
+    assert "physical_memory_projection" in large.failures
+    with pytest.raises(
+        ValueError,
+        match=r"use m6i\.xlarge.*No client-count, memory-reserve",
+    ):
+        require_runner_provisioning_capacity("m6i.large")
+
+    xlarge = require_runner_provisioning_capacity("m6i.xlarge")
+    assert xlarge.sufficient
+    assert xlarge.selected.vcpu_count == 4
+    assert xlarge.usable_memory_bytes > xlarge.required_memory_bytes
+    assert xlarge.projected_fds == 20_256
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failed_gate"),
+    (
+        ({"held_clients_at_gate": 9_999, "distinct_socket_fds": 9_999,
+          "distinct_local_endpoints": 9_999}, "exact_count"),
+        ({"terminal_failures": 1}, "zero_failures"),
+        ({"retries": 1}, "zero_failures"),
+        ({"hold_elapsed_ms": 29_999.999}, "hold"),
+        ({"sampled_queries_succeeded": 63, "sampled_queries_failed": 1},
+         "sampled_queries"),
+        ({"peak_backend_sessions": 10_000}, "multiplexing"),
+        ({"preexisting_client_role_sessions": 1}, "observer_separation"),
+        ({"observer_role": "anti_demo_burst"}, "observer_separation"),
+        ({"observer_direct": False}, "observer_separation"),
+        ({"connect_latency_p95_ms": None}, "identity"),
+        ({"connect_latency_p95_ms": 79.0}, "identity"),
+        ({"auth_method": ""}, "identity"),
+        ({"auth_method": "md5"}, "identity"),
+        ({"telemetry_verified": False}, "telemetry"),
+        ({"telemetry_peak_event_loop_p99_ms": 50.001}, "telemetry"),
+        ({"telemetry_peak_cpu_capacity_fraction": 0.851}, "telemetry"),
+        ({"telemetry_min_available_memory_bytes": 767 * 1024**2}, "telemetry"),
+        ({"telemetry_peak_open_fds": 52_429}, "telemetry"),
+        ({"telemetry_min_ephemeral_port_reserve": 1_999}, "telemetry"),
+        ({"telemetry_failures": ["event_loop_pressure"]}, "telemetry"),
+    ),
+)
+def test_exact_stop_gate_rejects_every_mutation(
+    mutation: dict[str, object],
+    failed_gate: str,
+) -> None:
+    raw = {**raw_lane("lakebase"), **mutation}
+    result = finalize(raw)
+    assert not result.verified
+    assert failed_gate in result.gates.failures
+
+
+def test_backend_sessions_are_evidence_not_client_count() -> None:
+    result = finalize(raw_lane("lakebase", peak_backends=37))
+    assert result.verified
+    assert result.held_clients_at_gate == 10_000
+    assert result.peak_backend_sessions == 37
+    assert result.peak_backend_sessions != result.held_clients_at_gate
+
+
+def test_runtime_telemetry_summary_fails_on_each_pressure_dimension() -> None:
+    summary = runner.TelemetrySummary()
+    healthy = {
+        "physical_memory_bytes": 15 * 1024**3,
+        "available_memory_bytes": 7 * 1024**3,
+        "rss_bytes": 7 * 1024**3,
+        "fd_soft_limit": 65_535,
+        "open_fds": 20_264,
+        "ephemeral_port_count": 28_232,
+        "event_loop_p99_ms": 4.5,
+        "cpu_capacity_fraction": 0.31,
+    }
+    summary.observe(healthy)
+    assert summary.verified
+    assert summary.public_dict()["telemetry_failures"] == []
+
+    pressure = runner.TelemetrySummary()
+    pressure.observe(
+        {
+            **healthy,
+            "available_memory_bytes": 767 * 1024**2,
+            "open_fds": 60_000,
+            "ephemeral_port_count": 11_999,
+            "event_loop_p99_ms": 50.001,
+            "cpu_capacity_fraction": 0.851,
+        }
+    )
+    assert not pressure.verified
+    assert set(pressure.public_dict()["telemetry_failures"]) == {
+        "available_memory_pressure",
+        "cpu_pressure",
+        "ephemeral_port_pressure",
+        "event_loop_pressure",
+        "file_descriptor_pressure",
+    }
+
+
+def test_winner_exists_only_after_both_exact_gates_under_same_protocol() -> None:
+    lakebase = finalize(raw_lane("lakebase", time_to_target_ms=12_500.0))
+    competitor = finalize(raw_lane("competitor", time_to_target_ms=20_000.0))
+    comparison = compare_lanes(lakebase, competitor)
+    assert comparison is not None
+    assert comparison.winner_lane_id == "lakebase"
+    assert comparison.margin_ms == 7_500.0
+
+    incomplete = finalize(raw_lane("competitor", held=9_999, time_to_target_ms=None))
+    assert compare_lanes(lakebase, incomplete) is None
+    mismatch = replace(competitor, config_sha256="b" * 64)
+    assert compare_lanes(lakebase, mismatch) is None
+
+
+def test_stale_schema_and_digest_cannot_be_finalized_as_v2() -> None:
+    arm = ConnectionSpikeArm(
+        arm_id="arm",
+        contract_sha256=ConnectionSpikeContract().sha256,
+        config_sha256=fanin_config_sha256(),
+        generator_sha256=SHA,
+        capacity_model_sha256=capacity_model_sha256(),
+        preflight=passing_preflight(),
+    )
+    raw = {
+        "schema_version": FANIN_SCHEMA_VERSION,
+        "protocol": FANIN_PROTOCOL,
+        "contract_sha256": arm.contract_sha256,
+        "config_sha256": arm.config_sha256,
+        "generator_sha256": arm.generator_sha256,
+        "capacity_model_sha256": arm.capacity_model_sha256,
+        "lanes": [raw_lane("lakebase"), raw_lane("competitor")],
+        "runtime_diagnostics": {"loop_samples": 100},
+    }
+    result = _finalize_raw_result(arm, raw)
+    assert result.comparison is not None
+    assert result.runtime_diagnostics == {"loop_samples": 100}
+
+    with pytest.raises(ConnectionSpikeLiveOperationError, match="stale"):
+        _finalize_raw_result(arm, {**raw, "schema_version": 1})
+    with pytest.raises(ConnectionSpikeLiveOperationError, match="stale"):
+        _finalize_raw_result(arm, {**raw, "config_sha256": "b" * 64})
+    with pytest.raises(ConnectionSpikeLiveOperationError, match="diagnostics"):
+        _finalize_raw_result(arm, {**raw, "runtime_diagnostics": None})
+
+
+def test_scram_tls_state_machine_derives_and_verifies_server_signature() -> None:
+    state = runner.ScramState.new("anti_demo_burst", "correct horse battery staple", 7)
+    salt = b"round5-salt"
+    server_first = (
+        f"r={state.nonce}server,s={base64.b64encode(salt).decode()},i=4096"
+    )
+    final = state.continue_message(server_first)
+    assert final.startswith(b"c=biws,r=")
+    assert b",p=" in final
+    assert state.server_signature is not None
+    state.verify_final(
+        f"v={base64.b64encode(state.server_signature).decode()}"
+    )
+    with pytest.raises(runner.FanInProtocolError, match="signature"):
+        state.verify_final(f"v={base64.b64encode(b'wrong').decode()}")
+
+
+def test_scram_reuses_the_run_local_salted_key_without_reusing_a_nonce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = runner.hashlib.pbkdf2_hmac
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner.hashlib, "pbkdf2_hmac", counted)
+    cache = runner.ScramKeyCache()
+    salt = base64.b64encode(b"one-postgres-role-salt").decode()
+    states = [
+        runner.ScramState.new(
+            "anti_demo_burst",
+            "correct horse battery staple",
+            ordinal,
+            cache,
+        )
+        for ordinal in range(500)
+    ]
+    for state in states:
+        state.continue_message(
+            f"r={state.nonce}server,s={salt},i=4096"
+        )
+
+    assert calls == 1
+    assert len({state.nonce for state in states}) == len(states)
+    other = runner.ScramState.new(
+        "anti_demo_burst",
+        "different password",
+        501,
+        cache,
+    )
+    other.continue_message(f"r={other.nonce}server,s={salt},i=4096")
+    assert calls == 2
+
+
+async def test_direct_observer_retries_transient_wake_before_shared_t0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, *unused, **kwargs):
+            assert kwargs["prepare"] is False
+
+        async def fetchone(self):
+            return (runner.OBSERVER_ROLE, 0)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        async def commit(self):
+            return None
+
+        async def close(self):
+            return None
+
+    attempts = 0
+
+    async def connect(**unused):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise runner.psycopg.OperationalError("endpoint is waking")
+        return Connection()
+
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(runner, "OBSERVER_RETRY_SECONDS", 0.0)
+    observer = runner.DirectObserver(
+        "lakebase",
+        {
+            "host": "direct.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": runner.OBSERVER_ROLE,
+            "password": "test-only",
+            "credential_sha256": SHA,
+        },
+        "anti-demo-r5-test",
+    )
+
+    await observer.open_and_preflight()
+
+    assert attempts == 2
+    assert observer.evidence.role_verified is True
+    assert observer.evidence.preexisting == 0
+    await observer.close()
+
+
+async def test_direct_observer_waits_for_setup_sessions_to_quiesce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [(runner.OBSERVER_ROLE, 1), (runner.OBSERVER_ROLE, 0)]
+
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, *unused, **kwargs):
+            assert kwargs["prepare"] is False
+
+        async def fetchone(self):
+            return rows.pop(0)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        async def commit(self):
+            return None
+
+        async def close(self):
+            return None
+
+    async def connect(**unused):
+        return Connection()
+
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(runner, "OBSERVER_RETRY_SECONDS", 0.0)
+    observer = runner.DirectObserver(
+        "competitor",
+        {
+            "host": "direct.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": runner.OBSERVER_ROLE,
+            "password": "test-only",
+            "credential_sha256": SHA,
+        },
+        "anti-demo-r5-test",
+    )
+
+    await observer.open_and_preflight()
+
+    assert rows == []
+    assert observer.evidence.preexisting == 0
+    await observer.close()
+
+
+async def test_direct_observer_names_lane_when_sessions_do_not_quiesce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, *unused, **kwargs):
+            assert kwargs["prepare"] is False
+
+        async def fetchone(self):
+            return (runner.OBSERVER_ROLE, 1)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        async def commit(self):
+            return None
+
+        async def close(self):
+            return None
+
+    async def connect(**unused):
+        return Connection()
+
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(runner, "OBSERVER_QUIESCE_TIMEOUT_SECONDS", 0.0)
+    observer = runner.DirectObserver(
+        "competitor",
+        {
+            "host": "direct.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": runner.OBSERVER_ROLE,
+            "password": "test-only",
+            "credential_sha256": SHA,
+        },
+        "anti-demo-r5-test",
+    )
+
+    with pytest.raises(
+        runner.FanInProtocolError,
+        match="^competitor_preexisting_client_sessions$",
+    ):
+        await observer.open_and_preflight()
+
+
+async def test_direct_observer_exhaustion_returns_a_safe_lane_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def refused(**unused):
+        raise runner.psycopg.OperationalError(
+            "password=must-not-escape host=private.example.test"
+        )
+
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", refused)
+    monkeypatch.setattr(runner, "OBSERVER_READY_TIMEOUT_SECONDS", 0.0)
+    observer = runner.DirectObserver(
+        "competitor",
+        {
+            "host": "direct.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": runner.OBSERVER_ROLE,
+            "password": "test-only",
+            "credential_sha256": SHA,
+        },
+        "anti-demo-r5-test",
+    )
+
+    with pytest.raises(
+        runner.FanInProtocolError,
+        match="^competitor_observer_connect_failed$",
+    ):
+        await observer.open_and_preflight()
+
+
+def _observer_for_sample_test() -> runner.DirectObserver:
+    return runner.DirectObserver(
+        "competitor",
+        {
+            "host": "direct.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": runner.OBSERVER_ROLE,
+            "password": "test-only",
+            "credential_sha256": SHA,
+        },
+        "anti-demo-r5-test",
+    )
+
+
+async def test_direct_observer_reconnects_after_transient_transport_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+            self.row = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, query, parameters=None, **unused):
+            if "current_user" in query:
+                self.row = (runner.OBSERVER_ROLE,)
+            elif self.connection.fail_sample:
+                self.connection.fail_sample = False
+                self.connection.broken = True
+                raise runner.psycopg.errors.ConnectionFailure("transport dropped")
+            else:
+                assert parameters == (runner.CLIENT_ROLE,)
+                self.row = (7, [101, 102])
+
+        async def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __init__(self, *, fail_sample: bool) -> None:
+            self.fail_sample = fail_sample
+            self.closed = False
+            self.broken = False
+
+        def cursor(self):
+            return Cursor(self)
+
+        async def commit(self):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    initial = Connection(fail_sample=True)
+    reconnects: list[dict[str, object]] = []
+
+    async def connect(**kwargs):
+        reconnects.append(kwargs)
+        return Connection(fail_sample=False)
+
+    observer = _observer_for_sample_test()
+    observer.connection = initial
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(runner, "OBSERVER_SAMPLE_RETRY_SECONDS", 0.0)
+
+    assert await observer.sample() is True
+    assert initial.closed is True
+    assert observer.evidence.reconnect_attempts == 1
+    assert observer.evidence.sample_failures == 1
+    assert observer.evidence.last_sqlstate == "08006"
+    assert observer.evidence.last_connection_state == "open"
+    assert observer.evidence.current_backends == 7
+    assert len(reconnects) == 1
+    assert reconnects[0]["user"] == runner.OBSERVER_ROLE
+    assert reconnects[0]["application_name"].endswith("-observer")
+
+
+async def test_direct_observer_transient_reconnect_exhaustion_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, query, *unused, **unused_keywords):
+            if "current_user" not in query:
+                self.connection.broken = True
+                raise runner.psycopg.errors.ConnectionFailure("transport dropped")
+
+        async def fetchone(self):
+            return (runner.OBSERVER_ROLE,)
+
+    class Connection:
+        closed = False
+        broken = False
+
+        def cursor(self):
+            return Cursor(self)
+
+        async def commit(self):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    async def connect(**unused):
+        return Connection()
+
+    observer = _observer_for_sample_test()
+    observer.connection = Connection()
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(runner, "OBSERVER_SAMPLE_RETRY_SECONDS", 0.0)
+
+    assert await observer.sample() is False
+    assert observer.evidence.reconnect_attempts == runner.OBSERVER_SAMPLE_MAX_RETRIES
+    assert observer.evidence.sample_failures == 3
+    assert (
+        observer.evidence.last_failure_code
+        == "observer_transport_retry_exhausted"
+    )
+    assert observer.evidence.last_sqlstate == "08006"
+
+
+async def test_direct_observer_permanent_failure_never_reconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, *unused, **unused_keywords):
+            raise runner.psycopg.errors.InvalidPassword("invalid identity")
+
+    class Connection:
+        closed = False
+        broken = False
+
+        def cursor(self):
+            return Cursor()
+
+    async def must_not_connect(**unused):
+        raise AssertionError("permanent observer failure was retried")
+
+    observer = _observer_for_sample_test()
+    observer.connection = Connection()
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", must_not_connect)
+
+    assert await observer.sample() is False
+    assert observer.evidence.reconnect_attempts == 0
+    assert observer.evidence.last_sqlstate == "28P01"
+    assert observer.evidence.last_failure_code == "observer_operational_permanent"
+
+
+async def test_direct_observer_serializes_sample_ownership() -> None:
+    in_flight = 0
+    peak = 0
+
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, *unused, **unused_keywords):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)
+            in_flight -= 1
+
+        async def fetchone(self):
+            return (1, [101])
+
+    class Connection:
+        closed = False
+        broken = False
+
+        def cursor(self):
+            return Cursor()
+
+        async def commit(self):
+            return None
+
+    observer = _observer_for_sample_test()
+    observer.connection = Connection()
+
+    assert await asyncio.gather(observer.sample(), observer.sample()) == [True, True]
+    assert peak == 1
+
+
+async def test_equal_wave_scheduler_alternates_lanes_and_never_tunes_one_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def opened(runtime, t0_ns):
+        assert t0_ns == 123
+        calls.append(runtime.lane_id)
+        runtime.initiated += 1
+
+    monkeypatch.setattr(runner, "_open_client", opened)
+    lanes = [
+        SimpleNamespace(lane_id="lakebase", initiated=0, target_clients=4),
+        SimpleNamespace(lane_id="competitor", initiated=0, target_clients=4),
+    ]
+    await runner._open_equal_wave(lanes, 4, 123)
+    assert calls == [
+        "lakebase", "competitor",
+        "lakebase", "competitor",
+        "lakebase", "competitor",
+        "lakebase", "competitor",
+    ]
+    assert [lane.initiated for lane in lanes] == [4, 4]
+
+
+async def test_equal_wave_scheduler_bounds_each_mirrored_microbatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    in_flight = {"lakebase": 0, "competitor": 0}
+    peak = {"lakebase": 0, "competitor": 0}
+    release = asyncio.Event()
+
+    async def opened(runtime, _t0_ns):
+        in_flight[runtime.lane_id] += 1
+        peak[runtime.lane_id] = max(
+            peak[runtime.lane_id],
+            in_flight[runtime.lane_id],
+        )
+        runtime.initiated += 1
+        if sum(in_flight.values()) == 2 * runner.MICRO_BATCH_SIZE:
+            release.set()
+        await release.wait()
+        in_flight[runtime.lane_id] -= 1
+
+    monkeypatch.setattr(runner, "_open_client", opened)
+    lanes = [
+        SimpleNamespace(lane_id="lakebase", initiated=0, target_clients=12),
+        SimpleNamespace(lane_id="competitor", initiated=0, target_clients=12),
+    ]
+    await runner._open_equal_wave(lanes, 12, 123)
+    assert peak == {
+        "lakebase": runner.MICRO_BATCH_SIZE,
+        "competitor": runner.MICRO_BATCH_SIZE,
+    }
+    assert [lane.initiated for lane in lanes] == [12, 12]
+
+
+def test_worker_aggregation_uses_one_shared_start_and_exact_partitions() -> None:
+    aggregated = runner.aggregate_worker_results(
+        [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    )
+
+    assert aggregated["release_ns"] == 123
+    assert aggregated["worker_count"] == 4
+    for lane in aggregated["lanes"]:
+        assert lane["initiated_clients"] == 10_000
+        assert lane["authenticated_clients"] == 10_000
+        assert lane["held_clients_at_gate"] == 10_000
+        assert lane["sampled_queries_attempted"] == 64
+        assert lane["sampled_queries_succeeded"] == 64
+        assert lane["distinct_socket_fds"] == 10_000
+        assert lane["distinct_local_endpoints"] == 10_000
+        assert lane["identity_verified"] is True
+        assert lane["launch_skew_ms"] == pytest.approx(0.0003)
+        assert lane["telemetry_peak_cpu_capacity_fraction"] == pytest.approx(
+            0.1
+        )
+
+
+def test_partition_sampling_indices_cover_all_groups_without_global_indexing() -> None:
+    runtime = SimpleNamespace(
+        target_clients=runner.PARTITION_CLIENTS_PER_LANE,
+        clients=[object()] * runner.PARTITION_CLIENTS_PER_LANE,
+    )
+    sampled = [
+        index
+        for group in range(runner.SAMPLE_GROUPS)
+        for index in runner._sample_group_indices(runtime, group)
+    ]
+
+    assert len(sampled) == runner.SAMPLED_QUERIES_PER_LANE
+    assert len(set(sampled)) == runner.SAMPLED_QUERIES_PER_LANE
+    assert min(sampled) == 0
+    assert max(sampled) < runner.PARTITION_CLIENTS_PER_LANE
+    assert "TARGET_CLIENTS_PER_LANE" not in inspect.getsource(
+        runner._sample_group_indices
+    )
+
+
+@pytest.mark.parametrize("aggregate_count", [8_044, 8_045, 8_046, 10_000])
+def test_aggregation_is_order_independent_at_boundary_counts(
+    aggregate_count: int,
+) -> None:
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    quotient, remainder = divmod(aggregate_count, runner.WORKER_COUNT)
+    for index, result in enumerate(results):
+        count = quotient + (index < remainder)
+        for lane in result["lanes"]:
+            lane["initiated_clients"] = count
+            lane["authenticated_clients"] = count
+            lane["held_clients_at_gate"] = count
+    forward = runner.aggregate_worker_results(results)
+    reverse = runner.aggregate_worker_results(list(reversed(results)))
+
+    for aggregate in (forward, reverse):
+        assert {
+            int(lane["authenticated_clients"]) for lane in aggregate["lanes"]
+        } == {aggregate_count}
+        assert {
+            int(lane["held_clients_at_gate"]) for lane in aggregate["lanes"]
+        } == {aggregate_count}
+        assert all(
+            bool(lane["identity_verified"]) is (aggregate_count == 10_000)
+            for lane in aggregate["lanes"]
+        )
+
+
+@pytest.mark.parametrize("partition_count", [2_011, 2_012])
+def test_sampling_rejects_incomplete_partition_before_indexing(
+    partition_count: int,
+) -> None:
+    runtime = SimpleNamespace(
+        target_clients=runner.PARTITION_CLIENTS_PER_LANE,
+        clients=[object()] * partition_count,
+    )
+    with pytest.raises(runner.FanInProtocolError, match="sample_partition_incomplete"):
+        runner._sample_group_indices(runtime, 2)
+
+
+async def test_disconnect_during_sampling_cannot_invalidate_selected_indices() -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.ready = True
+            self.closed = asyncio.get_running_loop().create_future()
+
+        async def sample_select_one(self) -> None:
+            await asyncio.sleep(0)
+            if self.closed.done():
+                raise ConnectionError("closed")
+
+    runtime = SimpleNamespace(
+        lane_id="lakebase",
+        target_clients=runner.PARTITION_CLIENTS_PER_LANE,
+        clients=[Client() for _ in range(runner.PARTITION_CLIENTS_PER_LANE)],
+        sample_attempted=0,
+        sample_succeeded=0,
+        sample_failed=0,
+    )
+    indices = runner._sample_group_indices(runtime, 2)
+    sample = asyncio.create_task(runner._sample_group(runtime, 2))
+    await asyncio.sleep(0)
+    for index in indices:
+        runtime.clients[index].closed.set_result(None)
+    await sample
+
+    assert runtime.sample_attempted == runner.CLIENTS_PER_SAMPLE_GROUP
+    assert runtime.sample_succeeded + runtime.sample_failed == runtime.sample_attempted
+
+
+async def test_final_observer_disconnect_is_a_failed_check_not_worker_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DisconnectedObserver:
+        async def sample(self) -> None:
+            raise ConnectionError("observer disconnected")
+
+    monkeypatch.setattr(
+        runner,
+        "_telemetry",
+        lambda *unused: {
+            "physical_memory_bytes": 16 * 1024**3,
+            "available_memory_bytes": 12 * 1024**3,
+            "rss_bytes": 1024**3,
+            "fd_soft_limit": 65_535,
+            "open_fds": 100,
+            "ephemeral_port_count": 28_232,
+            "event_loop_p99_ms": 0.01,
+            "cpu_capacity_fraction": 0.1,
+        },
+    )
+    summary = runner.TelemetrySummary()
+    _, observer_ok = await runner._hold_and_sample(
+        [],
+        [DisconnectedObserver()],
+        t0_ns=time.monotonic_ns(),
+        start_cpu=time.process_time(),
+        network_start=(0, 0),
+        telemetry_summary=summary,
+        hold_started_ns=time.monotonic_ns()
+        - int((runner.HOLD_SECONDS + 1) * 1_000_000_000),
+        sample_groups=(),
+    )
+
+    assert observer_ok is False
+
+
+def test_worker_aggregation_rejects_double_count_and_shared_start_mutations() -> None:
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    lane_zero = results[0]["lanes"][0]
+    lane_one = results[1]["lanes"][0]
+    lane_zero["authenticated_clients"] = 2_499
+    lane_zero["held_clients_at_gate"] = 2_499
+    lane_one["authenticated_clients"] = 2_501
+    lane_one["held_clients_at_gate"] = 2_501
+    aggregated = runner.aggregate_worker_results(results)
+    lakebase = next(
+        lane for lane in aggregated["lanes"] if lane["lane_id"] == "lakebase"
+    )
+    assert lakebase["authenticated_clients"] == 10_000
+    assert lakebase["identity_verified"] is False
+
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    results[-1]["release_ns"] = 124
+    with pytest.raises(runner.FanInProtocolError, match="release"):
+        runner.aggregate_worker_results(results)
+
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    results[-1]["worker_cpu"] = results[0]["worker_cpu"]
+    with pytest.raises(runner.FanInProtocolError, match="affinity"):
+        runner.aggregate_worker_results(results)
+
+
+async def test_guarded_wave_cancels_both_lanes_on_runtime_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = asyncio.Event()
+
+    async def blocked(*unused):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(runner, "_open_equal_wave", blocked)
+    monkeypatch.setattr(
+        runner,
+        "_telemetry",
+        lambda *unused: {
+            "physical_memory_bytes": 15 * 1024**3,
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 7 * 1024**3,
+            "fd_soft_limit": 65_535,
+            "open_fds": 20_264,
+            "ephemeral_port_count": 28_232,
+            "event_loop_p99_ms": 50.001,
+            "cpu_capacity_fraction": 0.31,
+        },
+    )
+    summary = runner.TelemetrySummary()
+    await runner._open_equal_wave_guarded(
+        [],
+        250,
+        123,
+        start_cpu=0.0,
+        network_start=(0, 0),
+        telemetry_summary=summary,
+    )
+
+    assert cancelled.is_set()
+    assert summary.failures == {"event_loop_pressure"}
+
+
+async def test_continuous_loop_monitor_attributes_a_real_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stalled_wave(*unused):
+        await asyncio.sleep(0)
+        cpu_deadline = time.thread_time() + 0.06
+        while time.thread_time() < cpu_deadline:
+            pass
+        await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(runner, "_open_equal_wave", stalled_wave)
+    monkeypatch.setattr(runner, "LOOP_MONITOR_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(runner, "RESOURCE_TELEMETRY_INTERVAL_SECONDS", 1.0)
+    monkeypatch.setattr(
+        runner,
+        "_telemetry",
+        lambda *unused: {
+            "physical_memory_bytes": 15 * 1024**3,
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 100 * 1024**2,
+            "fd_soft_limit": 65_535,
+            "open_fds": 7,
+            "ephemeral_port_count": 28_232,
+            "event_loop_p99_ms": 0.0,
+            "cpu_capacity_fraction": 0.01,
+        },
+    )
+    diagnostics = runner.RuntimeDiagnostics()
+    monkeypatch.setattr(runner, "_runtime_diagnostics", diagnostics)
+    summary = runner.TelemetrySummary()
+
+    peak = await runner._open_equal_wave_guarded(
+        [],
+        10,
+        time.monotonic_ns(),
+        start_cpu=time.process_time(),
+        network_start=(0, 0),
+        telemetry_summary=summary,
+    )
+
+    assert peak > 50.0
+    assert summary.failures == {"event_loop_pressure"}
+    assert diagnostics.loop_samples > 0
+    assert diagnostics.peak_loop_lag_ms == peak
+
+
+@pytest.mark.parametrize(
+    ("process_cpu_ms", "thread_cpu_ms", "ready_batch", "phase", "gc_pause_ms"),
+    (
+        (60.0, 60.0, 1, "event_loop_wait", 0.0),
+        (1.0, 1.0, 1, "gc_generation_2", 60.0),
+        (1.0, 1.0, 16, "wave_task_creation", 0.0),
+    ),
+)
+def test_generator_owned_stalls_keep_the_50ms_gate(
+    process_cpu_ms: float,
+    thread_cpu_ms: float,
+    ready_batch: int,
+    phase: str,
+    gc_pause_ms: float,
+) -> None:
+    assert runner.classify_generator_owned_stall(
+        wall_lag_ms=60.0,
+        process_cpu_ms=process_cpu_ms,
+        thread_cpu_ms=thread_cpu_ms,
+        ready_batch_size=ready_batch,
+        selector_batch_size=1,
+        phase=phase,
+        gc_pause_ms=gc_pause_ms,
+    )
+
+
+def test_external_descheduling_is_raw_lag_not_generator_pressure() -> None:
+    owned = runner.classify_generator_owned_stall(
+        wall_lag_ms=72.929,
+        process_cpu_ms=0.5,
+        thread_cpu_ms=0.2,
+        ready_batch_size=2,
+        selector_batch_size=3,
+        phase="ssl_handshake_wall",
+        gc_pause_ms=0.0,
+    )
+    summary = runner.TelemetrySummary()
+    summary.observe_event_loop(
+        72.929,
+        generator_owned_lag_ms=72.929 if owned else 0.0,
+    )
+
+    assert not owned
+    assert summary.peak_raw_event_loop_p99_ms == 72.929
+    assert summary.peak_event_loop_p99_ms == 0.0
+    assert summary.raw_event_loop_warning_count == 1
+    assert summary.failures == set()
+
+
+def test_repeated_extreme_external_lag_fails_as_host_instability() -> None:
+    summary = runner.TelemetrySummary()
+    for _ in range(runner.RAW_WALL_LAG_MAX_BREACHES):
+        summary.observe_event_loop(
+            runner.RAW_WALL_LAG_CEILING_MS + 0.001,
+            generator_owned_lag_ms=0.0,
+        )
+
+    assert summary.peak_event_loop_p99_ms == 0.0
+    assert summary.raw_event_loop_ceiling_breaches == 3
+    assert summary.failures == {"host_scheduling_instability"}
+
+
+def test_runtime_diagnostics_records_gc_and_restores_selector_probe() -> None:
+    diagnostics = runner.RuntimeDiagnostics()
+    loop = asyncio.new_event_loop()
+    selector = loop._selector
+    original_select = selector.select
+    diagnostics.install_selector_probe(loop)
+    try:
+        assert selector.select != original_select
+        gc.callbacks.append(diagnostics.gc_callback)
+        gc.collect(0)
+        assert diagnostics.gc_collections[0] >= 1
+        assert diagnostics.gc_max_pause_ms[0] >= 0.0
+    finally:
+        gc.callbacks.remove(diagnostics.gc_callback)
+        diagnostics.restore_selector_probe()
+        loop.close()
+    assert selector.select == original_select
+
+
+async def test_ready_queue_reports_true_length_and_drains_in_order() -> None:
+    loop = asyncio.get_running_loop()
+    diagnostics = runner.RuntimeDiagnostics()
+    original_ready = loop._ready
+    diagnostics.install_ready_batch_limit(loop)
+    seen: list[int] = []
+    drained = asyncio.Event()
+
+    def record(value: int) -> None:
+        seen.append(value)
+        if value == 999:
+            drained.set()
+
+    try:
+        for value in range(1_000):
+            loop.call_soon(record, value)
+        # The loop must see the real backlog. A capped __len__ leaves the un-run
+        # descriptors readable and level-triggered epoll re-reports them, so the
+        # cap buys re-delivery rather than saving work.
+        assert runner.READY_CALLBACK_BATCH_LIMIT == 0
+        assert runner._ready_backlog_size(loop) >= 1_000
+        assert len(loop._ready) == runner._ready_backlog_size(loop)
+        await drained.wait()
+    finally:
+        diagnostics.restore_ready_batch_limit()
+
+    assert loop._ready is original_ready
+    assert seen == list(range(1_000))
+
+
+def test_ready_queue_still_caps_when_explicitly_asked() -> None:
+    """Regression coverage for the historical capped behaviour only."""
+
+    ready = runner.BoundedReadyDeque(batch_limit=64)
+    for _ in range(1_000):
+        ready.append(object())
+    assert len(ready) == 64
+    assert ready.actual_length() == 1_000
+
+
+def test_ready_queue_age_survives_duplicate_handle_appends() -> None:
+    """A level-triggered re-poll re-appends the same persistent reader handle.
+
+    Keying enqueue times by id() collapsed those duplicates and removed the
+    entry on the first dequeue, so oldest_fifo_ready_age_ms read 0.0 exactly
+    when the backlog was deepest -- the one moment it had to be right.
+    """
+
+    handle = object()
+    ready = runner.BoundedReadyDeque(batch_limit=0)
+    ready.append(handle)
+    time.sleep(0.005)
+    ready.append(handle)
+
+    assert ready.actual_length() == 2
+    assert ready.popleft() is handle
+    assert ready.last_oldest_age_ms >= 5.0
+    assert ready.popleft() is handle
+    assert ready.actual_length() == 0
+
+
+async def test_mirrored_wave_pipelines_within_the_in_flight_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lanes stay equal and interleaved while connects overlap.
+
+    Awaiting each micro-batch pinned in-flight at MICRO_BATCH_SIZE * lanes (4),
+    which made the ramp latency-bound at five to six round trips per client.
+    """
+
+    class Lane:
+        def __init__(self, lane_id: str) -> None:
+            self.lane_id = lane_id
+            self.initiated = 0
+            self.target_clients = 200
+
+    lanes = [Lane("lakebase"), Lane("competitor")]
+    in_flight = 0
+    peak_in_flight = 0
+    order: list[str] = []
+
+    async def fake_open_client(runtime: object, t0_ns: int) -> None:
+        nonlocal in_flight, peak_in_flight
+        del t0_ns
+        runtime.initiated += 1  # type: ignore[attr-defined]
+        order.append(runtime.lane_id)  # type: ignore[attr-defined]
+        in_flight += 1
+        peak_in_flight = max(peak_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0.002)  # stands in for the connect round trips
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(runner, "_open_client", fake_open_client)
+    await runner._open_equal_wave(lanes, 200, 0)
+
+    bound = runner.LANE_CONNECT_CONCURRENCY * len(lanes)
+    assert [lane.initiated for lane in lanes] == [200, 200]
+    assert peak_in_flight <= bound
+    assert peak_in_flight > runner.MICRO_BATCH_SIZE * len(lanes)
+    assert in_flight == 0
+    assert order[:4] == ["lakebase", "competitor", "lakebase", "competitor"]
+    assert order.count("lakebase") == order.count("competitor") == 200
+
+
+def test_ready_heartbeat_cannot_jump_fifo_backlog() -> None:
+    class Handle:
+        def __init__(self, name: str, *, priority: bool = False) -> None:
+            self.name = name
+
+            def callback() -> None:
+                pass
+
+            callback._round5_monitor_priority = priority  # type: ignore[attr-defined]
+            self._callback = callback
+
+    ready = runner.BoundedReadyDeque(batch_limit=64)
+    ready.append(Handle("oldest"))
+    ready.append(Handle("heartbeat", priority=True))
+    time.sleep(0.001)
+
+    assert ready.popleft().name == "oldest"
+    assert ready.last_oldest_age_ms >= 1.0
+    assert ready.popleft().name == "heartbeat"
+
+
+async def test_selector_admission_cap_amplifies_wakeups_quadratically() -> None:
+    """The capped selector reads better per turn and is worse end to end.
+
+    Servicing N ready descriptors K at a time costs about N**2 / 2K wakeups
+    because level-triggered readiness is re-reported, and selectors.py has
+    already paid a kernel copy-out plus a key lookup and tuple for each one.
+    """
+
+    unbounded_ms, unbounded_deferred, unbounded_wakeups, events = (
+        await runner._event_loop_selector_fanout_benchmark()
+    )
+    capped_ms, capped_deferred, capped_wakeups, capped_events = (
+        await runner._event_loop_selector_fanout_benchmark(event_batch_limit=16)
+    )
+
+    assert events == capped_events == runner.SELECTOR_FANOUT_PROBE_SOCKETS
+
+    # Production configuration delivers each readiness event about once.
+    assert unbounded_deferred == 0
+    assert unbounded_wakeups == events
+    assert unbounded_wakeups / events <= runner.MAX_SELECTOR_WAKEUP_AMPLIFICATION
+
+    # The historical cap re-reports what it dropped, and now says so. The floor
+    # is a deliberately loose form of N**2 / 2K.
+    assert capped_deferred > 0
+    assert capped_wakeups > events * 4
+    assert capped_wakeups / events > runner.MAX_SELECTOR_WAKEUP_AMPLIFICATION
+
+    # The per-turn latency gate prefers the slower configuration, which is
+    # exactly why it must never be the only signal.
+    assert capped_ms < unbounded_ms
+
+
+def test_owned_stall_envelope_captures_worker_wave_counts() -> None:
+    diagnostics = runner.RuntimeDiagnostics()
+    runner._worker_execution_context = {
+        "worker_id": 1,
+        "worker_cpu": 1,
+        "phase": "ramp",
+        "operation": "wave_27",
+        "wave": 27,
+        "partition_start": 2_500,
+        "partition_end_exclusive": 5_000,
+        "lane_counts": {
+            "lakebase": {"initiated": 2_077, "authenticated": 2_076, "held": 2_076},
+            "competitor": {
+                "initiated": 2_077,
+                "authenticated": 2_077,
+                "held": 2_077,
+            },
+        },
+    }
+    try:
+        diagnostics.observe_loop(
+            runner.LoopDelaySample(
+                wall_lag_ms=109.544,
+                process_cpu_ms=119.231,
+                thread_cpu_ms=78.310,
+                scheduler_wait_ms=36.347,
+                voluntary_context_switches=5,
+                involuntary_context_switches=23,
+                active_handshakes=1,
+                selector_batch_size=0,
+                ready_batch_size=618,
+                oldest_fifo_ready_age_ms=109.544,
+                callback_interval={
+                    "calls": 618,
+                    "cpu_total_ms": 78.31,
+                    "profiles": {},
+                },
+                phase="telemetry_sampling_wall",
+                gc_pause_ms=0.0,
+                generator_owned=True,
+            )
+        )
+    finally:
+        runner._worker_execution_context = None
+
+    envelope = diagnostics.public_dict()["significant_stall_envelopes"][0]
+    assert envelope["worker_id"] == 1
+    assert envelope["worker_cpu"] == 1
+    assert envelope["wave"] == 27
+    assert envelope["lanes"]["lakebase"]["authenticated"] == 2_076
+    assert envelope["ready_batch_size"] == 618
+
+
+def test_selector_probe_delivers_every_event_and_counts_a_cap_it_is_given() -> None:
+    class Selector:
+        def __init__(self, polls: list[list[tuple[str, int]]]) -> None:
+            self.polls = polls
+
+        def select(self, timeout=None):
+            del timeout
+            return self.polls.pop(0) if self.polls else []
+
+    class Loop:
+        def __init__(self, selector: Selector) -> None:
+            self._selector = selector
+
+    def fresh_polls() -> list[list[tuple[str, int]]]:
+        return [
+            [("old-registration", value) for value in range(610)],
+            [("new-registration", 7)],
+        ]
+
+    # Production configuration drops nothing, so nothing is ever re-delivered
+    # and no SelectorKey is retained across iterations to go stale.
+    selector = Selector(fresh_polls())
+    diagnostics = runner.RuntimeDiagnostics()
+    original_select = selector.select
+    diagnostics.install_selector_probe(Loop(selector))
+    try:
+        first = selector.select(None)
+        second = selector.select(None)
+    finally:
+        diagnostics.restore_selector_probe()
+
+    assert len(first) == 610
+    assert second == [("new-registration", 7)]
+    assert diagnostics.peak_deferred_selector_events == 0
+    assert diagnostics.deferred_selector_events == 0
+    assert diagnostics.peak_selector_wakeups == 610
+    assert diagnostics.peak_selector_batch == 610
+    assert selector.select == original_select
+
+    # Given the historical cap, the discarded events are now counted instead of
+    # silently reported as zero deferred.
+    capped_selector = Selector(fresh_polls())
+    capped = runner.RuntimeDiagnostics()
+    capped.selector_event_batch_limit = 16
+    capped.install_selector_probe(Loop(capped_selector))
+    try:
+        capped_first = capped_selector.select(None)
+    finally:
+        capped.restore_selector_probe()
+
+    assert len(capped_first) == 16
+    assert capped.deferred_selector_events == 610 - 16
+    assert capped.peak_deferred_selector_events == 610 - 16
+
+
+def test_socket_state_telemetry_is_single_worker_and_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def tcp_states() -> dict[str, int]:
+        nonlocal calls
+        calls += 1
+        return {"established": 16_345}
+
+    monkeypatch.setattr(runner, "_tcp_states", tcp_states)
+    monkeypatch.setattr(runner, "_network_bytes", lambda: (0, 0))
+    monkeypatch.setattr(runner, "_memory", lambda: (16 * 1024**3, 10 * 1024**3))
+    monkeypatch.setattr(runner, "_rss_bytes", lambda: 1024)
+    monkeypatch.setattr(runner, "_open_fds", lambda: 10)
+    monkeypatch.setattr(runner, "_ephemeral_ports", lambda: (32_768, 60_999))
+    monkeypatch.setattr(runner.resource, "getrlimit", lambda unused: (65_535, 65_535))
+    monkeypatch.setattr(
+        runner.os,
+        "sched_getaffinity",
+        lambda unused: {0},
+        raising=False,
+    )
+    runner._socket_states_cache.clear()
+    runner._socket_states_cache_ns = 0
+
+    non_owner = runner._telemetry(0.0, time.monotonic_ns(), (0, 0), 0.0, False)
+    first = runner._telemetry(0.0, time.monotonic_ns(), (0, 0), 0.0, True)
+    second = runner._telemetry(0.0, time.monotonic_ns(), (0, 0), 0.0, True)
+
+    assert non_owner["socket_states"] == {}
+    assert first["socket_states"] == {"established": 16_345}
+    assert second["socket_states"] == first["socket_states"]
+    assert calls == 1
+
+
+def test_controlled_gc_always_restores_prior_state_and_collects() -> None:
+    diagnostics = runner.RuntimeDiagnostics()
+    control = runner.ControlledGC(diagnostics)
+    gc.enable()
+    control.start()
+    assert not gc.isenabled()
+    assert control.active
+    control.stop()
+    assert gc.isenabled()
+    assert not control.active
+    assert diagnostics.controlled_gc
+    assert diagnostics.gc_initial_collect_ms >= 0.0
+    assert diagnostics.gc_final_collect_ms >= 0.0
+
+    gc.disable()
+    try:
+        control = runner.ControlledGC(runner.RuntimeDiagnostics())
+        control.start()
+        control.stop()
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
+
+
+async def test_protocol_parser_completes_tls_scram_auth_and_sparse_select(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Socket:
+        def fileno(self):
+            return 42
+
+    class SslObject:
+        def version(self):
+            return "TLSv1.3"
+
+        def cipher(self):
+            return ("TLS_AES_256_GCM_SHA384", "TLSv1.3", 256)
+
+    class Transport:
+        def __init__(self):
+            self.writes: list[bytes] = []
+            self.paused = False
+            self.protocol = None
+
+        def write(self, value):
+            self.writes.append(bytes(value))
+
+        def pause_reading(self):
+            self.paused = True
+
+        def resume_reading(self):
+            self.paused = False
+
+        def get_extra_info(self, name):
+            return {
+                "ssl_object": SslObject(),
+                "socket": Socket(),
+                "sockname": ("10.0.0.10", 40_042),
+            }.get(name)
+
+        def abort(self):
+            if self.protocol is not None:
+                protocol, self.protocol = self.protocol, None
+                protocol.connection_lost(None)
+
+    loop = asyncio.get_running_loop()
+    transport = Transport()
+
+    async def start_tls(original, protocol, context, **kwargs):
+        assert original is transport
+        assert isinstance(context, ssl.SSLContext)
+        assert kwargs["server_hostname"] == "pool.example.test"
+        transport.protocol = protocol
+        return transport
+
+    monkeypatch.setattr(loop, "start_tls", start_tls)
+    disconnects: list[str] = []
+    client = runner.PostgresClient(
+        lane_id="lakebase",
+        ordinal=7,
+        database={
+            "host": "pool.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": "anti_demo_burst",
+            "password": "correct horse battery staple",
+        },
+        application_name="anti-demo-r5-fanin-test",
+        ssl_context=ssl.create_default_context(),
+        on_unexpected_disconnect=disconnects.append,
+    )
+    transport.protocol = client
+    client.connection_made(transport)
+    assert transport.writes == [runner.SSL_REQUEST]
+    client.data_received(b"S")
+    for _ in range(5):
+        await asyncio.sleep(0)
+        if len(transport.writes) > 1:
+            break
+    assert b"application_name\0anti-demo-r5-fanin-test\0" in transport.writes[-1]
+
+    client.data_received(
+        runner._message(
+            b"R",
+            struct.pack("!I", 10) + b"SCRAM-SHA-256\0\0",
+        )
+    )
+    assert transport.writes[-1].startswith(b"p")
+    salt = b"round5-parser-salt"
+    server_first = (
+        f"r={client.scram.nonce}server,"
+        f"s={base64.b64encode(salt).decode()},i=4096"
+    )
+    client.data_received(
+        runner._message(
+            b"R",
+            struct.pack("!I", 11) + server_first.encode(),
+        )
+    )
+    assert client.scram.server_signature is not None
+    client.data_received(
+        b"".join(
+            (
+                runner._message(
+                    b"R",
+                    struct.pack("!I", 12)
+                    + (
+                        "v="
+                        + base64.b64encode(
+                            client.scram.server_signature
+                        ).decode()
+                    ).encode(),
+                ),
+                runner._message(b"R", struct.pack("!I", 0)),
+                runner._message(b"K", struct.pack("!II", 321, 654)),
+                runner._message(b"Z", b"I"),
+            )
+        )
+    )
+    await client.authenticated
+    assert client.ready
+    assert client.backend_pid == 321
+    assert client.fd == 42
+    assert client.local_endpoint == ("10.0.0.10", 40_042)
+    assert client.tls_version == "TLSv1.3"
+    assert client.auth_method == "scram-sha-256"
+
+    sample = asyncio.create_task(client.sample_select_one())
+    await asyncio.sleep(0)
+    assert transport.writes[-1] == runner._message(b"Q", b"SELECT 1\0")
+    data_row = struct.pack("!H", 1) + struct.pack("!I", 1) + b"1"
+    client.data_received(
+        runner._message(b"D", data_row)
+        + runner._message(b"C", b"SELECT 1\0")
+        + runner._message(b"Z", b"I")
+    )
+    await sample
+    client.close()
+    await client.closed
+    assert disconnects == []
+
+
+async def test_cleartext_password_requires_verified_tls_and_is_never_logged(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    password = "never-print-this-password"
+
+    class Transport:
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+
+        def write(self, value: bytes) -> None:
+            self.writes.append(bytes(value))
+
+    client = runner.PostgresClient(
+        lane_id="lakebase",
+        ordinal=1,
+        database={
+            "host": "pool.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": "anti_demo_burst",
+            "password": password,
+        },
+        application_name="anti-demo-r5-auth-test",
+        ssl_context=ssl.create_default_context(),
+        on_unexpected_disconnect=lambda _: None,
+    )
+    transport = Transport()
+    client.transport = transport  # type: ignore[assignment]
+
+    with pytest.raises(runner.FanInProtocolError, match="verified_tls") as before_tls:
+        client._authentication(struct.pack("!I", 3))
+    assert password not in str(before_tls.value)
+    assert transport.writes == []
+
+    client.tls_verified = True
+    client._authentication(struct.pack("!I", 3))
+    assert client.auth_method == "tls-cleartext-password"
+    assert transport.writes == [runner._message(b"p", password.encode() + b"\0")]
+    assert not hasattr(client, "password_message")
+    client._authentication(struct.pack("!I", 0))
+    assert client.authentication_ok
+    captured = capsys.readouterr()
+    assert password not in captured.out
+    assert password not in captured.err
+
+
+@pytest.mark.parametrize("code", [2, 5, 6, 7, 8, 9])
+async def test_unsupported_authentication_methods_fail_closed(code: int) -> None:
+    client = runner.PostgresClient(
+        lane_id="competitor",
+        ordinal=1,
+        database={
+            "host": "proxy.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": "anti_demo_burst",
+            "password": "secret",
+        },
+        application_name="anti-demo-r5-auth-test",
+        ssl_context=ssl.create_default_context(),
+        on_unexpected_disconnect=lambda _: None,
+    )
+    client.transport = SimpleNamespace(write=lambda _: None)
+    client.tls_verified = True
+    with pytest.raises(
+        runner.FanInProtocolError,
+        match=rf"authentication_method_{code}_unsupported",
+    ):
+        client._authentication(struct.pack("!I", code))
+
+
+async def test_authentication_downgrade_and_missing_scram_signature_fail() -> None:
+    client = runner.PostgresClient(
+        lane_id="competitor",
+        ordinal=1,
+        database={
+            "host": "proxy.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": "anti_demo_burst",
+            "password": "secret",
+        },
+        application_name="anti-demo-r5-auth-test",
+        ssl_context=ssl.create_default_context(),
+        on_unexpected_disconnect=lambda _: None,
+    )
+    client.transport = SimpleNamespace(write=lambda _: None)
+    client.tls_verified = True
+    client._authentication(struct.pack("!I", 10) + b"SCRAM-SHA-256\0\0")
+    with pytest.raises(runner.FanInProtocolError, match="signature_missing"):
+        client._authentication(struct.pack("!I", 0))
+    with pytest.raises(runner.FanInProtocolError, match="method_changed"):
+        client._authentication(struct.pack("!I", 3))
+
+
+async def test_malformed_and_unsupported_sasl_challenges_fail_closed() -> None:
+    def client() -> runner.PostgresClient:
+        value = runner.PostgresClient(
+            lane_id="competitor",
+            ordinal=1,
+            database={
+                "host": "proxy.example.test",
+                "port": 5432,
+                "dbname": "anti_demo",
+                "user": "anti_demo_burst",
+                "password": "secret",
+            },
+            application_name="anti-demo-r5-auth-test",
+            ssl_context=ssl.create_default_context(),
+            on_unexpected_disconnect=lambda _: None,
+        )
+        value.transport = SimpleNamespace(write=lambda _: None)
+        value.tls_verified = True
+        return value
+
+    with pytest.raises(runner.FanInProtocolError, match="sasl_challenge_malformed"):
+        client()._authentication(struct.pack("!I", 10) + b"SCRAM-SHA-256")
+    with pytest.raises(runner.FanInProtocolError, match="scram_unavailable"):
+        client()._authentication(struct.pack("!I", 10) + b"SCRAM-SHA-256-PLUS\0\0")
+
+
+def test_provider_selected_authentication_difference_preserves_fairness() -> None:
+    lakebase = finalize(raw_lane("lakebase", time_to_target_ms=12_000))
+    competitor = finalize(raw_lane("competitor", time_to_target_ms=13_000))
+    comparison = compare_lanes(lakebase, competitor)
+    assert lakebase.auth_method == "tls-cleartext-password"
+    assert competitor.auth_method == "scram-sha-256"
+    assert lakebase.gates.fairness and competitor.gates.fairness
+    assert comparison is not None
+    assert comparison.winner_lane_id == "lakebase"
+
+
+def test_progress_sequence_is_monotonic_and_reconnect_deduplicates() -> None:
+    values = [
+        {
+            "schema_version": 2,
+            "protocol": FANIN_PROTOCOL,
+            "sequence": sequence,
+            "lane_id": lane,
+            "phase": "ramp",
+            "authenticated_clients": sequence * 1_000,
+            "held_clients": sequence * 1_000,
+            "elapsed_ms": sequence * 10.0,
+        }
+        for sequence, lane in ((1, "lakebase"), (2, "competitor"))
+    ]
+    output = "\n".join(
+        "PROGRESS_JSON:" + runner.canonical_json(value).decode()
+        for value in values
+    )
+    progress, last = LiveConnectionSpikeAdapter._progress_from_output(
+        output,
+        after_sequence=0,
+    )
+    assert last == 2
+    assert [item.authenticated_clients for item in progress] == [1_000, 2_000]
+    replay, replay_last = LiveConnectionSpikeAdapter._progress_from_output(
+        output,
+        after_sequence=last,
+    )
+    assert replay == []
+    assert replay_last == last
+    broken = output.replace('"sequence":2', '"sequence":3')
+    with pytest.raises(ConnectionSpikeLiveOperationError, match="sequence"):
+        LiveConnectionSpikeAdapter._progress_from_output(
+            broken,
+            after_sequence=0,
+        )
+
+
+def test_progress_wire_output_is_compact_bounded_and_parseable(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner, "_progress_callback", None)
+    monkeypatch.setattr(runner, "_progress_sequence", 0)
+    monkeypatch.setattr(runner, "_progress_output_bytes", 0)
+    value = {
+        "schema_version": 2,
+        "protocol": FANIN_PROTOCOL,
+        "lane_id": "lakebase",
+        "phase": "hold",
+        "authenticated_clients": 10_000,
+        "held_clients": 10_000,
+        "terminal_failures": 0,
+        "elapsed_ms": 81_234.5,
+        "time_to_target_ms": 48_123.4,
+        "hold_remaining_ms": 12_345.6,
+        "sampled_queries_succeeded": 48,
+        "sampled_queries_failed": 0,
+        "event_loop_p99_ms": 0.02,
+        "available_memory_bytes": 9_000_000_000,
+        "network_received_bytes": 123_456_789,
+        "socket_states": {"established": 20_009},
+    }
+
+    for _ in range(100):
+        runner._progress(value)
+
+    output = capsys.readouterr().out
+    assert len(output.encode()) <= runner.PROGRESS_OUTPUT_BUDGET_BYTES
+    assert "available_memory_bytes" not in output
+    assert "network_received_bytes" not in output
+    assert "socket_states" not in output
+    parsed, last = LiveConnectionSpikeAdapter._progress_from_output(
+        output,
+        after_sequence=0,
+    )
+    assert parsed
+    assert last == len(parsed)
+    assert [item.lane_id for item in parsed] == ["lakebase"] * len(parsed)
+
+
+def test_execution_probes_capture_callback_cpu_and_fifo_age() -> None:
+    async def scenario() -> tuple[
+        runner.RuntimeDiagnostics,
+        dict[str, object],
+        dict[str, object],
+    ]:
+        loop = asyncio.get_running_loop()
+        diagnostics = runner.RuntimeDiagnostics()
+        diagnostics.install_ready_batch_limit(loop)
+        diagnostics.install_execution_probes(loop)
+
+        async def diagnostic_leaf_callback() -> None:
+            await asyncio.sleep(0)
+
+        try:
+            await asyncio.gather(
+                *(diagnostic_leaf_callback() for _ in range(64))
+            )
+            await asyncio.sleep(0)
+            interval = diagnostics.consume_callback_interval()
+            empty_interval = diagnostics.consume_callback_interval()
+            return diagnostics, interval, empty_interval
+        finally:
+            diagnostics.restore_execution_probes()
+            diagnostics.restore_ready_batch_limit()
+
+    diagnostics, interval, empty_interval = asyncio.run(scenario())
+    assert diagnostics.callback_cpu_total_ms > 0
+    assert diagnostics.callback_profiles
+    assert diagnostics.run_once_calls > 0
+    assert diagnostics.run_once_ready_cpu_total_ms > 0
+    assert interval["calls"] >= 64
+    assert any(
+        "diagnostic_leaf_callback" in callback_type
+        for callback_type in interval["profiles"]
+    )
+    assert empty_interval == {
+        "calls": 0,
+        "cpu_total_ms": 0.0,
+        "cpu_max_ms": 0.0,
+        "profiles": {},
+    }
+
+
+def test_callback_profiling_cpu_overhead_is_bounded() -> None:
+    def measure(*, probed: bool, callbacks: int = 10_000) -> float:
+        loop = asyncio.new_event_loop()
+        diagnostics = runner.RuntimeDiagnostics()
+        diagnostics.install_ready_batch_limit(loop)
+        if probed:
+            diagnostics.install_execution_probes(loop)
+        remaining = [callbacks]
+        completed = loop.create_future()
+
+        def callback() -> None:
+            remaining[0] -= 1
+            if remaining[0] == 0:
+                completed.set_result(None)
+
+        try:
+            for _ in range(callbacks):
+                loop.call_soon(callback)
+            started_ns = time.thread_time_ns()
+            loop.run_until_complete(completed)
+            return (time.thread_time_ns() - started_ns) / 1_000_000
+        finally:
+            if probed:
+                diagnostics.restore_execution_probes()
+            diagnostics.restore_ready_batch_limit()
+            loop.close()
+
+    baseline_ms = min(measure(probed=False) for _ in range(3))
+    profiled_ms = min(measure(probed=True) for _ in range(3))
+    assert profiled_ms / baseline_ms < 2.5
+
+
+def test_malformed_counts_and_monotonic_times_fail_closed() -> None:
+    with pytest.raises(FanInError, match="held_clients"):
+        finalize({**raw_lane("lakebase"), "held_clients_at_gate": True})
+    with pytest.raises(FanInError, match="time_to_target"):
+        finalize({**raw_lane("lakebase"), "time_to_target_ms": -1.0})

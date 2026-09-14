@@ -20,26 +20,36 @@ from uuid import uuid4
 
 import boto3
 
+# Round 5 v2 replaces the bounded v1 burst, but the setup phase -- provisioning the
+# RDS Proxy an AWS lane needs and Lakebase does not -- is unchanged and still lives
+# in `.connection_spike`. Both modules export `ConnectionSpikeArm`, `finalize_lane`
+# and `compare_lanes`, so the v2 names are aliased rather than shadowing the setup
+# phase's while that removal is staged.
+from .connection_fanin import (
+    FANIN_PROTOCOL,
+    FANIN_SCHEMA_VERSION,
+    PROGRESS_PREFIX,
+    RUNNER_LANE_COUNT,
+    ConnectionSpikeLaneResult,
+    FanInError,
+    FanInProgress,
+)
+from .connection_fanin import ConnectionSpikeArm as FanInArm
+from .connection_fanin import ConnectionSpikeRunResult as FanInRunResult
+from .connection_fanin import compare_lanes as compare_fanin_lanes
+from .connection_fanin import finalize_lane as finalize_fanin_lane
 from .connection_spike import (
-    MAX_LAUNCH_SKEW_MS,
-    AttemptObservation,
     AttemptProof,
-    AttemptStatus,
     ConnectionSpikeArm,
     ConnectionSpikeContract,
     ConnectionSpikeRunResult,
-    ConnectionSpikeWitness,
     PublicSetupEvidence,
-    RetainedClientWitness,
     SetupLaneObservation,
     SetupLaneStatus,
     SetupPhaseArm,
     SetupStopGateEvidence,
-    SharedBarrier,
     arm_setup_phase,
     build_schedule,
-    compare_lanes,
-    finalize_lane,
 )
 from .connection_spike_journal import (
     ROUND5_CREATION_JOURNAL_TABLE,
@@ -71,6 +81,17 @@ SETUP_RUNNER_PROTOCOL = "connection-spike-setup-v1"
 _RUNNER_ERROR_PREFIX = "RUNNER_ERROR:"
 _RUNNER_ERROR_CODE = re.compile(r"[a-z0-9_]{1,64}")
 SSM_TIMEOUT_SECONDS = 120.0
+#: The same number, named for the agreement it is half of.
+#:
+#: `runner.connection_spike_runner.SSM_COMMAND_TIMEOUT_SECONDS` must equal this, and
+#: the runner's own `SETUP_VERIFY_DEADLINE_SECONDS` must fall strictly inside it. If
+#: the runner were allowed to verify right up to this boundary, SSM would time the
+#: command out while the runner still held a transaction open -- and the failure
+#: would arrive as "the command did not complete", which says nothing about the
+#: transaction that was actually mid-flight. Kept as a distinct name from
+#: `SSM_TIMEOUT_SECONDS` because it is a cross-boundary contract rather than a local
+#: preference: changing it means changing the runner in the same commit.
+SETUP_SSM_TIMEOUT_SECONDS = SSM_TIMEOUT_SECONDS
 #: How long a cancelled setup command is given to confirm it has settled.
 #:
 #: Ten seconds could not have worked, and a live towel thrown during Round 5
@@ -3764,6 +3785,75 @@ class LiveConnectionSpikeAdapter:
         self._pending: _PendingCommand | None = None
         self._dispatch_lock = asyncio.Lock()
 
+    @staticmethod
+    def _progress_from_output(
+        output: str,
+        *,
+        after_sequence: int,
+    ) -> tuple[list[FanInProgress], int]:
+        """Read the runner's progress lines out of one SSM output block.
+
+        SSM has no stream: each poll returns the whole of stdout so far, so the same
+        lines arrive again on every poll for the life of the bout. `after_sequence`
+        is what makes that idempotent -- the caller passes back the last sequence it
+        has already shown, and gets only what is new. The returned sequence is the
+        highest *seen*, not the highest returned, so a poll that finds nothing new
+        still reports where the stream is and cannot rewind the caller's cursor.
+
+        A gap is refused rather than skipped. The runner numbers these consecutively
+        and stops printing when it runs out of budget, so it cannot skip one; a gap
+        therefore means output was lost or spliced, and silently continuing would
+        show the room a ramp with a hole in it and call it a measurement. Lines that
+        are not progress lines are ignored: the same stdout legitimately carries the
+        runner's own refusals and settlement tokens.
+        """
+
+        parsed: list[FanInProgress] = []
+        last_seen = after_sequence
+        expected: int | None = None
+        wire_fields = {slot for slot in FanInProgress.__slots__}
+
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(PROGRESS_PREFIX):
+                continue
+            body = stripped[len(PROGRESS_PREFIX) :]
+            try:
+                payload = json.loads(body)
+            except ValueError as exc:
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 progress line was not valid JSON"
+                ) from exc
+            if not isinstance(payload, Mapping):
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 progress line was not a JSON object"
+                )
+            try:
+                sequence = int(payload["sequence"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 progress line carried no usable sequence"
+                ) from exc
+            if expected is not None and sequence != expected:
+                raise ConnectionSpikeLiveOperationError(
+                    f"Round 5 progress sequence jumped from {expected - 1} to "
+                    f"{sequence}; output was lost rather than merely delayed"
+                )
+            expected = sequence + 1
+            last_seen = max(last_seen, sequence)
+            if sequence <= after_sequence:
+                continue
+            # Only the declared fields, so a field added to the runner's wire
+            # cannot reach this dataclass as an unexpected keyword and turn a
+            # newer runner into a crash on this side.
+            fields = {
+                name: value for name, value in payload.items() if name in wire_fields
+            }
+            fields["sequence"] = sequence
+            parsed.append(FanInProgress(**fields))
+
+        return parsed, last_seen
+
     def _cancelled_burst_identifier(self, active: _ActiveCommand) -> str:
         """Name what a cancelled burst may leave holding something.
 
@@ -4561,98 +4651,181 @@ def _proof(value: object) -> AttemptProof | None:
         return None
 
 
+#: Keys whose values are method *labels* rather than credential material.
+#:
+#: `auth_method` legitimately carries `tls-cleartext-password`: that is the name of
+#: a PostgreSQL authentication method, and Round 5 reports it because which method
+#: the server negotiated is part of what the round proves. A scanner that flagged
+#: the substring `password` anywhere would refuse every honest result from the
+#: cleartext-password lane, so the exemption is by key and the key is named here
+#: rather than inferred from the value.
+_CREDENTIAL_LABEL_KEYS = frozenset({"auth_method", "auth_methods"})
+
+#: What leaking credential material actually looks like in this payload: an
+#: assignment, not a word. A connection string, a libpq keyword pair or an env dump
+#: all take the form `name=value`, and it is the value after `=` that must never
+#: reach a receipt or a log. Matching the assignment rather than the bare noun is
+#: what lets `auth_method` above stay readable while still refusing `password=...`.
+_FORBIDDEN_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?:password|passwd|pgpassword|secret|secret_access_key|session_token|token)"
+    r"\s*[=:]\s*\S",
+    re.IGNORECASE,
+)
+
+
+def _runner_result_has_forbidden_credential(raw: object) -> bool:
+    """Does this runner payload carry credential material anywhere inside it?
+
+    Round 5's result crosses a boundary the rest of the round does not: it comes
+    back from an EC2 instance over SSM, is folded into a receipt, and receipts are
+    pasted into notes and issues. The runner is written not to emit secrets, but
+    "the runner is careful" is not a property this side can verify, so the payload
+    is scanned before anything is retained.
+
+    Walks the whole structure rather than a known set of fields, because the leak
+    that matters is the one nobody predicted -- a diagnostic added to the runner in
+    a hurry, under a key this file has never heard of. Keys are matched by name
+    only to *exempt* label fields; nothing is trusted because of where it sits.
+
+    Returns True when the payload must be refused, so a caller that cannot decide
+    treats it as unsafe.
+    """
+
+    if isinstance(raw, Mapping):
+        for key, value in raw.items():
+            if isinstance(value, str) and str(key) in _CREDENTIAL_LABEL_KEYS:
+                continue
+            if _runner_result_has_forbidden_credential(value):
+                return True
+        return False
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return any(_runner_result_has_forbidden_credential(item) for item in raw)
+    if isinstance(raw, str):
+        return _FORBIDDEN_CREDENTIAL_ASSIGNMENT.search(raw) is not None
+    return False
+
+
 def _finalize_raw_result(
-    arm: ConnectionSpikeArm,
+    arm: FanInArm,
     raw: Mapping[str, object],
-) -> ConnectionSpikeRunResult:
-    try:
-        release_ns = int(raw["release_ns"])
-        first_launch = {
-            str(key): int(value) for key, value in dict(raw["first_launch_ns_by_lane"]).items()
-        }
-        raw_lanes = {
-            str(value["lane_id"]): value for value in raw["lanes"] if isinstance(value, Mapping)
-        }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ConnectionSpikeLiveOperationError("Round 5 runner evidence is incomplete") from exc
-    barrier = SharedBarrier(
-        release_ns=release_ns,
-        first_launch_ns_by_lane=first_launch,
-    )
-    lanes = {}
-    for lane_id in arm.schedule.lane_ids:
-        lane = raw_lanes.get(lane_id)
-        if lane is None:
-            raise ConnectionSpikeLiveOperationError("Round 5 runner evidence omitted a lane")
-        observations = []
-        scheduled = {str(item.attempt_id): item for item in arm.schedule.lane_attempts(lane_id)}
-        for value in lane.get("observations", []):
-            if not isinstance(value, Mapping):
-                raise ConnectionSpikeLiveOperationError(
-                    "Round 5 runner returned a malformed observation"
-                )
-            attempt_id = str(value.get("attempt_id") or "")
-            attempt = scheduled.get(attempt_id)
-            if attempt is None:
-                raise ConnectionSpikeLiveOperationError(
-                    "Round 5 runner returned an unowned observation"
-                )
-            status = AttemptStatus(str(value.get("status") or "error"))
-            started_ns = int(value["started_ns"])
-            completed_ns = int(value["completed_ns"])
-            observations.append(
-                AttemptObservation(
-                    attempt_id=attempt.attempt_id,
-                    status=status,
-                    started_ns=started_ns,
-                    completed_ns=completed_ns,
-                    response=(
-                        attempt.proof
-                        if value.get("exact") is True
-                        else _proof(value.get("response"))
-                    ),
-                    committed=(
-                        attempt.proof
-                        if value.get("exact") is True
-                        else _proof(value.get("committed"))
-                    ),
-                    error=str(value["error"]) if value.get("error") else None,
-                )
+    *,
+    cleanup_verified: bool = True,
+) -> FanInRunResult:
+    """Turn one runner payload into a scored v2 result, or refuse it.
+
+    Refusal is the common case worth designing for. This payload crossed SSM from a
+    machine that may be running an older generator than the arm was sealed against,
+    and a stale generator that still answers is more dangerous than one that fails:
+    its numbers look exactly like a measurement. So every digest in the seal is
+    compared before any lane is read, and a mismatch is reported as staleness rather
+    than as malformed evidence, because the operator's next move differs -- redeploy
+    the runner, not debug the round.
+
+    `cleanup_verified` defaults to True because the adapter has already refused any
+    command that did not print `SETUP_SETTLED` and `RUNNER_FLOCK_RELEASED` by the
+    time a payload reaches here. A caller that has not run that gate must pass what
+    it actually observed; the default is not a claim this function can make.
+    """
+
+    # The seal first, and all of it at once. Reporting only the first mismatched
+    # digest would send someone to redeploy one component and hit the next.
+    expected_seal = {
+        "schema_version": FANIN_SCHEMA_VERSION,
+        "protocol": FANIN_PROTOCOL,
+        "contract_sha256": arm.contract_sha256,
+        "config_sha256": arm.config_sha256,
+        "generator_sha256": arm.generator_sha256,
+        "capacity_model_sha256": arm.capacity_model_sha256,
+    }
+    stale: list[str] = []
+    for name, expected in expected_seal.items():
+        observed = raw.get(name)
+        # `bool` is a subclass of `int`, so True would otherwise satisfy a
+        # schema_version of 1. Compared by type as well as value because a runner
+        # that reported `true` there has not reported a version at all.
+        if isinstance(expected, int) and not isinstance(expected, bool):
+            matches = (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed == expected
             )
-        raw_witness = lane.get("witness")
-        if not isinstance(raw_witness, Mapping):
+        else:
+            matches = isinstance(observed, str) and observed == expected
+        if not matches:
+            stale.append(name)
+    if stale:
+        raise ConnectionSpikeLiveOperationError(
+            "Round 5 runner evidence is stale: "
+            f"{', '.join(stale)} does not match the sealed arm, so this payload was "
+            "produced by a different contract, config or generator than the one armed"
+        )
+
+    # Diagnostics are not scored, but their absence is still a refusal: the runtime
+    # gates (event-loop p99, selector amplification, CPU capacity) are what
+    # distinguish 10,000 real clients from 10,000 numbers, and a payload that
+    # carries no diagnostics cannot be checked against them at all.
+    diagnostics = raw.get("runtime_diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        raise ConnectionSpikeLiveOperationError(
+            "Round 5 runner returned no runtime diagnostics, so the runtime gates "
+            "this protocol depends on cannot be evaluated"
+        )
+
+    raw_lanes_value = raw.get("lanes")
+    if not isinstance(raw_lanes_value, Sequence) or isinstance(raw_lanes_value, (str, bytes)):
+        raise ConnectionSpikeLiveOperationError("Round 5 runner evidence carried no lanes")
+    raw_lanes: dict[str, Mapping[str, object]] = {}
+    for value in raw_lanes_value:
+        if not isinstance(value, Mapping):
+            raise ConnectionSpikeLiveOperationError("Round 5 runner returned a malformed lane")
+        lane_id = str(value.get("lane_id") or "")
+        if not lane_id:
+            raise ConnectionSpikeLiveOperationError("Round 5 runner returned an unnamed lane")
+        if lane_id in raw_lanes:
             raise ConnectionSpikeLiveOperationError(
-                "Round 5 runner omitted direct witness evidence"
+                f"Round 5 runner returned lane {lane_id} twice"
             )
-        clients = tuple(
-            RetainedClientWitness(
-                client_id=str(client["client_id"]),
-                retained=client.get("retained") is True,
-                verified=client.get("verified") is True,
-                backend_pid=int(client["backend_pid"]),
+        raw_lanes[lane_id] = value
+    if len(raw_lanes) != RUNNER_LANE_COUNT:
+        raise ConnectionSpikeLiveOperationError(
+            f"Round 5 is a two-lane round; the runner returned {len(raw_lanes)} lane(s)"
+        )
+
+    lanes: dict[str, ConnectionSpikeLaneResult] = {}
+    # Sorted so the left/right labels on the comparison are a property of the
+    # installation rather than of dict ordering in the runner's JSON.
+    for lane_id in sorted(raw_lanes):
+        try:
+            lanes[lane_id] = finalize_fanin_lane(
+                raw_lanes[lane_id],
+                expected_lane_id=lane_id,
+                expected_config_sha256=arm.config_sha256,
+                expected_generator_sha256=arm.generator_sha256,
+                expected_capacity_model_sha256=arm.capacity_model_sha256,
+                cleanup_verified=cleanup_verified,
             )
-            for client in raw_witness.get("clients", [])
-            if isinstance(client, Mapping)
-        )
-        witness = ConnectionSpikeWitness(
-            clients=clients,
-            peak_backend_sessions=int(raw_witness.get("peak_backend_sessions", -1)),
-        )
-        lanes[lane_id] = finalize_lane(
-            arm.schedule,
-            lane_id,
-            observations,
-            witness,
-            barrier,
-            cleanup_verified=True,
-            fairness_verified=barrier.launch_skew_ms <= MAX_LAUNCH_SKEW_MS,
-            contracts_verified=raw.get("contracts_verified") is True,
-        )
-    values = list(lanes.values())
-    return ConnectionSpikeRunResult(
+        except FanInError as exc:
+            # The contract's refusal token is the whole diagnosis and is safe to
+            # repeat: it is a fixed snake_case word chosen by this repository, never
+            # a host, ARN or credential.
+            raise ConnectionSpikeLiveOperationError(
+                f"Round 5 lane {lane_id} failed the fan-in contract: {exc}"
+            ) from exc
+
+    left_id, right_id = sorted(lanes)
+    return FanInRunResult(
+        schema_version=FANIN_SCHEMA_VERSION,
+        protocol=FANIN_PROTOCOL,
         contract_sha256=arm.contract_sha256,
+        config_sha256=arm.config_sha256,
+        generator_sha256=arm.generator_sha256,
+        capacity_model_sha256=arm.capacity_model_sha256,
         lanes=lanes,
-        comparison=compare_lanes(values[0], values[1]),
+        # None when either lane did not verify. That is not an error: a lane that
+        # held 9,999 clients has failed this protocol, and the round shows it
+        # failing rather than comparing it.
+        comparison=compare_fanin_lanes(lanes[left_id], lanes[right_id]),
+        runtime_diagnostics=dict(diagnostics),
     )
 
 

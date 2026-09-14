@@ -6,6 +6,14 @@ export interface ScorecardEntry {
   round_id?: RoundId
   round_title: string
   competitor: string
+  /**
+   * Which Round 5 protocol produced this entry, when it was Round 5.
+   *
+   * Stored rather than derived, because a scorecard outlives the installation that
+   * wrote it. Relabelling an old 128-attempt bout with today's 10,000-client copy
+   * would put a number on screen that the run never attempted.
+   */
+  round5_protocol?: string
   lakebase_ms: number | null
   competitor_ms: number | null
   competitor_censored?: boolean

@@ -1011,7 +1011,7 @@ describe('backstage setup', () => {
     }
     expect(fetchMock.mock.calls.filter(([input]) => input === `/api/sessions/${running.id}`)).toHaveLength(4)
     expect(screen.getByRole('heading', { name: /saved bout unavailable/i })).toBeInTheDocument()
-    expect(screen.getByText(/demo server connected/i)).toBeVisible()
+    expect(screen.getByText(/server connected/i)).toBeVisible()
     expect(screen.getByRole('button', { name: /discard saved bout/i })).toBeEnabled()
 
     await act(async () => {
@@ -1420,7 +1420,7 @@ describe('backstage setup', () => {
     const user = userEvent.setup()
     render(<App />)
     await user.click(screen.getByRole('button', { name: /press start/i }))
-    const indicator = await screen.findByRole('button', { name: /demo server offline/i })
+    const indicator = await screen.findByRole('button', { name: /server offline/i })
     expect(indicator).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText(/verifier offline/i)).not.toBeInTheDocument()
     await user.click(indicator)
@@ -1438,13 +1438,13 @@ describe('backstage setup', () => {
     expect(screen.getByText(/live proof locked/i)).toBeInTheDocument()
   })
 
-  it('explains the exact boundary of a connected demo server', async () => {
+  it('explains the exact boundary of a connected server', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(FALLBACK_CATALOG)))
     const user = userEvent.setup()
     render(<App />)
 
     await user.click(screen.getByRole('button', { name: /press start/i }))
-    const indicator = await screen.findByRole('button', { name: /demo server connected/i })
+    const indicator = await screen.findByRole('button', { name: /server connected/i })
     await user.click(indicator)
 
     const details = screen.getByRole('dialog', { name: /local api answered/i })
@@ -2491,7 +2491,7 @@ describe('backstage setup', () => {
     })
     expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
     expect(laneLinesOnScreen()[0]).toBe('BOUT IN PROGRESS')
-    expect(screen.getByText(/demo server connected/i)).toBeVisible()
+    expect(screen.getByText(/server connected/i)).toBeVisible()
     expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
     expect(refusalOnScreen()).toMatch(/status stale/i)
 
@@ -2544,7 +2544,7 @@ describe('backstage setup', () => {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(25_500)
     })
-    expect(screen.getByText(/demo server connected/i)).toBeVisible()
+    expect(screen.getByText(/server connected/i)).toBeVisible()
     expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
   })
 

@@ -1379,7 +1379,7 @@ class RunManager:
 
     def _require_open(self) -> None:
         if self._closed:
-            raise InvalidStateError("The demo server is restarting; refresh in a moment")
+            raise InvalidStateError("The server is restarting; refresh in a moment")
 
     async def close(self) -> None:
         """Settle active work before the coordinator connection is closed.

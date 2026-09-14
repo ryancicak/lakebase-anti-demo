@@ -4,6 +4,7 @@ import { RoundFiveProof, linkedInReceipt } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { applyRunEventSnapshot, selectRound4Session } from './round4'
+import { roundFiveFightCardOpening, roundFiveHasComparison, roundFiveLaneResult } from './round5'
 
 afterEach(() => {
   cleanup()
@@ -11,24 +12,96 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+it('gives every Round 5 lead voice a distinct human implication without proof mechanics', () => {
+  const personaIds = FALLBACK_CATALOG.personas.map((persona) => persona.id)
+  const openings = personaIds.map(roundFiveFightCardOpening)
+
+  expect(personaIds).toHaveLength(10)
+  expect(new Set(openings).size).toBe(personaIds.length)
+  expect(roundFiveFightCardOpening('software_engineer')).toBe(
+    'Lakebase includes pooling for up to 10,000 client connections. '
+    + 'The selected AWS path adds a service the app team must secure and own.',
+  )
+  for (const opening of openings) {
+    expect(opening).toMatch(/\bup to 10,000 client connections\b/i)
+    expect(opening).not.toMatch(
+      /[–—]|\b(?:spike|survive|witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i,
+    )
+    expect(opening.split(/\s+/).length).toBeLessThanOrEqual(34)
+  }
+})
+
+it('does not rewind live 10,000-client counters on refresh or SSE reconnect', () => {
+  const current = roundFiveSession()
+  current.state = 'running'
+  current.updated_at = '2026-08-18T20:00:10Z'
+  current.lanes.lakebase.state = 'verifying'
+  current.lanes.lakebase.evidence = {
+    ...current.lanes.lakebase.evidence,
+    held_clients: 7_500,
+    authenticated_clients: 7_500,
+  }
+  const stale = structuredClone(current)
+  stale.lanes.lakebase.evidence = {
+    ...stale.lanes.lakebase.evidence,
+    held_clients: 5_000,
+    authenticated_clients: 5_000,
+  }
+
+  const selected = selectRound4Session(current, stale)
+  expect(selected?.lanes.lakebase.evidence?.held_clients).toBe(7_500)
+})
+
 function burstLane(id: 'lakebase' | 'competitor', name: string, offset: number): LaneSnapshot {
   return {
     id,
     name,
     state: 'verified',
-    elapsed_ms: null,
-    attempts: 1,
-    status: 'Burst count contract verified',
+    elapsed_ms: 3_112.673 + offset * 100,
+    attempts: 10_000,
+    status: 'Exact 10,000-client fan-in verified',
     error: null,
     evidence: {
-      scheduled_clients: 128,
-      terminal_clients: 128,
-      successful_clients: 128,
-      error_clients: 0,
-      successful_latency_ms: Array.from({ length: 128 }, (_, index) => index + 0.1234 + offset),
-      witness_verified_clients: 64,
+      schema_version: 2,
+      protocol: 'round5-fanin-v2',
+      initiated_clients: 10_000,
+      authenticated_clients: 10_000,
+      held_clients_at_gate: 10_000,
+      terminal_failures: 0,
+      retries: 0,
+      disconnected_during_hold: 0,
+      time_to_target_ms: 3_112.673 + offset * 100,
+      hold_elapsed_ms: 30_000.5,
+      sampled_queries_attempted: 64,
+      sampled_queries_succeeded: 64,
+      sampled_queries_failed: 0,
+      preexisting_client_role_sessions: 0,
+      observer_role: 'anti_demo_observer',
+      client_role: 'anti_demo_burst',
+      observer_direct: true,
+      current_backend_sessions: id === 'lakebase' ? 7 : 11,
       unique_backend_pids: id === 'lakebase' ? 7 : 11,
       peak_backend_sessions: id === 'lakebase' ? 9 : 14,
+      distinct_socket_fds: 10_000,
+      distinct_local_endpoints: 10_000,
+      connect_latency_p50_ms: 80 + offset,
+      connect_latency_p95_ms: 150 + offset,
+      auth_method: id === 'lakebase' ? 'tls-cleartext-password' : 'scram-sha-256',
+      connect_latency_p99_ms: 201.455 + offset,
+      telemetry_samples: 49,
+      telemetry_physical_memory_bytes: 15 * 1024 ** 3,
+      telemetry_min_available_memory_bytes: 7 * 1024 ** 3,
+      telemetry_peak_rss_bytes: 7 * 1024 ** 3,
+      telemetry_fd_soft_limit: 65_535,
+      telemetry_peak_open_fds: 20_264,
+      telemetry_ephemeral_port_count: 28_232,
+      telemetry_min_ephemeral_port_reserve: 18_232,
+      telemetry_peak_event_loop_p99_ms: 4.5,
+      telemetry_peak_raw_event_loop_p99_ms: 6.25,
+      telemetry_peak_external_event_loop_p99_ms: 6.25,
+      telemetry_peak_cpu_capacity_fraction: 0.31,
+      telemetry_failures: [],
+      telemetry_verified: true,
     },
   }
 }
@@ -62,11 +135,16 @@ function roundFiveSession(): DemoSession {
       same_transaction: true,
       same_nonce: true,
       launch_skew_ms: 1.23456,
-      warmup_connections: 4,
-      concurrency: 64,
-      runner: 'Python 3.12 + psycopg 3.3.4',
-      tls: 'required',
-      timeout: '10 seconds',
+      warmup_connections: 0,
+      concurrency: 10_000,
+      runner: 'Python 3.12 event-driven TLS/native-password',
+      tls: 'verify-full',
+      timeout: '20s connect · 600s run',
+      protocol: 'round5-fanin-v2',
+      target_clients_per_lane: 10_000,
+      hold_seconds: 30,
+      sampled_queries_per_lane: 64,
+      max_retries: 0,
     },
     cost_receipt: {
       currency: 'USD',
@@ -150,10 +228,12 @@ function roundFiveSession(): DemoSession {
     comparison: {
       kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: { spec_id: 'setup_elapsed_ms', lane_id: 'lakebase', value: 11_654.322, display_value: '11654.32 ms' },
+      margin: { spec_id: 'time_to_10000_ms', lane_id: 'lakebase', value: 1_000, display_value: '1000.00 ms' },
       detail: 'Lakebase completed the verified setup sooner.',
     },
     round5_setup: {
+      schema_version: 2,
+      protocol: 'round5-fanin-v2',
       state: 'verified',
       workflow_launch_skew_ms: 0.75,
       lanes: {
@@ -195,6 +275,31 @@ function roundFiveSession(): DemoSession {
   }
 }
 
+it('rejects stale or unversioned fan-in evidence before reading its counters', () => {
+  for (const schemaVersion of [undefined, 1]) {
+    const lane = burstLane('lakebase', 'Lakebase', 0)
+    lane.evidence = {
+      ...lane.evidence,
+      schema_version: schemaVersion,
+    }
+    const result = roundFiveLaneResult(lane)
+    expect(result.contractVerified).toBe(false)
+    expect(result.held).toBeNull()
+    expect(result.telemetryVerified).toBe(false)
+  }
+})
+
+it('records each provider-selected authentication method without requiring equality', () => {
+  const session = roundFiveSession()
+  const lakebase = roundFiveLaneResult(session.lanes.lakebase)
+  const competitor = roundFiveLaneResult(session.lanes.competitor)
+  expect(lakebase.authMethod).toBe('tls-cleartext-password')
+  expect(competitor.authMethod).toBe('scram-sha-256')
+  expect(lakebase.contractVerified).toBe(true)
+  expect(competitor.contractVerified).toBe(true)
+  expect(roundFiveHasComparison(session)).toBe(true)
+})
+
 function runningRoundFiveSession(): DemoSession {
   const proof = roundFiveSession()
   return {
@@ -208,16 +313,20 @@ function runningRoundFiveSession(): DemoSession {
         ...proof.lanes.lakebase,
         state: 'connecting',
         elapsed_ms: null,
-        status: 'Waiting for scored setup to finish',
+        status: 'Waiting for supporting setup to finish',
+        evidence: {},
       },
       competitor: {
         ...proof.lanes.competitor,
         state: 'connecting',
         elapsed_ms: null,
-        status: 'Waiting for scored setup to finish',
+        status: 'Waiting for supporting setup to finish',
+        evidence: {},
       },
     },
     round5_setup: {
+      schema_version: 2,
+      protocol: 'round5-fanin-v2',
       state: 'running',
       workflow_launch_skew_ms: 0.75,
       lanes: {
@@ -385,11 +494,13 @@ it('renders the running Round 5 race in the canonical two-clock arena', async ()
 
   expect(container.querySelector('.round5-result-card')).not.toBeInTheDocument()
   expect(container.querySelector('.proof-screen.round5-arena')).toBeInTheDocument()
-  expect(screen.getByText(/pass\/fail spike: 128 fresh app connection attempts \/ lane · max 64 at once · after 4 untimed warmups/i)).toBeInTheDocument()
+  expect(screen.getByText(/Phase 1 setup supports · Phase 2 scores exact 10,000-client fan-in · 30s hold/i)).toBeInTheDocument()
   expect(container.querySelector('.proof-lanes')).toBeInTheDocument()
   expect(container.querySelectorAll('.proof-lane')).toHaveLength(2)
   expect(container.querySelector('.lane-rule')).toHaveTextContent('VS')
   expect(container.querySelector('.proof-footer')).toBeInTheDocument()
+  expect(container.querySelector('.round5-architecture')).not.toBeInTheDocument()
+  expect(container.querySelectorAll('.database-fighter')).toHaveLength(2)
 
   const lakebase = screen.getByLabelText('Lakebase result')
   const competitor = screen.getByLabelText('RDS PostgreSQL + RDS Proxy result')
@@ -403,6 +514,32 @@ it('renders the running Round 5 race in the canonical two-clock arena', async ()
 
   expect(displayedSeconds(lakebase)).toBeGreaterThan(initialLakebaseSeconds)
   expect(displayedSeconds(competitor)).toBeGreaterThan(initialCompetitorSeconds)
+})
+
+it('fails closed to 10,000-client copy when Round 5 setup is absent', () => {
+  const withoutSetup = runningRoundFiveSession()
+  withoutSetup.round5_setup = undefined
+
+  const { container } = render(
+    <RoundFiveProof
+      session={withoutSetup}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview
+      hasNextRound
+      commentaryOpen={false}
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+
+  expect(container).toHaveTextContent(/Phase 2 scores exact 10,000-client fan-in/i)
+  expect(container).toHaveTextContent(/10,000 authenticated held clients per lane/i)
+  expect(container).not.toHaveTextContent(
+    /\b64\b|128 attempts|max(?:imum)? 64 concurrent|bounded (?:connection )?(?:check|proof|protocol)/i,
+  )
 })
 
 it('restores a silent Round 5 lane from the server snapshot floor without rewinding', async () => {
@@ -568,7 +705,7 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
     'Takeaway',
   ])
   expect(within(story).getByLabelText('Primary measured result')).toHaveTextContent(
-    /Lakebase built-in pool.*1\.23s.*Selected AWS managed pool.*>4\.50s.*Unverified when stopped/i,
+    /Lakebase time to 10,000.*1\.23s.*Selected AWS managed pool.*>4\.50s.*Unverified when stopped/i,
   )
   expect(story).toHaveTextContent(
     /Lakebase produced exact proof.*RDS PostgreSQL \+ RDS Proxy did not.*no completed comparison or margin/i,
@@ -577,7 +714,7 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
   const evidence = within(replay).getByText(/view full evidence/i).closest('details')
   expect(evidence).not.toHaveAttribute('open')
   fireEvent.click(within(replay).getByText(/view full evidence/i))
-  const setupEvidence = within(replay).getByLabelText('Scored setup evidence')
+  const setupEvidence = within(replay).getByLabelText('Pooled-path setup evidence')
   expect(within(setupEvidence).getByLabelText('Lakebase setup result')).toHaveTextContent(
     /SETUP STOP.*Setup state.*verified.*Stop gate.*EXACT STOP.*FINAL GATE MATRIX NOT RETURNED BEFORE TOWEL/i,
   )
@@ -585,7 +722,8 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
     /stop gate.*not verified/i,
   )
   expect(replay).toHaveTextContent(/Exact setup stop published before the towel.*final expected\/observed gate matrix was not returned/i)
-  expect(replay).toHaveTextContent(/Shared post-preflight monotonic T0.*Bounded 128-attempt, maximum-64-concurrent check is pass\/fail/i)
+  expect(replay).toHaveTextContent(/Phase 2 raced both from one T0 to exactly 10,000 authenticated held clients.*All 20,000 held 30s/i)
+  expect(replay).toHaveTextContent(/Phase 1 pooled-path setup is supporting.*30-second hold.*cleanup are exact gates/i)
   expect(replay).not.toHaveTextContent(/Non-executable round · No live fairness or timing contract/i)
   fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
   expect(screen.queryByRole('dialog', { name: /ready a pooled application path/i })).not.toBeInTheDocument()
@@ -593,11 +731,12 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
   const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
   expect(explanation).toHaveTextContent(
-    /Lakebase pooled-path setup verified at 1\.23s.*RDS PostgreSQL \+ RDS Proxy exceeded 4\.50s without verification.*recurring 128-attempt check at maximum 64 concurrent did not run/i,
+    /what this means.*Lakebase includes pooling for up to 10,000 client connections.*application path without a separate pooling handoff/i,
   )
   expect(explanation).toHaveTextContent(
-    /recurring 128-attempt check at maximum 64 concurrent did not run/i,
+    /Lakebase pooled-path setup verified at 1\.23s.*RDS PostgreSQL \+ RDS Proxy exceeded 4\.50s without verification.*10,000-client fan-in never started/i,
   )
+  expect(explanation).toHaveTextContent(/10,000-client fan-in never started/i)
   expect(explanation).not.toHaveTextContent(
     /neither setup|neither readiness|no verified result/i,
   )
@@ -639,9 +778,9 @@ it('keeps the one-sided Round 5 share copy aligned with the stopped receipt', ()
   const caption = linkedInReceipt(towelledRoundFiveSession(), 5)
 
   expect(caption).toMatch(
-    /Lakebase reached verified connection readiness in 1\.23s.*RDS PostgreSQL \+ RDS Proxy was still unverified beyond 4\.50s/i,
+    /Lakebase reached verified pooled-path setup in 1\.23s.*RDS PostgreSQL \+ RDS Proxy was still unverified beyond 4\.50s/i,
   )
-  expect(caption).toMatch(/bounded connection check did not run.*no winner or margin/i)
+  expect(caption).toMatch(/10,000-client fan-in never started.*no winner or margin/i)
   expect(caption).toMatch(/NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N\/A/i)
   expect(caption).not.toMatch(
     /neither setup|no verified result|both passed 128|readiness result declared/i,
@@ -683,7 +822,7 @@ it('stops Lakebase at its exact setup elapsed while AWS and the commentator cont
     /Lakebase · Exact setup gate verified · Clock stopped at 1\.23s · Native transaction verified/i,
   )
   expect(runningCommentary).toHaveTextContent(
-    /Lakebase reached readiness at 1\.23s · RDS PostgreSQL \+ RDS Proxy readiness clock still running · No comparison yet/i,
+    /Lakebase reached pooled-path setup at 1\.23s · RDS PostgreSQL \+ RDS Proxy setup clock still running · No comparison yet/i,
   )
 
   const competitorBefore = displayedSeconds(competitor)
@@ -822,23 +961,25 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(arena).toBeInTheDocument()
   expect(arena?.querySelectorAll('.proof-lane')).toHaveLength(2)
   expect(arena?.querySelector('.lane-rule')).toHaveTextContent('VS')
+  expect(arena?.querySelector('.round5-architecture')).not.toBeInTheDocument()
+  expect(arena?.querySelectorAll('.database-fighter')).toHaveLength(2)
   const lakebase = screen.getByLabelText('Lakebase result')
   const competitor = screen.getByLabelText('RDS PostgreSQL + RDS Proxy result')
   expect(lakebase).toHaveAttribute('data-corner', 'red')
   expect(competitor).toHaveAttribute('data-corner', 'blue')
-  expect(lakebase.querySelector('.lane-time')).toHaveTextContent('12.35s')
-  expect(competitor.querySelector('.lane-time')).toHaveTextContent('24.00s')
+  expect(lakebase.querySelector('.lane-time')).toHaveTextContent('3.11s')
+  expect(competitor.querySelector('.lane-time')).toHaveTextContent('4.11s')
   expect(container.querySelector('.remembered')).toHaveTextContent(
-    /Verified readiness comparison.*Lakebase verified a pooled path.*sooner/i,
+    /Verified exact 10,000-client fan-in comparison.*Lakebase reached exactly 10,000 held clients.*sooner/i,
   )
 
   const commentator = screen.getByLabelText('Ringside commentator')
   expect(commentator).toHaveTextContent(/Final verified call/i)
   expect(commentator).toHaveTextContent(
-    /Lakebase · Exact setup gate verified · Clock stopped at 12\.35s/i,
+    /Lakebase · 10,000 clients held at 3\.11s · Exact 10,000-client fan-in verified/i,
   )
   expect(commentator).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy · Exact setup gate verified · Clock stopped at 24\.00s/i,
+    /RDS PostgreSQL \+ RDS Proxy · 10,000 clients held at 4\.11s · Exact 10,000-client fan-in verified/i,
   )
 
   expect(container.querySelector('.round5-body')).not.toBeInTheDocument()
@@ -857,11 +998,11 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(selectedPriorities.children).toHaveLength(2)
   expect(selectedPriorities).toHaveTextContent(/cost.*performance/i)
   expect(ringsideTake).toHaveTextContent(
-    /what this means.*includes a pool for up to 10,000 client connections.*what we proved.*included-pool setup verified.*128 attempts at maximum 64 concurrent.*64-client multiplexing/i,
+    /what this means.*Lakebase includes pooling for up to 10,000 client connections.*application path without a separate pooling handoff/i,
   )
   expect(ringsideTake).toHaveTextContent(/question for the room.*when does a missed job window justify keeping a pool ready/i)
   expect(ringsideTake).toHaveTextContent(
-    /what we proved.*included-pool setup verified in 12\.35s.*selected AWS managed pooling path using RDS Proxy verified in 24\.00s.*128 attempts at maximum 64 concurrent.*64-client multiplexing.*direct AWS connections and alternative pools were not compared/i,
+    /what we proved.*Both paths connected and held 10,000 clients from the same start.*20,000 held for at least 30 seconds.*64 sparse SELECT 1 checks per lane passed.*provider-selected password exchange inside verify-full TLS.*TLS-protected password.*challenge-response password.*inside connection timing.*Setup.*Lakebase 12\.35s.*selected AWS path 24\.00s.*transaction throughput were not measured/i,
   )
   expect(ringsideTake.querySelector('details')).toBeNull()
   expect(ringsideTake).not.toHaveTextContent(
@@ -883,15 +1024,15 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   stubReceiptCanvas()
   fireEvent.click(screen.getByRole('button', { name: /share the receipt/i }))
   const shareReceipt = screen.getByRole('dialog', { name: /share the proof/i })
-  expect(within(shareReceipt).getByLabelText('Lakebase receipt result')).toHaveTextContent('12.35s')
+  expect(within(shareReceipt).getByLabelText('Lakebase receipt result')).toHaveTextContent('3.11s')
   expect(within(shareReceipt).getByLabelText(
     /RDS PostgreSQL(?: \+ RDS Proxy)? receipt result/i,
-  )).toHaveTextContent('24.00s')
+  )).toHaveTextContent('4.11s')
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).not.toHaveTextContent(
     /not timed|non-executable/i,
   )
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).toHaveTextContent(
-    /Lakebase verified a pooled path.*11\.65s sooner.*EXACT SETUP MARGIN 11\.65s/i,
+    /BOTH PATHS CONNECTED AND HELD 10,000 CLIENTS FROM THE SAME START.*LAKEBASE REACHED 10,000.*1\.00s SOONER.*EXACT 10,000-CLIENT MARGIN 1\.00s/i,
   )
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).toHaveTextContent(/Start gap 0\.750ms/i)
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).not.toHaveTextContent(/Start gap 1\.235ms/i)
@@ -957,7 +1098,7 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
     /primary setup result.*one setup verified/i,
   )
   expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy setup verified 24\.00s.*Lakebase not verified.*bounded check not run.*no declared winner.*comparison incomplete/i,
+    /RDS PostgreSQL \+ RDS Proxy setup verified 24\.00s.*Lakebase not verified.*exact dual-10,000-client fan-in did not run.*no declared winner.*comparison incomplete/i,
   )
   expect(screen.queryByLabelText(/warm burst evidence|setup result|fair proof contract|managed component disclosure/i)).not.toBeInTheDocument()
   expect(screen.getByText('Technical details')).toBeInTheDocument()
@@ -1102,7 +1243,7 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   /* Legibility only. The win still stands, the retry is still offered, and the
      exits are still shut -- this notice explains the lockout, it does not
      change who is allowed to walk away from a resource that may still exist. */
-  expect(screen.getByText(/verified readiness comparison/i)).toBeInTheDocument()
+  expect(screen.getByText(/verified exact 10,000-client fan-in comparison/i)).toBeInTheDocument()
   expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: /next round|fight card/i })).not.toBeInTheDocument()
 
@@ -1110,6 +1251,18 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
     ...failed,
     state: 'towelled',
     failure: null,
+    lanes: {
+      lakebase: {
+        ...failed.lanes.lakebase,
+        state: 'towelled',
+        evidence: {},
+      },
+      competitor: {
+        ...failed.lanes.competitor,
+        state: 'verified',
+        evidence: {},
+      },
+    },
     towel: {
       state: 'cleaning',
       requested_at: '2026-08-18T20:01:10Z',
@@ -1234,20 +1387,20 @@ it('names Aurora in the canonical Round 5 arena and its on-demand explanation', 
   )
 
   expect(container.querySelector('.proof-screen.round5-arena[data-session-state="verified"]')).toBeInTheDocument()
-  expect(screen.getByLabelText('Aurora Serverless v2 + RDS Proxy result')).toHaveTextContent('24.00s')
+  expect(screen.getByLabelText('Aurora Serverless v2 + RDS Proxy result')).toHaveTextContent('4.11s')
   expect(within(container).queryByLabelText('Managed component disclosure')).not.toBeInTheDocument()
 
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
   const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
   expect(explanation).toHaveTextContent(
-    /what we proved.*included-pool setup verified in 12\.35s.*selected AWS managed pooling path using RDS Proxy verified in 24\.00s.*128 attempts at maximum 64 concurrent.*64-client multiplexing.*direct AWS connections and alternative pools were not compared/i,
+    /what we proved.*Both paths connected and held 10,000 clients from the same start.*20,000 held for at least 30 seconds.*64 sparse SELECT 1 checks per lane passed.*provider-selected password exchange inside verify-full TLS.*TLS-protected password.*challenge-response password.*inside connection timing.*Setup.*Lakebase 12\.35s.*selected AWS path 24\.00s.*transaction throughput were not measured/i,
   )
   expect(explanation.querySelector('details')).toBeNull()
   expect(explanation).not.toHaveTextContent(/full verified proof|component disclosure|supporting changes/i)
   expect(explanation).not.toHaveTextContent(/Aurora unexecuted|not executed or scored/i)
 })
 
-it('offers an instant replay on a verified Round 5 with the scored setup evidence behind it', () => {
+it('offers an instant replay with primary fan-in and supporting setup evidence', () => {
   const session = roundFiveSession()
   render(
     <RoundFiveProof
@@ -1277,10 +1430,10 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
   expect(story.querySelectorAll('.replay-beat')).toHaveLength(3)
   expect(story.querySelectorAll('.replay-primary-metric')).toHaveLength(1)
   expect(story).toHaveTextContent(/setup.*same test.*takeaway/i)
-  expect(story).toHaveTextContent(/12\.35s/)
-  expect(story).toHaveTextContent(/24\.00s/)
-  expect(story).toHaveTextContent(/128 attempts.*maximum 64 concurrent.*pass\/fail/i)
-  expect(story).toHaveTextContent(/direct AWS connections and existing pools remain outside/i)
+  expect(story).toHaveTextContent(/3\.11s/)
+  expect(story).toHaveTextContent(/4\.11s/)
+  expect(story).toHaveTextContent(/Phase 2 raced both from one T0 to exactly 10,000 authenticated held clients.*provider-selected authentication stayed timed.*all 20,000 held 30s.*64 lane samples passed.*proved multiplexing/i)
+  expect(story).toHaveTextContent(/Direct AWS connections and other pools were not tested/i)
   expect(story).not.toHaveTextContent('N/A')
 
   const evidence = within(replay).getByText(/view full evidence/i).closest('details')!
@@ -1291,19 +1444,24 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
   expect(replay).toHaveTextContent('0.750ms')
   expect(replay).not.toHaveTextContent('1.235ms')
   expect(within(replay).getByLabelText('Round 5 detailed proof')).toHaveTextContent(
-    /full verified proof.*readiness setup is scored.*identical spike is pass\/fail/i,
+    /full verified proof.*10,000-client fan-in is scored.*pooled-path setup is supporting.*exactly 10,000 authenticated held clients.*30s hold.*64 sparse samples/i,
+  )
+  expect(within(replay).getByLabelText('Generator telemetry evidence')).toHaveTextContent(
+    /generator telemetry.*peak cpu capacity.*31\.0%.*peak rss.*7\.00 GiB.*15\.00 GiB.*peak fds.*20264.*65535.*generator-owned event-loop peak.*4\.50 ms.*raw event-loop wall-lag peak.*6\.25 ms.*external scheduling-lag peak.*6\.25 ms.*ephemeral-port reserve.*18232/i,
   )
   expect(within(replay).getByLabelText('Managed component disclosure')).toHaveTextContent(
-    /new Proxy \+ 8 supporting changes.*already-deployed Proxy would not pay this setup delay/i,
+    /selected AWS managed pooling path.*new RDS Proxy \+ 8 supporting changes.*direct AWS connections.*existing Proxy.*PgBouncer.*application pooling.*were not tested/i,
   )
 
   // Every evidence step is Round 5 specific, with no nested accordion.
-  expect(within(replay).getAllByText(/setup workflows|setup clock|bounded check/i).length).toBeGreaterThanOrEqual(3)
+  expect(within(replay).getAllByText(/setup workflows|setup clock|exact client fan-in|common hold/i).length).toBeGreaterThanOrEqual(3)
   expect(replay.querySelectorAll('details')).toHaveLength(1)
   expect(replay).not.toHaveTextContent(/will appear when this round adapter is executable/i)
 
-  // The nine journaled AWS mutations are the substance of the replay.
-  const calls = within(replay).getByText(/nine journaled resources/i).closest('.replay-evidence-step')!
+  // The nine journaled AWS mutations are the substance of the selected reference path.
+  const calls = within(replay).getByText(
+    /selected AWS reference path needed nine journaled resource mutations.*drained and rebound/i,
+  ).closest('.replay-evidence-step')!
   for (const resource of [
     'proxy_security_group', 'proxy_default_egress', 'proxy_ingress', 'proxy_egress',
     'runner_egress', 'rds_ingress', 'rds_proxy', 'proxy_target_group', 'proxy_target',
@@ -1311,6 +1469,8 @@ it('offers an instant replay on a verified Round 5 with the scored setup evidenc
     expect(calls).toHaveTextContent(`journal: ${resource}`)
   }
   expect(calls).toHaveTextContent(/built-in Lakebase pooled endpoint/i)
+  expect(calls).toHaveTextContent(/deregister target.*zero targets.*re-register same target/i)
+  expect(replay).toHaveTextContent(/connection churn p50 \/ p95 \/ p99.*80\.00 ms \/ 150\.00 ms \/ 201\.46 ms/i)
 
   fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
   expect(screen.queryByRole('dialog', { name: /ready a pooled application path/i })).not.toBeInTheDocument()
@@ -1332,7 +1492,7 @@ it('puts the sound toggle in the header of both Round 5 layouts', () => {
     onToggleSound,
   }
 
-  // The arena, while the spike is running.
+  // The arena while exact fan-in is running.
   const { container, rerender } = render(
     <RoundFiveProof {...props} session={runningRoundFiveSession()} />,
   )

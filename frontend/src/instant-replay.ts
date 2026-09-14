@@ -1,9 +1,7 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
 import { classifyOutcome } from './ringside-cues'
 import { metricValue, modelScoreEvidence } from './round4'
-import {
-  ROUND_FIVE_BOUNDED_CHECK,
-} from './round5'
+import { ROUND_FIVE_SAMPLED_QUERIES } from './round5'
 import { preciseDuration } from './time'
 
 export type ReplayBeatId = 'setup' | 'same-test' | 'takeaway'
@@ -44,6 +42,10 @@ function evidenceText(session: DemoSession, key: string): string | null {
 
 function laneName(session: DemoSession, laneId: LaneId): string {
   return session.round5_setup?.lanes?.[laneId]?.name || session.lanes[laneId].name
+}
+
+function roundFiveUsesFanIn(session: DemoSession): boolean {
+  return session.round5_setup?.protocol !== 'connection-spike-v1'
 }
 
 function exactMetric(
@@ -136,7 +138,26 @@ function incompleteTakeaway(session: DemoSession): string | null {
     session.round.id === 'survive_connection_spike'
     && outcome.evidence.laneShape === 'both_exact_verified'
   ) {
-    return 'Both pooled-path setup times were observed, but the bounded check did not fully pass. No result or margin was declared.'
+    return roundFiveUsesFanIn(session)
+      ? 'Both lanes reached exactly 10,000 clients, but a required hold, sample, multiplexing, telemetry, identity, fairness, or cleanup check did not pass. No winner or margin was declared.'
+      : 'Legacy Round 5 scorecard decoded, but the current 10,000-client fan-in result was not recorded. No fan-in result or margin was declared.'
+  }
+  if (
+    session.round.id === 'survive_connection_spike'
+    && roundFiveUsesFanIn(session)
+    && Object.values(session.lanes).some(
+      (lane) => lane.evidence?.protocol === 'round5-fanin-v2',
+    )
+  ) {
+    const observed = (['lakebase', 'competitor'] as const).map((laneId) => {
+      const lane = session.lanes[laneId]
+      const raw = lane.evidence?.authenticated_clients ?? lane.evidence?.achieved_clients
+      const count = typeof raw === 'number' && Number.isFinite(raw)
+        ? `${Math.max(0, Math.floor(raw)).toLocaleString('en-US')}/10,000 clients`
+        : 'no trustworthy count recorded'
+      return `${lane.name}: ${count}`
+    })
+    return `The fan-in stopped before every required check completed. ${observed.join(' · ')}. No winner or margin was declared.`
   }
   if (outcome.evidence.exactLane) {
     const exact = laneName(session, outcome.evidence.exactLane)
@@ -155,7 +176,9 @@ function incompleteTestSuffix(session: DemoSession): string {
     session.round.id === 'survive_connection_spike'
     && outcome.evidence.exactLane
   ) {
-    return ' The bounded check did not run, so the common pass/fail proof did not complete.'
+    return roundFiveUsesFanIn(session)
+      ? ' The shared-T0 10,000-client fan-in did not run, so the primary proof did not complete.'
+      : ' The legacy scorecard did not record the current 10,000-client fan-in contract, so no fan-in proof is shown.'
   }
   if (outcome.status === 'guardrail_failure') {
     return ' A required guardrail did not verify.'
@@ -315,18 +338,19 @@ function roundFourStory(session: DemoSession): ReplayStory {
 
 function roundFiveStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
+  const recurringFanIn = roundFiveUsesFanIn(session)
   const setup = [
     exactMetric(
       session,
       'lakebase',
-      'Lakebase built-in pool',
-      'Included pool verified',
+      recurringFanIn ? 'Lakebase time to 10,000' : 'Lakebase built-in pool',
+      recurringFanIn ? 'Exact authenticated held-client gate' : 'Included pool verified',
     ) ?? lowerBoundMetric(session, 'lakebase', 'Lakebase built-in pool'),
     exactMetric(
       session,
       'competitor',
-      'Selected AWS managed pool',
-      'New RDS Proxy provisioned',
+      recurringFanIn ? 'Selected AWS path time to 10,000' : 'Selected AWS managed pool',
+      recurringFanIn ? 'Exact authenticated held-client gate' : 'New RDS Proxy provisioned',
     ) ?? lowerBoundMetric(session, 'competitor', 'Selected AWS managed pool'),
   ].filter((metric): metric is ReplayMetric => metric !== null)
   return {
@@ -337,18 +361,22 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       {
         id: 'setup',
         title: 'Setup',
-        body: 'From a database-only start, Lakebase verified its included pool; the selected AWS path provisioned RDS Proxy and dependencies.',
+        body: "Phase 1 timed Lakebase's included pool and new selected RDS Proxy separately.",
       },
       {
         id: 'same-test',
         title: 'Same test',
-        body: `Both ran ${ROUND_FIVE_BOUNDED_CHECK}, then a separate 64-client multiplexing witness. This was pass/fail validation, not another speed comparison.${incompleteTestSuffix(session)}`,
+        body: recurringFanIn
+          ? `Phase 2 raced both from one T0 to exactly 10,000 authenticated held clients under one verify-full TLS client and mirrored scheduler. Provider-selected authentication stayed timed. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} lane samples passed; observers proved multiplexing.${incompleteTestSuffix(session)}`
+          : `Legacy Round 5 scorecard decoded. The current exact 10,000-client fan-in contract was not recorded, so the replay does not infer fan-in evidence.${incompleteTestSuffix(session)}`,
       },
       {
         id: 'takeaway',
         title: 'Takeaway',
         body: incompleteTakeaway(session)
-          ?? 'The score is pooled-path setup. Direct AWS connections and existing pools remain outside this selected-path comparison.',
+          ?? (recurringFanIn
+            ? 'Fan-in time is primary; setup supports it. Authentication is recorded, not excluded. Client count is not backend count or transaction throughput. Direct AWS connections and other pools were not tested.'
+            : 'Legacy scorecard fields remain readable, but only the current 10,000-client fan-in contract is presented. No fan-in claim is inferred.'),
       },
     ],
   }

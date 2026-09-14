@@ -213,3 +213,39 @@ export function getRoundFivePersonaOutcomeRecord(
   }
   return record
 }
+
+/**
+ * What Round 5 at 10,000 connections means to each persona, in one line.
+ *
+ * The shape of the round is the same for everyone; what it *costs* is not. For an
+ * AWS lane, reaching 10,000 pooled client connections means deciding on an RDS
+ * Proxy, provisioning it, and paying for it -- usually before you know you need it.
+ * Lakebase includes the pool. Every line below is that one asymmetry, told to the
+ * person who carries it.
+ *
+ * `roundFiveFightCardOpening` falls back to a general line when a persona is
+ * absent, so a new persona degrades to correct-but-generic rather than throwing on
+ * a fight card.
+ */
+export const ROUND_FIVE_PERSONA_MEANING: Record<PersonaId, string> = {
+  data_engineer:
+    'Ten thousand held connections is a pipeline fan-out problem. Lakebase pools them for you; the AWS path needs an RDS Proxy standing before the first burst arrives.',
+  software_engineer:
+    'Your connection pool is the app. Lakebase gives you 10,000 client connections without another component in the path; the AWS lane adds a Proxy you now own.',
+  data_analyst:
+    'Concurrency is why a dashboard stalls at the worst moment. Lakebase absorbs 10,000 clients on the included pool rather than queueing them behind a pooler you had to plan for.',
+  architect_it:
+    'This is the buy-versus-build line drawn precisely: an included pool at 10,000 clients, or an RDS Proxy you select, provision, secure and pay for in advance.',
+  data_scientist_ml:
+    'Feature and inference services open connections in bursts. Lakebase holds 10,000 without a pooling tier; the AWS lane cannot until a Proxy exists.',
+  dba:
+    'Ten thousand client connections are not 10,000 backends -- that is the whole point of a pooler. Lakebase includes one; on AWS you provision RDS Proxy and keep it healthy.',
+  sre:
+    'The failure you get paged for is connection exhaustion under load you did not forecast. Lakebase pools to 10,000 by default; the AWS path fails until a Proxy is in place.',
+  executive:
+    'One path needs a decision, a provisioning step and a bill before it can take the load. The other already can. That difference is the round.',
+  infosec:
+    'Every added component widens the surface. Lakebase reaches 10,000 pooled clients with no new endpoint, credential or Proxy to review; the AWS lane introduces all three.',
+  application_owner:
+    'Discovering you need connection pooling during a launch is the expensive way to learn it. Lakebase includes it at 10,000 clients; RDS Proxy is work you must have done already.',
+}

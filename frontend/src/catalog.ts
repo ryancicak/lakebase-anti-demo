@@ -250,7 +250,11 @@ export function metricForCorners(
   return `${list[0].toUpperCase()}${list.slice(1)} to the same verified outcome`
 }
 
-export function stopCondition(roundId: RoundId, competitor?: CompetitorId): string {
+export function stopCondition(
+  roundId: RoundId,
+  competitor?: CompetitorId,
+  fanIn = false,
+): string {
   if (roundId === 'wake_idle_app' && competitor === 'rds_postgres') {
     return 'Lakebase stops after commit + read-back; RDS eligibility is checked before the bell and not timed.'
   }
@@ -267,6 +271,13 @@ export function stopCondition(roundId: RoundId, competitor?: CompetitorId): stri
     return 'The clock stops only after the committed Delta version is synchronized and a fresh application connection reads the exact operational Postgres row.'
   }
   if (roundId === 'survive_connection_spike') {
+    if (fanIn) {
+      // Setup dominates the AWS lane and that is the finding, not a handicap:
+      // an RDS Proxy is a decision you have to make and provision before you
+      // need it, and Lakebase's pool is simply already there. The lanes are not
+      // expected to reach 10,000 at the same moment.
+      return 'Lakebase verifies its included pool; the selected AWS path must first provision an RDS Proxy, which is most of its clock. Each lane then holds exactly 10,000 authenticated client connections from a shared start, keeps them for a 30-second hold, and answers 64 sparse queries per lane with zero retries. 9,999 fails.'
+    }
     return 'Each pooled-path setup clock stops at an exact application transaction from the database-only declared start. Lakebase verifies its included pool; the selected AWS managed pooling path provisions a new RDS Proxy. The 128-attempt, maximum-64-concurrent check and separate 64-client witness must then pass.'
   }
   if (roundId === 'analyze_live_orders_without_slowing_checkout') {

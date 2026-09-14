@@ -9,7 +9,9 @@ import hashlib
 import io
 import json
 import math
+import multiprocessing as mp
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -17,17 +19,51 @@ import signal
 import stat
 import sys
 import time
+import traceback
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import boto3
 import psycopg
 from psycopg import sql
 
-PROTOCOL = "connection-spike-v1"
+from runner.external_io import (
+    connect_runner_database,
+    secrets_manager_for_runner_operation,
+)
+
+WORKER_CRASH_PREFIX = "WORKER_CRASH_JSON:"
+WORKER_RESULT_QUEUE_PROFILE_PREFIX = "WORKER_RESULT_QUEUE_PROFILE_JSON:"
+PARENT_RESULT_PROFILE_PREFIX = "PARENT_RESULT_PROFILE_JSON:"
+
+
+try:
+    from . import round5_fanin as fanin
+except ImportError:
+    # run_connection_spike.sh execs the venv interpreter with -I, and isolated
+    # mode implies -P: the script's own directory is not placed on sys.path. The
+    # sealed installer therefore has to copy round5_fanin.py into the venv's
+    # site-packages, and resolving that directory with
+    # sysconfig.get_path("purelib") returns the *system* path on RHEL-derived
+    # images such as Amazon Linux 2023. The copy then succeeds as root into a
+    # directory the venv never reads, so the install reports no failure and the
+    # import dies here instead.
+    #
+    # round5_fanin.py is always installed beside this file in the sealed runner
+    # directory, so resolve it from __file__ rather than trusting any packaging
+    # scheme. This adds exactly the sealed directory and nothing ambient, which
+    # keeps the -I isolation the protocol requires.
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _runner_directory = str(_Path(__file__).resolve().parent)
+    if _runner_directory not in _sys.path:
+        _sys.path.insert(0, _runner_directory)
+    import round5_fanin as fanin
+PROTOCOL = fanin.PROTOCOL
+BOUNDED_PROTOCOL = "connection-spike-v1"
 SETUP_PROTOCOL = "connection-spike-setup-v1"
 # SETUP_PROTOCOL is the only credential-preparation transport. Its SSM-safe
 # envelopes contain public data, sealed ciphertext, or secret ARNs--never a
@@ -51,10 +87,10 @@ SETUP_PROTOCOL = "connection-spike-setup-v1"
 PYTHON_VERSION = (3, 12)
 PSYCOPG_VERSION = "3.3.4"
 WARMUP_ATTEMPTS = 4
-SCORED_ATTEMPTS = 128
-MAX_CONCURRENCY = 64
-WITNESS_CLIENTS = 64
-WITNESS_CONCURRENCY = 8
+SCORED_ATTEMPTS = 128  # v1 decoder compatibility only
+MAX_CONCURRENCY = 64  # v1 decoder compatibility only
+WITNESS_CLIENTS = 64  # v1 decoder compatibility only
+WITNESS_CONCURRENCY = 8  # v1 decoder compatibility only
 CONNECT_TIMEOUT_SECONDS = 10
 ATTEMPT_TIMEOUT_SECONDS = 20.0
 RUN_TIMEOUT_SECONDS = 110.0
@@ -63,6 +99,7 @@ RUN_TIMEOUT_SECONDS = 110.0
 # server.connection_spike_live.SSM_TIMEOUT_SECONDS; a regression test binds the
 # two standalone constants together.
 SSM_COMMAND_TIMEOUT_SECONDS = 120.0
+FANIN_SSM_COMMAND_TIMEOUT_SECONDS = 660.0
 # The setup verification deadline starts only after the Python process has
 # imported, decoded and validated its request, acquired the flock, checked the
 # trust bundle, and verified the sealed credential digest. It therefore cannot
@@ -70,9 +107,7 @@ SSM_COMMAND_TIMEOUT_SECONDS = 120.0
 # pre-deadline work, result serialization/printing, flock release, and the SSM
 # agent to report terminal completion.
 SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS = 20.0
-SETUP_VERIFY_DEADLINE_SECONDS = (
-    SSM_COMMAND_TIMEOUT_SECONDS - SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS
-)
+SETUP_VERIFY_DEADLINE_SECONDS = SSM_COMMAND_TIMEOUT_SECONDS - SETUP_VERIFY_SSM_SAFETY_MARGIN_SECONDS
 SETUP_VERIFY_MAX_RETRY_DELAY_SECONDS = 8.0
 TLS_MODE = "verify-full"
 TRUST_BUNDLE_PATH = Path("/opt/lakebase-anti-demo/round5/round5-ca.pem")
@@ -85,10 +120,17 @@ BASELINE_CREDENTIAL_PATHS = {
     "rds": CREDENTIAL_ROOT / "rds.json",
     "aurora": CREDENTIAL_ROOT / "aurora.json",
 }
+OBSERVER_CREDENTIAL_PATHS = {
+    lane_id: CREDENTIAL_ROOT / f"{lane_id}-observer.json" for lane_id in BASELINE_CREDENTIAL_PATHS
+}
 RUNTIME_LANE_IDS = frozenset({"lakebase", "competitor"})
+FANIN_WORKER_READY_TIMEOUT_SECONDS = 60.0
+FANIN_WORKER_RAMP_TIMEOUT_SECONDS = fanin.RUN_TIMEOUT_SECONDS + 60.0
+FANIN_WORKER_RESULT_TIMEOUT_SECONDS = fanin.HOLD_SECONDS + 180.0
 AWS_CREDENTIAL_IDS = frozenset({"rds", "aurora"})
 SEALED_BOX_KEY_PATH = CREDENTIAL_ROOT / "sealed-box.key"
 BASELINE_ROLE = "anti_demo_burst"
+OBSERVER_ROLE = "anti_demo_observer"
 BASELINE_DATABASE_KEYS = frozenset({"host", "port", "dbname", "username", "password"})
 RDS_BASELINE_KEYS = BASELINE_DATABASE_KEYS | {"master_secret_arn"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -138,6 +180,7 @@ class Target:
     credential_host: str
     baseline_sha256: str = ""
     baseline_credential_id: str = ""
+    observer_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,11 +221,119 @@ def _decode_payload(argument: str) -> dict[str, object]:
     return request
 
 
+def _decode_fanin_request(
+    argument: str,
+) -> tuple[str, tuple[Target, ...], str, dict[str, object]]:
+    request = _decode_payload(argument)
+    if (
+        request.get("protocol") != fanin.PROTOCOL
+        or request.get("schema_version") != fanin.SCHEMA_VERSION
+        or request.get("action") not in {"preflight", "run"}
+    ):
+        raise RunnerContractError("fanin_schema_invalid")
+    run_id = request.get("run_id")
+    if not isinstance(run_id, str) or _SAFE_ID.fullmatch(run_id) is None:
+        raise RunnerContractError("run_id_invalid")
+    for name, expected in (
+        ("contract_sha256", fanin.contract_sha256()),
+        ("config_sha256", fanin.config_sha256()),
+        ("generator_sha256", fanin.generator_sha256()),
+        ("capacity_model_sha256", fanin.capacity_model_sha256()),
+    ):
+        if request.get(name) != expected:
+            raise RunnerContractError("fanin_digest_mismatch")
+    if request["action"] == "preflight":
+        if set(request) != {
+            "protocol",
+            "schema_version",
+            "action",
+            "run_id",
+            "runner_instance_type",
+            "contract_sha256",
+            "config_sha256",
+            "generator_sha256",
+            "capacity_model_sha256",
+        }:
+            raise RunnerContractError("fanin_preflight_request_invalid")
+        return run_id, (), "", request
+    if (
+        request.get("trust_bundle_path") != str(TRUST_BUNDLE_PATH)
+        or _SHA256.fullmatch(str(request.get("trust_bundle_sha256") or "")) is None
+    ):
+        raise RunnerContractError("trust_bundle_contract_invalid")
+    raw_auth = request.get("baseline_auth")
+    if not isinstance(raw_auth, dict) or set(raw_auth) != RUNTIME_LANE_IDS:
+        raise RunnerContractError("baseline_auth_invalid")
+    client_hashes: dict[str, str] = {}
+    observer_hashes: dict[str, str] = {}
+    credential_ids: dict[str, str] = {}
+    for lane_id, raw in raw_auth.items():
+        if not isinstance(raw, dict):
+            raise RunnerContractError("baseline_auth_invalid")
+        expected_fields = (
+            {"credential_sha256", "observer_credential_sha256"}
+            if lane_id == "lakebase"
+            else {
+                "credential_sha256",
+                "observer_credential_sha256",
+                "credential_id",
+            }
+        )
+        if (
+            set(raw) != expected_fields
+            or _SHA256.fullmatch(str(raw.get("credential_sha256") or "")) is None
+            or _SHA256.fullmatch(str(raw.get("observer_credential_sha256") or "")) is None
+        ):
+            raise RunnerContractError("baseline_auth_invalid")
+        credential_id = "lakebase" if lane_id == "lakebase" else raw.get("credential_id")
+        if credential_id not in BASELINE_CREDENTIAL_PATHS:
+            raise RunnerContractError("baseline_auth_invalid")
+        client_hashes[lane_id] = str(raw["credential_sha256"])
+        observer_hashes[lane_id] = str(raw["observer_credential_sha256"])
+        credential_ids[lane_id] = str(credential_id)
+    raw_targets = request.get("targets")
+    if not isinstance(raw_targets, list) or len(raw_targets) != 2:
+        raise RunnerContractError("targets_invalid")
+    targets: list[Target] = []
+    for raw in raw_targets:
+        if not isinstance(raw, dict):
+            raise RunnerContractError("target_invalid")
+        lane_id = raw.get("lane_id")
+        if (
+            lane_id not in RUNTIME_LANE_IDS
+            or set(raw) != {"lane_id", "secret_arn", "endpoint_host", "credential_host"}
+            or not isinstance(raw.get("secret_arn"), str)
+            or not isinstance(raw.get("endpoint_host"), str)
+            or not raw["endpoint_host"]
+            or not isinstance(raw.get("credential_host"), str)
+            or not raw["credential_host"]
+        ):
+            raise RunnerContractError("target_invalid")
+        targets.append(
+            Target(
+                lane_id=str(lane_id),
+                secret_arn=str(raw["secret_arn"]),
+                endpoint_host=str(raw["endpoint_host"]),
+                credential_host=str(raw["credential_host"]),
+                baseline_sha256=client_hashes[str(lane_id)],
+                baseline_credential_id=credential_ids[str(lane_id)],
+                observer_sha256=observer_hashes[str(lane_id)],
+            )
+        )
+    if {target.lane_id for target in targets} != RUNTIME_LANE_IDS:
+        raise RunnerContractError("targets_invalid")
+    _secrets_manager_region(
+        [target.secret_arn for target in targets if target.secret_arn],
+        "target_invalid",
+    )
+    return run_id, tuple(targets), str(request["trust_bundle_sha256"]), request
+
+
 def _decode_request(
     argument: str,
 ) -> tuple[str, tuple[Target, ...], tuple[Attempt, ...], str]:
     request = _decode_payload(argument)
-    if request.get("protocol") != PROTOCOL:
+    if request.get("protocol") != BOUNDED_PROTOCOL:
         raise RunnerContractError("protocol_invalid")
     if request.get("trust_bundle_path") != str(TRUST_BUNDLE_PATH) or not re.fullmatch(
         r"[0-9a-f]{64}", str(request.get("trust_bundle_sha256") or "")
@@ -435,9 +586,7 @@ def _validate_database_value(
 def _load_baseline_database(target: Target) -> dict[str, object]:
     credential_id = target.baseline_credential_id or target.lane_id
     path = BASELINE_CREDENTIAL_PATHS.get(credential_id)
-    expected_keys = (
-        BASELINE_DATABASE_KEYS if credential_id == "lakebase" else RDS_BASELINE_KEYS
-    )
+    expected_keys = BASELINE_DATABASE_KEYS if credential_id == "lakebase" else RDS_BASELINE_KEYS
     if path is None:
         raise RunnerContractError("baseline_auth_invalid")
     value = _read_root_json(path, expected_keys)
@@ -445,6 +594,482 @@ def _load_baseline_database(target: Target) -> dict[str, object]:
     if hashlib.sha256(encoded).hexdigest() != target.baseline_sha256:
         raise RunnerContractError("baseline_auth_hash_invalid")
     return _validate_database_value(value, expected_host=target.credential_host)
+
+
+def _load_observer_database(target: Target) -> dict[str, object]:
+    credential_id = target.baseline_credential_id or target.lane_id
+    path = OBSERVER_CREDENTIAL_PATHS.get(credential_id)
+    if path is None:
+        raise RunnerContractError("observer_auth_invalid")
+    value = _read_root_json(path, BASELINE_DATABASE_KEYS)
+    if hashlib.sha256(_canonical_json(value)).hexdigest() != target.observer_sha256:
+        raise RunnerContractError("observer_auth_hash_invalid")
+    database = _validate_database_value(value, expected_host=target.credential_host)
+    if database["user"] != OBSERVER_ROLE:
+        raise RunnerContractError("observer_role_invalid")
+    return database
+
+
+async def _execute_fanin_request(
+    request: Mapping[str, object],
+    targets: Sequence[Target],
+    cancelled: asyncio.Event,
+) -> dict[str, object]:
+    expanded_targets: list[dict[str, object]] = []
+    for target in targets:
+        client = _load_baseline_database(target)
+        observer = _load_observer_database(target)
+        expanded_targets.append(
+            {
+                "lane_id": target.lane_id,
+                "database": {
+                    **client,
+                    "host": target.endpoint_host,
+                    "credential_sha256": target.baseline_sha256,
+                },
+                "observer_database": {
+                    **observer,
+                    "credential_sha256": target.observer_sha256,
+                },
+            }
+        )
+    expanded = {
+        **request,
+        "targets": expanded_targets,
+    }
+    if fanin.WORKER_COUNT == 1:
+        return await fanin.execute_fanin(
+            expanded,
+            cancelled=cancelled,
+            trust_bundle_path=TRUST_BUNDLE_PATH,
+        )
+    preflight = await fanin.capacity_preflight(str(expanded.get("runner_instance_type") or ""))
+    if not preflight["sufficient"]:
+        failures = "_".join(str(value) for value in preflight.get("failures", ()))
+        raise RunnerContractError(
+            f"runner_capacity_insufficient_{failures}"
+            if failures
+            else "runner_capacity_insufficient_without_evidence"
+        )
+    return await _execute_sharded_fanin(expanded, cancelled)
+
+
+async def _await_process_event(
+    event: Any,
+    *,
+    cancel_event: Any | None = None,
+    poll_seconds: float = 0.01,
+) -> None:
+    """Wait for a multiprocessing event without occupying an executor thread."""
+
+    while not event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise RunnerCancelled("fanin_cancelled")
+        await asyncio.sleep(poll_seconds)
+
+
+def _sanitized_worker_crash(
+    exc: BaseException,
+    *,
+    worker_index: int,
+    worker_cpu: int,
+) -> dict[str, object]:
+    raw_sqlstate = getattr(exc, "sqlstate", None)
+    sqlstate = (
+        raw_sqlstate.upper()
+        if isinstance(raw_sqlstate, str) and _SQLSTATE.fullmatch(raw_sqlstate)
+        else None
+    )
+    frames = []
+    for frame in traceback.extract_tb(exc.__traceback__):
+        filename = Path(frame.filename)
+        if filename.name not in {"connection_spike_runner.py", "round5_fanin.py"}:
+            continue
+        function = re.sub(r"[^A-Za-z0-9_]", "_", frame.name)[:64]
+        frames.append(
+            {
+                "file": filename.name,
+                "function": function,
+                "line": frame.lineno,
+            }
+        )
+    context = fanin.worker_crash_context()
+    return {
+        **context,
+        "worker_id": worker_index,
+        "worker_cpu": worker_cpu,
+        "error_type": type(exc).__name__,
+        "sqlstate": sqlstate,
+        "frames": frames[-12:],
+    }
+
+
+def _preserve_worker_crash(value: object) -> None:
+    if not isinstance(value, Mapping):
+        raise RunnerContractError("fanin_worker_crash_envelope_invalid")
+    print(
+        WORKER_CRASH_PREFIX + fanin.canonical_json(dict(value)).decode("utf-8"),
+        flush=True,
+    )
+
+
+def _fanin_worker_process(
+    request: Mapping[str, object],
+    worker_index: int,
+    control_queue: Any,
+    result_queue: Any,
+    release_event: Any,
+    release_ns: Any,
+    hold_event: Any,
+    hold_ns: Any,
+    cancel_event: Any,
+) -> None:
+    worker_cpu = _pin_fanin_worker(worker_index)
+
+    def publish_worker_progress(value: Mapping[str, object]) -> None:
+        started_ns = time.perf_counter_ns()
+        control_queue.put(("progress", worker_index, dict(value)))
+        fanin._record_phase("worker_progress_queue_write", started_ns)
+
+    fanin._progress_callback = publish_worker_progress
+
+    async def run() -> dict[str, object]:
+        cancelled = asyncio.Event()
+        ramp_announced = False
+
+        async def watch_cancel() -> None:
+            await _await_process_event(cancel_event)
+            cancelled.set()
+
+        async def await_release() -> int:
+            control_queue.put(("ready", worker_index))
+            await _await_process_event(release_event, cancel_event=cancel_event)
+            return int(release_ns.value)
+
+        async def await_hold() -> int:
+            nonlocal ramp_announced
+            ramp_announced = True
+            control_queue.put(("ramp", worker_index))
+            await _await_process_event(hold_event, cancel_event=cancel_event)
+            return int(hold_ns.value)
+
+        watcher = asyncio.create_task(watch_cancel())
+        try:
+            result = await fanin.execute_fanin(
+                request,
+                cancelled=cancelled,
+                trust_bundle_path=TRUST_BUNDLE_PATH,
+                worker_index=worker_index,
+                worker_count=fanin.WORKER_COUNT,
+                partition_target_clients=fanin.PARTITION_CLIENTS_PER_LANE,
+                await_release=await_release,
+                await_hold=await_hold,
+                worker_cpu=worker_cpu,
+                capacity_preflight_verified=True,
+            )
+            if not ramp_announced:
+                control_queue.put(("ramp", worker_index))
+            return result
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    try:
+        result = asyncio.run(run())
+        queue_started_ns = time.perf_counter_ns()
+        result_queue.put(("ok", worker_index, result))
+        queue_elapsed_ms = (time.perf_counter_ns() - queue_started_ns) / 1_000_000
+        print(
+            WORKER_RESULT_QUEUE_PROFILE_PREFIX
+            + json.dumps(
+                {
+                    "worker_id": worker_index,
+                    "worker_cpu": worker_cpu,
+                    "elapsed_ms": queue_elapsed_ms,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
+        fanin._worker_execution_context = None
+    except BaseException as exc:
+        code = str(exc)
+        if not code or len(code) > 96 or not code.replace("_", "").isalnum():
+            code = type(exc).__name__
+        if isinstance(exc, (RunnerCancelled, asyncio.CancelledError)):
+            control_queue.put(("error", worker_index, code))
+            result_queue.put(("error", worker_index, code))
+            return
+        envelope = _sanitized_worker_crash(
+            exc,
+            worker_index=worker_index,
+            worker_cpu=worker_cpu,
+        )
+        control_queue.put(("error", worker_index, code, envelope))
+        result_queue.put(("error", worker_index, code, envelope))
+    finally:
+        fanin._progress_callback = None
+
+
+def _pin_fanin_worker(worker_index: int) -> int:
+    if not hasattr(os, "sched_getaffinity") or not hasattr(os, "sched_setaffinity"):
+        raise RunnerContractError("fanin_worker_affinity_unavailable")
+    available = sorted(os.sched_getaffinity(0))
+    if len(available) < fanin.WORKER_COUNT:
+        raise RunnerContractError("fanin_worker_affinity_insufficient")
+    worker_cpu = int(available[worker_index])
+    os.sched_setaffinity(0, {worker_cpu})
+    if os.sched_getaffinity(0) != {worker_cpu}:
+        raise RunnerContractError("fanin_worker_affinity_failed")
+    return worker_cpu
+
+
+async def _execute_sharded_fanin(
+    request: Mapping[str, object],
+    cancelled: asyncio.Event,
+) -> dict[str, object]:
+    context = mp.get_context("spawn")
+    control_queue = context.Queue()
+    result_queue = context.Queue()
+    release_event = context.Event()
+    hold_event = context.Event()
+    cancel_event = context.Event()
+    release_ns = context.Value("q", 0)
+    hold_ns = context.Value("q", 0)
+    processes = [
+        context.Process(
+            target=_fanin_worker_process,
+            args=(
+                request,
+                index,
+                control_queue,
+                result_queue,
+                release_event,
+                release_ns,
+                hold_event,
+                hold_ns,
+                cancel_event,
+            ),
+            name=f"round5-fanin-{index}",
+        )
+        for index in range(fanin.WORKER_COUNT)
+    ]
+    latest_progress: dict[tuple[int, str], Mapping[str, object]] = {}
+    latest_system_socket_states: Mapping[str, object] = {}
+    parent_profile: dict[str, dict[str, float | int]] = {}
+
+    def record_parent_phase(phase: str, started_ns: int) -> None:
+        elapsed_ms = (time.perf_counter_ns() - started_ns) / 1_000_000
+        value = parent_profile.setdefault(
+            phase,
+            {"calls": 0, "total_ms": 0.0, "max_ms": 0.0},
+        )
+        value["calls"] = int(value["calls"]) + 1
+        value["total_ms"] = float(value["total_ms"]) + elapsed_ms
+        value["max_ms"] = max(float(value["max_ms"]), elapsed_ms)
+
+    def publish_progress(index: int, value: object) -> None:
+        nonlocal latest_system_socket_states
+        started_ns = time.perf_counter_ns()
+        if not isinstance(value, Mapping):
+            raise RunnerContractError("fanin_worker_progress_invalid")
+        lane_id = str(value.get("lane_id") or "")
+        if lane_id not in RUNTIME_LANE_IDS:
+            raise RunnerContractError("fanin_worker_progress_invalid")
+        socket_states = value.get("socket_states")
+        if index == 0 and isinstance(socket_states, Mapping) and socket_states:
+            latest_system_socket_states = dict(socket_states)
+        latest_progress[(index, lane_id)] = value
+        peers = [
+            latest_progress.get((worker_index, lane_id), {})
+            for worker_index in range(fanin.WORKER_COUNT)
+        ]
+        aggregate = dict(value)
+        for field in (
+            "authenticated_clients",
+            "held_clients",
+            "terminal_failures",
+            "sampled_queries_succeeded",
+            "sampled_queries_failed",
+        ):
+            aggregate[field] = sum(int(peer.get(field, 0)) for peer in peers)
+        if latest_system_socket_states:
+            aggregate["socket_states"] = dict(latest_system_socket_states)
+        fanin._progress(aggregate)
+        record_parent_phase("progress_snapshot_aggregate_json", started_ns)
+
+    async def await_stage(stage: str, timeout_seconds: float) -> None:
+        observed: set[int] = set()
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while len(observed) < fanin.WORKER_COUNT:
+            if cancelled.is_set():
+                raise RunnerCancelled("fanin_cancelled")
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RunnerContractError(f"fanin_worker_{stage}_timeout")
+            try:
+                message = await asyncio.to_thread(
+                    control_queue.get,
+                    True,
+                    0.25,
+                )
+            except queue.Empty:
+                crashed = [
+                    process.name for process in processes if process.exitcode not in (None, 0)
+                ]
+                if crashed:
+                    raise RunnerContractError("fanin_worker_crashed") from None
+                continue
+            if not isinstance(message, tuple) or len(message) < 2:
+                raise RunnerContractError("fanin_worker_message_invalid")
+            kind, raw_index, *detail = message
+            index = int(raw_index)
+            if kind == "progress":
+                publish_progress(index, detail[0] if detail else None)
+                continue
+            if kind == "error":
+                if len(detail) > 1:
+                    _preserve_worker_crash(detail[1])
+                raise RunnerContractError(str(detail[0]) if detail else "fanin_worker_failed")
+            if kind != stage or index not in range(fanin.WORKER_COUNT):
+                raise RunnerContractError("fanin_worker_barrier_invalid")
+            if index in observed:
+                raise RunnerContractError("fanin_worker_barrier_duplicate")
+            observed.add(index)
+
+    for process in processes:
+        process.start()
+    try:
+        await await_stage("ready", FANIN_WORKER_READY_TIMEOUT_SECONDS)
+        with release_ns.get_lock():
+            release_ns.value = time.monotonic_ns()
+        release_event.set()
+        await await_stage("ramp", FANIN_WORKER_RAMP_TIMEOUT_SECONDS)
+        with hold_ns.get_lock():
+            hold_ns.value = time.monotonic_ns()
+        hold_event.set()
+        results: list[Mapping[str, object]] = []
+        result_deadline = asyncio.get_running_loop().time() + FANIN_WORKER_RESULT_TIMEOUT_SECONDS
+        while len(results) < fanin.WORKER_COUNT:
+            if cancelled.is_set():
+                raise RunnerCancelled("fanin_cancelled")
+            if asyncio.get_running_loop().time() >= result_deadline:
+                raise RunnerContractError("fanin_worker_result_timeout")
+            while True:
+                try:
+                    control_message = control_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if (
+                    isinstance(control_message, tuple)
+                    and len(control_message) == 3
+                    and control_message[0] == "progress"
+                ):
+                    publish_progress(
+                        int(control_message[1]),
+                        control_message[2],
+                    )
+                elif (
+                    isinstance(control_message, tuple)
+                    and len(control_message) >= 2
+                    and control_message[0] == "error"
+                ):
+                    if len(control_message) > 3:
+                        _preserve_worker_crash(control_message[3])
+                    raise RunnerContractError(
+                        str(control_message[2])
+                        if len(control_message) > 2
+                        else "fanin_worker_failed"
+                    )
+            try:
+                message = await asyncio.to_thread(
+                    result_queue.get,
+                    True,
+                    0.25,
+                )
+            except queue.Empty:
+                crashed = [
+                    process.name for process in processes if process.exitcode not in (None, 0)
+                ]
+                if crashed:
+                    raise RunnerContractError("fanin_worker_crashed") from None
+                continue
+            if not isinstance(message, tuple) or len(message) not in {3, 4}:
+                raise RunnerContractError("fanin_worker_result_invalid")
+            if message[0] == "error":
+                if len(message) == 4:
+                    _preserve_worker_crash(message[3])
+                raise RunnerContractError(str(message[2]))
+            if message[0] != "ok" or not isinstance(message[2], Mapping):
+                raise RunnerContractError("fanin_worker_result_invalid")
+            results.append(message[2])
+        aggregate_started_ns = time.perf_counter_ns()
+        aggregate = fanin.aggregate_worker_results(results)
+        record_parent_phase("worker_result_aggregation", aggregate_started_ns)
+        aggregate["parent_phase_profile"] = parent_profile
+        return aggregate
+    finally:
+        cancel_event.set()
+        release_event.set()
+        hold_event.set()
+        for process in processes:
+            await asyncio.to_thread(process.join, 5.0)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        for process in processes:
+            await asyncio.to_thread(process.join, 5.0)
+        if any(process.is_alive() for process in processes):
+            raise RunnerContractError("fanin_worker_cleanup_incomplete")
+        for process_queue in (control_queue, result_queue):
+            close = getattr(process_queue, "close", None)
+            if callable(close):
+                close()
+            join_thread = getattr(process_queue, "join_thread", None)
+            if callable(join_thread):
+                join_thread()
+
+
+def _shard_smoke_worker(result_queue: Any, worker_index: int) -> None:
+    try:
+        worker_cpu = _pin_fanin_worker(worker_index)
+        loop_p99_ms = asyncio.run(fanin._event_loop_microbatch_benchmark())
+        result_queue.put(("ok", worker_index, os.getpid(), worker_cpu, loop_p99_ms))
+    except BaseException:
+        result_queue.put(("error", worker_index, os.getpid(), -1, math.inf))
+
+
+def shard_process_preflight() -> dict[str, object]:
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_shard_smoke_worker,
+            args=(result_queue, index),
+            name=f"round5-preflight-{index}",
+        )
+        for index in range(fanin.WORKER_COUNT)
+    ]
+    for process in processes:
+        process.start()
+    results = [result_queue.get(timeout=30.0) for _ in processes]
+    for process in processes:
+        process.join(30.0)
+    if (
+        any(process.exitcode != 0 for process in processes)
+        or any(result[0] != "ok" for result in results)
+        or len({int(result[2]) for result in results}) != fanin.WORKER_COUNT
+        or len({int(result[3]) for result in results}) != fanin.WORKER_COUNT
+    ):
+        raise RunnerContractError("fanin_shard_preflight_failed")
+    loop_values = [float(result[4]) for result in results]
+    return {
+        "worker_count": fanin.WORKER_COUNT,
+        "unique_processes": len({int(result[2]) for result in results}),
+        "unique_cpus": len({int(result[3]) for result in results}),
+        "peak_worker_loop_microbatch_p99_ms": max(loop_values),
+        "sufficient": max(loop_values) <= fanin.RUNTIME_MAX_EVENT_LOOP_P99_MS,
+    }
 
 
 async def _database_config(
@@ -494,13 +1119,12 @@ async def _database_config(
 
 
 async def _connect(database: Mapping[str, object], application_name: str) -> Any:
-    return await psycopg.AsyncConnection.connect(
-        **database,
-        sslmode=TLS_MODE,
-        sslrootcert=str(TRUST_BUNDLE_PATH),
-        connect_timeout=CONNECT_TIMEOUT_SECONDS,
-        prepare_threshold=None,
+    return await connect_runner_database(
+        database,
         application_name=application_name,
+        trust_bundle_path=TRUST_BUNDLE_PATH,
+        tls_mode=TLS_MODE,
+        connect_timeout_seconds=CONNECT_TIMEOUT_SECONDS,
     )
 
 
@@ -581,9 +1205,7 @@ def _decode_setup_request(argument: str) -> dict[str, object]:
     ):
         raise RunnerContractError("setup_lane_invalid")
     secret_arns = [
-        request[name]
-        for name in ("master_secret_arn", "destination_secret_arn")
-        if name in request
+        request[name] for name in ("master_secret_arn", "destination_secret_arn") if name in request
     ]
     if secret_arns:
         _secrets_manager_region(secret_arns, "setup_secret_binding_invalid")
@@ -657,6 +1279,8 @@ async def _configure_ordinary_role(
     *,
     create_if_missing: bool,
     retry_transient_restart: bool = False,
+    role_name: str = BASELINE_ROLE,
+    observer: bool = False,
 ) -> None:
     retry_index = 0
     while True:
@@ -673,7 +1297,7 @@ async def _configure_ordinary_role(
                     await cursor.execute(
                         "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, "
                         "rolreplication, rolbypassrls FROM pg_roles WHERE rolname = %s",
-                        (BASELINE_ROLE,),
+                        (role_name,),
                         prepare=False,
                     )
                     attributes = await cursor.fetchone()
@@ -689,7 +1313,7 @@ async def _configure_ordinary_role(
                         raise RunnerContractError("baseline_role_attributes_invalid")
                     if attributes is None and not create_if_missing:
                         raise RunnerContractError("baseline_role_missing")
-                    role = sql.Identifier(BASELINE_ROLE)
+                    role = sql.Identifier(role_name)
                     password = sql.Literal(str(ordinary_database["password"]))
                     operation = (
                         sql.SQL("ALTER ROLE {} PASSWORD {}")
@@ -705,16 +1329,22 @@ async def _configure_ordinary_role(
                         sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(database, role),
                         prepare=False,
                     )
-                    await cursor.execute(
-                        sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(role),
-                        prepare=False,
-                    )
-                    await cursor.execute(
-                        sql.SQL(
-                            "GRANT SELECT, INSERT, DELETE ON TABLE public.anti_demo_probe TO {}"
-                        ).format(role),
-                        prepare=False,
-                    )
+                    if observer:
+                        await cursor.execute(
+                            sql.SQL("GRANT pg_monitor TO {}").format(role),
+                            prepare=False,
+                        )
+                    else:
+                        await cursor.execute(
+                            sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(role),
+                            prepare=False,
+                        )
+                        await cursor.execute(
+                            sql.SQL(
+                                "GRANT SELECT, INSERT, DELETE ON TABLE public.anti_demo_probe TO {}"
+                            ).format(role),
+                            prepare=False,
+                        )
                 await connection.commit()
             return
         except RunnerContractError:
@@ -731,15 +1361,12 @@ async def _configure_ordinary_role(
                 except psycopg.Error:
                     pass
             sqlstate = exc.sqlstate if isinstance(exc, psycopg.OperationalError) else None
-            transient_restart = (
-                isinstance(exc, (OSError, TimeoutError))
-                or (
-                    isinstance(exc, psycopg.OperationalError)
-                    and (
-                        sqlstate is None
-                        or sqlstate.startswith("08")
-                        or sqlstate in {"57P01", "57P02", "57P03"}
-                    )
+            transient_restart = isinstance(exc, (OSError, TimeoutError)) or (
+                isinstance(exc, psycopg.OperationalError)
+                and (
+                    sqlstate is None
+                    or sqlstate.startswith("08")
+                    or sqlstate in {"57P01", "57P02", "57P03"}
                 )
             )
             if (
@@ -761,14 +1388,40 @@ async def _configure_ordinary_role(
         await asyncio.sleep(retry_delay)
 
 
-def _new_ordinary_database(request: Mapping[str, object]) -> dict[str, object]:
+def _new_ordinary_database(
+    request: Mapping[str, object],
+    *,
+    role_name: str = BASELINE_ROLE,
+) -> dict[str, object]:
     return {
         "host": request["credential_host"],
         "port": request["port"],
         "dbname": request["dbname"],
-        "username": BASELINE_ROLE,
+        "username": role_name,
         "password": secrets.token_urlsafe(48),
     }
+
+
+async def _verify_database_role(
+    database: Mapping[str, object],
+    expected_role: str,
+) -> None:
+    connection: Any | None = None
+    try:
+        connection = await _connect(database, f"{APP_PREFIX}-role-verify")
+        async with connection.cursor() as cursor:
+            await cursor.execute("SELECT current_user", prepare=False)
+            row = await cursor.fetchone()
+        await connection.commit()
+        if row != (expected_role,):
+            raise RunnerContractError("baseline_role_verify_failed")
+    except RunnerContractError:
+        raise
+    except Exception as exc:
+        raise RunnerContractError("baseline_role_verify_failed") from exc
+    finally:
+        if connection is not None:
+            await connection.close()
 
 
 async def _read_master_database(
@@ -790,9 +1443,7 @@ async def _read_master_database(
         raise RunnerContractError("master_secret_invalid") from exc
     if not isinstance(value, dict):
         raise RunnerContractError("master_secret_invalid")
-    if "host" in value and (
-        not isinstance(value["host"], str) or value["host"] != expected_host
-    ):
+    if "host" in value and (not isinstance(value["host"], str) or value["host"] != expected_host):
         raise RunnerContractError("master_secret_invalid")
     if "port" in value and (
         not isinstance(value["port"], int)
@@ -801,9 +1452,7 @@ async def _read_master_database(
     ):
         raise RunnerContractError("master_secret_invalid")
     for name in ("dbname", "database"):
-        if name in value and (
-            not isinstance(value[name], str) or value[name] != expected_database
-        ):
+        if name in value and (not isinstance(value[name], str) or value[name] != expected_database):
             raise RunnerContractError("master_secret_invalid")
     username = value.get("username", value.get("user"))
     password = value.get("password")
@@ -842,9 +1491,7 @@ async def _verify_setup_transaction(
     sleep = asyncio.sleep if _sleep is None else _sleep
     credential_id = _setup_credential_id(request)
     path = BASELINE_CREDENTIAL_PATHS[credential_id]
-    keys = (
-        BASELINE_DATABASE_KEYS if credential_id == "lakebase" else RDS_BASELINE_KEYS
-    )
+    keys = BASELINE_DATABASE_KEYS if credential_id == "lakebase" else RDS_BASELINE_KEYS
     value = _read_root_json(path, keys)
     if hashlib.sha256(_canonical_json(value)).hexdigest() != request["credential_sha256"]:
         raise RunnerContractError("baseline_auth_hash_invalid")
@@ -874,6 +1521,7 @@ async def _verify_setup_transaction(
         connection: Any | None = None
         retry_delay: float | None = None
         try:
+
             async def verify() -> object:
                 nonlocal connection
                 connection = await _connect(database, f"{APP_PREFIX}-setup-verify")
@@ -905,15 +1553,12 @@ async def _verify_setup_transaction(
                 else None
             )
             last_sqlstate = sqlstate.lower() if sqlstate is not None else "none"
-            transient_restart = (
-                isinstance(exc, (OSError, TimeoutError))
-                or (
-                    isinstance(exc, psycopg.OperationalError)
-                    and (
-                        sqlstate is None
-                        or sqlstate.startswith("08")
-                        or sqlstate in {"57P01", "57P02", "57P03"}
-                    )
+            transient_restart = isinstance(exc, (OSError, TimeoutError)) or (
+                isinstance(exc, psycopg.OperationalError)
+                and (
+                    sqlstate is None
+                    or sqlstate.startswith("08")
+                    or sqlstate in {"57P01", "57P02", "57P03"}
                 )
             )
             if not retry_transient_restart:
@@ -971,28 +1616,43 @@ async def _execute_setup(request: Mapping[str, object]) -> dict[str, object]:
         if admin["dbname"] != request["dbname"]:
             raise RunnerContractError("setup_binding_invalid")
         ordinary = _new_ordinary_database(request)
+        observer = _new_ordinary_database(request, role_name=OBSERVER_ROLE)
         await _configure_ordinary_role(
             admin,
             ordinary,
             create_if_missing=True,
             retry_transient_restart=True,
         )
+        await _configure_ordinary_role(
+            admin,
+            observer,
+            create_if_missing=True,
+            retry_transient_restart=True,
+            role_name=OBSERVER_ROLE,
+            observer=True,
+        )
         credential_sha256 = _write_root_file(
             BASELINE_CREDENTIAL_PATHS["lakebase"], _canonical_json(ordinary)
         )
+        observer_credential_sha256 = _write_root_file(
+            OBSERVER_CREDENTIAL_PATHS["lakebase"], _canonical_json(observer)
+        )
         await _verify_setup_transaction({**request, "credential_sha256": credential_sha256})
+        await _verify_database_role(
+            _validate_database_value(observer, expected_host=str(request["credential_host"])),
+            OBSERVER_ROLE,
+        )
         result["credential_sha256"] = credential_sha256
+        result["observer_credential_sha256"] = observer_credential_sha256
         return result
 
     secret_arns = [
-        request[name]
-        for name in ("master_secret_arn", "destination_secret_arn")
-        if name in request
+        request[name] for name in ("master_secret_arn", "destination_secret_arn") if name in request
     ]
     secrets_client: Any | None = None
     if secret_arns:
-        region = _secrets_manager_region(secret_arns, "setup_secret_binding_invalid")
-        secrets_client = boto3.Session().client("secretsmanager", region_name=region)
+        _secrets_manager_region(secret_arns, "setup_secret_binding_invalid")
+        secrets_client = secrets_manager_for_runner_operation(secret_arns)
     if action == "prepare_rds_baseline":
         assert secrets_client is not None
         master_secret_arn = str(request["master_secret_arn"])
@@ -1004,6 +1664,7 @@ async def _execute_setup(request: Mapping[str, object]) -> dict[str, object]:
             expected_database=str(request["dbname"]),
         )
         ordinary = _new_ordinary_database(request)
+        observer = _new_ordinary_database(request, role_name=OBSERVER_ROLE)
         await _configure_ordinary_role(
             admin,
             ordinary,
@@ -1014,13 +1675,30 @@ async def _execute_setup(request: Mapping[str, object]) -> dict[str, object]:
             # that known restart race; RDS remains single-attempt.
             retry_transient_restart=request["lane_id"] == "aurora",
         )
+        await _configure_ordinary_role(
+            admin,
+            observer,
+            create_if_missing=True,
+            retry_transient_restart=request["lane_id"] == "aurora",
+            role_name=OBSERVER_ROLE,
+            observer=True,
+        )
         stored = {**ordinary, "master_secret_arn": master_secret_arn}
         credential_sha256 = _write_root_file(
             BASELINE_CREDENTIAL_PATHS[_setup_credential_id(request)],
             _canonical_json(stored),
         )
+        observer_credential_sha256 = _write_root_file(
+            OBSERVER_CREDENTIAL_PATHS[_setup_credential_id(request)],
+            _canonical_json(observer),
+        )
         await _verify_setup_transaction({**request, "credential_sha256": credential_sha256})
+        await _verify_database_role(
+            _validate_database_value(observer, expected_host=str(request["credential_host"])),
+            OBSERVER_ROLE,
+        )
         result["credential_sha256"] = credential_sha256
+        result["observer_credential_sha256"] = observer_credential_sha256
         return result
 
     if action == "reassert_rds_credentials":
@@ -1452,14 +2130,9 @@ async def _lifecycle(
     observers_stop = asyncio.Event()
     observers: list[asyncio.Task[None]] = []
     try:
-        region = _secrets_manager_region(
-            [target.secret_arn for target in targets if target.secret_arn],
-            "target_invalid",
-        )
-        secrets_client = boto3.Session().client(
-            "secretsmanager",
-            region_name=region,
-        )
+        secret_arns = [target.secret_arn for target in targets if target.secret_arn]
+        _secrets_manager_region(secret_arns, "target_invalid")
+        secrets_client = secrets_manager_for_runner_operation(secret_arns)
         bindings = await asyncio.gather(
             *(_database_config(secrets_client, target) for target in targets)
         )
@@ -1524,7 +2197,7 @@ async def _lifecycle(
                 }
             )
         result = {
-            "protocol": PROTOCOL,
+            "protocol": BOUNDED_PROTOCOL,
             "run_id": run_id,
             "release_ns": release_ns,
             "first_launch_ns_by_lane": first_launch,
@@ -1612,6 +2285,10 @@ def main() -> int:
         envelope = _decode_payload(sys.argv[1])
         protocol = envelope.get("protocol")
         setup_request: dict[str, object] | None = None
+        fanin_request: dict[str, object] | None = None
+        targets: tuple[Target, ...] = ()
+        attempts: tuple[Attempt, ...] = ()
+        trust_bundle_sha256 = ""
         if protocol == SETUP_PROTOCOL:
             setup_request = _decode_setup_request(sys.argv[1])
             run_id = str(setup_request.get("bout_id") or setup_request["nonce"])
@@ -1627,6 +2304,8 @@ def main() -> int:
             signal.signal(signal.SIGTERM, stop_setup)
             signal.signal(signal.SIGINT, stop_setup)
         elif protocol == PROTOCOL:
+            run_id, targets, trust_bundle_sha256, fanin_request = _decode_fanin_request(sys.argv[1])
+        elif protocol == BOUNDED_PROTOCOL:
             run_id, targets, attempts, trust_bundle_sha256 = _decode_request(sys.argv[1])
         else:
             raise RunnerContractError("protocol_invalid")
@@ -1653,6 +2332,22 @@ def main() -> int:
                 exit_code = 0
             return exit_code
 
+        if fanin_request is not None and fanin_request["action"] == "preflight":
+            preflight = asyncio.run(
+                fanin.capacity_preflight(str(fanin_request.get("runner_instance_type") or ""))
+            )
+            shard_preflight = shard_process_preflight()
+            if not shard_preflight["sufficient"]:
+                raise RunnerContractError("fanin_shard_preflight_failed")
+            preflight["shard_process_preflight"] = shard_preflight
+            encoded_preflight = _canonical_json(preflight).decode("utf-8")
+            if len(encoded_preflight.encode("utf-8")) > 4096:
+                raise RunnerContractError("preflight_result_too_large")
+            print("PREFLIGHT_RESULT:" + encoded_preflight, flush=True)
+            print(f"CLEANUP_CONFIRMED:{run_id}", flush=True)
+            exit_code = 0
+            return exit_code
+
         _validate_trust_bundle(trust_bundle_sha256)
         run_directory = _prepare_run_directory(run_id)
         cancelled = asyncio.Event()
@@ -1664,27 +2359,69 @@ def main() -> int:
         signal.signal(signal.SIGINT, stop)
 
         async def bounded() -> tuple[dict[str, object] | None, bool]:
-            async with asyncio.timeout(RUN_TIMEOUT_SECONDS):
+            timeout = (
+                fanin.RUN_TIMEOUT_SECONDS if fanin_request is not None else RUN_TIMEOUT_SECONDS
+            )
+            async with asyncio.timeout(timeout):
                 lifecycle = asyncio.create_task(
-                    _lifecycle(run_id, targets, attempts, cancelled, run_directory)
+                    _execute_fanin_request(fanin_request, targets, cancelled)
+                    if fanin_request is not None
+                    else _lifecycle(run_id, targets, attempts, cancelled, run_directory)
                 )
                 cancellation = asyncio.create_task(cancelled.wait())
-                done, _ = await asyncio.wait(
-                    (lifecycle, cancellation), return_when=asyncio.FIRST_COMPLETED
-                )
-                if cancellation in done and cancelled.is_set():
-                    lifecycle.cancel()
-                    await asyncio.gather(lifecycle, return_exceptions=True)
-                    return None, True
-                cancellation.cancel()
-                await asyncio.gather(cancellation, return_exceptions=True)
-                return await lifecycle
+                try:
+                    done, _ = await asyncio.wait(
+                        (lifecycle, cancellation),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if cancellation in done and cancelled.is_set():
+                        if fanin_request is None:
+                            lifecycle.cancel()
+                            await asyncio.gather(lifecycle, return_exceptions=True)
+                            return None, True
+                        return await lifecycle, True
+                    completed = await lifecycle
+                    if fanin_request is None:
+                        # The bounded lifecycle already returns
+                        # ``(result, was_cancelled)``. Wrapping it again encoded
+                        # the successful result as a JSON array, which the
+                        # server correctly rejected as an unexpected shape.
+                        return completed
+                    return completed, False
+                finally:
+                    cancellation.cancel()
+                    await asyncio.gather(cancellation, return_exceptions=True)
+                    if fanin_request is not None:
+                        cleanup = asyncio.create_task(
+                            asyncio.to_thread(_cleanup_owned, run_id, run_directory)
+                        )
+                        await asyncio.shield(cleanup)
+                        print(f"CLEANUP_CONFIRMED:{run_id}", flush=True)
 
         result, was_cancelled = asyncio.run(bounded())
         if was_cancelled:
+            if result is not None:
+                print(
+                    "TOWEL_GZIP_BASE64:" + _encode_result(result),
+                    flush=True,
+                )
             print(f"RUNNER_CANCELLED:{run_id}", flush=True)
         elif result is not None:
+            encode_started_ns = time.perf_counter_ns()
             encoded_result = _encode_result(result)
+            encode_elapsed_ms = (time.perf_counter_ns() - encode_started_ns) / 1_000_000
+            print(
+                PARENT_RESULT_PROFILE_PREFIX
+                + json.dumps(
+                    {
+                        "operation": "result_json_gzip_base64",
+                        "elapsed_ms": encode_elapsed_ms,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
             print(
                 "RESULT_GZIP_BASE64:" + encoded_result,
                 flush=True,
@@ -1692,6 +2429,14 @@ def main() -> int:
             exit_code = 0
     except RunnerContractError as exc:
         print(f"RUNNER_ERROR:{exc.args[0] if exc.args else 'contract_failed'}", flush=True)
+    except fanin.FanInProtocolError as exc:
+        raw_code = str(exc)
+        code = (
+            raw_code
+            if raw_code and len(raw_code) <= 64 and raw_code.replace("_", "").isalnum()
+            else "fanin_protocol_failed"
+        )
+        print(f"RUNNER_ERROR:{code}", flush=True)
     except (TimeoutError, RunnerCancelled, asyncio.CancelledError):
         print(f"RUNNER_CANCELLED:{run_id}", flush=True)
     except Exception:

@@ -205,6 +205,14 @@ export interface RoundDefinition {
   competitors: CompetitorId[]
   availability: Availability
   /**
+   * Which Round 5 protocol this installation runs. Only ever set on Round 5.
+   *
+   * Read explicitly rather than assumed: the display copy for 10,000 held clients
+   * is wrong for any other protocol, and a comparison that fails open here would
+   * put "10,000 connections" on screen for a bout that never attempted them.
+   */
+  round5_protocol?: string
+  /**
    * Machine-readable context for a temporary refusal. Absent for permanent
    * configuration and health failures; presentation must never infer it from
    * `availability_reason` or `availability_headline`.
@@ -253,6 +261,12 @@ export type FightCardState =
   | 'ready'
   | 'bout_in_progress'
   | 'cleanup_in_progress'
+  /**
+   * Under operator maintenance, and expected back. Distinct from `unavailable`,
+   * which is a configuration or health failure the operator must fix: this one
+   * clears itself, so the card says so instead of sending someone to the docs.
+   */
+  | 'temporarily_unavailable'
   | 'unavailable'
 
 export interface FightCardRoundStatus {
@@ -372,6 +386,32 @@ export interface FairnessSnapshot {
   runner?: string
   tls?: string
   timeout?: string
+  /**
+   * Which Round 5 protocol produced this snapshot.
+   *
+   * Optional because a stored scorecard predates the field, and a bout replayed
+   * from one must not be relabelled as the protocol running today. Presentation
+   * that needs the 10,000-client wording checks for it explicitly rather than
+   * assuming absence means the current protocol.
+   */
+  protocol?: string
+  /** 10,000 under `round5-fanin-v2`. Absent on a snapshot that predates it. */
+  target_clients_per_lane?: number
+  /** 64 sparse samples per lane under `round5-fanin-v2`. */
+  sampled_queries_per_lane?: number
+  /**
+   * How long every client is held open after the target is reached: 30 seconds
+   * under `round5-fanin-v2`, and 0 under the bounded protocol, which never held.
+   */
+  hold_seconds?: number
+  /**
+   * Retries allowed per client: 0 under `round5-fanin-v2`.
+   *
+   * Disclosed because it is the difference between "10,000 connected" and "10,000
+   * connected on the first attempt". A protocol that retried could reach the target
+   * while hiding the failures that make the number interesting.
+   */
+  max_retries?: number
 }
 
 /** How a disclosed capacity figure was obtained. `observed` was read back from
@@ -861,6 +901,21 @@ export interface SetupPhaseResult {
   lanes: Partial<Record<LaneId, SetupLaneResult>>
   setup_validated: boolean
   downstream_validated: boolean
+  /**
+   * Which Round 5 protocol this setup phase belongs to.
+   *
+   * Setup is the half of Round 5 that differs most between the lanes: the AWS lane
+   * spends it provisioning an RDS Proxy, and Lakebase spends it verifying a pool it
+   * already has. Naming the protocol here is what lets the replay label that
+   * asymmetry correctly instead of presenting it as a slow start.
+   */
+  protocol?: string
+  /**
+   * The protocol's schema version, sealed beside its name. Both or neither: a
+   * version with no protocol names nothing, and a protocol with no version cannot
+   * be checked against the contract that scored it.
+   */
+  schema_version?: number
   cleanup_retryable?: boolean
   /**
    * Why the backstage cleanup was given up on, in the server's own words.
