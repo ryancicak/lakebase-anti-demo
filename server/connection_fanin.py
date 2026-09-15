@@ -40,7 +40,24 @@ MICRO_BATCH_SIZE = 2
 # capping either broke the asyncio invariant that a turn consumes the readiness
 # it was handed, and under level-triggered epoll that turned O(N) readiness
 # service into O(N**2 / K) while the un-run descriptors stayed readable.
-LANE_CONNECT_CONCURRENCY = 32
+#: Measured cost of one TLS handshake on the event loop, on the sealed runner shape: about
+#: 1.6 ms of CPU. Recorded as a constant because the concurrency below is derived from it, so a
+#: future runner shape or cipher change has one number to revisit rather than a magic 32.
+TLS_HANDSHAKE_CPU_MS = 1.6
+#: How many connects may be in flight per lane per worker.
+#:
+#: This is the size of the handshake batch a single event-loop turn can be handed, so it is
+#: what decides whether one turn can exceed `RUNTIME_MAX_EVENT_LOOP_P99_MS` (50 ms, defined
+#: below) on handshake CPU alone. At 32 it could and did: 55 ms in one callback, and the ramp
+#: broke out at a few hundred clients with no connection failures at all.
+#:
+#: Half the ceiling divided by the handshake cost, so a full batch spends about half the budget
+#: and leaves the rest for the turn's other work. The result is also below
+#: `OWNED_STALL_READY_BATCH`, so a batch this size is no longer big enough to be classified as
+#: our own amplification.
+#:
+#: Capping the drain instead is not an option; see `READY_CALLBACK_BATCH_LIMIT` below.
+LANE_CONNECT_CONCURRENCY = int((50.0 / 2) / TLS_HANDSHAKE_CPU_MS)
 READY_CALLBACK_BATCH_LIMIT = 0
 SELECTOR_EVENT_BATCH_LIMIT = 0
 PARTITION_CLIENTS_PER_LANE = TARGET_CLIENTS_PER_LANE // WORKER_COUNT
@@ -75,7 +92,13 @@ RAW_WALL_LAG_WARNING_MS = 50.0
 RAW_WALL_LAG_CEILING_MS = 250.0
 RAW_WALL_LAG_MAX_BREACHES = 3
 OWNED_STALL_MIN_THREAD_CPU_MS = 5.0
-OWNED_STALL_READY_BATCH = 16
+#: A ready batch large enough to be our own amplification rather than the work we asked for.
+#:
+#: Derived from the connects this protocol deliberately keeps in flight across both lanes, so a
+#: full healthy batch is never suspicious. A flat 16 was below that number, which meant a
+#: perfectly ordinary turn counted as amplification and helped gate a ramp on lag it had not
+#: caused.
+OWNED_STALL_READY_BATCH = LANE_CONNECT_CONCURRENCY * RUNNER_LANE_COUNT
 RUNTIME_MAX_CPU_CAPACITY_FRACTION = 0.85
 LOOP_MONITOR_INTERVAL_SECONDS = 0.01
 RESOURCE_TELEMETRY_INTERVAL_SECONDS = 0.25

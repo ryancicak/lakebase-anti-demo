@@ -17,6 +17,7 @@ from server.connection_fanin import (
     FANIN_PROTOCOL,
     FANIN_SCHEMA_VERSION,
     MAX_PREEXISTING_CLIENT_SESSIONS,
+    OWNED_STALL_READY_BATCH,
     CapacityPreflight,
     ConnectionSpikeArm,
     ConnectionSpikeContract,
@@ -1230,9 +1231,14 @@ async def test_continuous_loop_monitor_attributes_a_real_stall(
 @pytest.mark.parametrize(
     ("process_cpu_ms", "thread_cpu_ms", "ready_batch", "phase", "gc_pause_ms"),
     (
+        # CPU that accounts for the delay: ours.
         (60.0, 60.0, 1, "event_loop_wait", 0.0),
+        # A garbage-collection pause past the ceiling: ours.
         (1.0, 1.0, 1, "gc_generation_2", 60.0),
-        (1.0, 1.0, 16, "wave_task_creation", 0.0),
+        # A ready batch past the amplification threshold: ours. Read from the constant, which
+        # is derived from the connects this protocol keeps in flight, so a healthy full batch
+        # is not mistaken for amplification.
+        (1.0, 1.0, OWNED_STALL_READY_BATCH, "wave_task_creation", 0.0),
     ),
 )
 def test_generator_owned_stalls_keep_the_50ms_gate(
@@ -1250,6 +1256,27 @@ def test_generator_owned_stalls_keep_the_50ms_gate(
         selector_batch_size=1,
         phase=phase,
         gc_pause_ms=gc_pause_ms,
+    )
+
+
+def test_cpu_that_does_not_account_for_the_delay_is_not_ours() -> None:
+    """The case a live ramp hit, and the reason it stopped short of 10,000.
+
+    Sixty milliseconds of wall lag with twenty of CPU, an ordinary batch and no GC pause: forty
+    of those milliseconds are the loop waiting on something else. An absolute five-millisecond
+    CPU floor called all sixty ours, so the ramp gated itself on pressure it had not caused and
+    stopped with zero connection failures. Corroboration has to be proportional to the delay it
+    is corroborating, which is what this function's own docstring always claimed.
+    """
+
+    assert not runner.classify_generator_owned_stall(
+        wall_lag_ms=60.0,
+        process_cpu_ms=20.0,
+        thread_cpu_ms=20.0,
+        ready_batch_size=OWNED_STALL_READY_BATCH - 1,
+        selector_batch_size=1,
+        phase="ramp",
+        gc_pause_ms=0.0,
     )
 
 

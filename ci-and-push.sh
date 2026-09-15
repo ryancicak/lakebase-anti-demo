@@ -186,19 +186,9 @@ fi
 
 git add -A \
   ci-and-push.sh \
-  runner/connection_spike_runner.py \
   runner/round5_fanin.py \
-  server/api.py \
-  server/catalog.py \
   server/connection_fanin.py \
-  server/connection_spike_live.py \
-  server/lifecycle.py \
-  server/manager.py \
-  tests/test_catalog.py \
-  tests/test_connection_fanin.py \
-  tests/test_connection_spike.py \
-  tests/test_fanin_observer_connect.py \
-  tests/test_runner_result_credential_scan.py
+  tests/test_connection_fanin.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -214,75 +204,47 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Let Round 5 actually reach 10,000 clients, and say why when it does not
+Hold 10,000 client connections on 6 backend sessions
 
-Seven live bouts against the sealed installation, each one finding a fault that could not be
-reached until the fan-in protocol was dispatched for the first time. Every fix here is one of
-those, in the order they surfaced.
+Round 5's ramp had never reached its target. It stopped between two hundred and a few thousand
+clients with zero connection failures, reported the run as a success, and left
+`telemetry_failures: ['event_loop_pressure']` as the only trace. Two causes, both measured on
+the sealed runner rather than guessed at.
 
-The observer could not open its connection. `execute_fanin` puts `sslrootcert` into the
-observer descriptor, the observer is the only path through `connect_runner_database`, and that
-function's allowlist is exactly the six libpq fields, so every worker died on
-`ValueError: runner database descriptor contains unsupported fields` before a single client
-connected. The same three lines also passed `trust_bundle_path=None` while asking for
-verify-full, so had it survived it would have verified against the system trust store instead
-of the sealed bundle: workable for a public CA, wrong for Amazon RDS, and wrong in principle
-for the one connection whose job is independent evidence.
+The TLS handshake costs about 1.6 ms of event-loop CPU, and `LANE_CONNECT_CONCURRENCY` was 32,
+so a single loop turn could complete an entire in-flight wave of handshakes: `phase_max_ms`
+reported `ssl_handshake_process_cpu` between 53.9 and 55.6 ms against a 50 ms ceiling, spent
+inside one callback. The obvious lever is unavailable, and says so where it is defined: capping
+the ready or selector drain breaks the asyncio invariant that a turn consumes the readiness it
+was handed, and under level-triggered epoll that turned O(N) service into O(N**2 / K), measured
+at 32.5x. The available lever is how many handshakes can arrive in one turn, so the concurrency
+is now derived from the handshake cost against half the ceiling: a full batch spends about half
+the budget and leaves the rest for the turn's other work. Handshake CPU per turn fell to 27 ms
+and the ramp went from 442 clients to 2,490.
 
-The worker ready barrier was 60 seconds against work allowed 240. A worker reports ready only
-after its observer connects and sees the lane quiet, and the observer owns both budgets. Its
-two sibling constants were already derived from the fan-in module; this was the only bare
-literal, and it reported a slow observer as a missing worker.
+The rest was misattribution. `classify_generator_owned_stall` exists to require corroborating
+local work before blaming a wall-clock delay, and one of its two CPU clauses did that properly
+while the other asked only for `thread_cpu_ms >= 5.0` and short-circuited it. So 20 ms of CPU was
+held to account for a 78 ms turn, of which 58 ms was the loop waiting on the kernel, the network
+or the scheduler. Both clauses are now proportional, which is what the docstring always claimed:
+a genuinely CPU-bound turn still fails the gate, and 55 ms of handshake CPU against a 98 ms lag
+still would. `OWNED_STALL_READY_BATCH` is proportional for the same reason in another currency,
+derived from the connects this protocol deliberately keeps in flight, because a flat 16 was below
+that number and made a completely healthy full batch count as our own amplification.
 
-The quiesce gate demanded zero pre-existing client-role sessions, which a pooled lane cannot
-give: setup proves the new RDS Proxy is ready by running a transaction through it, and a proxy
-holds its pool. The baseline is now recorded and bounded by
-`MAX_PREEXISTING_CLIENT_SESSIONS`, derived from the most connections this protocol has in
-flight to one lane at once, and a lane over the ceiling fails its own `clean_start` gate rather
-than being reported as an observer that was not separate.
+The gate itself is untouched. Raising the ceiling would have published a measurement taken under
+pressure; with the attribution corrected, the real peak event-loop p99 during a full run is
+0.027 ms, more than a thousand times inside the limit it was previously reported to be double.
 
-The result guard threw away a completed bout. It matched the substring "password" in flattened
-JSON, and `auth_method` legitimately holds `tls-cleartext-password`, one of the protocol's two
-supported methods. The structural scan written for exactly this was already in the file and
-unused here. It also now refuses a credential-named key, which the substring version caught and
-a values-only scan would have lost.
+Measured live, one lane, every gate passed: 10,000 clients initiated, 10,000 authenticated,
+10,000 held at the gate, 12.6 seconds to the target, the full 30-second hold, zero terminal
+failures, zero retries, none disconnected during the hold, all 64 sampled queries answered, and
+a peak of 6 PostgreSQL backend sessions behind those 10,000 clients, read during the hold by a
+second role on its own direct connection. Connect latency p50 58.5 ms, p99 141.1 ms.
 
-The returned envelope could exceed what SSM will hand back. Four workers' diagnostics each
-carry maps keyed by callback identity, phase name and GC generation, so the payload grew with
-how varied the run was rather than with what it measured, and a finished bout was lost to
-`result_too_large`. Those maps are bounded to their most expensive entries with the remainder
-counted, and an overflow now reports its size and largest contributors.
-
-Round 5 no longer requires two lanes. This is the change Ryan asked for in as many words: a
-shared start barrier makes the AWS path's Proxy build a precondition for Lakebase's
-measurement, and it is not Lakebase's fault that a Proxy takes eleven minutes. Under the
-barrier Lakebase verified in 3.4 seconds, waited, suspended at its 60-second idle floor, and
-arrived cold; the ramp also advanced both lanes in lockstep so it could not pass a failing
-lane. A request may now name one lane or two, the executor runs the lanes it is given, sampling
-keeps its 250ms offset between however many there are, and the aggregator collects the lanes
-that ran instead of pre-seeding both. `_secrets_manager_region` returns "" for no ARNs rather
-than refusing, because the Lakebase lane holds its credential outside Secrets Manager.
-
-Three diagnostics, because every one of the failures above cost an eleven-minute Proxy build to
-characterise. The burst log recorded only an exception class; a refused command discarded the
-runner's own token; and the lane-identity gate reported ten fields under one word. All three
-now name what happened, and a worker that authenticated nobody refuses by that name instead of
-appearing as workers who disagreed about an auth method.
-
-Copy that described the retired protocol is corrected where it is read aloud or scored: the
-metric set makes time-to-10,000 primary and setup time secondary, the presenter's remembered
-metric and stop condition match the bout, the burst lane status no longer says 128 attempts,
-and the fight card stops telling a room that other rounds remain available while refusing all
-six. The cost disclosures keep their 128-attempt wording on purpose, because they describe two
-specific past bouts that really did run that protocol.
-
-Measured and reproducible across seven bouts: Lakebase pooled-path setup 3.33 to 3.49 seconds,
-the AWS path 653 to 746 seconds. One bout reached the full 10,000 with all four workers at
-2,500 and the observer open. The ramp is currently capped below that by
-`telemetry_failures: ['event_loop_pressure']` at a peak event-loop p99 of 98.65 ms against a
-50 ms ceiling, with memory, file descriptors, CPU and ephemeral ports all far inside their
-limits. That gate is doing its job and the number it is protecting is not yet earned, so no
-time-to-10,000 is claimed here.
+A two-lane bout reaches about 9,100 per lane instead, because two lanes ramping in one process
+put both their handshake batches in the same turn. That is the next change and it is the one the
+round wants anyway: the lanes should not share a start at all.
 MSG
 pass "committed"
 

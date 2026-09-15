@@ -75,7 +75,24 @@ MICRO_BATCH_SIZE = 2
 # in flight at once. Draining every quantum made the ramp latency-bound: a
 # client costs five to six round trips, so the loop sat idle between batches
 # and 2,500 clients per lane became 1,250 serial round-trip waits.
-LANE_CONNECT_CONCURRENCY = 32
+#: Measured cost of one TLS handshake on the event loop, on the sealed runner shape: about
+#: 1.6 ms of CPU. Recorded as a constant because the concurrency below is derived from it, so a
+#: future runner shape or cipher change has one number to revisit rather than a magic 32.
+TLS_HANDSHAKE_CPU_MS = 1.6
+#: How many connects may be in flight per lane per worker.
+#:
+#: This is the size of the handshake batch a single event-loop turn can be handed, so it is
+#: what decides whether one turn can exceed `RUNTIME_MAX_EVENT_LOOP_P99_MS` (50 ms, defined
+#: below) on handshake CPU alone. At 32 it could and did: 55 ms in one callback, and the ramp
+#: broke out at a few hundred clients with no connection failures at all.
+#:
+#: Half the ceiling divided by the handshake cost, so a full batch spends about half the budget
+#: and leaves the rest for the turn's other work. The result is also below
+#: `OWNED_STALL_READY_BATCH`, so a batch this size is no longer big enough to be classified as
+#: our own amplification.
+#:
+#: Capping the drain instead is not an option; see `READY_CALLBACK_BATCH_LIMIT` below.
+LANE_CONNECT_CONCURRENCY = int((50.0 / 2) / TLS_HANDSHAKE_CPU_MS)
 PARTITION_CLIENTS_PER_LANE = TARGET_CLIENTS_PER_LANE // WORKER_COUNT
 MAX_IN_FLIGHT_CONNECTS_PER_LANE = LANE_CONNECT_CONCURRENCY * WORKER_COUNT
 # Readiness burst used by the no-endpoint preflight probe. One worker loop can
@@ -110,7 +127,13 @@ RAW_WALL_LAG_WARNING_MS = 50.0
 RAW_WALL_LAG_CEILING_MS = 250.0
 RAW_WALL_LAG_MAX_BREACHES = 3
 OWNED_STALL_MIN_THREAD_CPU_MS = 5.0
-OWNED_STALL_READY_BATCH = 16
+#: A ready batch large enough to be our own amplification rather than the work we asked for.
+#:
+#: Derived from the connects this protocol deliberately keeps in flight across both lanes, so a
+#: full healthy batch is never suspicious. A flat 16 was below that number, which meant a
+#: perfectly ordinary turn counted as amplification and helped gate a ramp on lag it had not
+#: caused.
+OWNED_STALL_READY_BATCH = LANE_CONNECT_CONCURRENCY * RUNNER_LANE_COUNT
 RUNTIME_MAX_CPU_CAPACITY_FRACTION = 0.85
 MEMORY_RESERVE_BYTES = 768 * 1024 * 1024
 FD_CONTROL_RESERVE = 256
@@ -272,9 +295,13 @@ def classify_generator_owned_stall(
 
     if wall_lag_ms <= RUNTIME_MAX_EVENT_LOOP_P99_MS:
         return False
-    cpu_owned = thread_cpu_ms >= OWNED_STALL_MIN_THREAD_CPU_MS or process_cpu_ms >= max(
-        OWNED_STALL_MIN_THREAD_CPU_MS, wall_lag_ms * 0.5
-    )
+    # Proportional in both currencies. The CPU has to account for at least half the delay
+    # before the delay is ours: 20 ms of work does not explain a 78 ms turn, and an absolute
+    # 5 ms floor on the thread clause used to say it did, short-circuiting the process clause
+    # that already required a share. The floor is kept as a lower bound so a tiny lag with a
+    # tiny CPU reading cannot be attributed either way on noise.
+    corroborating_cpu_ms = max(OWNED_STALL_MIN_THREAD_CPU_MS, wall_lag_ms * 0.5)
+    cpu_owned = thread_cpu_ms >= corroborating_cpu_ms or process_cpu_ms >= corroborating_cpu_ms
     internal_batch = ready_batch_size >= OWNED_STALL_READY_BATCH or (
         selector_batch_size >= OWNED_STALL_READY_BATCH
         and phase in {"protocol_data_received", "authentication_processing"}
