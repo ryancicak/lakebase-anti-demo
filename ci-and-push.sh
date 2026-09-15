@@ -186,9 +186,9 @@ fi
 
 git add -A \
   ci-and-push.sh \
-  runner/round5_fanin.py \
-  server/connection_fanin.py \
-  tests/test_connection_fanin.py
+  server/connection_spike_live.py \
+  server/manager.py \
+  tests/test_connection_spike_background_cleanup.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -204,47 +204,41 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Hold 10,000 client connections on 6 backend sessions
+Run each lane's 10,000 on its own clock, and Round 5 verifies
 
-Round 5's ramp had never reached its target. It stopped between two hundred and a few thousand
-clients with zero connection failures, reported the run as a success, and left
-`telemetry_failures: ['event_loop_pressure']` as the only trace. Two causes, both measured on
-the sealed runner rather than guessed at.
+Ryan's instruction, and the measurement turned out to agree with it: "a starting barrier is a
+DUMB idea as RDS proxy takes forever to start, that's not Lakebase's fault, so start Lakebase as
+soon as the round starts." Lakebase should never wait.
 
-The TLS handshake costs about 1.6 ms of event-loop CPU, and `LANE_CONNECT_CONCURRENCY` was 32,
-so a single loop turn could complete an entire in-flight wave of handshakes: `phase_max_ms`
-reported `ssl_handshake_process_cpu` between 53.9 and 55.6 ms against a 50 ms ceiling, spent
-inside one callback. The obvious lever is unavailable, and says so where it is defined: capping
-the ready or selector drain breaks the asyncio invariant that a turn consumes the readiness it
-was handed, and under level-triggered epoll that turned O(N) service into O(N**2 / K), measured
-at 32.5x. The available lever is how many handshakes can arrive in one turn, so the concurrency
-is now derived from the handshake cost against half the ceiling: a full batch spends about half
-the budget and leaves the rest for the turn's other work. Handshake CPU per turn fell to 27 ms
-and the ramp went from 442 clients to 2,490.
+It was not only unfair, it was inaccurate. Two lanes ramping in one process put both their
+handshake batches in the same event-loop turn, so each lane got half the budget and both stopped
+near 9,100 of 10,000 with no connection failures at all. Dispatched one at a time, each lane has
+the whole loop: both reach exactly 10,000.
 
-The rest was misattribution. `classify_generator_owned_stall` exists to require corroborating
-local work before blaming a wall-clock delay, and one of its two CPU clauses did that properly
-while the other asked only for `thread_cpu_ms >= 5.0` and short-circuited it. So 20 ms of CPU was
-held to account for a 78 ms turn, of which 58 ms was the loop waiting on the kernel, the network
-or the scheduler. Both clauses are now proportional, which is what the docstring always claimed:
-a genuinely CPU-bound turn still fails the gate, and 55 ms of handshake CPU against a 98 ms lag
-still would. `OWNED_STALL_READY_BATCH` is proportional for the same reason in another currency,
-derived from the connects this protocol deliberately keeps in flight, because a flat 16 was below
-that number and made a completely healthy full batch count as our own amplification.
+So `run` dispatches per lane, Lakebase first, and merges the results. `_fanin_request` builds one
+lane's request; `_finalize_lane_payload` verifies each payload's seal on arrival and scores the
+single lane it carries; `_merge_lane_results` holds the requirement that a scored Round 5 has two
+lanes, which is where it belongs now that they arrive separately. The seal comparison is extracted
+so both finalisers share one implementation rather than drifting apart. A payload is checked
+against the lanes its own request asked for, not against every sealed lane, because a correct
+single-lane result was being refused as having omitted a lane nobody asked it to run.
 
-The gate itself is untouched. Raising the ceiling would have published a measurement taken under
-pressure; with the attribution corrected, the real peak event-loop p99 during a full run is
-0.027 ms, more than a thousand times inside the limit it was previously reported to be double.
+The last refusal was the manager validating a fan-in result with the bounded protocol's
+arithmetic: 128 scheduled attempts, a 64-client witness phase that no longer exists, and backend
+session counts below 64. Both lanes held 10,000 with every gate green and the round still refused.
+A fan-in lane is now validated by `gates.passed`, the conjunction of the ten gates this protocol
+actually defines, evaluated where the evidence is, plus the one thing those gates cannot know:
+that the lane held the target this installation asked for. The bounded branch is untouched for a
+stored result from the retired protocol, which really did run 128 attempts and a separate witness.
 
-Measured live, one lane, every gate passed: 10,000 clients initiated, 10,000 authenticated,
-10,000 held at the gate, 12.6 seconds to the target, the full 30-second hold, zero terminal
-failures, zero retries, none disconnected during the hold, all 64 sampled queries answered, and
-a peak of 6 PostgreSQL backend sessions behind those 10,000 clients, read during the hold by a
-second role on its own direct connection. Connect latency p50 58.5 ms, p99 141.1 ms.
+Verified live, both lanes, every gate:
 
-A two-lane bout reaches about 9,100 per lane instead, because two lanes ramping in one process
-put both their handshake batches in the same turn. That is the next change and it is the one the
-round wants anyway: the lanes should not share a start at all.
+  lakebase    10,000 clients held, p99 141.19 ms, pooled-path setup 3,387 ms
+  competitor  10,000 clients held, p99 442.95 ms, pooled-path setup 870,157 ms
+
+Zero client errors on either lane, both setup stop gates exact, and the round declared its own
+verdict: Lakebase verified a pooled path 866.77 seconds sooner. Both lanes then held ten thousand
+authenticated client connections, so the margin is a setup finding rather than one side failing.
 MSG
 pass "committed"
 

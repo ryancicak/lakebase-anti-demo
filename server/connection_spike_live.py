@@ -30,7 +30,6 @@ from .connection_fanin import (
     FANIN_SCHEMA_VERSION,
     PROGRESS_PREFIX,
     RUNNER_LANE_COUNT,
-    RUNTIME_LANE_IDS,
     CapacityPreflight,
     ConnectionSpikeLaneResult,
     FanInError,
@@ -39,7 +38,6 @@ from .connection_fanin import (
     fanin_config_sha256,
     fanin_generator_sha256,
     fanin_preflight_request,
-    fanin_run_request,
 )
 from .connection_fanin import (
     RUN_TIMEOUT_SECONDS as FANIN_RUN_TIMEOUT_SECONDS,
@@ -47,6 +45,7 @@ from .connection_fanin import (
 from .connection_fanin import (
     RUNNER_INSTANCE_TYPE as FANIN_RUNNER_INSTANCE_TYPE,
 )
+from .connection_fanin import TRUST_BUNDLE_PATH as FANIN_TRUST_BUNDLE_PATH
 from .connection_fanin import ConnectionSpikeArm as FanInArm
 from .connection_fanin import ConnectionSpikeContract as FanInContract
 from .connection_fanin import ConnectionSpikeRunResult as FanInRunResult
@@ -4032,7 +4031,11 @@ class LiveConnectionSpikeAdapter:
                 # connection, so there is nothing for it to corroborate and asking
                 # would add a metric read that only ever returns nothing.
                 return self._parse_preflight_output(run_id, output)
-            result = self._parse_runner_output(run_id, output)
+            result = self._parse_runner_output(
+                run_id,
+                output,
+                expected_lane_ids=self._requested_lane_ids(request),
+            )
             witness = await self._cloudwatch_witness(
                 clients.cloudwatch,
                 started_at,
@@ -4417,7 +4420,31 @@ class LiveConnectionSpikeAdapter:
                 "Round 5 runner omitted cleanup or flock-release evidence"
             )
 
-    def _parse_runner_output(self, run_id: str, output: str) -> dict[str, object]:
+    @staticmethod
+    def _requested_lane_ids(request: Mapping[str, object]) -> frozenset[str]:
+        """The lanes this request told the runner to run.
+
+        Each dispatch carries one lane now, so the result is checked against what was asked for
+        rather than against every sealed lane. A runner that drops a lane it was told to run is
+        still refused; a runner that does not return a lane nobody asked for is not.
+        """
+
+        targets = request.get("targets")
+        if not isinstance(targets, Sequence) or isinstance(targets, (str, bytes)):
+            return frozenset()
+        return frozenset(
+            str(target.get("lane_id") or "")
+            for target in targets
+            if isinstance(target, Mapping) and target.get("lane_id")
+        )
+
+    def _parse_runner_output(
+        self,
+        run_id: str,
+        output: str,
+        *,
+        expected_lane_ids: frozenset[str] | None = None,
+    ) -> dict[str, object]:
         prefix = "RESULT_GZIP_BASE64:"
         candidates = [
             line.removeprefix(prefix) for line in output.splitlines() if line.startswith(prefix)
@@ -4448,8 +4475,16 @@ class LiveConnectionSpikeAdapter:
         result_lane_ids = {
             str(lane.get("lane_id")) for lane in result.get("lanes", []) if isinstance(lane, dict)
         }
-        if result_lane_ids != {target.lane_id for target in self.config.targets}:
-            raise ConnectionSpikeLiveOperationError("Round 5 runner result omitted a sealed lane")
+        expected = (
+            expected_lane_ids
+            if expected_lane_ids is not None
+            else frozenset(target.lane_id for target in self.config.targets)
+        )
+        if result_lane_ids != expected:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner result lanes do not match the dispatch: expected "
+                f"{', '.join(sorted(expected))}, got {', '.join(sorted(result_lane_ids)) or 'none'}"
+            )
         # The structural scan, not a substring sweep over flattened JSON. This payload
         # legitimately contains the word "password" in `auth_method`:
         # `tls-cleartext-password` is one of the protocol's two supported methods and is a
@@ -4928,6 +4963,47 @@ def _runner_result_has_forbidden_credential(raw: object) -> bool:
     return False
 
 
+def _require_sealed_payload(arm: FanInArm, raw: Mapping[str, object]) -> None:
+    """Refuse a payload produced by a different contract, config or generator than was armed.
+
+    Reported all at once, and as staleness rather than as malformed evidence, because the
+    operator's next move differs: redeploy the runner, not debug the round. A stale generator
+    that still answers is more dangerous than one that fails, since its numbers look exactly
+    like a measurement.
+    """
+
+    expected_seal = {
+        "schema_version": FANIN_SCHEMA_VERSION,
+        "protocol": FANIN_PROTOCOL,
+        "contract_sha256": arm.contract_sha256,
+        "config_sha256": arm.config_sha256,
+        "generator_sha256": arm.generator_sha256,
+        "capacity_model_sha256": arm.capacity_model_sha256,
+    }
+    stale: list[str] = []
+    for name, expected in expected_seal.items():
+        observed = raw.get(name)
+        # `bool` is a subclass of `int`, so True would otherwise satisfy a schema_version of 1.
+        # Compared by type as well as value because a runner that reported `true` there has not
+        # reported a version at all.
+        if isinstance(expected, int) and not isinstance(expected, bool):
+            matches = (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed == expected
+            )
+        else:
+            matches = isinstance(observed, str) and observed == expected
+        if not matches:
+            stale.append(name)
+    if stale:
+        raise ConnectionSpikeLiveOperationError(
+            "Round 5 runner evidence is stale: "
+            f"{', '.join(stale)} does not match the sealed arm, so this payload was "
+            "produced by a different contract, config or generator than the one armed"
+        )
+
+
 def _finalize_raw_result(
     arm: FanInArm,
     raw: Mapping[str, object],
@@ -4950,38 +5026,7 @@ def _finalize_raw_result(
     it actually observed; the default is not a claim this function can make.
     """
 
-    # The seal first, and all of it at once. Reporting only the first mismatched
-    # digest would send someone to redeploy one component and hit the next.
-    expected_seal = {
-        "schema_version": FANIN_SCHEMA_VERSION,
-        "protocol": FANIN_PROTOCOL,
-        "contract_sha256": arm.contract_sha256,
-        "config_sha256": arm.config_sha256,
-        "generator_sha256": arm.generator_sha256,
-        "capacity_model_sha256": arm.capacity_model_sha256,
-    }
-    stale: list[str] = []
-    for name, expected in expected_seal.items():
-        observed = raw.get(name)
-        # `bool` is a subclass of `int`, so True would otherwise satisfy a
-        # schema_version of 1. Compared by type as well as value because a runner
-        # that reported `true` there has not reported a version at all.
-        if isinstance(expected, int) and not isinstance(expected, bool):
-            matches = (
-                isinstance(observed, int)
-                and not isinstance(observed, bool)
-                and observed == expected
-            )
-        else:
-            matches = isinstance(observed, str) and observed == expected
-        if not matches:
-            stale.append(name)
-    if stale:
-        raise ConnectionSpikeLiveOperationError(
-            "Round 5 runner evidence is stale: "
-            f"{', '.join(stale)} does not match the sealed arm, so this payload was "
-            "produced by a different contract, config or generator than the one armed"
-        )
+    _require_sealed_payload(arm, raw)
 
     # Diagnostics are not scored, but their absence is still a refusal: the runtime
     # gates (event-loop p99, selector amplification, CPU capacity) are what
@@ -5049,6 +5094,92 @@ def _finalize_raw_result(
         # failing rather than comparing it.
         comparison=compare_fanin_lanes(lanes[left_id], lanes[right_id]),
         runtime_diagnostics=dict(diagnostics),
+    )
+
+
+def _finalize_lane_payload(
+    arm: FanInArm,
+    raw: Mapping[str, object],
+    *,
+    lane_id: str,
+    cleanup_verified: bool = True,
+) -> ConnectionSpikeLaneResult:
+    """Verify one dispatch's seal and score the single lane it carries.
+
+    Each lane is now dispatched on its own, so each payload is sealed on its own and is checked
+    on its own. A runner that changed underneath the second dispatch is caught there rather than
+    inherited from the first.
+    """
+
+    _require_sealed_payload(arm, raw)
+    diagnostics = raw.get("runtime_diagnostics")
+    if not isinstance(diagnostics, Mapping):
+        raise ConnectionSpikeLiveOperationError(
+            f"Round 5 lane {lane_id} returned no runtime diagnostics, so the runtime gates "
+            "this protocol depends on cannot be evaluated"
+        )
+    raw_lanes_value = raw.get("lanes")
+    if not isinstance(raw_lanes_value, Sequence) or isinstance(raw_lanes_value, (str, bytes)):
+        raise ConnectionSpikeLiveOperationError(
+            f"Round 5 lane {lane_id} evidence carried no lanes"
+        )
+    payloads = [
+        value
+        for value in raw_lanes_value
+        if isinstance(value, Mapping) and str(value.get("lane_id") or "") == lane_id
+    ]
+    if len(payloads) != 1:
+        raise ConnectionSpikeLiveOperationError(
+            f"Round 5 expected exactly one {lane_id} lane in this dispatch, got {len(payloads)}"
+        )
+    try:
+        return finalize_fanin_lane(
+            payloads[0],
+            expected_lane_id=lane_id,
+            expected_config_sha256=arm.config_sha256,
+            expected_generator_sha256=arm.generator_sha256,
+            expected_capacity_model_sha256=arm.capacity_model_sha256,
+            cleanup_verified=cleanup_verified,
+        )
+    except FanInError as exc:
+        # The contract's refusal token is the whole diagnosis and is safe to repeat: a fixed
+        # snake_case word chosen by this repository, never a host, ARN or credential.
+        raise ConnectionSpikeLiveOperationError(
+            f"Round 5 lane {lane_id} failed the fan-in contract: {exc}"
+        ) from exc
+
+
+def _merge_lane_results(
+    arm: FanInArm,
+    lanes: Mapping[str, ConnectionSpikeLaneResult],
+    diagnostics: Mapping[str, object],
+) -> FanInRunResult:
+    """One scored result from lanes that ran separately.
+
+    A scored Round 5 still needs both lanes; that requirement simply lives here now, because the
+    lanes no longer arrive in one payload. Each lane's time to 10,000 was measured from its own
+    start, which is the point: neither lane's number is held hostage to the other's setup.
+    """
+
+    if len(lanes) != RUNNER_LANE_COUNT:
+        raise ConnectionSpikeLiveOperationError(
+            f"Round 5 is a two-lane comparison; {len(lanes)} lane(s) completed"
+        )
+    left_id, right_id = sorted(lanes)
+    return FanInRunResult(
+        schema_version=FANIN_SCHEMA_VERSION,
+        protocol=FANIN_PROTOCOL,
+        contract_sha256=arm.contract_sha256,
+        config_sha256=arm.config_sha256,
+        generator_sha256=arm.generator_sha256,
+        capacity_model_sha256=arm.capacity_model_sha256,
+        lanes=dict(lanes),
+        # None when either lane did not verify. That is not an error: a lane that held 9,999
+        # clients has failed this protocol, and the round shows it failing rather than
+        # comparing it.
+        comparison=compare_fanin_lanes(lanes[left_id], lanes[right_id]),
+        # Kept per lane, because each lane ran its own dispatch and its own runtime gates.
+        runtime_diagnostics={"by_lane": dict(diagnostics)},
     )
 
 
@@ -5152,20 +5283,27 @@ class LiveConnectionSpikeEngine:
         run_id: str,
         arm: FanInArm,
         targets: Sequence[ConnectionSpikeTarget],
+        *,
+        lane_ids: Sequence[str] = (),
     ) -> dict[str, object]:
-        """Build the bout request from the arm, refusing a lane that cannot be proved."""
+        """Build one lane's bout request, refusing a lane that cannot be proved.
+
+        `lane_ids` selects which of the bound lanes this dispatch runs. One lane at a time is
+        the normal case: two lanes ramping in the same process put both their handshake batches
+        in one event-loop turn, so each got half the budget and neither reached 10,000.
+        """
 
         by_lane = {target.lane_id: target for target in targets}
-        missing = sorted(set(RUNTIME_LANE_IDS) - set(by_lane))
+        selected = tuple(lane_ids) or tuple(sorted(by_lane))
+        missing = [lane_id for lane_id in selected if lane_id not in by_lane]
         if missing:
             raise ConnectionSpikeLiveConfigurationError(
-                f"Round 5 is a two-lane round; no binding for {', '.join(missing)}"
+                f"Round 5 has no binding for {', '.join(sorted(missing))}"
             )
-        lakebase = by_lane["lakebase"]
-        competitor = by_lane["competitor"]
+        lanes = [by_lane[lane_id] for lane_id in selected]
         unproved = [
             lane.lane_id
-            for lane in (lakebase, competitor)
+            for lane in lanes
             if not lane.credential_sha256 or not lane.observer_credential_sha256
         ]
         if unproved:
@@ -5182,23 +5320,39 @@ class LiveConnectionSpikeEngine:
                 "installation sealed before the fan-in protocol will not have. Re-run "
                 "setup to reseal Round 5."
             )
-        return fanin_run_request(
-            run_id=run_id,
-            runner_instance_type=self._adapter.config.runner_instance_type,
-            contract_sha256=arm.contract_sha256,
-            config_sha256=arm.config_sha256,
-            generator_sha256=arm.generator_sha256,
-            capacity_model_sha256=arm.capacity_model_sha256,
-            trust_bundle_sha256=self._adapter.config.trust_bundle_sha256,
-            lakebase_credential_sha256=lakebase.credential_sha256,
-            lakebase_observer_credential_sha256=lakebase.observer_credential_sha256,
-            competitor_credential_sha256=competitor.credential_sha256,
-            competitor_observer_credential_sha256=competitor.observer_credential_sha256,
-            competitor_credential_id=(
-                "aurora" if competitor.competitor_id == "aurora_serverless_v2" else "rds"
-            ),
-            targets=[lane.runner_value() for lane in (lakebase, competitor)],
-        )
+        # Built here rather than through `fanin_run_request`, whose signature names both lanes
+        # and therefore cannot express one. The shape is identical; only the lanes present
+        # differ, and the runner validates that `baseline_auth` names exactly the lanes the
+        # targets name.
+        baseline_auth: dict[str, dict[str, str]] = {}
+        for lane in lanes:
+            entry = {
+                "credential_sha256": lane.credential_sha256,
+                "observer_credential_sha256": lane.observer_credential_sha256,
+            }
+            if lane.lane_id != "lakebase":
+                # Asymmetric on purpose and enforced by the runner: Aurora and RDS are two
+                # separately sealed credentials, so the competitor lane has to say which one it
+                # is holding, and the Lakebase lane has exactly one so saying is over-specifying.
+                entry["credential_id"] = (
+                    "aurora" if lane.competitor_id == "aurora_serverless_v2" else "rds"
+                )
+            baseline_auth[lane.lane_id] = entry
+        return {
+            "protocol": FANIN_PROTOCOL,
+            "schema_version": FANIN_SCHEMA_VERSION,
+            "action": "run",
+            "run_id": run_id,
+            "runner_instance_type": self._adapter.config.runner_instance_type,
+            "contract_sha256": arm.contract_sha256,
+            "config_sha256": arm.config_sha256,
+            "generator_sha256": arm.generator_sha256,
+            "capacity_model_sha256": arm.capacity_model_sha256,
+            "trust_bundle_path": FANIN_TRUST_BUNDLE_PATH,
+            "trust_bundle_sha256": self._adapter.config.trust_bundle_sha256,
+            "baseline_auth": baseline_auth,
+            "targets": [lane.runner_value() for lane in lanes],
+        }
 
     async def run(
         self,
@@ -5209,18 +5363,37 @@ class LiveConnectionSpikeEngine:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 arm is stale or belongs to another run"
             )
-        run_id = self._run_id_factory()
-        self._active_run_id = run_id
+        targets = self._runtime_targets()
+        effective = tuple(targets if targets is not None else self._adapter.config.targets)
+        # Lakebase first, always. It is ready in seconds while the AWS path is still building a
+        # Proxy, and it must never be held behind that: a shared start made the Proxy build a
+        # precondition for Lakebase's number, and running both ramps together made both numbers
+        # worse by splitting one event loop between them.
+        order = sorted(
+            (target.lane_id for target in effective),
+            key=lambda lane_id: (lane_id != "lakebase", lane_id),
+        )
+        merged: dict[str, ConnectionSpikeLaneResult] = {}
+        diagnostics: dict[str, object] = {}
         try:
-            await self._report(on_progress, "dispatching", "Dispatching the isolated runner")
-            targets = self._runtime_targets()
-            effective = tuple(targets if targets is not None else self._adapter.config.targets)
-            raw = await self._adapter.execute(
-                run_id,
-                self._fanin_request(run_id, arm, effective),
-                targets=targets,
-            )
-            result = _finalize_raw_result(arm, raw)
+            for lane_id in order:
+                run_id = self._run_id_factory()
+                self._active_run_id = run_id
+                await self._report(
+                    on_progress,
+                    "dispatching",
+                    f"Dispatching the isolated runner for {lane_id}",
+                )
+                raw = await self._adapter.execute(
+                    run_id,
+                    self._fanin_request(run_id, arm, effective, lane_ids=(lane_id,)),
+                    targets=targets,
+                )
+                lane_result = _finalize_lane_payload(arm, raw, lane_id=lane_id)
+                merged[lane_id] = lane_result
+                diagnostics[lane_id] = raw.get("runtime_diagnostics") or {}
+                self._active_run_id = None
+            result = _merge_lane_results(arm, merged, diagnostics)
             await self._report(on_progress, "verified", "Runner evidence verified")
             return result
         finally:

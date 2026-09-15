@@ -463,6 +463,10 @@ def _round_six_remembered_result(elapsed_ms: float) -> str:
         "AWS PIPELINE NOT BUILT · MARGIN N/A"
     )
 
+#: The fan-in target, read from the contract so this file cannot disagree with the runner
+#: about what 10,000 means.
+from .connection_fanin import TARGET_CLIENTS_PER_LANE  # noqa: E402
+
 _ROUND_FIVE_SCHEDULED_CLIENTS = 128
 _ROUND_FIVE_WARMUP_CONNECTIONS = 4
 _ROUND_FIVE_CONCURRENCY = 64
@@ -6210,7 +6214,17 @@ class RunManager:
                 )
                 and not failures
             )
-        return bool(cls._round_five_value(raw, "verified", gate_passed)) and (
+        verified = bool(cls._round_five_value(raw, "verified", gate_passed))
+        held = cls._round_five_value(raw, "held_clients_at_gate")
+        if held is not None:
+            # A fan-in lane. `gates.passed` above is the conjunction of all ten gates this
+            # protocol defines, evaluated where the evidence is, so the only thing left to
+            # check here is that the lane held the target this installation asked for. The
+            # bounded arithmetic below cannot describe this bout: it required 128 scheduled
+            # attempts and a separate 64-client witness phase that no longer exists, and
+            # applying it refused a bout with 10,000 clients held and every gate green.
+            return verified and int(held) == TARGET_CLIENTS_PER_LANE
+        return verified and (
             evidence["scheduled_clients"] == _ROUND_FIVE_SCHEDULED_CLIENTS
             and evidence["terminal_clients"] == _ROUND_FIVE_SCHEDULED_CLIENTS
             and evidence["successful_clients"] + evidence["error_clients"]

@@ -49,18 +49,37 @@ async def test_engine_returns_verified_result_before_starting_slow_cleanup(monke
             del run_id, digests
             return SimpleNamespace(sufficient=True, failures=())
 
+        dispatched: list[str] = []
+
         async def execute(self, run_id, request, *, targets=None):
-            del run_id, request, targets
+            del run_id, targets
+            # Each dispatch carries exactly one lane now, so the order they arrive in is the
+            # order the lanes run.
+            self.dispatched.extend(
+                str(target["lane_id"]) for target in request["targets"]
+            )
             return {}
 
     orchestrator = SimpleNamespace()
-    engine = LiveConnectionSpikeEngine(Adapter(), setup_orchestrator=orchestrator)
+    adapter = Adapter()
+    engine = LiveConnectionSpikeEngine(adapter, setup_orchestrator=orchestrator)
     engine._setup_result = SimpleNamespace(bout_id="bout-proof")
     engine._runtime_targets = lambda: None
     arm = await engine.check()
-    monkeypatch.setattr(live, "_finalize_raw_result", lambda supplied_arm, raw: expected)
+    # Stubbed at the two seams `run` actually uses: one payload per lane, then one merge.
+    monkeypatch.setattr(
+        live,
+        "_finalize_lane_payload",
+        lambda supplied_arm, raw, *, lane_id, **kwargs: lane_id,
+    )
+    monkeypatch.setattr(
+        live, "_merge_lane_results", lambda supplied_arm, lanes, diagnostics: expected
+    )
 
     assert await engine.run(arm) is expected
+    # Lakebase first, always: it is ready while the AWS path is still provisioning, and a
+    # shared start made that provisioning a precondition for its number.
+    assert adapter.dispatched == ["lakebase", "competitor"]
     assert engine._setup_result.bout_id == "bout-proof"
 
 
