@@ -309,6 +309,24 @@ _SHARED_RING_DETAIL_UNNAMED = (
     "BOUT IN PROGRESS · This installation runs one bout at a time and a bout is already "
     "running. Every round reopens when it finishes."
 )
+#: The same fact while the ring is being released rather than held. Named separately because the
+#: waiting is different: a bout ends when it ends, and cleanup ends when AWS confirms each
+#: per-bout resource absent, which is the part that takes minutes and is when a room is most
+#: likely to be reading the card.
+_SHARED_RING_CLEANUP_DETAIL = (
+    "CLEANUP IN PROGRESS · {holder} is releasing the ring this installation shares. Every "
+    "round reopens automatically once its per-bout resources are confirmed deleted."
+)
+_SHARED_RING_CLEANUP_DETAIL_UNNAMED = (
+    "CLEANUP IN PROGRESS · A bout is releasing the ring this installation shares. Every round "
+    "reopens automatically once its per-bout resources are confirmed deleted."
+)
+
+
+def _shared_ring_cleanup_detail(holder: str | None) -> str:
+    if not holder:
+        return _SHARED_RING_CLEANUP_DETAIL_UNNAMED
+    return _SHARED_RING_CLEANUP_DETAIL.format(holder=holder)
 def _shared_ring_detail(holder: str | None) -> str:
     """`holder` is the lease's own round title, which is the card's name for that round."""
 
@@ -334,7 +352,11 @@ def _fight_card_round_status(
         )
     elif bout.active and active_phase in _CLEANUP_PHASES:
         state = FightCardState.CLEANUP_IN_PROGRESS
-        detail = _CLEANUP_DETAIL[round_id]
+        detail = (
+            _shared_ring_cleanup_detail(ring_holder)
+            if rounds_share_one_ring
+            else _CLEANUP_DETAIL[round_id]
+        )
     elif bout.active:
         state = FightCardState.BOUT_IN_PROGRESS
         detail = (
@@ -347,7 +369,11 @@ def _fight_card_round_status(
         )
     elif getattr(availability, "availability_reason_code", None) == "cleanup_in_progress":
         state = FightCardState.CLEANUP_IN_PROGRESS
-        detail = _CLEANUP_DETAIL[round_id]
+        detail = (
+            _shared_ring_cleanup_detail(ring_holder)
+            if rounds_share_one_ring
+            else _CLEANUP_DETAIL[round_id]
+        )
     elif (
         getattr(availability, "availability", None) != Availability.READY
         or not bout.can_start

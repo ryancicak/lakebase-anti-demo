@@ -186,9 +186,8 @@ fi
 
 git add -A \
   ci-and-push.sh \
-  server/connection_spike_live.py \
-  server/manager.py \
-  tests/test_connection_spike_background_cleanup.py
+  server/api.py \
+  tests/test_fight_card_shared_ring.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -204,41 +203,29 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Run each lane's 10,000 on its own clock, and Round 5 verifies
+Stop offering rounds the fight card is about to refuse
 
-Ryan's instruction, and the measurement turned out to agree with it: "a starting barrier is a
-DUMB idea as RDS proxy takes forever to start, that's not Lakebase's fault, so start Lakebase as
-soon as the round starts." Lakebase should never wait.
+Found live during a Round 5 bout: all six rounds reported BOUT IN PROGRESS, each carrying the
+sentence "Other rounds remain available", and every one of them returned `can_start: false`. The
+card said go somewhere else and then refused everywhere. Read during a bout that is exactly what a
+broken ring fence looks like, which sends an operator to debug fencing that is working correctly,
+on stage.
 
-It was not only unfair, it was inaccurate. Two lanes ramping in one process put both their
-handshake batches in the same event-loop turn, so each lane got half the budget and both stopped
-near 9,100 of 10,000 with no connection failures at all. Dispatched one at a time, each lane has
-the whole loop: both reach exactly 10,000.
+The lock is real and is not a bug. Per-round ring fences require a manifest v7 seal, and
+`lifecycle` pins the version to 5 whenever `round6` is None, regardless of the six round
+environments already being present. So an installation whose Round 6 is unsealed has one ring for
+the whole installation and one bout does hold all six rounds. Only the sentence beside that was
+wrong.
 
-So `run` dispatches per lane, Lakebase first, and merges the results. `_fanin_request` builds one
-lane's request; `_finalize_lane_payload` verifies each payload's seal on arrival and scores the
-single lane it carries; `_merge_lane_results` holds the requirement that a scored Round 5 has two
-lanes, which is where it belongs now that they arrive separately. The seal comparison is extracted
-so both finalisers share one implementation rather than drifting apart. A payload is checked
-against the lanes its own request asked for, not against every sealed lane, because a correct
-single-lane result was being refused as having omitted a lane nobody asked it to run.
+Both moments now say which state they are in, and both name the round holding the ring, taken from
+the lease's own `round_title` so the card cannot name a different round than the one that has it.
+A shared ring says the installation runs one bout at a time and every round reopens when that one
+finishes, which is true and is also the only thing an operator can act on. Cleanup gets its own
+wording because the waiting is different and because it is the part that lasts minutes and is most
+likely to be on screen. Where rounds really are independent the original sentence is correct and
+is kept, which is why this is conditional rather than deleted.
 
-The last refusal was the manager validating a fan-in result with the bounded protocol's
-arithmetic: 128 scheduled attempts, a 64-client witness phase that no longer exists, and backend
-session counts below 64. Both lanes held 10,000 with every gate green and the round still refused.
-A fan-in lane is now validated by `gates.passed`, the conjunction of the ten gates this protocol
-actually defines, evaluated where the evidence is, plus the one thing those gates cannot know:
-that the lane held the target this installation asked for. The bounded branch is untouched for a
-stored result from the retired protocol, which really did run 128 attempts and a separate witness.
-
-Verified live, both lanes, every gate:
-
-  lakebase    10,000 clients held, p99 141.19 ms, pooled-path setup 3,387 ms
-  competitor  10,000 clients held, p99 442.95 ms, pooled-path setup 870,157 ms
-
-Zero client errors on either lane, both setup stop gates exact, and the round declared its own
-verdict: Lakebase verified a pooled path 866.77 seconds sooner. Both lanes then held ten thousand
-authenticated client connections, so the margin is a setup finding rather than one side failing.
+Nothing about who may start a bout changes. This is only what the card says while it refuses.
 MSG
 pass "committed"
 
