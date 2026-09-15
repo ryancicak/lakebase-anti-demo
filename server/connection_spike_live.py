@@ -1185,6 +1185,14 @@ class LiveConnectionSpikeSetupOrchestrator:
         #: under. Keyed by token and not just by bout so a re-armed bout under a new fence
         #: prepares again rather than trusting work done for a fence that has since been lost.
         self._prepared: dict[str, int] = {}
+        #: What that preparation discovered, kept for the bout that will use it.
+        #:
+        #: `_preflight_baseline` writes onto the resources it is handed -- the database's security
+        #: group, the sealed secret and proxy role, anything an interrupted bout left journalled --
+        #: so preparing against one object and then building the bout on another authorized the
+        #: per-bout rules against an empty source group id. Reusing the prepared object is what
+        #: makes skipping the preflight safe.
+        self._prepared_resources: dict[str, _SetupResources] = {}
         self._cleanup_start_lock = asyncio.Lock()
         self._cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._proxy_delete_accepted: dict[str, asyncio.Event] = {}
@@ -1245,7 +1253,35 @@ class LiveConnectionSpikeSetupOrchestrator:
                 bout_id, fencing_token
             )
             await self._preflight_baseline(scope, clients, coordinator, specs, resources)
+            self._require_rule_bindings(resources)
             self._prepared[bout_id] = fencing_token
+            self._prepared_resources[bout_id] = resources
+
+    def _require_rule_bindings(self, resources: _SetupResources) -> None:
+        """Refuse now if a per-bout security-group rule would name an empty source group.
+
+        Four rules are authorized during the timed setup and each references two groups. The
+        per-bout proxy group does not exist yet, so it cannot be checked here; the other two can,
+        and they are the two that were empty when a live bout died seconds after the bell on
+        `AuthorizeSecurityGroupEgress ... Source group ID missing`.
+
+        Named by binding rather than by AWS operation. The provider's own message sends an operator
+        to look at EC2 for a fault that is in this process.
+        """
+
+        missing = [
+            name
+            for name, value in (
+                ("the competitor database's security group", resources.rds_security_group_id),
+                ("the sealed runner security group", self.config.runner_security_group_id),
+            )
+            if not str(value or "").strip()
+        ]
+        if missing:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 cannot arm: the per-bout security-group rules would name no source group "
+                f"for {', and '.join(missing)}. Nothing was created and no clock was started."
+            )
 
     async def _begin_setup_scope(
         self, bout_id: str, fencing_token: int
@@ -1290,10 +1326,18 @@ class LiveConnectionSpikeSetupOrchestrator:
             scope, clients, resources, coordinator, specs = await self._begin_setup_scope(
                 bout_id, fencing_token
             )
-            if self._prepared.get(bout_id) != fencing_token:
-                # Nothing prepared this bout, so prepare it here. That is the old behaviour and
-                # it stays correct: an arm handled by a replica that has since been replaced
-                # must still be able to ring its own bell.
+            prepared = self._prepared_resources.pop(bout_id, None)
+            if self._prepared.get(bout_id) == fencing_token and prepared is not None:
+                # Everything preparation discovered, carried into the bout that needs it. Rebuilding
+                # the coordinator around it keeps the journal, the specs and the resources pointing
+                # at one object rather than two that disagree.
+                resources = prepared
+                coordinator, specs = self._coordinator(scope, clients, resources)
+                self._coordinators[bout_id] = coordinator
+            else:
+                # Nothing prepared this bout, or preparation left nothing to reuse, so prepare
+                # here. That is the old behaviour and it stays correct: an arm handled by a replica
+                # that has since been replaced must still be able to ring its own bell.
                 await self._preflight_baseline(scope, clients, coordinator, specs, resources)
                 self._prepared[bout_id] = fencing_token
 

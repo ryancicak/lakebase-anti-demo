@@ -187,7 +187,7 @@ fi
 git add -A \
   ci-and-push.sh \
   server/connection_spike_live.py \
-  tests/test_round5_lane_starts_on_its_own_stop.py
+  tests/test_round5_prepared_bindings.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -203,37 +203,32 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Start each lane's 10,000 the moment that lane's setup verifies
+Carry preparation's findings into the bout, and refuse the arm without them
 
-Lakebase no longer waits for an RDS Proxy it has nothing to do with. This is the behaviour Ryan asked
-for and repeated until it was unmistakable: ring the bell, and the lane that is ready goes.
+I broke a live bout and this fixes it. It died seconds after the bell on
+`AuthorizeSecurityGroupEgress ... Source group ID missing`.
 
-Lakebase verifies its included pooled path in about three and a half seconds. The AWS path spends
-eleven or twelve minutes building a per-bout RDS Proxy. Holding Lakebase's ramp until both setup
-clocks stopped made that Proxy build a precondition for Lakebase's own number, which is the exact
-inverse of the finding this round exists to show, and on screen it was eleven minutes of nothing that
-no audience would sit through.
+`_preflight_baseline` does not only verify. It writes what it discovers onto the `_SetupResources`
+it is handed: the competitor database's security group, the sealed secret and proxy role, and any
+resource an interrupted bout left journalled. Moving that call into `prepare` gave it an object
+`prepare` then discarded, and `setup` built a fresh empty one and skipped the preflight because
+preparation was already recorded. The per-bout security-group rules were then authorized against an
+empty source group, which is exactly what AWS reported. The point of preparing early was to move the
+waiting, never to lose the findings, so the prepared resources are kept and handed to the bout, and
+the coordinator is rebuilt around them so the journal, the specs and the resources cannot disagree.
+`setup` still prepares for itself when nothing prepared it, and now also when preparation left
+nothing to reuse.
 
-Each lane already produced its own stop, carrying the endpoint and credential digest its ramp needs,
-at the instant its setup verified. That stop is now handed to the engine right then, and the engine
-starts that lane's ramp as its own task. Lakebase holds its ten thousand while the Proxy is still
-being built; the competitor starts the moment its Proxy verifies. `run` collects what setup started
-and dispatches only a lane that never started one, because dispatching a lane that already ran would
-ramp ten thousand clients a second time and score the wrong attempt.
+The second half is Ryan's, and it is the better half: a rule that would be authorized with no source
+group should stop the round before the bell rather than after it. Nothing had been created and no
+clock needed to start for that to be knowable. Preparation now ends by checking the two groups it can
+check -- the database's, which it has just discovered, and the runner's, which is sealed at install
+time -- and refuses the arm naming the binding rather than the AWS operation, because "Source group ID
+missing" sends an operator to look at EC2 for a fault that is in this process. The per-bout proxy group
+is created during the timed setup and cannot be checked beforehand.
 
-The setup measurement is untouched. Both setup clocks still start from one t0, which is what makes
-the setup comparison fair, and each still stops at its own exact application transaction. The
-per-lane binding takes the endpoint from that lane's stop rather than from the seal, because for the
-competitor that endpoint is the per-bout Proxy and does not exist until setup builds it.
-
-Starting early is an optimisation and never a reason a round cannot ring. A bout with no arm yet, or
-a lane whose binding is incomplete, simply defers to the dispatch in `run`. Serialisation stays the
-runner's: it holds an exclusive flock, so a collision returns `runner_busy` into the setup's existing
-retry ladder, and each lane's ramp still gets the whole event loop, which is what let a lane reach
-exactly 10,000 in the first place.
-
-Five tests, driven through an orchestrator that reports one lane ready and then pauses, which is the
-shape of a real bout. The first one fails if Lakebase's dispatch waits for the competitor's setup.
+Seven tests, including the exact live failure and the case where both bindings are absent, which are
+reported together so one repair does not just uncover the next.
 MSG
 pass "committed"
 
