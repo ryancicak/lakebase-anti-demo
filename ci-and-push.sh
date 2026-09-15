@@ -187,8 +187,7 @@ fi
 git add -A \
   ci-and-push.sh \
   server/connection_spike_live.py \
-  server/manager.py \
-  tests/test_connection_spike_setup_live.py
+  tests/test_round5_lane_starts_on_its_own_stop.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -204,27 +203,37 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Measure the runner at arm, not after the bell
+Start each lane's 10,000 the moment that lane's setup verifies
 
-The capacity preflight is an SSM round trip that measures the runner's memory, file descriptors,
-ephemeral ports and event loop, and it ran after the bell, adding its own half minute to the dead
-period before either clock started. `check` refused to do it any earlier because it required both
-setup clocks to have stopped.
+Lakebase no longer waits for an RDS Proxy it has nothing to do with. This is the behaviour Ryan asked
+for and repeated until it was unmistakable: ring the bell, and the lane that is ready goes.
 
-Nothing it measures depends on a lane. It asks whether this runner can hold 10,000 clients per lane
-at all, which is a property of the instance and the same answer before the bell as after it. Asking
-at arm also means a runner that cannot hold the clients refuses the arm instead of refusing after
-an eleven-minute Proxy build has been paid for.
+Lakebase verifies its included pooled path in about three and a half seconds. The AWS path spends
+eleven or twelve minutes building a per-bout RDS Proxy. Holding Lakebase's ramp until both setup
+clocks stopped made that Proxy build a precondition for Lakebase's own number, which is the exact
+inverse of the finding this round exists to show, and on screen it was eleven minutes of nothing that
+no audience would sit through.
 
-The precondition moved rather than disappeared: `run` still refuses without the endpoints timed
-setup produces, and the test that covered it now covers it there.
+Each lane already produced its own stop, carrying the endpoint and credential digest its ramp needs,
+at the instant its setup verified. That stop is now handed to the engine right then, and the engine
+starts that lane's ramp as its own task. Lakebase holds its ten thousand while the Proxy is still
+being built; the competitor starts the moment its Proxy verifies. `run` collects what setup started
+and dispatches only a lane that never started one, because dispatching a lane that already ran would
+ramp ten thousand clients a second time and score the wrong attempt.
 
-Attempted, not required. `run` has always been able to arm for itself and still is, so an engine
-without a preflight or a transient AWS refusal costs a later bell rather than the bout, and the
-reason is logged. `run` performs the preflight only when the arm did not, because measuring the same
-runner twice would spend exactly the half minute this was meant to save. Preparation is tolerant the
-same way: a bout whose artifact lease is not yet held prepares at the bell instead of failing to
-arm, which is the fallback `setup` already implements.
+The setup measurement is untouched. Both setup clocks still start from one t0, which is what makes
+the setup comparison fair, and each still stops at its own exact application transaction. The
+per-lane binding takes the endpoint from that lane's stop rather than from the seal, because for the
+competitor that endpoint is the per-bout Proxy and does not exist until setup builds it.
+
+Starting early is an optimisation and never a reason a round cannot ring. A bout with no arm yet, or
+a lane whose binding is incomplete, simply defers to the dispatch in `run`. Serialisation stays the
+runner's: it holds an exclusive flock, so a collision returns `runner_busy` into the setup's existing
+retry ladder, and each lane's ramp still gets the whole event loop, which is what let a lane reach
+exactly 10,000 in the first place.
+
+Five tests, driven through an orchestrator that reports one lane ready and then pauses, which is the
+shape of a real bout. The first one fails if Lakebase's dispatch waits for the competitor's setup.
 MSG
 pass "committed"
 

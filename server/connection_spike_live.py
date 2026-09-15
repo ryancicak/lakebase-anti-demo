@@ -770,6 +770,14 @@ class ConnectionSpikeSetupResult:
         return abs(self.lakebase.launched_ns - self.competitor.launched_ns) / 1_000_000
 
 
+#: Called the moment one lane's setup verifies, with that lane's stop.
+#:
+#: The stop carries the endpoint and credential digest that lane's ramp needs, so a caller can
+#: start the lane's 10,000 immediately instead of waiting for the other lane's setup. Awaited inside
+#: the lane's own task, so a failure to start a ramp fails the lane it belongs to.
+SetupLaneReadyCallback = Callable[[ConnectionSpikeSetupLaneStop], Awaitable[None]]
+
+
 class ConnectionSpikeSetupJournal(Protocol):
     async def begin_setup(
         self,
@@ -1268,6 +1276,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         bout_id: str,
         fencing_token: int,
         on_progress: SetupProgressCallback | None = None,
+        on_lane_ready: SetupLaneReadyCallback | None = None,
     ) -> ConnectionSpikeSetupResult:
         if self._lock.locked():
             raise ConnectionSpikeLiveOperationError(
@@ -1291,7 +1300,9 @@ class LiveConnectionSpikeSetupOrchestrator:
             gate = asyncio.Event()
             t0_box: list[int] = []
             lakebase_task = asyncio.create_task(
-                self._setup_lakebase(bout_id, clients, gate, t0_box, on_progress)
+                self._setup_lakebase(
+                    bout_id, clients, gate, t0_box, on_progress, on_lane_ready
+                )
             )
             competitor_task = asyncio.create_task(
                 self._setup_competitor(
@@ -1304,6 +1315,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                     gate,
                     t0_box,
                     on_progress,
+                    on_lane_ready,
                 )
             )
             t0_ns = self._monotonic_ns()
@@ -1778,6 +1790,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         gate: asyncio.Event,
         t0_box: list[int],
         on_progress: SetupProgressCallback | None,
+        on_lane_ready: SetupLaneReadyCallback | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
@@ -1819,13 +1832,18 @@ class LiveConnectionSpikeSetupOrchestrator:
             "verified",
             setup_elapsed_ms=(stopped_ns - t0_box[0]) / 1_000_000,
         )
-        return ConnectionSpikeSetupLaneStop(
+        stop = ConnectionSpikeSetupLaneStop(
             lane_id="lakebase",
             launched_ns=launched_ns,
             stopped_ns=stopped_ns,
             credential_sha256=self.config.lakebase_credential_sha256,
             endpoint_host=host,
         )
+        # Ready now, not when the other lane is. Lakebase verifies its included pool in seconds
+        # and has no reason to wait on a Proxy build.
+        if on_lane_ready is not None:
+            await on_lane_ready(stop)
+        return stop
 
     async def _setup_competitor(
         self,
@@ -1838,6 +1856,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         gate: asyncio.Event,
         t0_box: list[int],
         on_progress: SetupProgressCallback | None,
+        on_lane_ready: SetupLaneReadyCallback | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
@@ -1915,7 +1934,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             "verified",
             setup_elapsed_ms=(stopped_ns - t0_box[0]) / 1_000_000,
         )
-        return ConnectionSpikeSetupLaneStop(
+        stop = ConnectionSpikeSetupLaneStop(
             lane_id="competitor",
             launched_ns=launched_ns,
             stopped_ns=stopped_ns,
@@ -1923,6 +1942,11 @@ class LiveConnectionSpikeSetupOrchestrator:
             endpoint_host=resources.proxy_endpoint,
             secret_arn=resources.secret_arn,
         )
+        # Ready the instant the Proxy verifies, so its 10,000 starts then rather than after
+        # some other lane finishes something unrelated to it.
+        if on_lane_ready is not None:
+            await on_lane_ready(stop)
+        return stop
 
     def _setup_observation(self, stop: ConnectionSpikeSetupLaneStop) -> SetupLaneObservation:
         if stop.lane_id == "lakebase":
@@ -5249,6 +5273,11 @@ class LiveConnectionSpikeEngine:
         self._setup_task: asyncio.Task[Any] | None = None
         self._cleanup_bout_id: str | None = None
         self._cleanup_start_lock = asyncio.Lock()
+        #: Ramps started by a lane's own setup stop, awaited by `run`. Populated during the setup
+        #: phase, which is the point: Lakebase's ten thousand is held while the AWS path is still
+        #: building its Proxy.
+        self._lane_bursts: dict[str, asyncio.Task[ConnectionSpikeLaneResult]] = {}
+        self._lane_stops: dict[str, ConnectionSpikeSetupLaneStop] = {}
 
     @property
     def has_timed_setup(self) -> bool:
@@ -5276,6 +5305,8 @@ class LiveConnectionSpikeEngine:
                 "Round 5 timed setup orchestration is not configured"
             )
         self._setup_bout_id = bout_id
+        self._lane_bursts = {}
+        self._lane_stops = {}
         setup_task = asyncio.current_task()
         assert setup_task is not None
         self._setup_task = setup_task
@@ -5284,12 +5315,97 @@ class LiveConnectionSpikeEngine:
                 bout_id,
                 fencing_token,
                 on_progress,
+                self._start_lane_burst,
             )
             self._setup_result = result
             return result
         finally:
             if self._setup_task is setup_task:
                 self._setup_task = None
+
+    async def _start_lane_burst(self, stop: ConnectionSpikeSetupLaneStop) -> None:
+        """Launch this lane's 10,000 now that its own setup has verified.
+
+        The other lane is not consulted. That is the whole change: Lakebase has no reason to wait
+        on an RDS Proxy build, and a round that makes it wait shows nothing for eleven minutes.
+
+        Launched as a task rather than awaited, so the setup phase is not blocked by a ramp and the
+        other lane keeps building. `run` awaits these.
+        """
+
+        arm = self._armed
+        if arm is None:
+            # Nothing to score against. The bout will arm at the bell and dispatch there, which is
+            # the pre-existing path, so this is a slower round rather than a broken one.
+            return
+        self._lane_stops[stop.lane_id] = stop
+        target = self._runtime_target_for(stop)
+        if target is None:
+            return
+        run_id = self._run_id_factory()
+        self._lane_bursts[stop.lane_id] = asyncio.create_task(
+            self._dispatch_lane(run_id, arm, target),
+            name=f"round5-burst-{stop.lane_id}",
+        )
+
+    def _runtime_target_for(
+        self, stop: ConnectionSpikeSetupLaneStop
+    ) -> ConnectionSpikeTarget | None:
+        """This lane's binding for the ramp: the endpoint setup produced, sealed credentials.
+
+        The observer digest and the direct host come from the configured lane rather than the stop,
+        because they are sealed once at install time and are the same in every bout; the stop
+        carries what this bout changed, which is the endpoint the clients connect to.
+        """
+
+        configured = {target.lane_id: target for target in self._adapter.config.targets}
+        lane = configured.get(stop.lane_id)
+        if lane is None:
+            return None
+        try:
+            return self._bind_lane(stop, lane)
+        except (AttributeError, ConnectionSpikeLiveConfigurationError):
+            # An incomplete binding means this lane cannot start early, not that the bout is
+            # broken: `run` still dispatches it. Starting a lane the moment its setup verifies is
+            # an optimisation, and an optimisation must never be the reason a round cannot ring.
+            return None
+
+    @staticmethod
+    def _bind_lane(
+        stop: ConnectionSpikeSetupLaneStop,
+        lane: ConnectionSpikeTarget,
+    ) -> ConnectionSpikeTarget:
+        return ConnectionSpikeTarget(
+            lane_id=stop.lane_id,
+            secret_arn=stop.secret_arn,
+            endpoint_host=stop.endpoint_host,
+            credential_host=lane.credential_host,
+            competitor_id=lane.competitor_id,
+            competitor_target_id=lane.competitor_target_id,
+            competitor_resource_id=lane.competitor_resource_id,
+            credential_sha256=stop.credential_sha256,
+            observer_credential_sha256=lane.observer_credential_sha256,
+        )
+
+    async def _dispatch_lane(
+        self,
+        run_id: str,
+        arm: FanInArm,
+        target: ConnectionSpikeTarget,
+    ) -> ConnectionSpikeLaneResult:
+        """One lane's ramp, hold and sampling, scored on arrival."""
+
+        self._active_run_id = run_id
+        try:
+            raw = await self._adapter.execute(
+                run_id,
+                self._fanin_request(run_id, arm, (target,), lane_ids=(target.lane_id,)),
+                targets=(target,),
+            )
+            return _finalize_lane_payload(arm, raw, lane_id=target.lane_id)
+        finally:
+            if self._active_run_id == run_id:
+                self._active_run_id = None
 
     async def check(self) -> FanInArm:
         """Arm one fan-in bout, refusing before a runner that cannot hold it.
@@ -5430,10 +5546,8 @@ class LiveConnectionSpikeEngine:
             )
         targets = self._runtime_targets()
         effective = tuple(targets if targets is not None else self._adapter.config.targets)
-        # Lakebase first, always. It is ready in seconds while the AWS path is still building a
-        # Proxy, and it must never be held behind that: a shared start made the Proxy build a
-        # precondition for Lakebase's number, and running both ramps together made both numbers
-        # worse by splitting one event loop between them.
+        # Lakebase first among anything still to dispatch. It is ready in seconds while the AWS
+        # path is still building a Proxy, and it must never be held behind that.
         order = sorted(
             (target.lane_id for target in effective),
             key=lambda lane_id: (lane_id != "lakebase", lane_id),
@@ -5442,6 +5556,19 @@ class LiveConnectionSpikeEngine:
         diagnostics: dict[str, object] = {}
         try:
             for lane_id in order:
+                launched = self._lane_bursts.pop(lane_id, None)
+                if launched is not None:
+                    # Started when this lane's own setup verified, which for Lakebase is seconds
+                    # into the round. Awaiting it here collects a measurement already taken;
+                    # dispatching again would ramp ten thousand clients a second time and score
+                    # the wrong attempt.
+                    await self._report(
+                        on_progress,
+                        "verifying",
+                        f"Collecting the {lane_id} fan-in that started at its own setup stop",
+                    )
+                    merged[lane_id] = await launched
+                    continue
                 run_id = self._run_id_factory()
                 self._active_run_id = run_id
                 await self._report(
@@ -5454,8 +5581,7 @@ class LiveConnectionSpikeEngine:
                     self._fanin_request(run_id, arm, effective, lane_ids=(lane_id,)),
                     targets=targets,
                 )
-                lane_result = _finalize_lane_payload(arm, raw, lane_id=lane_id)
-                merged[lane_id] = lane_result
+                merged[lane_id] = _finalize_lane_payload(arm, raw, lane_id=lane_id)
                 diagnostics[lane_id] = raw.get("runtime_diagnostics") or {}
                 self._active_run_id = None
             result = _merge_lane_results(arm, merged, diagnostics)
