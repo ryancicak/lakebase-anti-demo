@@ -186,8 +186,10 @@ fi
 
 git add -A \
   ci-and-push.sh \
-  server/api.py \
-  tests/test_fight_card_shared_ring.py
+  frontend/src/App.tsx \
+  frontend/src/instant-replay.ts \
+  frontend/src/instant-replay.test.tsx \
+  frontend/src/round5.test.tsx
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -203,29 +205,32 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Stop offering rounds the fight card is about to refuse
+Stop the card promising a shared start, and show that preparation is running
 
-Found live during a Round 5 bout: all six rounds reported BOUT IN PROGRESS, each carrying the
-sentence "Other rounds remain available", and every one of them returned `can_start: false`. The
-card said go somewhere else and then refused everywhere. Read during a bout that is exactly what a
-broken ring fence looks like, which sends an operator to debug fencing that is working correctly,
-on stage.
+Two things Ryan found on the live app, both of them the app misdescribing itself.
 
-The lock is real and is not a bug. Per-round ring fences require a manifest v7 seal, and
-`lifecycle` pins the version to 5 whenever `round6` is None, regardless of the six round
-environments already being present. So an installation whose Round 6 is unsealed has one ring for
-the whole installation and one bout does hold all six rounds. Only the sentence beside that was
-wrong.
+The card still said "Shared-T0 fan-in" and the replay still narrated "Phase 2 raced both from one
+T0". Neither is true any more: the lanes are dispatched one at a time, each holding its 10,000 on
+its own clock, precisely so Lakebase is never held behind an eleven-minute RDS Proxy build that has
+nothing to do with it. These are the lines an operator reads aloud and the ones a replay repeats
+afterwards, so they described the protocol that was replaced to the one audience that matters. Six
+places, all reworded to the claim that is actually made and proved.
 
-Both moments now say which state they are in, and both name the round holding the ring, taken from
-the lease's own `round_title` so the card cannot name a different round than the one that has it.
-A shared ring says the installation runs one bout at a time and every round reopens when that one
-finishes, which is true and is also the only thing an operator can act on. Cleanup gets its own
-wording because the waiting is different and because it is the part that lasts minutes and is most
-likely to be on screen. Where rounds really are independent the original sentence is correct and
-is kept, which is why this is conditional rather than deleted.
+The second is worse because it looked like a failure. A live Round 5 was abandoned two minutes and
+twenty-eight seconds in, and the app logs show no error at all: the round was minting the native
+login, the ordinary role and the runner credential, which is real work taking real minutes. That
+work is outside the scored clock deliberately -- the round's own non-claims say so, and folding it
+in would inflate the setup number this round exists to report -- so the clock correctly read 0.00.
+What was missing was any way to tell "preparing" from "stuck", which is the same failure this
+project keeps finding in itself: a surface reporting a state without saying what it is doing.
 
-Nothing about who may start a bout changes. This is only what the card says while it refuses.
+Preparation now carries its own elapsed count, labelled as preparation and derived from the
+server's own `run_started_at` and `updated_at` so it has no browser clock skew, and the label says
+the setup clock starts at the bell. The scored clock is untouched.
+
+The reading-budget test caught the first attempt at the replay wording at 85 words against a limit
+of 82. That test is right to exist, because the line is spoken, so the wording got shorter rather
+than the budget looser.
 MSG
 pass "committed"
 

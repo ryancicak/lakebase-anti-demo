@@ -4674,8 +4674,23 @@ function roundFiveArenaLane(
     && elapsedCandidate >= 0
     ? elapsedCandidate
     : null
+  // Counted from the run, not from t0, and never scored. Preparation is minutes of real work
+  // -- native login, ordinary role, runner credential -- and it is outside the setup clock on
+  // purpose. Showing nothing at all made it indistinguishable from a hang, which is how a live
+  // round came to be abandoned two and a half minutes in with nothing actually wrong.
+  // Both stamps are the server's, so this is the server's own view of how long preparation has
+  // been running and carries no browser clock skew. It advances as snapshots arrive, which is
+  // exactly when the rest of this card advances.
+  const preparingSeconds = state === 'sealed' && session.run_started_at && session.updated_at
+    ? Math.max(
+      0,
+      Math.round((Date.parse(session.updated_at) - Date.parse(session.run_started_at)) / 1000),
+    )
+    : null
   const status = state === 'sealed'
-    ? 'Untimed shared preflight · Setup clock has not started'
+    ? preparingSeconds === null
+      ? 'Untimed preparation · Setup clock has not started'
+      : `Untimed preparation · ${preparingSeconds}s · Setup clock starts at the bell`
     : setupLane?.status?.trim()
       || (state === 'verified'
         ? 'Exact setup stop gate verified'
@@ -4839,7 +4854,7 @@ export function RoundFiveProof({
                   <strong>{verdict}</strong>
                 </div>
                 <p className="final-fairness">{recurringFanIn
-                  ? 'Shared-T0 time to exactly 10,000 held clients is scored · setup is supporting · all 20,000 held for 30s · 64 sparse checks per lane'
+                  ? 'Time to exactly 10,000 held clients is scored per lane on its own clock · setup is supporting · every lane holds its 10,000 for 30s · 64 sparse checks per lane'
                   : 'Legacy scorecard decoded · current 10,000-client fan-in contract not recorded'}</p>
                 {/* A verified Round 5 keeps its win and can still fail to tidy
                     up, which is the case this screen used to render as a bare
@@ -4897,7 +4912,7 @@ export function RoundFiveProof({
                 <div className="fairness">
                   <span aria-hidden="true">◆</span>
                   {recurringFanIn
-                    ? 'Shared-T0 fan-in · 10,000 authenticated held clients per lane · 30s hold'
+                    ? 'Per-lane fan-in · 10,000 authenticated held clients per lane · 30s hold'
                     : 'Legacy scorecard · current 10,000-client fan-in evidence not recorded'}
                   <span aria-hidden="true">◆</span>
                 </div>
@@ -7555,7 +7570,7 @@ function proofCommentary(
         ? roundFiveVerifiedVerdict(session)
         : !liveEvidenceConnected
           ? 'Live evidence interrupted · Counters frozen while reconnecting'
-          : 'Shared-T0 fan-in live · no winner until both exact gates, hold, samples, multiplexing, and cleanup verify'
+          : 'Per-lane fan-in live · no winner until both exact gates, hold, samples, multiplexing, and cleanup verify'
       return {
         lanes: lines,
         verdict: `${update} · Client fan-in is not backend count or transaction throughput`,
@@ -7588,7 +7603,7 @@ function proofCommentary(
       } else if (state === 'towelled') {
         line = `${name} · Setup stopped before verification · ${status}`
       } else {
-        line = `${name} · Untimed shared preflight · Setup clock has not started`
+        line = `${name} · Untimed preparation · Setup clock starts at the bell`
       }
       return { name, state, elapsedMs, line }
     })
@@ -7613,7 +7628,7 @@ function proofCommentary(
             ? 'Pooled-path proof did not complete · No timing comparison'
             : active.length > 0
               ? 'Supporting pooled-path setup in progress · Primary fan-in has not started'
-              : 'Untimed shared preflight in progress · Both setup clocks are sealed'
+              : 'Untimed preparation in progress · Both setup clocks start at the bell'
     const verdict = `${setupUpdate} · RDS Proxy is the AWS managed pooling option selected for this reference path; direct and existing-pool designs were not tested`
     return {
       lanes: setupLanes.map((lane) => lane.line),
@@ -8094,7 +8109,7 @@ function fairnessCopy(roundId: RoundId, fanInRoundFive = false): string {
   }
   if (roundId === 'survive_connection_spike') {
     return fanInRoundFive
-      ? 'Phase 1 pooled-path setup is supporting · Phase 2 races both lanes from one T0 to exactly 10,000 authenticated held clients · 30-second hold, sparse SELECT 1 checks, multiplexing, fairness, telemetry, and cleanup are exact gates'
+      ? 'Phase 1 pooled-path setup is supporting · Phase 2 holds exactly 10,000 authenticated clients in each lane, each on its own clock · 30-second hold, sparse SELECT 1 checks, multiplexing, fairness, telemetry, and cleanup are exact gates'
       : 'Legacy Round 5 scorecard decoded · current 10,000-client fan-in contract not recorded'
   }
   return 'Non-executable round · No live fairness or timing contract'

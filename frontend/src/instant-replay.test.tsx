@@ -356,7 +356,7 @@ describe('replayStory', () => {
     ['put_model_score_in_app', /score 0\.81.*Delta version 11/i, /Managed Reverse ETL.*fresh app connection/i, /no AWS race or margin/i],
     // Fan-in: setup is supporting evidence and the shared-T0 time to 10,000 held
     // clients is the primary result.
-    ['survive_connection_spike', /included pool.*selected RDS Proxy separately/i, /raced both from one T0 to exactly 10,000 authenticated held clients.*held 30s.*multiplexing/i, /fan-in time is primary.*setup supports it.*client count is not backend count/i],
+    ['survive_connection_spike', /included pool.*selected RDS Proxy separately/i, /exactly 10,000 authenticated held clients per lane.*own clock.*held 30s.*multiplexing/i, /fan-in time is primary.*setup supports it.*client count is not backend count/i],
     ['analyze_live_orders_without_slowing_checkout', /checkout committed.*RED-GLOVE.*CHICAGO.*\$84\.50/i, /exact order once.*separate checkout/i, /no AWS race or margin/i],
   ] as const)(
     'maps %s to Setup, Same test, and Takeaway',
@@ -408,7 +408,7 @@ describe('replayStory', () => {
   it.each([
     ['one exact recovery', partialRecovery(), 'partial', /did not.*no completed comparison or margin/i],
     ['no-result recovery', noResultRecovery(), 'no-result', /without an exact verified result/i],
-    ['one exact Round 5 setup', partialRoundFive(), 'partial', /shared-T0 10,000-client fan-in did not run/i],
+    ['one exact Round 5 setup', partialRoundFive(), 'partial', /per-lane 10,000-client fan-in did not run/i],
     ['Round 4 identity failure', guardrailFailure('put_model_score_in_app'), 'partial', /exact row identity did not verify/i],
     ['Round 6 checkout failure', guardrailFailure('analyze_live_orders_without_slowing_checkout'), 'partial', /checkout guardrail did not verify/i],
   ] as const)('adapts %s without claiming completed proof', (_name, session, state, copy) => {

@@ -177,7 +177,7 @@ function incompleteTestSuffix(session: DemoSession): string {
     && outcome.evidence.exactLane
   ) {
     return roundFiveUsesFanIn(session)
-      ? ' The shared-T0 10,000-client fan-in did not run, so the primary proof did not complete.'
+      ? ' The per-lane 10,000-client fan-in did not run, so the primary proof did not complete.'
       : ' The legacy scorecard did not record the current 10,000-client fan-in contract, so no fan-in proof is shown.'
   }
   if (outcome.status === 'guardrail_failure') {
@@ -367,7 +367,7 @@ function roundFiveStory(session: DemoSession): ReplayStory {
         id: 'same-test',
         title: 'Same test',
         body: recurringFanIn
-          ? `Phase 2 raced both from one T0 to exactly 10,000 authenticated held clients under one verify-full TLS client and mirrored scheduler. Provider-selected authentication stayed timed. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} lane samples passed; observers proved multiplexing.${incompleteTestSuffix(session)}`
+          ? `Phase 2 held exactly 10,000 authenticated held clients per lane, each lane on its own clock, under one verify-full TLS client. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} lane samples passed; observers proved multiplexing.${incompleteTestSuffix(session)}`
           : `Legacy Round 5 scorecard decoded. The current exact 10,000-client fan-in contract was not recorded, so the replay does not infer fan-in evidence.${incompleteTestSuffix(session)}`,
       },
       {

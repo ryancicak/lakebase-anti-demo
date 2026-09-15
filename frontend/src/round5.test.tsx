@@ -612,21 +612,21 @@ it('keeps the shared preflight untimed until the setup clocks actually start', (
 
   const commentator = screen.getByLabelText('Ringside commentator')
   expect(commentator).toHaveTextContent(
-    /Lakebase · Untimed shared preflight · Setup clock has not started/i,
+    /Lakebase · Untimed preparation · Setup clock starts at the bell/i,
   )
   expect(commentator).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy · Untimed shared preflight · Setup clock has not started/i,
+    /RDS PostgreSQL \+ RDS Proxy · Untimed preparation · Setup clock starts at the bell/i,
   )
   expect(commentator).toHaveTextContent(
-    /Untimed shared preflight in progress · Both setup clocks are sealed/i,
+    /Untimed preparation in progress · Both setup clocks start at the bell/i,
   )
   expect(commentator).not.toHaveTextContent(/clock live/i)
   const lakebase = screen.getByLabelText('Lakebase result')
   const competitor = screen.getByLabelText('RDS PostgreSQL + RDS Proxy result')
   expect(lakebase).toHaveAttribute('data-state', 'sealed')
   expect(competitor).toHaveAttribute('data-state', 'sealed')
-  expect(lakebase).toHaveTextContent(/Untimed shared preflight · Setup clock has not started/i)
-  expect(competitor).toHaveTextContent(/Untimed shared preflight · Setup clock has not started/i)
+  expect(lakebase).toHaveTextContent(/Untimed preparation/i)
+  expect(competitor).toHaveTextContent(/Untimed preparation/i)
 })
 
 it('keeps the Round 5 towel action visible and forwards the stop request', async () => {
@@ -722,7 +722,7 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
     /stop gate.*not verified/i,
   )
   expect(replay).toHaveTextContent(/Exact setup stop published before the towel.*final expected\/observed gate matrix was not returned/i)
-  expect(replay).toHaveTextContent(/Phase 2 raced both from one T0 to exactly 10,000 authenticated held clients.*All 20,000 held 30s/i)
+  expect(replay).toHaveTextContent(/Phase 2 held exactly 10,000 authenticated held clients per lane.*All 20,000 held 30s/i)
   expect(replay).toHaveTextContent(/Phase 1 pooled-path setup is supporting.*30-second hold.*cleanup are exact gates/i)
   expect(replay).not.toHaveTextContent(/Non-executable round · No live fairness or timing contract/i)
   fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
@@ -1432,7 +1432,7 @@ it('offers an instant replay with primary fan-in and supporting setup evidence',
   expect(story).toHaveTextContent(/setup.*same test.*takeaway/i)
   expect(story).toHaveTextContent(/3\.11s/)
   expect(story).toHaveTextContent(/4\.11s/)
-  expect(story).toHaveTextContent(/Phase 2 raced both from one T0 to exactly 10,000 authenticated held clients.*provider-selected authentication stayed timed.*all 20,000 held 30s.*64 lane samples passed.*proved multiplexing/i)
+  expect(story).toHaveTextContent(/Phase 2 held exactly 10,000 authenticated held clients per lane.*all 20,000 held 30s.*64 lane samples passed.*proved multiplexing/i)
   expect(story).toHaveTextContent(/Direct AWS connections and other pools were not tested/i)
   expect(story).not.toHaveTextContent('N/A')
 
