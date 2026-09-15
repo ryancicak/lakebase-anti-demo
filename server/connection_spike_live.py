@@ -5301,10 +5301,12 @@ class LiveConnectionSpikeEngine:
 
         if self._setup_orchestrator is None:
             await self._adapter.check()
-        elif self._setup_result is None:
-            raise ConnectionSpikeLiveOperationError(
-                "Round 5 burst cannot arm before both timed setup stops"
-            )
+        # No setup-result requirement. The capacity preflight measures this runner's memory,
+        # file descriptors, ephemeral ports and event loop, none of which depend on a lane, so
+        # the answer is the same before the bell as after it. Requiring both setup clocks first
+        # put an SSM round trip after the bell, inside the dead period the round is judged on,
+        # and made a runner that cannot hold 10,000 clients refuse only after paying for an
+        # eleven-minute Proxy build. `run` still refuses without the endpoints setup produces.
         contract = FanInContract()
         config_sha256 = fanin_config_sha256()
         generator_sha256 = fanin_generator_sha256()
@@ -5419,6 +5421,12 @@ class LiveConnectionSpikeEngine:
         if arm is not self._armed:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 arm is stale or belongs to another run"
+            )
+        if self._setup_orchestrator is not None and self._setup_result is None:
+            # The precondition moved here from arming, where it did not belong. A bout needs the
+            # endpoints timed setup produces; measuring the runner never did.
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 burst cannot run before both timed setup stops"
             )
         targets = self._runtime_targets()
         effective = tuple(targets if targets is not None else self._adapter.config.targets)

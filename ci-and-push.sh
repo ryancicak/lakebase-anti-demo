@@ -187,7 +187,8 @@ fi
 git add -A \
   ci-and-push.sh \
   server/connection_spike_live.py \
-  server/manager.py
+  server/manager.py \
+  tests/test_connection_spike_setup_live.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -203,31 +204,27 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Prepare Round 5 when it is armed, so the bell starts the clock
+Measure the runner at arm, not after the bell
 
-Arming a timed-setup Round 5 did almost nothing. Pressing run then began with IAM verification, a
-journal read and an orphan sweep against AWS before t0 could be taken, so the first thing the room
-saw after the bell was two clocks reading 0.00 for minutes with nothing to distinguish preparing
-from hung. Ryan abandoned a live round at two minutes twenty-eight seconds with nothing wrong, and
-said it four times: as soon as you ring the bell the clock should start.
+The capacity preflight is an SSM round trip that measures the runner's memory, file descriptors,
+ephemeral ports and event loop, and it ran after the bell, adding its own half minute to the dead
+period before either clock started. `check` refused to do it any earlier because it required both
+setup clocks to have stopped.
 
-That work is outside the scored clock deliberately, because it is preparation both lanes need and
-folding it in would inflate the setup number this round exists to report. What it does not belong
-inside is the bout. The arm is where it belongs, which is also what an operator already means by
-arming, and it is where the fencing token the preparation must be scoped to already lives.
+Nothing it measures depends on a lane. It asks whether this runner can hold 10,000 clients per lane
+at all, which is a property of the instance and the same answer before the bell as after it. Asking
+at arm also means a runner that cannot hold the clients refuses the arm instead of refusing after
+an eleven-minute Proxy build has been paid for.
 
-`prepare` performs it and records the bout and fence it ran under; `setup` skips it when that
-record matches and performs it itself when it does not, so an arm handled by a replica that has
-since been replaced can still ring its own bell. Keyed by token rather than by bout, so a re-armed
-bout under a new fence prepares again instead of trusting work done for a fence that has been lost.
-Fresh AWS clients are still assumed inside `setup` rather than carried over, because assumed
-credentials expire and an arm can sit for minutes; re-assuming is the fast part, and the slow
-verification is what moved. A failure now fails the arm rather than the bout, which is the right
-place to learn it: an installation that cannot prepare cannot ring a fair bell either.
+The precondition moved rather than disappeared: `run` still refuses without the endpoints timed
+setup produces, and the test that covered it now covers it there.
 
-This closes the gap after the bell. It does not yet make Lakebase's 10,000 start while the AWS path
-is still building its Proxy: the burst still waits for both setup clocks to stop. That is the next
-change and it is a different one.
+Attempted, not required. `run` has always been able to arm for itself and still is, so an engine
+without a preflight or a transient AWS refusal costs a later bell rather than the bout, and the
+reason is logged. `run` performs the preflight only when the arm did not, because measuring the same
+runner twice would spend exactly the half minute this was meant to save. Preparation is tolerant the
+same way: a bout whose artifact lease is not yet held prepares at the bell instead of failing to
+arm, which is the fallback `setup` already implements.
 MSG
 pass "committed"
 

@@ -624,8 +624,12 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
         preflight_capacity=preflight_capacity,
     )
     engine = LiveConnectionSpikeEngine(adapter, setup_orchestrator=orchestrator)
+    # Arming no longer waits for the setup clocks. The capacity preflight measures this runner,
+    # which is the same answer before the bell as after it, and requiring both stops first put an
+    # SSM round trip inside the dead period the round is judged on. The precondition moved to the
+    # bout, which is what actually needs the endpoints setup produces.
     with pytest.raises(ConnectionSpikeLiveOperationError, match="before both timed setup stops"):
-        await engine.check()
+        await engine.run(await engine.check())
 
     progress = []
 

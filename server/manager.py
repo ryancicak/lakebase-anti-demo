@@ -4844,12 +4844,36 @@ class RunManager:
                 # and the orphan sweep take minutes against AWS and are excluded from the setup
                 # clock on purpose, so running them after the bell showed the room two clocks at
                 # 0.00 with nothing to distinguish preparing from stuck.
+                # Preparation is an optimisation with a working fallback -- `setup` prepares for
+                # itself when nothing else did -- so a bout whose artifact lease is not yet held
+                # simply prepares later. Failing the arm here would trade a slower bell for no
+                # bell at all.
                 lease = record.round5_lease
-                if lease is None:
-                    raise InvalidStateError("The Round 5 artifact lease is unavailable")
                 prepare = getattr(engine, "prepare", None)
-                if prepare is not None:
+                if lease is not None and prepare is not None:
                     await prepare(record.snapshot.id, lease.fencing_token)
+                # The capacity preflight too. It measures the runner, not the lanes, so the
+                # answer is the same before the bell as after it, and asking now takes an SSM
+                # round trip out of the dead period the round is judged on.
+                #
+                # Attempted, not required. `run` arms for itself when this did not, so an engine
+                # without a preflight or a transient refusal costs a later bell rather than the
+                # bout. The reason is logged because a bout that silently pays the cost again is
+                # exactly the kind of quiet regression this round keeps producing.
+                check = getattr(engine, "check", None)
+                if check is not None:
+                    try:
+                        arm = await check()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Round 5 could not arm at arm time, so the bell will do it "
+                            "session=%s diagnosis=%s",
+                            record.snapshot.id,
+                            operator_diagnosis(exc),
+                        )
+                        arm = None
             loop = asyncio.get_running_loop()
             async with record.lock:
                 armed_at = datetime.now(UTC)
@@ -5142,7 +5166,10 @@ class RunManager:
                     setup_snapshot,
                     ("lakebase", "competitor"),
                 )
-                arm = await engine.check()  # type: ignore[attr-defined]
+                if arm is None:
+                    # Only when the arm did not already do it. Measuring the same runner twice
+                    # would spend the half minute moving it to the arm was meant to save.
+                    arm = await engine.check()  # type: ignore[attr-defined]
                 record.connection_spike_arm = arm
             except asyncio.CancelledError:
                 raise
