@@ -1173,6 +1173,10 @@ class LiveConnectionSpikeSetupOrchestrator:
         self._scopes: dict[str, CreationScope] = {}
         self._receipts: dict[str, JournalReceipt] = {}
         self._results: dict[str, ConnectionSpikeSetupResult] = {}
+        #: Bouts whose untimed preparation has already run, mapped to the fencing token it ran
+        #: under. Keyed by token and not just by bout so a re-armed bout under a new fence
+        #: prepares again rather than trusting work done for a fence that has since been lost.
+        self._prepared: dict[str, int] = {}
         self._cleanup_start_lock = asyncio.Lock()
         self._cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._proxy_delete_accepted: dict[str, asyncio.Event] = {}
@@ -1210,6 +1214,55 @@ class LiveConnectionSpikeSetupOrchestrator:
             self.config.secret_name_prefix or "anti-demo-round5",
         ).proxy_name
 
+    async def prepare(self, bout_id: str, fencing_token: int) -> None:
+        """Do the untimed work now, so that ringing the bell starts the clock.
+
+        IAM verification, the journal read and the orphan sweep are preparation both lanes need,
+        and they take minutes against AWS. Performed after the bell they put two clocks at 0.00
+        with nothing visible happening, which is indistinguishable from a hang and is why a live
+        round was abandoned with nothing wrong. Performed at arm they are finished before anyone
+        is watching a clock.
+
+        Idempotent, and safe to skip: `setup` prepares for itself when this has not run.
+        """
+
+        async with self._lock:
+            if bout_id in self._results:
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 setup already completed for this bout"
+                )
+            if self._prepared.get(bout_id) == fencing_token:
+                return
+            scope, clients, resources, coordinator, specs = await self._begin_setup_scope(
+                bout_id, fencing_token
+            )
+            await self._preflight_baseline(scope, clients, coordinator, specs, resources)
+            self._prepared[bout_id] = fencing_token
+
+    async def _begin_setup_scope(
+        self, bout_id: str, fencing_token: int
+    ) -> tuple[CreationScope, Any, _SetupResources, Any, Any]:
+        """Resolve the names, scope, clients and coordinator this bout works through."""
+
+        names = self.names_for_bout(
+            self.config.deterministic_name_prefix,
+            bout_id,
+            self.config.secret_name_prefix or "anti-demo-round5",
+        )
+        scope = CreationScope(bout_id, fencing_token, self.config.baseline_sha256)
+        # Assumed fresh every time rather than carried over from `prepare`. Assumed credentials
+        # expire, an arm can sit for minutes before the bell, and re-assuming is the fast part.
+        clients = await self._assumed_clients(bout_id)
+        resources = _SetupResources(
+            names,
+            secret_arn=self.config.proxy_secret_arn,
+            proxy_role_arn=self.config.proxy_service_role_arn,
+        )
+        coordinator, specs = self._coordinator(scope, clients, resources)
+        self._coordinators[bout_id] = coordinator
+        self._scopes[bout_id] = scope
+        return scope, clients, resources, coordinator, specs
+
     async def setup(
         self,
         bout_id: str,
@@ -1225,22 +1278,15 @@ class LiveConnectionSpikeSetupOrchestrator:
                 raise ConnectionSpikeLiveOperationError(
                     "Round 5 setup already completed for this bout"
                 )
-            names = self.names_for_bout(
-                self.config.deterministic_name_prefix,
-                bout_id,
-                self.config.secret_name_prefix or "anti-demo-round5",
+            scope, clients, resources, coordinator, specs = await self._begin_setup_scope(
+                bout_id, fencing_token
             )
-            scope = CreationScope(bout_id, fencing_token, self.config.baseline_sha256)
-            clients = await self._assumed_clients(bout_id)
-            resources = _SetupResources(
-                names,
-                secret_arn=self.config.proxy_secret_arn,
-                proxy_role_arn=self.config.proxy_service_role_arn,
-            )
-            coordinator, specs = self._coordinator(scope, clients, resources)
-            self._coordinators[bout_id] = coordinator
-            self._scopes[bout_id] = scope
-            await self._preflight_baseline(scope, clients, coordinator, specs, resources)
+            if self._prepared.get(bout_id) != fencing_token:
+                # Nothing prepared this bout, so prepare it here. That is the old behaviour and
+                # it stays correct: an arm handled by a replica that has since been replaced
+                # must still be able to ring its own bell.
+                await self._preflight_baseline(scope, clients, coordinator, specs, resources)
+                self._prepared[bout_id] = fencing_token
 
             gate = asyncio.Event()
             t0_box: list[int] = []
@@ -1299,7 +1345,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                     bout_id=bout_id,
                     arm=arm,
                     observations=observations,
-                    names=names,
+                    names=resources.names,
                     lakebase=lakebase,
                     competitor=competitor,
                 )
@@ -5207,6 +5253,17 @@ class LiveConnectionSpikeEngine:
     @property
     def has_timed_setup(self) -> bool:
         return self._setup_orchestrator is not None
+
+    async def prepare(self, bout_id: str, fencing_token: int) -> None:
+        """Run the untimed preparation now, so the bell starts the clock.
+
+        Silent when this installation has no timed setup to prepare for, because then there is
+        no untimed phase to move: the round arms and rings in one step.
+        """
+
+        if self._setup_orchestrator is None:
+            return
+        await self._setup_orchestrator.prepare(bout_id, fencing_token)
 
     async def setup(
         self,

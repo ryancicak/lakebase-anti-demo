@@ -4839,6 +4839,17 @@ class RunManager:
             if not has_timed_setup:
                 check = engine.check  # type: ignore[attr-defined]
                 arm = await check()
+            else:
+                # The untimed preparation, moved off the bell. IAM verification, the journal read
+                # and the orphan sweep take minutes against AWS and are excluded from the setup
+                # clock on purpose, so running them after the bell showed the room two clocks at
+                # 0.00 with nothing to distinguish preparing from stuck.
+                lease = record.round5_lease
+                if lease is None:
+                    raise InvalidStateError("The Round 5 artifact lease is unavailable")
+                prepare = getattr(engine, "prepare", None)
+                if prepare is not None:
+                    await prepare(record.snapshot.id, lease.fencing_token)
             loop = asyncio.get_running_loop()
             async with record.lock:
                 armed_at = datetime.now(UTC)

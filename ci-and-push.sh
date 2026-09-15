@@ -186,10 +186,8 @@ fi
 
 git add -A \
   ci-and-push.sh \
-  frontend/src/App.tsx \
-  frontend/src/instant-replay.ts \
-  frontend/src/instant-replay.test.tsx \
-  frontend/src/round5.test.tsx
+  server/connection_spike_live.py \
+  server/manager.py
 
 # The list above is explicit so an unrelated edit cannot ride along. That makes
 # the opposite mistake possible -- staging a subset and committing half a change
@@ -205,32 +203,31 @@ if [[ -n "$LEFT_BEHIND" ]]; then
 fi
 
 git commit --file - <<'MSG'
-Stop the card promising a shared start, and show that preparation is running
+Prepare Round 5 when it is armed, so the bell starts the clock
 
-Two things Ryan found on the live app, both of them the app misdescribing itself.
+Arming a timed-setup Round 5 did almost nothing. Pressing run then began with IAM verification, a
+journal read and an orphan sweep against AWS before t0 could be taken, so the first thing the room
+saw after the bell was two clocks reading 0.00 for minutes with nothing to distinguish preparing
+from hung. Ryan abandoned a live round at two minutes twenty-eight seconds with nothing wrong, and
+said it four times: as soon as you ring the bell the clock should start.
 
-The card still said "Shared-T0 fan-in" and the replay still narrated "Phase 2 raced both from one
-T0". Neither is true any more: the lanes are dispatched one at a time, each holding its 10,000 on
-its own clock, precisely so Lakebase is never held behind an eleven-minute RDS Proxy build that has
-nothing to do with it. These are the lines an operator reads aloud and the ones a replay repeats
-afterwards, so they described the protocol that was replaced to the one audience that matters. Six
-places, all reworded to the claim that is actually made and proved.
+That work is outside the scored clock deliberately, because it is preparation both lanes need and
+folding it in would inflate the setup number this round exists to report. What it does not belong
+inside is the bout. The arm is where it belongs, which is also what an operator already means by
+arming, and it is where the fencing token the preparation must be scoped to already lives.
 
-The second is worse because it looked like a failure. A live Round 5 was abandoned two minutes and
-twenty-eight seconds in, and the app logs show no error at all: the round was minting the native
-login, the ordinary role and the runner credential, which is real work taking real minutes. That
-work is outside the scored clock deliberately -- the round's own non-claims say so, and folding it
-in would inflate the setup number this round exists to report -- so the clock correctly read 0.00.
-What was missing was any way to tell "preparing" from "stuck", which is the same failure this
-project keeps finding in itself: a surface reporting a state without saying what it is doing.
+`prepare` performs it and records the bout and fence it ran under; `setup` skips it when that
+record matches and performs it itself when it does not, so an arm handled by a replica that has
+since been replaced can still ring its own bell. Keyed by token rather than by bout, so a re-armed
+bout under a new fence prepares again instead of trusting work done for a fence that has been lost.
+Fresh AWS clients are still assumed inside `setup` rather than carried over, because assumed
+credentials expire and an arm can sit for minutes; re-assuming is the fast part, and the slow
+verification is what moved. A failure now fails the arm rather than the bout, which is the right
+place to learn it: an installation that cannot prepare cannot ring a fair bell either.
 
-Preparation now carries its own elapsed count, labelled as preparation and derived from the
-server's own `run_started_at` and `updated_at` so it has no browser clock skew, and the label says
-the setup clock starts at the bell. The scored clock is untouched.
-
-The reading-budget test caught the first attempt at the replay wording at 85 words against a limit
-of 82. That test is right to exist, because the line is spoken, so the wording got shorter rather
-than the budget looser.
+This closes the gap after the bell. It does not yet make Lakebase's 10,000 start while the AWS path
+is still building its Proxy: the burst still waits for both setup clocks to stop. That is the next
+change and it is a different one.
 MSG
 pass "committed"
 
