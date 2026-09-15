@@ -4851,7 +4851,22 @@ class RunManager:
                 lease = record.round5_lease
                 prepare = getattr(engine, "prepare", None)
                 if lease is not None and prepare is not None:
+                    started = time.monotonic()
                     await prepare(record.snapshot.id, lease.fencing_token)
+                    logger.info(
+                        "Round 5 arm timing session=%s step=prepare elapsed_ms=%.0f",
+                        record.snapshot.id,
+                        (time.monotonic() - started) * 1000,
+                    )
+                else:
+                    # Worth saying, because this is the branch that pushes the work onto the bell
+                    # and it is invisible otherwise: the round simply feels slow to start.
+                    logger.info(
+                        "Round 5 arm timing session=%s step=prepare skipped lease=%s engine=%s",
+                        record.snapshot.id,
+                        lease is not None,
+                        prepare is not None,
+                    )
                 # The capacity preflight too. It measures the runner, not the lanes, so the
                 # answer is the same before the bell as after it, and asking now takes an SSM
                 # round trip out of the dead period the round is judged on.
@@ -4863,7 +4878,13 @@ class RunManager:
                 check = getattr(engine, "check", None)
                 if check is not None:
                     try:
+                        check_started = time.monotonic()
                         arm = await check()
+                        logger.info(
+                            "Round 5 arm timing session=%s step=capacity_preflight elapsed_ms=%.0f",
+                            record.snapshot.id,
+                            (time.monotonic() - check_started) * 1000,
+                        )
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:  # noqa: BLE001
@@ -5146,10 +5167,16 @@ class RunManager:
                 lease = record.round5_lease
                 if lease is None:
                     raise InvalidStateError("The Round 5 artifact lease is unavailable")
+                setup_started = time.monotonic()
                 setup_result = await setup_operation(
                     record.snapshot.id,
                     lease.fencing_token,
                     on_setup_progress,
+                )
+                logger.info(
+                    "Round 5 bell timing session=%s step=setup_phase elapsed_ms=%.0f",
+                    record.snapshot.id,
+                    (time.monotonic() - setup_started) * 1000,
                 )
                 record.connection_spike_setup_result = setup_result
                 preliminary = self._round_five_finalize_setup(setup_result, {})
