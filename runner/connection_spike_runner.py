@@ -3702,6 +3702,43 @@ def _job_control(request: Mapping[str, object]) -> int:
 RESIDENT_CONTROL_PROTOCOL = "round5-resident-control-v3"
 RESIDENT_CONTROL_SCHEMA_VERSION = 3
 ROUND5_RUNNER_EVENT_TABLE = "anti_demo_coordination.round5_runner_event_v3"
+ROUND5_RUNNER_EVENT_DISPOSITION_FUNCTION = (
+    "anti_demo_coordination.round5_runner_event_disposition_v1"
+)
+# The systemd-managed runner attests its loaded harness to a tmpfs file here
+# before reading the control DSN. A module constant (rather than an inline
+# ``/run`` literal) keeps the path fixed in production while letting tests
+# redirect it to a temporary directory.
+RESIDENT_ATTESTATION_DIR = Path("/run")
+
+# The four exact, lane-bound dispositions the resident precomputes before every
+# local transition. They mirror the authoritative slot/outbox/event relations
+# the write-side RLS gate consults, so the resident never trusts a persisted
+# stage, spawns workers, and only then learns from a rejected insert that a
+# newer attempt superseded it.
+RESIDENT_DISPOSITION_CURRENT = "current"
+RESIDENT_DISPOSITION_SUPERSEDED = "superseded"
+RESIDENT_DISPOSITION_TERMINAL = "terminal"
+RESIDENT_DISPOSITION_UNKNOWN = "unknown"
+_RESIDENT_DISPOSITIONS = frozenset(
+    {
+        RESIDENT_DISPOSITION_CURRENT,
+        RESIDENT_DISPOSITION_SUPERSEDED,
+        RESIDENT_DISPOSITION_TERMINAL,
+        RESIDENT_DISPOSITION_UNKNOWN,
+    }
+)
+
+
+class RunnerAttemptSupersededError(RuntimeError):
+    """The warm attempt token was revoked between a disposition precheck and an
+    RLS-gated insert.
+
+    This is expected cleanup, not a crash: the row-level security ``WITH CHECK``
+    denied the event because the durable warm slot no longer names this
+    attempt's token (or the job is no longer dispatched under it). The resident
+    reclassifies and discards the stale local residue instead of crash-looping.
+    """
 
 
 def _decode_resident_control(body: str) -> dict[str, object]:
@@ -3709,6 +3746,18 @@ def _decode_resident_control(body: str) -> dict[str, object]:
         raw = json.loads(gzip.decompress(base64.urlsafe_b64decode(body)))
     except Exception as exc:
         raise RunnerContractError("resident_control_decode_invalid") from exc
+    return _verify_resident_control(raw)
+
+
+def _verify_resident_control(raw: object) -> dict[str, object]:
+    """Reverify a decoded control event's shape, event hash, and request digest.
+
+    Used both for freshly decoded SQS bodies and for control events replayed
+    from local stage/active recovery files. Reverifying on recovery means a
+    tampered or truncated persisted event is rejected before it drives any local
+    transition, rather than being trusted because it once passed on the wire.
+    """
+
     binding = raw.get("binding") if isinstance(raw, dict) else None
     payload = raw.get("payload") if isinstance(raw, dict) else None
     if (
@@ -3795,35 +3844,44 @@ def _write_resident_event(
     event_id = hashlib.sha256(_canonical_json(identity)).hexdigest()
     with psycopg.connect(control_dsn, autocommit=True) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                f"""
-                INSERT INTO {ROUND5_RUNNER_EVENT_TABLE} (
-                    event_id, installation_id, lane_id, generation,
-                    warm_attempt_token, job_id, sequence, kind, binding,
-                    payload, occurred_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s
+            try:
+                cursor.execute(
+                    f"""
+                    INSERT INTO {ROUND5_RUNNER_EVENT_TABLE} (
+                        event_id, installation_id, lane_id, generation,
+                        warm_attempt_token, job_id, sequence, kind, binding,
+                        payload, occurred_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s
+                    )
+                    ON CONFLICT (
+                        installation_id, lane_id, generation, warm_attempt_token,
+                        job_id, sequence
+                    ) DO NOTHING
+                    RETURNING event_id
+                    """,
+                    (
+                        event_id,
+                        binding["installation_id"],
+                        binding["lane_id"],
+                        binding["generation"],
+                        binding["warm_attempt_token"],
+                        binding["job_id"],
+                        sequence,
+                        kind,
+                        json.dumps(dict(binding), sort_keys=True, separators=(",", ":")),
+                        json.dumps(dict(payload), sort_keys=True, separators=(",", ":")),
+                        occurred_at,
+                    ),
                 )
-                ON CONFLICT (
-                    installation_id, lane_id, generation, warm_attempt_token,
-                    job_id, sequence
-                ) DO NOTHING
-                RETURNING event_id
-                """,
-                (
-                    event_id,
-                    binding["installation_id"],
-                    binding["lane_id"],
-                    binding["generation"],
-                    binding["warm_attempt_token"],
-                    binding["job_id"],
-                    sequence,
-                    kind,
-                    json.dumps(dict(binding), sort_keys=True, separators=(",", ":")),
-                    json.dumps(dict(payload), sort_keys=True, separators=(",", ":")),
-                    occurred_at,
-                ),
-            )
+            except psycopg.errors.InsufficientPrivilege as exc:
+                # The RLS WITH CHECK denied this row: the durable warm slot no
+                # longer names this attempt's token, or the job is no longer
+                # dispatched under it. Authority rotated between the caller's
+                # disposition precheck and this insert. Surface it distinctly so
+                # the resident reclassifies and discards the stale residue rather
+                # than treating a revoked attempt as a fatal contract failure.
+                raise RunnerAttemptSupersededError(kind) from exc
             row = cursor.fetchone()
             if row is not None and str(row[0]) == event_id:
                 return
@@ -3887,6 +3945,47 @@ def _last_resident_event_sequence(
             return int(row[0]) if row is not None else 0
 
 
+def _resident_event_disposition(
+    control_dsn: str,
+    *,
+    installation_id: str,
+    lane_id: str,
+    generation: int,
+    warm_attempt_token: str,
+    job_id: str,
+    event_id: str,
+    binding: Mapping[str, object],
+) -> str:
+    """Classify a control event as current / superseded / terminal / unknown.
+
+    Read-only, via the lane-scoped SECURITY DEFINER disposition function; the
+    runner login holds no read grant on the slot/outbox/event relations the
+    classifier consults. Called before every local transition so a superseded or
+    already-settled event never spawns/stops workers or replaces a stage file.
+    """
+
+    with psycopg.connect(control_dsn, autocommit=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT {ROUND5_RUNNER_EVENT_DISPOSITION_FUNCTION}"
+                "(%s, %s, %s, %s, %s, %s, %s::jsonb)",
+                (
+                    installation_id,
+                    lane_id,
+                    generation,
+                    warm_attempt_token,
+                    job_id,
+                    event_id,
+                    json.dumps(dict(binding), sort_keys=True, separators=(",", ":")),
+                ),
+            )
+            row = cursor.fetchone()
+    disposition = str(row[0]) if row is not None and row[0] is not None else ""
+    if disposition not in _RESIDENT_DISPOSITIONS:
+        raise RunnerContractError("resident_control_disposition_invalid")
+    return disposition
+
+
 def _resident_control_failure_is_permanent(error: BaseException) -> bool:
     return isinstance(error, (RunnerContractError, ValueError, KeyError, TypeError))
 
@@ -3928,7 +4027,9 @@ async def _resident_agent(
         temporary.chmod(0o600)
         temporary.replace(path)
 
-    attestation_path = Path(f"/run/lakebase-anti-demo-round5-{lane_id}.attestation.json")
+    attestation_path = (
+        RESIDENT_ATTESTATION_DIR / f"lakebase-anti-demo-round5-{lane_id}.attestation.json"
+    )
     persist(
         attestation_path,
         {
@@ -4028,69 +4129,177 @@ async def _resident_agent(
             await asyncio.to_thread(process.join, 5)
         pool = None
 
+    async def disposition_of(event: Mapping[str, object]) -> str:
+        """Classify an already-verified control event before any local mutation."""
+
+        event_binding = binding_of(event)
+        return await asyncio.to_thread(
+            _resident_event_disposition,
+            control_dsn,
+            installation_id=str(event_binding["installation_id"]),
+            lane_id=str(event_binding["lane_id"]),
+            generation=int(event_binding["generation"]),
+            warm_attempt_token=str(event_binding["warm_attempt_token"]),
+            job_id=str(event_binding["job_id"]),
+            event_id=str(event["event_id"]),
+            binding=event_binding,
+        )
+
+    async def discard_residue(binding: Mapping[str, object]) -> None:
+        """Drop only the local residue that belongs to this exact binding.
+
+        A superseded or terminal event must never disturb another attempt's live
+        pool, stage, or active job. This clears the staged file/pool only when
+        THIS binding is the one currently staged, and cancels an active job only
+        when THIS binding owns it, so a delayed old attempt cannot stop or
+        overwrite the attempt that superseded it.
+        """
+
+        nonlocal staged_binding, staged_request, heartbeat_binding
+        target = dict(binding)
+        job_id = str(binding["job_id"])
+        current = active.get(job_id)
+        if current is not None and current[2] == target:
+            current[1].set()
+            active.pop(job_id, None)
+            prepared_jobs.discard(job_id)
+            active_path.unlink(missing_ok=True)
+        if staged_binding is not None and dict(staged_binding) == target:
+            staged_binding = None
+            staged_request = None
+            heartbeat_binding = None
+            stage_path.unlink(missing_ok=True)
+            await stop_pool()
+
     if active_path.is_file():
+        # Active recovery: a process died holding a job. Do not blindly settle it
+        # -- classify first. Only a still-current job may be settled failed (its
+        # token still matches, so RLS admits the terminal events); a superseded or
+        # already-terminal job is discarded without writing under a revoked token
+        # or emitting a duplicate terminal event.
+        active_event = None
         try:
             active_value = json.loads(active_path.read_text(encoding="utf-8"))
-            active_binding = active_value["binding"]
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RunnerContractError("resident_active_registry_invalid") from exc
-        if not isinstance(active_binding, Mapping):
-            raise RunnerContractError("resident_active_registry_invalid")
-        await publish(
-            active_binding,
-            "failed",
-            {"code": "resident_process_restarted"},
-        )
-        await publish(
-            active_binding,
-            "settled",
-            {"state": "failed", "code": "resident_process_restarted"},
-        )
+            active_event = _verify_resident_control(active_value["event"])
+        except (
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            RunnerContractError,
+        ):
+            # Unparseable, legacy-format (pre-event schema), or tampered residue,
+            # e.g. an active file left by a previous harness version across a
+            # refresh. Discard it; never crash-loop the new process on residue it
+            # cannot interpret or attest.
+            active_event = None
+        if active_event is not None:
+            active_binding = binding_of(active_event)
+            active_disposition = await disposition_of(active_event)
+            if active_disposition == RESIDENT_DISPOSITION_CURRENT:
+                try:
+                    await publish(
+                        active_binding,
+                        "failed",
+                        {"code": "resident_process_restarted"},
+                    )
+                    await publish(
+                        active_binding,
+                        "settled",
+                        {"state": "failed", "code": "resident_process_restarted"},
+                    )
+                except RunnerAttemptSupersededError:
+                    # Authority rotated between the precheck and the settle: this
+                    # is now superseded cleanup, not a failure to record.
+                    pass
+            elif active_disposition == RESIDENT_DISPOSITION_UNKNOWN:
+                print("RESIDENT_CONTROL_QUARANTINED:startup_active_unknown", flush=True)
         active_path.unlink(missing_ok=True)
         stage_path.unlink(missing_ok=True)
 
     if stage_path.is_file():
+        stored_event = None
+        stored_binding = None
+        stored_request = None
         try:
             stored_stage = json.loads(stage_path.read_text(encoding="utf-8"))
-            stored_binding = stored_stage["binding"]
-            stored_request = stored_stage["request"]
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise RunnerContractError("resident_stage_invalid") from exc
-        if not isinstance(stored_binding, Mapping) or not isinstance(
-            stored_request,
-            Mapping,
+            stored_event = _verify_resident_control(stored_stage["event"])
+            stored_binding = binding_of(stored_event)
+            stored_request = stored_event["payload"]["request"]
+            if not isinstance(stored_binding, Mapping) or not isinstance(
+                stored_request,
+                Mapping,
+            ):
+                raise RunnerContractError("resident_stage_invalid")
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            json.JSONDecodeError,
+            RunnerContractError,
         ):
-            raise RunnerContractError("resident_stage_invalid")
-        try:
-            require_process_binding(stored_binding, allow_unattested=True)
-        except RunnerContractError:
-            await publish(
-                stored_binding,
-                "settled",
-                {"state": "failed", "code": "resident_process_restarted"},
-            )
+            # Unparseable, legacy-format (pre-event schema), or tampered residue,
+            # e.g. a stage file left by a previous harness version across a
+            # refresh. Discard it; never crash-loop the new process on residue it
+            # cannot interpret.
             stage_path.unlink(missing_ok=True)
-        else:
-            resident_generation = int(stored_binding["generation"])
-            resident_installation_id = str(stored_binding["installation_id"])
-            resident_attempt_token = str(stored_binding["warm_attempt_token"])
-            staged_binding = dict(stored_binding)
-            staged_request = dict(stored_request)
-            heartbeat_binding = attested_binding(staged_binding)
-            pool = ResidentShardPool.start()
-            await publish(
-                attested_binding(staged_binding),
-                "agent_ready",
-                {
-                    "worker_count": fanin.WORKER_COUNT,
-                    "worker_ready_indexes": list(pool.worker_ready_indexes),
-                    "warm_attempt_token": resident_attempt_token,
-                    "runner_boot_id": runner_boot_id,
-                    "runner_process_boot_id": process_boot_id,
-                    "process_pid": os.getpid(),
-                    "runner_harness_sha256": LOADED_RUNNER_HARNESS_SHA256,
-                },
-            )
+            stored_event = None
+        attestable = False
+        if stored_event is not None:
+            try:
+                require_process_binding(stored_binding, allow_unattested=True)
+                attestable = True
+            except RunnerContractError:
+                # The persisted stage does not belong to this runner build/boot (a
+                # redeploy or a foreign file). Discard the local residue only; do
+                # not settle a binding we cannot attest, and do not risk an
+                # RLS-rejected write under a token that may already be revoked.
+                stage_path.unlink(missing_ok=True)
+        if attestable:
+            # Classify BEFORE spawning workers or emitting readiness. A stale
+            # stage from a superseded attempt must be discarded locally -- never
+            # replayed as current -- so the resident stops crash-looping on it and
+            # is free to consume the current attempt's PRELOAD from the queue.
+            stage_disposition = await disposition_of(stored_event)
+            if stage_disposition == RESIDENT_DISPOSITION_CURRENT:
+                resident_generation = int(stored_binding["generation"])
+                resident_installation_id = str(stored_binding["installation_id"])
+                resident_attempt_token = str(stored_binding["warm_attempt_token"])
+                staged_binding = dict(stored_binding)
+                staged_request = dict(stored_request)
+                heartbeat_binding = attested_binding(staged_binding)
+                pool = ResidentShardPool.start()
+                try:
+                    await publish(
+                        attested_binding(staged_binding),
+                        "agent_ready",
+                        {
+                            "worker_count": fanin.WORKER_COUNT,
+                            "worker_ready_indexes": list(pool.worker_ready_indexes),
+                            "warm_attempt_token": resident_attempt_token,
+                            "runner_boot_id": runner_boot_id,
+                            "runner_process_boot_id": process_boot_id,
+                            "process_pid": os.getpid(),
+                            "runner_harness_sha256": LOADED_RUNNER_HARNESS_SHA256,
+                        },
+                    )
+                except RunnerAttemptSupersededError:
+                    # Authority rotated between the precheck and the readiness
+                    # insert. Discard the just-started residue; no crash.
+                    await stop_pool()
+                    stage_path.unlink(missing_ok=True)
+                    staged_binding = None
+                    staged_request = None
+                    heartbeat_binding = None
+                    resident_generation = generation or None
+                    resident_installation_id = ""
+                    resident_attempt_token = ""
+            else:
+                if stage_disposition == RESIDENT_DISPOSITION_UNKNOWN:
+                    print("RESIDENT_CONTROL_QUARANTINED:startup_stage_unknown", flush=True)
+                stage_path.unlink(missing_ok=True)
 
     active: dict[
         str,
@@ -4192,13 +4401,21 @@ async def _resident_agent(
                     code = str(exc)
                     if not code or len(code) > 64 or not code.replace("_", "").isalnum():
                         code = "resident_runner_failed"
-                    await publish(active_binding, "failed", {"code": code})
-                    settlement = {"state": "failed", "code": code}
+                    terminal_kind: str = "failed"
+                    terminal_payload: dict[str, object] = {"code": code}
+                    settlement: dict[str, object] = {"state": "failed", "code": code}
                 else:
-                    await publish(active_binding, "result", result)
+                    terminal_kind = "result"
+                    terminal_payload = result
                     settlement = {"state": "completed"}
-                await stop_pool()
-                await publish(active_binding, "settled", settlement)
+                try:
+                    await publish(active_binding, terminal_kind, terminal_payload)
+                    await stop_pool()
+                    await publish(active_binding, "settled", settlement)
+                except RunnerAttemptSupersededError:
+                    # The attempt was revoked mid-run; do not settle under the
+                    # revoked token. Discard local residue and stop.
+                    await stop_pool()
                 active_path.unlink(missing_ok=True)
                 stage_path.unlink(missing_ok=True)
                 return
@@ -4233,6 +4450,40 @@ async def _resident_agent(
                         binding,
                         allow_unattested=kind == "preload",
                     )
+                    # Classify BEFORE any local transition (worker spawn/stop,
+                    # stage/active file replacement, readiness/settlement emit).
+                    # A delayed old attempt arrives on its own FIFO group
+                    # (`lane-job`) and can be received after the attempt that
+                    # superseded it; without this gate its PRELOAD would stop the
+                    # pool and overwrite the current stage. Guarding every
+                    # transition -- not just startup -- is what closes that race.
+                    disposition = await disposition_of(event)
+                    if disposition == RESIDENT_DISPOSITION_UNKNOWN:
+                        # No matching dispatched outbox event: tampered, forged, or
+                        # never dispatched. Quarantine with NO local state mutation
+                        # and NO runner-event write (a 'quarantined' insert would
+                        # itself be RLS-denied under an unknown identity). Drop the
+                        # forged message so it does not redeliver forever.
+                        print(
+                            "RESIDENT_CONTROL_QUARANTINED:resident_control_disposition_unknown",
+                            flush=True,
+                        )
+                        consumed_control_events.add(event_id)
+                        acknowledge = True
+                        continue
+                    if disposition in {
+                        RESIDENT_DISPOSITION_SUPERSEDED,
+                        RESIDENT_DISPOSITION_TERMINAL,
+                    }:
+                        # A valid but revoked (superseded) or already-settled
+                        # (terminal) event. Discard only this job's residue -- never
+                        # another attempt's live pool/stage -- and ACK/delete the
+                        # message without writing any runner event under the
+                        # revoked token (no settle, no duplicate terminal).
+                        await discard_residue(binding)
+                        consumed_control_events.add(event_id)
+                        acknowledge = True
+                        continue
                     if kind == "preload":
                         if active:
                             raise RunnerContractError("resident_job_active")
@@ -4272,7 +4523,7 @@ async def _resident_agent(
                         heartbeat_binding = attested_binding(binding)
                         persist(
                             stage_path,
-                            {"binding": binding, "request": staged_request},
+                            {"event": event, "request": staged_request},
                         )
                         await publish(
                             attested_binding(binding),
@@ -4302,14 +4553,14 @@ async def _resident_agent(
                         heartbeat_binding = binding
                         persist(
                             stage_path,
-                            {"binding": binding, "request": staged_request},
+                            {"event": event, "request": staged_request},
                         )
                         cancelled = asyncio.Event()
                         release_gate = asyncio.Event()
                         persist(
                             active_path,
                             {
-                                "binding": binding,
+                                "event": event,
                                 "request": staged_request,
                                 "state": "staging",
                             },
@@ -4338,7 +4589,7 @@ async def _resident_agent(
                         persist(
                             active_path,
                             {
-                                "binding": binding,
+                                "event": event,
                                 "request": staged_request,
                                 "state": "released",
                             },
@@ -4384,6 +4635,15 @@ async def _resident_agent(
                     acknowledge = True
                 except asyncio.CancelledError:
                     raise
+                except RunnerAttemptSupersededError:
+                    # Authority rotated between the disposition precheck above and
+                    # the RLS-gated insert this branch attempted. Reclassify: this
+                    # is expected superseded cleanup, not a crash. Discard only
+                    # this job's residue and ACK/delete the message; never settle
+                    # or emit a terminal event under the now-revoked token.
+                    if isinstance(binding, Mapping):
+                        await discard_residue(binding)
+                    acknowledge = True
                 except Exception as exc:
                     if _resident_control_failure_is_permanent(exc):
                         code = str(exc) or type(exc).__name__
@@ -4419,18 +4679,33 @@ async def _resident_agent(
                 and heartbeat_binding is not None
                 and time.monotonic() - last_heartbeat_at >= 2.0
             ):
-                await publish(
-                    heartbeat_binding,
-                    "heartbeat",
-                    {
-                        "worker_ready_indexes": list(pool.worker_ready_indexes),
-                        "runner_boot_id": runner_boot_id,
-                        "runner_process_boot_id": process_boot_id,
-                        "process_pid": os.getpid(),
-                        "runner_harness_sha256": LOADED_RUNNER_HARNESS_SHA256,
-                    },
-                )
-                last_heartbeat_at = time.monotonic()
+                try:
+                    await publish(
+                        heartbeat_binding,
+                        "heartbeat",
+                        {
+                            "worker_ready_indexes": list(pool.worker_ready_indexes),
+                            "runner_boot_id": runner_boot_id,
+                            "runner_process_boot_id": process_boot_id,
+                            "process_pid": os.getpid(),
+                            "runner_harness_sha256": LOADED_RUNNER_HARNESS_SHA256,
+                        },
+                    )
+                except RunnerAttemptSupersededError:
+                    # This identity's token was revoked. Stop attesting it and
+                    # tear down its pool, but keep the process alive: a later
+                    # current PRELOAD re-establishes a fresh pool and heartbeat.
+                    # Only this attempt's residue is cleared; nothing else.
+                    heartbeat_binding = None
+                    staged_binding = None
+                    staged_request = None
+                    resident_installation_id = ""
+                    resident_attempt_token = ""
+                    resident_generation = generation or None
+                    stage_path.unlink(missing_ok=True)
+                    await stop_pool()
+                else:
+                    last_heartbeat_at = time.monotonic()
             await asyncio.sleep(0)
     finally:
         await stop_pool()

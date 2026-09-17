@@ -3135,6 +3135,54 @@ def _enable_round5_lakebase_native_login(manifest: DemoManifest) -> tuple[str, s
     return _round5_lakebase_hosts(manifest)
 
 
+def _enable_coordination_lakebase_native_login(manifest: DemoManifest) -> None:
+    """Enable Postgres native-password login on the coordination project.
+
+    The Round 5 resident logins (`_rotate_round5_resident_login`) are native
+    Postgres roles that authenticate to the *coordination* endpoint with a
+    rotated password, not with a Databricks OAuth credential. That only works
+    when the coordination project has `enable_pg_native_login` turned on, the
+    same project-level switch `_enable_round5_lakebase_native_login` flips for the
+    measured Round 5 project. Enabling it live but not in code meant a fresh
+    provision/reconcile rotated resident roles onto a project that rejected their
+    password logins, so the residents could not reach the event store and warm
+    never reached ring_ready. This persists the setup so provision/reconcile no
+    longer regresses resident DB access. It embeds no secret: the flag is a
+    project capability, and the resident passwords are minted fresh in
+    `ensure_coordination`.
+    """
+
+    project_id = _coordination_lakebase_binding(manifest).project_id
+    project_name = f"projects/{project_id}"
+    project = _get_lakebase_project_or_none(manifest, project_id=project_id)
+    if project is None:
+        raise RuntimeError("Coordination Lakebase project disappeared during native-login setup")
+    if (project.get("status") or {}).get("enable_pg_native_login") is True:
+        return
+    _run(
+        [
+            "databricks",
+            "postgres",
+            "update-project",
+            project_name,
+            "spec.enable_pg_native_login",
+            "--json",
+            json.dumps({"spec": {"enable_pg_native_login": True}}),
+            "--timeout",
+            "10m",
+            "-p",
+            manifest.databricks.profile,
+            "-o",
+            "json",
+        ],
+        capture=True,
+        timeout=700,
+    )
+    project = _get_lakebase_project_or_none(manifest, project_id=project_id)
+    if project is None or (project.get("status") or {}).get("enable_pg_native_login") is not True:
+        raise RuntimeError("Coordination Lakebase native password login is not enabled")
+
+
 def _round5_runner_archive() -> str:
     from .connection_spike_live import RUNNER_ASSETS
 
@@ -6785,6 +6833,89 @@ async def _rotate_round5_resident_login(
             sql.Identifier(role),
         )
     )
+    # A read-only, exact, lane-bound disposition classifier the resident calls
+    # BEFORE every local transition (startup/active recovery, incoming
+    # PRELOAD/STAGE, worker spawn/stop, heartbeat, file replacement) so it never
+    # trusts a persisted stage, mutates workers, and only then discovers via a
+    # rejected insert that a newer attempt superseded it. It shares the exact
+    # identity of the write-side RLS gate -- installation, lane, generation,
+    # token, job, and the control event's binding minus the per-process boot id
+    # -- and additionally binds the outbox event_id so a forged or never-
+    # dispatched event is classified 'unknown' rather than acted on. It returns:
+    #   'unknown'    -- no matching dispatched outbox event (tamper/forgery),
+    #   'terminal'   -- this job already settled/quarantined under this token,
+    #   'current'    -- the durable warm slot still names this attempt's token,
+    #   'superseded' -- a valid old event whose token the warm slot has rotated.
+    # It reads the same authoritative slot/outbox/event relations as the write
+    # gate without granting any of them to the runner, so a stolen DSN cannot
+    # use it to enumerate or manufacture state. Its truth must never be weaker
+    # than the RLS WITH CHECK: 'current' here is exactly the set the gate admits.
+    await cursor.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION {COORDINATION_SCHEMA}.round5_runner_event_disposition_v1(
+            p_installation_id text,
+            p_lane_id text,
+            p_generation bigint,
+            p_warm_attempt_token text,
+            p_job_id text,
+            p_event_id text,
+            p_binding jsonb
+        ) RETURNS text
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog
+        AS $function$
+            SELECT CASE
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS control
+                    WHERE control.installation_id = p_installation_id
+                      AND control.lane_id = p_lane_id
+                      AND control.generation = p_generation
+                      AND control.warm_attempt_token = p_warm_attempt_token
+                      AND control.job_id = p_job_id
+                      AND control.event_id = p_event_id
+                      AND (
+                          (control.payload -> 'binding') - 'runner_process_boot_id'::text
+                      ) = (
+                          p_binding - 'runner_process_boot_id'::text
+                      )
+                ) THEN 'unknown'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_RUNNER_EVENT_TABLE} AS ev
+                    WHERE ev.installation_id = p_installation_id
+                      AND ev.lane_id = p_lane_id
+                      AND ev.generation = p_generation
+                      AND ev.warm_attempt_token = p_warm_attempt_token
+                      AND ev.job_id = p_job_id
+                      AND ev.kind IN ('settled', 'quarantined')
+                ) THEN 'terminal'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_WARM_SLOT_TABLE} AS slot
+                    WHERE slot.installation_id = p_installation_id
+                      AND slot.generation = p_generation
+                      AND slot.payload ->> 'warm_attempt_token' = p_warm_attempt_token
+                ) THEN 'current'
+                ELSE 'superseded'
+            END
+        $function$
+        """
+    )
+    disposition_signature = sql.SQL(
+        "{}.round5_runner_event_disposition_v1(text,text,bigint,text,text,text,jsonb)"
+    ).format(sql.Identifier(COORDINATION_SCHEMA))
+    await cursor.execute(
+        sql.SQL("REVOKE ALL ON FUNCTION {} FROM PUBLIC").format(disposition_signature)
+    )
+    await cursor.execute(
+        sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+            disposition_signature,
+            sql.Identifier(role),
+        )
+    )
     await cursor.execute(
         sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(
             sql.SQL(ROUND5_RUNNER_EVENT_TABLE)
@@ -7769,6 +7900,13 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
 
     manifest.databricks.coordination_endpoint_name = expected_endpoint
     apply_manifest_environment(manifest)
+
+    # Persist the coordination-endpoint native-login capability the resident
+    # roles depend on. `rotate_resident_login` below mints native-password roles
+    # that authenticate to this endpoint; without this flag a fresh provision or
+    # reconcile would rotate logins the project then rejects, regressing resident
+    # DB access. Enable it before rotating so residents can reach the event store.
+    _enable_coordination_lakebase_native_login(manifest)
 
     async def initialize_table() -> None:
         from .coordination import (
