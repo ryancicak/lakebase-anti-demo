@@ -349,6 +349,15 @@ data "aws_iam_policy_document" "round5_execution" {
     actions = [
       "rds:DeleteDBProxy",
       "rds:ModifyDBProxy",
+      # ModifyDBProxyTargetGroup / (De)RegisterDBProxyTargets authorize against
+      # BOTH the target-group ARN (granted in the next statement) AND the parent
+      # db-proxy ARN. Without the db-proxy grant here, configuring the pool after
+      # CreateDBProxy fails at ModifyDBProxyTargetGroup with AccessDenied on the
+      # db-proxy resource, which failed the competitor setup ~56s in. The same
+      # bout-tag fencing below still scopes these to this bout's owned proxy.
+      "rds:ModifyDBProxyTargetGroup",
+      "rds:RegisterDBProxyTargets",
+      "rds:DeregisterDBProxyTargets",
     ]
     resources = ["arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:db-proxy:*"]
 
