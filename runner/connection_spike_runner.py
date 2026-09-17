@@ -176,8 +176,10 @@ RUNNER_HARNESS_ASSETS = (
     "run_connection_spike.sh",
     "requirements-round5.txt",
 )
-#: Maximum work represented by the ready stage. It is checked against the
-#: single run deadline below, not enforced with another resetting timeout.
+#: The pre-release readiness budget: the deadline `await_stage("ready")` runs
+#: under, before the authoritative release exists.  It bounds ONLY the readiness
+#: barrier (process spawn, CPU pinning, the observer connect+quiesce), never the
+#: unscored dwell behind the Proxy exact gate and never the scored ramp.
 #:
 #: A worker reports ready only once its observer has connected and seen the lane quiet, and
 #: the observer owns both of those budgets. Derived from them rather than chosen, because a
@@ -190,9 +192,14 @@ RUNNER_HARNESS_ASSETS = (
 FANIN_WORKER_READY_BUDGET_SECONDS = (
     fanin.OBSERVER_READY_TIMEOUT_SECONDS + fanin.OBSERVER_QUIESCE_TIMEOUT_SECONDS + 60.0
 )
-# One absolute worker deadline covers ready, ramp, the fresh hold prepare, hold,
-# sampling and result transfer.  Per-stage clocks used to reset at each barrier,
-# allowing the parent to promise more time than the outer fan-in contract owns.
+# The scored worker deadline covers ramp, the fresh hold prepare, hold, sampling
+# and result transfer.  It is anchored at the authoritative release (T0), NOT at
+# resident stage: a competitor lane dwells minutes behind the Proxy exact gate
+# between "ready" and release, and anchoring at stage spent this budget on that
+# unscored wait, timing out await_stage("ramp_ready") the instant release fired.
+# _execute_sharded_fanin re-bases run_deadline off the release instant so this
+# budget always begins at T0.  The pre-release readiness barrier uses
+# FANIN_WORKER_READY_BUDGET_SECONDS above; the two never share a clock.
 FANIN_WORKER_RUN_TIMEOUT_SECONDS = fanin.RUN_TIMEOUT_SECONDS
 AWS_CREDENTIAL_IDS = frozenset({"rds", "aurora"})
 SEALED_BOX_KEY_PATH = CREDENTIAL_ROOT / "sealed-box.key"
@@ -1502,7 +1509,16 @@ async def _execute_sharded_fanin(
     first_socket_by_worker: dict[int, int] = {}
     first_authentication_by_worker: dict[int, int] = {}
     barrier_state = "READY"
-    run_deadline = asyncio.get_running_loop().time() + FANIN_WORKER_RUN_TIMEOUT_SECONDS
+    # The scored run budget must originate at the authoritative release (T0), not
+    # here at resident stage.  A competitor lane dwells minutes behind the Proxy
+    # exact gate between "ready" and release; anchoring FANIN_WORKER_RUN_TIMEOUT
+    # at stage burned that budget on the wait and made await_stage("ramp_ready")
+    # time out mechanically the instant release fired.  Pre-release, run_deadline
+    # holds only the readiness budget (process spawn + observer connect/quiesce);
+    # it is re-based off the release instant below.  See _release_run below.
+    stage_entered_at = asyncio.get_running_loop().time()
+    ready_reached_at: float | None = None
+    run_deadline = stage_entered_at + FANIN_WORKER_READY_BUDGET_SECONDS
     parent_safety = fanin.TelemetrySummary()
     last_parent_safety_at = 0.0
     teardown_ready: set[int] = set()
@@ -1817,24 +1833,24 @@ async def _execute_sharded_fanin(
     try:
         await sample_parent_safety(force=True)
         await await_stage("ready")
+        ready_reached_at = asyncio.get_running_loop().time()
         if on_resident_prepared is not None:
             await on_resident_prepared()
         if resident_release_gate is not None:
+            # Wait for release-or-cancel WITHOUT subtracting the scored run
+            # budget.  This dwell is the competitor's Proxy build (~10-11 min);
+            # it is not scored and must not consume ramp/hold time.  The outer
+            # resident/SSM control plane owns the ceiling on this wait; a towel
+            # sets `cancelled`, which settles this promptly via cancel_wait.
             release_wait = asyncio.create_task(resident_release_gate.wait())
             cancel_wait = asyncio.create_task(cancelled.wait())
             try:
-                async with asyncio.timeout(
-                    max(
-                        0.0,
-                        run_deadline - asyncio.get_running_loop().time(),
-                    )
-                ):
-                    done, _pending = await asyncio.wait(
-                        (release_wait, cancel_wait),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if cancel_wait in done and cancelled.is_set():
-                        raise RunnerCancelled("fanin_cancelled")
+                done, _pending = await asyncio.wait(
+                    (release_wait, cancel_wait),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if cancel_wait in done and cancelled.is_set():
+                    raise RunnerCancelled("fanin_cancelled")
             finally:
                 release_wait.cancel()
                 cancel_wait.cancel()
@@ -1847,6 +1863,34 @@ async def _execute_sharded_fanin(
             if release_ns.value != 0:
                 raise RunnerContractError("fanin_release_epoch_already_set")
             release_ns.value = time.monotonic_ns()
+        # Authoritative release (T0).  The scored run budget originates HERE.
+        released_at = asyncio.get_running_loop().time()
+        run_deadline = released_at + FANIN_WORKER_RUN_TIMEOUT_SECONDS
+        # Pre-release parent telemetry (the readiness barrier and the unscored
+        # Proxy dwell) must not contaminate the scored ramp telemetry window.
+        parent_safety = fanin.TelemetrySummary()
+        last_parent_safety_at = 0.0
+        # Cheap structured deadline trace: proves stage->ready and the unscored
+        # ready->release dwell, and that the ramp deadline is release-anchored.
+        print(
+            "FANIN_RELEASE_TRACE_JSON:"
+            + _canonical_json(
+                {
+                    "worker_count": fanin.WORKER_COUNT,
+                    "stage_to_ready_ms": round(
+                        ((ready_reached_at or released_at) - stage_entered_at) * 1000.0,
+                        3,
+                    ),
+                    "ready_to_release_ms": round(
+                        (released_at - (ready_reached_at or released_at)) * 1000.0,
+                        3,
+                    ),
+                    "run_budget_seconds": FANIN_WORKER_RUN_TIMEOUT_SECONDS,
+                    "deadline_origin": "release",
+                }
+            ).decode("utf-8"),
+            flush=True,
+        )
         transition_barrier("READY", "RELEASED")
         release_event.set()
         ramp_proofs = await await_stage("ramp_ready")
@@ -4883,9 +4927,14 @@ def main() -> int:
             fanin._progress_callback = persist_progress
 
         async def bounded() -> tuple[dict[str, object] | None, bool]:
-            timeout = (
-                fanin.RUN_TIMEOUT_SECONDS if fanin_request is not None else RUN_TIMEOUT_SECONDS
-            )
+            # The fan-in path owns its authoritative deadlines inside
+            # _execute_sharded_fanin: a readiness budget before the authoritative
+            # release and the release-anchored FANIN_WORKER_RUN_TIMEOUT after T0.
+            # A second outer timeout anchored at process entry duplicates that
+            # budget and, behind a Proxy exact gate, would clip the scored ramp
+            # before it began.  Run the fan-in path under the inner deadline
+            # alone; the legacy lifecycle path keeps its own outer bound.
+            timeout = None if fanin_request is not None else RUN_TIMEOUT_SECONDS
             async with asyncio.timeout(timeout):
                 lifecycle = asyncio.create_task(
                     _execute_fanin_request(fanin_request, targets, cancelled)
