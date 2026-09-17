@@ -7229,17 +7229,25 @@ function ReceiptPoster({
   session,
   roundNumber,
   kind,
+  fallbackOnly = false,
 }: {
   session: DemoSession
   roundNumber: number
   kind: ReceiptKind
+  /**
+   * When the generated PNG is (or will be) the visible preview, the poster stays
+   * in the DOM as a text mirror -- it is how a non-bitmap environment reads the
+   * card -- but is visually removed so the modal shows only the one clean Fable
+   * card. Only a genuine render failure promotes it back to a visible fallback.
+   */
+  fallbackOnly?: boolean
 }) {
   const receipt = receiptPresentation(session, kind)
   const resultWidth = receipt.verdict.length > 52 ? 'long' : receipt.verdict.length > 36 ? 'medium' : 'short'
   const skew = receiptStartSkewDisplay(session)
   const competitorFighter = session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS'
   return (
-    <article className="receipt-poster" aria-label={kind === 'idle' ? 'Verified back to idle poster preview' : session.towel ? 'Bout result poster preview' : 'Verified result poster preview'}>
+    <article className={fallbackOnly ? 'receipt-poster receipt-poster--mirror' : 'receipt-poster'} aria-label={kind === 'idle' ? 'Verified back to idle poster preview' : session.towel ? 'Bout result poster preview' : 'Verified result poster preview'}>
       <header className="receipt-ticket-top">
         <div className="receipt-ticket-brand" aria-label="Lakebase: The Anti-Demo">
           <div><strong>Lakebase</strong><span>The Anti-Demo</span></div>
@@ -7399,8 +7407,20 @@ function ShareReceipt({
           <h2 id="receipt-heading">{kind === 'idle' ? 'Share idle proof' : 'Share the proof'}</h2>
         </header>
         <div className="receipt-previews">
-          {cardBlob && <ReceiptCardPreview key={cardKey} blob={cardBlob} kind={kind} />}
-          <ReceiptPoster session={session} roundNumber={roundNumber} kind={kind} />
+          {cardBlob ? (
+            <ReceiptCardPreview key={cardKey} blob={cardBlob} kind={kind} />
+          ) : cardRenderFailed ? null : (
+            <p className="receipt-card-loading" role="status">Rendering the 8-bit card…</p>
+          )}
+          {/* The PNG is the one visible card (the full Fable layout). The poster
+              stays mounted as a text mirror -- read by tests and screen readers,
+              promoted to a visible fallback only if the bitmap never rendered. */}
+          <ReceiptPoster
+            session={session}
+            roundNumber={roundNumber}
+            kind={kind}
+            fallbackOnly={!cardRenderFailed}
+          />
         </div>
         <p className="receipt-share-note">LinkedIn desktop needs the PNG added as media; browser image paste is not reliable.</p>
         {status && <p className="receipt-status" role="status">{status}</p>}

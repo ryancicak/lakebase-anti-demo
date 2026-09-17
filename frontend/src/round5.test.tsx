@@ -1708,6 +1708,10 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   )
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).toHaveTextContent(/Start gap 0\.750ms/i)
   expect(within(shareReceipt).getByLabelText('Verified result poster preview')).not.toHaveTextContent(/Start gap 1\.235ms/i)
+  // The modal shows ONE clean card -- the generated PNG (the full Fable layout).
+  // The text poster stays mounted only as a visually-hidden mirror for this test
+  // and for screen readers; it is never a second visible box beside the bitmap.
+  expect(within(shareReceipt).getByLabelText('Verified result poster preview')).toHaveClass('receipt-poster--mirror')
   fireEvent.click(within(shareReceipt).getByRole('button', { name: /^b · back$/i }))
   expect(screen.queryByRole('dialog', { name: /share the proof/i })).not.toBeInTheDocument()
 

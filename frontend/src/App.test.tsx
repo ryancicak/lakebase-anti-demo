@@ -3336,7 +3336,14 @@ describe('backstage setup', () => {
     stubReceiptCanvas()
     await user.click(screen.getByRole('button', { name: /share the receipt/i }))
     const shareReceipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    // One clean card: the generated PNG is the single visible preview (the full
+    // Fable layout). The poster stays mounted only as a visually-hidden text
+    // mirror -- never a second stacked box beside the bitmap.
+    const shareCardImage = await within(shareReceipt).findByRole('img', { name: /result card exactly as it will post/i })
+    expect(shareCardImage).toHaveAttribute('width', '1200')
+    expect(shareCardImage).toHaveAttribute('height', '627')
     const poster = within(shareReceipt).getByLabelText(/verified result poster preview/i)
+    expect(poster).toHaveClass('receipt-poster--mirror')
     expect(within(poster).getByLabelText(/lakebase receipt result/i)).toHaveTextContent(/0\.84s.*LIVE APP VERIFIED.*BUILT-IN MANAGED REVERSE ETL/i)
     expect(within(poster).getByLabelText(/lakebase receipt result/i)).not.toHaveTextContent(/SCORE 0\.81/i)
     expect(within(poster).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/SEPARATE REVERSE-ETL STACK REQUIRED.*NOT BUILT OR TIMED/i)
