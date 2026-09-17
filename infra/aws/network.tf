@@ -271,6 +271,30 @@ resource "aws_vpc_security_group_egress_rule" "round5_lakebase_runner_postgres" 
   })
 }
 
+# The v4 two-runner control plane requires BOTH residents to write their
+# durable control events (agent_ready, heartbeat, progress, result, settled) to
+# the public Lakebase *coordination* endpoint over PostgreSQL. That endpoint is
+# the same publicly reachable Lakebase host the lakebase runner reaches above,
+# and Lakebase still publishes no stable customer-specific CIDR a rule can seal,
+# so this mirrors the lakebase runner's exception rather than an allowlist. Its
+# absence is why the competitor lane could reach SQS/Secrets over 443 but timed
+# out on 5432 to the coordination DB and never reached agent_ready -- so the ring
+# never became ready even though the lakebase lane was healthy. Row-level
+# security on round5_runner_event_v3 still fences every write to the lane's own
+# generation and current warm attempt; opening egress does not weaken it.
+resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_postgres" {
+  security_group_id = aws_security_group.round5_competitor_runner.id
+  description       = "PostgreSQL to the public Lakebase coordination endpoint (resident control events)"
+  ip_protocol       = "tcp"
+  from_port         = 5432
+  to_port           = 5432
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "competitor"
+  })
+}
+
 # Stable least-privilege Proxy network fixtures. The per-bout Proxy is still
 # created after the bell; only its immutable network envelope stands warm.
 resource "aws_security_group" "round5_proxy" {
