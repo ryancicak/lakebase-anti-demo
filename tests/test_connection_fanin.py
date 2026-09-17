@@ -2660,3 +2660,29 @@ def test_malformed_counts_and_monotonic_times_fail_closed() -> None:
         finalize({**raw_lane("lakebase"), "held_clients_at_gate": True})
     with pytest.raises(FanInError, match="time_to_target"):
         finalize({**raw_lane("lakebase"), "time_to_target_ms": -1.0})
+
+
+def test_proxy_endpoint_resolution_retries_on_gaierror_within_a_bounded_window() -> None:
+    """The per-bout Proxy endpoint's DNS can lag CreateDBProxy; prepare must not
+    crash on the first gaierror. Resolution retries under a bounded deadline, and
+    the RELEASE gate still keeps any client from connecting before the Proxy is
+    available."""
+
+    source = inspect.getsource(runner.execute_fanin)
+    getaddr = source.index("loop.getaddrinfo(")
+    # The resolve is wrapped in a retry that tolerates gaierror and polls until a
+    # bounded deadline rather than raising on the first failure.
+    assert "except socket.gaierror" in source
+    deadline = source.index("PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS")
+    poll = source.index("PROXY_ENDPOINT_RESOLVE_POLL_SECONDS")
+    failure = source.index("_host_resolution_failed")
+    # The bounded deadline and poll are set up before the resolve loop, and the
+    # hard failure is only raised once the deadline is exceeded.
+    assert deadline < getaddr < failure
+    assert poll > getaddr
+    assert runner.PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS > 0
+    assert 0 < runner.PROXY_ENDPOINT_RESOLVE_POLL_SECONDS
+    assert (
+        runner.PROXY_ENDPOINT_RESOLVE_POLL_SECONDS
+        < runner.PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS
+    )

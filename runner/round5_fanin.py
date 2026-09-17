@@ -62,6 +62,13 @@ RUNNER_LANE_COUNT = 1
 WORKER_COUNT = 4
 MIN_RUNNER_CPU_COUNT = WORKER_COUNT
 HOLD_SECONDS = 30
+# Bounded window and poll interval for resolving the per-bout RDS Proxy endpoint
+# during prepare. The endpoint's public DNS record can lag CreateDBProxy by a
+# few seconds; the RELEASE gate keeps any client from connecting before the
+# Proxy is available, so retrying resolution here (rather than crashing on the
+# first gaierror) is safe and stays well within the resident's 720s deadline.
+PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS = 300.0
+PROXY_ENDPOINT_RESOLVE_POLL_SECONDS = 2.0
 SAMPLED_QUERIES_PER_LANE = 64
 SAMPLE_GROUPS = 8
 CLIENTS_PER_SAMPLE_GROUP = 8
@@ -3992,16 +3999,35 @@ async def execute_fanin(
             )
     loop = asyncio.get_running_loop()
     for lane in lanes:
-        addresses = await loop.getaddrinfo(
-            str(lane.database["host"]),
-            int(lane.database["port"]),
-            type=socket.SOCK_STREAM,
-        )
-        connect_hosts = sorted(
-            {str(address[4][0]) for address in addresses if len(address) >= 5 and address[4]}
-        )
-        if not connect_hosts:
-            raise FanInProtocolError(f"{lane.lane_id}_host_resolution_failed")
+        # The competitor lane's client target is the per-bout RDS Proxy, whose
+        # endpoint the coordinator sends in the STAGE the instant CreateDBProxy
+        # returns -- deliberately, so the resident prepares while AWS is still
+        # making the Proxy usable (the RELEASE is held behind the topology gate
+        # until the Proxy is available). The endpoint's public DNS record can lag
+        # that creation by seconds, so a single getaddrinfo can raise gaierror and
+        # crash the whole prepare. Resolve under a bounded retry instead: the
+        # RELEASE gate downstream still guarantees no client connects before the
+        # Proxy is actually available, so tolerating a not-yet-propagated record
+        # here is safe and matches the intended overlap.
+        resolve_deadline = time.monotonic() + PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS
+        connect_hosts: list[str] = []
+        while True:
+            try:
+                addresses = await loop.getaddrinfo(
+                    str(lane.database["host"]),
+                    int(lane.database["port"]),
+                    type=socket.SOCK_STREAM,
+                )
+            except socket.gaierror:
+                addresses = ()
+            connect_hosts = sorted(
+                {str(address[4][0]) for address in addresses if len(address) >= 5 and address[4]}
+            )
+            if connect_hosts:
+                break
+            if time.monotonic() >= resolve_deadline:
+                raise FanInProtocolError(f"{lane.lane_id}_host_resolution_failed")
+            await asyncio.sleep(PROXY_ENDPOINT_RESOLVE_POLL_SECONDS)
         lane.connect_host = connect_hosts[0]
     diagnostics = RuntimeDiagnostics()
     _runtime_diagnostics = diagnostics
