@@ -86,7 +86,30 @@
       ],
       "Resource": [
         "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/i*-r5-runner-boundary-*",
-        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/r5-*-runner-boundary-*"
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/r5-*-runner-boundary-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/i*-r5-competitor-boundary-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/r5-*-competitor-boundary-*"
+      ]
+    },
+    {
+      "Sid": "ManageRound5ExecutionManagedPolicies",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListEntitiesForPolicy",
+        "iam:ListPolicyVersions",
+        "iam:ListPolicyTags",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/i*-r5-exec-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/r5-*-exec-*"
       ]
     },
     {
@@ -112,7 +135,9 @@
       ],
       "Resource": [
         "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/i*-r5-runner-*",
-        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/r5-*-runner-*"
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/r5-*-runner-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/i*-r5-comp-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/r5-*-comp-*"
       ]
     },
     {
@@ -162,7 +187,27 @@
       ],
       "Resource": [
         "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:lakebase-ant*",
-        "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:rds!*"
+        "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:rds!*",
+        "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:i*-r5-*",
+        "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:r5-*"
+      ]
+    },
+    {
+      "Sid": "ManageRound5ControlQueues",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:CreateQueue",
+        "sqs:DeleteQueue",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueueTags",
+        "sqs:SetQueueAttributes",
+        "sqs:TagQueue",
+        "sqs:UntagQueue"
+      ],
+      "Resource": [
+        "arn:aws:sqs:<AWS_REGION>:<AWS_ACCOUNT_ID>:i*-r5-*",
+        "arn:aws:sqs:<AWS_REGION>:<AWS_ACCOUNT_ID>:r5-*"
       ]
     },
     {

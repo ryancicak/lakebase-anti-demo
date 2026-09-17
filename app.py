@@ -258,9 +258,7 @@ def _coordination_lakebase_endpoint(manifest: DemoManifest) -> str:
     sealed = getattr(manifest, "coordination_lakebase", None)
     if sealed is not None:
         return sealed.endpoint_name
-    return (
-        f"projects/{manifest.databricks.project_id}/branches/coordination/endpoints/primary"
-    )
+    return f"projects/{manifest.databricks.project_id}/branches/coordination/endpoints/primary"
 
 
 def _round_isolation_config(manifest: DemoManifest | None) -> tuple[bool, str]:
@@ -338,12 +336,8 @@ def _bind_deployed_runtime(manifest: DemoManifest) -> None:
         "AURORA_DATABASE": manifest.databricks.database,
         "RDS_DATABASE": manifest.databricks.database,
         "LAKEBASE_ENDPOINT_NAME": expected_production,
-        "ANTI_DEMO_ROUND2_LAKEBASE_ENDPOINT_NAME": _round_lakebase_endpoint(
-            manifest, 2
-        ),
-        "ANTI_DEMO_ROUND3_LAKEBASE_ENDPOINT_NAME": _round_lakebase_endpoint(
-            manifest, 3
-        ),
+        "ANTI_DEMO_ROUND2_LAKEBASE_ENDPOINT_NAME": _round_lakebase_endpoint(manifest, 2),
+        "ANTI_DEMO_ROUND3_LAKEBASE_ENDPOINT_NAME": _round_lakebase_endpoint(manifest, 3),
         "LAKEBASE_DATABASE": manifest.databricks.database,
         "LAKEBASE_EXPECTED_REGION": manifest.aws.region,
         "LAKEBASE_USER": sealed_client_id,
@@ -556,6 +550,8 @@ def connection_spike_factory_from_manifest(
     if owned is None:
         return None
     manifest = owned
+    resident_transport: object | None = None
+    resident_delivery_failure_handler: Callable[[str], Awaitable[None]] | None = None
 
     def build() -> Callable[[CompetitorId], object] | None:
         if not manifest.round5_ready:
@@ -572,10 +568,59 @@ def connection_spike_factory_from_manifest(
         return factory
 
     def factory(competitor: CompetitorId) -> object:
+        nonlocal resident_transport
         from server.connection_spike_live import (
             LakebaseCreationJournalStore,
             build_connection_spike_live_engine,
         )
+        from server.round5_control import (
+            LakebaseRound5ControlStore,
+            Round5ControlDispatcher,
+            Round5ResidentTransport,
+        )
+
+        if resident_transport is None:
+            import boto3
+
+            resources = manifest.require_round5_resources()
+            queues = {
+                "lakebase": str(resources.lakebase_control_queue_url),
+                "competitor": str(resources.competitor_control_queue_url),
+            }
+            control_store = LakebaseRound5ControlStore(lease_store._run)
+
+            async def publish_control(event: Any) -> None:
+                def send() -> None:
+                    source = boto3.Session(region_name=manifest.aws.region)
+                    assumed = source.client("sts").assume_role(
+                        RoleArn=resources.control_role_arn,
+                        RoleSessionName=f"anti-demo-r5-control-{event.lane_id}",
+                        DurationSeconds=900,
+                    )["Credentials"]
+                    session = boto3.Session(
+                        aws_access_key_id=assumed["AccessKeyId"],
+                        aws_secret_access_key=assumed["SecretAccessKey"],
+                        aws_session_token=assumed["SessionToken"],
+                        region_name=manifest.aws.region,
+                    )
+                    session.client("sqs").send_message(
+                        QueueUrl=queues[event.lane_id],
+                        MessageBody=event.encoded_body(),
+                        MessageGroupId=f"{event.lane_id}-{event.job_id}",
+                        MessageDeduplicationId=event.event_id,
+                    )
+
+                await asyncio.to_thread(send)
+
+            dispatcher = Round5ControlDispatcher(
+                control_store,
+                publish_control,
+                on_persistent_failure=resident_delivery_failure_handler,
+            )
+            resident_transport = Round5ResidentTransport(
+                control_store,
+                dispatcher,
+            )
 
         class ActiveLeaseFence:
             async def assert_current(self, scope: Any) -> None:
@@ -627,9 +672,32 @@ def connection_spike_factory_from_manifest(
             ),
             fence=ActiveLeaseFence(),
             fresh_lakebase_host=fresh_lakebase_host,
+            resident_transport=resident_transport,
         )
 
-    return build_round(5, RoundId.SURVIVE_CONNECTION_SPIKE, build)
+    async def close_resident_transport() -> None:
+        nonlocal resident_transport
+        if resident_transport is None:
+            return
+        dispatcher = getattr(resident_transport, "dispatcher", None)
+        close = getattr(dispatcher, "close", None)
+        if callable(close):
+            await close()
+        resident_transport = None
+
+    def set_resident_delivery_failure_handler(
+        handler: Callable[[str], Awaitable[None]],
+    ) -> None:
+        nonlocal resident_delivery_failure_handler
+        resident_delivery_failure_handler = handler
+
+    built = build_round(5, RoundId.SURVIVE_CONNECTION_SPIKE, build)
+    if built is not None:
+        built.close_resident_transport = close_resident_transport  # type: ignore[attr-defined]
+        built.set_resident_delivery_failure_handler = (  # type: ignore[attr-defined]
+            set_resident_delivery_failure_handler
+        )
+    return built
 
 
 def live_orders_factory_from_manifest(
@@ -800,6 +868,8 @@ class _Runtime:
     credential_task: asyncio.Task[None] | None = None
     receipt_store: Any = None
     round4_stop_recovery_task: asyncio.Task[None] | None = None
+    round5_warm_coordinator: Any | None = None
+    round5_resident_transport_closer: Any | None = None
 
 
 async def _open_receipt_store(lease_store: Any) -> DurableReceiptStore | None:
@@ -1003,9 +1073,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             # reopening the ring; the in-memory developer fallback remains lightweight.
             if not deployed and candidate_store.mode == "lakebase":
                 manifest = _load_ready_manifest(require_v2=True)
-            candidate_round5_store = build_lease_store(
-                ring_key=_round5_lease_ring_key(manifest)
-            )
+            candidate_round5_store = build_lease_store(ring_key=_round5_lease_ring_key(manifest))
             if manifest is not None and manifest.manifest_version == 7:
                 candidate_cost_store = build_cost_ledger_store()
                 if candidate_cost_store.mode != "lakebase":
@@ -1066,6 +1134,8 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
     receipt_store: DurableReceiptStore | None = None
     pipeline_power_store: DurablePipelinePowerStore | None = None
     inherited_round4_stop: dict[str, Any] | None = None
+    round5_warm_coordinator: Any | None = None
+    round5_resident_transport_closer: Any | None = None
     try:
         receipt_store = await _open_receipt_store(lease_store)
         install_receipt_store(receipt_store)
@@ -1091,9 +1161,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
 
                 return build_recovery_engine(owned, cleanup_only=True)
 
-            def round5_cleanup(
-                competitor_id: str, journal: object, fence: object
-            ) -> object:
+            def round5_cleanup(competitor_id: str, journal: object, fence: object) -> object:
                 from server.connection_spike_live import build_connection_spike_live_engine
 
                 workspace = (
@@ -1149,6 +1217,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             )
             readiness_verified = True
         else:
+
             class LocalReadinessGate:
                 status = ReadinessStatus(True, "ready", None)
                 round5_status = ReadinessStatus(True, "ready", None)
@@ -1185,6 +1254,75 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         # posted state, which is the same honest degradation a billing outage gets.
         posted_usage_cache = PostedUsageCache(manifest)
         app.state.posted_usage_cache = posted_usage_cache
+        connection_spike_factory = connection_spike_factory_from_manifest(
+            manifest,
+            lease_store=round5_lease_store,
+        )
+        round5_resident_transport_closer = getattr(
+            connection_spike_factory,
+            "close_resident_transport",
+            None,
+        )
+        if (
+            manifest is not None
+            and manifest.round5_ready
+            and getattr(round5_lease_store, "mode", None) == "lakebase"
+            and connection_spike_factory is not None
+            and callable(getattr(manifest, "require_round5_resources", None))
+        ):
+            from server.connection_fanin import (
+                capacity_model_sha256,
+                fanin_config_sha256,
+                fanin_generator_sha256,
+            )
+            from server.connection_spike_live import LiveRound5WarmProvider
+            from server.round5_control import ROUND5_CONTROL_PROTOCOL
+            from server.round5_warm import (
+                ROUND5_WARM_PROTOCOL,
+                LakebaseRound5WarmStore,
+                Round5WarmCoordinator,
+                stable_round5_id,
+            )
+
+            resources = manifest.require_round5_resources()
+            if not resources.v3_factory_ready:
+                raise InvalidStateError(
+                    "Round 5 V4 requires resident runners and static Proxy fixtures"
+                )
+            warm_contract_sha256 = stable_round5_id(
+                ROUND5_WARM_PROTOCOL,
+                resources.baseline_sha256,
+                resources.config_sha256,
+                fanin_config_sha256(),
+                fanin_generator_sha256(),
+                capacity_model_sha256(),
+                ROUND5_CONTROL_PROTOCOL,
+                str(resources.lakebase_control_queue_arn),
+                str(resources.competitor_control_queue_arn),
+                str(resources.runner_control_secret_arn),
+                str(resources.competitor_runner_control_secret_arn),
+            )
+            warm_store = LakebaseRound5WarmStore(
+                round5_lease_store._run,
+                database=manifest.databricks.database,
+            )
+            round5_warm_coordinator = Round5WarmCoordinator(
+                installation_id=manifest.installation_id or manifest.run_id,
+                warm_contract_sha256=warm_contract_sha256,
+                store=warm_store,
+                provider=LiveRound5WarmProvider(
+                    manifest,
+                    connection_spike_factory,
+                ),
+            )
+            set_delivery_failure_handler = getattr(
+                connection_spike_factory,
+                "set_resident_delivery_failure_handler",
+                None,
+            )
+            if callable(set_delivery_failure_handler):
+                set_delivery_failure_handler(round5_warm_coordinator.invalidate_readiness)
+        app.state.round5_warm_coordinator = round5_warm_coordinator
         app.state.run_manager = RunManager(
             lease_store=lease_store,
             round5_lease_store=round5_lease_store,
@@ -1195,9 +1333,8 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round5_prearm_guard=readiness_gate.round5_prearm_guard,
             model_score_factory=model_score_factory_from_manifest(manifest),
             delta_storage_probe=delta_storage_probe_from_manifest(manifest),
-            connection_spike_factory=connection_spike_factory_from_manifest(
-                manifest, lease_store=round5_lease_store
-            ),
+            connection_spike_factory=connection_spike_factory,
+            round5_warm_coordinator=round5_warm_coordinator,
             live_orders_factory=live_orders_factory_from_manifest(manifest),
             round_isolation=round_isolation,
             installation_id=installation_id,
@@ -1262,6 +1399,8 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         # record and the sweep declines. Deliberately not a shutdown hook: the
         # dying process is the worst place to run destructive AWS calls.
         app.state.startup_reap = await _reap_startup_orphans(manifest, lease_store)
+        if round5_warm_coordinator is not None:
+            await round5_warm_coordinator.start()
         posted_usage_task = asyncio.create_task(_refresh_posted_usage(posted_usage_cache))
         # What the startup check found, kept for the window before the probe's
         # first answer -- and for the case where there is no probe at all,
@@ -1295,6 +1434,8 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             credential_task=credential_task,
             receipt_store=receipt_store,
             round4_stop_recovery_task=round4_stop_recovery_task,
+            round5_warm_coordinator=round5_warm_coordinator,
+            round5_resident_transport_closer=round5_resident_transport_closer,
         )
     except BaseException:
         # Uninstalled before the stores below are closed: the write hooks are
@@ -1314,6 +1455,10 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+        if round5_warm_coordinator is not None:
+            await round5_warm_coordinator.close()
+        if callable(round5_resident_transport_closer):
+            await round5_resident_transport_closer()
         for store in (round5_lease_store, cost_ledger_store, lease_store):
             if store is None:
                 continue
@@ -1419,6 +1564,11 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         if callable(close_manager):
             await close_manager()
     finally:
+        if runtime.round5_warm_coordinator is not None:
+            await runtime.round5_warm_coordinator.close()
+        app.state.round5_warm_coordinator = None
+        if callable(runtime.round5_resident_transport_closer):
+            await runtime.round5_resident_transport_closer()
         delta_storage_task = getattr(app.state, "delta_storage_readiness_task", None)
         if delta_storage_task is not None and not delta_storage_task.done():
             delta_storage_task.cancel()
@@ -1581,9 +1731,7 @@ async def _open_runtime_when_manifest_settles(
                 # surface would be describing a problem that has moved on.
                 if first_transient_at is None:
                     first_transient_at = time.monotonic()
-                escalated = (
-                    time.monotonic() - first_transient_at
-                ) >= GATE_ESCALATE_AFTER_SECONDS
+                escalated = (time.monotonic() - first_transient_at) >= GATE_ESCALATE_AFTER_SECONDS
                 gate.detail = (
                     f"STARTUP IS RETRYING AFTER THE MUTATION FINISHED · "
                     f"{type(exc).__name__.upper()} · ATTEMPT {attempts}"
@@ -1641,9 +1789,9 @@ async def _open_runtime_when_manifest_settles(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    deployed = os.environ.get("ANTI_DEMO_ENV") == "databricks-app" or bool(os.environ.get(
-        "DATABRICKS_APP_NAME"
-    ))
+    deployed = os.environ.get("ANTI_DEMO_ENV") == "databricks-app" or bool(
+        os.environ.get("DATABRICKS_APP_NAME")
+    )
     try:
         runtime = await _open_runtime(app, deployed=deployed)
     except ManifestMutationInProgressError as exc:
@@ -1654,9 +1802,7 @@ async def lifespan(app: FastAPI):
         waiting_manager = app.state.run_manager
         opened: list[_Runtime] = []
         waiter = asyncio.create_task(
-            _open_runtime_when_manifest_settles(
-                app, deployed=deployed, gate=gate, opened=opened
-            ),
+            _open_runtime_when_manifest_settles(app, deployed=deployed, gate=gate, opened=opened),
             name="manifest-mutation-wait",
         )
         try:
@@ -1797,6 +1943,7 @@ def _recovery_detail(recovery_state: str, waiting_on: object) -> str:
         "retrying indefinitely, so it will recover on its own once they are -- "
         f"no restart is needed and a restart would not help. {base}"
     )
+
 
 #: Credential verdicts that stop every lane, as opposed to narrowing one round.
 #: These take the single `degraded_detail` slot from anything else that wants it:
@@ -2054,6 +2201,14 @@ def _readiness_response(
     _apply_round4_stop_recovery(payload)
     _apply_owed_pipeline_stop(payload)
     _apply_owed_round5_cleanup(payload)
+    warm_coordinator = getattr(app.state, "round5_warm_coordinator", None)
+    if warm_coordinator is not None:
+        existing_cleanup_owed = bool(payload.get("round5_cleanup_owed"))
+        warm_status = warm_coordinator.public_status_cached()
+        payload.update(warm_status)
+        payload["round5_cleanup_owed"] = existing_cleanup_owed or bool(
+            warm_status.get("round5_cleanup_owed")
+        )
     _apply_delta_storage_refusals(payload)
     # Last, so it yields the one `degraded_detail` sentence to all seven ranked
     # claimants above. It still degrades and still lowers `status`: it is the
@@ -2261,12 +2416,8 @@ def _apply_round4_stop_recovery(payload: dict[str, Any]) -> None:
 
     recovery = getattr(app.state, "round4_stop_recovery", None)
     status = getattr(recovery, "status", recovery) or SETTLED
-    payload["round4_stop_recovery_state"] = str(
-        getattr(status, "state", "settled")
-    )
-    payload["round4_stop_recovery_attempts"] = int(
-        getattr(status, "attempts", 0) or 0
-    )
+    payload["round4_stop_recovery_state"] = str(getattr(status, "state", "settled"))
+    payload["round4_stop_recovery_attempts"] = int(getattr(status, "attempts", 0) or 0)
     payload["round4_stop_recovery_detail"] = getattr(status, "detail", None)
     payload["round4_stop_recovery_next_attempt_seconds"] = getattr(
         status,
@@ -2274,9 +2425,7 @@ def _apply_round4_stop_recovery(payload: dict[str, Any]) -> None:
         None,
     )
     payload["round4_stop_recovery_error"] = getattr(status, "error", None)
-    payload["round4_stop_recovery_lease_held"] = bool(
-        getattr(recovery, "lease_held", False)
-    )
+    payload["round4_stop_recovery_lease_held"] = bool(getattr(recovery, "lease_held", False))
 
 
 def _apply_startup_reap(payload: dict[str, Any]) -> None:
@@ -2496,11 +2645,11 @@ async def readiness() -> JSONResponse:
     )
     return _readiness_response(ingress_drift, presence)
 
+
 if FRONTEND_DIST.exists():
     assets = FRONTEND_DIST / "assets"
     if assets.exists():
         app.mount("/assets", StaticFiles(directory=assets), name="assets")
-
 
 
 _POST_ONLY_SESSION_CONTROLS = frozenset(
@@ -2539,9 +2688,9 @@ async def serve_frontend(full_path: str) -> Response:
     dist = FRONTEND_DIST.resolve()
     candidate = (FRONTEND_DIST / full_path).resolve()
     if full_path and candidate.is_relative_to(dist) and candidate.is_file():
-        headers = SHELL_CACHE_HEADERS if candidate.suffix == ".html" else {
-            "Cache-Control": "no-cache"
-        }
+        headers = (
+            SHELL_CACHE_HEADERS if candidate.suffix == ".html" else {"Cache-Control": "no-cache"}
+        )
         return FileResponse(candidate, headers=headers)
 
     # A missing fingerprinted asset is a real deploy mismatch, never an SPA route.

@@ -1,0 +1,45 @@
+sequenceDiagram
+    autonumber
+    actor Operator
+    participant UI
+    participant Manager as Round 5 manager
+    participant LB as Lakebase pipeline
+    participant LBR as Lakebase runner
+    participant AWS as AWS pipeline
+    participant RDS as AWS RDS control plane
+    participant AWSR as Competitor runner
+
+    Note over Manager,AWSR: A READY warm generation already owns two fresh runner receipts and both target receipts
+    Note over RDS: No per-bout RDS Proxy exists before the bell
+
+    Operator->>UI: Ring bell
+    UI->>Manager: POST /run (claim_id, idempotency key)
+    Manager->>Manager: Durable CLAIMED to RUNNING CAS
+    Manager->>Manager: Capture only comparison T0
+    par Same event-loop turn
+        Manager-)LB: Release Lakebase gate
+        LB->>LBR: run_lane_v3(job_id)
+    and
+        Manager-)AWS: Release AWS gate
+        AWS->>RDS: CreateDBProxy
+    and
+        Manager-->>UI: RUNNING + two active elapsed floors
+    end
+
+    LBR->>LBR: Client 1 verifies pooled path and remains held
+    LBR-->>Manager: Ramp progress
+    LBR-->>Manager: Exactly 10,000 held
+    Manager-->>UI: Stop Lakebase observed bell clock
+
+    RDS-->>AWS: Proxy available + target available
+    AWS->>AWS: Verify exact role, auth, TLS, VPC, subnet and SG bindings
+    AWS->>AWSR: run_lane_v3(job_id)
+    AWSR->>AWSR: Client 1 verifies Proxy path and remains held
+    AWSR-->>Manager: Ramp progress
+    AWSR-->>Manager: Exactly 10,000 held
+    Manager-->>UI: Stop competitor observed bell clock
+
+    Manager->>Manager: Validate hold, samples, telemetry and identity
+    Manager-->>UI: Verified result or explicit failure
+    Manager->>RDS: Deregister target, delete Proxy, prove absence
+    Manager->>Manager: Enqueue next warm generation automatically

@@ -132,6 +132,13 @@ const runningLaneRank: Partial<Record<LaneSnapshot['state'], number>> = {
   verifying: 2,
 }
 
+const towelStateRank: Record<NonNullable<DemoSession['towel']>['state'], number> = {
+  stopping: 0,
+  cleaning: 1,
+  failed: 2,
+  ready: 3,
+}
+
 /**
  * The live fan-in counters, which only ever climb inside one bout.
  *
@@ -269,12 +276,82 @@ function anyRunningLaneRegresses(current: DemoSession, incoming: DemoSession): b
   )
 }
 
+function authoritativeRoundFiveTerminal(
+  current: DemoSession,
+  incoming: DemoSession,
+): boolean {
+  const prior = current.round5_runtime
+  const next = incoming.round5_runtime
+  if (!prior || !next || prior.bell_id !== next.bell_id) return false
+  const incomingTerminal = incoming.state === 'failed'
+    || incoming.state === 'towelled'
+    || incoming.state === 'verified'
+  return incomingTerminal && current.state === 'running'
+}
+
 export function acceptsReconciledSession(current: DemoSession, incoming: DemoSession): boolean {
   if (current.id !== incoming.id) return false
+  const currentRoundFive = current.round5_runtime
+  const incomingRoundFive = incoming.round5_runtime
+  const sameBell = Boolean(
+    currentRoundFive
+    && incomingRoundFive
+    && currentRoundFive.bell_id === incomingRoundFive.bell_id,
+  )
+  if (
+    sameBell
+    && currentRoundFive
+    && incomingRoundFive
+    && (currentRoundFive.state === 'verified'
+      || currentRoundFive.state === 'failed'
+      || currentRoundFive.state === 'towelled')
+    && (
+      incomingRoundFive.state !== currentRoundFive.state
+      || incoming.state !== current.state
+    )
+  ) return false
+  const terminalSupersedes = authoritativeRoundFiveTerminal(current, incoming)
+  const towelProgresses = Boolean(
+    current.state === 'towelled'
+    && incoming.state === 'towelled'
+    && current.towel
+    && incoming.towel
+    && current.towel.requested_at === incoming.towel.requested_at
+    && towelStateRank[incoming.towel.state] >= towelStateRank[current.towel.state],
+  )
+  if (
+    sameBell
+    && currentRoundFive
+    && incomingRoundFive
+    && incomingRoundFive.revision < currentRoundFive.revision
+    && !terminalSupersedes
+  ) return false
+  if (
+    sameBell
+    && currentRoundFive
+    && incomingRoundFive
+    && incomingRoundFive.revision === currentRoundFive.revision
+  ) {
+    if (JSON.stringify(currentRoundFive) !== JSON.stringify(incomingRoundFive)) return false
+  }
   const currentTimestamp = timestamp(current.updated_at)
   const incomingTimestamp = timestamp(incoming.updated_at)
-  if (incomingTimestamp < currentTimestamp) return false
-  if (incomingTimestamp === currentTimestamp && anyRunningLaneRegresses(current, incoming)) {
+  if (
+    incomingTimestamp < currentTimestamp
+    && !terminalSupersedes
+    && !(
+      sameBell
+      && currentRoundFive
+      && incomingRoundFive
+      && incomingRoundFive.revision > currentRoundFive.revision
+    )
+  ) return false
+  if (
+    incomingTimestamp === currentTimestamp
+    && anyRunningLaneRegresses(current, incoming)
+    && !terminalSupersedes
+    && !towelProgresses
+  ) {
     return false
   }
   const currentActiveRank = activeSessionRank[current.state]
@@ -287,6 +364,7 @@ export function acceptsReconciledSession(current: DemoSession, incoming: DemoSes
   if (
     current.state === 'verified'
     && incoming.state !== 'verified'
+    && !terminalSupersedes
     && !(
       incoming.state === 'running'
       && current.redo?.state === 'ready'
@@ -315,12 +393,13 @@ export function selectRound4Session(
 ): DemoSession | null {
   if (!current || !candidate) return candidate
   if (current.id !== candidate.id) return candidate
-  return acceptsReconciledSession(current, candidate)
-    ? preserveRunningLaneLatches(
+  if (!acceptsReconciledSession(current, candidate)) return current
+  return authoritativeRoundFiveTerminal(current, candidate)
+    ? preserveCooldownLaneLatches(current, candidate)
+    : preserveRunningLaneLatches(
         current,
         preserveCooldownLaneLatches(current, candidate),
       )
-    : current
 }
 
 export function roundFourUnsupportedReason(lane: LaneSnapshot): string {
@@ -424,4 +503,21 @@ export function applyRunEventSnapshot(current: DemoSession | null, event: RunEve
     }
   }
   return current
+}
+
+export function reconcileRunEventSession(
+  current: DemoSession | null,
+  event: RunEvent,
+): { accepted: boolean; session: DemoSession | null } {
+  const projected = applyRunEventSnapshot(current, event)
+  const selected = selectRound4Session(current, projected)
+  return {
+    accepted: !(
+      current
+      && projected
+      && projected !== current
+      && selected === current
+    ),
+    session: selected,
+  }
 }

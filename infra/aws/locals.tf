@@ -74,6 +74,10 @@ locals {
   round5_bout_base_tags = merge(local.round5_required_tags, {
     "managed-by" = "round5-lifecycle"
   })
+  round5_bout_tag_keys = sort(keys(merge(local.round5_bout_base_tags, {
+    "anti-demo-bout-id"    = ""
+    "anti-demo:bout-token" = ""
+  })))
 
   database_name   = "anti_demo"
   master_username = "antidemo_admin"

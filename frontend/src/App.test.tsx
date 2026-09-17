@@ -1230,7 +1230,7 @@ describe('backstage setup', () => {
     expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
   })
 
-  it('returns from a Round 5 towel result while cleanup stays authoritative backstage', async () => {
+  it('retains the Round 5 session pointer while towel cleanup remains unresolved', async () => {
     const towelled = roundFiveTowelCleanupSession()
     window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
       id: towelled.id,
@@ -1244,16 +1244,13 @@ describe('backstage setup', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
     render(<App />)
 
     expect(await screen.findByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
     const snapshotBeforeNavigation = JSON.stringify(towelled)
-    await user.click(screen.getByRole('button', { name: /a · (next round|fight card)/i }))
-
-    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
-    expect(screen.queryByText(/result posted · cleanup backstage/i)).not.toBeInTheDocument()
-    expect(window.location.hash).toBe('#setup/card')
+    expect(screen.queryByRole('button', { name: /a · (next round|fight card)/i })).not.toBeInTheDocument()
+    expect(window.location.hash).toBe('#proof')
+    expect(JSON.parse(window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')!).id).toBe(towelled.id)
     expect(JSON.stringify(towelled)).toBe(snapshotBeforeNavigation)
     expect(towelled.towel?.state).toBe('cleaning')
     expect(towelled.round5_setup?.cleanup_retryable).toBe(true)
@@ -1286,6 +1283,108 @@ describe('backstage setup', () => {
 
     expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
     expect(window.location.hash).toBe('#setup/card')
+  })
+
+  it('rejected V3 SSE snapshots have no UI side effects and trigger authoritative GET', async () => {
+    const base = session('running')
+    const round = FALLBACK_CATALOG.rounds.find(
+      (candidate) => candidate.id === 'survive_connection_spike',
+    )!
+    const running: DemoSession = {
+      ...base,
+      round,
+      round5_runtime: {
+        protocol: 'round5-bell-to-10k-v4',
+        warm_generation: 9,
+        bell_id: 'bell-reconcile',
+        revision: 8,
+        state: 'running',
+        bell_at_utc: base.run_started_at!,
+        lanes: {
+          lakebase: {
+            id: 'lakebase',
+            phase: 'ramping',
+            elapsed_at_snapshot_ms: 5_000,
+            bell_to_10000_observed_ms: null,
+            observation_uncertainty_ms: null,
+            pooled_path_ready_observed_ms: 1,
+            ramp_started_observed_ms: 1,
+            ramp_time_to_10000_ms: null,
+            clients_initiated: 5_000,
+            clients_authenticated: 4_990,
+            held_clients: 4_990,
+            peak_clients_authenticated: 4_990,
+            peak_held_clients: 4_990,
+            progress_revision: 1,
+            sampled_queries_succeeded: 0,
+            status: '4,990 / 10,000 clients held',
+          },
+          competitor: {
+            id: 'competitor',
+            phase: 'provisioning_proxy',
+            elapsed_at_snapshot_ms: 5_000,
+            bell_to_10000_observed_ms: null,
+            observation_uncertainty_ms: null,
+            pooled_path_ready_observed_ms: null,
+            ramp_started_observed_ms: null,
+            ramp_time_to_10000_ms: null,
+            clients_initiated: 0,
+            clients_authenticated: 0,
+            held_clients: 0,
+            peak_clients_authenticated: 0,
+            peak_held_clients: 0,
+            progress_revision: 0,
+            sampled_queries_succeeded: 0,
+            status: 'AWS is creating the per-bout RDS Proxy',
+          },
+        },
+      },
+    }
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: running.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    let sessionReads = 0
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${running.id}`) {
+        sessionReads += 1
+        return Promise.resolve(jsonResponse(running))
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    render(<App />)
+    const towel = await screen.findByRole('button', { name: /throw in the towel/i })
+    const rejected = structuredClone(running)
+    rejected.state = 'failed'
+    rejected.failure = 'Rejected equal-revision terminal'
+    rejected.round5_runtime!.state = 'failed'
+    rejected.round5_runtime!.lanes.lakebase.phase = 'failed'
+
+    FakeEventSource.instances.at(-1)!.emit({
+      sequence: 1,
+      event: 'session_failed',
+      occurred_at: running.updated_at,
+      payload: {
+        state: 'failed',
+        message: 'Rejected equal-revision terminal',
+        session: rejected,
+      },
+    })
+
+    await waitFor(() => expect(sessionReads).toBeGreaterThanOrEqual(2))
+    expect(towel).toBeEnabled()
+    expect(document.querySelector('.proof-screen')).toHaveAttribute(
+      'data-session-state',
+      'running',
+    )
+    expect(screen.queryByText(/Rejected equal-revision terminal/i)).not.toBeInTheDocument()
+    expect(JSON.parse(
+      window.localStorage.getItem('lakebase-anti-demo:scorecard:v2')!,
+    ).entries).toEqual([])
   })
 
   it.each([
@@ -1631,8 +1730,11 @@ describe('backstage setup', () => {
 
     const runCalls = () => fetchMock.mock.calls.filter((call) => String(call[0]).endsWith('/run'))
     expect(runCalls()).toHaveLength(1)
-    expect(audioMocks.playOriginalBell).toHaveBeenCalledTimes(1)
-    expect(audioMocks.startOriginalRoundTheme).toHaveBeenCalledTimes(1)
+    // The bell cue is authoritative: it fires only once /run is accepted. While
+    // the request is still in flight nothing has sounded, so a rejected bell
+    // produces no cue at all.
+    expect(audioMocks.playOriginalBell).toHaveBeenCalledTimes(0)
+    expect(audioMocks.startOriginalRoundTheme).toHaveBeenCalledTimes(0)
     // The control locks itself while the first bell is unresolved, which is the
     // mechanism that makes the second press unreportable in the first place.
     await waitFor(() => expect(screen.getByRole('button', { name: /confirming the bell/i })).toBeDisabled())
@@ -1643,7 +1745,9 @@ describe('backstage setup', () => {
 
     expect(await screen.findByRole('heading', { name: 'Wake this idle app' })).toBeInTheDocument()
     expect(runCalls()).toHaveLength(1)
+    // Exactly one accepted bell → exactly one cue.
     expect(audioMocks.playOriginalBell).toHaveBeenCalledTimes(1)
+    expect(audioMocks.startOriginalRoundTheme).toHaveBeenCalledTimes(1)
     // The notice described a request in flight, and that request has landed.
     expect(screen.queryByText(/cannot start a second bout/i)).not.toBeInTheDocument()
   })

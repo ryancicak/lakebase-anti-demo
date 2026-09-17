@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import pytest
 
+from runner import connection_spike_runner as runner_parent
 from runner import round5_fanin as runner_fanin
 from server.connection_fanin import (
     ConnectionSpikeContract,
     capacity_model_sha256,
     fanin_config_sha256,
     fanin_generator_sha256,
+)
+from server.connection_spike_live import (
+    RUNNER_ASSETS,
+    runner_harness_sha256,
 )
 
 
@@ -44,6 +49,10 @@ def test_the_generator_digest_matches_the_runner() -> None:
     assert fanin_generator_sha256() == runner_fanin.generator_sha256()
 
 
+def test_complete_five_file_harness_digest_matches_runner() -> None:
+    assert runner_harness_sha256() == runner_parent.runner_harness_sha256()
+
+
 def test_the_capacity_model_digest_matches_the_runner() -> None:
     assert capacity_model_sha256() == runner_fanin.capacity_model_sha256()
 
@@ -53,6 +62,22 @@ def test_a_generator_digest_is_read_from_the_named_file() -> None:
 
     with pytest.raises(OSError):
         fanin_generator_sha256("/nonexistent/round5_fanin.py")
+
+
+def test_parent_runner_drift_changes_complete_harness_not_generator(
+    tmp_path,
+) -> None:
+    source = runner_parent.Path(runner_parent.__file__).resolve().parent
+    for name in RUNNER_ASSETS:
+        (tmp_path / name).write_bytes((source / name).read_bytes())
+    before_harness = runner_harness_sha256(tmp_path)
+    before_generator = fanin_generator_sha256(tmp_path / "round5_fanin.py")
+
+    with (tmp_path / "connection_spike_runner.py").open("ab") as target:
+        target.write(b"\n# parent drift\n")
+
+    assert fanin_generator_sha256(tmp_path / "round5_fanin.py") == before_generator
+    assert runner_harness_sha256(tmp_path) != before_harness
 
 
 def test_the_runner_instance_shape_is_named_once() -> None:
@@ -79,6 +104,12 @@ def test_the_fanin_ssm_window_outlasts_the_runners_own_budget() -> None:
     about the 10,000 clients that were up at the time.
     """
 
+    from runner import connection_spike_runner as runner
     from server.connection_spike_live import FANIN_SSM_TIMEOUT_SECONDS
 
     assert FANIN_SSM_TIMEOUT_SECONDS > runner_fanin.RUN_TIMEOUT_SECONDS
+    assert (
+        runner.FANIN_SSM_COMMAND_TIMEOUT_SECONDS
+        == runner_fanin.RUN_TIMEOUT_SECONDS + runner.FANIN_SSM_SAFETY_MARGIN_SECONDS
+        == FANIN_SSM_TIMEOUT_SECONDS
+    )

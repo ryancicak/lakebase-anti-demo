@@ -1737,6 +1737,88 @@ def test_round_five_cleanup_is_machine_readable_without_reclassifying_failures()
     assert "availability_reason_code" not in reopened
 
 
+def test_round_five_warm_cleaning_is_cleanup_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_app = FastAPI()
+    api_app.state.run_manager = SimpleNamespace(
+        grant_refusals={},
+        storage_refusals={},
+        round5_ring_ready=False,
+        round5_warm_status={
+            "round5_warm_state": "cleaning",
+            "round5_warm_generation": 8,
+        },
+    )
+    api_app.state.readiness_gate = SimpleNamespace(
+        status=SimpleNamespace(ring_ready=True, maintenance_detail=None),
+        round5_status=SimpleNamespace(
+            ring_ready=False,
+            reason_code=None,
+            maintenance_state="ready",
+            maintenance_detail=None,
+        ),
+    )
+    monkeypatch.setattr(api_module, "effective_credential_verdict", lambda _state: None)
+    monkeypatch.setattr(api_module, "cached_installation_report", lambda: None)
+    monkeypatch.setattr(
+        api_module,
+        "deployed_aws_posture",
+        lambda: SimpleNamespace(
+            egress_sealed=True,
+            runtime_role_sealed=True,
+        ),
+    )
+    monkeypatch.setattr(api_module.selfheal, "deployed", lambda: False)
+    request = Request({"type": "http", "app": api_app})
+
+    signals = api_module._availability_signals(request)
+
+    assert signals.round5_ring_ready is False
+    assert signals.round5_reason_code == "cleanup_in_progress"
+    assert signals.round5_detail is not None
+    assert signals.round5_detail.startswith("CLEANUP IN PROGRESS")
+
+
+def test_round_five_without_warm_coordinator_uses_readiness_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_app = FastAPI()
+    api_app.state.run_manager = SimpleNamespace(
+        grant_refusals={},
+        storage_refusals={},
+        round5_ring_ready=True,
+        round5_warm_status=None,
+    )
+    api_app.state.readiness_gate = SimpleNamespace(
+        status=SimpleNamespace(ring_ready=True, maintenance_detail=None),
+        round5_status=SimpleNamespace(
+            ring_ready=False,
+            reason_code=None,
+            maintenance_state="maintenance",
+            maintenance_detail="Round 5 cleanup is still owed",
+        ),
+    )
+    monkeypatch.setattr(api_module, "effective_credential_verdict", lambda _state: None)
+    monkeypatch.setattr(api_module, "cached_installation_report", lambda: None)
+    monkeypatch.setattr(
+        api_module,
+        "deployed_aws_posture",
+        lambda: SimpleNamespace(
+            egress_sealed=True,
+            runtime_role_sealed=True,
+        ),
+    )
+    monkeypatch.setattr(api_module.selfheal, "deployed", lambda: False)
+    request = Request({"type": "http", "app": api_app})
+
+    signals = api_module._availability_signals(request)
+
+    assert signals.round5_ring_ready is False
+    assert signals.round5_reason_code == "cleanup_in_progress"
+    assert signals.round5_detail == "Round 5 cleanup is still owed"
+
+
 def test_the_deployed_refusals_lift_once_the_installation_admits_the_app() -> None:
     """The correction, and it is the mirror image of the original incident.
 

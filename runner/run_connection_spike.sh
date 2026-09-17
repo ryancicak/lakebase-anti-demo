@@ -6,6 +6,10 @@ readonly RUNNER_ROOT=/opt/lakebase-anti-demo/round5
 readonly PYTHON_BIN="${RUNNER_ROOT}/venv/bin/python3.12"
 readonly RUNNER="${RUNNER_ROOT}/connection_spike_runner.py"
 
+if [ "$#" -eq 5 ] && [ "$1" = "--resident-agent" ]; then
+  exec "${PYTHON_BIN}" -I "${RUNNER}" "$@"
+fi
+
 if [ "$#" -ne 1 ]; then
   printf '%s\n' 'RUNNER_ERROR:request_missing'
   exit 64

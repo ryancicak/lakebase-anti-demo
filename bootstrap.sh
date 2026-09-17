@@ -80,7 +80,7 @@ TF_S3_BACKEND_MIN="1.11.0"
 # Region-scoped list prices, copied from server/cost_model.py so the summary
 # below cannot drift from the model the app itself bills against.
 RATE_RDS_T4G_MEDIUM_HOUR="0.065"
-RATE_EC2_M6I_LARGE_HOUR="0.096"
+RATE_EC2_C7I_2XLARGE_HOUR="0.4284"
 RATE_PUBLIC_IPV4_HOUR="0.005"
 RATE_RDS_GP3_GB_MONTH="0.115"
 RATE_EBS_GP3_GB_MONTH="0.08"
@@ -94,8 +94,14 @@ RATE_LAKEBASE_DBU_PER_CU_HOUR="0.213"
 # round5_runner.tf and round5_secrets.tf.
 COUNT_AURORA_CLUSTERS=4
 COUNT_RDS_INSTANCES=3
-COUNT_RUNNERS=1
-COUNT_TF_SECRETS=2
+# Two resident runners now: the original Lakebase runner and a dedicated
+# competitor runner, each c7i.2xlarge with its own IPv4, IAM identity and lane.
+COUNT_RUNNERS=2
+# Terraform-created Secrets Manager secrets: the two static Proxy credential
+# secrets plus the two lane-scoped resident control DSN secrets (Lakebase and
+# competitor). The RDS-managed cluster/instance master secrets are counted
+# separately by COUNT_MANAGED_MASTER_SECRETS.
+COUNT_TF_SECRETS=4
 COUNT_MANAGED_MASTER_SECRETS=7
 COUNT_LAKEBASE_PROJECTS=7
 
@@ -600,6 +606,11 @@ unset EARLY_MANIFEST
 # ends in an actionable error instead. Generous enough that an operator reading
 # the prompt and reaching for a password manager is not cut off.
 PROMPT_TIMEOUT_SECONDS="${ANTI_DEMO_PROMPT_TIMEOUT_SECONDS:-120}"
+ROUND5_WARM_DEADLINE_SECONDS="${ANTI_DEMO_ROUND5_WARM_DEADLINE_SECONDS:-4500}"
+[[ "$ROUND5_WARM_DEADLINE_SECONDS" =~ ^[0-9]+$ ]] ||
+  die "ANTI_DEMO_ROUND5_WARM_DEADLINE_SECONDS must be a positive integer"
+((ROUND5_WARM_DEADLINE_SECONDS > 0)) ||
+  die "ANTI_DEMO_ROUND5_WARM_DEADLINE_SECONDS must be greater than zero"
 
 # Both prompts refuse through this, so the message cannot differ between them.
 # Every input is also readable from the environment -- the call sites pass
@@ -912,8 +923,10 @@ info "not syncing .venv or building frontend/dist; assuming both already exist"
   warn "frontend/dist is missing and this run was told not to build it; the UI answers 503."
 fi
 
-# The stable bounded protocol keeps the original neutral runner shape.
-ROUND5_RUNNER_INSTANCE_TYPE="m6i.large"
+# The frozen dual-10,000-client protocol requires the c7i.2xlarge runner shape;
+# infra/aws/variables.tf refuses anything smaller. The RunInstances dry-run probe
+# below must exercise the same shape provisioning will actually launch.
+ROUND5_RUNNER_INSTANCE_TYPE="c7i.2xlarge"
 
 # ---------------------------------------------------------------------------
 # 2. AWS identity
@@ -1943,7 +1956,7 @@ step "What this will cost"
 
 fixed_daily() {
   awk -v rds="$RATE_RDS_T4G_MEDIUM_HOUR" -v n_rds="$COUNT_RDS_INSTANCES" \
-    -v ec2="$RATE_EC2_M6I_LARGE_HOUR" -v n_ec2="$COUNT_RUNNERS" \
+    -v ec2="$RATE_EC2_C7I_2XLARGE_HOUR" -v n_ec2="$COUNT_RUNNERS" \
     -v ip="$RATE_PUBLIC_IPV4_HOUR" \
     'BEGIN { printf "%.2f", 24 * (rds * n_rds + ec2 * n_ec2 + ip * n_ec2) }'
 }
@@ -1968,8 +1981,8 @@ cat <<SUMMARY
 
   AWS, always on
     ${COUNT_RDS_INSTANCES} x RDS PostgreSQL db.t4g.medium, 20 GiB gp3   \$${RATE_RDS_T4G_MEDIUM_HOUR}/h each
-    ${COUNT_RUNNERS} x EC2 m6i.large Round 5 runner, 20 GiB gp3     \$${RATE_EC2_M6I_LARGE_HOUR}/h
-    ${COUNT_RUNNERS} x public IPv4 address on that runner            \$${RATE_PUBLIC_IPV4_HOUR}/h
+    ${COUNT_RUNNERS} x EC2 c7i.2xlarge Round 5 runner (Lakebase + competitor lanes), 20 GiB gp3   \$${RATE_EC2_C7I_2XLARGE_HOUR}/h each
+    ${COUNT_RUNNERS} x public IPv4 address, one per runner            \$${RATE_PUBLIC_IPV4_HOUR}/h each
                                                      -> ~\$$(fixed_daily)/day fixed
     storage and $((COUNT_TF_SECRETS + COUNT_MANAGED_MASTER_SECRETS)) Secrets Manager secrets       -> ~\$$(metered_daily)/day
 
@@ -1986,11 +1999,17 @@ cat <<SUMMARY
       \$${RATE_LAKEBASE_DBU_PER_CU_HOUR} DBU/CU-hour at \$${RATE_LAKEBASE_DBU}/DBU, plus \$0.023/DSU storage.
     SQL warehouse time for Round 4 and Round 6.
 
-  IAM this creates: 3 roles (Round 5 control, runner, proxy service),
-  1 customer-managed permissions boundary, 1 instance profile, 3 inline role
-  policies, 1 AWS-managed policy attachment. Networking reuses the default VPC
-  and its subnets; it creates 8 security groups, 1 egress rule and 4 DB subnet
-  groups.
+  IAM this creates: 4 roles (Round 5 control, Lakebase runner, competitor
+  runner, proxy service), 2 customer-managed permissions boundaries (one per
+  runner) plus the control role's attached execution-proxy managed policy,
+  2 instance profiles (one per runner), the control role's inline execution
+  policy and the per-runner baseline-secret and FIFO-consumer inline policies,
+  and 2 AWS-managed SSM policy attachments (one per runner). It also creates
+  4 SQS FIFO queues (a control queue and dead-letter queue per lane) and, with
+  the two lane-scoped resident control secrets above, the two-runner control
+  plane. Networking reuses the default VPC and its subnets; it creates the two
+  runner security groups, the two static Proxy network groups, the per-runner
+  egress rules, and 4 DB subnet groups.
 
   Expect the standing total in the tens of dollars per day. The app's own
   standing-cost panel is the number to trust once it is running.
@@ -2917,8 +2936,25 @@ if ((NEEDS_UV == 1)) && [[ ! -f uv.lock ]]; then
 fi
 
 info "syncing the working tree to $WORKSPACE_SRC"
-if OUT="$(databricks sync . "$WORKSPACE_SRC" --full "${DATABRICKS_ARGS[@]}" \
-  "${SYNC_ARGS[@]}" 2>&1)"; then
+SYNC_ATTEMPTS=4
+SYNC_OK=0
+for attempt in $(seq 1 $SYNC_ATTEMPTS); do
+  if OUT="$(databricks sync . "$WORKSPACE_SRC" --full "${DATABRICKS_ARGS[@]}" \
+    "${SYNC_ARGS[@]}" 2>&1)"; then
+    SYNC_OK=1
+    break
+  fi
+  if ! printf '%s' "$OUT" |
+    grep -Eqi 'request timed out|timeout|connection reset|unexpected EOF|unavailable|429|503'; then
+    break
+  fi
+  if ((attempt < SYNC_ATTEMPTS)); then
+    warn "Databricks source sync hit a transient transport failure; retrying \
+(attempt $((attempt + 1)) of $SYNC_ATTEMPTS)"
+    sleep $((attempt * 2))
+  fi
+done
+if ((SYNC_OK == 1)); then
   ok "source synced"
 else
   die "databricks sync failed: $(printf '%s' "$OUT" | tail -3)"
@@ -3111,7 +3147,10 @@ if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" && -n "$APP
       sleep 10
     done
     if ((SERVING == 1)); then
-      READINESS_DEADLINE=$((SECONDS + 300))
+      # Liveness is already proven above. Round 5 warms backstage and has a
+      # measured worst case near one hour, so deployment success waits for its
+      # explicit READY generation without holding the platform health endpoint.
+      READINESS_DEADLINE=$((SECONDS + ROUND5_WARM_DEADLINE_SECONDS))
       while ((SECONDS < READINESS_DEADLINE)); do
         READY_BODY="$(curl -fsS --max-time 30 -H "Authorization: Bearer $APP_TOKEN" \
           "$APP_URL/readyz" 2>/dev/null || true)"
@@ -3119,7 +3158,8 @@ if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" && -n "$APP
           "$APP_URL/api/catalog" 2>/dev/null || true)"
         if printf '%s' "$READY_BODY" | jq -e '
           .status == "ready" and .credentials_state == "ok" and
-          .degraded == false and .ring_ready == true' >/dev/null 2>&1 &&
+          .degraded == false and .ring_ready == true and
+          .round5_ring_ready == true' >/dev/null 2>&1 &&
           printf '%s' "$CATALOG_BODY" | jq -e '
             (.rounds | length) == 6 and
             all(.rounds[]; .availability == "ready")' >/dev/null 2>&1; then
@@ -3127,7 +3167,10 @@ if [[ "$FINAL_COMPUTE" == "ACTIVE" && "$FINAL_DEPLOY" == "SUCCEEDED" && -n "$APP
           ok "GET /readyz is ready and all six catalog rounds are ready"
           break
         fi
-        printf '  ...   waiting for full six-round readiness\n'
+        printf '  ...   waiting for full six-round readiness (Round 5: %s, retry: %s, error: %s)\n' \
+          "$(printf '%s' "$READY_BODY" | jq -r '.round5_warm_state // "unknown"' 2>/dev/null)" \
+          "$(printf '%s' "$READY_BODY" | jq -r '.round5_warm_next_retry_at // "none"' 2>/dev/null)" \
+          "$(printf '%s' "$READY_BODY" | jq -r '.round5_warm_last_error_code // "none"' 2>/dev/null)"
         sleep 10
       done
     fi

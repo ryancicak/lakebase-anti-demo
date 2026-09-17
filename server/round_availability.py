@@ -186,7 +186,12 @@ _STORAGE_HEADLINE = (
     "It stays off the card; the other available rounds are unaffected."
 )
 
-_ROUND5_RING_HEADLINE = (
+_ROUND5_WARMING_HEADLINE = (
+    f"{NOT_ON_THE_CARD} Round 5 is preparing backstage and will unlock "
+    "automatically. The other rounds are unaffected."
+)
+
+_ROUND5_CLEANUP_HEADLINE = (
     f"{NOT_ON_THE_CARD} Round 5's own backstage cleanup has not finished. The "
     "other rounds are unaffected."
 )
@@ -510,7 +515,11 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
             )
         if not signals.round5_ring_ready:
             return RoundRefusal(
-                _ROUND5_RING_HEADLINE,
+                (
+                    _ROUND5_CLEANUP_HEADLINE
+                    if signals.round5_reason_code == "cleanup_in_progress"
+                    else _ROUND5_WARMING_HEADLINE
+                ),
                 signals.round5_detail or _ROUND5_UNSETTLED_REFUSAL,
                 (
                     "cleanup_in_progress"

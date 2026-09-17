@@ -1,7 +1,12 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
 import { classifyOutcome } from './ringside-cues'
 import { metricValue, modelScoreEvidence } from './round4'
-import { ROUND_FIVE_SAMPLED_QUERIES } from './round5'
+import {
+  ROUND_FIVE_BELL_PROTOCOL,
+  ROUND_FIVE_FANIN_PROTOCOL,
+  ROUND_FIVE_SAMPLED_QUERIES,
+  roundFiveLaneResult,
+} from './round5'
 import { preciseDuration } from './time'
 
 export type ReplayBeatId = 'setup' | 'same-test' | 'takeaway'
@@ -45,7 +50,11 @@ function laneName(session: DemoSession, laneId: LaneId): string {
 }
 
 function roundFiveUsesFanIn(session: DemoSession): boolean {
-  return session.round5_setup?.protocol !== 'connection-spike-v1'
+  const protocol = session.round5_setup?.protocol
+  return session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    || protocol === ROUND_FIVE_FANIN_PROTOCOL
+    || protocol === 'round5-fanin-v3'
+    || protocol === 'round5-fanin-v2'
 }
 
 function exactMetric(
@@ -144,9 +153,22 @@ function incompleteTakeaway(session: DemoSession): string | null {
   }
   if (
     session.round.id === 'survive_connection_spike'
+    && session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    && session.round5_runtime.state !== 'verified'
+  ) {
+    const observed = (['lakebase', 'competitor'] as const).map((laneId) => {
+      const lane = session.round5_runtime!.lanes[laneId]
+      return `${laneName(session, laneId)}: ${lane.clients_authenticated.toLocaleString('en-US')}/10,000 clients authenticated, ${lane.held_clients.toLocaleString('en-US')} currently held`
+    })
+    return `The V4 resident fan-in stopped before every required check completed. ${observed.join(' · ')}. No winner or margin was declared.`
+  }
+  if (
+    session.round.id === 'survive_connection_spike'
     && roundFiveUsesFanIn(session)
     && Object.values(session.lanes).some(
-      (lane) => lane.evidence?.protocol === 'round5-fanin-v2',
+      (lane) => lane.evidence?.protocol === ROUND_FIVE_FANIN_PROTOCOL
+        || lane.evidence?.protocol === 'round5-fanin-v3'
+        || lane.evidence?.protocol === 'round5-fanin-v2',
     )
   ) {
     const observed = (['lakebase', 'competitor'] as const).map((laneId) => {
@@ -339,14 +361,42 @@ function roundFourStory(session: DemoSession): ReplayStory {
 function roundFiveStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
   const recurringFanIn = roundFiveUsesFanIn(session)
+  const exactFanInMetric = (
+    laneId: LaneId,
+    label: string,
+    note: string,
+  ): ReplayMetric | null => {
+    const runtimeLane = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+      ? session.round5_runtime.lanes[laneId]
+      : null
+    const legacyLane = roundFiveLaneResult(session.lanes[laneId])
+    const milliseconds = runtimeLane
+      ? runtimeLane.phase === 'verified'
+        ? runtimeLane.bell_to_10000_observed_ms
+        : null
+      : legacyLane.contractVerified
+        ? legacyLane.timeToTargetMs
+        : null
+    return milliseconds === null
+      ? null
+      : { laneId, label, value: preciseDuration(milliseconds), note }
+  }
   const setup = [
-    exactMetric(
+    exactFanInMetric(
+      'lakebase',
+      recurringFanIn ? 'Lakebase time to 10,000' : 'Lakebase built-in pool',
+      recurringFanIn ? 'Exact authenticated held-client gate' : 'Included pool verified',
+    ) ?? exactMetric(
       session,
       'lakebase',
       recurringFanIn ? 'Lakebase time to 10,000' : 'Lakebase built-in pool',
       recurringFanIn ? 'Exact authenticated held-client gate' : 'Included pool verified',
     ) ?? lowerBoundMetric(session, 'lakebase', 'Lakebase built-in pool'),
-    exactMetric(
+    exactFanInMetric(
+      'competitor',
+      recurringFanIn ? 'Selected AWS path time to 10,000' : 'Selected AWS managed pool',
+      recurringFanIn ? 'Exact authenticated held-client gate' : 'New RDS Proxy provisioned',
+    ) ?? exactMetric(
       session,
       'competitor',
       recurringFanIn ? 'Selected AWS path time to 10,000' : 'Selected AWS managed pool',

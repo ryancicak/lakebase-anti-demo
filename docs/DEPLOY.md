@@ -858,7 +858,32 @@ GRANT SELECT, INSERT ON anti_demo_coordination.round4_pipeline_power
 GRANT USAGE, SELECT ON SEQUENCE
   anti_demo_coordination.round4_pipeline_power_event_id_seq
   TO "<app-client-id>";
+
+-- Round 5 automatic warm slot. The installation-scoped head is changed by
+-- fenced compare-and-swap; every transition appends immutable evidence beside it.
+GRANT SELECT, INSERT, UPDATE ON anti_demo_coordination.round5_warm_slot_v4
+  TO "<app-client-id>";
+GRANT SELECT, INSERT ON anti_demo_coordination.round5_warm_event_v4
+  TO "<app-client-id>";
+GRANT SELECT, INSERT, UPDATE ON anti_demo_coordination.round5_control_outbox_v3
+  TO "<app-client-id>";
+GRANT SELECT, INSERT ON anti_demo_coordination.round5_runner_event_v3
+  TO "<app-client-id>";
 ```
+
+Round 5 resident agents use a separate PostgreSQL role. Schema-owner bootstrap
+creates or rotates that
+installation-scoped login, grants `CONNECT`, schema `USAGE`, and
+`SELECT, INSERT, UPDATE` on the runner-event table, then writes its TLS-required
+DSN directly as the fenced `AWSCURRENT` secret version. Terraform owns only the
+secret container, so plaintext never enters Terraform state. The runner role
+may read that secret and no other coordination credential. The installed systemd agents
+consume the two lane-specific FIFO queues. WARMING stages a generation and
+waits for the four-worker `agent_ready` acknowledgement; bell and Proxy-gate
+paths write only to the PostgreSQL outbox and never start an SSM command.
+The runtime wire contract is `round5-resident-control-v3`. Its `_v3` control
+tables and the V4 warm tables are created only by this schema-owner bootstrap
+path. App and runner startup issue catalog reads and DML only—never DDL.
 
 That is the whole set. Three things deliberately absent, so nobody adds them
 back looking for a fix:

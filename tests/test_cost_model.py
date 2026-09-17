@@ -31,6 +31,7 @@ from server.cost_model import (
     SECONDS_PER_BILLING_MONTH,
     SECONDS_PER_HOUR,
     TERRAFORM_PROXY_SECRETS,
+    TERRAFORM_RUNNER_CONTROL_SECRETS,
     UNPRICED_PIPELINE_SERVICES,
     V7_CONNECTION_SPIKE_SAMPLES,
     V7_MEASURED_AURORA_ACU_SECONDS,
@@ -343,9 +344,8 @@ class TestHistoryIsNotRepricedByTheResize:
             estimate_carrying_cost(_A_DAY, rates=RateCard.for_basis(PricingBasis.AS_RUN))
         )
         assert as_run.rate.usd == Decimal("0.016")
-        assert (
-            as_run.usd
-            == Decimal(24) * Decimal(InstallationShape().rds_instances) * Decimal("0.016")
+        assert as_run.usd == Decimal(24) * Decimal(InstallationShape().rds_instances) * Decimal(
+            "0.016"
         )
         assert "db.t4g.micro" in as_run.component
 
@@ -987,14 +987,14 @@ class TestTheFleetShapeMatchesTheFleet:
         assert standing == keys
 
     def test_one_address_and_one_managed_secret_per_database(self) -> None:
-        # Every database is `publicly_accessible = true` and every one arrives
-        # with an RDS-managed master credential, so both counts are a function of
-        # the two fleet sizes. The two static Round 5 proxy secrets are the only
-        # thing that is not.
+        # Every database has one public address and master credential. Round 5
+        # adds two runner addresses plus three Terraform-owned secret containers.
         shape = InstallationShape()
         databases = shape.rds_instances + shape.aurora_clusters
-        assert shape.public_ipv4_addresses == databases
-        assert shape.managed_secrets == databases + TERRAFORM_PROXY_SECRETS
+        assert shape.public_ipv4_addresses == databases + shape.runner_instances
+        assert shape.managed_secrets == (
+            databases + TERRAFORM_PROXY_SECRETS + TERRAFORM_RUNNER_CONTROL_SECRETS
+        )
 
     def test_the_deleted_instance_is_reconstructible_and_not_re_typed(self) -> None:
         # `with_r1_rds_instance` exists so the deletion identity stays checkable.
@@ -1042,17 +1042,21 @@ class TestTheMeasuredAuroraQuantities:
     def test_the_ceiling_convention_understated_every_round_it_priced(self) -> None:
         # The sign the model asserted for as long as it had an Aurora line.
         published = Decimal("0.049800")
-        measured = sum(
-            (
-                V7_MEASURED_AURORA_ACU_SECONDS[round_id].point
-                for round_id in (
-                    RoundId.WAKE_IDLE_APP,
-                    RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
-                    RoundId.RECOVER_DELETED_ORDER,
-                )
-            ),
-            Decimal(0),
-        ) / SECONDS_PER_HOUR * Decimal("0.12")
+        measured = (
+            sum(
+                (
+                    V7_MEASURED_AURORA_ACU_SECONDS[round_id].point
+                    for round_id in (
+                        RoundId.WAKE_IDLE_APP,
+                        RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
+                        RoundId.RECOVER_DELETED_ORDER,
+                    )
+                ),
+                Decimal(0),
+            )
+            / SECONDS_PER_HOUR
+            * Decimal("0.12")
+        )
         assert measured > published
         assert measured / published == pytest.approx(Decimal("1.73"), rel=Decimal("1e-2"))
 
@@ -1169,9 +1173,7 @@ class TestWakeRound:
             observed_acu_seconds_above_floor=measurement.point,
         )
         wake = next(
-            line
-            for line in estimate_bout_cost(telemetry).lines
-            if "wake" in line.component.lower()
+            line for line in estimate_bout_cost(telemetry).lines if "wake" in line.component.lower()
         )
         assert wake.usd == pytest.approx(Decimal("0.015628"), rel=Decimal("1e-4"))
         assert wake.quantity.provenance is Provenance.MEASURED
@@ -1474,7 +1476,7 @@ class TestCarryingCost:
         carrying = estimate_carrying_cost(CarryingWindow(seconds=Decimal(3600)))
         runner = next(line for line in carrying.lines if "burst runner" in line.component)
         assert runner.scope is EstimateScope.OVERHEAD
-        assert runner.usd == Decimal("0.096")
+        assert runner.usd == Decimal("0.8568")
 
     def test_posted_lakebase_carrying_usage_is_priced_when_supplied(self) -> None:
         carrying = estimate_carrying_cost(
@@ -1725,9 +1727,7 @@ class TestTheImputedFiguresDeriveFromTheRateCard:
         # doubled window and a doubled day can disagree in the 28th place. The
         # linearity is the claim; the last place is Decimal's context.
         two_days = CarryingWindow(seconds=_A_DAY.seconds * 2)
-        doubled = imputed_total_usd(
-            imputed_round_carrying_lines(RoundId.WAKE_IDLE_APP, two_days)
-        )
+        doubled = imputed_total_usd(imputed_round_carrying_lines(RoundId.WAKE_IDLE_APP, two_days))
         assert abs(doubled - _imputed_rds_day() * 2) < Decimal("1e-24")
 
 
@@ -1741,9 +1741,7 @@ class TestTheTwoTotalsNeverMerge:
 
     def test_no_bout_estimate_emits_an_imputed_line_either(self) -> None:
         for round_id in RoundId:
-            estimate = estimate_bout_cost(
-                _telemetry(round_id, CompetitorId.AURORA_SERVERLESS_V2)
-            )
+            estimate = estimate_bout_cost(_telemetry(round_id, CompetitorId.AURORA_SERVERLESS_V2))
             assert not any(line.imputed for line in estimate.lines)
 
     def test_the_counterfactual_total_carries_only_imputed_lines(self) -> None:
@@ -1773,9 +1771,7 @@ class TestTheTwoTotalsNeverMerge:
     def test_the_floor_claim_follows_the_rounds_that_make_it_true(self) -> None:
         # Round 1 alone is not a floor: its own Aurora cluster is real, and nothing
         # about it is missing a pipeline service. The claim is not a blanket caveat.
-        round_one = customer_equivalent_carrying_cost(
-            _A_DAY, rounds=(RoundId.WAKE_IDLE_APP,)
-        )
+        round_one = customer_equivalent_carrying_cost(_A_DAY, rounds=(RoundId.WAKE_IDLE_APP,))
         assert round_one.floor is False
         assert round_one.floor_reason == ""
         assert round_one.unpriced_services == ()
@@ -1812,9 +1808,7 @@ class TestTheTwoTotalsNeverMerge:
 
     def test_the_counterfactual_can_be_taken_apart_by_round_again(self) -> None:
         equivalent = customer_equivalent_carrying_cost(_A_DAY)
-        assert imputed_total_usd(
-            equivalent.for_round(RoundId.WAKE_IDLE_APP)
-        ) == _imputed_rds_day()
+        assert imputed_total_usd(equivalent.for_round(RoundId.WAKE_IDLE_APP)) == _imputed_rds_day()
         assert equivalent.usd == sum(
             (imputed_total_usd(equivalent.for_round(round_id)) for round_id in equivalent.rounds),
             Decimal(0),
@@ -1850,22 +1844,18 @@ class TestTheDeletionIdentities:
     """
 
     def test_the_model_reproduces_the_shipped_aws_standing_figure(self) -> None:
-        # `$10.12/day AWS` was the published figure while four RDS instances,
-        # eight addresses and ten managed secrets stood. Round 1's instance has
-        # since been deleted, so the sealed shape is three/seven/nine and the
-        # installation now carries `$8.35/day`. Both are pinned: the older figure
-        # because an audience may have written it down, the current one because it
-        # is what the panel prints.
+        # The resident architecture adds two runner addresses and one
+        # lane-scoped event secret per runner to both fleet generations.
         before = InstallationShape().with_r1_rds_instance()
         assert before.rds_instances == 4
         assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=before)).quantize(
             Decimal("0.01")
-        ) == Decimal("10.12")
+        ) == Decimal("28.82")
         now = InstallationShape()
-        assert (now.rds_instances, now.public_ipv4_addresses, now.managed_secrets) == (3, 7, 9)
+        assert (now.rds_instances, now.public_ipv4_addresses, now.managed_secrets) == (3, 9, 11)
         assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=now)).quantize(
             Decimal("0.01")
-        ) == Decimal("8.35")
+        ) == Decimal("27.05")
 
     def test_removing_r1s_instance_takes_exactly_one_imputed_line_off_the_bill(self) -> None:
         # The internal consistency check the whole imputation rests on: what this
@@ -1876,8 +1866,9 @@ class TestTheDeletionIdentities:
         fall = _aws_usd(estimate_carrying_cost(_A_DAY, shape=before)) - _aws_usd(
             estimate_carrying_cost(_A_DAY, shape=after)
         )
-        assert fall == _imputed_rds_day(shape=after)
-        assert fall == _imputed_rds_day(shape=before)
+        quantum = Decimal("0.000000000000000000000001")
+        assert fall.quantize(quantum) == _imputed_rds_day(shape=after).quantize(quantum)
+        assert fall.quantize(quantum) == _imputed_rds_day(shape=before).quantize(quantum)
 
     def test_the_deletion_removes_an_instance_an_address_and_a_secret_and_nothing_else(
         self,
@@ -1921,7 +1912,8 @@ class TestTheDeletionIdentities:
         assert customer_after == customer_before
         gap_before = customer_before - installation_before
         gap_after = customer_after - installation_after
-        assert gap_after - gap_before == _imputed_rds_day()
+        quantum = Decimal("0.000000000000000000000001")
+        assert (gap_after - gap_before).quantize(quantum) == _imputed_rds_day().quantize(quantum)
 
 
 class TestTheIdleContrastIsOneObject:

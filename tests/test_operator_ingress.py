@@ -905,7 +905,14 @@ def test_terraform_admits_the_sealed_list_beside_the_operator_never_instead_of_i
     # Inline `ingress` blocks are what make Terraform authoritative over the whole
     # rule set, so a hand-added rule is revoked on the next apply. Standalone rule
     # resources would give that up, and the seal would become advisory.
-    assert 'resource "aws_vpc_security_group_ingress_rule"' not in hcl
+    # Database ingress remains inline and authoritative. The one standalone
+    # ingress resource belongs to the installation-owned static Proxy fixture,
+    # whose group is not a database group.
+    assert hcl.count('resource "aws_vpc_security_group_ingress_rule"') == 1
+    assert (
+        'resource "aws_vpc_security_group_ingress_rule" "round5_runner_to_proxy"'
+        in hcl
+    )
 
 
 # --------------------------------------------------------------------------

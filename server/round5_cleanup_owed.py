@@ -50,7 +50,7 @@ from datetime import UTC, datetime, timedelta
 #: *disappear* after accepting, and that case does not reach here at all because
 #: the caller gates on acceptance rather than absence. Two minutes is therefore
 #: an order of magnitude of headroom over the thing being waited for, and two
-#: minutes rather than the fifty-odd the retry budget runs to.
+#: minutes rather than an extended hidden retry window with no operator control.
 GRACE_SECONDS = 120.0
 
 
@@ -140,10 +140,8 @@ def record_round5_cleanup_owed(
     """Note that this bout's Proxy deletion is not confirmed, or update the note.
 
     Re-recording an already-noted session keeps its original ``since`` and due
-    time. The automatic retry calls this once per failed attempt, and a clock
-    that restarted on each call would hold the notice below its due time forever
-    -- a counter that resets faster than it counts is how a bound becomes no
-    bound at all.
+    time. Readiness and explicit repair paths may record the same debt again; a
+    clock that restarted on each call could hide the oldest outstanding resource.
     """
 
     stamped = now().astimezone(UTC)

@@ -1,0 +1,27 @@
+stateDiagram-v2
+    direction TB
+
+    [*] --> WARMING: deploy or startup
+
+    state "WARMING" as WARMING
+    state "READY" as READY
+    state "CLAIMED" as CLAIMED
+    state "RUNNING" as RUNNING
+    state "CLEANING" as CLEANING
+    WARMING --> READY: all warm proofs fresh
+    READY --> CLAIMED: O(1) fenced claim
+    CLAIMED --> RUNNING: bell accepted
+    RUNNING --> CLEANING: result, failure, or towel
+    CLEANING --> WARMING: cleanup exact, enqueue N+1
+
+    note right of WARMING
+      Automatic backstage work.
+      May take about 3,600 seconds.
+      Retries never run in a user request.
+    end note
+
+    note right of READY
+      Both targets and runners are prepared.
+      The per-bout RDS Proxy is absent.
+      Lost freshness returns to WARMING.
+    end note

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
@@ -23,6 +24,7 @@ from .capacity import (
     observed_rds_instance_class,
 )
 from .catalog import (
+    ROUND5_BELL_PROTOCOL,
     ROUND5_FANIN_PROTOCOL,
     ROUND5_PROTOCOLS,
     build_presenter_pack,
@@ -31,6 +33,7 @@ from .catalog import (
     recommend_round,
     round_by_id,
 )
+from .connection_fanin import FANIN_SCHEMA_VERSION, SAFETY_EVIDENCE_VERSION
 from .coordination import (
     ROUND5_RING_KEY,
     BoutLease,
@@ -90,6 +93,9 @@ from .models import (
     RedoSnapshot,
     RedoState,
     ResetMode,
+    RoundFiveClockProjectionSnapshot,
+    RoundFiveRuntimeLaneSnapshot,
+    RoundFiveRuntimeSnapshot,
     RoundFiveSetupEvidenceSnapshot,
     RoundFiveSetupGateSnapshot,
     RoundFiveSetupLaneSnapshot,
@@ -123,6 +129,14 @@ from .round5_cleanup_owed import (
     Round5CleanupOwed,
     clear_round5_cleanup_owed,
     record_round5_cleanup_owed,
+)
+from .round5_warm import (
+    BellContext,
+    Round5LaunchCapsule,
+    Round5Variant,
+    Round5WarmCoordinator,
+    Round5WarmSlot,
+    Round5WarmState,
 )
 from .round_availability import (
     GRANT_REFUSAL_HEADLINE,
@@ -468,10 +482,10 @@ def _round_six_remembered_result(elapsed_ms: float) -> str:
 from .connection_fanin import TARGET_CLIENTS_PER_LANE  # noqa: E402
 
 _ROUND_FIVE_SCHEDULED_CLIENTS = 128
-_ROUND_FIVE_WARMUP_CONNECTIONS = 4
-_ROUND_FIVE_CONCURRENCY = 64
+_ROUND_FIVE_WARMUP_CONNECTIONS = 0
+_ROUND_FIVE_CONCURRENCY = 10_000
 _ROUND_FIVE_WITNESS_CLIENTS = 64
-_ROUND_FIVE_RUNNER = "Python 3.12 + psycopg 3.3.4"
+_ROUND_FIVE_RUNNER = "Python 3.12 event-driven TLS/native-password"
 _ROUND_FIVE_CLEANUP_PENDING = "Round 5 cleanup is settling automatically · Ring remains protected"
 
 #: The two honest accounts of a control action aimed at a fight card this process
@@ -697,6 +711,25 @@ class SessionRecord:
     # private T0. Kept off the snapshot deliberately: it is a raw monotonic
     # reading, and no monotonic value may reach a public event.
     round5_progress_observed_ns: dict[str, int] = field(default_factory=dict)
+    # Canonical wire identity for every accepted physical-runner revision.  SSM
+    # stdout and the durable job registry are two transports for the same
+    # progress record; an equal sequence is idempotent only when its payload is
+    # identical.  Kept off the public snapshot because it is an ingestion
+    # guard, not bout evidence.
+    round5_progress_payload_digests: dict[tuple[str, int], str] = field(
+        default_factory=dict
+    )
+    round5_terminal_lane_evidence: dict[str, dict[str, object]] = field(
+        default_factory=dict
+    )
+    round5_projection_revision: int = 0
+    round5_clock_projection_revision: int = 0
+    # Set by the terminal mutation while holding ``lock``. Every Round 5
+    # callback checks it before touching or publishing state, so a late SSM
+    # progress line cannot resurrect RUNNING after FAILED/TOWELLED/VERIFIED.
+    round5_ingestion_closed: bool = False
+    round5_callback_epoch: int = 0
+    round5_terminal_published: bool = False
     # Consecutive Lakebase IDLE observations are timed in the process monotonic
     # domain. The public snapshot carries only their count and wall-clock upper
     # bound; a raw monotonic value must never cross the API boundary.
@@ -711,6 +744,9 @@ class SessionRecord:
     round5_lease_heartbeat_task: asyncio.Task[None] | None = None
     round5_lease_heartbeat_lease: BoutLease | None = None
     round5_lease: BoutLease | None = None
+    round5_warm_slot: Round5WarmSlot | None = None
+    round5_launch_capsule: Round5LaunchCapsule | None = None
+    round5_bell_context: BellContext | None = None
     round2_fencing_token: int | None = None
     operator: BoutOperator | None = None
     cost_bout_id: str | None = None
@@ -755,7 +791,8 @@ class RunManager:
         clock_ns: Callable[[], int] = time.monotonic_ns,
         delta_storage_probe: Callable[[], Awaitable[None]] | None = None,
         delta_storage_probe_interval_seconds: float = 60.0,
-        round5_protocol: str = ROUND5_FANIN_PROTOCOL,
+        round5_protocol: str = ROUND5_BELL_PROTOCOL,
+        round5_warm_coordinator: Round5WarmCoordinator | None = None,
     ) -> None:
         self._records: dict[str, SessionRecord] = {}
         self._records_lock = asyncio.Lock()
@@ -796,6 +833,7 @@ class RunManager:
         if round5_protocol not in ROUND5_PROTOCOLS:
             raise ValueError(f"Unknown Round 5 protocol: {round5_protocol}")
         self._round5_protocol = round5_protocol
+        self._round5_warm_coordinator = round5_warm_coordinator
         self._live_orders_factory = live_orders_factory
         self._readiness_check = readiness_check or (lambda: None)
         self._readiness_status = readiness_status
@@ -897,38 +935,6 @@ class RunManager:
             os.environ.get("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "1")
         )
         self._cleanup_retry_max = float(os.environ.get("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "30"))
-        # The automatic Round 5 cleanup retry has to terminate. It used to loop
-        # `while not self._closed`, which is correct for a transient AWS fault
-        # and wrong for a durable one: the towel stays `cleaning` forever, which
-        # is the one cleanup state that offers the operator neither a retry
-        # button nor an exit. So it is bounded, and then it hands over to a
-        # human by failing loudly.
-        #
-        # 120 attempts is roughly 58 minutes at the 1s..30s backoff, plus each
-        # attempt's own AWS round trip. It was 20 attempts -- roughly eight
-        # minutes -- and eight minutes is shorter than AWS. A measured bout took
-        # 31.5 minutes from an accepted `DeleteDBProxy` to the proxy actually
-        # disappearing, so cleanup gave up about five minutes early and wrote
-        # `cleanup_failure` onto the receipt of a bout that was entirely
-        # healthy. Worse, it abandoned while still waiting on the proxy, so the
-        # per-bout security group -- deletable only after the proxy that
-        # references it is gone -- was never attempted even once, and leaked.
-        #
-        # The budget is not the ring-held time: abandoning does not release the
-        # lease either, it only converts automatic recovery into a manual one,
-        # and a human pressing "Retry cleanup" at minute eight cannot make AWS
-        # finish sooner. What the budget really buys is the delay before the
-        # operator is told to intervene, so it is sized at roughly double the
-        # one slow deletion observed rather than trimmed to just clear it.
-        self._cleanup_retry_attempts = max(
-            1, int(os.environ.get("ANTI_DEMO_CLEANUP_RETRY_ATTEMPTS", "120"))
-        )
-        # Swappable so a test can total up the schedule the loop actually asks
-        # for. The attempt count on its own says nothing about the budget --
-        # only the sum of the delays does -- and the alternative to this seam is
-        # a test that either waits an hour or re-derives the backoff and then
-        # drifts away from it.
-        self._cleanup_retry_sleep = asyncio.sleep
         # How long a towelled run task gets to notice the cooperative stop
         # before it is cancelled outright. Rounds 1 and 3 have no explicit
         # cancel -- they stop by observing a control -- so a task parked in a
@@ -1011,6 +1017,21 @@ class RunManager:
     @property
     def round5_protocol(self) -> str:
         return self._round5_protocol
+
+    @property
+    def round5_ring_ready(self) -> bool:
+        return bool(
+            self._round5_warm_coordinator is not None
+            and self._round5_warm_coordinator.ring_ready
+        )
+
+    @property
+    def round5_warm_status(self) -> Mapping[str, object] | None:
+        return (
+            self._round5_warm_coordinator.public_status_cached()
+            if self._round5_warm_coordinator is not None
+            else None
+        )
 
     @property
     def live_orders_available(self) -> bool:
@@ -1203,6 +1224,7 @@ class RunManager:
         *,
         kind: str,
         started_at: datetime,
+        bout_id: str | None = None,
     ) -> str | None:
         store = self._cost_ledger_store
         manifest = self._cost_manifest
@@ -1210,7 +1232,7 @@ class RunManager:
             return None
         if record.cost_bout_id is not None:
             raise InvalidStateError("The current cost bout window is already open")
-        bout_id = uuid4().hex
+        bout_id = bout_id or uuid4().hex
         identity = capture_bout_cost_identity(
             manifest,
             round_id=record.snapshot.round.id,
@@ -1380,6 +1402,48 @@ class RunManager:
                         record.cost_bout_id = None
                         record.cost_bout_started_at = None
                         record.cost_bout_kind = None
+
+    async def _run_round5_cost_bout_after_bell(
+        self,
+        record: SessionRecord,
+        *,
+        started_at: datetime,
+        bell_id: str,
+        operation: asyncio.Task[None],
+    ) -> None:
+        """Persist Round 5 cost evidence without holding the bell request open."""
+
+        cost_bout_id: str | None = None
+        try:
+            try:
+                cost_bout_id = await self._open_cost_bout(
+                    record,
+                    kind="run",
+                    started_at=started_at,
+                    bout_id=hashlib.sha256(
+                        (
+                            f"round5-cost\0{self._installation_id}\0"
+                            f"{record.snapshot.id}\0{bell_id}"
+                        ).encode()
+                    ).hexdigest(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Bell acceptance and both lane tasks already exist.  Cost
+                # bookkeeping is reconciliation debt, never authority to undo
+                # the single durable bell or strand its cleanup leases.
+                logger.error(
+                    "Round 5 cost window open failed after bell session=%s "
+                    "diagnostic=%s",
+                    record.snapshot.id,
+                    _redacted_exception_chain(exc),
+                )
+            await self._run_cost_bout(record, cost_bout_id, operation)
+        finally:
+            if not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
 
     def _require_open(self) -> None:
         if self._closed:
@@ -1763,6 +1827,7 @@ class RunManager:
             record.snapshot.state == SessionState.RUNNING
             and started_ns is not None
             and bool(active_lane_ids)
+            and record.snapshot.round5_runtime is None
         )
         setup = snapshot.round5_setup
         needs_round_five_projection = (
@@ -1777,7 +1842,15 @@ class RunManager:
         )
         measured_at_ns = (
             self._clock_ns()
-            if as_of_ns is None and (needs_lane_projection or needs_round_five_projection)
+            if as_of_ns is None
+            and (
+                needs_lane_projection
+                or needs_round_five_projection
+                or (
+                    record.snapshot.round5_runtime is not None
+                    and record.snapshot.state == SessionState.RUNNING
+                )
+            )
             else as_of_ns if as_of_ns is not None else 0
         )
 
@@ -1791,11 +1864,87 @@ class RunManager:
                     bout_floor_ms,
                 )
 
-        if setup is not None:
+        if setup is not None and snapshot.round5_runtime is None:
             floors = self._round_five_elapsed_floors(record, as_of_ns=measured_at_ns)
             for lane_id, lane in setup.lanes.items():
                 lane.elapsed_at_snapshot_ms = floors.get(lane_id)
-        return snapshot
+        runtime = snapshot.round5_runtime
+        if (
+            runtime is not None
+            and record.snapshot.state == SessionState.RUNNING
+            and record.run_started_monotonic_ns is not None
+        ):
+            if not measured_at_ns:
+                measured_at_ns = self._clock_ns()
+            bell_floor_ms = max(
+                0.0,
+                (measured_at_ns - record.run_started_monotonic_ns) / 1_000_000,
+            )
+            record.round5_clock_projection_revision += 1
+            snapshot.round5_clock_projection = RoundFiveClockProjectionSnapshot(
+                bell_id=runtime.bell_id,
+                projection_revision=record.round5_clock_projection_revision,
+                elapsed_ms={
+                    lane_id: (
+                    lane.bell_to_10000_observed_ms
+                    if lane.bell_to_10000_observed_ms is not None
+                    else max(lane.elapsed_at_snapshot_ms, bell_floor_ms)
+                    )
+                    for lane_id, lane in runtime.lanes.items()
+                },
+            )
+        return self._revalidated_snapshot(snapshot)
+
+    @staticmethod
+    def _revalidated_snapshot(snapshot: SessionSnapshot) -> SessionSnapshot:
+        return SessionSnapshot.model_validate(
+            snapshot.model_dump(mode="python")
+        )
+
+    @staticmethod
+    def _advance_round5_revision_locked(record: SessionRecord) -> int:
+        """Allocate exactly one revision for a Round 5 state mutation.
+
+        Callers hold ``record.lock``. Projection/GET paths never call this;
+        revisions describe durable logical mutations, not how often a browser
+        happened to poll.
+        """
+
+        if not record.lock.locked():
+            raise RuntimeError("Round 5 revision allocation requires the record lock")
+        runtime = record.snapshot.round5_runtime
+        if runtime is None:
+            return 0
+        record.round5_projection_revision = max(
+            record.round5_projection_revision,
+            runtime.revision,
+        ) + 1
+        runtime.revision = record.round5_projection_revision
+        return runtime.revision
+
+    @staticmethod
+    def _new_round_five_runtime(context: BellContext) -> RoundFiveRuntimeSnapshot:
+        return RoundFiveRuntimeSnapshot(
+            warm_generation=context.warm_generation,
+            bell_id=context.bell_id,
+            revision=1,
+            state="running",
+            bell_at_utc=context.bell_at_utc,
+            lanes={
+                "lakebase": RoundFiveRuntimeLaneSnapshot(
+                    id="lakebase",
+                    phase="dispatching",
+                    elapsed_at_snapshot_ms=0.0,
+                    status="Dispatching the retained first Lakebase client",
+                ),
+                "competitor": RoundFiveRuntimeLaneSnapshot(
+                    id="competitor",
+                    phase="provisioning_proxy",
+                    elapsed_at_snapshot_ms=0.0,
+                    status="AWS is creating the per-bout RDS Proxy",
+                ),
+            },
+        )
 
     async def get(self, session_id: str) -> SessionSnapshot:
         record = await self._record(session_id)
@@ -1872,7 +2021,7 @@ class RunManager:
             record.armed_at_monotonic = None
             if record.task is arm_task:
                 record.task = None
-            snapshot = record.snapshot.model_copy(deep=True)
+            snapshot = self._revalidated_snapshot(record.snapshot)
         await record.event_log.publish(
             "session_cancelled",
             {
@@ -1938,6 +2087,24 @@ class RunManager:
                             authority.fencing_token,
                         )
                 except Exception as exc:
+                    if (
+                        self._round5_warm_coordinator is not None
+                        and record.round5_warm_slot is not None
+                        and record.round5_warm_slot.claim is not None
+                    ):
+                        claim_id = record.round5_warm_slot.claim.claim_id
+                        try:
+                            await self._round5_warm_coordinator.begin_cleanup(
+                                claim_id
+                            )
+                            await self._round5_warm_coordinator.finish_cleanup_and_rewarm(
+                                claim_id
+                            )
+                        except Exception:
+                            logger.error(
+                                "Round 5 failed claim could not return to warming",
+                                exc_info=True,
+                            )
                     await self._release_round5_lease(record)
                     await self._release_bout(record)
                     if isinstance(exc, InvalidStateError):
@@ -1945,6 +2112,36 @@ class RunManager:
                     raise InvalidStateError(
                         "ROUND 5 BACKSTAGE CLEANUP IS STILL FINISHING · OTHER ROUNDS ARE READY"
                     ) from exc
+            if (
+                is_connection_spike
+                and self._round5_warm_coordinator is not None
+                and record.round5_warm_slot is None
+            ):
+                authority = record.round5_lease
+                if authority is None:
+                    await self._release_bout(record)
+                    raise InvalidStateError(
+                        "Round 5 cleanup authority is unavailable"
+                    )
+                try:
+                    warm_slot, capsule = await self._round5_warm_coordinator.claim(
+                        session_id=record.snapshot.id,
+                        bout_id=record.snapshot.id,
+                        selected_variant=(
+                            Round5Variant.AURORA
+                            if record.snapshot.competitor.id
+                            == CompetitorId.AURORA_SERVERLESS_V2
+                            else Round5Variant.RDS
+                        ),
+                        bout_fence=authority.fencing_token,
+                    )
+                except Exception:
+                    await self._release_round5_lease(record)
+                    await self._release_bout(record)
+                    raise
+                record.round5_warm_slot = warm_slot
+                record.round5_launch_capsule = capsule
+                record.round5_bell_context = None
             record.operator = bout_operator
             self._reset_outcome(record.snapshot)
             record.armed_at_monotonic = None
@@ -2016,7 +2213,11 @@ class RunManager:
                 await self._release_bout(record)
                 raise
             record.task = asyncio.create_task(operation, name=f"arm-{session_id}")
-            result = record.snapshot.model_copy(deep=True)
+            result = (
+                self._public_snapshot_locked(record)
+                if is_connection_spike
+                else record.snapshot.model_copy(deep=True)
+            )
         return result
 
     async def start_run(
@@ -2029,13 +2230,19 @@ class RunManager:
         record = await self._record(session_id)
         async with record.lock:
             effective_operator = operator or record.operator
+            self._assert_operator(record.operator, effective_operator)
             if (
                 record.task is not None
                 and not record.task.done()
                 and record.task.get_name() == f"run-{session_id}"
             ):
                 self._assert_operator(record.operator, effective_operator)
-                return record.snapshot.model_copy(deep=True)
+                return (
+                    self._public_snapshot_locked(record)
+                    if record.snapshot.round.id
+                    == RoundId.SURVIVE_CONNECTION_SPIKE
+                    else record.snapshot.model_copy(deep=True)
+                )
             if record.snapshot.run_started_at is not None and record.snapshot.state in {
                 SessionState.RUNNING,
                 SessionState.VERIFIED,
@@ -2043,7 +2250,12 @@ class RunManager:
                 SessionState.TOWELLED,
             }:
                 self._assert_operator(record.operator, effective_operator)
-                return record.snapshot.model_copy(deep=True)
+                return (
+                    self._public_snapshot_locked(record)
+                    if record.snapshot.round.id
+                    == RoundId.SURVIVE_CONNECTION_SPIKE
+                    else record.snapshot.model_copy(deep=True)
+                )
             if record.task and not record.task.done():
                 raise InvalidStateError("A session operation is already running")
             if record.snapshot.state != SessionState.ARMED:
@@ -2084,31 +2296,129 @@ class RunManager:
                 and record.live_targets is None
             ):
                 raise InvalidStateError("The live targets are unavailable")
-            await self._commit_bout(record, operator or record.operator)
-            cost_started_at = datetime.now(UTC)
-            try:
-                cost_bout_id = await self._open_cost_bout(
-                    record,
-                    kind="run",
-                    started_at=cost_started_at,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Bout cost window open failed session=%s round=%s diagnosis=%s",
-                    record.snapshot.id,
-                    record.snapshot.round.id.value,
-                    operator_diagnosis(exc),
-                    exc_info=True,
-                )
-                if is_connection_spike:
-                    await self._release_round5_lease(record)
-                await self._release_bout(record)
-                raise InvalidStateError(
-                    cost_window_refusal(
-                        "The bout cost window could not be opened before the bell.",
-                        exc,
+            round5_atomic_bell = bool(
+                is_connection_spike
+                and self._round5_warm_coordinator is not None
+                and callable(
+                    getattr(
+                        self._round5_warm_coordinator.store,
+                        "accept_bell_with_leases",
+                        None,
                     )
-                ) from exc
+                )
+            )
+            if not round5_atomic_bell:
+                await self._commit_bout(record, operator or record.operator)
+            cost_started_at = datetime.now(UTC)
+            cost_bout_id: str | None = None
+            if not is_connection_spike:
+                try:
+                    cost_bout_id = await self._open_cost_bout(
+                        record,
+                        kind="run",
+                        started_at=cost_started_at,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Bout cost window open failed session=%s round=%s diagnosis=%s",
+                        record.snapshot.id,
+                        record.snapshot.round.id.value,
+                        operator_diagnosis(exc),
+                        exc_info=True,
+                    )
+                    await self._release_bout(record)
+                    raise InvalidStateError(
+                        cost_window_refusal(
+                            "The bout cost window could not be opened before the bell.",
+                            exc,
+                        )
+                    ) from exc
+            if is_connection_spike and self._round5_warm_coordinator is not None:
+                warm_slot = record.round5_warm_slot
+                claim = warm_slot.claim if warm_slot is not None else None
+                if claim is None:
+                    await self._release_round5_lease(record)
+                    await self._release_bout(record)
+                    raise InvalidStateError(
+                        "Round 5 warm claim is unavailable"
+                    )
+                if round5_atomic_bell:
+                    main_lease = record.lease
+                    cleanup_lease = record.round5_lease
+                    if main_lease is None or cleanup_lease is None:
+                        raise InvalidStateError(
+                            "Round 5 bell leases are unavailable"
+                        )
+                    (
+                        context,
+                        committed_main,
+                        committed_cleanup,
+                    ) = await self._round5_warm_coordinator.accept_bell_with_leases(
+                        claim.claim_id,
+                        main_store=self._lease_store_for_record(record),
+                        main_lease=main_lease,
+                        cleanup_store=self._round5_cleanup_store(),
+                        cleanup_lease=cleanup_lease,
+                        ttl=timedelta(seconds=self._running_lease_ttl),
+                        release_event_factory=getattr(
+                            record.connection_spike_engine,
+                            "lakebase_release_event",
+                            None,
+                        ),
+                    )
+                    record.lease = committed_main
+                    record.round5_lease = committed_cleanup
+                    self._start_lease_heartbeat(
+                        record,
+                        timedelta(seconds=self._running_lease_ttl),
+                    )
+                    self._start_round5_lease_heartbeat(
+                        record,
+                        timedelta(seconds=self._running_lease_ttl),
+                    )
+                else:
+                    context = await self._round5_warm_coordinator.accept_bell(
+                        claim.claim_id
+                    )
+                bind_bell = getattr(
+                    record.connection_spike_engine,
+                    "bind_bell",
+                    None,
+                )
+                if callable(bind_bell):
+                    bind_bell(context)
+                record.round5_bell_context = context
+                record.snapshot.state = SessionState.RUNNING
+                record.snapshot.run_started_at = context.bell_at_utc
+                record.run_started_monotonic_ns = context.t0_monotonic_ns
+                record.snapshot.updated_at = context.bell_at_utc
+                record.snapshot.metrics = []
+                record.snapshot.comparison = None
+                record.snapshot.round5_setup = self._new_round_five_setup(
+                    record.snapshot
+                )
+                record.snapshot.round5_setup.state = RoundFiveSetupState.RUNNING
+                record.snapshot.round5_runtime = self._new_round_five_runtime(
+                    context
+                )
+                record.round5_projection_revision = 1
+                record.round5_clock_projection_revision = 0
+                record.round5_ingestion_closed = False
+                record.round5_callback_epoch += 1
+                record.round5_terminal_published = False
+                for lane_id, lane in record.snapshot.lanes.items():
+                    lane.state = LaneState.CONNECTING
+                    lane.status = record.snapshot.round5_runtime.lanes[
+                        lane_id
+                    ].status
+                    lane.attempts = 0
+                    lane.successes = 0
+                    lane.errors = 0
+                    lane.p99_ms = None
+                    lane.error = None
+                    lane.activity = LaneActivity(
+                        phase=record.snapshot.round5_runtime.lanes[lane_id].phase
+                    )
             self._cancel_armed_expiry(record)
             record.towel_stop_event = asyncio.Event()
             if is_recovery:
@@ -2146,11 +2456,37 @@ class RunManager:
                 if is_live_orders
                 else self._run(record)
             )
-            record.task = asyncio.create_task(
-                self._run_cost_bout(record, cost_bout_id, operation),
-                name=f"run-{session_id}",
+            if is_connection_spike:
+                lane_operation = asyncio.create_task(
+                    operation,
+                    name=f"round5-lanes-{session_id}",
+                )
+                context = record.round5_bell_context
+                round5_cost_started_at = (
+                    context.bell_at_utc if context is not None else cost_started_at
+                )
+                round5_bell_id = (
+                    context.bell_id if context is not None else f"legacy-{session_id}"
+                )
+                record.task = asyncio.create_task(
+                    self._run_round5_cost_bout_after_bell(
+                        record,
+                        started_at=round5_cost_started_at,
+                        bell_id=round5_bell_id,
+                        operation=lane_operation,
+                    ),
+                    name=f"run-{session_id}",
+                )
+            else:
+                record.task = asyncio.create_task(
+                    self._run_cost_bout(record, cost_bout_id, operation),
+                    name=f"run-{session_id}",
+                )
+            result = (
+                self._public_snapshot_locked(record)
+                if is_connection_spike
+                else record.snapshot.model_copy(deep=True)
             )
-            result = record.snapshot.model_copy(deep=True)
         return result
 
     async def start_redo(
@@ -2234,7 +2570,7 @@ class RunManager:
             lane.state = LaneState.CONNECTING
             lane.status = "Committing the distinct v2 model score update"
             lane.activity = LaneActivity(phase=ModelScorePhase.COMMITTING_SOURCE)
-            snapshot = record.snapshot.model_copy(deep=True)
+            snapshot = self._revalidated_snapshot(record.snapshot)
             await record.event_log.publish(
                 "redo_started",
                 {"session": snapshot.model_dump(mode="json")},
@@ -2287,11 +2623,22 @@ class RunManager:
             if engine is None or getattr(engine, "reconcile_failed_cleanup", None) is None:
                 engine = self._connection_spike_factory(record.snapshot.competitor.id)
                 record.connection_spike_engine = engine
+            setup.cleanup_retryable = True
+            setup.cleanup_failure = None
+            if record.snapshot.towel is not None:
+                record.snapshot.towel.state = TowelState.CLEANING
+                record.snapshot.towel.cleanup_failure = None
+            record.snapshot.updated_at = datetime.now(UTC)
+            snapshot = self._revalidated_snapshot(record.snapshot)
+            await record.event_log.publish(
+                "cleanup_update",
+                {"session": snapshot.model_dump(mode="json")},
+            )
             record.task = asyncio.create_task(
                 self._retry_connection_spike_cleanup(record, engine),
                 name=f"retry-cleanup-{session_id}",
             )
-            return record.snapshot.model_copy(deep=True)
+            return snapshot
 
     async def start_towel(
         self,
@@ -2312,6 +2659,23 @@ class RunManager:
                 raise InvalidStateError("ONLY THE RING OWNER CAN CONTROL THIS BOUT")
 
             towel = record.snapshot.towel
+            is_round_five_v3 = (
+                record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+                and record.snapshot.round5_runtime is not None
+            )
+            if is_round_five_v3 and (
+                towel is not None
+                or record.snapshot.state
+                in {
+                    SessionState.VERIFIED,
+                    SessionState.FAILED,
+                    SessionState.TOWELLED,
+                }
+            ):
+                # Terminal V3 state is absorbing. Cleanup has its own retry
+                # endpoint; a late or repeated towel cannot rewrite the verdict
+                # or consume another ownership fence.
+                return self._public_snapshot_locked(record)
             if towel is not None:
                 # `STOPPING` belongs here as much as `FAILED` does. A towel that
                 # never got its cleanup task -- because something between the
@@ -2339,6 +2703,21 @@ class RunManager:
                 return record.snapshot.model_copy(deep=True)
 
             if record.snapshot.state != SessionState.RUNNING:
+                # A runner failure and an operator click can cross in flight:
+                # the browser still has the last RUNNING revision while this
+                # process has already moved Round 5 to FAILED and begun the
+                # exact same stop-and-cleanup handoff. Emergency stop is
+                # idempotent at that edge. Returning the newer terminal
+                # snapshot both acknowledges the click and lets the UI replace
+                # its stale button; every other round/state combination keeps
+                # the strict refusal below.
+                if (
+                    record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+                    and record.snapshot.state == SessionState.FAILED
+                ):
+                    if record.towel_stop_event is not None:
+                        record.towel_stop_event.set()
+                    return record.snapshot.model_copy(deep=True)
                 raise InvalidStateError("The bout must be running before throwing in the towel")
             lease = record.lease
             if (
@@ -2402,6 +2781,15 @@ class RunManager:
 
             if is_round_five:
                 assert round_five_setup is not None
+                record.round5_ingestion_closed = True
+                record.round5_callback_epoch += 1
+                runtime = record.snapshot.round5_runtime
+                if runtime is not None:
+                    runtime.state = "towelled"
+                    for runtime_lane in runtime.lanes.values():
+                        if runtime_lane.phase != "verified":
+                            runtime_lane.phase = "cancelled"
+                    self._advance_round5_revision_locked(record)
                 adjudication = adjudicate_round_five_towel(
                     lanes=record.snapshot.lanes,
                     setup_lanes=round_five_setup.lanes,
@@ -2477,10 +2865,16 @@ class RunManager:
             )
             record.snapshot.towel = requested_towel
             record.snapshot.lanes = adjudication.lanes
-            record.snapshot.comparison = adjudication.comparison
+            record.snapshot.comparison = (
+                None
+                if is_round_five and record.snapshot.round5_runtime is not None
+                else adjudication.comparison
+            )
             record.snapshot.state = SessionState.TOWELLED
             record.snapshot.failure = None
             record.snapshot.remembered_result = adjudication.public_result
+            if is_round_five and record.snapshot.round5_runtime is not None:
+                record.snapshot.metrics = []
             if round_five_setup is not None:
                 for lane in round_five_setup.lanes.values():
                     if lane.state != RoundFiveSetupState.VERIFIED:
@@ -2529,6 +2923,8 @@ class RunManager:
                         str(exc) or "The bout cost window could not be closed"
                     )
             snapshot = record.snapshot.model_copy(deep=True)
+            if is_round_five:
+                record.round5_terminal_published = True
             await record.event_log.publish(
                 "towel_started",
                 {"session": snapshot.model_dump(mode="json")},
@@ -2882,6 +3278,21 @@ class RunManager:
         """
         if cls._unfinished_operations(record):
             return False
+        setup = record.snapshot.round5_setup
+        if (
+            record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and setup is not None
+            and (
+                setup.cleanup_retryable
+                or setup.cleanup_failure is not None
+                or (
+                    record.snapshot.towel is not None
+                    and record.snapshot.towel.state
+                    in {TowelState.CLEANING, TowelState.FAILED}
+                )
+            )
+        ):
+            return False
         if (
             record.lease is not None
             or record.round5_lease is not None
@@ -2979,6 +3390,52 @@ class RunManager:
                 self._running_lease_ttl if phase == "redo_committed" else self._active_lease_ttl
             )
         )
+        if (
+            record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and self._round5_warm_coordinator is not None
+            and callable(
+                getattr(
+                    self._round5_warm_coordinator.store,
+                    "claim_ready_with_leases",
+                    None,
+                )
+            )
+            and phase == "checking"
+        ):
+            try:
+                (
+                    warm_slot,
+                    capsule,
+                    main_lease,
+                    cleanup_lease,
+                ) = await self._round5_warm_coordinator.claim_with_leases(
+                    session_id=record.snapshot.id,
+                    bout_id=record.snapshot.id,
+                    selected_variant=(
+                        Round5Variant.AURORA
+                        if record.snapshot.competitor.id
+                        == CompetitorId.AURORA_SERVERLESS_V2
+                        else Round5Variant.RDS
+                    ),
+                    main_store=self._lease_store_for_record(record),
+                    cleanup_store=self._round5_cleanup_store(),
+                    operator=operator,
+                    round_id=record.snapshot.round.id.value,
+                    round_title=record.snapshot.round.title,
+                    competitor_id=record.snapshot.competitor.id.value,
+                    competitor_name=record.snapshot.competitor.short_name,
+                )
+            except Exception as exc:
+                raise InvalidStateError(
+                    "ROUND 5 IS PREPARING BACKSTAGE · OTHER ROUNDS ARE READY"
+                ) from exc
+            record.lease = main_lease
+            record.round5_lease = cleanup_lease
+            record.round5_warm_slot = warm_slot
+            record.round5_launch_capsule = capsule
+            self._start_lease_heartbeat(record, ttl)
+            self._start_round5_lease_heartbeat(record, ttl)
+            return
 
         async def claim(store: BoutLeaseStore) -> BoutLease:
             return await store.claim(
@@ -3367,6 +3824,7 @@ class RunManager:
                         record.round5_lease = renewed
             if lost is None:
                 continue
+            failure_message: str | None = None
             async with record.lock:
                 async with record.lease_lock:
                     if record.round5_lease != lost:
@@ -3378,27 +3836,29 @@ class RunManager:
                     SessionState.VERIFIED,
                     SessionState.TOWELLED,
                     SessionState.FAILED,
-                }:
-                    message = "Round 5 artifact authority was lost; no comparison was declared."
-                    record.snapshot.state = SessionState.FAILED
-                    record.snapshot.failure = message
-                    record.snapshot.remembered_result = None
-                    record.snapshot.metrics = []
-                    record.snapshot.comparison = None
-                    record.snapshot.updated_at = datetime.now(UTC)
-                    snapshot = record.snapshot.model_copy(deep=True)
-                else:
-                    snapshot = None
-            if snapshot is not None:
-                await record.event_log.publish(
-                    "session_failed",
-                    {
-                        "state": SessionState.FAILED,
-                        "message": snapshot.failure,
-                        "session": snapshot.model_dump(mode="json"),
-                    },
+                } and not record.round5_terminal_published:
+                    failure_message = (
+                        "Round 5 artifact authority was lost; no comparison was declared."
+                    )
+                    if not record.round5_ingestion_closed:
+                        record.round5_ingestion_closed = True
+                        record.round5_callback_epoch += 1
+            if failure_message is not None:
+                task = record.task
+                if (
+                    task is not None
+                    and task is not asyncio.current_task()
+                    and not task.done()
+                ):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                await self._finish_connection_spike_failure(
+                    record,
+                    failure_message,
+                    cleanup_verified=False,
                 )
-            await self._release_bout(record)
+            else:
+                await self._release_bout(record)
             return
 
     async def _heartbeat_lease(self, record: SessionRecord, ttl: timedelta) -> None:
@@ -3442,6 +3902,8 @@ class RunManager:
 
     async def _handle_lost_lease(self, record: SessionRecord, lease: BoutLease) -> None:
         message = "Ring lease lost; active work was stopped before another bout can begin."
+        round5_terminal_event_published = False
+        round5_failure_pending = False
         async with record.lock:
             async with record.lease_lock:
                 terminal_lease = record.model_score_terminal_lease
@@ -3524,22 +3986,12 @@ class RunManager:
                     "Round 5 ring lease was lost; cleanup was required and no "
                     "comparison was declared."
                 )
-                record.snapshot.state = SessionState.FAILED
-                record.snapshot.failure = message
-                record.snapshot.remembered_result = None
-                record.snapshot.metrics = []
-                record.snapshot.comparison = None
-                if record.snapshot.round5_setup is not None:
-                    record.snapshot.round5_setup.state = RoundFiveSetupState.FAILED
-                    record.snapshot.round5_setup.downstream_validated = False
-                    record.snapshot.round5_setup.failure = (
-                        "Setup or downstream verification did not complete"
-                    )
-                for lane in record.snapshot.lanes.values():
-                    lane.state = LaneState.FAILED
-                    lane.status = message
-                    lane.error = message
-                    lane.activity = LaneActivity(phase="failed")
+                if record.round5_terminal_published:
+                    return
+                if not record.round5_ingestion_closed:
+                    record.round5_ingestion_closed = True
+                    record.round5_callback_epoch += 1
+                round5_failure_pending = True
             else:
                 record.snapshot.state = SessionState.FAILED
                 record.snapshot.failure = message
@@ -3548,6 +4000,30 @@ class RunManager:
             task = record.task
             cooldown_task = record.cooldown_task
             snapshot = record.snapshot.model_copy(deep=True)
+            if (
+                is_connection_spike
+                and not round5_terminal_event_published
+                and not round5_failure_pending
+            ):
+                await record.event_log.publish(
+                    "session_failed",
+                    {
+                        "state": SessionState.FAILED,
+                        "message": message,
+                        "session": snapshot.model_dump(mode="json"),
+                    },
+                )
+                round5_terminal_event_published = True
+        if round5_failure_pending:
+            if task and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await self._finish_connection_spike_failure(
+                record,
+                message,
+                cleanup_verified=False,
+            )
+            return
         cleanup_ok = True
         if is_connection_spike:
             if task and task is not asyncio.current_task() and not task.done():
@@ -3580,26 +4056,27 @@ class RunManager:
                         setup.cleanup_retryable = True
                         setup.downstream_validated = False
                         setup.failure = "Automatic cleanup verification is in progress"
+                    self._advance_round5_revision_locked(record)
                     record.snapshot.updated_at = datetime.now(UTC)
                     snapshot = record.snapshot.model_copy(deep=True)
+                    await record.event_log.publish(
+                        "cleanup_update",
+                        {"session": snapshot.model_dump(mode="json")},
+                    )
         for operation in (task, cooldown_task):
             if is_connection_spike and operation is task:
                 continue
             if operation and operation is not asyncio.current_task() and not operation.done():
                 operation.cancel()
         event = "redo_failed" if redo_lost else "session_failed"
-        await record.event_log.publish(
-            event,
-            {
-                "state": snapshot.state,
-                "message": message,
-                "session": snapshot.model_dump(mode="json"),
-            },
-        )
-        if is_connection_spike and not cleanup_ok and record.connection_spike_engine is not None:
-            self._schedule_connection_spike_cleanup_retry(
-                record,
-                record.connection_spike_engine,
+        if not round5_terminal_event_published:
+            await record.event_log.publish(
+                event,
+                {
+                    "state": snapshot.state,
+                    "message": message,
+                    "session": snapshot.model_dump(mode="json"),
+                },
             )
 
     async def _release_bout(self, record: SessionRecord) -> bool:
@@ -3654,6 +4131,19 @@ class RunManager:
 
     async def _release_round5_lease(self, record: SessionRecord) -> bool:
         self._cancel_round5_lease_heartbeat(record)
+        # Stop backstage renewal of the warm claim so an abandoned arm's claim can
+        # expire and return the warm generation to READY/WARMING.  The coordinator
+        # already clears the claim at the bell and during cleanup; this covers the
+        # remaining arm-abandon paths (arm failure, refused bell) that release the
+        # Round 5 lease without a cleanup transition.
+        coordinator = self._round5_warm_coordinator
+        warm_slot = record.round5_warm_slot
+        if (
+            coordinator is not None
+            and warm_slot is not None
+            and warm_slot.claim is not None
+        ):
+            coordinator.release_claim_active(warm_slot.claim.claim_id)
         store = self._round5_cleanup_store()
         async with record.lease_lock:
             lease = record.round5_lease
@@ -3688,6 +4178,7 @@ class RunManager:
             and left.fencing_token == right.fencing_token
             and left.session_id == right.session_id
             and left.owner_subject == right.owner_subject
+            and left.phase == right.phase
         )
 
     async def _settle_model_score_terminal_lease(
@@ -3929,6 +4420,8 @@ class RunManager:
         session_state: SessionState,
         *,
         expected_phase: str = "run_committed",
+        expected_lease: BoutLease | None = None,
+        expected_round5_lease: BoutLease | None = None,
     ) -> None:
         cleanup_ttl_seconds = self._running_lease_ttl
         if record.snapshot.round.id == RoundId.WAKE_IDLE_APP:
@@ -3945,6 +4438,20 @@ class RunManager:
             lease = record.lease
             if lease is None or lease.session_id != record.snapshot.id:
                 raise InvalidStateError("RING LEASE EXPIRED · CLEANUP REMAINS FENCED")
+            if expected_lease is not None and not self._same_exact_lease(
+                lease,
+                expected_lease,
+            ):
+                raise InvalidStateError("RING LEASE CHANGED · CLEANUP REMAINS FENCED")
+            if expected_round5_lease is not None:
+                round5_lease = record.round5_lease
+                if round5_lease is None or not self._same_exact_lease(
+                    round5_lease,
+                    expected_round5_lease,
+                ):
+                    raise InvalidStateError(
+                        "ROUND 5 ARTIFACT LEASE CHANGED · CLEANUP REMAINS FENCED"
+                    )
             try:
                 record.lease = await self._lease_store_for_record(record).transition(
                     lease,
@@ -4251,11 +4758,6 @@ class RunManager:
                             "session": snapshot.model_dump(mode="json"),
                         },
                     )
-                    if record.connection_spike_engine is not None:
-                        self._schedule_connection_spike_cleanup_retry(
-                            record,
-                            record.connection_spike_engine,
-                        )
                     return
             if not await self._confirm_terminal_release(record):
                 record.armed_expiry_task = None
@@ -4828,11 +5330,23 @@ class RunManager:
     async def _arm_connection_spike(self, record: SessionRecord) -> None:
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         factory = self._connection_spike_factory
-        if factory is None:
+        capsule = record.round5_launch_capsule
+        warm_slot = record.round5_warm_slot
+        if factory is None and capsule is None:
             await self._fail(record, "Round 5 live adapter is not configured.")
             return
         try:
-            engine = factory(record.snapshot.competitor.id)
+            if capsule is not None and warm_slot is not None:
+                variant = (
+                    Round5Variant.AURORA
+                    if record.snapshot.competitor.id
+                    == CompetitorId.AURORA_SERVERLESS_V2
+                    else Round5Variant.RDS
+                )
+                engine = capsule.variant_contexts[variant]
+            else:
+                assert factory is not None
+                engine = factory(record.snapshot.competitor.id)
             record.connection_spike_engine = engine
             has_timed_setup = self._round_five_has_timed_setup(engine)
             arm = None
@@ -4840,61 +5354,46 @@ class RunManager:
                 check = engine.check  # type: ignore[attr-defined]
                 arm = await check()
             else:
-                # The untimed preparation, moved off the bell. IAM verification, the journal read
-                # and the orphan sweep take minutes against AWS and are excluded from the setup
-                # clock on purpose, so running them after the bell showed the room two clocks at
-                # 0.00 with nothing to distinguish preparing from stuck.
-                # Preparation is an optimisation with a working fallback -- `setup` prepares for
-                # itself when nothing else did -- so a bout whose artifact lease is not yet held
-                # simply prepares later. Failing the arm here would trade a slower bell for no
-                # bell at all.
+                # Compatibility path until the installation-scoped warm slot is
+                # injected. Both calls are mandatory: the bell has no provider,
+                # discovery, credential, or capacity fallback.
                 lease = record.round5_lease
                 prepare = getattr(engine, "prepare", None)
-                if lease is not None and prepare is not None:
-                    started = time.monotonic()
+                if lease is None:
+                    raise InvalidStateError(
+                        "Round 5 automatic warm context is unavailable"
+                    )
+                if capsule is not None:
+                    if prepare is None:
+                        raise InvalidStateError(
+                            "Round 5 automatic warm context is unavailable"
+                        )
+                    claim = warm_slot.claim
+                    bind_claim = getattr(engine, "bind_claim", None)
+                    if claim is None or bind_claim is None:
+                        raise InvalidStateError(
+                            "Round 5 deterministic runner job claim is unavailable"
+                        )
+                    bind_claim(claim)
                     await prepare(record.snapshot.id, lease.fencing_token)
-                    logger.info(
-                        "Round 5 arm timing session=%s step=prepare elapsed_ms=%.0f",
-                        record.snapshot.id,
-                        (time.monotonic() - started) * 1000,
-                    )
+                    arm = getattr(engine, "_armed", None)
+                    if arm is None:
+                        raise InvalidStateError(
+                            "Round 5 warm capacity receipt is unavailable"
+                        )
                 else:
-                    # Worth saying, because this is the branch that pushes the work onto the bell
-                    # and it is invisible otherwise: the round simply feels slow to start.
-                    logger.info(
-                        "Round 5 arm timing session=%s step=prepare skipped lease=%s engine=%s",
-                        record.snapshot.id,
-                        lease is not None,
-                        prepare is not None,
+                    if prepare is not None:
+                        await prepare(record.snapshot.id, lease.fencing_token)
+                    check = getattr(engine, "check", None) or getattr(
+                        engine,
+                        "preflight",
+                        None,
                     )
-                # The capacity preflight too. It measures the runner, not the lanes, so the
-                # answer is the same before the bell as after it, and asking now takes an SSM
-                # round trip out of the dead period the round is judged on.
-                #
-                # Attempted, not required. `run` arms for itself when this did not, so an engine
-                # without a preflight or a transient refusal costs a later bell rather than the
-                # bout. The reason is logged because a bout that silently pays the cost again is
-                # exactly the kind of quiet regression this round keeps producing.
-                check = getattr(engine, "check", None)
-                if check is not None:
-                    try:
-                        check_started = time.monotonic()
-                        arm = await check()
-                        logger.info(
-                            "Round 5 arm timing session=%s step=capacity_preflight elapsed_ms=%.0f",
-                            record.snapshot.id,
-                            (time.monotonic() - check_started) * 1000,
+                    if check is None:
+                        raise InvalidStateError(
+                            "Round 5 warm capacity receipt is unavailable"
                         )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "Round 5 could not arm at arm time, so the bell will do it "
-                            "session=%s diagnosis=%s",
-                            record.snapshot.id,
-                            operator_diagnosis(exc),
-                        )
-                        arm = None
+                    arm = await check()
             loop = asyncio.get_running_loop()
             async with record.lock:
                 armed_at = datetime.now(UTC)
@@ -4910,7 +5409,12 @@ class RunManager:
                     concurrency=_ROUND_FIVE_CONCURRENCY,
                     runner=_ROUND_FIVE_RUNNER,
                     tls="verify-full",
-                    timeout="10 seconds",
+                    timeout="20s connect · 600s run",
+                    protocol=ROUND5_FANIN_PROTOCOL,
+                    target_clients_per_lane=TARGET_CLIENTS_PER_LANE,
+                    hold_seconds=30,
+                    sampled_queries_per_lane=64,
+                    max_retries=0,
                 )
                 for lane in record.snapshot.lanes.values():
                     lane.state = LaneState.SEALED
@@ -5037,39 +5541,73 @@ class RunManager:
             await self._fail(record, "The Round 5 pooled-path proof must be armed again.")
             return
         async with record.lock:
-            started_at = datetime.now(UTC)
-            record.snapshot.state = SessionState.RUNNING
-            record.snapshot.run_started_at = started_at
-            record.run_started_monotonic_ns = self._clock_ns()
-            record.snapshot.updated_at = started_at
-            record.snapshot.metrics = []
-            record.snapshot.comparison = None
-            record.snapshot.round5_setup = self._new_round_five_setup(record.snapshot)
-            record.snapshot.round5_setup.state = RoundFiveSetupState.RUNNING
-            record.round5_progress_observed_ns.clear()
-            for lane in record.snapshot.lanes.values():
-                lane.state = LaneState.CONNECTING
-                lane.status = "Preparing a clean per-bout pooling setup"
-                lane.attempts = 0
-                lane.successes = 0
-                lane.errors = 0
-                lane.p99_ms = None
-                lane.error = None
-                lane.activity = LaneActivity(phase="setup")
+            if record.round5_bell_context is None:
+                started_at = datetime.now(UTC)
+                record.snapshot.state = SessionState.RUNNING
+                record.snapshot.run_started_at = started_at
+                record.run_started_monotonic_ns = self._clock_ns()
+                record.snapshot.updated_at = started_at
+                record.snapshot.metrics = []
+                record.snapshot.comparison = None
+                record.snapshot.round5_setup = self._new_round_five_setup(record.snapshot)
+                record.snapshot.round5_setup.state = RoundFiveSetupState.RUNNING
+                record.round5_progress_observed_ns.clear()
+                record.round5_progress_payload_digests.clear()
+                record.round5_terminal_lane_evidence.clear()
+                record.round5_ingestion_closed = False
+                record.round5_callback_epoch += 1
+                record.round5_terminal_published = False
+                for lane in record.snapshot.lanes.values():
+                    lane.state = LaneState.CONNECTING
+                    lane.status = "Preparing a clean per-bout pooling setup"
+                    lane.attempts = 0
+                    lane.successes = 0
+                    lane.errors = 0
+                    lane.p99_ms = None
+                    lane.error = None
+                    lane.activity = LaneActivity(phase="setup")
+            callback_runtime = record.snapshot.round5_runtime
+            callback_bell_id = (
+                callback_runtime.bell_id if callback_runtime is not None else None
+            )
+            callback_generation = (
+                callback_runtime.warm_generation
+                if callback_runtime is not None
+                else None
+            )
+            callback_epoch = record.round5_callback_epoch
             running_snapshot = self._public_snapshot_locked(record)
-        await record.event_log.publish(
-            "run_started",
-            {
-                "state": SessionState.RUNNING,
-                "lanes": ["lakebase", "competitor"],
-                "session": running_snapshot.model_dump(mode="json"),
-            },
-        )
+        run_started_payload = {
+            "state": SessionState.RUNNING,
+            "lanes": ["lakebase", "competitor"],
+            "session": running_snapshot.model_dump(mode="json"),
+        }
+        publication_ready = asyncio.Event()
+
+        def ingestion_is_open() -> bool:
+            runtime = record.snapshot.round5_runtime
+            return (
+                not record.round5_ingestion_closed
+                and record.snapshot.state == SessionState.RUNNING
+                and record.round5_callback_epoch == callback_epoch
+                and (
+                    runtime is None
+                    or (
+                        runtime.bell_id == callback_bell_id
+                        and runtime.warm_generation == callback_generation
+                        and runtime.state == "running"
+                    )
+                )
+            )
 
         async def publish_lane_snapshots(
-            snapshot: SessionSnapshot,
             lane_ids: tuple[str, ...],
         ) -> None:
+            if not record.lock.locked():
+                raise RuntimeError("Round 5 publication requires the record lock")
+            if not ingestion_is_open():
+                return
+            snapshot = self._public_snapshot_locked(record)
             serialized = snapshot.model_dump(mode="json")
             for lane_id in lane_ids:
                 lane = snapshot.lanes[lane_id]
@@ -5087,14 +5625,12 @@ class RunManager:
                             if lane.activity is not None
                             else None
                         ),
-                        # Retained for clients that understand the richer Round 5
-                        # setup snapshot; the standard lane fields above keep the
-                        # SSE contract valid for every existing client.
                         "session": serialized,
                     },
                 )
 
         async def on_setup_progress(progress: object) -> None:
+            await publication_ready.wait()
             lane_id = self._round_five_value(progress, "lane_id")
             phase = self._round_five_public_phase(
                 self._round_five_value(progress, "phase", "setup")
@@ -5112,7 +5648,7 @@ class RunManager:
             )
             status = self._round_five_setup_status(lane_id, phase)
             async with record.lock:
-                if record.snapshot.towel is not None:
+                if not ingestion_is_open():
                     return
                 setup = record.snapshot.round5_setup
                 if setup is None:
@@ -5158,9 +5694,345 @@ class RunManager:
                     lane = record.snapshot.lanes[affected_lane_id]
                     lane.status = status
                     lane.activity = LaneActivity(phase=phase)
+                    runtime = record.snapshot.round5_runtime
+                    if runtime is not None:
+                        runtime_lane = runtime.lanes[affected_lane_id]
+                        runtime_lane.phase = (
+                            "dispatching"
+                            if reached_stop
+                            else "provisioning_proxy"
+                            if affected_lane_id == "competitor"
+                            and phase
+                            in {
+                                "creating_proxy",
+                                "freezing_proxy_settings",
+                                "registering_proxy_target",
+                                "waiting_for_proxy_target",
+                                "resuming_database",
+                            }
+                            else "verifying_proxy"
+                            if affected_lane_id == "competitor"
+                            else "dispatching"
+                        )
+                        runtime_lane.status = status
+                self._advance_round5_revision_locked(record)
                 record.snapshot.updated_at = datetime.now(UTC)
-                snapshot = self._public_snapshot_locked(record)
-            await publish_lane_snapshots(snapshot, affected_lane_ids)
+                await publish_lane_snapshots(affected_lane_ids)
+
+        async def on_lane_progress(progress: object) -> None:
+            await publication_ready.wait()
+            lane_id = str(self._round_five_value(progress, "lane_id", ""))
+            if lane_id not in {"lakebase", "competitor"}:
+                return
+            phase_value = str(
+                self._round_five_value(progress, "phase", "ramping")
+            ).lower()
+            phase = "holding" if phase_value == "holding" else "ramping"
+            initiated = max(
+                0,
+                self._round_five_count(
+                    self._round_five_value(
+                        progress,
+                        "initiated_clients",
+                        self._round_five_value(
+                            progress,
+                            "authenticated_clients",
+                            0,
+                        ),
+                    )
+                ),
+            )
+            authenticated = max(
+                0,
+                self._round_five_count(
+                    self._round_five_value(
+                        progress,
+                        "authenticated_clients",
+                        0,
+                    )
+                ),
+            )
+            held = max(
+                0,
+                self._round_five_count(
+                    self._round_five_value(progress, "held_clients", 0)
+                ),
+            )
+            peak_held = max(
+                held,
+                self._round_five_count(
+                    self._round_five_value(
+                        progress,
+                        "peak_held_clients",
+                        held,
+                    )
+                ),
+            )
+            samples = max(
+                0,
+                self._round_five_count(
+                    self._round_five_value(
+                        progress,
+                        "sampled_queries_succeeded",
+                        0,
+                    )
+                ),
+            )
+            runner_elapsed = self._round_five_number(
+                self._round_five_value(progress, "elapsed_ms")
+            )
+            target_elapsed = self._round_five_number(
+                self._round_five_value(progress, "time_to_target_ms")
+            )
+            milestone = str(
+                self._round_five_value(progress, "milestone", "") or ""
+            )
+            first_socket_ms = self._round_five_number(
+                self._round_five_value(
+                    progress,
+                    "first_socket_initiated_ms",
+                )
+            )
+            first_authentication_ms = self._round_five_number(
+                self._round_five_value(
+                    progress,
+                    "first_client_authenticated_ms",
+                )
+            )
+            exact_target = (
+                initiated == TARGET_CLIENTS_PER_LANE
+                and authenticated == TARGET_CLIENTS_PER_LANE
+                and held == TARGET_CLIENTS_PER_LANE
+                and target_elapsed is not None
+            )
+            if not exact_target:
+                phase = "ramping"
+                target_elapsed = None
+            raw_progress_revision = self._round_five_value(progress, "sequence")
+            progress_revision = (
+                int(raw_progress_revision)
+                if isinstance(raw_progress_revision, int)
+                and not isinstance(raw_progress_revision, bool)
+                and raw_progress_revision > 0
+                else None
+            )
+            observed_ns = self._clock_ns()
+            progress_digest = (
+                hashlib.sha256(
+                    json.dumps(
+                        {
+                            "lane_id": lane_id,
+                            "phase": phase,
+                            "initiated_clients": initiated,
+                            "authenticated_clients": authenticated,
+                            "held_clients": held,
+                            "peak_held_clients": peak_held,
+                            "sampled_queries_succeeded": samples,
+                            "elapsed_ms": runner_elapsed,
+                            "time_to_target_ms": target_elapsed,
+                            "milestone": milestone,
+                            "first_socket_initiated_ms": first_socket_ms,
+                            "first_client_authenticated_ms": (
+                                first_authentication_ms
+                            ),
+                            "sequence": progress_revision,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if progress_revision is not None
+                else None
+            )
+            async with record.lock:
+                if not ingestion_is_open():
+                    return
+                runtime = record.snapshot.round5_runtime
+                started_ns = record.run_started_monotonic_ns
+                if runtime is None or started_ns is None:
+                    return
+                lane_runtime = runtime.lanes[lane_id]
+                # Worker progress is a current-state projection, not a set of
+                # monotonic counters. Multiprocess output can be replayed by an
+                # SSM poll, so only a newer per-lane revision may replace it.
+                # Synthetic final-result updates have no runner sequence and
+                # are ordered locally after every observed progress callback.
+                if progress_revision is not None:
+                    progress_key = (lane_id, progress_revision)
+                    if progress_revision < lane_runtime.progress_revision:
+                        return
+                    if progress_revision == lane_runtime.progress_revision:
+                        if (
+                            record.round5_progress_payload_digests.get(progress_key)
+                            != progress_digest
+                        ):
+                            raise InvalidStateError(
+                                "Round 5 equal progress revision changed payload"
+                            )
+                        return
+                    assert progress_digest is not None
+                    record.round5_progress_payload_digests[progress_key] = (
+                        progress_digest
+                    )
+                lane_runtime.progress_revision = (
+                    progress_revision
+                    if progress_revision is not None
+                    else lane_runtime.progress_revision + 1
+                )
+                observed_ms = max(0.0, (observed_ns - started_ns) / 1_000_000)
+                previous_ns = record.round5_progress_observed_ns.get(lane_id)
+                uncertainty_ms = (
+                    max(0.0, (observed_ns - previous_ns) / 1_000_000)
+                    if previous_ns is not None
+                    else 0.0
+                )
+                record.round5_progress_observed_ns[lane_id] = observed_ns
+                lane_runtime.phase = phase
+                lane_runtime.elapsed_at_snapshot_ms = (
+                    lane_runtime.bell_to_10000_observed_ms
+                    or observed_ms
+                )
+                lane_runtime.clients_initiated = initiated
+                lane_runtime.clients_authenticated = authenticated
+                lane_runtime.held_clients = held
+                lane_runtime.peak_clients_authenticated = max(
+                    lane_runtime.peak_clients_authenticated,
+                    authenticated,
+                )
+                lane_runtime.peak_held_clients = max(
+                    lane_runtime.peak_held_clients,
+                    peak_held,
+                )
+                lane_runtime.sampled_queries_succeeded = samples
+                if (
+                    lane_runtime.ramp_started_observed_ms is None
+                    and first_socket_ms is not None
+                ):
+                    lane_runtime.ramp_started_observed_ms = first_socket_ms
+                if milestone == "runner_observed_release":
+                    lane_runtime.release_published_observed_ms = (
+                        lane_runtime.release_published_observed_ms or observed_ms
+                    )
+                    lane_runtime.runner_release_observed_ms = (
+                        lane_runtime.runner_release_observed_ms or observed_ms
+                    )
+                if first_socket_ms is not None:
+                    release_floor = lane_runtime.runner_release_observed_ms
+                    if release_floor is not None:
+                        lane_runtime.first_socket_initiated_observed_ms = (
+                            lane_runtime.first_socket_initiated_observed_ms
+                            or release_floor + first_socket_ms
+                        )
+                if first_authentication_ms is not None:
+                    release_floor = lane_runtime.runner_release_observed_ms
+                    if release_floor is not None:
+                        authentication_at = (
+                            release_floor + first_authentication_ms
+                        )
+                        lane_runtime.first_client_authenticated_observed_ms = (
+                            lane_runtime.first_client_authenticated_observed_ms
+                            or authentication_at
+                        )
+                        lane_runtime.pooled_path_ready_observed_ms = (
+                            lane_runtime.pooled_path_ready_observed_ms
+                            or authentication_at
+                        )
+                if runner_elapsed is not None:
+                    lane_runtime.ramp_time_to_10000_ms = target_elapsed
+                if (
+                    exact_target
+                    and lane_runtime.bell_to_10000_observed_ms is None
+                ):
+                    lane_runtime.bell_to_10000_observed_ms = observed_ms
+                    lane_runtime.elapsed_at_snapshot_ms = observed_ms
+                    lane_runtime.observation_uncertainty_ms = uncertainty_ms
+                lane_runtime.status = (
+                    f"{held:,} / {TARGET_CLIENTS_PER_LANE:,} clients held"
+                    if phase != "holding"
+                    else (
+                        f"{held:,} held · {samples} of 64 verification samples completed"
+                    )
+                )
+                self._advance_round5_revision_locked(record)
+                lane = record.snapshot.lanes[lane_id]
+                lane.state = (
+                    LaneState.VERIFYING
+                    if phase == "holding"
+                    else LaneState.CONNECTING
+                )
+                lane.attempts = lane_runtime.held_clients
+                lane.successes = lane_runtime.clients_authenticated
+                lane.status = lane_runtime.status
+                lane.activity = LaneActivity(phase=phase)
+                lane.evidence = {
+                    **lane.evidence,
+                    "initiated_clients": lane_runtime.clients_initiated,
+                    "authenticated_clients": lane_runtime.clients_authenticated,
+                    "held_clients": lane_runtime.held_clients,
+                    "peak_authenticated_clients": (
+                        lane_runtime.peak_clients_authenticated
+                    ),
+                    "peak_held_clients": lane_runtime.peak_held_clients,
+                    "progress_revision": lane_runtime.progress_revision,
+                    "sampled_queries_succeeded": (
+                        lane_runtime.sampled_queries_succeeded
+                    ),
+                }
+                record.snapshot.updated_at = datetime.now(UTC)
+                await publish_lane_snapshots((lane_id,))
+
+        async def on_lane_result(result: object) -> None:
+            await publication_ready.wait()
+            lane_id = str(self._round_five_value(result, "lane_id", ""))
+            if lane_id not in {"lakebase", "competitor"}:
+                raise InvalidStateError("Round 5 result named an unknown lane")
+            evidence = self._round_five_evidence(result)
+            lane_valid = self._round_five_lane_valid(result, evidence)
+            if lane_valid:
+                async with record.lock:
+                    runtime = record.snapshot.round5_runtime
+                    lane_valid = (
+                        runtime is None
+                        or runtime.lanes[lane_id].bell_to_10000_observed_ms
+                        is not None
+                    )
+            if not lane_valid:
+                async with record.lock:
+                    if not ingestion_is_open():
+                        return
+                    record.round5_ingestion_closed = True
+                    record.round5_callback_epoch += 1
+                    record.round5_terminal_lane_evidence[lane_id] = evidence
+                raise InvalidStateError(
+                    f"Round 5 {lane_id} result failed its exact gate"
+                )
+            async with record.lock:
+                if not ingestion_is_open():
+                    return
+                lane = record.snapshot.lanes[lane_id]
+                lane.attempts = int(evidence.get("initiated_clients") or 0)
+                lane.successes = int(evidence.get("authenticated_clients") or 0)
+                lane.errors = int(evidence.get("terminal_failures") or 0)
+                lane.p99_ms = self._round_five_number(
+                    evidence.get("connect_latency_p99_ms")
+                )
+                lane.evidence = evidence
+                # This is a lane-scoped proof latch, not the bout verdict.  It
+                # must survive a sibling failure so the terminal snapshot does
+                # not rewrite valid evidence as though this lane also failed.
+                lane.state = LaneState.VERIFIED
+                lane.status = "Exact lane result verified; awaiting sibling lane"
+                lane.error = None
+                lane.verified_at = datetime.now(UTC)
+                lane.activity = LaneActivity(phase="verified")
+                runtime = record.snapshot.round5_runtime
+                if runtime is not None:
+                    runtime_lane = runtime.lanes[lane_id]
+                    runtime_lane.phase = "verified"
+                    runtime_lane.status = lane.status
+                self._advance_round5_revision_locked(record)
+                record.snapshot.updated_at = datetime.now(UTC)
+                await publish_lane_snapshots((lane_id,))
 
         if setup_operation is not None:
             try:
@@ -5168,12 +6040,41 @@ class RunManager:
                 if lease is None:
                     raise InvalidStateError("The Round 5 artifact lease is unavailable")
                 setup_started = time.monotonic()
-                setup_result = await setup_operation(
-                    record.snapshot.id,
-                    lease.fencing_token,
-                    on_setup_progress,
+                setup_awaitable = (
+                    setup_operation(
+                        record.snapshot.id,
+                        lease.fencing_token,
+                        on_setup_progress,
+                        on_lane_progress,
+                        on_lane_result,
+                    )
+                    if record.snapshot.round5_runtime is not None
+                    else setup_operation(
+                        record.snapshot.id,
+                        lease.fencing_token,
+                        on_setup_progress,
+                    )
                 )
-                logger.info(
+                setup_task = asyncio.create_task(
+                    setup_awaitable,
+                    name=f"round5-lane-pipelines-{record.snapshot.id}",
+                )
+                # The setup coroutine's first turn constructs both lane tasks
+                # and releases their shared bell gate. Event publication is
+                # deliberately scheduled only after that turn and is never on
+                # either eligibility edge.
+                await asyncio.sleep(0)
+                try:
+                    async with record.lock:
+                        if ingestion_is_open():
+                            await record.event_log.publish(
+                                "run_started",
+                                run_started_payload,
+                            )
+                finally:
+                    publication_ready.set()
+                setup_result = await setup_task
+                logger.warning(
                     "Round 5 bell timing session=%s step=setup_phase elapsed_ms=%.0f",
                     record.snapshot.id,
                     (time.monotonic() - setup_started) * 1000,
@@ -5181,23 +6082,19 @@ class RunManager:
                 record.connection_spike_setup_result = setup_result
                 preliminary = self._round_five_finalize_setup(setup_result, {})
                 async with record.lock:
-                    if record.snapshot.towel is not None:
+                    if not ingestion_is_open():
                         return
                     record.snapshot.round5_setup = self._round_five_setup_snapshot(
                         record.snapshot,
                         preliminary,
                         terminal=False,
                     )
-                    setup_snapshot = self._public_snapshot_locked(record)
-                await publish_lane_snapshots(
-                    setup_snapshot,
-                    ("lakebase", "competitor"),
-                )
+                    self._advance_round5_revision_locked(record)
+                    await publish_lane_snapshots(("lakebase", "competitor"))
                 if arm is None:
-                    # Only when the arm did not already do it. Measuring the same runner twice
-                    # would spend the half minute moving it to the arm was meant to save.
-                    arm = await engine.check()  # type: ignore[attr-defined]
-                record.connection_spike_arm = arm
+                    raise InvalidStateError(
+                        "Round 5 warm capacity receipt is unavailable"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -5215,22 +6112,22 @@ class RunManager:
                     cleanup_verified=False,
                 )
                 return
+        else:
+            await record.event_log.publish("run_started", run_started_payload)
+            publication_ready.set()
 
         async with record.lock:
-            if record.snapshot.towel is not None:
+            if not ingestion_is_open():
                 return
-            for lane in record.snapshot.lanes.values():
-                lane.status = (
-                    "Opening 10,000 client connections from the shared start"
-                )
-                lane.activity = LaneActivity(phase="burst")
-            burst_snapshot = self._public_snapshot_locked(record)
-        await publish_lane_snapshots(
-            burst_snapshot,
-            ("lakebase", "competitor"),
-        )
+            if record.snapshot.round5_runtime is None:
+                for lane in record.snapshot.lanes.values():
+                    lane.status = "Opening 10,000 client connections"
+                    lane.activity = LaneActivity(phase="burst")
+            self._advance_round5_revision_locked(record)
+            await publish_lane_snapshots(("lakebase", "competitor"))
 
         async def on_progress(progress: object) -> None:
+            await publication_ready.wait()
             lane_id = self._round_five_value(progress, "lane_id")
             phase = self._round_five_public_phase(
                 self._round_five_value(progress, "phase", "burst")
@@ -5252,8 +6149,8 @@ class RunManager:
                     else ("lakebase", "competitor")
                 )
                 record.snapshot.updated_at = datetime.now(UTC)
-                snapshot = record.snapshot.model_copy(deep=True)
-            await publish_lane_snapshots(snapshot, affected_lane_ids)
+                self._advance_round5_revision_locked(record)
+                await publish_lane_snapshots(affected_lane_ids)
 
         try:
             if arm is None:
@@ -5377,7 +6274,10 @@ class RunManager:
         result: LiveOrdersResult,
     ) -> None:
         async with record.lock:
-            if record.snapshot.towel is not None:
+            if (
+                record.snapshot.towel is not None
+                or record.round5_terminal_published
+            ):
                 return
             if not await self._confirm_terminal_release(record):
                 return
@@ -5518,6 +6418,7 @@ class RunManager:
     ) -> None:
         """Move Round 5 artifacts backstage without delaying the verdict."""
 
+        await self._mark_connection_spike_cleanup_in_progress(record)
         engine = record.connection_spike_engine
         operator = record.operator
         if engine is None or operator is None:
@@ -5530,9 +6431,24 @@ class RunManager:
                 session_state=record.snapshot.state,
                 allow_claim=False,
             )
+            if (
+                self._round5_warm_coordinator is not None
+                and record.round5_warm_slot is not None
+                and record.round5_warm_slot.claim is not None
+            ):
+                record.round5_warm_slot = (
+                    await self._round5_warm_coordinator.begin_cleanup(
+                        record.round5_warm_slot.claim.claim_id
+                    )
+                )
             stop_run = getattr(engine, "stop_and_begin_cleanup", None)
             stop_setup = getattr(engine, "stop_setup_and_begin_cleanup", None)
-            if stop_run is not None and record.connection_spike_arm is not None:
+            if (
+                stop_run is not None
+                and record.connection_spike_arm is not None
+                and record.snapshot.round5_setup is not None
+                and record.snapshot.round5_setup.setup_validated
+            ):
                 await stop_run(record.connection_spike_arm)
             elif stop_setup is not None:
                 await stop_setup(record.snapshot.id)
@@ -5543,9 +6459,6 @@ class RunManager:
                 _redacted_exception_chain(exc),
             )
             await self._mark_connection_spike_cleanup_pending(record)
-            if record.snapshot.towel is None:
-                await self._release_bout(record)
-            self._schedule_connection_spike_cleanup_retry(record, engine)
             return
 
         current = record.connection_spike_cleanup_task
@@ -5556,17 +6469,63 @@ class RunManager:
             name=f"round5-backstage-cleanup-{record.snapshot.id}",
         )
 
+    async def _mark_connection_spike_cleanup_in_progress(
+        self,
+        record: SessionRecord,
+    ) -> None:
+        async with record.lock:
+            setup = record.snapshot.round5_setup
+            if setup is not None:
+                setup.cleanup_retryable = False
+                setup.cleanup_failure = None
+            if record.snapshot.towel is not None:
+                record.snapshot.towel.state = TowelState.CLEANING
+                record.snapshot.towel.cleanup_failure = None
+            record.snapshot.updated_at = datetime.now(UTC)
+            snapshot = self._revalidated_snapshot(record.snapshot)
+            await record.event_log.publish(
+                "cleanup_update",
+                {"session": snapshot.model_dump(mode="json")},
+            )
+
     async def _round5_proof_authority_is_current(
         self,
         record: SessionRecord,
-    ) -> bool:
+    ) -> tuple[BoutLease, BoutLease] | None:
         async with record.lease_lock:
             main = record.lease
             round5 = record.round5_lease
         if main is None or round5 is None:
-            return False
+            return None
         if main.phase != "run_committed" or round5.phase != "run_committed":
-            return False
+            return None
+        try:
+            current_main, current_round5 = await asyncio.gather(
+                self._lease_store_for_record(record).current(),
+                self._round5_cleanup_store().current(),
+            )
+        except Exception:
+            return None
+        if not (
+            current_main is not None
+            and current_round5 is not None
+            and self._same_exact_lease(main, current_main)
+            and self._same_exact_lease(round5, current_round5)
+            and current_main.phase == "run_committed"
+            and current_round5.phase == "run_committed"
+        ):
+            return None
+        return main, round5
+
+    async def _commit_round5_proof_authority_to_cleanup(
+        self,
+        record: SessionRecord,
+        authority: tuple[BoutLease, BoutLease],
+        session_state: SessionState,
+    ) -> bool:
+        """CAS the exact observed proof fence and read it back before publication."""
+
+        main, round5 = authority
         try:
             current_main, current_round5 = await asyncio.gather(
                 self._lease_store_for_record(record).current(),
@@ -5574,11 +6533,48 @@ class RunManager:
             )
         except Exception:
             return False
-        return bool(
+        if not (
             current_main is not None
             and current_round5 is not None
             and self._same_exact_lease(main, current_main)
             and self._same_exact_lease(round5, current_round5)
+            and current_main.phase == "run_committed"
+            and current_round5.phase == "run_committed"
+        ):
+            return False
+        try:
+            await self._transition_bout_to_cleanup(
+                record,
+                session_state,
+                expected_lease=main,
+                expected_round5_lease=round5,
+            )
+        except InvalidStateError:
+            return False
+        async with record.lease_lock:
+            transitioned = record.lease
+            local_round5 = record.round5_lease
+        if (
+            transitioned is None
+            or local_round5 is None
+            or transitioned.phase != "cooldown"
+            or not self._same_exact_lease(local_round5, round5)
+        ):
+            return False
+        try:
+            readback_main, readback_round5 = await asyncio.gather(
+                self._lease_store_for_record(record).current(),
+                self._round5_cleanup_store().current(),
+            )
+        except Exception:
+            return False
+        return bool(
+            readback_main is not None
+            and readback_round5 is not None
+            and self._same_exact_lease(transitioned, readback_main)
+            and self._same_exact_lease(round5, readback_round5)
+            and readback_main.phase == "cooldown"
+            and readback_round5.phase == "run_committed"
         )
 
     async def _complete_connection_spike_cleanup_handoff(
@@ -5587,7 +6583,6 @@ class RunManager:
         engine: object,
     ) -> None:
         task = asyncio.current_task()
-        retry = False
         try:
             wait_accepted = getattr(engine, "wait_for_proxy_delete_accepted", None)
             wait_complete = getattr(engine, "wait_for_cleanup_complete", None)
@@ -5598,14 +6593,24 @@ class RunManager:
                     accepted = getattr(engine, "proxy_delete_accepted", None)
                     if accepted is None or not bool(accepted()):
                         raise
-                if not await self._release_bout(record):
-                    raise InvalidStateError("Main ring release is still pending")
                 await wait_complete()
             else:
                 if not await self._cleanup_connection_spike(record):
                     raise InvalidStateError("Round 5 cleanup could not be verified")
-                if not await self._release_bout(record):
-                    raise InvalidStateError("Main ring release is still pending")
+            if (
+                self._round5_warm_coordinator is not None
+                and record.round5_warm_slot is not None
+                and record.round5_warm_slot.claim is not None
+            ):
+                record.round5_warm_slot = (
+                    await self._round5_warm_coordinator.finish_cleanup_and_rewarm(
+                        record.round5_warm_slot.claim.claim_id
+                    )
+                )
+                record.round5_launch_capsule = None
+            self._require_round5_rewarm_transition(record)
+            if not await self._release_bout(record):
+                raise InvalidStateError("Main ring release is still pending")
             if not await self._release_round5_lease(record):
                 raise InvalidStateError("Round 5 cleanup lease release is still pending")
             await self._mark_connection_spike_cleanup_complete(record)
@@ -5618,33 +6623,63 @@ class RunManager:
                 _redacted_exception_chain(exc),
             )
             await self._mark_connection_spike_cleanup_pending(record)
-            retry = not self._closed
         finally:
             if record.connection_spike_cleanup_task is task:
                 record.connection_spike_cleanup_task = None
-        if retry:
-            self._schedule_connection_spike_cleanup_retry(record, engine)
+
+    def _require_round5_rewarm_transition(
+        self,
+        record: SessionRecord,
+    ) -> None:
+        if self._round5_warm_coordinator is None:
+            return
+        slot = record.round5_warm_slot
+        if (
+            slot is None
+            or slot.claim is not None
+            or slot.state
+            in {
+                Round5WarmState.CLAIMED,
+                Round5WarmState.RUNNING,
+                Round5WarmState.CLEANING,
+            }
+        ):
+            raise InvalidStateError(
+                "Round 5 durable rewarm transition is not confirmed"
+            )
 
     async def _mark_connection_spike_cleanup_pending(
         self,
         record: SessionRecord,
     ) -> None:
+        owed = self._note_round5_proxy_at_risk(
+            record,
+            still_retrying=False,
+        )
+        cleanup_failure = (
+            owed.detail
+            if owed is not None
+            else "Automatic backstage cleanup failed; use Retry Cleanup."
+        )
         async with record.lock:
             setup = record.snapshot.round5_setup
             if setup is not None:
                 setup.cleanup_retryable = True
-                if record.snapshot.state == SessionState.FAILED:
+                setup.cleanup_failure = cleanup_failure
+                if record.snapshot.towel is not None:
+                    setup.state = RoundFiveSetupState.TOWELLED
+                elif record.snapshot.state == SessionState.FAILED:
                     setup.state = RoundFiveSetupState.CLEANUP_FAILED
-                    setup.failure = "Automatic backstage cleanup is still settling"
+                    setup.failure = setup.cleanup_failure
             if record.snapshot.towel is not None:
-                record.snapshot.towel.state = TowelState.CLEANING
+                record.snapshot.towel.state = TowelState.FAILED
+                record.snapshot.towel.cleanup_failure = cleanup_failure
             record.snapshot.updated_at = datetime.now(UTC)
-            snapshot = record.snapshot.model_copy(deep=True)
-        self._note_round5_proxy_at_risk(record)
-        await record.event_log.publish(
-            "cleanup_update",
-            {"session": snapshot.model_dump(mode="json")},
-        )
+            snapshot = self._revalidated_snapshot(record.snapshot)
+            await record.event_log.publish(
+                "cleanup_update",
+                {"session": snapshot.model_dump(mode="json")},
+            )
 
     def _note_round5_proxy_at_risk(
         self,
@@ -5664,10 +6699,10 @@ class RunManager:
         away by the second week. A delete that was never accepted is a different
         animal: nothing has asked AWS to remove anything, so nothing will.
 
-        Abandonment overrides the gate. Once the retries are spent, "the delete
-        was accepted" is no longer reassuring -- it was accepted and the resource
-        was still never proved gone -- and the operator is the only remaining
-        way that gets resolved.
+        Handing control back to the operator overrides the gate. Once automatic
+        cleanup has failed, "the delete was accepted" is not proof that the
+        resource disappeared; the retained fence and Retry Cleanup are the only
+        safe continuation.
         """
 
         engine = record.connection_spike_engine
@@ -5700,6 +6735,7 @@ class RunManager:
         self,
         record: SessionRecord,
     ) -> None:
+        self._require_round5_rewarm_transition(record)
         async with record.lock:
             setup = record.snapshot.round5_setup
             if setup is not None:
@@ -5713,15 +6749,15 @@ class RunManager:
                 record.snapshot.towel.cleanup_failure = None
             record.connection_spike_setup_result = None
             record.snapshot.updated_at = datetime.now(UTC)
-            snapshot = record.snapshot.model_copy(deep=True)
+            snapshot = self._revalidated_snapshot(record.snapshot)
+            await record.event_log.publish(
+                "cleanup_update",
+                {"session": snapshot.model_dump(mode="json")},
+            )
         # The one place a Proxy is proved gone. Every surface that was warning
         # about it stops here, together, so `/readyz` cannot keep naming a
         # resource the snapshot has already stopped naming.
         clear_round5_cleanup_owed(record.snapshot.id)
-        await record.event_log.publish(
-            "cleanup_update",
-            {"session": snapshot.model_dump(mode="json")},
-        )
 
     async def _finish_connection_spike(
         self,
@@ -5729,9 +6765,15 @@ class RunManager:
         result: object,
     ) -> None:
         async with record.lock:
-            if record.snapshot.towel is not None:
+            if (
+                record.snapshot.towel is not None
+                or record.round5_terminal_published
+            ):
                 return
-        if not await self._round5_proof_authority_is_current(record):
+            record.round5_ingestion_closed = True
+            record.round5_callback_epoch += 1
+        proof_authority = await self._round5_proof_authority_is_current(record)
+        if proof_authority is None:
             await self._finish_connection_spike_failure(
                 record,
                 "Round 5 proof authority changed; no comparison was declared.",
@@ -5739,7 +6781,17 @@ class RunManager:
             )
             return
         async with record.lock:
+            if (
+                record.snapshot.towel is not None
+                or record.round5_terminal_published
+            ):
+                return
+            pre_verdict_snapshot = record.snapshot.model_copy(deep=True)
+            pre_verdict_armed_at = record.armed_at_monotonic
+            pre_verdict_setup_result = record.connection_spike_setup_result
+            record.round5_ingestion_closed = True
             lanes = self._round_five_lanes(result)
+            runtime = record.snapshot.round5_runtime
             valid = set(lanes) == {"lakebase", "competitor"}
             for lane_id in ("lakebase", "competitor"):
                 raw = lanes.get(lane_id)
@@ -5751,17 +6803,84 @@ class RunManager:
                     valid = False
                     continue
                 evidence = self._round_five_evidence(raw)
-                lane.attempts = int(evidence["scheduled_clients"])
-                lane.successes = int(evidence["successful_clients"])
-                lane.errors = int(evidence["error_clients"])
+                lane.attempts = int(
+                    evidence.get(
+                        "scheduled_clients",
+                        evidence.get("initiated_clients", 0),
+                    )
+                    or 0
+                )
+                lane.successes = int(
+                    evidence.get(
+                        "successful_clients",
+                        evidence.get("authenticated_clients", 0),
+                    )
+                    or 0
+                )
+                lane.errors = int(
+                    evidence.get(
+                        "error_clients",
+                        evidence.get("terminal_failures", 0),
+                    )
+                    or 0
+                )
                 lane.p99_ms = self._round_five_number(
                     self._round_five_value(raw, "application_p99_ms")
                 )
-                # Setup is the primary clock. Burst p99 remains an independent
-                # secondary metric and is never folded into generic elapsed time.
-                lane.elapsed_ms = None
                 lane.evidence = evidence
                 lane_valid = self._round_five_lane_valid(raw, evidence)
+                if runtime is not None:
+                    runtime_lane = runtime.lanes[lane_id]
+                    # Result transfer happens after ramp, hold, sampling and
+                    # socket cleanup.  It is not the parent barrier edge and
+                    # must never be substituted for a missing bell-to-10K
+                    # progress observation.
+                    barrier_observed = (
+                        runtime_lane.bell_to_10000_observed_ms is not None
+                    )
+                    lane_valid = lane_valid and barrier_observed
+                    observed_ms = max(
+                        runtime_lane.elapsed_at_snapshot_ms,
+                        (
+                            self._clock_ns() - record.run_started_monotonic_ns
+                        )
+                        / 1_000_000
+                        if record.run_started_monotonic_ns is not None
+                        else 0.0,
+                    )
+                    runtime_lane.clients_initiated = int(
+                        evidence.get("initiated_clients") or 0
+                    )
+                    runtime_lane.clients_authenticated = int(
+                        evidence.get("authenticated_clients") or 0
+                    )
+                    runtime_lane.held_clients = int(
+                        evidence.get("held_clients_at_gate") or 0
+                    )
+                    runtime_lane.sampled_queries_succeeded = int(
+                        evidence.get("sampled_queries_succeeded") or 0
+                    )
+                    runtime_lane.ramp_time_to_10000_ms = self._round_five_number(
+                        evidence.get("time_to_target_ms")
+                    )
+                    if lane_valid:
+                        runtime_lane.elapsed_at_snapshot_ms = (
+                            runtime_lane.bell_to_10000_observed_ms
+                        )
+                        runtime_lane.phase = "verified"
+                    else:
+                        runtime_lane.phase = "failed"
+                        runtime_lane.elapsed_at_snapshot_ms = observed_ms
+                    runtime_lane.status = (
+                        "Exact 10,000-client retained gate verified"
+                        if lane_valid
+                        else "Round 5 exact lane gate or barrier evidence failed"
+                    )
+                    lane.elapsed_ms = runtime_lane.bell_to_10000_observed_ms
+                else:
+                    # Legacy setup-clock scorecards retain their historical
+                    # rendering without being relabelled as V4 runtime evidence.
+                    lane.elapsed_ms = None
                 valid = valid and lane_valid
                 lane.state = LaneState.VERIFIED if lane_valid else LaneState.FAILED
                 lane.status = (
@@ -5789,7 +6908,12 @@ class RunManager:
                 concurrency=_ROUND_FIVE_CONCURRENCY,
                 runner=_ROUND_FIVE_RUNNER,
                 tls="verify-full",
-                timeout="10 seconds",
+                timeout="20s connect · 600s run",
+                protocol=ROUND5_FANIN_PROTOCOL,
+                target_clients_per_lane=TARGET_CLIENTS_PER_LANE,
+                hold_seconds=30,
+                sampled_queries_per_lane=64,
+                max_retries=0,
             )
             raw_downstream = self._round_five_value(result, "lanes", {})
             setup_result = self._round_five_finalize_setup(
@@ -5808,19 +6932,40 @@ class RunManager:
                 and setup_snapshot.setup_validated
                 and setup_snapshot.downstream_validated
             )
-            comparison = (
-                self._round_five_setup_comparison(
-                    setup_result,
-                    record.snapshot.competitor.short_name,
+            comparison = None
+            if valid:
+                comparison = (
+                    self._round_five_v4_comparison(
+                        runtime,
+                        record.snapshot.competitor.short_name,
+                    )
+                    if runtime is not None
+                    else self._round_five_setup_comparison(
+                        setup_result,
+                        record.snapshot.competitor.short_name,
+                    )
                 )
-                if valid
-                else None
-            )
             if comparison is None:
                 valid = False
             record.snapshot.comparison = comparison if valid else None
             record.snapshot.metrics = (
-                self._round_five_metrics(record.snapshot, setup_snapshot) if valid else []
+                self._round_five_metrics(record.snapshot, setup_snapshot)
+                if valid and runtime is None
+                else [
+                    MetricValue(
+                        spec_id="bell_to_10000_observed_ms",
+                        lane_id=lane_id,
+                        value=runtime_lane.bell_to_10000_observed_ms or 0.0,
+                        display_value=(
+                            f"{runtime_lane.bell_to_10000_observed_ms:.2f} ms"
+                            if runtime_lane.bell_to_10000_observed_ms is not None
+                            else "N/A"
+                        ),
+                    )
+                    for lane_id, runtime_lane in runtime.lanes.items()
+                ]
+                if valid and runtime is not None
+                else []
             )
             if valid:
                 record.snapshot.state = SessionState.VERIFIED
@@ -5842,6 +6987,8 @@ class RunManager:
                         f"{comparison.margin.value / 1000:.2f}s SOONER"
                     )
                 setup_snapshot.state = RoundFiveSetupState.VERIFIED
+                if runtime is not None:
+                    runtime.state = "verified"
             else:
                 record.snapshot.state = SessionState.FAILED
                 record.snapshot.failure = (
@@ -5850,12 +6997,16 @@ class RunManager:
                 record.snapshot.remembered_result = None
                 setup_snapshot.state = RoundFiveSetupState.FAILED
                 setup_snapshot.failure = "Setup or downstream verification did not complete"
+                if runtime is not None:
+                    runtime.state = "failed"
                 # Before the overwrite below, not after. That loop replaces every
                 # lane's own reason with one bout-level sentence, so a log call
                 # placed after it would report the same generic string twice and
                 # lose which lane's contract gate actually refused.
                 self._log_lane_refusals(record, round_number=5)
                 for lane in record.snapshot.lanes.values():
+                    if lane.state == LaneState.VERIFIED:
+                        continue
                     lane.state = LaneState.FAILED
                     lane.status = record.snapshot.failure
                     lane.error = record.snapshot.failure
@@ -5875,26 +7026,164 @@ class RunManager:
                 )
             record.armed_at_monotonic = None
             record.connection_spike_setup_result = None
-            try:
-                # Publish the verdict only after the durable main-ring phase says
-                # cleanup. The Round 5 readiness reconciler may need one poll to
-                # observe its separate artifact lease; this fence makes every
-                # intermediate all-round snapshot conservatively CLEANUP rather
-                # than BOUT or generic UNAVAILABLE.
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError:
+            # Publish the verdict only after the exact main/artifact observations
+            # used to authorize it have won the cleanup CAS and that transition
+            # has been read back.  A lost CAS restores the pre-verdict state;
+            # otherwise a local VERIFIED mutation could leak through GET or a
+            # sealed receipt even though durable authority had already moved.
+            authority_committed = await self._commit_round5_proof_authority_to_cleanup(
+                record,
+                proof_authority,
+                record.snapshot.state,
+            )
+            if not authority_committed:
                 logger.error(
-                    "Round 5 result reached terminal state before its cleanup phase "
-                    "could be durably published session=%s",
+                    "Round 5 result lost its exact proof fence before terminal "
+                    "publication session=%s",
                     record.snapshot.id,
-                    exc_info=True,
                 )
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            "run_finished",
-            {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
-        )
+                record.snapshot = pre_verdict_snapshot
+                record.armed_at_monotonic = pre_verdict_armed_at
+                record.connection_spike_setup_result = pre_verdict_setup_result
+                record.round5_ingestion_closed = True
+            else:
+                self._advance_round5_revision_locked(record)
+                snapshot = self._revalidated_snapshot(record.snapshot)
+                record.round5_terminal_published = True
+                await record.event_log.publish(
+                    "run_finished",
+                    {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
+                )
+        if not authority_committed:
+            await self._finish_connection_spike_failure(
+                record,
+                "Round 5 proof authority changed; no comparison was declared.",
+                cleanup_verified=False,
+            )
+            return
         await self._begin_connection_spike_cleanup_handoff(record)
+
+    async def _publish_connection_spike_failure_locked(
+        self,
+        record: SessionRecord,
+        message: str,
+    ) -> bool:
+        """Publish the one absorbing Round 5 failure snapshot under the record gate."""
+
+        if not record.lock.locked():
+            raise RuntimeError("Round 5 terminal publication requires the record lock")
+        if record.snapshot.towel is not None or record.round5_terminal_published:
+            return False
+        if not record.round5_ingestion_closed:
+            record.round5_ingestion_closed = True
+            record.round5_callback_epoch += 1
+        setup_elapsed_floors = self._round_five_elapsed_floors(
+            record,
+            as_of_ns=self._clock_ns(),
+        )
+        record.snapshot.state = SessionState.FAILED
+        record.snapshot.failure = message
+        record.snapshot.remembered_result = None
+        record.snapshot.metrics = []
+        record.snapshot.comparison = None
+        setup = record.snapshot.round5_setup
+        runtime = record.snapshot.round5_runtime
+        for lane_id, evidence in record.round5_terminal_lane_evidence.items():
+            lane = record.snapshot.lanes[lane_id]
+            if lane.state == LaneState.VERIFIED:
+                continue
+            lane.attempts = int(evidence.get("initiated_clients") or 0)
+            lane.successes = int(evidence.get("authenticated_clients") or 0)
+            lane.errors = int(evidence.get("terminal_failures") or 0)
+            lane.evidence = evidence
+            if runtime is not None:
+                runtime_lane = runtime.lanes[lane_id]
+                runtime_lane.clients_initiated = lane.attempts
+                runtime_lane.clients_authenticated = lane.successes
+                runtime_lane.held_clients = int(
+                    evidence.get("held_clients_at_gate") or 0
+                )
+                runtime_lane.sampled_queries_succeeded = int(
+                    evidence.get("sampled_queries_succeeded") or 0
+                )
+                # Preserve a legitimate exact-10k observed stop. This field is set
+                # only by the authoritative progress observation of exactly
+                # TARGET_CLIENTS_PER_LANE held clients, so a non-null value records
+                # a real moment the lane reached 10,000 -- keep it even when later
+                # telemetry leaves the lane unscored or failed. The failed verdict
+                # is carried by lane.state / runtime_lane.phase below, not by
+                # discarding this measurement. Only clear it when the terminal
+                # evidence contradicts the observation (the lane never actually
+                # held the exact target).
+                if int(evidence.get("held_clients_at_gate") or 0) < TARGET_CLIENTS_PER_LANE:
+                    runtime_lane.bell_to_10000_observed_ms = None
+        if runtime is not None:
+            runtime.state = "failed"
+            for runtime_lane in runtime.lanes.values():
+                if runtime_lane.phase != "verified":
+                    runtime_lane.phase = "failed"
+                    runtime_lane.status = (
+                        f"{runtime_lane.held_clients:,} / "
+                        f"{TARGET_CLIENTS_PER_LANE:,} clients held · "
+                        "Bout stopped · cleanup underway"
+                    )
+        if setup is not None:
+            for lane_id, lane in setup.lanes.items():
+                if lane.state == RoundFiveSetupState.VERIFIED:
+                    continue
+                frozen_elapsed_ms = setup_elapsed_floors.get(lane_id)
+                if frozen_elapsed_ms is not None:
+                    lane.setup_elapsed_ms = frozen_elapsed_ms
+                    lane.elapsed_at_snapshot_ms = frozen_elapsed_ms
+                lane.state = RoundFiveSetupState.FAILED
+                lane.verified = False
+                lane.status = "Stopped after the Round 5 proof failed"
+                lane.error = message
+            setup.state = RoundFiveSetupState.FAILED
+            setup.downstream_validated = False
+            setup.failure = "Setup or downstream verification did not complete"
+            setup.cleanup_retryable = False
+        terminal_at = datetime.now(UTC)
+        record.snapshot.updated_at = terminal_at
+        competitor_setup = setup.lanes.get("competitor") if setup is not None else None
+        if record.snapshot.cost_receipt is not None:
+            record.snapshot.cost_receipt = update_terminal_cost_receipt(
+                record.snapshot.cost_receipt,
+                record.snapshot.competitor.id,
+                terminal_at=terminal_at,
+                run_started_at=record.snapshot.run_started_at,
+                rds_proxy_created=bool(
+                    competitor_setup is not None and competitor_setup.verified
+                ),
+            )
+        for lane in record.snapshot.lanes.values():
+            if lane.state == LaneState.VERIFIED:
+                continue
+            lane.state = LaneState.FAILED
+            lane.status = message
+            lane.error = message
+            lane.activity = LaneActivity(phase="failed")
+        self._advance_round5_revision_locked(record)
+        try:
+            await self._transition_bout_to_cleanup(record, record.snapshot.state)
+        except InvalidStateError:
+            logger.error(
+                "Round 5 failure reached terminal state before its cleanup phase "
+                "could be durably published session=%s",
+                record.snapshot.id,
+                exc_info=True,
+            )
+        snapshot = self._revalidated_snapshot(record.snapshot)
+        record.round5_terminal_published = True
+        await record.event_log.publish(
+            "session_failed",
+            {
+                "state": SessionState.FAILED,
+                "message": message,
+                "session": snapshot.model_dump(mode="json"),
+            },
+        )
+        return True
 
     async def _finish_connection_spike_failure(
         self,
@@ -5904,65 +7193,12 @@ class RunManager:
         cleanup_verified: bool,
     ) -> None:
         async with record.lock:
-            if record.snapshot.towel is not None:
-                return
-            record.snapshot.state = SessionState.FAILED
-            record.snapshot.failure = message
-            record.snapshot.remembered_result = None
-            record.snapshot.metrics = []
-            record.snapshot.comparison = None
-            setup = record.snapshot.round5_setup
-            if setup is not None:
-                setup.state = (
-                    RoundFiveSetupState.FAILED
-                    if cleanup_verified
-                    else RoundFiveSetupState.CLEANUP_FAILED
-                )
-                setup.downstream_validated = False
-                setup.failure = (
-                    "Setup or downstream verification did not complete"
-                    if cleanup_verified
-                    else "Automatic cleanup verification is in progress"
-                )
-                setup.cleanup_retryable = not cleanup_verified
-            terminal_at = datetime.now(UTC)
-            record.snapshot.updated_at = terminal_at
-            competitor_setup = setup.lanes.get("competitor") if setup is not None else None
-            if record.snapshot.cost_receipt is not None:
-                record.snapshot.cost_receipt = update_terminal_cost_receipt(
-                    record.snapshot.cost_receipt,
-                    record.snapshot.competitor.id,
-                    terminal_at=terminal_at,
-                    run_started_at=record.snapshot.run_started_at,
-                    rds_proxy_created=bool(
-                        competitor_setup is not None and competitor_setup.verified
-                    ),
-                )
-            for lane in record.snapshot.lanes.values():
-                lane.state = LaneState.FAILED
-                lane.status = record.snapshot.failure
-                lane.error = record.snapshot.failure
-                lane.activity = LaneActivity(
-                    phase="cleanup_failed" if not cleanup_verified else "failed"
-                )
-            try:
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError:
-                logger.error(
-                    "Round 5 failure reached terminal state before its cleanup phase "
-                    "could be durably published session=%s",
-                    record.snapshot.id,
-                    exc_info=True,
-                )
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            "session_failed",
-            {
-                "state": SessionState.FAILED,
-                "message": message,
-                "session": snapshot.model_dump(mode="json"),
-            },
-        )
+            published = await self._publish_connection_spike_failure_locked(
+                record,
+                message,
+            )
+        if not published:
+            return
         if cleanup_verified:
             await self._release_bout(record)
             await self._release_round5_lease(record)
@@ -5973,14 +7209,50 @@ class RunManager:
         self,
         record: SessionRecord,
         engine: object,
-        *,
-        emit_failure: bool = True,
     ) -> bool:
         reconcile = getattr(engine, "reconcile_failed_cleanup", None)
         async with record.lease_lock:
             lease = record.round5_lease
-        if reconcile is None or lease is None or lease.phase != "round5_cleanup":
+        if reconcile is None:
+            await self._mark_connection_spike_cleanup_pending(record)
             return False
+        if lease is None or lease.phase != "round5_cleanup":
+            operator = record.operator
+            if operator is not None:
+                try:
+                    await self._retain_connection_spike_cleanup_lease(
+                        record,
+                        operator,
+                        session_state=record.snapshot.state,
+                        allow_claim=True,
+                    )
+                except Exception:
+                    pass
+            async with record.lease_lock:
+                lease = record.round5_lease
+            if lease is None or lease.phase != "round5_cleanup":
+                await self._mark_connection_spike_cleanup_pending(record)
+                return False
+        claim_id = (
+            record.round5_warm_slot.claim.claim_id
+            if record.round5_warm_slot is not None
+            and record.round5_warm_slot.claim is not None
+            else None
+        )
+        if self._round5_warm_coordinator is not None and claim_id is not None:
+            try:
+                record.round5_warm_slot = (
+                    await self._round5_warm_coordinator.begin_cleanup(claim_id)
+                )
+            except Exception as exc:
+                logger.error(
+                    "Round 5 durable cleanup start is not settled session=%s "
+                    "diagnostic=%s",
+                    record.snapshot.id,
+                    _redacted_exception_chain(exc),
+                )
+                await self._mark_connection_spike_cleanup_pending(record)
+                return False
         try:
             await reconcile(record.snapshot.id, lease.fencing_token)
         except Exception as exc:
@@ -5989,192 +7261,40 @@ class RunManager:
                 record.snapshot.id,
                 _redacted_exception_chain(exc),
             )
-            async with record.lock:
-                setup = record.snapshot.round5_setup
-                if setup is not None:
-                    setup.cleanup_retryable = True
-                    if record.snapshot.state == SessionState.FAILED:
-                        setup.state = RoundFiveSetupState.CLEANUP_FAILED
-                        setup.failure = "Automatic cleanup verification is in progress"
-                record.snapshot.updated_at = datetime.now(UTC)
-                snapshot = record.snapshot.model_copy(deep=True)
-            if emit_failure:
-                await record.event_log.publish(
-                    "session_failed",
-                    {
-                        "state": SessionState.FAILED,
-                        "message": snapshot.failure,
-                        "session": snapshot.model_dump(mode="json"),
-                    },
-                )
+            await self._mark_connection_spike_cleanup_pending(record)
             return False
 
+        if (
+            self._round5_warm_coordinator is not None
+            and claim_id is not None
+        ):
+            try:
+                record.round5_warm_slot = (
+                    await self._round5_warm_coordinator.finish_cleanup_and_rewarm(
+                        claim_id
+                    )
+                )
+                record.round5_launch_capsule = None
+            except Exception as exc:
+                logger.error(
+                    "Round 5 durable rewarm transition is not settled session=%s "
+                    "diagnostic=%s",
+                    record.snapshot.id,
+                    _redacted_exception_chain(exc),
+                )
+                await self._mark_connection_spike_cleanup_pending(record)
+                return False
+        self._require_round5_rewarm_transition(record)
         main_released = await self._release_bout(record)
-        round5_released = await self._release_round5_lease(record)
+        round5_released = (
+            await self._release_round5_lease(record) if main_released else False
+        )
         if main_released and round5_released:
             await self._mark_connection_spike_cleanup_complete(record)
         else:
             await self._mark_connection_spike_cleanup_pending(record)
         snapshot = await self.get(record.snapshot.id)
-        await record.event_log.publish(
-            "cleanup_update",
-            {
-                "session": snapshot.model_dump(mode="json"),
-            },
-        )
         return not (snapshot.round5_setup is not None and snapshot.round5_setup.cleanup_retryable)
-
-    def _schedule_connection_spike_cleanup_retry(
-        self,
-        record: SessionRecord,
-        engine: object,
-    ) -> None:
-        if self._closed:
-            return
-        current = record.connection_spike_cleanup_task
-        if current is not None and not current.done():
-            return
-        record.connection_spike_cleanup_task = asyncio.create_task(
-            self._auto_retry_connection_spike_cleanup(record, engine),
-            name=f"auto-cleanup-{record.snapshot.id}",
-        )
-
-    async def _auto_retry_connection_spike_cleanup(
-        self,
-        record: SessionRecord,
-        engine: object,
-    ) -> None:
-        task = asyncio.current_task()
-        delay = max(0.1, self._cleanup_retry_initial)
-        maximum_delay = max(delay, self._cleanup_retry_max)
-        attempts = 0
-        try:
-            while not self._closed:
-                if attempts >= self._cleanup_retry_attempts:
-                    # Terminating matters more than the last attempt. This loop
-                    # used to be unbounded, and on a durable failure -- expired
-                    # credentials, a permanent AWS error -- it ground on while
-                    # the towel sat at `cleaning`: the one cleanup state with
-                    # neither a retry button nor an exit, on the only round that
-                    # can reach it. Landing on `failed` is what hands control
-                    # back, to the UI and to `start_towel`'s retry branch alike.
-                    await self._abandon_connection_spike_cleanup_retry(record, attempts)
-                    return
-                attempts += 1
-                if await self._retry_connection_spike_cleanup(
-                    record,
-                    engine,
-                    emit_failure=False,
-                ):
-                    return
-                async with record.lock:
-                    setup = record.snapshot.round5_setup
-                    async with record.lease_lock:
-                        lease = record.round5_lease
-                    if (
-                        setup is None
-                        or not setup.cleanup_retryable
-                        or lease is None
-                        or lease.phase != "round5_cleanup"
-                    ):
-                        return
-                    if record.snapshot.state == SessionState.FAILED:
-                        setup.state = RoundFiveSetupState.CLEANUP_FAILED
-                        setup.failure = "Automatic cleanup is still settling"
-                    record.snapshot.updated_at = datetime.now(UTC)
-                    snapshot = record.snapshot.model_copy(deep=True)
-                serialized = snapshot.model_dump(mode="json")
-                for lane_id, lane in snapshot.lanes.items():
-                    await record.event_log.publish(
-                        "lane_update",
-                        {
-                            "lane_id": lane_id,
-                            "state": lane.state,
-                            "attempts": lane.attempts,
-                            "elapsed_ms": lane.elapsed_ms,
-                            "status": lane.status,
-                            "error": lane.error,
-                            "activity": (
-                                lane.activity.model_dump(mode="json")
-                                if lane.activity is not None
-                                else None
-                            ),
-                            "session": serialized,
-                        },
-                    )
-                await self._cleanup_retry_sleep(delay)
-                delay = min(delay * 2, maximum_delay)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            if record.connection_spike_cleanup_task is task:
-                record.connection_spike_cleanup_task = None
-
-    async def _abandon_connection_spike_cleanup_retry(
-        self,
-        record: SessionRecord,
-        attempts: int,
-    ) -> None:
-        """Stop retrying Round 5 cleanup, and say so where the operator looks.
-
-        The ring lease stays held: the artifacts were not proved gone, and
-        handing back authority over resources that may still exist is worse than
-        keeping the lockout. What changes is that the lockout is now legible and
-        has a way out -- a `failed` towel is what both the "Retry cleanup"
-        button and `start_towel`'s server-side retry branch key on.
-
-        The diagnostic is not written here. It comes from
-        `round5_cleanup_owed.leaked_proxy_sentence`, which `/readyz` reads too,
-        because the sentence written here used to say only that cleanup "did not
-        converge" -- true, and silent about the one consequence that costs money.
-        Naming the resource in two places independently is how this project
-        already produced two warnings that disagreed.
-        """
-
-        owed = self._note_round5_proxy_at_risk(
-            record,
-            attempts=attempts,
-            still_retrying=False,
-        )
-        diagnostic = (
-            owed.detail
-            if owed is not None
-            else (
-                f"Round 5 backstage cleanup did not converge after {attempts} "
-                "automatic attempts. The ring stays held until cleanup is "
-                "confirmed; retry cleanup."
-            )
-        )
-        logger.error(
-            "Round 5 automatic cleanup abandoned session=%s attempts=%d",
-            record.snapshot.id,
-            attempts,
-        )
-        async with record.lock:
-            setup = record.snapshot.round5_setup
-            if setup is not None:
-                setup.cleanup_retryable = True
-                # Recorded outside the FAILED guard below, deliberately. A Round
-                # 5 bout that verified keeps its win -- a tidy-up failure is not
-                # evidence the setup did not verify -- but the proxy it built may
-                # still be billing, and the guard used to leave that fact
-                # nowhere: not on the snapshot, so not in the receipt and not on
-                # the operator's screen either. The only trace was the log line
-                # above.
-                setup.cleanup_failure = diagnostic
-                if record.snapshot.state == SessionState.FAILED:
-                    setup.state = RoundFiveSetupState.CLEANUP_FAILED
-                    setup.failure = diagnostic
-            towel = record.snapshot.towel
-            if towel is not None:
-                towel.state = TowelState.FAILED
-                towel.cleanup_failure = diagnostic
-            record.snapshot.updated_at = datetime.now(UTC)
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            "towel_update" if snapshot.towel is not None else "cleanup_update",
-            {"session": snapshot.model_dump(mode="json")},
-        )
 
     async def _cleanup_connection_spike(self, record: SessionRecord) -> bool:
         engine = record.connection_spike_engine
@@ -6221,6 +7341,88 @@ class RunManager:
 
     @classmethod
     def _round_five_evidence(cls, lane: object) -> dict[str, object]:
+        held = cls._round_five_value(lane, "held_clients_at_gate")
+        if held is not None:
+            gates = cls._round_five_value(lane, "gates")
+            fanin_fields = (
+                "initiated_clients",
+                "authenticated_clients",
+                "cancelled_clients",
+                "held_clients_at_gate",
+                "terminal_failures",
+                "failure_codes",
+                "connection_diagnostics",
+                "retries",
+                "disconnected_during_hold",
+                "time_to_target_ns",
+                "time_to_target_ms",
+                "hold_elapsed_ms",
+                "sampled_queries_attempted",
+                "sampled_queries_succeeded",
+                "sampled_queries_failed",
+                "preexisting_client_role_sessions",
+                "observer_role",
+                "client_role",
+                "observer_direct",
+                "current_backend_sessions",
+                "peak_backend_sessions",
+                "unique_backend_pids",
+                "distinct_socket_fds",
+                "distinct_local_endpoints",
+                "socket_identity_sha256",
+                "connect_latency_p50_ms",
+                "connect_latency_p95_ms",
+                "connect_latency_p99_ms",
+                "endpoint_host_sha256",
+                "credential_sha256",
+                "observer_credential_sha256",
+                "tls_mode",
+                "auth_method",
+                "config_sha256",
+                "generator_sha256",
+                "capacity_model_sha256",
+                "telemetry_samples",
+                "telemetry_physical_memory_bytes",
+                "telemetry_min_available_memory_bytes",
+                "telemetry_peak_rss_bytes",
+                "telemetry_fd_soft_limit",
+                "telemetry_peak_open_fds",
+                "telemetry_ephemeral_port_count",
+                "telemetry_peak_ephemeral_ports_in_use",
+                "telemetry_min_ephemeral_port_reserve",
+                "telemetry_peak_event_loop_p99_ms",
+                "telemetry_peak_raw_event_loop_p99_ms",
+                "telemetry_peak_external_event_loop_p99_ms",
+                "telemetry_peak_cpu_capacity_fraction",
+                "telemetry_failures",
+                "telemetry_advisories",
+                "safety_evidence_version",
+                "hard_safety_verified",
+                "port_accounting_verified",
+                "admission_controller_min_concurrency",
+                "admission_controller_reductions",
+                "admission_controller_recoveries",
+                "admission_controller_throttled_ms",
+                "admission_controller_recovery_hysteresis_intervals",
+                "admission_controller_pressure_hysteresis_intervals",
+                "launch_skew_ms",
+                "achieved_elapsed_ms",
+            )
+            evidence = {
+                name: cls._round_five_value(lane, name)
+                for name in fanin_fields
+            }
+            evidence.update(
+                {
+                    "schema_version": FANIN_SCHEMA_VERSION,
+                    "protocol": ROUND5_FANIN_PROTOCOL,
+                    "held_clients": held,
+                    "telemetry_verified": bool(
+                        cls._round_five_value(gates, "telemetry", False)
+                    ),
+                }
+            )
+            return evidence
         latencies = cls._round_five_value(lane, "successful_latency_ms", ())
         if not isinstance(latencies, (list, tuple)):
             latencies = ()
@@ -6266,7 +7468,7 @@ class RunManager:
         raw: object,
         evidence: Mapping[str, object],
     ) -> bool:
-        latencies = evidence["successful_latency_ms"]
+        latencies = evidence.get("successful_latency_ms", ())
         gates = cls._round_five_value(raw, "gates")
         gate_passed = cls._round_five_value(gates, "passed")
         if gate_passed is None:
@@ -6282,13 +7484,107 @@ class RunManager:
         verified = bool(cls._round_five_value(raw, "verified", gate_passed))
         held = cls._round_five_value(raw, "held_clients_at_gate")
         if held is not None:
-            # A fan-in lane. `gates.passed` above is the conjunction of all ten gates this
-            # protocol defines, evaluated where the evidence is, so the only thing left to
-            # check here is that the lane held the target this installation asked for. The
-            # bounded arithmetic below cannot describe this bout: it required 128 scheduled
-            # attempts and a separate 64-client witness phase that no longer exists, and
-            # applying it refused a bout with 10,000 clients held and every gate green.
-            return verified and int(held) == TARGET_CLIENTS_PER_LANE
+            required_gates = (
+                "exact_count",
+                "zero_failures",
+                "hold",
+                "sampled_queries",
+                "multiplexing",
+                "identity",
+                "observer_separation",
+                "clean_start",
+                "fairness",
+                "telemetry",
+                "cleanup",
+            )
+            failure_codes = evidence.get("failure_codes")
+            telemetry_failures = evidence.get("telemetry_failures")
+            ephemeral_count = cls._round_five_count(
+                evidence.get("telemetry_ephemeral_port_count")
+            )
+            ephemeral_used = cls._round_five_count(
+                evidence.get("telemetry_peak_ephemeral_ports_in_use")
+            )
+            ephemeral_remaining = cls._round_five_count(
+                evidence.get("telemetry_min_ephemeral_port_reserve")
+            )
+            physical_memory = cls._round_five_count(
+                evidence.get("telemetry_physical_memory_bytes")
+            )
+            peak_rss = cls._round_five_count(
+                evidence.get("telemetry_peak_rss_bytes")
+            )
+            fd_soft = cls._round_five_count(
+                evidence.get("telemetry_fd_soft_limit")
+            )
+            peak_fds = cls._round_five_count(
+                evidence.get("telemetry_peak_open_fds")
+            )
+            return bool(
+                verified
+                and gate_passed is True
+                and all(
+                    cls._round_five_value(gates, name) is True
+                    for name in required_gates
+                )
+                and not cls._round_five_value(gates, "failures", ())
+                and evidence.get("schema_version") == FANIN_SCHEMA_VERSION
+                and evidence.get("protocol") == ROUND5_FANIN_PROTOCOL
+                and cls._round_five_count(evidence.get("initiated_clients"))
+                == TARGET_CLIENTS_PER_LANE
+                and cls._round_five_count(evidence.get("authenticated_clients"))
+                == TARGET_CLIENTS_PER_LANE
+                and cls._round_five_count(held) == TARGET_CLIENTS_PER_LANE
+                and cls._round_five_count(evidence.get("cancelled_clients")) == 0
+                and cls._round_five_count(evidence.get("terminal_failures")) == 0
+                and isinstance(failure_codes, Mapping)
+                and not any(failure_codes.values())
+                and cls._round_five_count(evidence.get("retries")) == 0
+                and cls._round_five_count(evidence.get("disconnected_during_hold"))
+                == 0
+                and cls._round_five_number(evidence.get("time_to_target_ms"))
+                is not None
+                and cls._round_five_number(evidence.get("hold_elapsed_ms")) is not None
+                and float(evidence["hold_elapsed_ms"]) >= 30_000
+                and cls._round_five_count(
+                    evidence.get("sampled_queries_attempted")
+                )
+                == 64
+                and cls._round_five_count(
+                    evidence.get("sampled_queries_succeeded")
+                )
+                == 64
+                and cls._round_five_count(evidence.get("sampled_queries_failed")) == 0
+                and cls._round_five_count(evidence.get("distinct_socket_fds"))
+                == TARGET_CLIENTS_PER_LANE
+                and cls._round_five_count(evidence.get("distinct_local_endpoints"))
+                == TARGET_CLIENTS_PER_LANE
+                and evidence.get("safety_evidence_version")
+                == SAFETY_EVIDENCE_VERSION
+                and evidence.get("hard_safety_verified") is True
+                and evidence.get("port_accounting_verified") is True
+                and evidence.get(
+                    "admission_controller_recovery_hysteresis_intervals"
+                )
+                == 3
+                and evidence.get(
+                    "admission_controller_pressure_hysteresis_intervals"
+                )
+                == 2
+                and isinstance(telemetry_failures, (list, tuple))
+                and not telemetry_failures
+                and cls._round_five_count(evidence.get("telemetry_samples")) > 0
+                and cls._round_five_count(
+                    evidence.get("telemetry_min_available_memory_bytes")
+                )
+                >= 768 * 1024 * 1024
+                and physical_memory >= peak_rss + 768 * 1024 * 1024
+                and fd_soft > 0
+                and 0 <= peak_fds <= math.floor(fd_soft * 0.80)
+                and ephemeral_used >= TARGET_CLIENTS_PER_LANE
+                and ephemeral_remaining >= 2_000
+                and ephemeral_count == ephemeral_used + ephemeral_remaining
+            )
         return verified and (
             evidence["scheduled_clients"] == _ROUND_FIVE_SCHEDULED_CLIENTS
             and evidence["terminal_clients"] == _ROUND_FIVE_SCHEDULED_CLIENTS
@@ -6583,6 +7879,38 @@ class RunManager:
                 "primary setup by "
                 f"{margin_ms:.2f} ms; both secondary bursts, witnesses, and cleanup "
                 "gates verified."
+            ),
+        )
+
+    @staticmethod
+    def _round_five_v4_comparison(
+        runtime: RoundFiveRuntimeSnapshot,
+        competitor_name: str,
+    ) -> ComparisonSnapshot | None:
+        left = runtime.lanes["lakebase"].bell_to_10000_observed_ms
+        right = runtime.lanes["competitor"].bell_to_10000_observed_ms
+        if left is None or right is None:
+            return None
+        if left == right:
+            return ComparisonSnapshot(
+                kind=ComparisonKind.TIE,
+                detail="Both lanes reached the exact 10,000-held gate together.",
+            )
+        winner = "lakebase" if left < right else "competitor"
+        margin_ms = abs(left - right)
+        return ComparisonSnapshot(
+            kind=ComparisonKind.MEASURED,
+            winner_lane_id=winner,
+            margin=MetricValue(
+                spec_id="bell_to_10000_observed_ms",
+                lane_id=winner,
+                value=margin_ms,
+                display_value=f"{margin_ms:.2f} ms",
+            ),
+            detail=(
+                f"{'Lakebase' if winner == 'lakebase' else competitor_name} "
+                f"reached exactly 10,000 held clients {margin_ms:.2f} ms sooner "
+                "on the server-authoritative bell clock."
             ),
         )
 

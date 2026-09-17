@@ -105,11 +105,14 @@ resource "aws_security_group" "aurora" {
   }
 
   ingress {
-    description     = "Direct PostgreSQL observer and cleanup control path from the Round 5 runner"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.round5_runner.id]
+    description = "Round 5 direct observer plus static Aurora Proxy path"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    security_groups = [
+      aws_security_group.round5_competitor_runner.id,
+      aws_security_group.round5_proxy["aurora"].id,
+    ]
   }
 
   egress {
@@ -157,11 +160,14 @@ resource "aws_security_group" "rds_control_plane_only" {
   }
 
   ingress {
-    description     = "Direct PostgreSQL observer and cleanup control path from the Round 5 runner"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = [aws_security_group.round5_runner.id]
+    description = "Round 5 direct observer plus static RDS Proxy path"
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    security_groups = [
+      aws_security_group.round5_competitor_runner.id,
+      aws_security_group.round5_proxy["rds"].id,
+    ]
   }
 
   egress {
@@ -184,20 +190,172 @@ resource "aws_security_group" "rds_control_plane_only" {
 
 resource "aws_security_group" "round5_runner" {
   name_prefix            = "${local.round5_resource_name}-runner-"
-  description            = "Round 5 neutral runner: outbound only, with no ingress rules"
+  description            = "Round 5 Lakebase runner: outbound only, with no ingress rules"
   vpc_id                 = local.selected_vpc_id
   revoke_rules_on_delete = true
 
-  tags = local.round5_required_tags
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "lakebase"
+  })
+
+  # This group is attached to the running runner instance's ENI, and AWS refuses
+  # to replace an attached security group. A description ForceNew would try to
+  # replace it anyway -- and because the execution role, the runner boundary and
+  # the database groups all cross-reference it, that replacement forms an apply
+  # graph cycle. Keep the sealed group in place; rules and tags stay managed.
+  # Same rationale as the aurora/rds groups above.
+  lifecycle {
+    ignore_changes = [description]
+  }
 }
 
-resource "aws_vpc_security_group_egress_rule" "round5_runner_outbound" {
+resource "aws_security_group" "round5_competitor_runner" {
+  name_prefix            = "${local.round5_resource_name}-competitor-runner-"
+  description            = "Round 5 competitor runner: outbound only, with no ingress rules"
+  vpc_id                 = local.selected_vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "competitor"
+  })
+
+  # Same ENI-attachment constraint as the Lakebase runner group above.
+  lifecycle {
+    ignore_changes = [description]
+  }
+}
+
+# Public AWS APIs and the install-time package/CA fetches all use TLS. This is
+# intentionally narrower than the former all-protocol rule, but it is not a
+# destination allowlist: the public Lakebase path and package bootstrap still
+# require an egress architecture before TCP/443 can be made private.
+resource "aws_vpc_security_group_egress_rule" "round5_lakebase_runner_https" {
   security_group_id = aws_security_group.round5_runner.id
-  description       = "Outbound access for SSM, package installation, Lakebase, and RDS Proxy"
-  ip_protocol       = "-1"
+  description       = "HTTPS for SSM, SQS, Secrets Manager, package installation, and CA refresh"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
   cidr_ipv4         = "0.0.0.0/0"
 
-  tags = local.round5_required_tags
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "lakebase"
+  })
+}
+
+resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_https" {
+  security_group_id = aws_security_group.round5_competitor_runner.id
+  description       = "HTTPS for SSM, SQS, Secrets Manager, package installation, and CA refresh"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "competitor"
+  })
+}
+
+# Lakebase is publicly reachable and does not publish a stable customer-specific
+# CIDR that a security-group rule can seal. Limit the exception to PostgreSQL;
+# the competitor runner receives no corresponding public destination rule.
+resource "aws_vpc_security_group_egress_rule" "round5_lakebase_runner_postgres" {
+  security_group_id = aws_security_group.round5_runner.id
+  description       = "PostgreSQL to the public Lakebase direct, pooled, and coordination endpoints"
+  ip_protocol       = "tcp"
+  from_port         = 5432
+  to_port           = 5432
+  cidr_ipv4         = "0.0.0.0/0"
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "lakebase"
+  })
+}
+
+# Stable least-privilege Proxy network fixtures. The per-bout Proxy is still
+# created after the bell; only its immutable network envelope stands warm.
+resource "aws_security_group" "round5_proxy" {
+  for_each = toset(["aurora", "rds"])
+
+  name_prefix            = "${local.round5_resource_name}-${each.key}-proxy-"
+  description            = "Static Round 5 ${each.key} Proxy network fixture"
+  vpc_id                 = local.selected_vpc_id
+  revoke_rules_on_delete = true
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-warm-fixture" = "proxy-network"
+    "anti-demo-variant"      = each.key
+  })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "round5_runner_to_proxy" {
+  for_each = aws_security_group.round5_proxy
+
+  security_group_id            = each.value.id
+  description                  = "PostgreSQL from the sealed Round 5 competitor runner"
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+  referenced_security_group_id = aws_security_group.round5_competitor_runner.id
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-warm-fixture" = "proxy-network"
+    "anti-demo-variant"      = each.key
+  })
+}
+
+resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_to_proxy" {
+  for_each = aws_security_group.round5_proxy
+
+  security_group_id            = aws_security_group.round5_competitor_runner.id
+  description                  = "PostgreSQL to the sealed Round 5 ${each.key} Proxy fixture"
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+  referenced_security_group_id = each.value.id
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "competitor"
+    "anti-demo-variant"     = each.key
+  })
+}
+
+resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_to_database" {
+  for_each = {
+    aurora = local.round5_aurora_sg.id
+    rds    = local.round5_rds_sg.id
+  }
+
+  security_group_id            = aws_security_group.round5_competitor_runner.id
+  description                  = "PostgreSQL observer and cleanup path to the sealed Round 5 ${each.key} source"
+  ip_protocol                  = "tcp"
+  from_port                    = 5432
+  to_port                      = 5432
+  referenced_security_group_id = each.value
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-runner-lane" = "competitor"
+    "anti-demo-variant"     = each.key
+  })
+}
+
+resource "aws_vpc_security_group_egress_rule" "round5_proxy_to_database" {
+  for_each = aws_security_group.round5_proxy
+
+  security_group_id = each.value.id
+  description       = "PostgreSQL to the exact sealed Round 5 source"
+  ip_protocol       = "tcp"
+  from_port         = 5432
+  to_port           = 5432
+  referenced_security_group_id = (
+    each.key == "aurora"
+    ? local.round5_aurora_sg.id
+    : local.round5_rds_sg.id
+  )
+
+  tags = merge(local.round5_required_tags, {
+    "anti-demo-warm-fixture" = "proxy-network"
+    "anti-demo-variant"      = each.key
+  })
 }
 
 resource "aws_db_subnet_group" "by_round" {
@@ -259,11 +417,14 @@ resource "aws_security_group" "aurora_by_round" {
   dynamic "ingress" {
     for_each = each.key == "r5" ? [true] : []
     content {
-      description     = "Direct PostgreSQL observer and cleanup control path from the Round 5 runner"
-      from_port       = 5432
-      to_port         = 5432
-      protocol        = "tcp"
-      security_groups = [aws_security_group.round5_runner.id]
+      description = "Direct PostgreSQL observer and cleanup control path from the Round 5 runner"
+      from_port   = 5432
+      to_port     = 5432
+      protocol    = "tcp"
+      security_groups = [
+        aws_security_group.round5_competitor_runner.id,
+        aws_security_group.round5_proxy["aurora"].id,
+      ]
     }
   }
 
@@ -310,11 +471,14 @@ resource "aws_security_group" "rds_by_round" {
   dynamic "ingress" {
     for_each = each.key == "r5" ? [true] : []
     content {
-      description     = "Direct PostgreSQL observer and cleanup control path from the Round 5 runner"
-      from_port       = 5432
-      to_port         = 5432
-      protocol        = "tcp"
-      security_groups = [aws_security_group.round5_runner.id]
+      description = "Direct PostgreSQL observer and cleanup control path from the Round 5 runner"
+      from_port   = 5432
+      to_port     = 5432
+      protocol    = "tcp"
+      security_groups = [
+        aws_security_group.round5_competitor_runner.id,
+        aws_security_group.round5_proxy["rds"].id,
+      ]
     }
   }
 

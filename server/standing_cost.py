@@ -69,6 +69,8 @@ from .capacity import AURORA_AUTO_PAUSE_SECONDS, LAKEBASE_SUSPEND_SECONDS
 from .cost_model import (
     AS_RUN_RDS_INSTANCE_CLASS,
     IMPUTED_RDS_ROUNDS,
+    TERRAFORM_PROXY_SECRETS,
+    TERRAFORM_RUNNER_CONTROL_SECRETS,
     CarryingWindow,
     Cloud,
     CostKind,
@@ -145,7 +147,7 @@ _IMPUTED_RDS_ROUND_NUMBERS: tuple[int, ...] = tuple(
 
 
 def _round_list(numbers: tuple[int, ...]) -> str:
-    """"Rounds 2, 3 and 5" from (2, 3, 5), so the prose tracks the fleet."""
+    """ "Rounds 2, 3 and 5" from (2, 3, 5), so the prose tracks the fleet."""
 
     if not numbers:
         return "no round"
@@ -154,11 +156,10 @@ def _round_list(numbers: tuple[int, ...]) -> str:
     head = ", ".join(str(number) for number in numbers[:-1])
     return f"Rounds {head} and {numbers[-1]}"
 
-# The paragraph already on the proof surface, reused rather than rewritten. Only
-# the figures are slots, so a rate change moves them and the argument stays in one
-# voice. The claim it makes -- that our half is the larger one -- is checked against
-# the derivation before the paragraph is stated, and withheld rather than reworded
-# when it stops holding.
+
+# The paragraph is derived from the current physical topology. Round 5 V4 uses
+# a second c7i.2xlarge runner, so it must not assume which cloud is the larger
+# half; the figures and direction are both slots.
 #
 # It used to carry a second sentence comparing the margin to what it was "before
 # their four boxes were resized up". When that was written the resize had not
@@ -168,10 +169,11 @@ def _round_list(numbers: tuple[int, ...]) -> str:
 # compare against and would be sourcing the "before" from memory. The current
 # ratio is the only comparison there is evidence for.
 _FAIRNESS_PARAGRAPH = (
-    "Both sides carry standing cost here, and ours is the larger half — {databricks}/day "
-    "Databricks against {aws}/day AWS, a {now}x margin. The difference is capability, "
-    "not this bill: Lakebase can scale to zero and does at {suspend}s. No provisioned "
-    "RDS instance can scale to zero at any price."
+    "Both sides carry standing cost here — {databricks}/day Databricks against "
+    "{aws}/day AWS, with {larger} the larger half by {now}x. Round 5 includes both "
+    "physical c7i.2xlarge runners. The difference is capability, not this bill: "
+    "Lakebase can scale to zero and does at {suspend}s. No provisioned RDS instance "
+    "can scale to zero at any price."
 )
 
 # The one platform meter this module says anything more about than "it bills".
@@ -614,13 +616,13 @@ def _lane_copy(
             ),
         ),
         StandingCostLaneId.NEUTRAL_RUNNER: _LaneCopy(
-            product="Neutral m6i.large runner",
+            product="Two isolated c7i.2xlarge runners",
             side="shared",
-            idle_label="Never sleeps · the box bills whether or not a bout runs",
+            idle_label="Never sleep · both boxes bill whether or not a bout runs",
             caveat=(
-                "The runner drives both lanes and belongs to neither corner, so it is "
-                "neither side's cost and is still the installation's. Leaving it out "
-                "would leave a total that does not reconcile."
+                "Each lane owns a physical runner, job registry, lock, CPU, and "
+                "cancellation boundary. They belong to neither corner, so both are "
+                "shared installation cost and neither may be omitted."
             ),
         ),
         StandingCostLaneId.DATABRICKS_PLATFORM: _LaneCopy(
@@ -672,12 +674,19 @@ def _allocations(line: CostLine, shape: InstallationShape) -> tuple[_Allocation,
 def _address_allocations(shape: InstallationShape) -> tuple[_Allocation, ...]:
     total = shape.public_ipv4_addresses
     rds = min(shape.rds_instances, total)
+    aurora = min(shape.aurora_clusters, total - rds)
+    runner = total - rds - aurora
     parts = (
         (StandingCostLaneId.RDS, rds, "one address per publicly reachable RDS instance"),
         (
             StandingCostLaneId.AURORA,
-            total - rds,
+            aurora,
             "one address per publicly reachable Aurora writer",
+        ),
+        (
+            StandingCostLaneId.NEUTRAL_RUNNER,
+            runner,
+            "one address per resident runner instance",
         ),
     )
     return tuple(
@@ -696,8 +705,16 @@ def _secret_allocations(shape: InstallationShape) -> tuple[_Allocation, ...]:
         (StandingCostLaneId.AURORA, aurora, "one RDS-managed master credential per cluster"),
         (
             StandingCostLaneId.RDS_PROXY,
-            total - rds - aurora,
+            min(TERRAFORM_PROXY_SECRETS, total - rds - aurora),
             "Terraform-managed proxy secrets, which stand whether or not a proxy does",
+        ),
+        (
+            StandingCostLaneId.NEUTRAL_RUNNER,
+            min(
+                TERRAFORM_RUNNER_CONTROL_SECRETS,
+                max(0, total - rds - aurora - TERRAFORM_PROXY_SECRETS),
+            ),
+            "lane-scoped resident event secret containers",
         ),
     )
     return tuple(
@@ -925,9 +942,7 @@ def _lane_figure(items: Sequence[_Priced], hours: Decimal) -> StandingCostFigure
     )
 
 
-_DATABRICKS_LANES = frozenset(
-    {StandingCostLaneId.LAKEBASE, StandingCostLaneId.DATABRICKS_PLATFORM}
-)
+_DATABRICKS_LANES = frozenset({StandingCostLaneId.LAKEBASE, StandingCostLaneId.DATABRICKS_PLATFORM})
 _AWS_LANES = frozenset(
     {
         StandingCostLaneId.RDS,
@@ -989,9 +1004,7 @@ def _lanes(
                 idle_label=copy[lane_id].idle_label,
                 figure=figure,
                 components=[item.component for item in owned],
-                evidence=_lane_evidence(
-                    lane_id, figure, platform=platform, observed=observed
-                ),
+                evidence=_lane_evidence(lane_id, figure, platform=platform, observed=observed),
                 rate_source=_lane_rate_source(owned),
                 caveat=copy[lane_id].caveat,
                 # True exactly when ``figure`` is the lane's share of
@@ -1011,9 +1024,7 @@ def _lanes(
 def _counted(items: Sequence[_Priced], lanes: Sequence[StandingCostLane]) -> list[_Priced]:
     """Components in lanes that priced. An unpriced lane leaves both totals."""
 
-    priced = {
-        lane.lane_id for lane in lanes if lane.figure.state != "unavailable"
-    }
+    priced = {lane.lane_id for lane in lanes if lane.figure.state != "unavailable"}
     return [item for item in items if item.lane in priced and item.window_usd is not None]
 
 
@@ -1032,9 +1043,7 @@ def _totals(
 
     counted = _counted(items, lanes)
     with_platform = _sum(item.window_usd or Decimal(0) for item in counted)
-    installation = _sum(
-        item.window_usd or Decimal(0) for item in counted if not item.predates
-    )
+    installation = _sum(item.window_usd or Decimal(0) for item in counted if not item.predates)
     predating = [item.component.component for item in counted if item.predates]
     reasons = list(partial_reasons)
     unpriced = [lane.product for lane in lanes if lane.figure.state == "unavailable"]
@@ -1042,9 +1051,9 @@ def _totals(
         reasons.append("excluded from the total: " + ", ".join(unpriced) + " could not be priced")
     partial = bool(reasons)
     reason = " · ".join(reasons)
-    lane_ids = [
-        lane.lane_id for lane in lanes if lane.figure.state != "unavailable"
-    ] or [lane.lane_id for lane in lanes]
+    lane_ids = [lane.lane_id for lane in lanes if lane.figure.state != "unavailable"] or [
+        lane.lane_id for lane in lanes
+    ]
     prefix = "Partial standing cost" if partial else "Standing cost"
     if predating:
         names = ", ".join(predating)
@@ -1401,9 +1410,7 @@ def _drift(report: DriftReport | None, now: datetime) -> StandingCostDrift:
         for item in findings
         if item.usd_per_day is not None and not item.charging_for_absent
     )
-    accrued = [
-        Decimal(str(item.accrued_usd)) for item in findings if item.accrued_usd is not None
-    ]
+    accrued = [Decimal(str(item.accrued_usd)) for item in findings if item.accrued_usd is not None]
     label = f"{_per_day(unexpected_rate)} unexpected" if unexpected_rate > 0 else "RATE UNAVAILABLE"
     return StandingCostDrift(
         state="unexpected_accrual",
@@ -1421,32 +1428,31 @@ def _fairness(
     databricks_per_day: Decimal | None,
     aws_per_day: Decimal | None,
 ) -> StandingCostFairness:
-    """Fill the existing paragraph's figures in, or withhold it entirely."""
+    """Fill the current topology's figures in, or withhold it entirely."""
 
     if databricks_per_day is None or aws_per_day is None:
         return StandingCostFairness(
             state="withheld",
             withheld_reason=(
-                "The paragraph states that our half is the larger one. One of the two "
-                "halves is unpriced here, so the claim has nothing behind it and the "
-                "paragraph is withheld rather than reworded."
+                "One of the two standing-cost halves is unpriced, so the comparison "
+                "is withheld rather than inferred."
             ),
         )
-    if aws_per_day <= 0 or databricks_per_day <= aws_per_day:
+    if aws_per_day <= 0 or databricks_per_day <= 0:
         return StandingCostFairness(
             state="withheld",
-            withheld_reason=(
-                "The paragraph concedes that our half is the larger one. The derived "
-                "figures no longer show that, so it is withheld rather than rewritten "
-                "into a claim it was not making."
-            ),
+            withheld_reason="A non-positive standing-cost half cannot be compared.",
         )
-    now_ratio = databricks_per_day / aws_per_day
+    now_ratio = max(databricks_per_day, aws_per_day) / min(
+        databricks_per_day,
+        aws_per_day,
+    )
     return StandingCostFairness(
         state="stated",
         paragraph=_FAIRNESS_PARAGRAPH.format(
             databricks=f"${databricks_per_day:.2f}",
             aws=f"${aws_per_day:.2f}",
+            larger="Databricks" if databricks_per_day > aws_per_day else "AWS",
             now=f"{now_ratio:.1f}",
             suspend=LAKEBASE_SUSPEND_SECONDS,
         ),
@@ -1481,8 +1487,7 @@ def _continuous(
         (
             item
             for item in counted
-            if item.component.component == ROUND4_PIPELINE_LABEL
-            and item.window_usd is not None
+            if item.component.component == ROUND4_PIPELINE_LABEL and item.window_usd is not None
         ),
         None,
     )
@@ -1524,9 +1529,7 @@ def _continuous(
         for item in counted
         if item.cloud == "databricks" and not item.predates and item is not pipeline
     ]
-    largest = (
-        _CONTINUOUS_LARGEST if all(pipeline.window_usd > other for other in others) else ""
-    )
+    largest = _CONTINUOUS_LARGEST if all(pipeline.window_usd > other for other in others) else ""
     share = per_day / databricks_per_day
     return StandingCostContinuous(
         state="stated",
@@ -1775,9 +1778,7 @@ def build_standing_cost_disclosure(
             unclassified.append(line.component)
             continue
         amounts: Sequence[Decimal | None] = (
-            [None] * len(allocations)
-            if line.usd is None
-            else _split_amounts(line.usd, allocations)
+            [None] * len(allocations) if line.usd is None else _split_amounts(line.usd, allocations)
         )
         for allocation, amount in zip(allocations, amounts, strict=True):
             if allocation.lane is StandingCostLaneId.RDS and unpriced_rds:
@@ -1835,10 +1836,7 @@ def build_standing_cost_disclosure(
         observed_rds_instance_class=observed_rds_instance_class,
     )
     partial_reasons = (
-        [
-            "unclassified carrying line(s) not grouped into any lane: "
-            + ", ".join(unclassified)
-        ]
+        ["unclassified carrying line(s) not grouped into any lane: " + ", ".join(unclassified)]
         if unclassified
         else []
     )

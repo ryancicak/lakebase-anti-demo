@@ -1,10 +1,10 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
 import { metricValue, modelScoreEvidence } from '../round4'
 import {
-  ROUND_FIVE_FANIN_PROTOCOL,
   roundFiveHasComparison,
   roundFiveLaneResult,
   roundFiveSetupLaneResult,
+  roundFiveUsesFanIn,
 } from '../round5'
 import {
   classifyEvidence,
@@ -77,7 +77,16 @@ function roundSixElapsed(session: DemoSession): number | null {
  * printed beside them.
  */
 function roundFiveExactPrimaryMs(session: DemoSession, laneId: LaneId): number | null {
-  if (session.round5_setup?.protocol === ROUND_FIVE_FANIN_PROTOCOL) {
+  const runtimeLane = session.round5_runtime?.lanes[laneId]
+  if (session.round5_runtime?.protocol === 'round5-bell-to-10k-v4') {
+    return (
+      runtimeLane?.phase === 'verified'
+      && session.lanes[laneId].state === 'verified'
+    )
+      ? nonNegativeNumber(runtimeLane.bell_to_10000_observed_ms)
+      : null
+  }
+  if (roundFiveUsesFanIn(session)) {
     // Falls back to the setup stop rather than the lane's elapsed time. A bout
     // towelled during setup has a real exact setup measurement and no fan-in result
     // at all, while `elapsed_ms` on such a lane is the wall time the lane spent
@@ -344,7 +353,7 @@ function outcomeHeadline(
     // both paths verified, and the result is which one got 10,000 clients there
     // first. "VERIFIED A POOLED PATH" was the bounded round's verdict, where
     // finishing setup was the whole achievement.
-    const fanIn = session.round5_setup?.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    const fanIn = roundFiveUsesFanIn(session)
     if (winner === 'TIE') {
       return fanIn
         ? 'BOTH PATHS REACHED 10,000 TOGETHER'

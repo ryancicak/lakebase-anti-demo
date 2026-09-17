@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 
 from server.connection_fanin import (
+    LANE_CONNECT_CONCURRENCY,
+    SAFETY_EVIDENCE_VERSION,
     ConnectionSpikeGates,
     ConnectionSpikeLaneResult,
 )
@@ -86,10 +88,21 @@ def verified_fanin_lane(lane_id: str) -> ConnectionSpikeLaneResult:
         telemetry_fd_soft_limit=65_535,
         telemetry_peak_open_fds=20_264,
         telemetry_ephemeral_port_count=28_232,
+        telemetry_peak_ephemeral_ports_in_use=10_000,
         telemetry_min_ephemeral_port_reserve=18_232,
         telemetry_peak_event_loop_p99_ms=4.5,
         telemetry_peak_cpu_capacity_fraction=0.31,
         telemetry_failures=(),
+        telemetry_advisories=(),
+        safety_evidence_version=SAFETY_EVIDENCE_VERSION,
+        hard_safety_verified=True,
+        port_accounting_verified=True,
+        admission_controller_min_concurrency=LANE_CONNECT_CONCURRENCY,
+        admission_controller_reductions=0,
+        admission_controller_recoveries=0,
+        admission_controller_throttled_ms=0.0,
+        admission_controller_recovery_hysteresis_intervals=3,
+        admission_controller_pressure_hysteresis_intervals=2,
         launch_skew_ms=0.1,
         achieved_elapsed_ms=31_000.0,
         gates=ConnectionSpikeGates(

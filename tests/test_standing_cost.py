@@ -314,15 +314,16 @@ class TestTheSixLanes:
 
     def test_the_proxy_lane_is_not_zero_because_its_secrets_stand(self):
         # describe-db-proxies returns nothing, and the lane is still not free: the
-        # two Terraform-managed proxy secrets outlive every proxy. That is why this
-        # lane needs no special case to avoid reading as $0.00.
+        # two Terraform-managed proxy secrets outlive every proxy. The separate
+        # lane-scoped resident event secrets belong to the runner lane. The proxy lane
+        # needs no special case to avoid reading as $0.00.
         shape = InstallationShape()
         proxy = lane(full(), StandingCostLaneId.RDS_PROXY)
         secrets = shape.managed_secrets - shape.rds_instances - shape.aurora_clusters
-        assert secrets == 2
+        assert secrets == 4
         expected = (
             RateCard().secret_month.usd
-            * Decimal(secrets)
+            * Decimal(2)
             * CarryingWindow(seconds=ELAPSED_HOURS * Decimal(3600)).months
             / ELAPSED_HOURS
             * HOURS_PER_DAY
@@ -398,9 +399,7 @@ class TestTheZeroInvariant:
         lakebase = lane(disclosure, StandingCostLaneId.LAKEBASE)
         assert lakebase.figure.state == "unavailable"
         assert "would read as a" in lakebase.figure.derivation
-        assert any(
-            component.figure.state == "priced" for component in lakebase.components
-        )
+        assert any(component.figure.state == "priced" for component in lakebase.components)
 
 
 class TestTheTwoTotals:
@@ -427,9 +426,7 @@ class TestTheTwoTotals:
         assert float(difference) == pytest.approx(float(app))
         platform_lane = lane(disclosure, StandingCostLaneId.DATABRICKS_PLATFORM)
         (predating,) = [
-            component
-            for component in platform_lane.components
-            if component.predates_installation
+            component for component in platform_lane.components if component.predates_installation
         ]
         assert predating.figure.usd_per_day == pytest.approx(float(app))
         # And it is not inside the lane's own subtotal, which is what the reader
@@ -471,9 +468,7 @@ class TestTheTwoTotals:
             # And with the predating app the larger of the two platform lines, so
             # the identity is not resting on which line happens to dominate.
             build(
-                posted=posted_usage(
-                    platform=platform(pipeline=Decimal("0.4"), app=Decimal("6.0"))
-                )
+                posted=posted_usage(platform=platform(pipeline=Decimal("0.4"), app=Decimal("6.0")))
             ),
         )
         for disclosure in payloads:
@@ -524,8 +519,7 @@ class TestTheTwoTotals:
                 (
                     Decimal(str(part.figure.usd_per_day))
                     for part in owner.components
-                    if not part.predates_installation
-                    and part.component != continuous.component
+                    if not part.predates_installation and part.component != continuous.component
                 ),
                 Decimal(0),
             )
@@ -592,9 +586,9 @@ class TestTheTwoTotals:
         for lane_id in StandingCostLaneId:
             if lane_id is StandingCostLaneId.RDS:
                 continue
-            assert lane(after, lane_id).figure.usd_per_day == lane(
-                before, lane_id
-            ).figure.usd_per_day
+            assert (
+                lane(after, lane_id).figure.usd_per_day == lane(before, lane_id).figure.usd_per_day
+            )
 
     def test_an_unknown_rds_class_leaves_that_lane_out_and_says_the_total_is_partial(self):
         disclosure = build(
@@ -760,9 +754,7 @@ class TestDrift:
                 ),
             ),
             observed=(
-                ObservedResource(
-                    RDS_INSTANCE, "adsc-v7-rds", "available", created_at=created
-                ),
+                ObservedResource(RDS_INSTANCE, "adsc-v7-rds", "available", created_at=created),
             ),
         )
         (finding,) = build(posted=posted_usage(), report=report).drift.findings
@@ -782,9 +774,7 @@ class TestDrift:
                     basis="2 ACU ceiling + 1 public IPv4",
                 ),
             ),
-            observed=(
-                ObservedResource(AURORA_WRITER, "adrc-v7-aurora-writer", "available"),
-            ),
+            observed=(ObservedResource(AURORA_WRITER, "adrc-v7-aurora-writer", "available"),),
         )
         (finding,) = build(posted=posted_usage(), report=report).drift.findings
         assert finding.usd_per_day == pytest.approx(5.88)
@@ -890,7 +880,9 @@ class TestTheCopy:
         fairness = full().fairness
         assert fairness.state == "stated"
         for sentence in (
-            "Both sides carry standing cost here, and ours is the larger half",
+            "Both sides carry standing cost here",
+            "with AWS the larger half",
+            "Round 5 includes both physical c7i.2xlarge runners",
             "The difference is capability, not this bill",
             f"scale to zero and does at {LAKEBASE_SUSPEND_SECONDS}s.",
             "No provisioned RDS instance can scale to zero at any price.",
@@ -1049,7 +1041,9 @@ class TestTheCopy:
         aws = aws_usd_per_day(RateCard(), InstallationShape())
         assert f"${databricks:.2f}/day" in disclosure.fairness.paragraph
         assert f"${aws:.2f}/day" in disclosure.fairness.paragraph
-        assert f"{databricks / aws:.1f}x" in disclosure.fairness.paragraph
+        assert f"{max(databricks, aws) / min(databricks, aws):.1f}x" in (
+            disclosure.fairness.paragraph
+        )
         # The AWS half is recomputed from the rate card above and has no
         # predating component, so the two derivations must agree on it.
         assert float(installation_half_usd_per_day(disclosure, "aws")) == pytest.approx(
@@ -1080,9 +1074,11 @@ class TestTheCopy:
             assert paragraph
             databricks = installation_half_usd_per_day(disclosure, "databricks")
             aws = installation_half_usd_per_day(disclosure, "aws")
+            larger = "Databricks" if databricks > aws else "AWS"
+            ratio = max(databricks, aws) / min(databricks, aws)
             assert (
                 f"${databricks:.2f}/day Databricks against ${aws:.2f}/day AWS, "
-                f"a {databricks / aws:.1f}x margin"
+                f"with {larger} the larger half by {ratio:.1f}x"
             ) in paragraph
             # And the test is not vacuous: this payload really does carry a
             # priced Databricks component that predates the installation, so an
@@ -1258,14 +1254,16 @@ class TestTheCopy:
         # The observed day was fed in as $29.8568 across both Databricks lanes,
         # of which the app's third predates this installation. The paragraph
         # quotes the other two thirds, against an AWS half that is still the
-        # deleted-instance fleet's $8.35/day.
+        # deleted-instance fleet plus two physical runners.
         databricks = installation_half_usd_per_day(disclosure, "databricks")
         aws = aws_usd_per_day(RateCard(), InstallationShape())
         assert f"${aws:.2f}/day AWS" in paragraph
-        assert f"{aws:.2f}" == "8.35"
+        assert f"{aws:.2f}" == "27.05"
+        larger = "Databricks" if databricks > aws else "AWS"
+        ratio = max(databricks, aws) / min(databricks, aws)
         assert (
             f"${databricks:.2f}/day Databricks against ${aws:.2f}/day AWS, "
-            f"a {databricks / aws:.1f}x margin"
+            f"with {larger} the larger half by {ratio:.1f}x"
         ) in paragraph
         # The figure the unfiltered comprehension used to produce may not come
         # back beside it, nor may the superseded four-instance AWS half.
@@ -1278,14 +1276,12 @@ class TestTheCopy:
         assert fairness.paragraph == ""
         assert "unpriced" in fairness.withheld_reason
 
-    def test_the_paragraph_is_withheld_when_our_half_is_no_longer_the_larger_one(self):
-        # A tiny posted platform day makes the concession false. The paragraph goes
-        # away; it is not quietly turned into a boast.
+    def test_the_paragraph_names_aws_when_two_runners_make_it_the_larger_half(self):
         disclosure = build(
             posted=posted_usage(platform=platform(pipeline=Decimal("0.01"), app=Decimal("0.01")))
         )
-        assert disclosure.fairness.state == "withheld"
-        assert "larger one" in disclosure.fairness.withheld_reason
+        assert disclosure.fairness.state == "stated"
+        assert "with AWS the larger half" in disclosure.fairness.paragraph
 
     def test_the_word_verified_appears_nowhere(self):
         # No figure here has met an invoice, so no copy field may imply one has.
@@ -1339,13 +1335,9 @@ class TestNoRateLiterals:
             lakebase_dbu=replace(RateCard().lakebase_dbu, usd=RateCard().lakebase_dbu.usd * 2),
         )
         base = lane(build(posted=posted_usage()), StandingCostLaneId.LAKEBASE)
-        moved = lane(
-            build(rates=doubled, posted=posted_usage()), StandingCostLaneId.LAKEBASE
-        )
+        moved = lane(build(rates=doubled, posted=posted_usage()), StandingCostLaneId.LAKEBASE)
         compute = POSTED_LAKEBASE_DBU_PER_HOUR * RateCard().lakebase_dbu.usd * HOURS_PER_DAY
-        assert moved.figure.usd_per_day == pytest.approx(
-            base.figure.usd_per_day + float(compute)
-        )
+        assert moved.figure.usd_per_day == pytest.approx(base.figure.usd_per_day + float(compute))
 
     def test_the_shape_decides_the_quantities_not_the_module(self):
         one_of_each = InstallationShape(
@@ -1361,9 +1353,7 @@ class TestNoRateLiterals:
                 (
                     rds_instance_hour_usd("db.t4g.medium")
                     + RateCard().public_ipv4_hour.usd
-                    + RateCard().rds_gp3_gb_month.usd
-                    * one_of_each.rds_allocated_gb
-                    / Decimal(730)
+                    + RateCard().rds_gp3_gb_month.usd * one_of_each.rds_allocated_gb / Decimal(730)
                     + RateCard().secret_month.usd / Decimal(730)
                 )
                 * HOURS_PER_DAY
@@ -1548,9 +1538,7 @@ _COST_CLAIMS: dict[str, tuple[str, ...]] = {
     # anchor stops before the gap for the reason the docstring above gives --
     # nothing in this plan may carry a dollar amount, and "fourteen cents" was
     # one spelled in words.
-    "installation": (
-        r"\$([\d.]+) and \$[\d.]+ are two different quantities",
-    ),
+    "installation": (r"\$([\d.]+) and \$[\d.]+ are two different quantities",),
     "with_platform_stopped": (
         r"\$[\d.]+ and \$([\d.]+) are two different quantities",
         r"or about \$([\d.]+)/day with the pipeline stopped",
@@ -1727,11 +1715,7 @@ def _stated_cost_figures(name: str) -> dict[str, Decimal]:
     prose = _normalised_cost_prose(name)
     found: dict[str, Decimal] = {}
     for claim, patterns in _COST_CLAIMS.items():
-        hits = {
-            Decimal(match)
-            for pattern in patterns
-            for match in re.findall(pattern, prose)
-        }
+        hits = {Decimal(match) for pattern in patterns for match in re.findall(pattern, prose)}
         if not hits:
             continue
         assert len(hits) == 1, (

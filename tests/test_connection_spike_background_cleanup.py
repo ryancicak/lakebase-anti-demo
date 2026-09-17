@@ -51,14 +51,16 @@ async def test_engine_returns_verified_result_before_starting_slow_cleanup(monke
 
         dispatched: list[str] = []
 
-        async def execute(self, run_id, request, *, targets=None):
-            del run_id, targets
+        async def execute(self, run_id, request, *, targets=None, on_progress=None):
+            del run_id, targets, on_progress
             # Each dispatch carries exactly one lane now, so the order they arrive in is the
             # order the lanes run.
             self.dispatched.extend(
                 str(target["lane_id"]) for target in request["targets"]
             )
             return {}
+
+        execute_prepared = execute
 
     orchestrator = SimpleNamespace()
     adapter = Adapter()
@@ -75,11 +77,18 @@ async def test_engine_returns_verified_result_before_starting_slow_cleanup(monke
     monkeypatch.setattr(
         live, "_merge_lane_results", lambda supplied_arm, lanes, diagnostics: expected
     )
+    async def completed_lane(lane_id: str) -> str:
+        return lane_id
+
+    engine._lane_bursts = {
+        lane_id: asyncio.create_task(completed_lane(lane_id))
+        for lane_id in ("lakebase", "competitor")
+    }
 
     assert await engine.run(arm) is expected
-    # Lakebase first, always: it is ready while the AWS path is still provisioning, and a
-    # shared start made that provisioning a precondition for its number.
-    assert adapter.dispatched == ["lakebase", "competitor"]
+    # These logical jobs were already dispatched at their eligibility edges;
+    # collecting the result must not send either one again.
+    assert adapter.dispatched == []
     assert engine._setup_result.bout_id == "bout-proof"
 
 
@@ -90,6 +99,14 @@ async def test_stop_starts_cleanup_once_and_exposes_two_wait_boundaries() -> Non
     class Adapter:
         async def cancel(self, run_id):
             calls.append(("cancel", run_id))
+
+        async def cancel_resident(self, *, generation, lane_id, job_id):
+            del generation, lane_id
+            calls.append(("cancel", job_id))
+
+        def settlement_pending(self, run_id):
+            del run_id
+            return False
 
     class Orchestrator:
         accepted = False
@@ -111,7 +128,7 @@ async def test_stop_starts_cleanup_once_and_exposes_two_wait_boundaries() -> Non
     engine = LiveConnectionSpikeEngine(Adapter(), setup_orchestrator=orchestrator)
     arm = object()
     engine._armed = arm
-    engine._active_run_id = "runner-one"
+    engine._active_run_ids = {"lakebase": "runner-one"}
     engine._setup_result = SimpleNamespace(bout_id="bout-one")
 
     await asyncio.gather(

@@ -211,7 +211,10 @@ class FakeSessionFactory:
 
         class Session:
             def client(self, name, **client_kwargs):
+                config = client_kwargs.pop("config", None)
                 assert client_kwargs == {"region_name": "us-west-2"}
+                assert config.connect_timeout == 5
+                assert config.read_timeout == 30
                 factory.client_origins.append((origin, name))
                 if origin == "ambient":
                     assert name == "sts"
@@ -235,6 +238,7 @@ def live_config() -> ConnectionSpikeLiveConfig:
         runner_instance_profile_arn=(f"arn:aws:iam::{ACCOUNT}:instance-profile/runner"),
         runner_subnet_id="subnet-sealed",
         runner_security_group_id="sg-sealed",
+        runner_harness_sha256=runner.runner_harness_sha256(),
         trust_bundle_sha256="a" * 64,
         targets=(
             ConnectionSpikeTarget(
@@ -278,6 +282,7 @@ def fanin_request(run_id: str) -> dict[str, object]:
         config_sha256=fanin_config_sha256(),
         generator_sha256=fanin_generator_sha256(),
         capacity_model_sha256=fanin_capacity_model_sha256(),
+        runner_harness_sha256=runner.runner_harness_sha256(),
         trust_bundle_sha256="a" * 64,
         lakebase_credential_sha256="c" * 64,
         lakebase_observer_credential_sha256="d" * 64,

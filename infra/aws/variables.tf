@@ -210,7 +210,12 @@ variable "round5_runner_instance_type" {
   default     = "c7i.2xlarge"
 
   validation {
-    condition     = contains(["m6i.xlarge", "c7i.2xlarge"], var.round5_runner_instance_type)
-    error_message = "Round 5 dual-10,000 capacity requires m6i.xlarge or c7i.2xlarge. Smaller overrides are refused before provisioning; do not lower client count, memory/FD reserves, hold time, or telemetry."
+    # The runtime capacity invariant is exactly c7i.2xlarge: the sealed
+    # frozen_constants (server/manifest.py Round5FrozenConstants) and both
+    # resident runners are sized for it. m6i.xlarge cannot hold two independent
+    # 10,000-client lanes with the required memory/FD reserves, so it is refused
+    # rather than left as a silent capacity downgrade.
+    condition     = var.round5_runner_instance_type == "c7i.2xlarge"
+    error_message = "Round 5 dual-10,000 capacity requires exactly c7i.2xlarge; no smaller shape is accepted. Do not lower client count, memory/FD reserves, hold time, or telemetry."
   }
 }
