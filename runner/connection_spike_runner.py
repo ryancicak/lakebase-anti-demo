@@ -147,6 +147,15 @@ SETUP_VERIFY_MAX_RETRY_DELAY_SECONDS = 8.0
 TLS_MODE = "verify-full"
 TRUST_BUNDLE_PATH = Path("/opt/lakebase-anti-demo/round5/round5-ca.pem")
 LOCK_PATH = Path("/run/lock/lakebase-anti-demo-round5.lock")
+# The resident agent's staged burst holds its OWN exclusive lock, separate from
+# LOCK_PATH. In the v4 two-runner control plane the resident holds this while a
+# job is staged/prepared/running, and a setup runner invocation (the Aurora
+# pending-capacity wake, credential prep) must be able to run in parallel over
+# LOCK_PATH -- which the app still requires to print RUNNER_FLOCK_RELEASED as
+# proof it settled. Sharing one lock made the Aurora wake fail with runner_busy
+# against the resident's own staged burst. Two locks let both proceed; the
+# resident is still the sole burst runner, serialized by its own active-job set.
+RESIDENT_LOCK_PATH = Path("/run/lock/lakebase-anti-demo-round5-resident.lock")
 RUN_ROOT = Path("/run/lakebase-anti-demo/round5")
 JOB_ROOT = Path("/var/lib/lakebase-anti-demo/round5-jobs")
 APP_PREFIX = "anti-demo-r5"
@@ -4339,8 +4348,8 @@ async def _resident_agent(
             progress_values.append(dict(value))
 
         fanin._progress_callback = capture_progress
-        LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        lock_file = LOCK_PATH.open("a+", encoding="utf-8")  # noqa: ASYNC230
+        RESIDENT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        lock_file = RESIDENT_LOCK_PATH.open("a+", encoding="utf-8")  # noqa: ASYNC230
 
         async def mark_prepared() -> None:
             await publish(

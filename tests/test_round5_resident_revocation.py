@@ -731,6 +731,23 @@ def test_ready_provenance_requires_all_lanes_current() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Resident burst lock is separate from the setup runner's LOCK_PATH so the
+# Aurora pending-capacity wake can run in parallel with a staged burst.
+# --------------------------------------------------------------------------- #
+def test_resident_burst_lock_is_separate_from_setup_lock() -> None:
+    assert runner.RESIDENT_LOCK_PATH != runner.LOCK_PATH
+    agent_source = inspect.getsource(runner._resident_agent)
+    # The resident's staged execute() holds its own lock, not the setup lock.
+    assert "RESIDENT_LOCK_PATH.open(" in agent_source
+    assert "LOCK_PATH.open(" not in agent_source.replace("RESIDENT_LOCK_PATH.open(", "")
+    # The setup runner still acquires LOCK_PATH and prints RUNNER_FLOCK_RELEASED,
+    # which the app requires as proof the setup command settled.
+    main_source = inspect.getsource(runner.main)
+    assert "LOCK_PATH.open(" in main_source
+    assert "RUNNER_FLOCK_RELEASED" in main_source
+
+
+# --------------------------------------------------------------------------- #
 # Requirement 3: coordination native login is persisted in code.
 # --------------------------------------------------------------------------- #
 def test_ensure_coordination_persists_native_login() -> None:
