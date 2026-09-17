@@ -5,6 +5,8 @@ import {
   ROUND_FIVE_BELL_PROTOCOL,
   ROUND_FIVE_FANIN_PROTOCOL,
   ROUND_FIVE_SAMPLED_QUERIES,
+  roundFiveBellRuntime,
+  roundFiveLanePresentation,
   roundFiveLaneResult,
 } from './round5'
 import { preciseDuration } from './time'
@@ -148,7 +150,7 @@ function incompleteTakeaway(session: DemoSession): string | null {
     && outcome.evidence.laneShape === 'both_exact_verified'
   ) {
     return roundFiveUsesFanIn(session)
-      ? 'Both lanes reached exactly 10,000 clients, but a required hold, sample, multiplexing, telemetry, identity, fairness, or cleanup check did not pass. No winner or margin was declared.'
+      ? 'Both lanes reached exactly 10,000 clients, but a required hold, query check, multiplexing, telemetry, identity, fairness, or cleanup check did not pass. No winner or margin was declared.'
       : 'Legacy Round 5 scorecard decoded, but the current 10,000-client fan-in result was not recorded. No fan-in result or margin was declared.'
   }
   if (
@@ -361,22 +363,47 @@ function roundFourStory(session: DemoSession): ReplayStory {
 function roundFiveStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
   const recurringFanIn = roundFiveUsesFanIn(session)
+  const bellRuntime = roundFiveBellRuntime(session)
+  // Under the V4 bell runtime the primary clock is the observed
+  // bell_to_10000_observed_ms, which stays sticky through a hold, a towel, or a
+  // failure after 10,000 clients. A lane that only reached 10,000 clients keeps
+  // its exact time as timed evidence but is labelled reached/interrupted, never
+  // verified; a lane that never reached 10,000 clients shows its lower bound.
+  // This is the same canonical view-model the arena and the share receipt read.
+  const bellFanInMetric = (
+    laneId: LaneId,
+    label: string,
+  ): ReplayMetric | null => {
+    const presentation = roundFiveLanePresentation(session, laneId)
+    if (!presentation) return null
+    if (presentation.timeMs !== null) {
+      const note = presentation.semantic === 'verified'
+        ? 'Exact authenticated held-client gate'
+        : presentation.semantic === 'reached_hold_interrupted'
+          ? '10,000 clients reached · hold interrupted by towel'
+          : presentation.semantic === 'reached_hold_failed'
+            ? '10,000 clients reached · hold did not verify'
+            : '10,000 clients reached · hold still running'
+      return { laneId, label, value: preciseDuration(presentation.timeMs), note }
+    }
+    if (presentation.lowerBoundMs !== null) {
+      return {
+        laneId,
+        label,
+        value: `>${preciseDuration(presentation.lowerBoundMs)}`,
+        note: 'Never reached 10,000 clients · unverified when stopped',
+      }
+    }
+    return null
+  }
   const exactFanInMetric = (
     laneId: LaneId,
     label: string,
     note: string,
   ): ReplayMetric | null => {
-    const runtimeLane = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
-      ? session.round5_runtime.lanes[laneId]
-      : null
+    if (bellRuntime) return bellFanInMetric(laneId, label)
     const legacyLane = roundFiveLaneResult(session.lanes[laneId])
-    const milliseconds = runtimeLane
-      ? runtimeLane.phase === 'verified'
-        ? runtimeLane.bell_to_10000_observed_ms
-        : null
-      : legacyLane.contractVerified
-        ? legacyLane.timeToTargetMs
-        : null
+    const milliseconds = legacyLane.contractVerified ? legacyLane.timeToTargetMs : null
     return milliseconds === null
       ? null
       : { laneId, label, value: preciseDuration(milliseconds), note }
@@ -403,6 +430,16 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       recurringFanIn ? 'Exact authenticated held-client gate' : 'New RDS Proxy provisioned',
     ) ?? lowerBoundMetric(session, 'competitor', 'Selected AWS managed pool'),
   ].filter((metric): metric is ReplayMetric => metric !== null)
+  // On the V4 bell runtime a lane can genuinely reach 10,000 clients, so asserting "all
+  // 20,000 held 30s" on a towel/failure is a false completed-hold claim. Only
+  // rewrite that beat for an incomplete bell bout; legacy fan-in keeps its
+  // methodology description (which already appends an "did not complete" suffix).
+  const bellIncomplete = bellRuntime !== null && bellRuntime.state !== 'verified'
+  const sameTestBody = !recurringFanIn
+    ? `Legacy Round 5 scorecard decoded. The current exact 10,000-client fan-in contract was not recorded, so the replay does not infer fan-in evidence.${incompleteTestSuffix(session)}`
+    : bellIncomplete
+      ? `Phase 2 raced each lane on its own clock to exactly 10,000 authenticated held clients under one verify-full TLS client. The 30-second hold and ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks per lane did not complete before the bout stopped, so no lane is verified.${incompleteTestSuffix(session)}`
+      : `Phase 2 held exactly 10,000 authenticated held clients per lane, each lane on its own clock, under one verify-full TLS client. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks passed per lane; observers proved multiplexing.${incompleteTestSuffix(session)}`
   return {
     ...state,
     metricBeat: 'setup',
@@ -416,9 +453,7 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       {
         id: 'same-test',
         title: 'Same test',
-        body: recurringFanIn
-          ? `Phase 2 held exactly 10,000 authenticated held clients per lane, each lane on its own clock, under one verify-full TLS client. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} lane samples passed; observers proved multiplexing.${incompleteTestSuffix(session)}`
-          : `Legacy Round 5 scorecard decoded. The current exact 10,000-client fan-in contract was not recorded, so the replay does not infer fan-in evidence.${incompleteTestSuffix(session)}`,
+        body: sameTestBody,
       },
       {
         id: 'takeaway',

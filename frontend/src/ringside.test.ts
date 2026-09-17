@@ -947,7 +947,7 @@ describe('Ringside output behavior', () => {
           expect(cue.show).toContain(
             'Both paths connected and held 10,000 clients from the same start.',
           )
-          expect(cue.show).toMatch(/passed 64 verification samples per lane/i)
+          expect(cue.show).toMatch(/passed 64 held-connection checks per lane/i)
           expect(cue.show).toMatch(/transaction throughput were not measured/i)
           // Under the bounded protocol the proof line was forbidden from naming
           // 10,000, because 10,000 was a product limit the bout never approached

@@ -1230,7 +1230,7 @@ describe('backstage setup', () => {
     expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
   })
 
-  it('retains the Round 5 session pointer while towel cleanup remains unresolved', async () => {
+  it('returns from a Round 5 towel result immediately while its cleanup lease stays active', async () => {
     const towelled = roundFiveTowelCleanupSession()
     window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
       id: towelled.id,
@@ -1244,13 +1244,23 @@ describe('backstage setup', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
     vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
     render(<App />)
 
+    // The posted towel offers its full action row while cleanup is still backstage.
     expect(await screen.findByText(/result posted · cleanup backstage/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /explain to the room/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+    const next = screen.getByRole('button', { name: /^a · (next round|fight card)$/i })
+    expect(next).toBeEnabled()
+
     const snapshotBeforeNavigation = JSON.stringify(towelled)
-    expect(screen.queryByRole('button', { name: /a · (next round|fight card)/i })).not.toBeInTheDocument()
-    expect(window.location.hash).toBe('#proof')
-    expect(JSON.parse(window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')!).id).toBe(towelled.id)
+    await user.click(next)
+
+    // Leaving returns to the fight card and never mutates the backstage cleanup.
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(window.location.hash).toBe('#setup/card')
     expect(JSON.stringify(towelled)).toBe(snapshotBeforeNavigation)
     expect(towelled.towel?.state).toBe('cleaning')
     expect(towelled.round5_setup?.cleanup_retryable).toBe(true)

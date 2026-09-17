@@ -11,6 +11,7 @@ from .models import (
     LaneActivity,
     LaneSnapshot,
     LaneState,
+    RoundFiveRuntimeLaneSnapshot,
     RoundFiveSetupLaneSnapshot,
     RoundFiveSetupState,
     RoundId,
@@ -191,6 +192,122 @@ def adjudicate_round_five_towel(
             winner_lane_id=None,
             margin=None,
             detail=comparison_detail,
+        ),
+        public_result=public_result,
+    )
+
+
+def adjudicate_round_five_bell_towel(
+    *,
+    lanes: Mapping[str, LaneSnapshot],
+    runtime_lanes: Mapping[str, RoundFiveRuntimeLaneSnapshot],
+) -> TowelAdjudication:
+    """Freeze a V4 (``round5-bell-to-10k-v4``) towel from the runtime, not setup.
+
+    The scored quantity for the current protocol is the runtime's
+    ``bell_to_10000_observed_ms`` -- the exact time to 10,000 authenticated held
+    clients. This adjudication must therefore never promote the ~0.01s pooled-path
+    *setup* stop into the generic ``snapshot.lanes`` as VERIFIED, which is the
+    defect that put "0.01s · EXACT VERIFIED" on the share receipt while the arena
+    correctly showed 14.15s. The truth per lane is:
+
+    * ``phase == 'verified'``: the lane completed the full 30-second hold and all
+      64 held-connection checks -> VERIFIED, exact ``bell_to_10000_observed_ms``.
+    * reached 10,000 clients (``bell_to_10000_observed_ms`` set) but cancelled or
+      failed mid-hold: the exact observed time is preserved as *timed evidence*,
+      but the lane is TOWELLED/FAILED and never verified.
+    * never reached 10,000 clients: a censored lower bound from the lane's own
+      runtime clock (``elapsed_at_snapshot_ms``), or untimed when it published nothing.
+
+    No winner or margin is ever declared here; that requires the full contract.
+    """
+
+    expected_lanes = {"lakebase", "competitor"}
+    if set(lanes) != expected_lanes or set(runtime_lanes) != expected_lanes:
+        raise ValueError("Round 5 bell towel adjudication requires both lanes")
+
+    frozen = {lane_id: lane.model_copy(deep=True) for lane_id, lane in lanes.items()}
+    censored: dict[str, float] = {}
+    for lane_id, runtime_lane in runtime_lanes.items():
+        lane = frozen[lane_id]
+        lane.error = None
+        lane.verified_at = None
+        observed_ms = _finite_ms(runtime_lane.bell_to_10000_observed_ms)
+        reached = observed_ms is not None
+        if runtime_lane.phase == "verified" and reached:
+            lane.state = LaneState.VERIFIED
+            lane.elapsed_ms = observed_ms
+            lane.status = "Exact 10,000-client held gate verified"
+            lane.activity = LaneActivity(phase="verified")
+            lane.evidence = {
+                "reached_10000": True,
+                "bell_to_10000_observed_ms": observed_ms,
+                "verified": True,
+            }
+            continue
+        if reached:
+            # Reached 10,000 clients but the hold was interrupted (towel) or did
+            # not verify (failure). Keep the exact observed time as evidence; it
+            # is not an exact *verified* result, so elapsed_ms stays None and the
+            # lane is not VERIFIED.
+            lane.state = (
+                LaneState.FAILED
+                if runtime_lane.phase == "failed"
+                else LaneState.TOWELLED
+            )
+            lane.elapsed_ms = None
+            interrupted = runtime_lane.phase != "failed"
+            lane.status = (
+                "Reached 10,000 clients · hold interrupted by towel · not verified"
+                if interrupted
+                else "Reached 10,000 clients · hold did not verify after reaching them"
+            )
+            lane.activity = LaneActivity(
+                phase=LaneState.TOWELLED if interrupted else LaneState.FAILED
+            )
+            lane.evidence = {
+                "reached_10000": True,
+                "bell_to_10000_observed_ms": observed_ms,
+                "verified": False,
+                "display_value": f"{observed_ms / 1000:.2f}s",
+            }
+            continue
+        # Never reached 10,000 clients. The lane's own runtime clock at the stop
+        # is a censored lower bound; a lane that published nothing stays untimed.
+        lower_bound_ms = _finite_ms(runtime_lane.elapsed_at_snapshot_ms)
+        lane.state = LaneState.TOWELLED
+        lane.elapsed_ms = None
+        lane.activity = LaneActivity(phase=LaneState.TOWELLED)
+        if lower_bound_ms is None or lower_bound_ms <= 0:
+            lane.status = "Toweled · never reached 10,000 clients · no exact timing observed"
+            lane.evidence = {"censored": True, "reached_10000": False, "display_value": "NOT TIMED"}
+            continue
+        censored[lane_id] = lower_bound_ms
+        display = _cutoff_display(lower_bound_ms)
+        lane.status = f"Toweled · never reached 10,000 clients · {display} observed lower bound"
+        lane.evidence = {
+            "censored": True,
+            "reached_10000": False,
+            "lower_bound_ms": lower_bound_ms,
+            "display_value": display,
+        }
+
+    public_result = (
+        "Toweled · No exact verified result · No declared winner · "
+        "Comparison incomplete · Margin N/A"
+    )
+    return TowelAdjudication(
+        cutoff_ms=None,
+        lanes=frozen,
+        censored_lower_bounds_ms=censored,
+        comparison=ComparisonSnapshot(
+            kind=ComparisonKind.NOT_COMPARABLE,
+            winner_lane_id=None,
+            margin=None,
+            detail=(
+                "The V4 fan-in was stopped before its contract completed; "
+                "no winner or margin was declared."
+            ),
         ),
         public_result=public_result,
     )

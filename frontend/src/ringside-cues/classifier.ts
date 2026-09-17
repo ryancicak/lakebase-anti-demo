@@ -1,7 +1,9 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
 import { metricValue, modelScoreEvidence } from '../round4'
 import {
+  roundFiveBellRuntime,
   roundFiveHasComparison,
+  roundFiveLanePresentation,
   roundFiveLaneResult,
   roundFiveSetupLaneResult,
   roundFiveUsesFanIn,
@@ -665,7 +667,8 @@ export function buildRingsideCue(
         required(outcome.question, 'question'),
         required(outcome.question_decision, 'question_decision') as 'KEEP' | 'REWRITE',
       )
-  const proof = interpolateProof(outcome.proof_template, values)
+  const proof = roundFiveBellIncompleteProof(session, classified)
+    ?? interpolateProof(outcome.proof_template, values)
   return {
     say: sayRecord.text,
     ask: askRecord.text,
@@ -677,10 +680,56 @@ export function buildRingsideCue(
   }
 }
 
+/**
+ * The "what we proved" line for a V4 bell Round 5 bout that did not complete its
+ * contract (towelled or failed). It replaces the authored `setup_incomplete` /
+ * one-sided proof templates, which say "the 10,000-client fan-in did not run" /
+ * "never started" -- false when the runtime proves a lane reached 10,000. Reads
+ * the same canonical lane view-model as every other surface. Returns null for
+ * verified bouts and every non-bell session so their authored copy is used.
+ */
+function roundFiveBellIncompleteProof(
+  session: DemoSession,
+  classified: RoundContractDecision,
+): string | null {
+  if (session.round.id !== 'survive_connection_spike') return null
+  if (!roundFiveBellRuntime(session)) return null
+  if (classified.contractComplete) return null
+
+  const clause = (laneId: LaneId): string => {
+    const name = session.round5_setup?.lanes?.[laneId]?.name
+      ?? session.lanes[laneId].name
+    const presentation = roundFiveLanePresentation(session, laneId)
+    if (!presentation) return `${name} produced no fan-in evidence`
+    switch (presentation.semantic) {
+      case 'verified':
+        return `${name} verified exactly 10,000 held clients at ${presentation.value}`
+      case 'reached_hold_interrupted':
+        return `${name} reached 10,000 clients at ${presentation.value}, but the 30-second hold was interrupted by the towel before it verified`
+      case 'reached_hold_failed':
+        return `${name} reached 10,000 clients at ${presentation.value}, but the hold did not verify`
+      case 'reached_hold_in_progress':
+        return `${name} reached 10,000 clients at ${presentation.value} with the hold still running`
+      case 'not_reached_lower_bound':
+        return `${name} never reached 10,000 clients (unverified when stopped, ${presentation.value})`
+      case 'not_supported':
+        return `${name} was not supported`
+      default:
+        return `${name} never reached 10,000 clients`
+    }
+  }
+
+  return (
+    `${clause('lakebase')}. ${clause('competitor')}. `
+    + 'No exact verified result, no declared winner, comparison incomplete, margin N/A.'
+  )
+}
+
 export function buildRingsideShow(session: DemoSession): string {
   const classified = classifyOutcome(session)
-  return interpolateProof(
-    classified.outcome.proof_template,
-    proofValues(session, classified),
-  )
+  return roundFiveBellIncompleteProof(session, classified)
+    ?? interpolateProof(
+      classified.outcome.proof_template,
+      proofValues(session, classified),
+    )
 }

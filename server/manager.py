@@ -162,7 +162,11 @@ from .targets import (
     TargetNotArmedError,
     TargetResolver,
 )
-from .towel import adjudicate_round_five_towel, adjudicate_towel
+from .towel import (
+    adjudicate_round_five_bell_towel,
+    adjudicate_round_five_towel,
+    adjudicate_towel,
+)
 from .verifier import NeutralVerifier, VerificationResult, VerifierStopped
 
 logger = logging.getLogger(__name__)
@@ -2790,11 +2794,23 @@ class RunManager:
                         if runtime_lane.phase != "verified":
                             runtime_lane.phase = "cancelled"
                     self._advance_round5_revision_locked(record)
-                adjudication = adjudicate_round_five_towel(
-                    lanes=record.snapshot.lanes,
-                    setup_lanes=round_five_setup.lanes,
-                    elapsed_at_cutoff_ms=round_five_elapsed_at_cutoff_ms,
-                )
+                if runtime is not None and runtime.protocol == "round5-bell-to-10k-v4":
+                    # V4 durable truth comes from the bell runtime, never the
+                    # ~0.01s pooled-path setup stop. This keeps the setup clock
+                    # out of the primary `snapshot.lanes` verification so
+                    # `derive_receipt`, summary, and finale all read the exact
+                    # bell_to_10000 observation and its reached/verified
+                    # distinction instead of a promoted setup stop.
+                    adjudication = adjudicate_round_five_bell_towel(
+                        lanes=record.snapshot.lanes,
+                        runtime_lanes=runtime.lanes,
+                    )
+                else:
+                    adjudication = adjudicate_round_five_towel(
+                        lanes=record.snapshot.lanes,
+                        setup_lanes=round_five_setup.lanes,
+                        elapsed_at_cutoff_ms=round_five_elapsed_at_cutoff_ms,
+                    )
             else:
                 normal_comparison = record.snapshot.comparison
                 if normal_comparison is None and all(
@@ -2843,8 +2859,20 @@ class RunManager:
                     RecoveryPhase.VERIFYING_RECOVERED_ORDER,
                     RecoveryPhase.VERIFYING_SOURCE,
                 }
+            # `lakebase_verified_ms` is a transitional Round 3 compatibility field.
+            # It must never carry a V4 value: the V4 receipt reads the canonical
+            # bell runtime, and populating this legacy field from a towel-promoted
+            # setup stop is exactly what put "0.01s · EXACT VERIFIED" on the share
+            # card. Leave it unset for the V4 bell protocol.
+            is_round_five_bell = (
+                is_round_five
+                and record.snapshot.round5_runtime is not None
+                and record.snapshot.round5_runtime.protocol == "round5-bell-to-10k-v4"
+            )
             lakebase_verified_ms = (
-                adjudication.lanes["lakebase"].elapsed_ms
+                None
+                if is_round_five_bell
+                else adjudication.lanes["lakebase"].elapsed_ms
                 if adjudication.lanes["lakebase"].state == LaneState.VERIFIED
                 else None
             )
