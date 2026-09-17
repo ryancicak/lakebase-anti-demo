@@ -427,6 +427,16 @@ class RoundFiveSetupLaneSnapshot(BaseModel):
     stop_gate_evidence: RoundFiveSetupGateSnapshot | None = None
     verified: bool = False
     error: str | None = None
+    # Absolute launch delay of this lane's workflow after the shared setup T0,
+    # persisted per lane.  Inter-lane skew alone (``workflow_launch_skew_ms``)
+    # cannot prove each lane launched within the bounded window; this can.
+    workflow_launch_delay_ms: float | None = None
+    # Secret-free finalizer subcode that survives auto-cleanup and the terminal
+    # receipt.  Distinguishes a genuine stop-gate failure (e.g.
+    # ``stop_gate_evidence``/``workflow_launch_window``/``setup_deadline``) from
+    # a public-projection rejection (``public_fact_key_rejected``), instead of
+    # collapsing every case into the generic "Setup verification failed".
+    setup_diagnostic: str | None = None
 
 
 class RoundFiveSetupSnapshot(BaseModel):

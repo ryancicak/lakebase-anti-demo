@@ -7678,8 +7678,16 @@ class RunManager:
     def _round_five_public_evidence_fact(
         value: object,
     ) -> RoundFiveSetupEvidenceSnapshot | None:
-        key = str(getattr(value, "key", "")).strip()
-        fact = getattr(value, "value", None)
+        # Mapping-aware: a stop-gate fact survives a JSON/dict round trip (e.g.
+        # a persisted terminal receipt reloaded as plain dicts) as well as the
+        # in-process ``PublicSetupEvidence`` dataclass.  The strict sanitizer
+        # below is unchanged; only where the key/value are read from differs.
+        if isinstance(value, Mapping):
+            key = str(value.get("key", "")).strip()
+            fact = value.get("value", None)
+        else:
+            key = str(getattr(value, "key", "")).strip()
+            fact = getattr(value, "value", None)
         lowered = key.lower()
         forbidden = (
             not key
@@ -7790,6 +7798,48 @@ class RunManager:
             comparison=comparison,
         )
 
+    #: Fixed, secret-free finalizer subcodes the snapshot may carry. Extended
+    #: only with new fixed labels; never with runtime/provider strings.
+    _ROUND_FIVE_SETUP_LANE_FAILURES = (
+        "workflow_launch_window",
+        "stop_gate_evidence",
+        "stop_gate_before_workflow_launch",
+        "setup_deadline",
+        "setup_error",
+        "setup_failed",
+        "setup_towelled",
+    )
+    _ROUND_FIVE_PUBLIC_FACT_REJECTED = "public_fact_key_rejected"
+
+    @classmethod
+    def _round_five_setup_lane_diagnostic(
+        cls,
+        raw: object,
+        *,
+        core_verified: bool,
+        gate_dropped: bool,
+    ) -> str | None:
+        """Reduce a lane result to one durable, secret-free finalizer subcode.
+
+        A public-projection rejection (core proof verified but a fact key was
+        redacted) is reported distinctly from a genuine stop-gate failure, so a
+        reader can tell a sanitizer collision from a real setup miss. Only fixed
+        labels are ever emitted.
+        """
+
+        subcodes: list[str] = []
+        if gate_dropped:
+            subcodes.append(cls._ROUND_FIVE_PUBLIC_FACT_REJECTED)
+        raw_failures = cls._round_five_value(raw, "failures", ())
+        if isinstance(raw_failures, (list, tuple)):
+            for failure in raw_failures:
+                label = str(getattr(failure, "value", failure))
+                if label in cls._ROUND_FIVE_SETUP_LANE_FAILURES and label not in subcodes:
+                    subcodes.append(label)
+        if not subcodes and not core_verified:
+            subcodes.append("setup_unverified")
+        return ";".join(subcodes) if subcodes else None
+
     @classmethod
     def _round_five_setup_snapshot(
         cls,
@@ -7810,8 +7860,9 @@ class RunManager:
             lane = public.lanes[str(lane_id)]
             status_value = cls._round_five_value(raw, "status", "failed")
             status = str(getattr(status_value, "value", status_value))
+            core_verified = bool(cls._round_five_value(raw, "verified", False))
             gate = cls._round_five_public_gate(cls._round_five_value(raw, "stop_gate_evidence"))
-            verified = bool(cls._round_five_value(raw, "verified", False)) and gate is not None
+            verified = core_verified and gate is not None
             lane.state = (
                 RoundFiveSetupState.VERIFIED
                 if verified
@@ -7822,12 +7873,32 @@ class RunManager:
             lane.setup_elapsed_ms = cls._round_five_number(
                 cls._round_five_value(raw, "setup_elapsed_ms")
             )
+            lane.workflow_launch_delay_ms = cls._round_five_number(
+                cls._round_five_value(raw, "workflow_launch_delay_ms")
+            )
             lane.stop_gate_evidence = gate
             lane.verified = verified
+            # Durable, secret-free finalizer subcode. Fixed labels only: the core
+            # gate failures come from ``finalize_setup_lane`` and a projection
+            # rejection is flagged explicitly, so the exact reason survives the
+            # terminal receipt and auto-cleanup instead of collapsing to generic
+            # text. Never fabricated from the burst result.
+            lane.setup_diagnostic = cls._round_five_setup_lane_diagnostic(
+                raw,
+                core_verified=core_verified,
+                gate_dropped=core_verified and gate is None,
+            )
             lane.status = (
                 "Setup stop gate verified" if verified else "Setup stop gate did not verify"
             )
             lane.error = None if verified else "Setup verification failed"
+            if not verified and lane.setup_diagnostic:
+                logger.warning(
+                    "Round 5 setup lane finalizer session=%s lane=%s subcode=%s",
+                    snapshot.id,
+                    str(lane_id),
+                    lane.setup_diagnostic,
+                )
             safe_validated = safe_validated and verified
         public.workflow_launch_skew_ms = cls._round_five_number(
             cls._round_five_value(result, "workflow_launch_skew_ms")

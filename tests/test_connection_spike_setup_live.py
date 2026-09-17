@@ -11,11 +11,13 @@ from types import SimpleNamespace
 import pytest
 
 from runner import round5_fanin as runner_fanin
+from server.connection_spike import arm_setup_phase, finalize_setup_phase
 from server.connection_spike_journal import CreationScope, JournalEvent, ResourceSpec
 from server.connection_spike_live import (
     ConnectionSpikeLiveConfigurationError,
     ConnectionSpikeLiveOperationError,
     ConnectionSpikeSetupConfig,
+    ConnectionSpikeSetupLaneStop,
     LakebaseCreationJournalStore,
     LiveConnectionSpikeEngine,
     LiveConnectionSpikeSetupOrchestrator,
@@ -376,6 +378,59 @@ def _v7_manifest_past_ttl(tmp_path):
     assert manifest.expires_at < datetime.now(UTC), "fixture must be past its TTL"
     assert manifest.round5_ready
     return manifest
+
+
+def test_production_setup_stop_facts_survive_public_projection_end_to_end() -> None:
+    """The exact shipped Lakebase + Aurora stop-gate facts must survive the
+    public projection and drive ``setup_validated=true`` through the manager.
+
+    Derived from the production ``_setup_observation`` so a fact-key regression
+    (the ``endpoint`` denylist collision that once nulled the Lakebase gate)
+    fails here. This is the collected replacement for the v4-stale
+    ``legacy_two_phase_setup_*`` flow, which now trips the warm-context guard for
+    reasons unrelated to the setup-stop evidence contract.
+    """
+
+    from test_connection_spike import verified_fanin_lane
+
+    t0_ns = 1_000_000_000
+
+    def observation(lane_id: str, *, launch_delay_ns: int, elapsed_ns: int):
+        stop = ConnectionSpikeSetupLaneStop(
+            lane_id=lane_id,
+            launched_ns=t0_ns + launch_delay_ns,
+            stopped_ns=t0_ns + elapsed_ns,
+            credential_sha256="a" * 64,
+            endpoint_host="pooled.internal" if lane_id == "lakebase" else "proxy.internal",
+            secret_arn="" if lane_id == "lakebase" else f"arn:aws:secretsmanager:x:{ACCOUNT}:s:z",
+        )
+        return LiveConnectionSpikeSetupOrchestrator._setup_observation(None, stop)
+
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observations = (
+        observation("lakebase", launch_delay_ns=2_000_000, elapsed_ns=3_600_000_000),
+        observation("competitor", launch_delay_ns=6_000_000, elapsed_ns=650_000_000_000),
+    )
+    fanin = {lane_id: verified_fanin_lane(lane_id) for lane_id in ("lakebase", "competitor")}
+    result = finalize_setup_phase(arm, observations, fanin)
+    assert result.setup_validated
+
+    fake_snapshot = SimpleNamespace(
+        id="sess-live-projection",
+        lanes={
+            "lakebase": SimpleNamespace(name="Lakebase"),
+            "competitor": SimpleNamespace(name="Aurora"),
+        },
+    )
+    projected = RunManager._round_five_setup_snapshot(fake_snapshot, result, terminal=True)
+    assert projected.setup_validated
+    for lane_id in ("lakebase", "competitor"):
+        lane = projected.lanes[lane_id]
+        assert lane.verified, lane_id
+        assert lane.stop_gate_evidence is not None and lane.stop_gate_evidence.exact
+        assert lane.setup_diagnostic is None
+        assert lane.workflow_launch_delay_ms is not None
+    assert RunManager._round_five_setup_comparison(result, "Aurora") is not None
 
 
 async def legacy_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(

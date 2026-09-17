@@ -2191,7 +2191,13 @@ class LiveConnectionSpikeSetupOrchestrator:
         if stop.lane_id == "lakebase":
             facts = (
                 PublicSetupEvidence("warm_launch_capsule_current", True),
-                PublicSetupEvidence("pooled_endpoint_binding_exact", True),
+                # Boolean gate fact, not a host: it asserts that the pooled path
+                # bound exactly.  It must NOT contain the substring "endpoint",
+                # because the public projection's sensitive-key denylist redacts
+                # any key carrying "endpoint"/"host"/"arn"; a collision there
+                # once nulled this lane's entire public gate and downgraded a
+                # genuinely verified Lakebase setup to unverified.
+                PublicSetupEvidence("pooled_path_binding_exact", True),
             )
             gate_id = "lakebase_dispatch_eligibility"
         else:
