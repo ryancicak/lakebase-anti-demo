@@ -314,8 +314,15 @@ resource "aws_security_group" "round5_proxy" {
 resource "aws_vpc_security_group_ingress_rule" "round5_runner_to_proxy" {
   for_each = aws_security_group.round5_proxy
 
-  security_group_id            = each.value.id
-  description                  = "PostgreSQL from the sealed Round 5 competitor runner"
+  security_group_id = each.value.id
+  # This description is part of the app's exact Proxy topology gate
+  # (`_verify_proxy_topology` network_ingress), which matches the ingress tuple
+  # byte-for-byte. It must read exactly "PostgreSQL from the sealed Round 5
+  # physical runners" or the gate fails after the ~11-min Proxy build with
+  # "Round 5 exact Proxy control gate failed: network_ingress". The referenced
+  # group is still only the competitor runner (the sole lane that connects to
+  # the per-bout Proxy).
+  description                  = "PostgreSQL from the sealed Round 5 physical runners"
   ip_protocol                  = "tcp"
   from_port                    = 5432
   to_port                      = 5432
