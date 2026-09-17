@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import { RoundFiveProof, linkedInReceipt, receiptPresentation } from './App'
+import { RoundFiveProof, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { replayStory } from './instant-replay'
@@ -2770,4 +2770,46 @@ it('fail-after-10k keeps the frozen time and marks it not verified across surfac
   expect(lakebase.value).toBe('14.15s')
   expect(lakebase.verified).toBe(false)
   expect(lakebase.status).not.toMatch(/EXACT VERIFIED/i)
+})
+
+it('knockout: a verified V4 win under 2× leads with the exact margin, not a multiplier', () => {
+  const receipt = receiptPresentation(verifiedBellRoundFiveSession(), 'round')
+  expect(receipt.knockout).toEqual({
+    hero: '0.10s',
+    qualifier: receipt.verdict,
+    setup: '10,000 CLIENTS · ONE BELL · 30S HOLD',
+    chip: 'EARLIER',
+    winnerColor: '#e8482e',
+    winner: 'lakebase',
+    capabilityGap: false,
+  })
+  expect(receipt.verdict.length).toBeLessThanOrEqual(80)
+})
+
+it('knockout: a 45× gap prints the floored multiplier from the bell clocks', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 141_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 141_000
+  session.lanes.competitor.elapsed_ms = 141_000
+  session.comparison = {
+    kind: 'measured',
+    winner_lane_id: 'lakebase',
+    margin: { spec_id: 'bell_to_10000_observed_ms', lane_id: 'lakebase', value: 137_887.327, display_value: '137887.33 ms' },
+    detail: 'Lakebase reached 10,000 first.',
+  }
+  const receipt = receiptPresentation(session, 'round')
+  expect(receipt.winner).toBe('lakebase')
+  expect(receipt.knockout?.hero).toBe('45×')
+})
+
+it('knockout: the ratio is floored and only printed from 2× up', () => {
+  expect(knockoutRatioLabel(13_690, 621_260)).toBe('45×')
+  expect(knockoutRatioLabel(3_080, 9_870)).toBe('3.2×')
+  expect(knockoutRatioLabel(3_112.673, 3_212.673)).toBeNull()
+  expect(knockoutRatioLabel(0, 5_000)).toBeNull()
+  expect(knockoutRatioLabel(5_000, 4_000)).toBeNull()
+})
+
+it('knockout: a towel keeps the scorecard card', () => {
+  expect(receiptPresentation(screenshotTowelRoundFiveSession(), 'round').knockout).toBeUndefined()
 })

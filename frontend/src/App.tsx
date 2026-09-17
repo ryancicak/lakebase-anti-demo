@@ -1298,14 +1298,34 @@ export interface ReceiptPresentation {
   verifiedStamp: string
   receiptLabel: string
   integrityDetail?: string
+  knockout?: ReceiptKnockout
+}
+
+/**
+ * The one-figure treatment of a receipt: what the knockout card leads with,
+ * the condition it may not travel without, and which corner it belongs to.
+ * Present only on a complete, untowelled receipt with a named winner -- see
+ * `receiptKnockout`. Absent, the card is the scorecard.
+ */
+export interface ReceiptKnockout {
+  /** '45×' at 2× and above; the exact margin below that; the home clock on a capability gap. */
+  hero: string
+  /** The ledger headline (≤ 80 chars), or a structured line that says the same thing. */
+  qualifier: string
+  /** The round in plain words, printed top right in place of the verified stamp. */
+  setup: string
+  /** The scorecard's own chip word for this receipt. */
+  chip: 'EARLIER' | 'WINNER'
+  /** Home red or challenger blue -- the hero's drop shadow, never hardcoded to the home corner. */
+  winnerColor: '#e8482e' | '#4a83e8'
+  /** Which lane the chip sits over. */
+  winner: LaneId
+  /** The challenger has no clock: the right lane prints why instead of a time. */
+  capabilityGap: boolean
 }
 
 function receiptWinner(session: DemoSession): ReceiptWinner {
   return classifyOutcome(session).formalWinner
-}
-
-function roundFiveSetupMilliseconds(session: DemoSession, laneId: LaneId): number | null {
-  return roundFiveSetupLaneResult(session, laneId).setupElapsedMs
 }
 
 function roundFiveCensoredLowerBoundMilliseconds(session: DemoSession, laneId: LaneId): number | null {
@@ -1324,10 +1344,6 @@ function receiptStartSkewDisplay(session: DemoSession): string {
   return typeof skew === 'number' && Number.isFinite(skew) && skew >= 0
     ? `${skew.toFixed(3)}ms`
     : 'N/A'
-}
-
-function roundFiveSetupSeconds(session: DemoSession, laneId: LaneId): string {
-  return laneReceiptTime(roundFiveSetupMilliseconds(session, laneId))
 }
 
 /**
@@ -1525,8 +1541,8 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
     const lines = [
       linkedInHook(session),
       '',
-      `🔴 Lakebase · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'} · setup ${roundFiveSetupSeconds(session, 'lakebase')}`,
-      `🔵 ${session.competitor.short_name} + RDS Proxy · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'} · setup ${roundFiveSetupSeconds(session, 'competitor')}`,
+      `🔴 Lakebase · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'}`,
+      `🔵 ${session.competitor.short_name} + RDS Proxy · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'}`,
       '',
       `ROUND ${roundNumber} · ${ROUND_FIVE_DISPLAY_TITLE}`,
       roundFiveVerifiedVerdict(session),
@@ -1749,9 +1765,120 @@ function roundFiveBellReceiptPresentation(
   }
 }
 
+/**
+ * The multiplier for the hero, or null when a multiplier would mislead.
+ *
+ * Floored, never rounded: 45.38 prints as 45×, so the figure understates the
+ * clocks rather than the reverse (the same rule `compactDuration` applies to
+ * margins). Below 2× there is no multiplier at all -- "1.3×" reads as a rout
+ * that a one-second gap does not support, so the exact margin leads instead.
+ */
+// Exported for the receipt contract test; it remains a pure function.
+// eslint-disable-next-line react-refresh/only-export-components
+export function knockoutRatioLabel(winnerMs: number, loserMs: number): string | null {
+  if (!(winnerMs > 0) || !Number.isFinite(loserMs) || loserMs < winnerMs) return null
+  const ratio = loserMs / winnerMs
+  if (ratio < 2) return null
+  return ratio >= 10
+    ? `${Math.floor(ratio)}×`
+    : `${(Math.floor(ratio * 10) / 10).toFixed(1)}×`
+}
+
+/**
+ * The two exact clocks a receipt compares, read from the surface that owns
+ * them: the cooldown for the idle receipt, the V4 bell runtime for Round 5
+ * (never the legacy setup clock), the lanes otherwise.
+ */
+function knockoutClocks(
+  session: DemoSession,
+  kind: ReceiptKind,
+): { lakebaseMs: number | null; competitorMs: number | null } {
+  if (kind === 'idle') {
+    const lanes = session.cooldown?.lanes
+    return {
+      lakebaseMs: lanes?.lakebase.elapsed_ms ?? null,
+      competitorMs: lanes?.competitor.elapsed_ms ?? null,
+    }
+  }
+  if (isRoundFive(session)) {
+    const runtime = roundFiveBellRuntime(session)
+    if (runtime) {
+      return {
+        lakebaseMs: runtime.lanes.lakebase.bell_to_10000_observed_ms ?? null,
+        competitorMs: runtime.lanes.competitor.bell_to_10000_observed_ms ?? null,
+      }
+    }
+  }
+  return {
+    lakebaseMs: session.lanes.lakebase.elapsed_ms,
+    competitorMs: session.lanes.competitor.elapsed_ms,
+  }
+}
+
+/**
+ * Whether a receipt may lead with one figure, and what the figure is.
+ *
+ * Undefined -- keep the scorecard -- for a towel, a tie, an incomplete
+ * contract, a legacy Round 5 scorecard, or a race with a clock missing: none
+ * of those has anything a headline number could honestly stand for. A
+ * capability gap (Rounds 4 and 6, or a challenger that cannot enter) has no
+ * ratio and no margin, so the hero is the home clock itself and the right
+ * lane says why there was no race.
+ */
+function receiptKnockout(
+  session: DemoSession,
+  kind: ReceiptKind,
+  receipt: ReceiptPresentation,
+): ReceiptKnockout | undefined {
+  if (session.towel) return undefined
+  const winner = receipt.winner
+  if (winner !== 'lakebase' && winner !== 'competitor') return undefined
+  if (kind === 'round') {
+    if (!classifyOutcome(session).contractComplete) return undefined
+    if (isRoundFive(session) && !roundFiveUsesFanIn(session)) return undefined
+  }
+  const winnerName = winner === 'lakebase' ? 'LAKEBASE' : session.competitor.short_name.toUpperCase()
+  const headline = receipt.verdict
+  const roundFive = kind === 'round' && isRoundFive(session)
+  const setup = roundFive ? '10,000 CLIENTS · ONE BELL · 30S HOLD' : receipt.title.toUpperCase()
+  const chip = roundFive ? 'EARLIER' : 'WINNER'
+  const winnerColor = winner === 'lakebase' ? '#e8482e' : '#4a83e8'
+
+  if (receipt.competitorCapabilityGap) {
+    if (winner !== 'lakebase' || !/^\d/.test(receipt.lakebaseValue)) return undefined
+    return {
+      hero: receipt.lakebaseValue,
+      qualifier: headline.length <= 80
+        ? headline
+        : `${winnerName} CAPABILITY WIN · OPPONENT NOT TIMED · MARGIN N/A`,
+      setup, chip, winnerColor, winner, capabilityGap: true,
+    }
+  }
+
+  const { lakebaseMs, competitorMs } = knockoutClocks(session, kind)
+  if (lakebaseMs === null || competitorMs === null) return undefined
+  const winnerMs = winner === 'lakebase' ? lakebaseMs : competitorMs
+  const loserMs = winner === 'lakebase' ? competitorMs : lakebaseMs
+  const marginMs = Math.abs(competitorMs - lakebaseMs)
+  const marginLabel = kind === 'idle' ? compactDuration(marginMs) : preciseDuration(marginMs)
+  return {
+    hero: knockoutRatioLabel(winnerMs, loserMs) ?? marginLabel,
+    qualifier: headline.length <= 80 ? headline : `${winnerName} WINS · MARGIN ${marginLabel}`,
+    setup, chip, winnerColor, winner, capabilityGap: false,
+  }
+}
+
 // Exported for the all-surface contract matrix; it remains a pure renderer.
 // eslint-disable-next-line react-refresh/only-export-components
 export function receiptPresentation(
+  session: DemoSession,
+  kind: ReceiptKind,
+): ReceiptPresentation {
+  const receipt = receiptPresentationBase(session, kind)
+  return { ...receipt, knockout: receiptKnockout(session, kind, receipt) }
+}
+
+function receiptPresentationBase(
   session: DemoSession,
   kind: ReceiptKind,
 ): ReceiptPresentation {
@@ -2062,24 +2189,26 @@ function drawPixelFighter(
   y: number,
   color: string,
   label: string,
+  scale = 1,
 ) {
+  const u = (value: number) => value * scale
   context.fillStyle = '#fff4c2'
-  context.fillRect(x + 17, y, 46, 9)
+  context.fillRect(x + u(17), y, u(46), u(9))
   context.fillStyle = color
-  context.fillRect(x + 10, y + 12, 60, 18)
+  context.fillRect(x + u(10), y + u(12), u(60), u(18))
   context.fillStyle = '#dca36f'
-  context.fillRect(x + 18, y + 30, 44, 32)
+  context.fillRect(x + u(18), y + u(30), u(44), u(32))
   context.fillStyle = '#070b22'
-  context.fillRect(x + 25, y + 40, 7, 7)
-  context.fillRect(x + 48, y + 40, 7, 7)
+  context.fillRect(x + u(25), y + u(40), u(7), u(7))
+  context.fillRect(x + u(48), y + u(40), u(7), u(7))
   context.fillStyle = color
-  context.fillRect(x + 12, y + 64, 56, 44)
-  context.fillRect(x, y + 70, 17, 24)
-  context.fillRect(x + 63, y + 70, 17, 24)
+  context.fillRect(x + u(12), y + u(64), u(56), u(44))
+  context.fillRect(x, y + u(70), u(17), u(24))
+  context.fillRect(x + u(63), y + u(70), u(17), u(24))
   context.fillStyle = '#fff4c2'
-  context.font = '400 10px "Press Start 2P", monospace'
+  context.font = `400 ${u(10)}px "Press Start 2P", monospace`
   context.textAlign = 'center'
-  context.fillText(label, x + 40, y + 79)
+  context.fillText(label, x + u(40), y + u(79))
   context.textAlign = 'left'
 }
 
@@ -2118,6 +2247,11 @@ async function renderReceiptCard(
   context.fillStyle = '#f8d83b'
   context.font = '400 16px "Press Start 2P", monospace'
   context.fillText('THE ANTI-DEMO', 55, 78)
+
+  if (receipt.knockout) {
+    drawKnockoutReceipt(context, session, roundNumber, kind, receipt, receipt.knockout)
+    return encodeReceiptCard(canvas)
+  }
 
   context.fillStyle = '#0a2c22'
   context.fillRect(862, 36, 274, 73)
@@ -2276,9 +2410,156 @@ async function renderReceiptCard(
   context.fillText('NOT A BENCHMARK', 973, 551)
   context.textAlign = 'left'
 
+  return encodeReceiptCard(canvas)
+}
+
+function encodeReceiptCard(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((value) => value ? resolve(value) : reject(new Error('The result card could not be encoded.')), 'image/png')
   })
+}
+
+/**
+ * The knockout card: one figure a phone-sized feed can read, its condition set
+ * directly beneath it, and both lanes' exact clocks beside it.
+ *
+ * Why a second layout exists. The scorecard card carries every gate at 7-10px;
+ * LinkedIn shows the image at 552px (desktop) or ~360px (phone), where that
+ * type is texture, not words, and nothing on the card is large enough to land.
+ * The caption already carries the integrity ledger verbatim, so the image stops
+ * duplicating it and leads with the one thing the caption cannot: a figure
+ * that reads at 30% scale.
+ *
+ * The house rules hold. The qualifier under the hero is the ledger's own
+ * headline, set as large as two lines allow, so the number cannot be lifted
+ * off the card without the winner, the gate and the exact margin; both lanes'
+ * exact clocks are printed with the scorecard's chip over the winner; a
+ * capability gap prints the challenger's "not built or timed" where its clock
+ * would go; "ONE LIVE RUN · NOT A BENCHMARK" keeps its box. Only a complete,
+ * untowelled receipt with a named winner gets here -- see `receiptKnockout`.
+ */
+function drawKnockoutReceipt(
+  context: CanvasRenderingContext2D,
+  session: DemoSession,
+  roundNumber: number,
+  kind: ReceiptKind,
+  receipt: ReceiptPresentation,
+  knockout: ReceiptKnockout,
+) {
+  const font = (size: number) => `400 ${size}px "Press Start 2P", monospace`
+
+  // Round chip top right, where the scorecard keeps its verified stamp; the
+  // stamp's words move to the receipt block, bottom right.
+  context.fillStyle = '#e8482e'
+  context.fillRect(1007, 40, 146, 38)
+  context.fillStyle = '#fff4c2'
+  context.font = font(13)
+  context.textAlign = 'center'
+  context.fillText(kind === 'idle' ? 'IDLE' : `ROUND ${String(roundNumber).padStart(2, '0')}`, 1080, 52)
+  drawFittedCanvasText(context, knockout.setup, {
+    x: 1153, y: 92, maxWidth: 560, maxLines: 1, startSize: 11, minSize: 8, color: '#f8d83b', align: 'right',
+  })
+
+  // The scorecard's two fighters at twice the size: an integer scale, so the
+  // pixel grid stays a grid.
+  drawPixelFighter(context, 70, 150, '#e8482e', 'LB', 2)
+  drawPixelFighter(
+    context, 970, 150, '#4a83e8',
+    session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS', 2,
+  )
+
+  // The hero: 180px for a short ratio, stepped down for a longer label, never
+  // under 100px -- smaller than that it is no longer the one thing a
+  // phone-sized feed can read, which is this card's whole reason to exist.
+  let heroSize = 180
+  context.font = font(heroSize)
+  while (heroSize > 100 && context.measureText(knockout.hero).width > 700) {
+    heroSize -= 10
+    context.font = font(heroSize)
+  }
+  const heroY = 150 + (180 - heroSize) / 2
+  const drop = Math.round(heroSize / 24)
+  context.textAlign = 'center'
+  context.fillStyle = knockout.winnerColor
+  context.fillText(knockout.hero, 600 + drop, heroY + drop)
+  context.fillStyle = '#f8d83b'
+  context.fillText(knockout.hero, 600, heroY)
+  context.textAlign = 'left'
+
+  // The condition on the figure, in the ledger's own words.
+  drawFittedCanvasText(context, knockout.qualifier, {
+    x: 600, y: 346, maxWidth: 700, maxLines: 2, startSize: 30, minSize: 16,
+    color: '#fff4c2', align: 'center', lineHeight: 38,
+  })
+
+  // Both lanes, the winner chipped exactly as the scorecard chips it.
+  const chipX = knockout.winner === 'lakebase' ? 70 : 1028
+  context.fillStyle = '#f8d83b'
+  context.fillRect(chipX, 428, 102, 20)
+  context.fillStyle = '#070b22'
+  context.font = font(9)
+  context.textAlign = 'center'
+  context.fillText(knockout.chip, chipX + 51, 434)
+  context.textAlign = 'left'
+  drawFittedCanvasText(context, 'LAKEBASE', {
+    x: 70, y: 452, maxWidth: 420, maxLines: 1, startSize: 13, minSize: 9, color: '#e8482e',
+  })
+  drawFittedCanvasText(context, receipt.lakebaseValue, {
+    x: 70, y: 470, maxWidth: 420, maxLines: 1, startSize: 40, minSize: 20, color: '#fff4c2',
+  })
+  drawFittedCanvasText(context, session.competitor.short_name.toUpperCase(), {
+    x: 1130, y: 452, maxWidth: 420, maxLines: 1, startSize: 13, minSize: 9, color: '#4a83e8', align: 'right',
+  })
+  if (knockout.capabilityGap) {
+    // No clock to print: the lane fact, in full, where the clock would go.
+    drawFittedCanvasText(context, receipt.competitorValue.toUpperCase(), {
+      x: 1130, y: 470, maxWidth: 420, maxLines: 2, startSize: 16, minSize: 10, color: '#fff4c2', align: 'right', lineHeight: 19,
+    })
+    drawFittedCanvasText(context, receipt.competitorStatus.toUpperCase(), {
+      x: 1130, y: 508, maxWidth: 420, maxLines: 1, startSize: 7, minSize: 6, color: '#aeb9df', align: 'right',
+    })
+  } else {
+    drawFittedCanvasText(context, receipt.competitorValue, {
+      x: 1130, y: 470, maxWidth: 420, maxLines: 1, startSize: 40, minSize: 20, color: '#fff4c2', align: 'right',
+    })
+  }
+  // What was declared, before which lane took it -- the scorecard's own label.
+  drawFittedCanvasText(context, receipt.verdictLabel, {
+    x: 600, y: 518, maxWidth: 1060, maxLines: 1, startSize: 9, minSize: 7, color: '#aeb9df', align: 'center',
+  })
+
+  // The stub. Everything else the scorecard printed at 7-10px is in the caption
+  // verbatim; what stays is the disclaimer, the invitation, and the receipt identity.
+  context.fillStyle = '#f1ebd7'
+  context.fillRect(38, 530, 1115, 66)
+  context.fillStyle = '#070b22'
+  for (let x = 52; x < 1136; x += 24) context.fillRect(x, 530, 12, 5)
+  context.strokeStyle = '#e8482e'
+  context.lineWidth = 5
+  context.strokeRect(60.5, 540.5, 257, 46)
+  context.textAlign = 'center'
+  context.fillStyle = '#e8482e'
+  context.font = font(12)
+  context.fillText('ONE LIVE RUN', 189, 549)
+  context.fillStyle = '#070b22'
+  context.font = font(9)
+  context.fillText('NOT A BENCHMARK', 189, 568)
+  context.textAlign = 'left'
+  context.font = font(16)
+  context.fillStyle = '#070b22'
+  context.fillText("DON'T TRUST THIS POST.", 352, 545)
+  context.fillStyle = '#e8482e'
+  context.fillText('RING THE BELL YOURSELF.', 352, 569)
+  const auditStart = kind === 'idle'
+    ? `RESET ${session.cooldown!.started_at}`
+    : `START GAP ${receiptStartSkewDisplay(session)}`
+  context.textAlign = 'right'
+  context.fillStyle = '#070b22'
+  context.font = font(9)
+  context.fillText(`${receipt.verifiedStamp} · RECEIPT ${receiptId(session)}`, 1133, 543)
+  context.font = font(7)
+  context.fillText(`${auditStart} · ${receipt.measuredAt}`, 1133, 561)
+  context.textAlign = 'left'
 }
 
 async function downloadReceiptCard(
@@ -7000,6 +7281,32 @@ function ReceiptPoster({
   )
 }
 
+/**
+ * The bitmap that actually posts, shown beside the text poster so the operator
+ * sees what LinkedIn will receive. The object URL is minted at render time from
+ * the blob and revoked when this element unmounts (the parent remounts it per
+ * `cardKey`, so a new blob is a new URL). No effect writes state -- that keeps
+ * `react-hooks/set-state-in-effect` clean. jsdom has no `createObjectURL`;
+ * there this renders nothing and the poster stays the only preview.
+ */
+function ReceiptCardPreview({ blob, kind }: { blob: Blob; kind: ReceiptKind }) {
+  const url = useMemo(
+    () => (typeof URL.createObjectURL === 'function' ? URL.createObjectURL(blob) : null),
+    [blob],
+  )
+  useEffect(
+    () => () => { if (url && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url) },
+    [url],
+  )
+  if (!url) return null
+  return (
+    <figure className="receipt-card-preview">
+      <img src={url} width={1200} height={627} alt={kind === 'idle' ? 'The back-to-idle card exactly as it will post' : 'The result card exactly as it will post'} />
+      <figcaption>8-bit card · exactly as it will post</figcaption>
+    </figure>
+  )
+}
+
 function ShareReceipt({
   session,
   roundNumber,
@@ -7091,7 +7398,10 @@ function ShareReceipt({
         <header>
           <h2 id="receipt-heading">{kind === 'idle' ? 'Share idle proof' : 'Share the proof'}</h2>
         </header>
-        <ReceiptPoster session={session} roundNumber={roundNumber} kind={kind} />
+        <div className="receipt-previews">
+          {cardBlob && <ReceiptCardPreview key={cardKey} blob={cardBlob} kind={kind} />}
+          <ReceiptPoster session={session} roundNumber={roundNumber} kind={kind} />
+        </div>
         <p className="receipt-share-note">LinkedIn desktop needs the PNG added as media; browser image paste is not reliable.</p>
         {status && <p className="receipt-status" role="status">{status}</p>}
         <div className="receipt-actions">

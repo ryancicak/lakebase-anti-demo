@@ -2468,3 +2468,11 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
     height: 4px;
   }
 }
+
+
+/* Share dialog: the rendered PNG (exactly what posts) above the text poster, in
+   the modal's flexible row, scrolling together so the actions stay in view. */
+.receipt-previews { display: grid; align-content: start; gap: 1.3vh; min-height: 0; padding: 0 1em 1em 0; overflow: auto; }
+.receipt-card-preview { margin: 0; min-height: 0; }
+.receipt-card-preview img { display: block; width: 100%; height: auto; border: clamp(4px, .5vw, 8px) solid var(--yellow); box-shadow: .6em .6em #000; }
+.receipt-card-preview figcaption { margin-top: .8vh; color: var(--yellow); font-size: clamp(7px, .58vw, 11px); text-transform: uppercase; }
