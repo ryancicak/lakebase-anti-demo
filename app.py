@@ -592,6 +592,25 @@ def connection_spike_factory_from_manifest(
             async def publish_control(event: Any) -> None:
                 def send() -> None:
                     source = boto3.Session(region_name=manifest.aws.region)
+                    # The Round 5 control role trusts the shared anti-demo-runtime
+                    # role, not the app's ambient principal, so it must be reached
+                    # through the same two STS hops the bout path uses: ambient ->
+                    # runtime role -> control role. Doing a single hop from the
+                    # ambient principal is refused with AccessDenied and was what
+                    # made the control outbox fail to deliver (warm never rings).
+                    runtime_role_arn = manifest.aws.runtime_role_arn
+                    if runtime_role_arn:
+                        runtime = source.client("sts").assume_role(
+                            RoleArn=runtime_role_arn,
+                            RoleSessionName="anti-demo-r5-control-runtime",
+                            DurationSeconds=3600,
+                        )["Credentials"]
+                        source = boto3.Session(
+                            aws_access_key_id=runtime["AccessKeyId"],
+                            aws_secret_access_key=runtime["SecretAccessKey"],
+                            aws_session_token=runtime["SessionToken"],
+                            region_name=manifest.aws.region,
+                        )
                     assumed = source.client("sts").assume_role(
                         RoleArn=resources.control_role_arn,
                         RoleSessionName=f"anti-demo-r5-control-{event.lane_id}",
