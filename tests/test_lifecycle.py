@@ -364,6 +364,12 @@ def ready_round5_stub(**updates) -> Round5Resources:
             "arn:aws:secretsmanager:us-west-2:123456789012:secret:aurora-proxy"
         ),
         "rds_proxy_secret_arn": ("arn:aws:secretsmanager:us-west-2:123456789012:secret:rds-proxy"),
+        "runner_instance_id": "i-0123456789abcdef0",
+        "competitor_runner_instance_id": "i-0fedcba9876543210",
+        "runner_security_group_id": "sg-runner",
+        "aurora_proxy_security_group_id": "sg-proxy-aurora",
+        "rds_proxy_security_group_id": "sg-proxy-rds",
+        "competitor_runner_public_key_sha256": "b" * 64,
     }
     values.update(updates)
     return Round5Resources.model_construct(**values)
@@ -677,7 +683,10 @@ def test_rds_network_check_requires_public_instance_with_exact_operator_ingress(
     attach_round4(manifest)
     manifest.round5 = ready_round5_stub(runner_security_group_id="sg-runner")
     manifest.manifest_version = 5
-    ingress[0]["UserIdGroupPairs"] = [{"GroupId": "sg-runner"}]
+    ingress[0]["UserIdGroupPairs"] = [
+        {"GroupId": "sg-runner"},
+        {"GroupId": "sg-proxy-rds"},
+    ]
     check = _rds_ingress(manifest)
     assert check.ok is True
 
@@ -844,18 +853,42 @@ def test_round5_outputs_require_static_proxy_role_and_secret_bindings() -> None:
         "aurora_proxy_secret_arn": "round5_aurora_proxy_secret_arn",
         "rds_proxy_secret_arn": "round5_rds_proxy_secret_arn",
         "runner_permissions_boundary_arn": "round5_runner_permissions_boundary_arn",
+        "competitor_runner_permissions_boundary_arn": (
+            "round5_competitor_runner_permissions_boundary_arn"
+        ),
         "runner_instance_id": "round5_runner_instance_id",
+        "competitor_runner_instance_id": "round5_competitor_runner_instance_id",
+        "lakebase_control_queue_url": "round5_lakebase_control_queue_url",
+        "competitor_control_queue_url": "round5_competitor_control_queue_url",
+        "lakebase_control_queue_arn": "round5_lakebase_control_queue_arn",
+        "competitor_control_queue_arn": "round5_competitor_control_queue_arn",
+        "runner_control_secret_arn": "round5_runner_control_secret_arn",
+        "competitor_runner_control_secret_arn": "round5_competitor_runner_control_secret_arn",
         "runner_instance_type": "round5_runner_instance_type",
         "runner_instance_profile_arn": "round5_runner_instance_profile_arn",
         "runner_role_arn": "round5_runner_role_arn",
+        "competitor_runner_instance_profile_arn": "round5_competitor_runner_instance_profile_arn",
+        "competitor_runner_role_arn": "round5_competitor_runner_role_arn",
         "runner_subnet_id": "round5_runner_subnet_id",
         "runner_security_group_id": "round5_runner_security_group_id",
         "runner_egress_rule_id": "round5_runner_egress_rule_id",
+        "lakebase_runner_egress_rule_ids": "round5_lakebase_runner_egress_rule_ids",
+        "competitor_runner_security_group_id": "round5_competitor_runner_security_group_id",
+        "competitor_runner_egress_rule_ids": "round5_competitor_runner_egress_rule_ids",
+        "aurora_proxy_security_group_id": "round5_aurora_proxy_security_group_id",
+        "rds_proxy_security_group_id": "round5_rds_proxy_security_group_id",
         "bout_name_prefix": "round5_bout_name_prefix",
         "ownership_tags": "round5_bout_base_tags",
     }
     outputs = {name: f"value-{field}" for field, name in output_names.items()}
     outputs["subnet_ids"] = ["subnet-a", "subnet-b"]
+    outputs["round5_lakebase_runner_egress_rule_ids"] = [
+        "sgr-0123456789abcdef0",
+        "sgr-1123456789abcdef0",
+    ]
+    outputs["round5_competitor_runner_egress_rule_ids"] = [
+        "sgr-2123456789abcdef0",
+    ]
     outputs["round5_bout_base_tags"] = {"managed-by": "round5-lifecycle"}
 
     required = _required_round5_outputs(outputs)
@@ -868,6 +901,81 @@ def test_round5_outputs_require_static_proxy_role_and_secret_bindings() -> None:
         _required_round5_outputs({**outputs, "round5_rds_proxy_secret_arn": None})
 
 
+async def test_clean_install_resident_acl_secret_and_state_inventory() -> None:
+    required_addresses = {
+        "aws_iam_role.round5_competitor_runner",
+        "aws_iam_instance_profile.round5_competitor_runner",
+        "aws_iam_policy.round5_competitor_runner_boundary",
+        "aws_iam_role_policy.round5_competitor_runner_baseline_secret",
+        "aws_iam_role_policy.round5_lakebase_runner_control",
+        "aws_iam_role_policy.round5_competitor_runner_control",
+        "aws_iam_role_policy_attachment.round5_competitor_runner_ssm",
+        "aws_sqs_queue.round5_lakebase_control",
+        "aws_sqs_queue.round5_competitor_control",
+        "aws_sqs_queue.round5_lakebase_control_dlq",
+        "aws_sqs_queue.round5_competitor_control_dlq",
+        "aws_secretsmanager_secret.round5_runner_control",
+        "aws_secretsmanager_secret.round5_competitor_runner_control",
+        "aws_security_group.round5_competitor_runner",
+    }
+    assert required_addresses <= lifecycle.EXPECTED_AWS_STATE_ADDRESSES
+
+    issued: list[object] = []
+
+    class Cursor:
+        def __init__(self) -> None:
+            self._last = ""
+
+        async def execute(self, statement, parameters=None):
+            self._last = str(statement)
+            issued.append(statement)
+
+        async def fetchone(self):
+            # The lock-down verification reads the role's attribute flags; report a
+            # fully locked-down role (every dangerous attribute off) so rotation
+            # accepts it. Every other read (role existence) returns None, which
+            # drives the CREATE ROLE path.
+            if "rolsuper" in self._last:
+                return (False, False, False, False, False, False)
+            return None
+
+    await lifecycle._rotate_round5_resident_login(
+        Cursor(),
+        database="anti_demo",
+        role="anti_demo_r5_installation",
+        password="not-written-to-terraform",
+        lane_id="lakebase",
+    )
+    sql_text = " ".join(map(str, issued))
+    for required in (
+        "CREATE ROLE",
+        "GRANT CONNECT",
+        "GRANT USAGE",
+        "SELECT",
+        "INSERT",
+        "ROW LEVEL SECURITY",
+        "CREATE POLICY",
+        "round5_runner_event_authorized_v1",
+        "round5_runner_event_v3",
+    ):
+        assert required in sql_text
+
+    dsn = lifecycle._round5_resident_dsn(
+        host="coordination.example.test",
+        database="anti_demo",
+        role="anti_demo_r5_installation",
+        password="a password/with punctuation",
+        trust_bundle_path="/opt/lakebase-anti-demo/round5/round5-ca.pem",
+    )
+    assert "sslmode=verify-full" in dsn
+    assert "a password/with punctuation" not in dsn
+
+    terraform_root = (
+        Path(__file__).resolve().parents[1] / "infra/aws"  # noqa: ASYNC240
+    )
+    terraform = "\n".join(path.read_text() for path in terraform_root.glob("*.tf"))
+    assert 'variable "round5_control_dsn"' not in terraform
+    assert 'resource "aws_secretsmanager_secret_version" "round5_runner_control"' not in terraform
 
 
 def test_round5_provisioning_tags_use_installation_scope_before_v7_commit() -> None:
@@ -936,8 +1044,7 @@ def test_round5_inventory_distinguishes_static_terraform_role_from_bout_roles(
                         "Arn": control_role_arn,
                         "RoleName": f"{prefix}exec-static",
                         "Tags": [
-                            {"Key": key, "Value": value}
-                            for key, value in static_tags.items()
+                            {"Key": key, "Value": value} for key, value in static_tags.items()
                         ],
                     },
                     {
@@ -1001,9 +1108,7 @@ def test_round5_inventory_distinguishes_static_terraform_role_from_bout_roles(
 
     bout_policy = f"{prefix}{'0' * 16}-runner-secret"
     policy_names.append(bout_policy)
-    assert _round5_runtime_tag_inventory(candidate) == [
-        f"iam-inline:static-runner/{bout_policy}"
-    ]
+    assert _round5_runtime_tag_inventory(candidate) == [f"iam-inline:static-runner/{bout_policy}"]
     policy_names.remove(bout_policy)
 
     static_tags.pop("anti-demo-round")
@@ -1113,7 +1218,10 @@ def test_the_cleanup_runner_idle_probe_is_a_command_ssm_would_accept(monkeypatch
     )
     manifest = SimpleNamespace(
         round5_ready=True,
-        require_round5_resources=lambda: SimpleNamespace(runner_instance_id=instance_id),
+        require_round5_resources=lambda: SimpleNamespace(
+            runner_instance_id=instance_id,
+            competitor_runner_instance_id=instance_id,
+        ),
     )
     monkeypatch.setattr(
         "server.lifecycle._aws_session",
@@ -1131,8 +1239,29 @@ def test_the_cleanup_runner_idle_probe_is_a_command_ssm_would_accept(monkeypatch
                 "Parameters": {
                     "commands": [
                         "set -euo pipefail",
-                        "flock -n /run/lock/lakebase-anti-demo-round5.lock "
-                        "-c 'echo RUNNER_IDLE'",
+                        "flock -n /run/lock/lakebase-anti-demo-round5.lock -c 'echo RUNNER_IDLE'",
+                    ],
+                    "executionTimeout": [ANY],
+                },
+                "CloudWatchOutputConfig": {"CloudWatchOutputEnabled": False},
+            },
+        )
+        stubber.add_response(
+            "get_command_invocation",
+            {"Status": "Success", "StandardOutputContent": "RUNNER_IDLE\n"},
+            {"CommandId": command_id, "InstanceId": instance_id},
+        )
+        stubber.add_response(
+            "send_command",
+            {"Command": {"CommandId": command_id}},
+            {
+                "InstanceIds": [instance_id],
+                "DocumentName": "AWS-RunShellScript",
+                "TimeoutSeconds": ANY,
+                "Parameters": {
+                    "commands": [
+                        "set -euo pipefail",
+                        "flock -n /run/lock/lakebase-anti-demo-round5.lock -c 'echo RUNNER_IDLE'",
                     ],
                     "executionTimeout": [ANY],
                 },
@@ -2118,10 +2247,13 @@ def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_pat
     )
 
     assert prepared is manifest
+    # Round 5 is resealed *before* reset: reset() -> ensure_coordination writes
+    # the resident event DSN into the sealed control secrets and reads their ARNs
+    # from the seal, so the seal must carry the two-runner control plane first.
     assert calls == [
         "reconcile",
-        "reset:321",
         "round5:321",
+        "reset:321",
         "round6:321",
         "doctor:aurora:321",
         "doctor:rds:321",
@@ -2251,9 +2383,7 @@ def test_round4_names_take_an_unsealed_catalog_from_the_environment(monkeypatch)
     assert names["catalog"] == "customer_catalog"
     assert names["source_table"].startswith("customer_catalog.")
     assert names["synced_table_id"].startswith("customer_catalog.")
-    assert (
-        _round4_synced_spec(names)["new_pipeline_spec"]["storage_catalog"] == "customer_catalog"
-    )
+    assert _round4_synced_spec(names)["new_pipeline_spec"]["storage_catalog"] == "customer_catalog"
 
 
 def test_round4_names_prefer_the_sealed_catalog_over_a_missing_environment(monkeypatch) -> None:
@@ -2340,8 +2470,10 @@ def test_round4_provisioning_sql_and_grants_follow_a_foreign_catalog(monkeypatch
     statements: list[str] = []
     monkeypatch.setattr(
         "server.lifecycle._sql_statement",
-        lambda profile, warehouse_id, statement: statements.append(statement)
-        or {"result": {"data_array": [["7"]]}, "manifest": {"schema": {"columns": []}}},
+        lambda profile, warehouse_id, statement: (
+            statements.append(statement)
+            or {"result": {"data_array": [["7"]]}, "manifest": {"schema": {"columns": []}}}
+        ),
     )
     monkeypatch.setattr("server.lifecycle._sql_rows", lambda payload: [{"version": 7}])
     monkeypatch.setattr("server.lifecycle._run", lambda arguments, **kwargs: None)
@@ -2527,8 +2659,7 @@ def test_round4_pipeline_requires_exactly_one_exact_sink(monkeypatch) -> None:
         f"`{names['catalog']}`.`{names['online_schema']}` TO `{principal}`",
         "GRANT SELECT, MODIFY ON TABLE "
         f"`{names['source_table'].replace('.', '`.`')}` TO `{principal}`",
-        "GRANT SELECT ON TABLE "
-        f"`{names['synced_table_id'].replace('.', '`.`')}` TO `{principal}`",
+        f"GRANT SELECT ON TABLE `{names['synced_table_id'].replace('.', '`.`')}` TO `{principal}`",
     ]
 
     role_reads: dict[str, int] = {}
@@ -2675,9 +2806,7 @@ def _durable_coordination_tables() -> dict[str, tuple[str, ...]]:
     tables: dict[str, tuple[str, ...]] = {}
     for path in sorted((Path(__file__).resolve().parents[1] / "server").glob("*.py")):
         source = path.read_text(encoding="utf-8")
-        tables.update(
-            _coordination_tables_created_in(source, source, origin=path.name)
-        )
+        tables.update(_coordination_tables_created_in(source, source, origin=path.name))
     return tables
 
 
@@ -2776,10 +2905,50 @@ def _setup_initialized_coordination_tables() -> set[str]:
                 continue
             body = ast.get_source_segment(source, node) or ""
             created.update(
+                _coordination_tables_created_in(body, source, origin=f"{path.name}::{node.name}")
+            )
+    migrations = {
+        node.func.id
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id.startswith("migrate_round5_")
+    }
+    for path in sorted(server.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for node in ast.parse(source).body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name not in migrations:
+                continue
+            body = ast.get_source_segment(source, node) or ""
+            created.update(
                 _coordination_tables_created_in(
-                    body, source, origin=f"{path.name}::{node.name}"
+                    body,
+                    source,
+                    origin=f"{path.name}::{node.name}",
                 )
             )
+            helpers = {
+                call.func.id
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id.endswith("_migration_statements")
+            }
+            for helper in ast.parse(source).body:
+                if (
+                    isinstance(helper, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and helper.name in helpers
+                ):
+                    helper_body = ast.get_source_segment(source, helper) or ""
+                    created.update(
+                        _coordination_tables_created_in(
+                            helper_body,
+                            source,
+                            origin=f"{path.name}::{helper.name}",
+                        )
+                    )
     return created
 
 
@@ -2787,14 +2956,12 @@ def _deploy_doc_grants() -> dict[tuple[str, str], frozenset[str]]:
     """The runtime privilege set `docs/DEPLOY.md` publishes as authoritative."""
 
     heading = "### Coordination-database grants — the complete runtime set"
-    document = (
-        Path(__file__).resolve().parents[1] / "docs" / "DEPLOY.md"
-    ).read_text(encoding="utf-8")
+    document = (Path(__file__).resolve().parents[1] / "docs" / "DEPLOY.md").read_text(
+        encoding="utf-8"
+    )
     assert heading in document, "docs/DEPLOY.md no longer publishes the runtime grant set"
     block = document.split(heading, 1)[1].split("```sql", 1)[1].split("```", 1)[0]
-    sql_only = "\n".join(
-        line for line in block.splitlines() if not line.strip().startswith("--")
-    )
+    sql_only = "\n".join(line for line in block.splitlines() if not line.strip().startswith("--"))
     grants: dict[tuple[str, str], frozenset[str]] = {}
     for raw in sql_only.split(";"):
         statement = " ".join(raw.split())
@@ -2806,7 +2973,7 @@ def _deploy_doc_grants() -> dict[tuple[str, str], frozenset[str]]:
 
 def _parse_grant(statement: str) -> dict[tuple[str, str], frozenset[str]]:
     match = re.fullmatch(
-        r'GRANT (?P<privileges>[A-Z, ]+) ON (?:(?P<kind>DATABASE|SCHEMA|SEQUENCE|TABLE) )?'
+        r"GRANT (?P<privileges>[A-Z, ]+) ON (?:(?P<kind>DATABASE|SCHEMA|SEQUENCE|TABLE) )?"
         r'(?P<name>[\w."]+) TO "(?P<role>[^"]+)"',
         statement,
     )
@@ -3075,7 +3242,7 @@ def _measured_ownership_ddl() -> dict[int, set[str]]:
 
 
 def test_every_relation_the_rounds_run_ddl_against_is_owned_by_a_role_the_app_is_in() -> None:
-    """"must be owner of table orders", and why no GRANT could ever have fixed it.
+    """ "must be owner of table orders", and why no GRANT could ever have fixed it.
 
     The privilege plan was complete and correct -- SELECT, INSERT and DELETE on
     `orders`, all granted, all verified -- and Round 2 still failed inside its
@@ -3101,8 +3268,9 @@ def test_every_relation_the_rounds_run_ddl_against_is_owned_by_a_role_the_app_is
     # The scan found Round 2's migration, or every assertion below is vacuous.
     assert needed == {2: {ORDERS_TABLE}}, needed
 
-    planned = {number: set(relations) for number, relations in
-               _measured_lakebase_owned_relations().items()}
+    planned = {
+        number: set(relations) for number, relations in _measured_lakebase_owned_relations().items()
+    }
 
     # Every round that issues ownership-requiring DDL is covered ...
     assert set(needed) - set(planned) == set(), sorted(set(needed) - set(planned))
@@ -3184,11 +3352,9 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
     # can drift without the other noticing.
     assert initialized - planned == set(), sorted(initialized - planned)
 
-    # Eight tables, or the DDL scan is broken and proves nothing below. The
-    # eighth is `round4_pipeline_power`: the app now stops the Round 4 pipeline
-    # once a bout has settled, and a stop it could not record is one a later
-    # check reports as a failure rather than as the deliberate saving it is.
-    assert len(durable) == 8, durable
+    # Twelve tables, or the DDL scan is broken and proves nothing below. The
+    # final four are Round 5's warm state plus resident control outbox/inbox.
+    assert len(durable) == 12, durable
 
     # Every durable coordination table is granted. This is the assertion that
     # fails when someone adds a table to a store and forgets the grant -- the
@@ -3197,9 +3363,7 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
     # ... and every sequence behind a `serial` column, since an INSERT that omits
     # such a column reads the sequence and INSERT alone is not enough.
     assert {name for kind, name in documented if kind == "SEQUENCE"} == {
-        f"{table}_{column}_seq"
-        for table, columns in durable.items()
-        for column in columns
+        f"{table}_{column}_seq" for table, columns in durable.items() for column in columns
     }
 
     manifest = make_manifest()
@@ -3481,9 +3645,7 @@ def test_the_app_holds_select_on_every_unity_catalog_object_round4_reads() -> No
     read = {
         candidate
         for candidate in candidates
-        if any(
-            re.search(re.escape(candidate) + r"(?![A-Za-z0-9_])", path) for path in requested
-        )
+        if any(re.search(re.escape(candidate) + r"(?![A-Za-z0-9_])", path) for path in requested)
     }
 
     # Guard the scan itself: if the adapter stops naming the synced table in a
@@ -3494,8 +3656,7 @@ def test_the_app_holds_select_on_every_unity_catalog_object_round4_reads() -> No
     # And the privileges are the least each read needs. The synced table is
     # written by the Managed Sync pipeline and only ever read by the app.
     privileges = {
-        grant.name: set(grant.privileges)
-        for grant in lifecycle._round4_unity_catalog_grants(names)
+        grant.name: set(grant.privileges) for grant in lifecycle._round4_unity_catalog_grants(names)
     }
     assert privileges[names["synced_table_id"]] == {"SELECT"}
     assert privileges[names["source_table"]] == {"SELECT", "MODIFY"}
@@ -3664,13 +3825,15 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(monkeypatch, t
     )
     monkeypatch.setattr(
         "server.lifecycle._round4_list_uc_tables",
-        lambda candidate, schema, *, catalog: {
-            names["source_schema"]: [{"full_name": names["source_table"]}],
-            names["storage_schema"]: [],
-            names["online_schema"]: [{"full_name": names["synced_table_id"]}],
-        }[schema]
-        if catalog == names["catalog"]
-        else pytest.fail(f"cleanup listed tables in the wrong catalog: {catalog}"),
+        lambda candidate, schema, *, catalog: (
+            {
+                names["source_schema"]: [{"full_name": names["source_table"]}],
+                names["storage_schema"]: [],
+                names["online_schema"]: [{"full_name": names["synced_table_id"]}],
+            }[schema]
+            if catalog == names["catalog"]
+            else pytest.fail(f"cleanup listed tables in the wrong catalog: {catalog}")
+        ),
     )
 
     def fake_api(profile, method, path, **kwargs):
@@ -4123,9 +4286,7 @@ def test_round4_source_repair_adopts_the_exact_job_left_by_an_interrupted_setup(
     assert job_id == "123"
     assert not any(path == "/api/2.1/jobs/create" for _, path, _ in calls)
     resets = [
-        body
-        for method, path, body in calls
-        if method == "post" and path == "/api/2.1/jobs/reset"
+        body for method, path, body in calls if method == "post" and path == "/api/2.1/jobs/reset"
     ]
     assert len(resets) == 1
     assert resets[0]["job_id"] == 123
@@ -4144,9 +4305,7 @@ def test_round4_cleanup_removes_the_installation_workspace_folder(monkeypatch) -
             "job_id": 123,
             "creator_user_name": manifest.round4.setup_principal,
             "settings": {
-                "name": (
-                    f"lakebase-anti-demo-{manifest.run_id[:8]}-round4-source-repair"
-                )
+                "name": (f"lakebase-anti-demo-{manifest.run_id[:8]}-round4-source-repair")
             },
         },
     )
@@ -4170,7 +4329,7 @@ def test_round4_cleanup_removes_the_installation_workspace_folder(monkeypatch) -
 
 
 def test_a_pipeline_that_survives_its_own_deletion_refuses_the_teardown(monkeypatch) -> None:
-    """"Delete returned" is not "gone", and the difference is the whole bill."""
+    """ "Delete returned" is not "gone", and the difference is the whole bill."""
 
     manifest = make_manifest()
     manifest.round4 = SimpleNamespace(pipeline_id="pipe-1")
@@ -4234,9 +4393,7 @@ def _stub_refusable_cleanup(monkeypatch, manifest, reconciliation, *, addresses=
     monkeypatch.setattr(
         "server.lifecycle._terraform_managed_addresses", lambda candidate: set(addresses)
     )
-    monkeypatch.setattr(
-        "server.lifecycle._hydrate_aws_resources", lambda candidate, **kwargs: None
-    )
+    monkeypatch.setattr("server.lifecycle._hydrate_aws_resources", lambda candidate, **kwargs: None)
     monkeypatch.setattr(
         "server.lifecycle._aws_ownership", lambda candidate: Check("aws_ownership", True, "owned")
     )
@@ -4370,12 +4527,18 @@ def test_cleanup_refuses_to_tear_down_around_a_leaked_per_bout_clone(
             # reporting its own fleet as residue. Refusing on that code would
             # block every ordinary teardown, which is why this refusal does not.
             ObservedResource(
-                AURORA_WRITER, sealed.aurora_writer_instance_id, "available",
-                run_id=manifest.run_id, public_ipv4=True,
+                AURORA_WRITER,
+                sealed.aurora_writer_instance_id,
+                "available",
+                run_id=manifest.run_id,
+                public_ipv4=True,
             ),
             ObservedResource(
-                RDS_INSTANCE, sealed.rds_instance_id, "available",
-                run_id=manifest.run_id, public_ipv4=True,
+                RDS_INSTANCE,
+                sealed.rds_instance_id,
+                "available",
+                run_id=manifest.run_id,
+                public_ipv4=True,
             ),
             # The two that actually outlived their bouts.
             ObservedResource(
@@ -4503,9 +4666,7 @@ def test_aws_hydration_can_inventory_without_writing_the_manifest(monkeypatch) -
     manifest.aws.resources = AwsResources()
     hydrated = AwsResources(aurora_cluster_id="anti-demo-aurora")
     saved: list[str] = []
-    monkeypatch.setattr(
-        "server.lifecycle._aws_resources_from_outputs", lambda outputs: hydrated
-    )
+    monkeypatch.setattr("server.lifecycle._aws_resources_from_outputs", lambda outputs: hydrated)
     monkeypatch.setattr(
         "server.lifecycle.save_manifest",
         lambda candidate, path=None: saved.append(candidate.run_id),
@@ -4736,15 +4897,11 @@ class FakeRound4SourceTable:
     def __call__(self, profile: str, warehouse_id: str, statement: str, **kwargs) -> dict:
         self.statements.append(statement)
         if statement.startswith("DESCRIBE DETAIL"):
-            return sql_payload(
-                ("properties",), [({"delta.enableChangeDataFeed": "true"},)]
-            )
+            return sql_payload(("properties",), [({"delta.enableChangeDataFeed": "true"},)])
         if statement.startswith("DESCRIBE HISTORY"):
             return sql_payload(("version",), [(self.version,)])
         if statement.startswith("SELECT"):
-            return sql_payload(
-                ("entity_id", "score", "model_version", "proof_nonce"), [self.row]
-            )
+            return sql_payload(("entity_id", "score", "model_version", "proof_nonce"), [self.row])
         if statement.startswith("MERGE INTO"):
             self.row = ("customer-0001", 0.25, "risk-v0", "round4-baseline")
             self.version += 1
@@ -4770,9 +4927,7 @@ def stub_round4_control_plane(monkeypatch, manifest, names, table) -> None:
         "server.lifecycle._validate_round4_project_and_branch",
         lambda *args, **kwargs: ("project-uid-001", "branch-uid-001"),
     )
-    monkeypatch.setattr(
-        "server.lifecycle._ensure_round4_app_roles", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr("server.lifecycle._ensure_round4_app_roles", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "server.lifecycle._round4_get_synced_table",
         lambda *args, **kwargs: round4_payload(manifest, names),
@@ -4783,9 +4938,7 @@ def stub_round4_control_plane(monkeypatch, manifest, names, table) -> None:
     )
     monkeypatch.setattr(
         "server.lifecycle._round4_get_database_synced_table",
-        lambda *args, **kwargs: database_round4_payload(
-            manifest, names, version=table.version
-        ),
+        lambda *args, **kwargs: database_round4_payload(manifest, names, version=table.version),
     )
     monkeypatch.setattr(
         "server.lifecycle._validate_round4_database_synced_table",
@@ -4839,9 +4992,7 @@ def test_round4_readiness_leaves_an_untouched_baseline_alone(monkeypatch) -> Non
     # the constant, never written down: this rate had three independent recorded
     # values before it was derived from its own meter. The daily rate is also the
     # longest horizon this line may state -- see the absence assertion below.
-    assert (
-        f"RUNNING · ${PIPELINE_USD_PER_DAY:.2f}/day {PIPELINE_RATE_TOLERANCE}"
-    ) in check.detail
+    assert (f"RUNNING · ${PIPELINE_USD_PER_DAY:.2f}/day {PIPELINE_RATE_TOLERANCE}") in check.detail
     assert "/month" not in check.detail
     assert "antidemo pipeline stop" in check.detail
     assert table.merges == []

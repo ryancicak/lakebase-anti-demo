@@ -756,7 +756,14 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .round5-retry-cleanup { border: clamp(4px, .4vw, 7px) solid #ff9888; color: var(--cream); background: #3a0d12; box-shadow: .38em .38em #000; font-size: clamp(7px, .62vw, 12px); }
 .round5-retry-cleanup:disabled { cursor: wait; opacity: .72; }
 .round5-next { border: 3px solid #8996c1; color: #c0c8e3; background: #10183e; font-size: clamp(6px, .52vw, 10px); }
-.round5-compact-body { position: relative; z-index: 2; display: grid; place-items: center; min-height: 0; padding: clamp(24px, 4vh, 56px) 5vw; background: radial-gradient(circle at 50% 45%, #18234a 0, var(--navy) 52%, #050817 100%); }
+.round5-compact-body { position: relative; z-index: 2; display: grid; place-items: center; gap: clamp(18px, 3vh, 34px); min-height: 0; padding: clamp(24px, 4vh, 56px) 5vw; background: radial-gradient(circle at 50% 45%, #18234a 0, var(--navy) 52%, #050817 100%); }
+.round5-partial-evidence { width: min(980px, 92vw); color: var(--cream); }
+.round5-partial-evidence > header { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 12px; color: var(--yellow); text-transform: uppercase; }
+.round5-partial-evidence > div { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.round5-partial-evidence article { display: grid; gap: 7px; padding: 18px; border: 3px solid var(--cream); background: #0a0f28; box-shadow: .35em .35em #000; }
+.round5-partial-evidence article[data-corner="red"] { border-top-color: var(--red); }
+.round5-partial-evidence article[data-corner="blue"] { border-top-color: var(--blue); }
+.round5-partial-evidence small { color: #b8c1df; }
 .round5-result-card { width: min(850px, 88vw); padding: clamp(24px, 4vh, 52px) clamp(24px, 4vw, 58px); border: clamp(4px, .4vw, 7px) solid #ff806d; background: #0a0f28; box-shadow: .65em .65em #000, inset 0 .55vh var(--red); text-align: center; }
 .round5-result-card > p:first-child { margin: 0; color: var(--yellow); font-size: clamp(6px, .55vw, 10px); line-height: 1.3; text-transform: uppercase; }
 .round5-result-card h2 { margin: .75em 0 0; color: #ff806d; font-size: clamp(20px, 2.6vw, 46px); line-height: 1.2; text-shadow: .12em .12em #000; }
@@ -785,6 +792,31 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .round5-arena-footer > .towel-call { margin-top: 0; }
 .round5-arena-footer > .remembered span { margin-bottom: .55em; }
 .round5-arena-footer > .remembered strong { font-size: clamp(18px, 2vw, 38px); }
+/* Round 5 two-region live lane: the big "Time to 10,000" clock and, beneath it,
+   the "Hold checks" region. Both lanes always render both regions so the two
+   never look asymmetric. Children stack tightly and centre instead of leaning on
+   the shared lane's 1fr row, which would otherwise open a gap under the clock. */
+.round5-arena .proof-lane { grid-template-rows: none; grid-auto-rows: min-content; align-content: center; row-gap: 1vh; }
+.lane-timer-caption { margin: .55em 0 0; color: #c7d0ee; font-family: "Press Start 2P", monospace; font-size: clamp(8px, .8vw, 15px); letter-spacing: .04em; line-height: 1.4; text-align: center; text-transform: uppercase; }
+.lane-timer-caption[data-frozen="true"] { color: var(--yellow); }
+.lane-hold-checks { width: 94%; max-width: 42vw; margin: 0 auto; padding: .85em .95em; border: 3px solid #33407a; background: #0a1130; box-shadow: .18em .18em 0 #000; text-align: left; }
+.lane-hold-checks-title { margin: 0 0 .5em; color: #9fb0e6; font-family: "Press Start 2P", monospace; font-size: clamp(7px, .62vw, 12px); letter-spacing: .05em; text-transform: uppercase; }
+.lane-hold-checks-line { margin: 0; color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(10px, .92vw, 17px); font-weight: 900; line-height: 1.45; }
+.lane-hold-checks-note { margin: .5em 0 0; color: #aab6dd; font-family: ui-monospace, monospace; font-size: clamp(9px, .78vw, 14px); font-weight: 600; line-height: 1.5; }
+.lane-hold-checks[data-waiting="true"] { border-color: #2a3560; background: #080d24; opacity: .72; }
+.lane-hold-checks[data-waiting="true"] .lane-hold-checks-line { color: #8f9bc4; }
+.lane-hold-checks[data-phase="verified"] { border-color: #2f8f57; background: #0a2417; }
+.lane-hold-checks[data-phase="verified"] .lane-hold-checks-line { color: #7cf2a6; }
+.lane-hold-checks[data-phase="failed"] { border-color: #7a352c; background: #240d0a; }
+.lane-hold-checks-line[data-failed="true"] { color: #ff9a86; }
+/* Raw backend status becomes a subordinate technical footnote once the hold-checks
+   region is carrying the primary, plain-language story. */
+.lane-status[data-subordinate="true"] { min-height: 0; margin-top: .1em; color: #7f8bb4; font-weight: 600; font-size: clamp(8px, .7vw, 13px); opacity: .85; }
+.lane-status[data-subordinate="true"] span { width: 1.5em; height: 1.5em; margin-right: .5em; font-size: .6em; }
+/* Persistent shared explainer while both lanes are still live: no winner yet. */
+.round5-live-explainer { width: min(1040px, 94vw); margin: 0 auto; text-align: center; }
+.round5-live-verdict { margin: 0; color: var(--yellow); font-family: "Press Start 2P", monospace; font-size: clamp(11px, 1.15vw, 20px); line-height: 1.55; }
+.round5-live-copy { margin: .6em 0 0; color: #c2cbe9; font-family: ui-monospace, monospace; font-size: clamp(10px, .85vw, 15px); font-weight: 600; line-height: 1.55; }
 .round5-explain-proof { display: grid; gap: 1.2vh; padding: 1.2vh 1vw; border: 3px solid var(--blue-light); background: #070b22; }
 .round5-explain-proof > header { display: flex; align-items: baseline; justify-content: space-between; gap: 1vw; padding-bottom: .8vh; border-bottom: 2px solid #46527c; text-transform: uppercase; }
 .round5-explain-proof > header span { color: var(--yellow); font-size: clamp(6px, .5vw, 10px); }

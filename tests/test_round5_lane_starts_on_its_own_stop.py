@@ -14,17 +14,31 @@ then pauses, which is the shape of a real bout: one lane verified, the other sti
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from server import connection_spike_live as live
+from server.connection_fanin import SAFETY_EVIDENCE_VERSION
 from server.connection_spike_live import (
+    ConnectionSpikeLiveOperationError,
     ConnectionSpikeSetupLaneStop,
     ConnectionSpikeTarget,
     LiveConnectionSpikeEngine,
 )
 
 ACCOUNT = "123456789012"
+
+
+@pytest.fixture(autouse=True)
+def _accept_recording_adapter_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        live,
+        "_finalize_lane_payload",
+        lambda arm, raw, *, lane_id, **kwargs: SimpleNamespace(lane_id=lane_id),
+    )
 
 
 def target(lane_id: str, *, competitor_id: str = "") -> ConnectionSpikeTarget:
@@ -56,14 +70,54 @@ class Adapter:
 
     async def preflight_capacity(self, run_id, **digests):
         del run_id, digests
-        return SimpleNamespace(sufficient=True, failures=())
+        return SimpleNamespace(
+            sufficient=True,
+            failures=(),
+            boot_id="test-runner-boot",
+            runner_harness_sha256="e" * 64,
+            model_sha256=live.fanin_capacity_model_sha256(),
+            receipt={
+                "protocol": live.FANIN_PROTOCOL,
+                "schema_version": live.FANIN_SCHEMA_VERSION,
+                "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
+                "boot_id": "test-runner-boot",
+                "capacity_model_sha256": live.fanin_capacity_model_sha256(),
+                "runner_harness_sha256": "e" * 64,
+                "hard_safety_verified": True,
+            },
+        )
 
-    async def execute(self, run_id, request, *, targets=None):
-        del run_id, targets
+    async def ensure_dispatch_capsule(self, context_id, **kwargs):
+        del context_id, kwargs
+        return None
+
+    async def execute(self, run_id, request, *, targets=None, on_progress=None):
+        assert request["job_id"] == run_id
+        del targets, on_progress
+        assert request["action"] == "run_lane_v3"
+        prepared = request["prepared_request_digest"]
+        unsigned = {
+            key: value
+            for key, value in request.items()
+            if key != "prepared_request_digest"
+        }
+        assert prepared == hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         lanes = [str(entry["lane_id"]) for entry in request["targets"]]
         assert len(lanes) == 1, "each dispatch carries exactly one lane"
         self.dispatched.extend(lanes)
         return {}
+
+    execute_prepared = execute
+
+    def settlement_pending(self, run_id):
+        del run_id
+        return False
 
 
 class Orchestrator:
@@ -76,8 +130,15 @@ class Orchestrator:
     async def prepare(self, bout_id, fencing_token):
         del bout_id, fencing_token
 
-    async def setup(self, bout_id, fencing_token, on_progress=None, on_lane_ready=None):
-        del fencing_token, on_progress
+    async def setup(
+        self,
+        bout_id,
+        fencing_token,
+        on_progress=None,
+        on_lane_ready=None,
+        on_lane_stage=None,
+    ):
+        del fencing_token, on_progress, on_lane_stage
         assert on_lane_ready is not None, "the engine must ask to be told when a lane is ready"
         lakebase = ConnectionSpikeSetupLaneStop(
             lane_id="lakebase",
@@ -149,20 +210,18 @@ async def test_the_engine_asks_to_be_told_when_a_lane_is_ready() -> None:
     await asyncio.wait_for(setup, timeout=2)
 
 
-async def test_a_lane_with_no_arm_defers_instead_of_failing() -> None:
-    """Starting early is an optimisation and must never be why a round cannot ring.
-
-    A bout armed at the bell rather than at the arm has no arm while setup runs, so no lane can be
-    dispatched early. That has to be a slower round, not a failed one.
-    """
+async def test_a_lane_with_no_warm_arm_fails_instead_of_preparing_after_bell() -> None:
+    """Missing warm evidence blocks dispatch; no slower bell fallback exists."""
 
     adapter = Adapter()
     orchestrator = Orchestrator()
     engine = LiveConnectionSpikeEngine(adapter, setup_orchestrator=orchestrator)
     setup = asyncio.create_task(engine.setup("bout-unarmed", 7))
-    await asyncio.wait_for(orchestrator.lakebase_reported.wait(), timeout=2)
-    orchestrator.release_competitor.set()
-    await asyncio.wait_for(setup, timeout=2)
+    with pytest.raises(
+        ConnectionSpikeLiveOperationError,
+        match="warm capacity receipt",
+    ):
+        await asyncio.wait_for(setup, timeout=2)
     assert adapter.dispatched == [], "no arm means nothing is dispatched early"
 
 

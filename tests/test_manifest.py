@@ -419,15 +419,52 @@ def _round5_resources() -> Round5Resources:
         runner_permissions_boundary_arn=(
             "arn:aws:iam::123456789012:policy/anti-demo-round5-runner"
         ),
+        competitor_runner_permissions_boundary_arn=(
+            "arn:aws:iam::123456789012:policy/anti-demo-round5-competitor"
+        ),
         runner_instance_id="i-0123456789abcdef0",
+        competitor_runner_instance_id="i-0fedcba9876543210",
         runner_instance_profile_arn=(
             "arn:aws:iam::123456789012:instance-profile/anti-demo-round5-runner"
         ),
         runner_role_arn="arn:aws:iam::123456789012:role/anti-demo-round5-runner",
+        competitor_runner_instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/anti-demo-round5-competitor"
+        ),
+        competitor_runner_role_arn=("arn:aws:iam::123456789012:role/anti-demo-round5-competitor"),
         runner_subnet_id="subnet-0123456789abcdef0",
         runner_security_group_id="sg-0123456789abcdef0",
         runner_egress_rule_id="sgr-0123456789abcdef0",
+        lakebase_runner_egress_rule_ids=(
+            "sgr-0123456789abcdef0",
+            "sgr-1123456789abcdef0",
+        ),
+        competitor_runner_security_group_id="sg-0123abcd",
+        competitor_runner_egress_rule_ids=(
+            "sgr-2123456789abcdef0",
+            "sgr-3123456789abcdef0",
+            "sgr-4123456789abcdef0",
+            "sgr-5123456789abcdef0",
+            "sgr-6123456789abcdef0",
+        ),
+        aurora_proxy_security_group_id="sg-1123456789abcdef0",
+        rds_proxy_security_group_id="sg-abcd1234",
         runner_public_key_sha256="e" * 64,
+        competitor_runner_public_key_sha256="7" * 64,
+        lakebase_control_queue_url=(
+            "https://sqs.us-west-2.amazonaws.com/123456789012/lakebase.fifo"
+        ),
+        competitor_control_queue_url=(
+            "https://sqs.us-west-2.amazonaws.com/123456789012/competitor.fifo"
+        ),
+        lakebase_control_queue_arn=("arn:aws:sqs:us-west-2:123456789012:lakebase.fifo"),
+        competitor_control_queue_arn=("arn:aws:sqs:us-west-2:123456789012:competitor.fifo"),
+        runner_control_secret_arn=(
+            "arn:aws:secretsmanager:us-west-2:123456789012:secret:runner-control"
+        ),
+        competitor_runner_control_secret_arn=(
+            "arn:aws:secretsmanager:us-west-2:123456789012:secret:competitor-control"
+        ),
         lakebase_credential_sha256="f" * 64,
         aurora_credential_sha256="8" * 64,
         rds_credential_sha256="9" * 64,
@@ -548,9 +585,7 @@ def test_round5_ownership_tags_preserve_legacy_and_seal_v7_scope() -> None:
             "anti_demo_round": "r5",
         }
     )
-    assert scoped.as_aws_tags()["anti-demo-installation-slug"] == (
-        "i0123456789abcdefabcd-r5"
-    )
+    assert scoped.as_aws_tags()["anti-demo-installation-slug"] == ("i0123456789abcdefabcd-r5")
     assert scoped.as_aws_tags()["anti-demo-round"] == "r5"
 
     with pytest.raises(ValidationError, match="installation ownership scope is incomplete"):

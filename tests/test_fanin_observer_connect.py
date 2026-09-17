@@ -117,7 +117,10 @@ def test_the_worker_ready_barrier_outlasts_the_observer_preflight() -> None:
 
     from runner import connection_spike_runner as runner
 
-    assert runner.FANIN_WORKER_READY_TIMEOUT_SECONDS > (
+    assert runner.FANIN_WORKER_READY_BUDGET_SECONDS > (
         fanin.OBSERVER_READY_TIMEOUT_SECONDS + fanin.OBSERVER_QUIESCE_TIMEOUT_SECONDS
     )
-
+    assert (
+        runner.FANIN_WORKER_RUN_TIMEOUT_SECONDS
+        > runner.FANIN_WORKER_READY_BUDGET_SECONDS
+    )

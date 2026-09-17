@@ -276,7 +276,7 @@ export function stopCondition(
       // an RDS Proxy is a decision you have to make and provision before you
       // need it, and Lakebase's pool is simply already there. The lanes are not
       // expected to reach 10,000 at the same moment.
-      return 'Lakebase verifies its included pool; the selected AWS path must first provision an RDS Proxy, which is most of its clock. Each lane then holds exactly 10,000 authenticated client connections from a shared start, keeps them for a 30-second hold, and answers 64 sparse queries per lane with zero retries. 9,999 fails.'
+      return 'Lakebase verifies its included pool; the selected AWS path must first provision an RDS Proxy, which is most of its clock. Each lane then holds exactly 10,000 authenticated client connections from a shared start, keeps them for a 30-second hold, and completes 64 verification samples per lane with zero retries. 9,999 fails.'
     }
     return 'Each pooled-path setup clock stops at an exact application transaction from the database-only declared start. Lakebase verifies its included pool; the selected AWS managed pooling path provisions a new RDS Proxy. The 128-attempt, maximum-64-concurrent check and separate 64-client witness must then pass.'
   }

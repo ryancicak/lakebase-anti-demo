@@ -78,11 +78,14 @@ def number_word(count: int) -> str:
 
     return _NUMBER_WORDS[count] if 0 <= count < len(_NUMBER_WORDS) else str(count)
 
-# The Round 5 proxy secrets, which Terraform manages directly rather than RDS
-# creating them alongside a database.  Named because they are the only part of
+
+# The two Round 5 proxy secrets plus one lane-scoped resident event secret per
+# physical runner,
+# which Terraform manages directly rather than RDS creating them alongside a database.
 # `InstallationShape.managed_secrets` that is *not* one-per-database, which is
 # what makes that field checkable against the two fleet counts beside it.
 TERRAFORM_PROXY_SECRETS = 2
+TERRAFORM_RUNNER_CONTROL_SECRETS = 2
 
 # An RDS instance is billed in one-second increments with a ten-minute minimum
 # charge after a billable status change.  A point-in-time restore that lives for
@@ -562,6 +565,11 @@ class RateCard:
         "instance-hour",
         "AWS Price List API · AmazonEC2 · OnDemand · us-west-2",
     )
+    ec2_c7i_2xlarge_hour: Rate = Rate(
+        Decimal("0.4284"),
+        "instance-hour",
+        "AWS Price List API · AmazonEC2 · OnDemand · us-west-2",
+    )
     ebs_gp3_gb_month: Rate = Rate(
         Decimal("0.08"),
         "GB-month",
@@ -629,15 +637,14 @@ class InstallationShape:
     # to wake up. Raise this and the carrying total moves immediately.
     aurora_min_acu: Decimal = Decimal(0)
     aurora_storage_gb: Decimal = Decimal(1)
-    # Every database is `publicly_accessible = true`: three RDS instances and
-    # four Aurora writers, each holding one chargeable address.
-    public_ipv4_addresses: int = 7
+    # Seven publicly reachable database writers plus two resident runner instances.
+    public_ipv4_addresses: int = 9
     # Seven RDS-managed master credentials -- three RDS instances plus four Aurora
-    # clusters -- plus the two Terraform-managed Round 5 proxy secrets. The
+    # clusters -- plus four Terraform-managed Round 5 secret containers. The
     # `rds!`-prefixed managed secrets are chargeable: the RDS guide states plainly
     # that "you are charged for that secret".
-    managed_secrets: int = 9
-    runner_instances: int = 1
+    managed_secrets: int = 11
+    runner_instances: int = 2
     runner_root_gb: Decimal = Decimal(20)
     lakebase_projects: int = 7
 
@@ -1744,7 +1751,7 @@ def estimate_carrying_cost(
             rate=rates.secret_month,
         ),
         _line(
-            "Neutral m6i.large burst runner",
+            "Two isolated c7i.2xlarge burst runners",
             cloud=Cloud.AWS,
             kind=CostKind.COMPUTE,
             scope=EstimateScope.OVERHEAD,
@@ -1753,10 +1760,10 @@ def estimate_carrying_cost(
                 hours * shape.runner_instances,
                 "instance_type in infra/aws/round5_runner.tf",
             ),
-            rate=rates.ec2_m6i_large_hour,
+            rate=rates.ec2_c7i_2xlarge_hour,
         ),
         _line(
-            "Neutral runner gp3 root volume",
+            "Two isolated runner gp3 root volumes",
             cloud=Cloud.AWS,
             kind=CostKind.STORAGE,
             scope=EstimateScope.OVERHEAD,
@@ -1768,7 +1775,7 @@ def estimate_carrying_cost(
             rate=rates.ebs_gp3_gb_month,
         ),
         _line(
-            "Neutral runner public IPv4",
+            "Two isolated runner public IPv4 addresses",
             cloud=Cloud.AWS,
             kind=CostKind.NETWORK,
             scope=EstimateScope.OVERHEAD,

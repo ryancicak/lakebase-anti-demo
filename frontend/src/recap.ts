@@ -39,7 +39,7 @@ export interface BoutReceipt {
   sealing_event: string
   has_measurements: boolean
 
-  metric: 'bout_elapsed_ms' | 'setup_elapsed_ms'
+  metric: 'bout_elapsed_ms' | 'setup_elapsed_ms' | 'bell_to_10000_observed_ms'
   lakebase: LaneReceipt
   opponent_lane: LaneReceipt
 

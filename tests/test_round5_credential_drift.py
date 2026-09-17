@@ -52,12 +52,27 @@ _COMPARED_OUTPUT_FIELDS = (
     "aurora_proxy_secret_arn",
     "rds_proxy_secret_arn",
     "runner_permissions_boundary_arn",
+    "competitor_runner_permissions_boundary_arn",
     "runner_instance_id",
+    "competitor_runner_instance_id",
+    "lakebase_control_queue_url",
+    "competitor_control_queue_url",
+    "lakebase_control_queue_arn",
+    "competitor_control_queue_arn",
+    "runner_control_secret_arn",
+    "competitor_runner_control_secret_arn",
     "runner_instance_profile_arn",
     "runner_role_arn",
+    "competitor_runner_instance_profile_arn",
+    "competitor_runner_role_arn",
     "runner_subnet_id",
     "runner_security_group_id",
     "runner_egress_rule_id",
+    "lakebase_runner_egress_rule_ids",
+    "competitor_runner_security_group_id",
+    "competitor_runner_egress_rule_ids",
+    "aurora_proxy_security_group_id",
+    "rds_proxy_security_group_id",
     "bout_name_prefix",
 )
 
@@ -112,8 +127,15 @@ def _stub_reseal_preconditions(monkeypatch: pytest.MonkeyPatch, manifest) -> lis
     monkeypatch.setattr(
         lifecycle,
         "_round5_setup_request",
-        lambda *args, **kwargs: {"public_key_sha256": sealed.runner_public_key_sha256},
+        lambda *args, **kwargs: {
+            "public_key_sha256": (
+                sealed.competitor_runner_public_key_sha256
+                if kwargs.get("runner_instance_id") == sealed.competitor_runner_instance_id
+                else sealed.runner_public_key_sha256
+            )
+        },
     )
+
     # An existing seal is reasserted, never rotated. Keep the old helper loud so
     # any regression back to reset-time rotation fails every re-seal test here.
     def refuse_rotation(*args, **kwargs):
@@ -366,17 +388,13 @@ def test_the_digest_doctor_refuses_output_it_cannot_trust(
     """
 
     def reply(text: str):
-        monkeypatch.setattr(
-            lifecycle, "_run_round5_ssm_command", lambda *args, **kwargs: text
-        )
+        monkeypatch.setattr(lifecycle, "_run_round5_ssm_command", lambda *args, **kwargs: text)
         return lifecycle._round5_runner_credential_digests(
             _Session(), runner_instance_id="i-0123456789abcdef0"
         )
 
     good = reply(
-        f"DIGEST_AURORA={ROTATED_AURORA}\n"
-        f"DIGEST_LAKEBASE={'a' * 64}\n"
-        f"DIGEST_RDS={ROTATED_RDS}\n"
+        f"DIGEST_AURORA={ROTATED_AURORA}\nDIGEST_LAKEBASE={'a' * 64}\nDIGEST_RDS={ROTATED_RDS}\n"
     )
     assert good == {
         "aurora": ROTATED_AURORA,

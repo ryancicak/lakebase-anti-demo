@@ -301,6 +301,90 @@ async def test_a_thrown_towel_records_its_censored_lower_bounds() -> None:
     assert receipt.margin_ms is None
 
 
+async def test_v4_bell_towel_receipt_reads_the_runtime_not_the_setup_stop() -> None:
+    """A durable V4 towel receipt must carry the bell_to_10000 evidence and its
+    reached-but-not-verified distinction, never the promoted ~6ms setup stop."""
+    from server.models import (
+        RoundFiveRuntimeLaneSnapshot,
+        RoundFiveRuntimeSnapshot,
+    )
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.round = snapshot.round.model_copy(
+        update={
+            "id": RoundId.SURVIVE_CONNECTION_SPIKE,
+            "title": "Ready a pooled application path",
+        }
+    )
+    snapshot.state = SessionState.TOWELLED
+    snapshot.comparison = None
+    snapshot.remembered_result = None
+    # The poison: the generic lakebase lane was promoted VERIFIED at ~6ms setup.
+    snapshot.lanes["lakebase"].state = LaneState.TOWELLED
+    snapshot.lanes["lakebase"].elapsed_ms = None
+    snapshot.lanes["competitor"].state = LaneState.TOWELLED
+    snapshot.lanes["competitor"].elapsed_ms = None
+    snapshot.round5_runtime = RoundFiveRuntimeSnapshot(
+        protocol="round5-bell-to-10k-v4",
+        warm_generation=1,
+        bell_id="bell-one",
+        revision=14,
+        state="towelled",
+        bell_at_utc=snapshot.updated_at,
+        lanes={
+            "lakebase": RoundFiveRuntimeLaneSnapshot(
+                id="lakebase",
+                phase="cancelled",
+                elapsed_at_snapshot_ms=14_150.0,
+                bell_to_10000_observed_ms=14_150.0,
+                clients_initiated=10_000,
+                clients_authenticated=10_000,
+                held_clients=10_000,
+                peak_clients_authenticated=10_000,
+                peak_held_clients=10_000,
+                sampled_queries_succeeded=41,
+                status="Towel thrown during the 30-second hold",
+            ),
+            "competitor": RoundFiveRuntimeLaneSnapshot(
+                id="competitor",
+                phase="cancelled",
+                elapsed_at_snapshot_ms=23_890.0,
+                bell_to_10000_observed_ms=None,
+                clients_initiated=8_400,
+                clients_authenticated=8_400,
+                held_clients=8_400,
+                peak_clients_authenticated=8_400,
+                peak_held_clients=8_400,
+                sampled_queries_succeeded=0,
+                status="Towel thrown before reaching 10,000",
+            ),
+        },
+    )
+    snapshot.towel = TowelSnapshot(
+        state=TowelState.CLEANING,
+        requested_at=snapshot.updated_at,
+        censored_lower_bounds_ms={"competitor": 23_890.0},
+        public_result="Toweled · No exact verified result · No declared winner",
+    )
+
+    receipt = derive_receipt(snapshot, "towel_finished")
+
+    assert receipt.metric == "bell_to_10000_observed_ms"
+    # Lakebase reached 10,000 -> its exact bell time is evidence, but a floor
+    # (lower bound), never a verified time, and never the 6ms setup stop.
+    assert receipt.lakebase.ms == pytest.approx(14_150.0)
+    assert receipt.lakebase.state != "verified"
+    assert receipt.lakebase.lower_bound is True
+    # Aurora never reached 10,000 -> censored lower bound.
+    assert receipt.opponent_lane.ms == pytest.approx(23_890.0)
+    assert receipt.opponent_lane.lower_bound is True
+    assert receipt.margin_ms is None
+    # The receipt round-trips through its own schema unchanged.
+    from server.receipts import BoutReceipt
+
+    assert BoutReceipt.model_validate(receipt.model_dump(mode="json")) == receipt
+
+
 async def test_a_verified_lane_is_never_flagged_as_a_lower_bound() -> None:
     snapshot = await verified_round_one_snapshot()
 

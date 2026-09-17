@@ -249,8 +249,48 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
     # life, which is when somebody is most likely to be loading the screen.
     status_now = getattr(gate, "status", None)
     round5_status = getattr(gate, "round5_status", None)
+    run_manager = getattr(request.app.state, "run_manager", None)
+    warm_ring_ready = getattr(run_manager, "round5_ring_ready", None)
+    warm_status = getattr(run_manager, "round5_warm_status", None)
+    coordinator_present = isinstance(warm_status, dict)
+    warm_detail = None
+    if coordinator_present and not warm_ring_ready:
+        warm_detail = " · ".join(
+            part
+            for part in (
+                "Preparing backstage",
+                str(warm_status.get("round5_warm_state") or "warming").upper(),
+                (
+                    f"attempt {warm_status['round5_warm_attempt_count']}"
+                    if warm_status.get("round5_warm_attempt_count")
+                    else ""
+                ),
+                (
+                    f"retry {warm_status['round5_warm_next_retry_at']}"
+                    if warm_status.get("round5_warm_next_retry_at")
+                    else ""
+                ),
+                (
+                    f"error {warm_status['round5_warm_last_error_code']}"
+                    if warm_status.get("round5_warm_last_error_code")
+                    else ""
+                ),
+            )
+            if part
+        )
     round5_reason_code = getattr(round5_status, "reason_code", None)
-    if (
+    warm_state = (
+        str(warm_status.get("round5_warm_state") or "")
+        if isinstance(warm_status, dict)
+        else ""
+    )
+    if coordinator_present:
+        round5_reason_code = (
+            "cleanup_in_progress"
+            if warm_state == "cleaning"
+            else None
+        )
+    elif (
         round5_reason_code is None
         and getattr(round5_status, "maintenance_state", None) == "maintenance"
     ):
@@ -264,9 +304,25 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         signals,
         ring_ready=bool(getattr(status_now, "ring_ready", False)),
         ring_detail=getattr(status_now, "maintenance_detail", None),
-        round5_ring_ready=bool(getattr(round5_status, "ring_ready", False)),
+        round5_ring_ready=(
+            bool(warm_ring_ready)
+            if coordinator_present
+            else bool(getattr(round5_status, "ring_ready", False))
+        ),
         round5_reason_code=round5_reason_code,
-        round5_detail=getattr(round5_status, "maintenance_detail", None),
+        round5_detail=(
+            None
+            if coordinator_present and warm_ring_ready
+            else (
+                "CLEANUP IN PROGRESS · Round 5 will reopen automatically "
+                "after exact cleanup."
+            )
+            if warm_state == "cleaning"
+            else warm_detail
+            or "Preparing backstage · Round 5 will unlock automatically"
+            if coordinator_present
+            else getattr(round5_status, "maintenance_detail", None)
+        ),
     )
 
 

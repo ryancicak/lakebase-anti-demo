@@ -18,10 +18,17 @@ class _Manifest:
         self.installation_id = "00000000-0000-0000-0000-000000000001"
         self.round5 = SimpleNamespace(
             runner_instance_id="i-runner",
+            competitor_runner_instance_id="i-competitor",
             runner_instance_profile_arn="arn:aws:iam::123456789012:instance-profile/runner",
             trust_bundle_path="/opt/lakebase-anti-demo/round5/round5-ca.pem",
             trust_bundle_sha256="c" * 64,
             harness_sha256="a" * 64,
+            lakebase_control_queue_url="https://example/lakebase.fifo",
+            competitor_control_queue_url="https://example/competitor.fifo",
+            runner_control_secret_arn="arn:aws:secretsmanager:us-west-2:123456789012:secret:x",
+            competitor_runner_control_secret_arn=(
+                "arn:aws:secretsmanager:us-west-2:123456789012:secret:y"
+            ),
         )
         self.round4 = {"seal": "unchanged-four"}
         self.round6 = {"seal": "unchanged-six"}
@@ -57,6 +64,8 @@ def test_runner_refresh_installs_verifies_and_reseals_only_round5(
         [
             ({"connection_spike_runner.py": "0" * 64}, "a" * 64, "c" * 64),
             (assets, harness, "c" * 64),
+            (assets, harness, "c" * 64),
+            (assets, harness, "c" * 64),
         ]
     )
     installs: list[str] = []
@@ -68,8 +77,10 @@ def test_runner_refresh_installs_verifies_and_reseals_only_round5(
     )
     monkeypatch.setattr(
         lifecycle,
-        "_install_round5_runner_assets",
-        lambda _session, *, runner_instance_id: installs.append(runner_instance_id),
+        "_configure_round5_runner",
+        lambda _session, *, runner_instance_id, **_kwargs: (
+            installs.append(runner_instance_id) or "c" * 64
+        ),
     )
     monkeypatch.setattr(
         lifecycle,
@@ -80,7 +91,7 @@ def test_runner_refresh_installs_verifies_and_reseals_only_round5(
 
     result = lifecycle._refresh_round5_runner_locked(manifest, object())
 
-    assert installs == ["i-runner"]
+    assert installs == ["i-runner", "i-competitor"]
     assert result is saved[0]
     assert result.round5.harness_sha256 == harness
     assert result.round4 == manifest.round4
@@ -97,7 +108,7 @@ def test_runner_install_failure_leaves_old_seal_untouched(monkeypatch, source) -
     )
     monkeypatch.setattr(
         lifecycle,
-        "_install_round5_runner_assets",
+        "_configure_round5_runner",
         lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("provider secret")),
     )
     monkeypatch.setattr(
@@ -122,7 +133,11 @@ def test_post_install_hash_mismatch_leaves_old_seal_untouched(monkeypatch, sourc
         ]
     )
     monkeypatch.setattr(lifecycle, "_round5_runner_asset_checksums", lambda *_a, **_k: next(checks))
-    monkeypatch.setattr(lifecycle, "_install_round5_runner_assets", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "_configure_round5_runner",
+        lambda *_a, **_k: "c" * 64,
+    )
     monkeypatch.setattr(
         lifecycle,
         "save_manifest",
@@ -167,6 +182,40 @@ def test_per_file_ec2_checksum_output_is_required(monkeypatch) -> None:
             runner_instance_id="i-runner",
             trust_bundle_path="/safe/round5-ca.pem",
         )
+
+
+def test_runner_archive_is_transferred_in_bounded_ssm_chunks(monkeypatch) -> None:
+    archive = "a" * (lifecycle.ROUND5_RUNNER_SSM_ARCHIVE_CHUNK_CHARS * 2 + 17)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(lifecycle, "_round5_runner_archive", lambda: archive)
+    monkeypatch.setattr(
+        lifecycle,
+        "_run_round5_ssm_command",
+        lambda _ssm, *, commands, **_kwargs: calls.append(commands) or "",
+    )
+    session = SimpleNamespace(client=lambda _name: object())
+
+    lifecycle._install_round5_runner_assets(
+        session,
+        runner_instance_id="i-runner",
+    )
+
+    assert len(calls) == 5
+    chunk_calls = calls[1:-1]
+    labels = [
+        next(item for item in call if item.startswith("echo ARCHIVE_CHUNK="))
+        for call in chunk_calls
+    ]
+    assert labels == [
+        "echo ARCHIVE_CHUNK=1/3",
+        "echo ARCHIVE_CHUNK=2/3",
+        "echo ARCHIVE_CHUNK=3/3",
+    ]
+    assert all(
+        len(next(item for item in call if item.startswith("printf ")))
+        < lifecycle.ROUND5_RUNNER_SSM_ARCHIVE_CHUNK_CHARS + 100
+        for call in chunk_calls
+    )
 
 
 def test_active_round5_ring_refuses_before_install(monkeypatch) -> None:

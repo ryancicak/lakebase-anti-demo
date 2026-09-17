@@ -59,6 +59,7 @@ from .manifest import (
     Round5Resources,
     RoundEnvironmentSeal,
     apply_manifest_environment,
+    canonical_round5_seal_payload,
     load_manifest,
     manifest_path,
     save_manifest,
@@ -152,6 +153,19 @@ ROUND5_LEGACY_REFUSED_ADDRESSES = {
 }
 ROUND5_LEGACY_DYNAMIC_ADDRESSES = {
     "aws_iam_policy.round5_per_bout_role_boundary",
+}
+# Pre-`moved{}` Round 5 addresses that a checked-in migration renames during the
+# next `terraform apply`. The state-address validation in
+# `_terraform_managed_addresses` runs *before* apply, so it sees the old name
+# while `infra/aws/migrations.tf` has not yet executed the move. These must be
+# recognised so the reconcile can reach the apply that renames them; they are
+# deliberately kept out of `_expected_aws_state_addresses`, so the post-apply
+# convergence check still demands the new address and fails if the move did not
+# take. This mirrors `_INDEXED_LEGACY_AWS_STATE_ADDRESSES` for the count-index
+# moves. Today: the single Lakebase-runner egress rule that v4 narrows to public
+# PostgreSQL and renames `round5_runner_outbound` -> `round5_lakebase_runner_postgres`.
+ROUND5_PENDING_MOVE_ADDRESSES = {
+    "aws_vpc_security_group_egress_rule.round5_runner_outbound",
 }
 
 _ROUND_NUMBER_IDS = dict(enumerate(tuple(RoundId), start=1))
@@ -762,16 +776,12 @@ def _sealed_ingress_admits(observed: str, egress_cidrs: Sequence[str]) -> bool:
     """
     try:
         host = ipaddress.ip_network(observed, strict=False).network_address
-        return any(
-            host in ipaddress.ip_network(cidr, strict=False) for cidr in egress_cidrs
-        )
+        return any(host in ipaddress.ip_network(cidr, strict=False) for cidr in egress_cidrs)
     except ValueError:
         return False
 
 
-def operator_ingress_drift(
-    *, manifest: DemoManifest | None = None
-) -> IngressDrift | None:
+def operator_ingress_drift(*, manifest: DemoManifest | None = None) -> IngressDrift | None:
     """Whether the sealed database allowance still matches reality.
 
     Two findings come out of here, and they are reported through one seam
@@ -1158,15 +1168,15 @@ def _terraform_init(manifest: DemoManifest) -> None:
         # Terraform cannot interpolate a backend block, so the values are
         # written as literals and regenerated on every init.
         BACKEND_OVERRIDE.write_text(
-            'terraform {\n'
+            "terraform {\n"
             '  backend "s3" {\n'
             f'    bucket       = "{record["bucket"]}"\n'
             f'    key          = "{record["key"]}"\n'
             f'    region       = "{record["region"]}"\n'
-            '    use_lockfile = true\n'
-            '    encrypt      = true\n'
-            '  }\n'
-            '}\n',
+            "    use_lockfile = true\n"
+            "    encrypt      = true\n"
+            "  }\n"
+            "}\n",
             encoding="utf-8",
         )
         backend_arguments = [
@@ -1227,23 +1237,52 @@ EXPECTED_AWS_STATE_ADDRESSES = {
     "aws_db_instance.rds_control_plane_only",
     "aws_db_subnet_group.round1",
     "aws_iam_instance_profile.round5_runner",
+    "aws_iam_instance_profile.round5_competitor_runner",
+    "aws_iam_policy.round5_competitor_runner_boundary",
+    "aws_iam_policy.round5_execution_proxy",
+    "aws_iam_role.round5_competitor_runner",
     "aws_iam_role.round5_execution",
     "aws_iam_role.round5_proxy_service",
     "aws_iam_role.round5_runner",
     "aws_iam_role_policy.round5_execution",
     "aws_iam_role_policy.round5_proxy_secrets",
     "aws_iam_role_policy.round5_runner_baseline_secret",
+    "aws_iam_role_policy.round5_competitor_runner_baseline_secret",
+    "aws_iam_role_policy.round5_lakebase_runner_control",
+    "aws_iam_role_policy.round5_competitor_runner_control",
+    "aws_iam_role_policy_attachment.round5_execution_proxy",
     "aws_iam_role_policy_attachment.round5_runner_ssm",
+    "aws_iam_role_policy_attachment.round5_competitor_runner_ssm",
     "aws_iam_policy.round5_runner_boundary",
+    "aws_instance.round5_competitor_runner",
     "aws_instance.round5_runner",
     "aws_rds_cluster.aurora",
     "aws_rds_cluster_instance.aurora_writer",
     "aws_security_group.aurora",
     "aws_security_group.rds_control_plane_only",
+    'aws_security_group.round5_proxy["aurora"]',
+    'aws_security_group.round5_proxy["rds"]',
+    "aws_security_group.round5_competitor_runner",
     "aws_security_group.round5_runner",
     "aws_secretsmanager_secret.round5_aurora_proxy_credentials",
     "aws_secretsmanager_secret.round5_rds_proxy_credentials",
-    "aws_vpc_security_group_egress_rule.round5_runner_outbound",
+    "aws_secretsmanager_secret.round5_competitor_runner_control",
+    "aws_secretsmanager_secret.round5_runner_control",
+    "aws_sqs_queue.round5_lakebase_control",
+    "aws_sqs_queue.round5_competitor_control",
+    "aws_sqs_queue.round5_lakebase_control_dlq",
+    "aws_sqs_queue.round5_competitor_control_dlq",
+    'aws_vpc_security_group_egress_rule.round5_proxy_to_database["aurora"]',
+    'aws_vpc_security_group_egress_rule.round5_proxy_to_database["rds"]',
+    "aws_vpc_security_group_egress_rule.round5_lakebase_runner_https",
+    "aws_vpc_security_group_egress_rule.round5_lakebase_runner_postgres",
+    "aws_vpc_security_group_egress_rule.round5_competitor_runner_https",
+    'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy["aurora"]',
+    'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy["rds"]',
+    'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_database["aurora"]',
+    'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_database["rds"]',
+    'aws_vpc_security_group_ingress_rule.round5_runner_to_proxy["aurora"]',
+    'aws_vpc_security_group_ingress_rule.round5_runner_to_proxy["rds"]',
     "terraform_data.round5_destroy_guard",
 }
 
@@ -1295,10 +1334,7 @@ _V7_AWS_STATE_ADDRESSES = (
 _ANTI_DEMO_RUNTIME_POLICY_KEYS = ("1-network", "2-databases", "3-identity")
 _ANTI_DEMO_RUNTIME_STATE_ADDRESSES = {
     "aws_iam_role.anti_demo_runtime[0]",
-    *(
-        f'aws_iam_policy.anti_demo_runtime["{key}"]'
-        for key in _ANTI_DEMO_RUNTIME_POLICY_KEYS
-    ),
+    *(f'aws_iam_policy.anti_demo_runtime["{key}"]' for key in _ANTI_DEMO_RUNTIME_POLICY_KEYS),
     *(
         f'aws_iam_role_policy_attachment.anti_demo_runtime["{key}"]'
         for key in _ANTI_DEMO_RUNTIME_POLICY_KEYS
@@ -1349,6 +1385,7 @@ def _terraform_managed_addresses(manifest: DemoManifest) -> set[str]:
         | ROUND5_LEGACY_PARTIAL_ADDRESSES
         | ROUND5_LEGACY_REFUSED_ADDRESSES
         | ROUND5_LEGACY_DYNAMIC_ADDRESSES
+        | ROUND5_PENDING_MOVE_ADDRESSES
     )
     unexpected = addresses - recognized
     if unexpected:
@@ -1581,9 +1618,7 @@ def _required_round_output_map(outputs: dict[str, Any], name: str) -> dict[str, 
     payload = outputs.get(name)
     if not isinstance(payload, dict):
         raise RuntimeError(f"Terraform output {name} is not a round-keyed map")
-    expected = set(
-        _V7_RDS_ROUND_KEYS if name in _V7_RDS_ROUND_OUTPUTS else _V7_ROUND_KEYS
-    )
+    expected = set(_V7_RDS_ROUND_KEYS if name in _V7_RDS_ROUND_OUTPUTS else _V7_ROUND_KEYS)
     if set(payload) != expected:
         raise RuntimeError(f"Terraform output {name} has unexpected round keys")
     values = {key: str(value or "") for key, value in payload.items()}
@@ -1650,9 +1685,7 @@ def _v7_aws_environment_seals(
     return sealed
 
 
-def _reseal_v7_aws_round_environments(
-    manifest: DemoManifest, outputs: dict[str, Any]
-) -> None:
+def _reseal_v7_aws_round_environments(manifest: DemoManifest, outputs: dict[str, Any]) -> None:
     """Re-derive the AWS half of each round seal from the applied Terraform outputs.
 
     Reconciliation never used to change *which* resources exist, so refreshing the
@@ -1796,6 +1829,9 @@ def _validate_partial_aws_destroy_retry(
         # which is tagged and is checked by this same loop.
         "aws_iam_role_policy.round5_proxy_secrets",
         "aws_iam_role_policy.round5_runner_secrets",
+        # A managed-policy attachment carries no tags of its own; its ownership is
+        # proven by the tagged managed policy and the tagged control role it binds.
+        "aws_iam_role_policy_attachment.round5_execution_proxy",
         "aws_iam_role_policy_attachment.round5_runner_ssm",
         "aws_vpc_security_group_egress_rule.round5_proxy_to_rds",
         "aws_vpc_security_group_egress_rule.round5_runner_outbound",
@@ -1919,7 +1955,6 @@ def _aws_source_session(manifest: DemoManifest) -> boto3.Session:
     )
 
 
-
 def _aws_session(manifest: DemoManifest) -> boto3.Session:
     source = _aws_source_session(manifest)
     runtime_role = manifest.aws.runtime_role_arn
@@ -1936,10 +1971,7 @@ def _aws_session(manifest: DemoManifest) -> boto3.Session:
         DurationSeconds=3600,
     )
     credentials = response.get("Credentials") or {}
-    if any(
-        not credentials.get(key)
-        for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
-    ):
+    if any(not credentials.get(key) for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")):
         raise RuntimeError("STS did not return the sealed anti-demo runtime role")
     return boto3.Session(
         aws_access_key_id=credentials["AccessKeyId"],
@@ -2725,9 +2757,7 @@ def _lakebase_max_cu(manifest: DemoManifest) -> float | None:
     seals one endpoint per round and must use :func:`_lakebase_capacity`.
     """
 
-    maximum, _ = _endpoint_capacity(
-        manifest.databricks.profile, manifest.databricks.endpoint_name
-    )
+    maximum, _ = _endpoint_capacity(manifest.databricks.profile, manifest.databricks.endpoint_name)
     return maximum
 
 
@@ -2746,9 +2776,7 @@ def _lakebase_capacity(
     """
 
     environment = manifest.round_environment(round_id)
-    return _endpoint_capacity(
-        manifest.databricks.profile, environment.lakebase.endpoint_name
-    )
+    return _endpoint_capacity(manifest.databricks.profile, environment.lakebase.endpoint_name)
 
 
 def _capacity_parity(manifest: DemoManifest) -> Check:
@@ -2792,12 +2820,8 @@ def _capacity_parity(manifest: DemoManifest) -> Check:
                 (
                     "r1",
                     None,
-                    AuroraEnvironmentSeal.model_construct(
-                        cluster_id=resources.aurora_cluster_id
-                    ),
-                    RdsEnvironmentSeal.model_construct(
-                        instance_id=resources.rds_instance_id
-                    ),
+                    AuroraEnvironmentSeal.model_construct(cluster_id=resources.aurora_cluster_id),
+                    RdsEnvironmentSeal.model_construct(instance_id=resources.rds_instance_id),
                 )
             ]
         details: list[str] = []
@@ -2823,9 +2847,9 @@ def _capacity_parity(manifest: DemoManifest) -> Check:
             # the same trap as in `_aws_ownership`, but here it would be reported
             # as a parity verdict rather than refused.
             if postgres is not None and postgres.instance_id:
-                instance = rds.describe_db_instances(
-                    DBInstanceIdentifier=postgres.instance_id
-                )["DBInstances"][0]
+                instance = rds.describe_db_instances(DBInstanceIdentifier=postgres.instance_id)[
+                    "DBInstances"
+                ][0]
                 instance_class = str(instance.get("DBInstanceClass") or "") or None
             result = capacity_parity(
                 lakebase_max_cu=lakebase_max_cu,
@@ -2893,9 +2917,7 @@ def _configure_lakebase(
             # Use each product's shortest native auto-suspend setting so the
             # re-do round measures the capability instead of normalizing away
             # Lakebase's faster idle policy.
-            json.dumps(
-                {"spec": {"suspend_timeout_duration": f"{LAKEBASE_SUSPEND_SECONDS}s"}}
-            ),
+            json.dumps({"spec": {"suspend_timeout_duration": f"{LAKEBASE_SUSPEND_SECONDS}s"}}),
             "--timeout",
             "10m",
             "-p",
@@ -3113,6 +3135,54 @@ def _enable_round5_lakebase_native_login(manifest: DemoManifest) -> tuple[str, s
     return _round5_lakebase_hosts(manifest)
 
 
+def _enable_coordination_lakebase_native_login(manifest: DemoManifest) -> None:
+    """Enable Postgres native-password login on the coordination project.
+
+    The Round 5 resident logins (`_rotate_round5_resident_login`) are native
+    Postgres roles that authenticate to the *coordination* endpoint with a
+    rotated password, not with a Databricks OAuth credential. That only works
+    when the coordination project has `enable_pg_native_login` turned on, the
+    same project-level switch `_enable_round5_lakebase_native_login` flips for the
+    measured Round 5 project. Enabling it live but not in code meant a fresh
+    provision/reconcile rotated resident roles onto a project that rejected their
+    password logins, so the residents could not reach the event store and warm
+    never reached ring_ready. This persists the setup so provision/reconcile no
+    longer regresses resident DB access. It embeds no secret: the flag is a
+    project capability, and the resident passwords are minted fresh in
+    `ensure_coordination`.
+    """
+
+    project_id = _coordination_lakebase_binding(manifest).project_id
+    project_name = f"projects/{project_id}"
+    project = _get_lakebase_project_or_none(manifest, project_id=project_id)
+    if project is None:
+        raise RuntimeError("Coordination Lakebase project disappeared during native-login setup")
+    if (project.get("status") or {}).get("enable_pg_native_login") is True:
+        return
+    _run(
+        [
+            "databricks",
+            "postgres",
+            "update-project",
+            project_name,
+            "spec.enable_pg_native_login",
+            "--json",
+            json.dumps({"spec": {"enable_pg_native_login": True}}),
+            "--timeout",
+            "10m",
+            "-p",
+            manifest.databricks.profile,
+            "-o",
+            "json",
+        ],
+        capture=True,
+        timeout=700,
+    )
+    project = _get_lakebase_project_or_none(manifest, project_id=project_id)
+    if project is None or (project.get("status") or {}).get("enable_pg_native_login") is not True:
+        raise RuntimeError("Coordination Lakebase native password login is not enabled")
+
+
 def _round5_runner_archive() -> str:
     from .connection_spike_live import RUNNER_ASSETS
 
@@ -3144,11 +3214,11 @@ def _round5_runner_archive() -> str:
 #: so a value chosen at the floor buys nothing and risks refusing a cleanup the
 #: runner would have permitted.
 ROUND5_SSM_COMMAND_TIMEOUT_SECONDS = 120
-# SSM limits the complete command document plus parameters to 100 KB. The
-# compressed base64 runner archive is one parameter entry; reserve 20 KB for the
-# document wrapper and install commands instead of carrying the old arbitrary
-# 20,000-character cliff.
-ROUND5_RUNNER_SSM_ARCHIVE_MAX_CHARS = 80_000
+# SSM limits one command document to 100 KB. Transfer the sealed archive in
+# individually bounded chunks, with an explicit total ceiling, so runner growth
+# does not force a weaker or unbounded install transport.
+ROUND5_RUNNER_SSM_ARCHIVE_CHUNK_CHARS = 60_000
+ROUND5_RUNNER_SSM_ARCHIVE_MAX_CHUNKS = 16
 
 
 def _run_round5_ssm_command(
@@ -3294,12 +3364,60 @@ def _configure_round5_runner(
     *,
     runner_instance_id: str,
     expected_harness_sha256: str,
+    resident_lane_id: str,
+    resident_control_queue_url: str,
+    resident_control_secret_arn: str,
 ) -> str:
     from .connection_spike_live import RUNNER_PATH, runner_asset_sha256s
 
     install_root = str(Path(RUNNER_PATH).parent)
     trust_bundle_path = f"{install_root}/round5-ca.pem"
     expected_assets = runner_asset_sha256s()
+    unit_name = f"lakebase-anti-demo-round5-{resident_lane_id}.service"
+    active_registry = (
+        f"/var/lib/lakebase-anti-demo/round5-jobs/resident-{resident_lane_id}-active.json"
+    )
+    attestation_path = f"/run/lakebase-anti-demo-round5-{resident_lane_id}.attestation.json"
+    stop_output = _run_round5_ssm_command(
+        session.client("ssm"),
+        runner_instance_id=runner_instance_id,
+        commands=[
+            "set -euo pipefail",
+            f"test ! -e {active_registry}",
+            (
+                f"if systemctl cat {unit_name} >/dev/null 2>&1; then "
+                f"systemctl show {unit_name} -p MainPID --value "
+                "| sed 's/^/OLD_PID=/'; "
+                f"test ! -e {attestation_path} || "
+                f'python3 -c "import json; '
+                f"v=json.load(open('{attestation_path}')); "
+                "print('OLD_PROCESS_BOOT=' + "
+                "str(v.get('runner_process_boot_id','')))\"; "
+                f"systemctl stop {unit_name}; "
+                f"systemctl is-active --quiet {unit_name} && exit 1 || true; "
+                f"rm -f {attestation_path}; "
+                "else echo OLD_PID=0; fi"
+            ),
+            f"rm -f {attestation_path}",
+        ],
+        timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+    )
+    old_pid = next(
+        (
+            int(line.removeprefix("OLD_PID="))
+            for line in stop_output.splitlines()
+            if line.startswith("OLD_PID=")
+        ),
+        0,
+    )
+    old_process_boot = next(
+        (
+            line.removeprefix("OLD_PROCESS_BOOT=")
+            for line in stop_output.splitlines()
+            if line.startswith("OLD_PROCESS_BOOT=")
+        ),
+        "",
+    )
     _install_round5_runner_assets(session, runner_instance_id=runner_instance_id)
     commands = [
         "set -euo pipefail",
@@ -3322,7 +3440,6 @@ def _configure_round5_runner(
         commands=commands,
         timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
     )
-
     installed_assets, harness_checksum, trust_checksum = _round5_runner_asset_checksums(
         session,
         runner_instance_id=runner_instance_id,
@@ -3332,6 +3449,76 @@ def _configure_round5_runner(
         raise RuntimeError("Round 5 runner per-file checksums differ from the local assets")
     if harness_checksum != expected_harness_sha256:
         raise RuntimeError("Round 5 runner checksum differs from the sealed local harness")
+
+    unit = "\n".join(
+        (
+            "[Unit]",
+            "Description=Lakebase Anti-Demo Round 5 resident runner",
+            "After=network-online.target",
+            "Wants=network-online.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            # A systemd service does not inherit the ambient AWS region the way an
+            # interactive SSM command does, and botocore does not derive one from
+            # IMDS on its own, so the resident agent's first client raised
+            # NoRegionError and the service crash-looped. Pin the region the
+            # provisioning session is operating in; the instance profile still
+            # supplies the credentials.
+            f"Environment=AWS_REGION={session.region_name}",
+            f"Environment=AWS_DEFAULT_REGION={session.region_name}",
+            (
+                f"ExecStart={RUNNER_PATH} --resident-agent {resident_lane_id} 0 "
+                f"{resident_control_queue_url} {resident_control_secret_arn}"
+            ),
+            "Restart=always",
+            "RestartSec=2",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+            "",
+        )
+    )
+    encoded_unit = base64.b64encode(unit.encode()).decode("ascii")
+    start_output = _run_round5_ssm_command(
+        session.client("ssm"),
+        runner_instance_id=runner_instance_id,
+        commands=[
+            "set -euo pipefail",
+            f"printf '%s' '{encoded_unit}' | base64 -d > /etc/systemd/system/{unit_name}",
+            f"chmod 0644 /etc/systemd/system/{unit_name}",
+            "systemctl daemon-reload",
+            f"systemctl enable --now {unit_name}",
+            "deadline=$((SECONDS + 60))",
+            (
+                f"until systemctl is-active --quiet {unit_name} "
+                f"&& test -s {attestation_path}; do "
+                "test $SECONDS -lt $deadline; sleep 1; done"
+            ),
+            f"new_pid=$(systemctl show {unit_name} -p MainPID --value)",
+            'test "$new_pid" -gt 0',
+            f"test \"$new_pid\" != '{old_pid}'",
+            (
+                f"python3 -c \"import json; v=json.load(open('{attestation_path}')); "
+                "assert int(v.get('pid',0)) == int('$new_pid'); "
+                f"assert v.get('runner_harness_sha256') == '{expected_harness_sha256}'; "
+                "print('NEW_PID=' + str(v.get('pid',''))); "
+                "print('NEW_PROCESS_BOOT=' + "
+                "str(v.get('runner_process_boot_id',''))); "
+                "print('LOADED_HARNESS=' + "
+                "str(v.get('runner_harness_sha256','')))\""
+            ),
+        ],
+        timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+    )
+    values = dict(line.split("=", 1) for line in start_output.splitlines() if "=" in line)
+    if (
+        not str(values.get("NEW_PID", "")).isdigit()
+        or int(values.get("NEW_PID", "0")) <= 0
+        or values.get("NEW_PROCESS_BOOT") in {"", old_process_boot}
+        or values.get("LOADED_HARNESS") != expected_harness_sha256
+    ):
+        raise RuntimeError("Round 5 resident process did not attest a new loaded harness")
     return trust_checksum
 
 
@@ -3340,35 +3527,76 @@ def _install_round5_runner_assets(
     *,
     runner_instance_id: str,
 ) -> None:
-    """Install only the three versioned runner assets and their Python environment."""
-    from .connection_spike_live import RUNNER_PATH
+    """Install the sealed runner assets through bounded SSM archive chunks."""
+    from .connection_spike_live import RUNNER_ASSETS, RUNNER_PATH
 
     install_root = str(Path(RUNNER_PATH).parent)
+    stage_root = f"{install_root}.next"
     archive = _round5_runner_archive()
-    if len(archive) > ROUND5_RUNNER_SSM_ARCHIVE_MAX_CHARS:
-        raise RuntimeError("Round 5 runner bundle exceeds the bounded SSM install payload")
-    commands = [
-        "set -euo pipefail",
-        "stage=bootstrap",
-        "trap 'echo ANTI_DEMO_STAGE=$stage >&2' ERR",
-        "stage=packages",
-        "dnf install -y python3.12",
-        "stage=directory",
-        f"install -d -m 0755 {install_root}",
-        "stage=archive",
-        f"printf '%s' '{archive}' | base64 -d | tar -xz -C {install_root}",
-        "stage=venv",
-        f"python3.12 -m venv {install_root}/venv",
-        "stage=dependencies",
-        f"{install_root}/venv/bin/pip install --disable-pip-version-check "
-        f"--no-cache-dir -r {install_root}/requirements-round5.txt",
-        "stage=permissions",
-        f"chmod 0755 {RUNNER_PATH} {install_root}/connection_spike_runner.py",
+    chunks = [
+        archive[index : index + ROUND5_RUNNER_SSM_ARCHIVE_CHUNK_CHARS]
+        for index in range(0, len(archive), ROUND5_RUNNER_SSM_ARCHIVE_CHUNK_CHARS)
     ]
+    if not chunks or len(chunks) > ROUND5_RUNNER_SSM_ARCHIVE_MAX_CHUNKS:
+        raise RuntimeError("Round 5 runner bundle exceeds the bounded SSM install payload")
+    archive_path = f"{install_root}/.runner-assets.tar.gz.b64"
+    ssm = session.client("ssm")
     _run_round5_ssm_command(
-        session.client("ssm"),
+        ssm,
         runner_instance_id=runner_instance_id,
-        commands=commands,
+        commands=[
+            "set -euo pipefail",
+            "stage=bootstrap",
+            "trap 'echo ANTI_DEMO_STAGE=$stage >&2' ERR",
+            "stage=packages",
+            "dnf install -y python3.12",
+            "stage=directory",
+            f"install -d -m 0755 {install_root}",
+            f"install -m 0600 /dev/null {archive_path}",
+        ],
+        timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+    )
+    for index, chunk in enumerate(chunks):
+        _run_round5_ssm_command(
+            ssm,
+            runner_instance_id=runner_instance_id,
+            commands=[
+                "set -euo pipefail",
+                f"test -f {archive_path}",
+                f"printf '%s' '{chunk}' >> {archive_path}",
+                f"echo ARCHIVE_CHUNK={index + 1}/{len(chunks)}",
+            ],
+            timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+        )
+    _run_round5_ssm_command(
+        ssm,
+        runner_instance_id=runner_instance_id,
+        commands=[
+            "set -euo pipefail",
+            "stage=archive",
+            "trap 'echo ANTI_DEMO_STAGE=$stage >&2' ERR",
+            f"rm -rf {stage_root}",
+            f"install -d -m 0755 {stage_root}",
+            f"base64 -d {archive_path} | tar -xz -C {stage_root}",
+            f"rm -f {archive_path}",
+            "stage=venv",
+            f"python3.12 -m venv {stage_root}/venv",
+            "stage=dependencies",
+            f"{stage_root}/venv/bin/pip install --disable-pip-version-check "
+            f"--no-cache-dir -r {stage_root}/requirements-round5.txt",
+            "stage=permissions",
+            *(
+                f"install -m {'0755' if name.endswith('.sh') or name.endswith('.py') else '0644'} "
+                f"{stage_root}/{name} {install_root}/{name}.next"
+                for name in RUNNER_ASSETS
+            ),
+            *(f"mv {install_root}/{name}.next {install_root}/{name}" for name in RUNNER_ASSETS),
+            f"rm -rf {install_root}/venv.old",
+            f"test ! -e {install_root}/venv || mv {install_root}/venv {install_root}/venv.old",
+            f"mv {stage_root}/venv {install_root}/venv",
+            f"rm -rf {stage_root} {install_root}/venv.old",
+            f"chmod 0755 {RUNNER_PATH} {install_root}/connection_spike_runner.py",
+        ],
         timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
     )
 
@@ -3413,11 +3641,7 @@ def _round5_runner_asset_checksums(
     for line in output.splitlines():
         if line.startswith("ASSET="):
             name, separator, checksum = line.removeprefix("ASSET=").partition(":")
-            if (
-                separator
-                and name in RUNNER_ASSETS
-                and re.fullmatch(r"[0-9a-f]{64}", checksum)
-            ):
+            if separator and name in RUNNER_ASSETS and re.fullmatch(r"[0-9a-f]{64}", checksum):
                 assets[name] = checksum
         elif line.startswith("HARNESS="):
             harness = line.removeprefix("HARNESS=")
@@ -3450,6 +3674,7 @@ def _round5_runner_credential_digests(
     session: boto3.Session,
     *,
     runner_instance_id: str,
+    credential_ids: tuple[str, ...] = ("aurora", "lakebase", "rds"),
 ) -> dict[str, str]:
     """Hash the runner's baseline credentials with the runner's own code.
 
@@ -3493,7 +3718,7 @@ def _round5_runner_credential_digests(
             "module = importlib.util.module_from_spec(spec)",
             "sys.modules[spec.name] = module",
             "spec.loader.exec_module(module)",
-            "for lane in sorted(module.BASELINE_CREDENTIAL_PATHS):",
+            f"for lane in {tuple(sorted(credential_ids))!r}:",
             "    keys = (",
             "        module.RDS_BASELINE_KEYS",
             "        if lane in module.AWS_CREDENTIAL_IDS",
@@ -3512,9 +3737,7 @@ def _round5_runner_credential_digests(
         if line.strip().startswith("DIGEST_") and "=" in line
         for key, value in [line.strip().split("=", 1)]
     }
-    if not digests or any(
-        not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in digests.values()
-    ):
+    if not digests or any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in digests.values()):
         raise RuntimeError("Round 5 secret-free credential doctor returned invalid output")
     return digests
 
@@ -3538,12 +3761,29 @@ def _required_round5_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
         "aurora_proxy_secret_arn": "round5_aurora_proxy_secret_arn",
         "rds_proxy_secret_arn": "round5_rds_proxy_secret_arn",
         "runner_permissions_boundary_arn": "round5_runner_permissions_boundary_arn",
+        "competitor_runner_permissions_boundary_arn": (
+            "round5_competitor_runner_permissions_boundary_arn"
+        ),
         "runner_instance_id": "round5_runner_instance_id",
+        "competitor_runner_instance_id": "round5_competitor_runner_instance_id",
+        "lakebase_control_queue_url": "round5_lakebase_control_queue_url",
+        "competitor_control_queue_url": "round5_competitor_control_queue_url",
+        "lakebase_control_queue_arn": "round5_lakebase_control_queue_arn",
+        "competitor_control_queue_arn": "round5_competitor_control_queue_arn",
+        "runner_control_secret_arn": "round5_runner_control_secret_arn",
+        "competitor_runner_control_secret_arn": "round5_competitor_runner_control_secret_arn",
         "runner_instance_profile_arn": "round5_runner_instance_profile_arn",
         "runner_role_arn": "round5_runner_role_arn",
+        "competitor_runner_instance_profile_arn": "round5_competitor_runner_instance_profile_arn",
+        "competitor_runner_role_arn": "round5_competitor_runner_role_arn",
         "runner_subnet_id": "round5_runner_subnet_id",
         "runner_security_group_id": "round5_runner_security_group_id",
         "runner_egress_rule_id": "round5_runner_egress_rule_id",
+        "lakebase_runner_egress_rule_ids": "round5_lakebase_runner_egress_rule_ids",
+        "competitor_runner_security_group_id": "round5_competitor_runner_security_group_id",
+        "competitor_runner_egress_rule_ids": "round5_competitor_runner_egress_rule_ids",
+        "aurora_proxy_security_group_id": "round5_aurora_proxy_security_group_id",
+        "rds_proxy_security_group_id": "round5_rds_proxy_security_group_id",
         "bout_name_prefix": "round5_bout_name_prefix",
         "ownership_tags": "round5_bout_base_tags",
     }
@@ -3564,9 +3804,20 @@ def _required_round5_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
             "Terraform state is missing required Round 5 baseline outputs: " + ", ".join(missing)
         )
     for field in fields:
-        if field not in {"ownership_tags", "proxy_subnet_ids"}:
+        if field not in {
+            "ownership_tags",
+            "proxy_subnet_ids",
+            "lakebase_runner_egress_rule_ids",
+            "competitor_runner_egress_rule_ids",
+        }:
             values[field] = str(values[field])
     values["proxy_subnet_ids"] = tuple(str(item) for item in values["proxy_subnet_ids"])
+    values["lakebase_runner_egress_rule_ids"] = tuple(
+        str(item) for item in values["lakebase_runner_egress_rule_ids"]
+    )
+    values["competitor_runner_egress_rule_ids"] = tuple(
+        str(item) for item in values["competitor_runner_egress_rule_ids"]
+    )
     return values
 
 
@@ -3803,6 +4054,12 @@ def _round5_topology_check(
     sealed = resources or (manifest.round5 if manifest.round5_ready else None)
     if not isinstance(sealed, Round5Resources):
         return Check("round5_secret_free_topology", False, "manifest has no Round 5 seal")
+    if not sealed.v3_factory_ready:
+        return Check(
+            "round5_secret_free_topology",
+            False,
+            "Round 5 requires the lane-isolated runner secret and security-group migration",
+        )
     try:
         round5_binding = _round_lakebase_binding(manifest, 5)
         project = (
@@ -3867,49 +4124,96 @@ def _round5_topology_check(
             raise RuntimeError("RDS source is not on default.postgres17, available, and in-sync")
 
         ec2 = session.client("ec2")
-        instances = ec2.describe_instances(InstanceIds=[sealed.runner_instance_id]).get(
-            "Reservations", []
+        runner_ids = (
+            (
+                sealed.runner_instance_id,
+                str(sealed.competitor_runner_instance_id),
+            )
+            if sealed.v3_factory_ready
+            else (sealed.runner_instance_id,)
+        )
+        instances = ec2.describe_instances(InstanceIds=list(runner_ids)).get(
+            "Reservations",
+            [],
         )
         runners = [
             instance for reservation in instances for instance in reservation.get("Instances", [])
         ]
-        if len(runners) != 1:
-            raise RuntimeError("Round 5 runner did not resolve exactly once")
-        runner = runners[0]
-        groups = [item.get("GroupId") for item in runner.get("SecurityGroups", [])]
-        if (
-            runner.get("InstanceId") != sealed.runner_instance_id
-            or (runner.get("State") or {}).get("Name") != "running"
-            or runner.get("InstanceType") != ROUND5_RUNNER_INSTANCE_TYPE
-            or not runner.get("PublicIpAddress")
-            or runner.get("SubnetId") != sealed.runner_subnet_id
-            or runner.get("VpcId") != sealed.vpc_id
-            or groups != [sealed.runner_security_group_id]
-            or (runner.get("IamInstanceProfile") or {}).get("Arn")
-            != sealed.runner_instance_profile_arn
-            or (runner.get("MetadataOptions") or {}).get("HttpTokens") != "required"
-        ):
-            raise RuntimeError("Round 5 runner topology differs from the sealed contract")
+        if len(runners) != len(runner_ids) or {
+            str(runner.get("InstanceId") or "") for runner in runners
+        } != set(runner_ids):
+            raise RuntimeError("Round 5 physical runners did not resolve exactly")
+        expected_profiles = {
+            sealed.runner_instance_id: sealed.runner_instance_profile_arn,
+            str(sealed.competitor_runner_instance_id): (
+                sealed.competitor_runner_instance_profile_arn
+            ),
+        }
+        expected_runner_groups = {
+            sealed.runner_instance_id: sealed.runner_security_group_id,
+            str(sealed.competitor_runner_instance_id): (sealed.competitor_runner_security_group_id),
+        }
+        for runner in runners:
+            groups = [item.get("GroupId") for item in runner.get("SecurityGroups", [])]
+            runner_id = str(runner.get("InstanceId") or "")
+            if (
+                (runner.get("State") or {}).get("Name") != "running"
+                or runner.get("InstanceType") != ROUND5_RUNNER_INSTANCE_TYPE
+                or not runner.get("PublicIpAddress")
+                or runner.get("SubnetId") != sealed.runner_subnet_id
+                or runner.get("VpcId") != sealed.vpc_id
+                or groups != [expected_runner_groups[runner_id]]
+                or (runner.get("IamInstanceProfile") or {}).get("Arn")
+                != expected_profiles[runner_id]
+                or (runner.get("MetadataOptions") or {}).get("HttpTokens") != "required"
+            ):
+                raise RuntimeError("Round 5 runner topology differs from the sealed contract")
         runner_groups = ec2.describe_security_groups(
-            GroupIds=[sealed.runner_security_group_id]
+            GroupIds=list(expected_runner_groups.values())
         ).get("SecurityGroups", [])
-        if len(runner_groups) != 1 or runner_groups[0].get("IpPermissions"):
-            raise RuntimeError("Round 5 runner security group permits inbound traffic")
-        rules = ec2.describe_security_group_rules(
-            Filters=[
-                {
-                    "Name": "group-id",
-                    "Values": [sealed.runner_security_group_id],
-                }
-            ]
-        ).get("SecurityGroupRules", [])
-        if len(rules) != 1 or not (
-            rules[0].get("SecurityGroupRuleId") == sealed.runner_egress_rule_id
-            and rules[0].get("IsEgress") is True
-            and rules[0].get("IpProtocol") == "-1"
-            and rules[0].get("CidrIpv4") == "0.0.0.0/0"
+        if (
+            len(runner_groups) != 2
+            or {group.get("GroupId") for group in runner_groups}
+            != set(expected_runner_groups.values())
+            or any(group.get("IpPermissions") for group in runner_groups)
         ):
-            raise RuntimeError("Round 5 runner egress differs from the baseline seal")
+            raise RuntimeError("Round 5 runner security groups are not distinct and ingress-free")
+        expected_egress_ids = {
+            sealed.runner_security_group_id: set(sealed.lakebase_runner_egress_rule_ids),
+            str(sealed.competitor_runner_security_group_id): set(
+                sealed.competitor_runner_egress_rule_ids
+            ),
+        }
+        for group_id, expected_rule_ids in expected_egress_ids.items():
+            rules = ec2.describe_security_group_rules(
+                Filters=[{"Name": "group-id", "Values": [group_id]}]
+            ).get("SecurityGroupRules", [])
+            if {
+                str(rule.get("SecurityGroupRuleId") or "") for rule in rules
+            } != expected_rule_ids or any(
+                rule.get("IsEgress") is not True
+                or rule.get("IpProtocol") != "tcp"
+                or rule.get("FromPort") not in {443, 5432}
+                or rule.get("ToPort") != rule.get("FromPort")
+                for rule in rules
+            ):
+                raise RuntimeError(
+                    "Round 5 runner egress differs from the lane-scoped baseline seal"
+                )
+            if group_id == sealed.runner_security_group_id:
+                public_ports = {
+                    rule.get("FromPort") for rule in rules if rule.get("CidrIpv4") == "0.0.0.0/0"
+                }
+                if public_ports != {443, 5432}:
+                    raise RuntimeError(
+                        "Round 5 Lakebase runner public egress is not limited "
+                        "to HTTPS and PostgreSQL"
+                    )
+            elif any(
+                rule.get("FromPort") == 5432 and rule.get("CidrIpv4") == "0.0.0.0/0"
+                for rule in rules
+            ):
+                raise RuntimeError("Round 5 competitor runner has public PostgreSQL egress")
 
         iam = session.client("iam")
         runner_role_name = sealed.runner_role_arn.rsplit("/", 1)[-1]
@@ -3930,6 +4234,30 @@ def _round5_topology_check(
             role.get("Arn") for role in profile.get("Roles", [])
         ] != [sealed.runner_role_arn]:
             raise RuntimeError("Round 5 runner instance profile differs from the seal")
+        competitor_role_arn = str(sealed.competitor_runner_role_arn)
+        competitor_role_name = competitor_role_arn.rsplit("/", 1)[-1]
+        competitor_role = iam.get_role(RoleName=competitor_role_name).get("Role") or {}
+        if (
+            competitor_role.get("Arn") != competitor_role_arn
+            or (competitor_role.get("PermissionsBoundary") or {}).get("PermissionsBoundaryArn")
+            != sealed.competitor_runner_permissions_boundary_arn
+            or _canonical_iam_policy(competitor_role.get("AssumeRolePolicyDocument"))
+            != _canonical_iam_policy(sealed.runner_trust_policy)
+        ):
+            raise RuntimeError(
+                "Round 5 competitor runner role, trust, or boundary differs from the seal"
+            )
+        competitor_profile_arn = str(sealed.competitor_runner_instance_profile_arn)
+        competitor_profile = (
+            iam.get_instance_profile(
+                InstanceProfileName=competitor_profile_arn.rsplit("/", 1)[-1]
+            ).get("InstanceProfile")
+            or {}
+        )
+        if competitor_profile.get("Arn") != competitor_profile_arn or [
+            role.get("Arn") for role in competitor_profile.get("Roles", [])
+        ] != [competitor_role_arn]:
+            raise RuntimeError("Round 5 competitor runner instance profile differs from the seal")
         control_name = sealed.control_role_arn.rsplit("/", 1)[-1]
         control_role = iam.get_role(RoleName=control_name).get("Role") or {}
         if control_role.get("Arn") != sealed.control_role_arn or _canonical_iam_policy(
@@ -3940,6 +4268,15 @@ def _round5_topology_check(
             iam.get_policy(PolicyArn=sealed.runner_permissions_boundary_arn).get("Policy") or {}
         ).get("Arn") != sealed.runner_permissions_boundary_arn:
             raise RuntimeError("Round 5 runner permissions boundary differs from the seal")
+        if (
+            iam.get_policy(PolicyArn=sealed.competitor_runner_permissions_boundary_arn).get(
+                "Policy"
+            )
+            or {}
+        ).get("Arn") != sealed.competitor_runner_permissions_boundary_arn:
+            raise RuntimeError(
+                "Round 5 competitor runner permissions boundary differs from the seal"
+            )
 
         proxy_role_arn = str(sealed.proxy_service_role_arn)
         proxy_role_name = proxy_role_arn.rsplit("/", 1)[-1]
@@ -4013,28 +4350,44 @@ def _round5_topology_check(
                 or any(secret_tags.get(key) != value for key, value in expected_secret_tags.items())
             ):
                 raise RuntimeError(f"Round 5 static {lane_id} Proxy secret differs from the seal")
-        managed = (
-            session.client("ssm")
-            .describe_instance_information(
-                Filters=[{"Key": "InstanceIds", "Values": [sealed.runner_instance_id]}]
+        ssm = session.client("ssm")
+        for runner_instance_id in runner_ids:
+            managed = ssm.describe_instance_information(
+                Filters=[{"Key": "InstanceIds", "Values": [runner_instance_id]}]
+            ).get("InstanceInformationList", [])
+            if (
+                len(managed) != 1
+                or managed[0].get("InstanceId") != runner_instance_id
+                or str(managed[0].get("PingStatus") or "").upper() != "ONLINE"
+            ):
+                raise RuntimeError("A Round 5 physical runner is not online in SSM")
+            harness, trust = _round5_runner_checksums(
+                session,
+                runner_instance_id=runner_instance_id,
+                trust_bundle_path=sealed.trust_bundle_path,
             )
-            .get("InstanceInformationList", [])
-        )
-        if (
-            len(managed) != 1
-            or managed[0].get("InstanceId") != sealed.runner_instance_id
-            or str(managed[0].get("PingStatus") or "").upper() != "ONLINE"
-        ):
-            raise RuntimeError("Round 5 runner is not online in SSM")
-        harness, trust = _round5_runner_checksums(
-            session,
-            runner_instance_id=sealed.runner_instance_id,
-            trust_bundle_path=sealed.trust_bundle_path,
-        )
-        if harness != sealed.harness_sha256 or trust != sealed.trust_bundle_sha256:
-            raise RuntimeError("Round 5 runner or trust-bundle checksum differs from v5")
-        digests = _round5_runner_credential_digests(
-            session, runner_instance_id=sealed.runner_instance_id
+            if harness != sealed.harness_sha256 or trust != sealed.trust_bundle_sha256:
+                raise RuntimeError(
+                    "A Round 5 runner or trust-bundle checksum differs from the seal"
+                )
+        digests = (
+            {
+                **_round5_runner_credential_digests(
+                    session,
+                    runner_instance_id=sealed.runner_instance_id,
+                    credential_ids=("lakebase",),
+                ),
+                **_round5_runner_credential_digests(
+                    session,
+                    runner_instance_id=str(sealed.competitor_runner_instance_id),
+                    credential_ids=("aurora", "rds"),
+                ),
+            }
+            if sealed.v3_factory_ready
+            else _round5_runner_credential_digests(
+                session,
+                runner_instance_id=sealed.runner_instance_id,
+            )
         )
         # `getattr` without a default on purpose: if a sealed field is ever
         # renamed, this raises rather than quietly comparing nothing.
@@ -4129,21 +4482,26 @@ def _require_round5_tags_the_control_role_allows(iam: Any, sealed: Round5Resourc
 
 
 def _require_round5_runner_idle(manifest: DemoManifest) -> None:
-    """Fail cleanup closed while a bounded Round 5 command still owns the runner."""
+    """Fail cleanup closed while either physical Round 5 runner is active."""
     if not manifest.round5_ready:
         return
     round5 = manifest.require_round5_resources()
-    output = _run_round5_ssm_command(
-        _aws_session(manifest).client("ssm"),
-        runner_instance_id=round5.runner_instance_id,
-        commands=[
-            "set -euo pipefail",
-            "flock -n /run/lock/lakebase-anti-demo-round5.lock -c 'echo RUNNER_IDLE'",
-        ],
-        timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
-    )
-    if output.strip() != "RUNNER_IDLE":
-        raise RuntimeError("Cleanup refused: the Round 5 runner lock is not free")
+    ssm = _aws_session(manifest).client("ssm")
+    for lane_id, runner_instance_id in (
+        ("lakebase", round5.runner_instance_id),
+        ("competitor", round5.competitor_runner_instance_id),
+    ):
+        output = _run_round5_ssm_command(
+            ssm,
+            runner_instance_id=str(runner_instance_id),
+            commands=[
+                "set -euo pipefail",
+                "flock -n /run/lock/lakebase-anti-demo-round5.lock -c 'echo RUNNER_IDLE'",
+            ],
+            timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+        )
+        if output.strip() != "RUNNER_IDLE":
+            raise RuntimeError(f"Cleanup refused: the Round 5 {lane_id} runner lock is not free")
 
 
 def _reseal_round5_harness(sealed: Round5Resources, harness_sha256: str) -> Round5Resources:
@@ -4267,27 +4625,36 @@ def _verify_round5_runner_instance(
     session: boto3.Session,
 ) -> None:
     sealed = manifest.require_round5_resources()
-    reservations = session.client("ec2", region_name=manifest.aws.region).describe_instances(
-        InstanceIds=[sealed.runner_instance_id]
-    ).get("Reservations", [])
+    expected_ids = {
+        sealed.runner_instance_id,
+        str(sealed.competitor_runner_instance_id),
+    }
+    reservations = (
+        session.client("ec2", region_name=manifest.aws.region)
+        .describe_instances(InstanceIds=sorted(expected_ids))
+        .get("Reservations", [])
+    )
     instances = [
         instance for reservation in reservations for instance in reservation.get("Instances", [])
     ]
-    if len(instances) != 1:
-        raise RuntimeError("Runner refresh refused: the sealed EC2 runner did not resolve once")
-    instance = instances[0]
-    availability_zone = str((instance.get("Placement") or {}).get("AvailabilityZone") or "")
-    profile_arn = str((instance.get("IamInstanceProfile") or {}).get("Arn") or "")
-    if (
-        instance.get("InstanceId") != sealed.runner_instance_id
-        or (instance.get("State") or {}).get("Name") != "running"
-        or not availability_zone.startswith(manifest.aws.region)
-        or profile_arn != sealed.runner_instance_profile_arn
-    ):
-        raise RuntimeError(
-            "Runner refresh refused: the EC2 runner no longer matches its sealed "
-            "account, region, state, or instance profile"
-        )
+    if len(instances) != 2 or {item.get("InstanceId") for item in instances} != expected_ids:
+        raise RuntimeError("Runner refresh refused: both sealed EC2 runners did not resolve")
+    expected_profiles = {
+        sealed.runner_instance_id: sealed.runner_instance_profile_arn,
+        str(sealed.competitor_runner_instance_id): (sealed.competitor_runner_instance_profile_arn),
+    }
+    for instance in instances:
+        availability_zone = str((instance.get("Placement") or {}).get("AvailabilityZone") or "")
+        profile_arn = str((instance.get("IamInstanceProfile") or {}).get("Arn") or "")
+        if (
+            (instance.get("State") or {}).get("Name") != "running"
+            or not availability_zone.startswith(manifest.aws.region)
+            or profile_arn != expected_profiles[str(instance.get("InstanceId") or "")]
+        ):
+            raise RuntimeError(
+                "Runner refresh refused: an EC2 runner no longer matches its sealed "
+                "account, region, state, or instance profile"
+            )
 
 
 def _refresh_round5_runner_locked(
@@ -4302,59 +4669,71 @@ def _refresh_round5_runner_locked(
     sealed = manifest.require_round5_resources()
     source_assets = runner_asset_sha256s()
     source_harness = runner_harness_sha256()
-    try:
-        installed_assets, installed_harness, installed_trust = (
-            _round5_runner_asset_checksums(
+    installed_by_lane: dict[str, tuple[dict[str, str], str, str]] = {}
+    for lane_id, runner_instance_id in (
+        ("lakebase", sealed.runner_instance_id),
+        ("competitor", str(sealed.competitor_runner_instance_id)),
+    ):
+        try:
+            installed_assets, installed_harness, installed_trust = _round5_runner_asset_checksums(
                 session,
-                runner_instance_id=sealed.runner_instance_id,
+                runner_instance_id=runner_instance_id,
                 trust_bundle_path=sealed.trust_bundle_path,
             )
-        )
-    except Exception:
-        # A missing/corrupt runner file is the main condition this command exists
-        # to repair. The post-install read below remains mandatory and fail-closed.
-        installed_assets, installed_harness, installed_trust = {}, "", ""
-    aligned = (
-        installed_assets == source_assets
-        and installed_harness == source_harness
-        and installed_trust == sealed.trust_bundle_sha256
-    )
-    if not aligned:
+        except Exception:
+            installed_assets, installed_harness, installed_trust = {}, "", ""
+        # A disk hash is not a live-process attestation. Rotate and re-attest on
+        # every explicit refresh even when the bytes already match.
         try:
-            _install_round5_runner_assets(
+            _configure_round5_runner(
                 session,
-                runner_instance_id=sealed.runner_instance_id,
+                runner_instance_id=runner_instance_id,
+                expected_harness_sha256=source_harness,
+                resident_lane_id=lane_id,
+                resident_control_queue_url=(
+                    str(sealed.lakebase_control_queue_url)
+                    if lane_id == "lakebase"
+                    else str(sealed.competitor_control_queue_url)
+                ),
+                resident_control_secret_arn=str(
+                    sealed.runner_control_secret_arn
+                    if lane_id == "lakebase"
+                    else sealed.competitor_runner_control_secret_arn
+                ),
             )
         except Exception as exc:
             stage = re.search(r" at stage ([a-z_]{1,32})", str(exc))
             stage_detail = f"; stage={stage.group(1)}" if stage else ""
             raise RuntimeError(
-                "Runner refresh failed during the bounded SSM install; "
+                f"{lane_id} runner refresh failed during the bounded SSM install; "
                 "the manifest seal was not changed "
                 f"(category=runner_install_failed{stage_detail})"
             ) from None
         try:
-            installed_assets, installed_harness, installed_trust = (
-                _round5_runner_asset_checksums(
-                    session,
-                    runner_instance_id=sealed.runner_instance_id,
-                    trust_bundle_path=sealed.trust_bundle_path,
-                )
+            installed_assets, installed_harness, installed_trust = _round5_runner_asset_checksums(
+                session,
+                runner_instance_id=runner_instance_id,
+                trust_bundle_path=sealed.trust_bundle_path,
             )
         except Exception:
             raise RuntimeError(
-                "Runner refresh could not verify the installed files; "
+                f"{lane_id} runner refresh could not verify the installed files; "
                 "the manifest seal was not changed (category=runner_verify_failed)"
             ) from None
-    if installed_assets != source_assets or installed_harness != source_harness:
-        raise RuntimeError(
-            "Runner refresh installed bytes that differ from source; "
-            "the manifest seal was not changed (category=runner_hash_mismatch)"
-        )
-    if installed_trust != sealed.trust_bundle_sha256:
-        raise RuntimeError(
-            "Runner refresh found trust-bundle drift; the manifest seal was not changed "
-            "(category=runner_trust_mismatch)"
+        if installed_assets != source_assets or installed_harness != source_harness:
+            raise RuntimeError(
+                f"{lane_id} runner refresh installed bytes that differ from source; "
+                "the manifest seal was not changed (category=runner_hash_mismatch)"
+            )
+        if installed_trust != sealed.trust_bundle_sha256:
+            raise RuntimeError(
+                f"{lane_id} runner refresh found trust-bundle drift; "
+                "the manifest seal was not changed (category=runner_trust_mismatch)"
+            )
+        installed_by_lane[lane_id] = (
+            installed_assets,
+            installed_harness,
+            installed_trust,
         )
     if runner_asset_sha256s() != source_assets or runner_harness_sha256() != source_harness:
         raise RuntimeError(
@@ -4377,7 +4756,8 @@ def _refresh_round5_runner_locked(
             "(category=runner_seal_write_failed); run './antidemo runner refresh' again"
         ) from None
     print(f"RUNNER source   sha256:{source_harness}", flush=True)
-    print(f"RUNNER installed sha256:{installed_harness}", flush=True)
+    for lane_id, (_assets, installed_harness, _trust) in installed_by_lane.items():
+        print(f"RUNNER {lane_id} installed sha256:{installed_harness}", flush=True)
     sealed_harness = candidate.require_round5_resources().harness_sha256
     print(f"RUNNER sealed    sha256:{sealed_harness}", flush=True)
     return candidate
@@ -4402,8 +4782,7 @@ async def _refresh_round5_runner_under_fence(
         await sibling.initialize()
         rings.append((sibling, label))
     operator = BoutOperator(
-        display_name=manifest.owner.split("@", 1)[0].replace(".", " ").title()
-        or "Demo operator",
+        display_name=manifest.owner.split("@", 1)[0].replace(".", " ").title() or "Demo operator",
         email=manifest.owner if "@" in manifest.owner else None,
         subject=f"maintenance:{manifest.owner.casefold()}",
     )
@@ -4501,11 +4880,16 @@ def refresh_round5_runner(*, timeout: float = 300.0) -> DemoManifest:
     )
     session = _round5_runner_refresh_session(manifest)
     _verify_round5_runner_instance(manifest, session)
-    _wait_round5_runner_ready(
-        session,
-        runner_instance_id=manifest.require_round5_resources().runner_instance_id,
-        timeout=timeout,
-    )
+    sealed = manifest.require_round5_resources()
+    for runner_instance_id in (
+        sealed.runner_instance_id,
+        sealed.competitor_runner_instance_id,
+    ):
+        _wait_round5_runner_ready(
+            session,
+            runner_instance_id=str(runner_instance_id),
+            timeout=timeout,
+        )
     return asyncio.run(
         _refresh_round5_runner_under_fence(
             manifest,
@@ -4566,6 +4950,10 @@ def _reseal_round5(sealed: Round5Resources, **updates: Any) -> Round5Resources:
         exclude_none=True,
     )
     values.update(updates)
+    # Keep derivation in lockstep with `require_canonical_hashes`: an empty
+    # migratable field is dropped on both sides so a pre-field seal reseals to
+    # the same baseline it loaded with. A populated field is preserved and hashed.
+    values = canonical_round5_seal_payload(values)
     baseline_sha256 = hashlib.sha256(
         json.dumps(values, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -4711,17 +5099,26 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
     _wait_round5_runner_ready(
         session, runner_instance_id=outputs["runner_instance_id"], timeout=timeout
     )
+    _wait_round5_runner_ready(
+        session,
+        runner_instance_id=outputs["competitor_runner_instance_id"],
+        timeout=timeout,
+    )
 
     # A seal minted before the observer digests existed verifies clean but cannot run
     # the fan-in protocol, because its request names an observer credential per lane.
     # Treat that as material to re-mint rather than as a seal to confirm, or the
     # installation stays permanently on the bounded protocol with nothing reporting why.
-    _observer_sealed = manifest.round5_ready and all(
-        getattr(manifest.round5, name, None)
-        for name in (
-            "lakebase_observer_credential_sha256",
-            "aurora_observer_credential_sha256",
-            "rds_observer_credential_sha256",
+    _observer_sealed = (
+        manifest.round5_ready
+        and bool(getattr(manifest.round5, "v3_factory_ready", False))
+        and all(
+            getattr(manifest.round5, name, None)
+            for name in (
+                "lakebase_observer_credential_sha256",
+                "aurora_observer_credential_sha256",
+                "rds_observer_credential_sha256",
+            )
         )
     )
     if manifest.round5_ready and _observer_sealed:
@@ -4744,12 +5141,27 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             "aurora_proxy_secret_arn",
             "rds_proxy_secret_arn",
             "runner_permissions_boundary_arn",
+            "competitor_runner_permissions_boundary_arn",
             "runner_instance_id",
+            "competitor_runner_instance_id",
+            "lakebase_control_queue_url",
+            "competitor_control_queue_url",
+            "lakebase_control_queue_arn",
+            "competitor_control_queue_arn",
+            "runner_control_secret_arn",
+            "competitor_runner_control_secret_arn",
             "runner_instance_profile_arn",
             "runner_role_arn",
+            "competitor_runner_instance_profile_arn",
+            "competitor_runner_role_arn",
             "runner_subnet_id",
             "runner_security_group_id",
             "runner_egress_rule_id",
+            "lakebase_runner_egress_rule_ids",
+            "competitor_runner_security_group_id",
+            "competitor_runner_egress_rule_ids",
+            "aurora_proxy_security_group_id",
+            "rds_proxy_security_group_id",
             "bout_name_prefix",
         ):
             if outputs[field] != getattr(sealed, field):
@@ -4758,7 +5170,20 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             session,
             runner_instance_id=outputs["runner_instance_id"],
             expected_harness_sha256=harness_sha256,
+            resident_lane_id="lakebase",
+            resident_control_queue_url=outputs["lakebase_control_queue_url"],
+            resident_control_secret_arn=outputs["runner_control_secret_arn"],
         )
+        competitor_trust_bundle_sha256 = _configure_round5_runner(
+            session,
+            runner_instance_id=outputs["competitor_runner_instance_id"],
+            expected_harness_sha256=harness_sha256,
+            resident_lane_id="competitor",
+            resident_control_queue_url=outputs["competitor_control_queue_url"],
+            resident_control_secret_arn=outputs["competitor_runner_control_secret_arn"],
+        )
+        if competitor_trust_bundle_sha256 != trust_bundle_sha256:
+            raise RuntimeError("Round 5 physical runners installed different trust bundles")
         if trust_bundle_sha256 != sealed.trust_bundle_sha256:
             raise RuntimeError("Round 5 trust bundle differs from the existing v5 seal")
         ssm = session.client("ssm")
@@ -4773,6 +5198,20 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
         )
         if public_key_result.get("public_key_sha256") != sealed.runner_public_key_sha256:
             raise RuntimeError("Round 5 runner public key differs from the v5 seal")
+        competitor_public_key_result = _round5_setup_request(
+            ssm,
+            runner_instance_id=sealed.competitor_runner_instance_id,
+            payload={
+                "protocol": "connection-spike-setup-v1",
+                "action": "public_key",
+                "nonce": secrets.token_hex(16),
+            },
+        )
+        if (
+            competitor_public_key_result.get("public_key_sha256")
+            != sealed.competitor_runner_public_key_sha256
+        ):
+            raise RuntimeError("Round 5 competitor runner public key differs from the seal")
         common = {
             "protocol": "connection-spike-setup-v1",
             "bout_id": f"baseline-{manifest.run_id}",
@@ -4797,7 +5236,7 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
         )
         _reassert_round5_aws_credentials(
             ssm,
-            runner_instance_id=sealed.runner_instance_id,
+            runner_instance_id=str(sealed.competitor_runner_instance_id),
             common=common,
             lanes=(
                 (
@@ -4835,7 +5274,20 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             session,
             runner_instance_id=outputs["runner_instance_id"],
             expected_harness_sha256=harness_sha256,
+            resident_lane_id="lakebase",
+            resident_control_queue_url=outputs["lakebase_control_queue_url"],
+            resident_control_secret_arn=outputs["runner_control_secret_arn"],
         )
+        competitor_trust_bundle_sha256 = _configure_round5_runner(
+            session,
+            runner_instance_id=outputs["competitor_runner_instance_id"],
+            expected_harness_sha256=harness_sha256,
+            resident_lane_id="competitor",
+            resident_control_queue_url=outputs["competitor_control_queue_url"],
+            resident_control_secret_arn=outputs["competitor_runner_control_secret_arn"],
+        )
+        if competitor_trust_bundle_sha256 != trust_bundle_sha256:
+            raise RuntimeError("Round 5 physical runners installed different trust bundles")
         ssm = session.client("ssm")
         baseline_bout = f"baseline-{manifest.run_id}"
         public_key_result = _round5_setup_request(
@@ -4857,6 +5309,27 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             raise RuntimeError("Round 5 runner public key is invalid") from exc
         if actual_public_key_sha256 != public_key_sha256:
             raise RuntimeError("Round 5 runner public-key digest is invalid")
+        competitor_public_key_result = _round5_setup_request(
+            ssm,
+            runner_instance_id=outputs["competitor_runner_instance_id"],
+            payload={
+                "protocol": "connection-spike-setup-v1",
+                "action": "public_key",
+                "nonce": secrets.token_hex(16),
+            },
+        )
+        competitor_public_key = str(competitor_public_key_result.get("public_key") or "")
+        competitor_public_key_sha256 = str(
+            competitor_public_key_result.get("public_key_sha256") or ""
+        )
+        try:
+            actual_competitor_public_key_sha256 = hashlib.sha256(
+                base64.b64decode(competitor_public_key, validate=True)
+            ).hexdigest()
+        except ValueError as exc:
+            raise RuntimeError("Round 5 competitor runner public key is invalid") from exc
+        if actual_competitor_public_key_sha256 != competitor_public_key_sha256:
+            raise RuntimeError("Round 5 competitor runner public-key digest is invalid")
 
         common = {
             "protocol": "connection-spike-setup-v1",
@@ -4883,7 +5356,7 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
         )
         aws_digests = _prepare_and_reassert_round5_aws_credentials(
             ssm,
-            runner_instance_id=outputs["runner_instance_id"],
+            runner_instance_id=outputs["competitor_runner_instance_id"],
             common=common,
             lanes=(
                 (
@@ -4939,13 +5412,33 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             "aurora_proxy_secret_arn": outputs["aurora_proxy_secret_arn"],
             "rds_proxy_secret_arn": outputs["rds_proxy_secret_arn"],
             "runner_permissions_boundary_arn": outputs["runner_permissions_boundary_arn"],
+            "competitor_runner_permissions_boundary_arn": outputs[
+                "competitor_runner_permissions_boundary_arn"
+            ],
             "runner_instance_id": outputs["runner_instance_id"],
+            "competitor_runner_instance_id": outputs["competitor_runner_instance_id"],
+            "lakebase_control_queue_url": outputs["lakebase_control_queue_url"],
+            "competitor_control_queue_url": outputs["competitor_control_queue_url"],
+            "lakebase_control_queue_arn": outputs["lakebase_control_queue_arn"],
+            "competitor_control_queue_arn": outputs["competitor_control_queue_arn"],
+            "runner_control_secret_arn": outputs["runner_control_secret_arn"],
+            "competitor_runner_control_secret_arn": outputs["competitor_runner_control_secret_arn"],
             "runner_instance_profile_arn": outputs["runner_instance_profile_arn"],
             "runner_role_arn": outputs["runner_role_arn"],
+            "competitor_runner_instance_profile_arn": outputs[
+                "competitor_runner_instance_profile_arn"
+            ],
+            "competitor_runner_role_arn": outputs["competitor_runner_role_arn"],
             "runner_subnet_id": outputs["runner_subnet_id"],
             "runner_security_group_id": outputs["runner_security_group_id"],
             "runner_egress_rule_id": outputs["runner_egress_rule_id"],
+            "lakebase_runner_egress_rule_ids": outputs["lakebase_runner_egress_rule_ids"],
+            "competitor_runner_security_group_id": outputs["competitor_runner_security_group_id"],
+            "competitor_runner_egress_rule_ids": outputs["competitor_runner_egress_rule_ids"],
+            "aurora_proxy_security_group_id": outputs["aurora_proxy_security_group_id"],
+            "rds_proxy_security_group_id": outputs["rds_proxy_security_group_id"],
             "runner_public_key_sha256": public_key_sha256,
+            "competitor_runner_public_key_sha256": competitor_public_key_sha256,
             "lakebase_credential_sha256": lakebase_credential_sha256,
             "aurora_credential_sha256": aurora_credential_sha256,
             "rds_credential_sha256": rds_credential_sha256,
@@ -5116,9 +5609,7 @@ def _ensure_round4_source_repair_job(
     job_name, notebook_path = round4_source_repair_identity(manifest)
     folder = notebook_path.rsplit("/", 1)[0]
     table = names["source_table"]
-    quoted_table = ".".join(
-        f"`{part.replace('`', '``')}`" for part in table.split(".")
-    )
+    quoted_table = ".".join(f"`{part.replace('`', '``')}`" for part in table.split("."))
     source = f'''# Databricks notebook source
 # Fixed, no-parameter Round 4 source repair. Do not add widgets or runtime inputs.
 TABLE = {quoted_table!r}
@@ -5218,9 +5709,7 @@ else:
             or not isinstance(current_settings, Mapping)
             or current_settings.get("name") != job_name
         ):
-            raise RuntimeError(
-                "Round 4 source repair job ID, owner, or deterministic name changed"
-            )
+            raise RuntimeError("Round 4 source repair job ID, owner, or deterministic name changed")
         return job
 
     existing_id = str(getattr(manifest.round4, "source_repair_job_id", "") or "")
@@ -5230,17 +5719,20 @@ else:
         listed = _databricks_api(
             profile,
             "get",
-            "/api/2.1/jobs/list"
-            f"?name={quote(job_name, safe='')}&limit=25",
+            f"/api/2.1/jobs/list?name={quote(job_name, safe='')}&limit=25",
         )
         jobs = listed.get("jobs")
-        matches = [
-            item
-            for item in jobs
-            if isinstance(item, Mapping)
-            and isinstance(item.get("settings"), Mapping)
-            and item["settings"].get("name") == job_name
-        ] if isinstance(jobs, list) else []
+        matches = (
+            [
+                item
+                for item in jobs
+                if isinstance(item, Mapping)
+                and isinstance(item.get("settings"), Mapping)
+                and item["settings"].get("name") == job_name
+            ]
+            if isinstance(jobs, list)
+            else []
+        )
         if len(matches) > 1:
             raise RuntimeError(
                 "Round 4 source repair job name is not unique; refusing to adopt one"
@@ -5248,9 +5740,7 @@ else:
         if matches:
             existing_id = str(matches[0].get("job_id") or "")
             if not existing_id.isdigit():
-                raise RuntimeError(
-                    "Round 4 source repair job candidate has no integer job ID"
-                )
+                raise RuntimeError("Round 4 source repair job candidate has no integer job ID")
             exact_job(existing_id)
     if existing_id:
         exact_job(existing_id)
@@ -5662,15 +6152,9 @@ def _round4_unity_catalog_grants(names: Mapping[str, str]) -> tuple[UnityCatalog
         UnityCatalogAppGrant("CATALOG", catalog, ("USE CATALOG",)),
         # The three schemas the adapter validates ownership of. `USE SCHEMA` is
         # traversal only and confers nothing on what is inside them.
-        UnityCatalogAppGrant(
-            "SCHEMA", f"{catalog}.{names['source_schema']}", ("USE SCHEMA",)
-        ),
-        UnityCatalogAppGrant(
-            "SCHEMA", f"{catalog}.{names['storage_schema']}", ("USE SCHEMA",)
-        ),
-        UnityCatalogAppGrant(
-            "SCHEMA", f"{catalog}.{names['online_schema']}", ("USE SCHEMA",)
-        ),
+        UnityCatalogAppGrant("SCHEMA", f"{catalog}.{names['source_schema']}", ("USE SCHEMA",)),
+        UnityCatalogAppGrant("SCHEMA", f"{catalog}.{names['storage_schema']}", ("USE SCHEMA",)),
+        UnityCatalogAppGrant("SCHEMA", f"{catalog}.{names['online_schema']}", ("USE SCHEMA",)),
         # The source Delta table: read by `read_source` and `_source_head`,
         # written by the MERGE in `commit_source_update`, and read again through
         # `table_changes(...)` for the CDF proof.
@@ -6062,9 +6546,7 @@ def _measured_lakebase_app_role_branches(manifest: DemoManifest) -> tuple[str, .
         return (f"projects/{manifest.run_id}/branches/production",)
     return tuple(
         dict.fromkeys(
-            _round_lakebase_binding(manifest, number).endpoint_name.rsplit(
-                "/endpoints/", 1
-            )[0]
+            _round_lakebase_binding(manifest, number).endpoint_name.rsplit("/endpoints/", 1)[0]
             for number in MEASURED_LAKEBASE_ROUNDS
         )
     )
@@ -6141,6 +6623,11 @@ def _coordination_runtime_grants() -> tuple[CoordinationRuntimeGrant, ...]:
     from .pipeline_power import PIPELINE_POWER_SEQUENCE, PIPELINE_POWER_TABLE
     from .readiness import READINESS_TABLE
     from .receipts import BOUT_RECEIPT_TABLE
+    from .round5_control import (
+        ROUND5_CONTROL_OUTBOX_TABLE,
+        ROUND5_RUNNER_EVENT_TABLE,
+    )
+    from .round5_warm import ROUND5_WARM_EVENT_TABLE, ROUND5_WARM_SLOT_TABLE
 
     return (
         # Claiming the ring is INSERT ... ON CONFLICT DO UPDATE, which needs both
@@ -6188,6 +6675,358 @@ def _coordination_runtime_grants() -> tuple[CoordinationRuntimeGrant, ...]:
             ("SELECT", "INSERT"),
             (PIPELINE_POWER_SEQUENCE,),
         ),
+        # One mutable installation-scoped head and one append-only transition
+        # stream. The runtime compare-and-swaps the head and appends events in
+        # the same statement; it never deletes either relation.
+        CoordinationRuntimeGrant(
+            ROUND5_WARM_SLOT_TABLE,
+            ("SELECT", "INSERT", "UPDATE"),
+        ),
+        CoordinationRuntimeGrant(
+            ROUND5_WARM_EVENT_TABLE,
+            ("SELECT", "INSERT"),
+        ),
+        CoordinationRuntimeGrant(
+            ROUND5_CONTROL_OUTBOX_TABLE,
+            ("SELECT", "INSERT", "UPDATE"),
+        ),
+        CoordinationRuntimeGrant(
+            ROUND5_RUNNER_EVENT_TABLE,
+            ("SELECT", "INSERT"),
+        ),
+    )
+
+
+async def _rotate_round5_resident_login(
+    cursor: Any,
+    *,
+    database: str,
+    role: str,
+    password: str,
+    lane_id: str,
+) -> None:
+    from .coordination import COORDINATION_SCHEMA
+    from .round5_control import (
+        ROUND5_CONTROL_OUTBOX_TABLE,
+        ROUND5_RUNNER_EVENT_TABLE,
+    )
+    from .round5_warm import ROUND5_WARM_SLOT_TABLE
+
+    if lane_id not in {"lakebase", "competitor"}:
+        raise ValueError("resident login requires an exact lane")
+
+    await cursor.execute(
+        "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s",
+        (role,),
+    )
+    role_exists = await cursor.fetchone() is not None
+    statement = (
+        sql.SQL("ALTER ROLE {} LOGIN PASSWORD {}")
+        if role_exists
+        else sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}")
+    )
+    await cursor.execute(statement.format(sql.Identifier(role), sql.Literal(password)))
+    # The resident login must be fully locked down: NOSUPERUSER, NOCREATEDB,
+    # NOCREATEROLE, NOINHERIT, NOREPLICATION and NOBYPASSRLS. Those are the
+    # CREATE ROLE defaults, and on managed Postgres (Lakebase) a non-superuser
+    # cannot restate SUPERUSER / REPLICATION / BYPASSRLS via ALTER ROLE at all --
+    # Postgres refuses any change to those attributes, in either direction,
+    # without the SUPERUSER attribute the schema owner does not (and must not)
+    # hold. So set only the one non-default, owner-settable attribute (NOINHERIT)
+    # and *verify* the dangerous attributes are off, which enforces the same
+    # NOBYPASSRLS / NOSUPERUSER guarantee at runtime instead of asserting it with
+    # a statement the platform rejects.
+    await cursor.execute(sql.SQL("ALTER ROLE {} NOINHERIT").format(sql.Identifier(role)))
+    await cursor.execute(
+        "SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit "
+        "FROM pg_catalog.pg_roles WHERE rolname = %s",
+        (role,),
+    )
+    attributes = await cursor.fetchone()
+    if attributes is None:
+        raise RuntimeError(f"Round 5 resident login {role!r} vanished during rotation")
+    rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls, rolinherit = attributes
+    if rolsuper or rolcreatedb or rolcreaterole or rolreplication or rolbypassrls or rolinherit:
+        raise RuntimeError(
+            f"Round 5 resident login {role!r} is not fully locked down: it must be "
+            "NOSUPERUSER, NOCREATEDB, NOCREATEROLE, NOINHERIT, NOREPLICATION and "
+            "NOBYPASSRLS so row-level security applies to it and it can hold no "
+            "capability beyond the lane-scoped grants below"
+        )
+    await cursor.execute(
+        sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
+            sql.Identifier(database),
+            sql.Identifier(role),
+        )
+    )
+    await cursor.execute(
+        sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+            sql.Identifier(COORDINATION_SCHEMA),
+            sql.Identifier(role),
+        )
+    )
+    await cursor.execute(
+        sql.SQL("REVOKE ALL ON {} FROM {}").format(
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+            sql.Identifier(role),
+        )
+    )
+    await cursor.execute(
+        sql.SQL("GRANT SELECT, INSERT ON {} TO {}").format(
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+            sql.Identifier(role),
+        )
+    )
+    # The runner login is a capability for one lane and only the generation the
+    # durable warm slot currently names. The security-definer predicate reads
+    # the authoritative slot/outbox without granting either relation to the
+    # runner. A stolen long-lived DSN therefore cannot pre-seed a future
+    # generation or manufacture a job the control plane never dispatched.
+    await cursor.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION {COORDINATION_SCHEMA}.round5_runner_event_authorized_v1(
+            p_installation_id text,
+            p_lane_id text,
+            p_generation bigint,
+            p_warm_attempt_token text,
+            p_job_id text,
+            p_binding jsonb
+        ) RETURNS boolean
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog
+        AS $function$
+            SELECT EXISTS (
+                SELECT 1
+                FROM {ROUND5_WARM_SLOT_TABLE} AS slot
+                WHERE slot.installation_id = p_installation_id
+                  AND slot.generation = p_generation
+                  AND slot.payload ->> 'warm_attempt_token' = p_warm_attempt_token
+            )
+            AND EXISTS (
+                SELECT 1
+                FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS control
+                WHERE control.installation_id = p_installation_id
+                  AND control.lane_id = p_lane_id
+                  AND control.generation = p_generation
+                  AND control.warm_attempt_token = p_warm_attempt_token
+                  AND control.job_id = p_job_id
+                  AND (
+                      (control.payload -> 'binding') - 'runner_process_boot_id'::text
+                  ) = (
+                      p_binding - 'runner_process_boot_id'::text
+                  )
+            )
+        $function$
+        """
+    )
+    function_signature = sql.SQL(
+        "{}.round5_runner_event_authorized_v1(text,text,bigint,text,text,jsonb)"
+    ).format(sql.Identifier(COORDINATION_SCHEMA))
+    await cursor.execute(
+        sql.SQL("REVOKE ALL ON FUNCTION {} FROM PUBLIC").format(function_signature)
+    )
+    await cursor.execute(
+        sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+            function_signature,
+            sql.Identifier(role),
+        )
+    )
+    # A read-only, exact, lane-bound disposition classifier the resident calls
+    # BEFORE every local transition (startup/active recovery, incoming
+    # PRELOAD/STAGE, worker spawn/stop, heartbeat, file replacement) so it never
+    # trusts a persisted stage, mutates workers, and only then discovers via a
+    # rejected insert that a newer attempt superseded it. It shares the exact
+    # identity of the write-side RLS gate -- installation, lane, generation,
+    # token, job, and the control event's binding minus the per-process boot id
+    # -- and additionally binds the outbox event_id so a forged or never-
+    # dispatched event is classified 'unknown' rather than acted on. It returns:
+    #   'unknown'    -- no matching dispatched outbox event (tamper/forgery),
+    #   'terminal'   -- this job already settled/quarantined under this token,
+    #   'current'    -- the durable warm slot still names this attempt's token,
+    #   'superseded' -- a valid old event whose token the warm slot has rotated.
+    # It reads the same authoritative slot/outbox/event relations as the write
+    # gate without granting any of them to the runner, so a stolen DSN cannot
+    # use it to enumerate or manufacture state. Its truth must never be weaker
+    # than the RLS WITH CHECK: 'current' here is exactly the set the gate admits.
+    await cursor.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION {COORDINATION_SCHEMA}.round5_runner_event_disposition_v1(
+            p_installation_id text,
+            p_lane_id text,
+            p_generation bigint,
+            p_warm_attempt_token text,
+            p_job_id text,
+            p_event_id text,
+            p_binding jsonb
+        ) RETURNS text
+        LANGUAGE sql
+        STABLE
+        SECURITY DEFINER
+        SET search_path = pg_catalog
+        AS $function$
+            SELECT CASE
+                WHEN NOT EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS control
+                    WHERE control.installation_id = p_installation_id
+                      AND control.lane_id = p_lane_id
+                      AND control.generation = p_generation
+                      AND control.warm_attempt_token = p_warm_attempt_token
+                      AND control.job_id = p_job_id
+                      AND control.event_id = p_event_id
+                      AND (
+                          (control.payload -> 'binding') - 'runner_process_boot_id'::text
+                      ) = (
+                          p_binding - 'runner_process_boot_id'::text
+                      )
+                ) THEN 'unknown'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_RUNNER_EVENT_TABLE} AS ev
+                    WHERE ev.installation_id = p_installation_id
+                      AND ev.lane_id = p_lane_id
+                      AND ev.generation = p_generation
+                      AND ev.warm_attempt_token = p_warm_attempt_token
+                      AND ev.job_id = p_job_id
+                      AND ev.kind IN ('settled', 'quarantined')
+                ) THEN 'terminal'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_WARM_SLOT_TABLE} AS slot
+                    WHERE slot.installation_id = p_installation_id
+                      AND slot.generation = p_generation
+                      AND slot.payload ->> 'warm_attempt_token' = p_warm_attempt_token
+                ) THEN 'current'
+                ELSE 'superseded'
+            END
+        $function$
+        """
+    )
+    disposition_signature = sql.SQL(
+        "{}.round5_runner_event_disposition_v1(text,text,bigint,text,text,text,jsonb)"
+    ).format(sql.Identifier(COORDINATION_SCHEMA))
+    await cursor.execute(
+        sql.SQL("REVOKE ALL ON FUNCTION {} FROM PUBLIC").format(disposition_signature)
+    )
+    await cursor.execute(
+        sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+            disposition_signature,
+            sql.Identifier(role),
+        )
+    )
+    await cursor.execute(
+        sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE)
+        )
+    )
+    # The deployed app already has table grants and consumes both lanes. Keep a
+    # policy for non-runner roles while the lane policies below constrain the
+    # only logins whose names use the reserved anti_demo_r5_* prefix.
+    await cursor.execute(
+        sql.SQL("DROP POLICY IF EXISTS {} ON {}").format(
+            sql.Identifier("round5_runtime_event_access_v1"),
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+        )
+    )
+    await cursor.execute(
+        sql.SQL(
+            "CREATE POLICY {} ON {} TO PUBLIC "
+            "USING (session_user NOT LIKE 'anti_demo_r5_%') "
+            "WITH CHECK (session_user NOT LIKE 'anti_demo_r5_%')"
+        ).format(
+            sql.Identifier("round5_runtime_event_access_v1"),
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+        )
+    )
+    policy_name = f"round5_{lane_id}_runner_events_v1"
+    await cursor.execute(
+        sql.SQL("DROP POLICY IF EXISTS {} ON {}").format(
+            sql.Identifier(policy_name),
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+        )
+    )
+    await cursor.execute(
+        sql.SQL(
+            "CREATE POLICY {} ON {} TO {} "
+            "USING (lane_id = {} AND "
+            "{}.round5_runner_event_authorized_v1("
+            "installation_id, lane_id, generation, warm_attempt_token, "
+            "job_id, binding)) "
+            "WITH CHECK (lane_id = {} AND "
+            "{}.round5_runner_event_authorized_v1("
+            "installation_id, lane_id, generation, warm_attempt_token, "
+            "job_id, binding))"
+        ).format(
+            sql.Identifier(policy_name),
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+            sql.Identifier(role),
+            sql.Literal(lane_id),
+            sql.Identifier(COORDINATION_SCHEMA),
+            sql.Literal(lane_id),
+            sql.Identifier(COORDINATION_SCHEMA),
+        )
+    )
+
+
+async def _retire_round5_shared_resident_login(
+    cursor: Any,
+    *,
+    database: str,
+    role: str,
+) -> None:
+    """Disable the pre-isolation DSN after both lane capabilities exist."""
+
+    from .coordination import COORDINATION_SCHEMA
+    from .round5_control import ROUND5_RUNNER_EVENT_TABLE
+
+    await cursor.execute(
+        "SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = %s",
+        (role,),
+    )
+    if await cursor.fetchone() is None:
+        return
+    await cursor.execute(sql.SQL("ALTER ROLE {} NOLOGIN").format(sql.Identifier(role)))
+    await cursor.execute(
+        sql.SQL("REVOKE ALL ON {} FROM {}").format(
+            sql.SQL(ROUND5_RUNNER_EVENT_TABLE),
+            sql.Identifier(role),
+        )
+    )
+    await cursor.execute(
+        sql.SQL("REVOKE USAGE ON SCHEMA {} FROM {}").format(
+            sql.Identifier(COORDINATION_SCHEMA),
+            sql.Identifier(role),
+        )
+    )
+    await cursor.execute(
+        sql.SQL("REVOKE CONNECT ON DATABASE {} FROM {}").format(
+            sql.Identifier(database),
+            sql.Identifier(role),
+        )
+    )
+
+
+def _round5_resident_dsn(
+    *,
+    host: str,
+    database: str,
+    role: str,
+    password: str,
+    trust_bundle_path: str,
+) -> str:
+    return (
+        "postgresql://"
+        + quote(role, safe="")
+        + ":"
+        + quote(password, safe="")
+        + "@"
+        + host
+        + ":5432/"
+        + quote(database, safe="")
+        + "?sslmode=verify-full&sslrootcert="
+        + quote(trust_bundle_path, safe="/")
     )
 
 
@@ -6345,9 +7184,7 @@ async def _own_measured_lakebase_relations(
                     if await cursor.fetchone() is None:
                         # NOLOGIN: nothing authenticates as this role; it exists
                         # only to be owned by, and to be a member of.
-                        await cursor.execute(
-                            sql.SQL("CREATE ROLE {} NOLOGIN").format(group)
-                        )
+                        await cursor.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(group))
                     # The operator keeps its DDL standing through membership
                     # rather than through ownership. Without this line the
                     # reassignment below would lock the local server, `resume`
@@ -6531,9 +7368,7 @@ async def _grant_round4_postgres(
             # side of the split is wrong. `ensure_coordination` provisions all of
             # them; the one provision path that can skip it is a resume of an
             # installation whose Round 4 was already sealed.
-            objects = await read_coordination_objects(
-                cursor, [grant.table for grant in grants]
-            )
+            objects = await read_coordination_objects(cursor, [grant.table for grant in grants])
             if not objects.complete:
                 raise RuntimeError(
                     "The app's runtime privileges cannot be granted: the coordination "
@@ -6545,9 +7380,7 @@ async def _grant_round4_postgres(
             for grant in grants:
                 await cursor.execute(
                     sql.SQL("GRANT {} ON TABLE {}.{} TO {}").format(
-                        sql.SQL(", ").join(
-                            sql.SQL(privilege) for privilege in grant.privileges
-                        ),
+                        sql.SQL(", ").join(sql.SQL(privilege) for privilege in grant.privileges),
                         sql.Identifier(grant.schema),
                         sql.Identifier(grant.name),
                         role,
@@ -6736,9 +7569,7 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
     # Ownership before privileges. `ALTER TABLE ... OWNER TO` preserves the ACL
     # it finds, but sequencing the grants afterwards means the privileges are
     # re-asserted against the final owner rather than an intermediate one.
-    ownership_failures = asyncio.run(
-        _own_measured_lakebase_relations(manifest, app_client_id)
-    )
+    ownership_failures = asyncio.run(_own_measured_lakebase_relations(manifest, app_client_id))
     if ownership_failures:
         raise RuntimeError(
             "The deployed app could not be made a member of the role owning the "
@@ -6746,9 +7577,7 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
             "published as ready and then refused with 'must be owner of table': "
             + "; ".join(ownership_failures)
         )
-    measured_failures = asyncio.run(
-        _grant_measured_lakebase_postgres(manifest, app_client_id)
-    )
+    measured_failures = asyncio.run(_grant_measured_lakebase_postgres(manifest, app_client_id))
     if measured_failures:
         raise RuntimeError(
             "The deployed app could not be granted the measured Lakebase privileges "
@@ -6901,9 +7730,7 @@ async def seed_identical_schema(manifest: DemoManifest) -> tuple[str, str, str]:
         aurora_providers = tuple(
             _round_aurora_provider(manifest, number) for number in round_numbers
         )
-        rds_providers = tuple(
-            _round_rds_provider(manifest, number) for number in rds_round_numbers
-        )
+        rds_providers = tuple(_round_rds_provider(manifest, number) for number in rds_round_numbers)
         await asyncio.gather(
             *(
                 _ensure_lakebase_database(manifest.databricks.database, provider)
@@ -7074,12 +7901,24 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
     manifest.databricks.coordination_endpoint_name = expected_endpoint
     apply_manifest_environment(manifest)
 
+    # Persist the coordination-endpoint native-login capability the resident
+    # roles depend on. `rotate_resident_login` below mints native-password roles
+    # that authenticate to this endpoint; without this flag a fresh provision or
+    # reconcile would rotate logins the project then rejects, regressing resident
+    # DB access. Enable it before rotating so residents can reach the event store.
+    _enable_coordination_lakebase_native_login(manifest)
+
     async def initialize_table() -> None:
-        from .coordination import LakebaseBoutLeaseStore, read_coordination_objects
+        from .coordination import (
+            LakebaseBoutLeaseStore,
+            read_coordination_objects,
+        )
         from .cost_ledger import LakebaseCostLedgerStore
         from .pipeline_power import DurablePipelinePowerStore
         from .readiness import StartupReadinessStore
         from .receipts import DurableReceiptStore
+        from .round5_control import LakebaseRound5ControlStore, migrate_round5_control
+        from .round5_warm import LakebaseRound5WarmStore, migrate_round5_warm
 
         if manifest.round_environments is not None:
             coordination_provider = LakebaseCredentialProvider(
@@ -7118,6 +7957,66 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
         await StartupReadinessStore(store._run).initialize()
         await DurableReceiptStore(store._run).initialize()
         await DurablePipelinePowerStore(store._run).initialize()
+
+        async def migrate_round5(cursor: Any) -> None:
+            await migrate_round5_warm(cursor)
+            await migrate_round5_control(cursor)
+
+        await store._run(migrate_round5)
+        await LakebaseRound5WarmStore(
+            store._run,
+            database=manifest.databricks.database,
+        ).initialize()
+        await LakebaseRound5ControlStore(store._run).initialize()
+
+        installation_digest = hashlib.sha256(
+            (manifest.installation_id or manifest.run_id).encode()
+        ).hexdigest()[:16]
+        resident_roles = {
+            "lakebase": f"anti_demo_r5_lakebase_{installation_digest}",
+            "competitor": f"anti_demo_r5_competitor_{installation_digest}",
+        }
+        resident_passwords = {lane_id: secrets.token_urlsafe(48) for lane_id in resident_roles}
+
+        async def rotate_resident_login(cursor: Any) -> None:
+            for lane_id, role in resident_roles.items():
+                await _rotate_round5_resident_login(
+                    cursor,
+                    database=manifest.databricks.database,
+                    role=role,
+                    password=resident_passwords[lane_id],
+                    lane_id=lane_id,
+                )
+            await _retire_round5_shared_resident_login(
+                cursor,
+                database=manifest.databricks.database,
+                role=f"anti_demo_r5_{installation_digest}",
+            )
+
+        await store._run(rotate_resident_login)
+        resources = manifest.require_round5_resources()
+        secret_arns = {
+            "lakebase": resources.runner_control_secret_arn,
+            "competitor": resources.competitor_runner_control_secret_arn,
+        }
+        if any(not value for value in secret_arns.values()):
+            raise RuntimeError("Round 5 lane-scoped resident event DSN secrets are not sealed")
+        secrets_manager = _aws_session(manifest).client("secretsmanager")
+        for lane_id, role in resident_roles.items():
+            resident_dsn = _round5_resident_dsn(
+                host=host,
+                database=manifest.databricks.database,
+                role=role,
+                password=resident_passwords[lane_id],
+                trust_bundle_path=resources.trust_bundle_path,
+            )
+            await asyncio.to_thread(
+                secrets_manager.put_secret_value,
+                SecretId=secret_arns[lane_id],
+                ClientRequestToken=str(uuid4()),
+                SecretString=resident_dsn,
+                VersionStages=["AWSCURRENT"],
+            )
         await store.close()
 
         ledger = LakebaseCostLedgerStore(
@@ -7516,8 +8415,7 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
         found.extend(
             f"iam-inline:{runner_role_name}/{policy_name}"
             for policy_name in policies
-            if matching_name(str(policy_name))
-            and str(policy_name).endswith("-runner-secret")
+            if matching_name(str(policy_name)) and str(policy_name).endswith("-runner-secret")
         )
     return sorted(set(found))
 
@@ -8560,9 +9458,7 @@ def renew(*, ttl_hours: float = DEFAULT_TTL_HOURS, timeout_seconds: float = 900)
                 f"Renew would move expires-at backwards, from {previous_tag} to "
                 f"{_utc_tag(target)}; choose a larger --ttl-hours"
             )
-    return asyncio.run(
-        _renew_under_ring_lease(manifest, target, previous_tag, timeout_seconds)
-    )
+    return asyncio.run(_renew_under_ring_lease(manifest, target, previous_tag, timeout_seconds))
 
 
 def _resume_renew_target() -> datetime | None:
@@ -9020,9 +9916,7 @@ def _ownership_environments(manifest: DemoManifest) -> list[tuple[str, Any, Any]
 #: The error codes with which RDS states, positively, that an identifier names
 #: nothing. Only these count as an absence; every other failure is a failure to
 #: look. Kept narrow on purpose -- see `_sealed_databases_absent`.
-_ABSENT_DATABASE_ERROR_CODES = frozenset(
-    {"DBClusterNotFoundFault", "DBInstanceNotFoundFault"}
-)
+_ABSENT_DATABASE_ERROR_CODES = frozenset({"DBClusterNotFoundFault", "DBInstanceNotFoundFault"})
 
 
 def _is_absent_database_error(exc: BaseException) -> bool:
@@ -9162,17 +10056,20 @@ def _sealed_ingress_summary(manifest: DemoManifest) -> str:
 def _aws_ingress(manifest: DemoManifest) -> Check:
     try:
         session = _aws_session(manifest)
-        runner_group = (
-            manifest.require_round5_resources().runner_security_group_id
+        round5_groups = (
+            (
+                manifest.require_round5_resources().runner_security_group_id,
+                str(manifest.require_round5_resources().aurora_proxy_security_group_id),
+            )
             if manifest.round5_ready
-            else None
+            else ()
         )
         if manifest.manifest_version == 7:
             groups = [
                 (
                     f"r{number}",
                     manifest.round_environment(number).aurora.security_group_id,
-                    runner_group if number == 5 else None,
+                    round5_groups if number == 5 else (),
                 )
                 for number in (1, 2, 3, 5)
             ]
@@ -9181,7 +10078,7 @@ def _aws_ingress(manifest: DemoManifest) -> Check:
                 (
                     "r1",
                     manifest.aws.resources.security_group_id,
-                    runner_group if manifest.round5_ready else None,
+                    round5_groups,
                 )
             ]
         for round_key, group_id, expected_runner in groups:
@@ -9213,7 +10110,7 @@ def _postgres_ingress_is_exact(
     permissions: list[dict[str, Any]],
     *,
     operator_cidr: str,
-    runner_group: str | None,
+    runner_group: str | Sequence[str] | None,
     serverless_egress_cidrs: Sequence[str] = (),
 ) -> bool:
     """Is this security group admitting precisely what the installation sealed?
@@ -9242,10 +10139,11 @@ def _postgres_ingress_is_exact(
         for permission in permissions
         for item in permission.get("UserIdGroupPairs", [])
     ]
+    expected_groups = [runner_group] if isinstance(runner_group, str) else list(runner_group or ())
     return (
-        len(permissions) in ({1, 2} if runner_group else {1})
+        len(permissions) in ({1, 2} if expected_groups else {1})
         and sorted(cidrs) == sorted({operator_cidr, *serverless_egress_cidrs})
-        and referenced_groups == ([runner_group] if runner_group else [])
+        and sorted(referenced_groups) == sorted(expected_groups)
         and all(permission.get("IpProtocol") == "tcp" for permission in permissions)
         and all(permission.get("FromPort") == 5432 for permission in permissions)
         and all(permission.get("ToPort") == 5432 for permission in permissions)
@@ -9261,17 +10159,20 @@ def _postgres_ingress_is_exact(
 def _rds_ingress(manifest: DemoManifest) -> Check:
     try:
         session = _aws_session(manifest)
-        runner_group = (
-            manifest.require_round5_resources().runner_security_group_id
+        round5_groups = (
+            (
+                manifest.require_round5_resources().runner_security_group_id,
+                str(manifest.require_round5_resources().rds_proxy_security_group_id),
+            )
             if manifest.round5_ready
-            else None
+            else ()
         )
         if manifest.manifest_version == 7:
             databases = [
                 (
                     f"r{number}",
                     manifest.round_environment(number).rds,
-                    runner_group if number == 5 else None,
+                    round5_groups if number == 5 else (),
                 )
                 for number in (1, 2, 3, 5)
                 # Round 1 seals no RDS instance: its lane refuses to enter on
@@ -9289,7 +10190,7 @@ def _rds_ingress(manifest: DemoManifest) -> Check:
                         instance_id=resources.rds_instance_id,
                         security_group_id=resources.rds_security_group_id,
                     ),
-                    runner_group if manifest.round5_ready else None,
+                    round5_groups,
                 )
             ]
         for round_key, sealed, expected_runner in databases:
@@ -9608,9 +10509,7 @@ def _prepare_and_reseal_round6(manifest: DemoManifest, *, timeout: float) -> Dem
                 round6_endpoint,
                 "spec.suspension",
                 "--json",
-                json.dumps(
-                    {"spec": {"suspend_timeout_duration": f"{LAKEBASE_SUSPEND_SECONDS}s"}}
-                ),
+                json.dumps({"spec": {"suspend_timeout_duration": f"{LAKEBASE_SUSPEND_SECONDS}s"}}),
                 "--timeout",
                 "10m",
                 "-p",
@@ -9788,8 +10687,18 @@ def setup(
             if existing.round5_ready:
                 _require_round5_clean_baseline(existing)
             reconcile_infrastructure(existing)
+            # reconcile applies the two-runner control plane (control queues,
+            # control secrets, the second runner, per-runner egress) but does not
+            # reseal Round 5's own resources. reset() -> ensure_coordination writes
+            # the resident event DSN into those control secrets and reads their
+            # ARNs from the seal, so Round 5 must be resealed before reset -- the
+            # same order provision() uses ahead of its own ensure_coordination. On
+            # an install whose seal predates the two-runner control plane this is
+            # also what first makes it v3-factory-ready.
+            _prepare_and_reseal_round5(load_manifest(), timeout=timeout_seconds)
             manifest = reset(timeout_seconds)
             round4_prepared = True
+            round5_prepared = True
             round6_prepared = manifest.round6_ready
         else:
             manifest = resume_provision(timeout_seconds)
@@ -9999,9 +10908,7 @@ def _delete_round4_resources(
                 or not isinstance(settings, Mapping)
                 or settings.get("name") != expected_job_name
             ):
-                raise RuntimeError(
-                    "Cleanup refused: Round 4 repair job identity or owner changed"
-                )
+                raise RuntimeError("Cleanup refused: Round 4 repair job identity or owner changed")
             _run(
                 [
                     "databricks",
@@ -10328,9 +11235,7 @@ def _round4_survivor_lines(manifest: DemoManifest) -> list[str]:
         lines.append(f"OWNED Databricks app: {app.name} (not in the workspace; from {app.source})")
         return lines
     verdict = "DELETED BY THIS CLEANUP" if app.owned else "SURVIVES THIS CLEANUP"
-    lines.append(
-        f"OWNED Databricks app: {app.name} · {app.compute_state or 'UNKNOWN'} · {verdict}"
-    )
+    lines.append(f"OWNED Databricks app: {app.name} · {app.compute_state or 'UNKNOWN'} · {verdict}")
     if app.source != "app-deploy.json":
         lines.append(
             f"      Named from {app.source}: no successful deploy is recorded beside this "

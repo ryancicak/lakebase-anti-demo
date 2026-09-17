@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -19,17 +20,27 @@ from urllib.parse import unquote
 from uuid import uuid4
 
 import boto3
+from botocore.config import Config
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
-# Round 5 v2 replaces the bounded v1 burst, but the setup phase -- provisioning the
+# Round 5 V4 retains the setup phase -- provisioning the
 # RDS Proxy an AWS lane needs and Lakebase does not -- is unchanged and still lives
 # in `.connection_spike`. Both modules export `ConnectionSpikeArm`, `finalize_lane`
 # and `compare_lanes`, so the v2 names are aliased rather than shadowing the setup
 # phase's while that removal is staged.
 from .connection_fanin import (
+    ADVISORY_TELEMETRY_CODES,
     FANIN_PROTOCOL,
     FANIN_SCHEMA_VERSION,
     PROGRESS_PREFIX,
-    RUNNER_LANE_COUNT,
+    RUNTIME_LANE_IDS,
+    SAFETY_EVIDENCE_VERSION,
+    WORKER_COUNT,
     CapacityPreflight,
     ConnectionSpikeLaneResult,
     FanInError,
@@ -79,10 +90,25 @@ from .connection_spike_journal import (
 )
 from .coordination import COORDINATION_TABLE, RING_KEY, validate_ring_key
 from .manifest import DemoManifest, load_manifest
-from .models import RoundId
+from .models import CompetitorId, RoundId
+from .round5_control import (
+    ROUND5_ARM_STAGE_DEADLINE_SECONDS,
+    Round5ControlBinding,
+    Round5ControlEvent,
+    Round5ControlKind,
+    Round5ResidentTransport,
+    canonical_request_sha256,
+)
 from .safe_change import DEFAULT_CANCEL_TEARDOWN_SECONDS, abandon_on_cancel
 
 logger = logging.getLogger(__name__)
+
+_AWS_CLIENT_CONFIG = Config(
+    connect_timeout=5,
+    read_timeout=30,
+    retries={"mode": "standard", "max_attempts": 4},
+)
+
 
 def _dispatch_timeout_seconds(request: Mapping[str, object], default: float) -> float:
     """How long this particular dispatch is given, chosen by what it is.
@@ -132,6 +158,9 @@ SETUP_SSM_TIMEOUT_SECONDS = SSM_TIMEOUT_SECONDS
 #: stdout propagation the server can only read afterwards.
 FANIN_SSM_MARGIN_SECONDS = 60.0
 FANIN_SSM_TIMEOUT_SECONDS = FANIN_RUN_TIMEOUT_SECONDS + FANIN_SSM_MARGIN_SECONDS
+DISPATCH_CAPSULE_SAFETY_SECONDS = FANIN_SSM_TIMEOUT_SECONDS + 60
+DISPATCH_CAPSULE_REFRESH_LEAD_SECONDS = 60
+DISPATCH_CAPSULE_REFRESH_INTERVAL_SECONDS = 30
 #: How long a cancelled setup command is given to confirm it has settled.
 #:
 #: Ten seconds could not have worked, and a live towel thrown during Round 5
@@ -224,10 +253,7 @@ def _proxy_target_set_matches(
             len(instances) >= 1
             and len(clusters) == 1
             and len(instances) + len(clusters) == len(targets)
-            and all(
-                str(target.get("TrackedClusterId") or "") == target_id
-                for target in instances
-            )
+            and all(str(target.get("TrackedClusterId") or "") == target_id for target in instances)
             and str(clusters[0].get("RdsResourceId") or "") == target_id
         )
     if not bound or not require_available:
@@ -441,6 +467,9 @@ class ConnectionSpikeLiveConfig:
     runner_instance_type: str = FANIN_RUNNER_INSTANCE_TYPE
     ssm_document_name: str = "AWS-RunShellScript"
     runner_path: str = RUNNER_PATH
+    resident_control_queue_url: str = ""
+    resident_control_secret_arn: str = ""
+    resident_installation_id: str = ""
     runner_harness_sha256: str = ""
     trust_bundle_path: str = TRUST_BUNDLE_PATH
     trust_bundle_sha256: str = ""
@@ -469,6 +498,17 @@ class ConnectionSpikeLiveConfig:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 execution role account does not match the sealed account"
             )
+        if (
+            self.resident_control_secret_arn
+            and _SECRET_ARN.fullmatch(self.resident_control_secret_arn) is None
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident control secret ARN is invalid"
+            )
+        if self.resident_control_queue_url and not self.resident_installation_id:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident installation identity is missing"
+            )
         if _INSTANCE_ID.fullmatch(self.runner_instance_id) is None:
             raise ConnectionSpikeLiveConfigurationError("Round 5 runner instance ID is invalid")
         if (
@@ -487,6 +527,12 @@ class ConnectionSpikeLiveConfig:
         if self.runner_path != RUNNER_PATH:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 runner path does not match the immutable harness contract"
+            )
+        if self.resident_control_queue_url and not self.resident_control_queue_url.endswith(
+            ".fifo"
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident FIFO control queue URL is missing"
             )
         if self.command_timeout_seconds != SSM_TIMEOUT_SECONDS:
             raise ConnectionSpikeLiveConfigurationError(
@@ -547,6 +593,7 @@ class ConnectionSpikeSetupConfig:
     expected_account_id: str
     baseline_control_role_arn: str
     runner_instance_id: str
+    competitor_runner_instance_id: str
     vpc_id: str
     proxy_subnet_ids: tuple[str, ...]
     lakebase_direct_host: str
@@ -557,6 +604,7 @@ class ConnectionSpikeSetupConfig:
     competitor_direct_host: str
     competitor_security_group_id: str
     runner_security_group_id: str
+    proxy_security_group_id: str
     proxy_service_role_arn: str
     proxy_service_policy_name: str
     aurora_proxy_secret_arn: str
@@ -600,9 +648,13 @@ class ConnectionSpikeSetupConfig:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 baseline control role is not sealed to the expected account"
             )
-        if _INSTANCE_ID.fullmatch(self.runner_instance_id) is None:
+        if (
+            _INSTANCE_ID.fullmatch(self.runner_instance_id) is None
+            or _INSTANCE_ID.fullmatch(self.competitor_runner_instance_id) is None
+            or self.runner_instance_id == self.competitor_runner_instance_id
+        ):
             raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 setup runner instance ID is invalid"
+                "Round 5 setup requires two distinct physical runner instance IDs"
             )
         if (
             not self.vpc_id
@@ -614,6 +666,7 @@ class ConnectionSpikeSetupConfig:
             or not self.competitor_resource_id
             or not self.competitor_direct_host
             or not self.competitor_security_group_id
+            or not self.proxy_security_group_id
             or not self.lakebase_direct_host
             or not self.lakebase_pooled_host
         ):
@@ -622,9 +675,7 @@ class ConnectionSpikeSetupConfig:
             )
         proxy_role = _ROLE_ARN.fullmatch(self.proxy_service_role_arn)
         if proxy_role is None or proxy_role.group("account") != self.expected_account_id:
-            raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 Proxy service role ARN is invalid"
-            )
+            raise ConnectionSpikeLiveConfigurationError("Round 5 Proxy service role ARN is invalid")
         if re.fullmatch(r"[\w+=,.@-]{1,128}", self.proxy_service_policy_name) is None:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 Proxy service policy name is invalid"
@@ -776,6 +827,10 @@ class ConnectionSpikeSetupResult:
 #: start the lane's 10,000 immediately instead of waiting for the other lane's setup. Awaited inside
 #: the lane's own task, so a failure to start a ramp fails the lane it belongs to.
 SetupLaneReadyCallback = Callable[[ConnectionSpikeSetupLaneStop], Awaitable[None]]
+#: Called after CreateDBProxy returns the provider-assigned endpoint but before
+#: the exact Proxy gate.  The resident may parse the exact late-bound request
+#: and prepare workers, but its release gate remains closed.
+SetupLaneStageCallback = Callable[[ConnectionSpikeSetupLaneStop], Awaitable[None]]
 
 
 class ConnectionSpikeSetupJournal(Protocol):
@@ -825,6 +880,7 @@ class _SetupAwsClients:
     ec2: Any
     iam: Any
     secretsmanager: Any
+    expires_at: datetime
 
 
 @dataclass
@@ -854,6 +910,7 @@ class _SetupActiveCommand:
     lane_id: str
     action: str
     command_id: str
+    runner_instance_id: str
     ssm: Any
 
 
@@ -872,6 +929,14 @@ class _SetupPendingSend:
     bout_id: str
     lane_id: str
     action: str
+
+
+@dataclass(frozen=True)
+class ConnectionSpikeWarmSetupContext:
+    clients: _SetupAwsClients
+    rds_security_group_id: str
+    proxy_security_group_id: str
+    observed_at: datetime
 
 
 SetupProgressCallback = Callable[[ConnectionSpikeSetupProgress], Awaitable[None]]
@@ -1043,6 +1108,7 @@ class _AwsClients:
     rds: Any
     cloudwatch: Any
     ec2: Any
+    expires_at: datetime
 
 
 @dataclass(frozen=True)
@@ -1050,6 +1116,7 @@ class _ActiveCommand:
     run_id: str
     command_id: str
     clients: _AwsClients
+    job_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1057,6 +1124,7 @@ class _PendingCommand:
     run_id: str
     send_task: asyncio.Task[str]
     clients: _AwsClients
+    job_id: str | None = None
 
 
 class SessionFactory(Protocol):
@@ -1071,8 +1139,7 @@ def runner_asset_sha256s(root: Path | None = None) -> dict[str, str]:
     """Return the source digest of each file in the installed runner contract."""
     asset_root = root or Path(__file__).resolve().parents[1] / "runner"
     return {
-        name: hashlib.sha256((asset_root / name).read_bytes()).hexdigest()
-        for name in RUNNER_ASSETS
+        name: hashlib.sha256((asset_root / name).read_bytes()).hexdigest() for name in RUNNER_ASSETS
     }
 
 
@@ -1100,6 +1167,9 @@ def connection_spike_config_sha256(config: ConnectionSpikeLiveConfig) -> str:
         "runner_instance_type": config.runner_instance_type,
         "ssm_document_name": config.ssm_document_name,
         "runner_path": config.runner_path,
+        "resident_control_queue_url": config.resident_control_queue_url,
+        "resident_control_secret_arn": config.resident_control_secret_arn,
+        "resident_installation_id": config.resident_installation_id,
         "runner_harness_sha256": config.runner_harness_sha256,
         "trust_bundle_path": config.trust_bundle_path,
         "trust_bundle_sha256": config.trust_bundle_sha256,
@@ -1193,6 +1263,9 @@ class LiveConnectionSpikeSetupOrchestrator:
         #: per-bout rules against an empty source group id. Reusing the prepared object is what
         #: makes skipping the preflight safe.
         self._prepared_resources: dict[str, _SetupResources] = {}
+        self._prepared_specs: dict[str, tuple[ResourceSpec, ...]] = {}
+        self._resources_by_bout: dict[str, _SetupResources] = {}
+        self._warm_context: ConnectionSpikeWarmSetupContext | None = None
         self._cleanup_start_lock = asyncio.Lock()
         self._cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._proxy_delete_accepted: dict[str, asyncio.Event] = {}
@@ -1231,16 +1304,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         ).proxy_name
 
     async def prepare(self, bout_id: str, fencing_token: int) -> None:
-        """Do the untimed work now, so that ringing the bell starts the clock.
-
-        IAM verification, the journal read and the orphan sweep are preparation both lanes need,
-        and they take minutes against AWS. Performed after the bell they put two clocks at 0.00
-        with nothing visible happening, which is indistinguishable from a hang and is why a live
-        round was abandoned with nothing wrong. Performed at arm they are finished before anyone
-        is watching a clock.
-
-        Idempotent, and safe to skip: `setup` prepares for itself when this has not run.
-        """
+        """Bind the current warm context to a bout using coordination only."""
 
         async with self._lock:
             if bout_id in self._results:
@@ -1249,13 +1313,138 @@ class LiveConnectionSpikeSetupOrchestrator:
                 )
             if self._prepared.get(bout_id) == fencing_token:
                 return
-            scope, clients, resources, coordinator, specs = await self._begin_setup_scope(
-                bout_id, fencing_token
+            warm = self._warm_context
+            if warm is None or warm.clients.expires_at <= datetime.now(UTC) + timedelta(
+                seconds=SETUP_DEADLINE_SECONDS + 60
+            ):
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 automatic warm launch context is unavailable"
+                )
+            names = self.names_for_bout(
+                self.config.deterministic_name_prefix,
+                bout_id,
+                self.config.secret_name_prefix or "anti-demo-round5",
             )
-            await self._preflight_baseline(scope, clients, coordinator, specs, resources)
+            scope = CreationScope(bout_id, fencing_token, self.config.baseline_sha256)
+            await self._fence.assert_current(scope)
+            resources = _SetupResources(
+                names,
+                secret_arn=self.config.proxy_secret_arn,
+                proxy_role_arn=self.config.proxy_service_role_arn,
+                proxy_security_group_id=warm.proxy_security_group_id,
+                rds_security_group_id=warm.rds_security_group_id,
+            )
             self._require_rule_bindings(resources)
+            coordinator, specs = self._coordinator(scope, warm.clients, resources)
+            self._coordinators[bout_id] = coordinator
+            self._scopes[bout_id] = scope
             self._prepared[bout_id] = fencing_token
             self._prepared_resources[bout_id] = resources
+            self._prepared_specs[bout_id] = specs
+            self._resources_by_bout[bout_id] = resources
+
+    async def warm(self, generation: int) -> ConnectionSpikeWarmSetupContext:
+        """Perform every slow setup prerequisite before a session can claim."""
+
+        clients = await self._assumed_clients(f"warm-{generation}")
+        source, lakebase_managed, competitor_managed = await asyncio.gather(
+            self._read_competitor_source(clients),
+            self._call(
+                clients.ssm.describe_instance_information,
+                Filters=[{"Key": "InstanceIds", "Values": [self.config.runner_instance_id]}],
+            ),
+            self._call(
+                clients.ssm.describe_instance_information,
+                Filters=[
+                    {
+                        "Key": "InstanceIds",
+                        "Values": [self.config.competitor_runner_instance_id],
+                    }
+                ],
+            ),
+        )
+        lakebase_runners = lakebase_managed.get("InstanceInformationList") or []
+        competitor_runners = competitor_managed.get("InstanceInformationList") or []
+        if (
+            source.identifier != self.config.competitor_target_id
+            or source.resource_id != self.config.competitor_resource_id
+            or source.direct_host != self.config.competitor_direct_host
+            or source.status != "available"
+            or source.vpc_id != self.config.vpc_id
+            or source.security_group_ids != (self.config.competitor_security_group_id,)
+            or len(lakebase_runners) != 1
+            or lakebase_runners[0].get("InstanceId") != self.config.runner_instance_id
+            or lakebase_runners[0].get("PingStatus") != "Online"
+            or len(competitor_runners) != 1
+            or competitor_runners[0].get("InstanceId") != self.config.competitor_runner_instance_id
+            or competitor_runners[0].get("PingStatus") != "Online"
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 warm source or physical runner identity changed"
+            )
+        await self._verify_proxy_service_role(clients)
+        await self._verify_static_proxy_network(clients)
+        await self._discover_orphaned_addons(
+            clients,
+            self.config.competitor_security_group_id,
+            include_legacy=False,
+        )
+        context = ConnectionSpikeWarmSetupContext(
+            clients=clients,
+            rds_security_group_id=self.config.competitor_security_group_id,
+            proxy_security_group_id=self.config.proxy_security_group_id,
+            observed_at=datetime.now(UTC),
+        )
+        self._warm_context = context
+        return context
+
+    async def _verify_static_proxy_network(self, clients: _SetupAwsClients) -> None:
+        groups = await self._call(
+            clients.ec2.describe_security_groups,
+            GroupIds=[self.config.proxy_security_group_id],
+        )
+        values = groups.get("SecurityGroups") or []
+        if len(values) != 1:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 static Proxy network fixture did not resolve exactly once"
+            )
+        group = values[0]
+        ingress = group.get("IpPermissions") or []
+        egress = group.get("IpPermissionsEgress") or []
+
+        def exact_rule(
+            rules: Sequence[Mapping[str, object]],
+            peer_key: str,
+            peer_id: str,
+        ) -> bool:
+            if len(rules) != 1:
+                return False
+            rule = rules[0]
+            peers = rule.get(peer_key) or []
+            return (
+                rule.get("IpProtocol") == "tcp"
+                and rule.get("FromPort") == 5432
+                and rule.get("ToPort") == 5432
+                and len(peers) == 1
+                and peers[0].get("GroupId") == peer_id
+            )
+
+        if (
+            group.get("GroupId") != self.config.proxy_security_group_id
+            or not exact_rule(
+                ingress,
+                "UserIdGroupPairs",
+                self.config.runner_security_group_id,
+            )
+            or not exact_rule(
+                egress,
+                "UserIdGroupPairs",
+                self.config.competitor_security_group_id,
+            )
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 static Proxy network fixture differs from the warm contract"
+            )
 
     def _require_rule_bindings(self, resources: _SetupResources) -> None:
         """Refuse now if a per-bout security-group rule would name an empty source group.
@@ -1283,36 +1472,15 @@ class LiveConnectionSpikeSetupOrchestrator:
                 f"for {', and '.join(missing)}. Nothing was created and no clock was started."
             )
 
-    async def _begin_setup_scope(
-        self, bout_id: str, fencing_token: int
-    ) -> tuple[CreationScope, Any, _SetupResources, Any, Any]:
-        """Resolve the names, scope, clients and coordinator this bout works through."""
-
-        names = self.names_for_bout(
-            self.config.deterministic_name_prefix,
-            bout_id,
-            self.config.secret_name_prefix or "anti-demo-round5",
-        )
-        scope = CreationScope(bout_id, fencing_token, self.config.baseline_sha256)
-        # Assumed fresh every time rather than carried over from `prepare`. Assumed credentials
-        # expire, an arm can sit for minutes before the bell, and re-assuming is the fast part.
-        clients = await self._assumed_clients(bout_id)
-        resources = _SetupResources(
-            names,
-            secret_arn=self.config.proxy_secret_arn,
-            proxy_role_arn=self.config.proxy_service_role_arn,
-        )
-        coordinator, specs = self._coordinator(scope, clients, resources)
-        self._coordinators[bout_id] = coordinator
-        self._scopes[bout_id] = scope
-        return scope, clients, resources, coordinator, specs
-
     async def setup(
         self,
         bout_id: str,
         fencing_token: int,
         on_progress: SetupProgressCallback | None = None,
         on_lane_ready: SetupLaneReadyCallback | None = None,
+        on_lane_stage: SetupLaneStageCallback | None = None,
+        *,
+        t0_ns: int | None = None,
     ) -> ConnectionSpikeSetupResult:
         if self._lock.locked():
             raise ConnectionSpikeLiveOperationError(
@@ -1323,30 +1491,31 @@ class LiveConnectionSpikeSetupOrchestrator:
                 raise ConnectionSpikeLiveOperationError(
                     "Round 5 setup already completed for this bout"
                 )
-            scope, clients, resources, coordinator, specs = await self._begin_setup_scope(
-                bout_id, fencing_token
-            )
             prepared = self._prepared_resources.pop(bout_id, None)
-            if self._prepared.get(bout_id) == fencing_token and prepared is not None:
-                # Everything preparation discovered, carried into the bout that needs it. Rebuilding
-                # the coordinator around it keeps the journal, the specs and the resources pointing
-                # at one object rather than two that disagree.
-                resources = prepared
-                coordinator, specs = self._coordinator(scope, clients, resources)
-                self._coordinators[bout_id] = coordinator
-            else:
-                # Nothing prepared this bout, or preparation left nothing to reuse, so prepare
-                # here. That is the old behaviour and it stays correct: an arm handled by a replica
-                # that has since been replaced must still be able to ring its own bell.
-                await self._preflight_baseline(scope, clients, coordinator, specs, resources)
-                self._prepared[bout_id] = fencing_token
+            scope = self._scopes.get(bout_id)
+            coordinator = self._coordinators.get(bout_id)
+            specs = self._prepared_specs.get(bout_id)
+            warm = self._warm_context
+            if (
+                self._prepared.get(bout_id) != fencing_token
+                or prepared is None
+                or scope is None
+                or coordinator is None
+                or specs is None
+                or warm is None
+                or warm.clients.expires_at <= datetime.now(UTC)
+            ):
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 has no current warm launch context; the bell is blocked "
+                    "while automatic warming repairs it"
+                )
+            resources = prepared
+            clients = warm.clients
 
             gate = asyncio.Event()
             t0_box: list[int] = []
             lakebase_task = asyncio.create_task(
-                self._setup_lakebase(
-                    bout_id, clients, gate, t0_box, on_progress, on_lane_ready
-                )
+                self._setup_lakebase(bout_id, clients, gate, t0_box, on_progress, on_lane_ready)
             )
             competitor_task = asyncio.create_task(
                 self._setup_competitor(
@@ -1360,11 +1529,15 @@ class LiveConnectionSpikeSetupOrchestrator:
                     t0_box,
                     on_progress,
                     on_lane_ready,
+                    on_lane_stage,
                 )
             )
-            t0_ns = self._monotonic_ns()
-            arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
-            t0_box.append(t0_ns)
+            comparison_t0_ns = self._monotonic_ns() if t0_ns is None else t0_ns
+            arm = arm_setup_phase(
+                ("lakebase", "competitor"),
+                t0_ns=comparison_t0_ns,
+            )
+            t0_box.append(comparison_t0_ns)
             gate.set()
             try:
                 async with asyncio.timeout(self.config.deadline_seconds):
@@ -1384,13 +1557,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                         (lakebase_task, competitor_task),
                         return_when=asyncio.FIRST_EXCEPTION,
                     )
-                    lakebase, competitor = await asyncio.gather(
-                        lakebase_task, competitor_task
-                    )
-                if abs(lakebase.launched_ns - competitor.launched_ns) > 10_000_000:
-                    raise ConnectionSpikeLiveOperationError(
-                        "Round 5 setup workflows exceeded the 10 ms launch gate"
-                    )
+                    lakebase, competitor = await asyncio.gather(lakebase_task, competitor_task)
                 receipt = await coordinator.seal(scope)
                 self._receipts[bout_id] = receipt
                 observations = (
@@ -1424,9 +1591,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                 # after the bounded drain spends that budget learning.
                 await abandon_on_cancel(
                     lambda: self._abandon_setup(bout_id, (lakebase_task, competitor_task)),
-                    identifier=lambda: self._cancelled_setup_identifier(
-                        bout_id, specs, resources
-                    ),
+                    identifier=lambda: self._cancelled_setup_identifier(bout_id, specs, resources),
                     timeout_seconds=self.cancel_teardown_timeout_seconds,
                 )
                 raise
@@ -1489,15 +1654,12 @@ class LiveConnectionSpikeSetupOrchestrator:
             for spec in specs
             if spec.deterministic_name
         ]
-        parts.append(
-            f"proxy target {self.config.competitor_id} {self.config.competitor_target_id}"
-        )
+        parts.append(f"proxy target {self.config.competitor_id} {self.config.competitor_target_id}")
         if resources.proxy_security_group_id:
             parts.append(f"observed security group {resources.proxy_security_group_id}")
         if resources.security_group_rule_ids:
             parts.append(
-                "observed security group rules "
-                + ",".join(resources.security_group_rule_ids)
+                "observed security group rules " + ",".join(resources.security_group_rule_ids)
             )
         if resources.proxy_endpoint:
             parts.append(f"observed proxy endpoint {resources.proxy_endpoint}")
@@ -1518,8 +1680,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         )
         if commands:
             parts.append(
-                f"in-flight SSM commands on {self.config.runner_instance_id} "
-                + ",".join(commands)
+                f"in-flight SSM commands on {self.config.runner_instance_id} " + ",".join(commands)
             )
         if unidentified:
             parts.append(
@@ -1554,6 +1715,20 @@ class LiveConnectionSpikeSetupOrchestrator:
             # longer stop the task below from being created -- and that task is
             # the only thing in this process that deletes the RDS Proxy.
             await self._settle_commands(bout_id)
+            scope = self._scopes.get(bout_id)
+            resources = getattr(self, "_resources_by_bout", {}).get(bout_id)
+            if scope is not None and resources is not None:
+                cleanup_clients = await self._assumed_clients(
+                    f"cleanup-{bout_id}",
+                    minimum_lifetime_seconds=45 * 60 + 60,
+                )
+                coordinator, specs = self._coordinator(
+                    scope,
+                    cleanup_clients,
+                    resources,
+                )
+                self._coordinators[bout_id] = coordinator
+                self._prepared_specs[bout_id] = specs
             self._proxy_delete_accepted.setdefault(bout_id, asyncio.Event())
             self._cleanup_tasks[bout_id] = asyncio.create_task(
                 self._cleanup_exactly(bout_id),
@@ -1586,6 +1761,8 @@ class LiveConnectionSpikeSetupOrchestrator:
         self._results.pop(bout_id, None)
         self._coordinators.pop(bout_id, None)
         self._scopes.pop(bout_id, None)
+        getattr(self, "_resources_by_bout", {}).pop(bout_id, None)
+        getattr(self, "_prepared_specs", {}).pop(bout_id, None)
         # A successfully completed cleanup with no live Proxy is also a completed
         # handoff (for example, recovery after the Proxy was already absent).
         self._proxy_delete_accepted.setdefault(bout_id, asyncio.Event()).set()
@@ -1641,6 +1818,38 @@ class LiveConnectionSpikeSetupOrchestrator:
         """Read the durable set that must be empty before a fresh Round 5 setup."""
 
         return tuple(await self._journal.unresolved_bout_ids())
+
+    async def prove_bout_absent(self, bout_id: str) -> None:
+        """Prove a journal-free inherited claim left no provider resource."""
+
+        LiveConnectionSpikeAdapter._validate_run_id(bout_id)
+        if bout_id in await self._journal.unresolved_bout_ids():
+            raise ConnectionSpikeCleanupError("Round 5 inherited claim still has journal debt")
+        clients = await self._assumed_clients(
+            f"cleanup-{bout_id}",
+            minimum_lifetime_seconds=45 * 60 + 60,
+        )
+        names = self.names_for_bout(
+            self.config.deterministic_name_prefix,
+            bout_id,
+            self.config.secret_name_prefix or "anti-demo-round5",
+        )
+        try:
+            response = await self._call(
+                clients.rds.describe_db_proxies,
+                DBProxyName=names.proxy_name,
+            )
+        except Exception as exc:
+            if self._error_code(exc) != "DBProxyNotFoundFault":
+                raise
+            response = {"DBProxies": []}
+        if response.get("DBProxies"):
+            raise ConnectionSpikeCleanupError("Round 5 inherited claim still owns an RDS Proxy")
+        await self._discover_orphaned_addons(
+            clients,
+            self.config.competitor_security_group_id,
+            include_legacy=False,
+        )
 
     async def assert_no_unresolved_bouts(
         self,
@@ -1838,10 +2047,6 @@ class LiveConnectionSpikeSetupOrchestrator:
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
-        if launched_ns - t0_box[0] > 10_000_000:
-            raise ConnectionSpikeLiveOperationError(
-                "Round 5 Lakebase setup workflow launched after 10 ms"
-            )
 
         async def report(phase: str, status: str = "running") -> None:
             await self._report(
@@ -1852,23 +2057,18 @@ class LiveConnectionSpikeSetupOrchestrator:
                 t0_ns=t0_box[0],
             )
 
-        await report("validating_host")
-        host = await self._fresh_lakebase_host()
-        if host != self.config.lakebase_pooled_host:
-            raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 fresh Lakebase pooled host differs from the sealed baseline"
-            )
-        await report("verifying_transaction")
-        await self._runner_action(
-            clients.ssm,
-            bout_id=bout_id,
-            lane_id="lakebase",
-            action="verify",
-            endpoint_host=host,
-            credential_host=self.config.lakebase_direct_host,
-            credential_sha256=self.config.lakebase_credential_sha256,
-        )
         stopped_ns = self._monotonic_ns()
+        stop = ConnectionSpikeSetupLaneStop(
+            lane_id="lakebase",
+            launched_ns=launched_ns,
+            stopped_ns=stopped_ns,
+            credential_sha256=self.config.lakebase_credential_sha256,
+            endpoint_host=self.config.lakebase_pooled_host,
+        )
+        # Ready now, not when the other lane is. Lakebase verifies its included pool in seconds
+        # and has no reason to wait on a Proxy build.
+        if on_lane_ready is not None:
+            await on_lane_ready(stop)
         await self._report(
             on_progress,
             "lakebase",
@@ -1876,17 +2076,6 @@ class LiveConnectionSpikeSetupOrchestrator:
             "verified",
             setup_elapsed_ms=(stopped_ns - t0_box[0]) / 1_000_000,
         )
-        stop = ConnectionSpikeSetupLaneStop(
-            lane_id="lakebase",
-            launched_ns=launched_ns,
-            stopped_ns=stopped_ns,
-            credential_sha256=self.config.lakebase_credential_sha256,
-            endpoint_host=host,
-        )
-        # Ready now, not when the other lane is. Lakebase verifies its included pool in seconds
-        # and has no reason to wait on a Proxy build.
-        if on_lane_ready is not None:
-            await on_lane_ready(stop)
         return stop
 
     async def _setup_competitor(
@@ -1901,13 +2090,10 @@ class LiveConnectionSpikeSetupOrchestrator:
         t0_box: list[int],
         on_progress: SetupProgressCallback | None,
         on_lane_ready: SetupLaneReadyCallback | None = None,
+        on_lane_stage: SetupLaneStageCallback | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
-        if launched_ns - t0_box[0] > 10_000_000:
-            raise ConnectionSpikeLiveOperationError(
-                "Round 5 RDS setup workflow launched after 10 ms"
-            )
 
         async def report(phase: str, status: str = "running") -> None:
             await self._report(
@@ -1919,20 +2105,39 @@ class LiveConnectionSpikeSetupOrchestrator:
             )
 
         phases = {
-            "proxy_security_group": "creating_proxy_network",
-            "proxy_default_egress": "freezing_proxy_egress",
-            "proxy_ingress": "authorizing_proxy_ingress",
-            "proxy_egress": "authorizing_proxy_egress",
-            "runner_egress": "authorizing_runner_egress",
-            "rds_ingress": "authorizing_rds_ingress",
             "rds_proxy": "creating_proxy",
             "proxy_target_group": "freezing_proxy_settings",
             "proxy_target": "registering_proxy_target",
         }
         for spec in specs:
             phase = phases[spec.resource_kind]
-            await report(phase)
-            await coordinator.create_resource(scope, spec)
+            if spec.resource_kind == "rds_proxy":
+                # No progress/log write lies between bell gate release and the
+                # first timed AWS mutation.
+                await coordinator.create_resource(scope, spec)
+                await report(phase)
+            else:
+                await report(phase)
+                await coordinator.create_resource(scope, spec)
+        if on_lane_stage is not None:
+            if not resources.proxy_endpoint:
+                raise ConnectionSpikeLiveOperationError(
+                    "RDS did not publish the exact per-bout Proxy endpoint"
+                )
+            # Bind only after CreateDBProxy has returned its endpoint.  The
+            # resident parses and prepares this exact request while AWS is
+            # still making the Proxy usable; its RELEASE remains durably held
+            # until the topology gate below passes.
+            await on_lane_stage(
+                ConnectionSpikeSetupLaneStop(
+                    lane_id="competitor",
+                    launched_ns=launched_ns,
+                    stopped_ns=self._monotonic_ns(),
+                    credential_sha256=self.config.competitor_credential_sha256,
+                    endpoint_host=resources.proxy_endpoint,
+                    secret_arn=resources.secret_arn,
+                )
+            )
         wake_aurora = self.config.competitor_id == "aurora_serverless_v2"
         aurora_proxy_state: Literal["available", "pending_capacity"] | None = None
         await report("waiting_for_proxy_target")
@@ -1960,24 +2165,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             await self._wait_proxy_available(clients, resources)
         await report("verifying_topology")
         await self._verify_proxy_topology(clients, resources)
-        await report("verifying_transaction")
-        await self._runner_action(
-            clients.ssm,
-            bout_id=bout_id,
-            lane_id=self.config.competitor_credential_id,
-            action="verify",
-            endpoint_host=resources.proxy_endpoint,
-            credential_host=self.config.competitor_direct_host,
-            credential_sha256=self.config.competitor_credential_sha256,
-        )
         stopped_ns = self._monotonic_ns()
-        await self._report(
-            on_progress,
-            "competitor",
-            "setup_stop",
-            "verified",
-            setup_elapsed_ms=(stopped_ns - t0_box[0]) / 1_000_000,
-        )
         stop = ConnectionSpikeSetupLaneStop(
             lane_id="competitor",
             launched_ns=launched_ns,
@@ -1990,24 +2178,37 @@ class LiveConnectionSpikeSetupOrchestrator:
         # some other lane finishes something unrelated to it.
         if on_lane_ready is not None:
             await on_lane_ready(stop)
+        await self._report(
+            on_progress,
+            "competitor",
+            "setup_stop",
+            "verified",
+            setup_elapsed_ms=(stopped_ns - t0_box[0]) / 1_000_000,
+        )
         return stop
 
     def _setup_observation(self, stop: ConnectionSpikeSetupLaneStop) -> SetupLaneObservation:
         if stop.lane_id == "lakebase":
             facts = (
-                PublicSetupEvidence("fresh_pooled_path_verified", True),
-                PublicSetupEvidence("runner_verify_full_transaction", True),
+                PublicSetupEvidence("warm_launch_capsule_current", True),
+                # Boolean gate fact, not a host: it asserts that the pooled path
+                # bound exactly.  It must NOT contain the substring "endpoint",
+                # because the public projection's sensitive-key denylist redacts
+                # any key carrying "endpoint"/"host"/"arn"; a collision there
+                # once nulled this lane's entire public gate and downgraded a
+                # genuinely verified Lakebase setup to unverified.
+                PublicSetupEvidence("pooled_path_binding_exact", True),
             )
-            gate_id = "lakebase_fresh_pooled_transaction"
+            gate_id = "lakebase_dispatch_eligibility"
         else:
             facts = (
                 PublicSetupEvidence("sealed_proxy_auth_verified", True),
                 PublicSetupEvidence("proxy_target_state", "AVAILABLE"),
                 PublicSetupEvidence("max_connections_percent", 90),
                 PublicSetupEvidence("connection_borrow_timeout_seconds", 120),
-                PublicSetupEvidence("runner_verify_full_transaction", True),
+                PublicSetupEvidence("static_network_fixture_exact", True),
             )
-            gate_id = "rds_proxy_topology_transaction"
+            gate_id = "rds_proxy_exact_control_plane"
         return SetupLaneObservation(
             lane_id=stop.lane_id,
             workflow_launched_ns=stop.launched_ns,
@@ -2046,7 +2247,12 @@ class LiveConnectionSpikeSetupOrchestrator:
                     "Round 5 provider reread differed from the journaled setup mutation"
                 )
 
-    async def _assumed_clients(self, bout_id: str) -> _SetupAwsClients:
+    async def _assumed_clients(
+        self,
+        bout_id: str,
+        *,
+        minimum_lifetime_seconds: int = SETUP_DEADLINE_SECONDS + 60,
+    ) -> _SetupAwsClients:
         def assume() -> _SetupAwsClients:
             suffix = hashlib.sha256(bout_id.encode()).hexdigest()[:16]
             source = _control_role_source_session(
@@ -2056,7 +2262,11 @@ class LiveConnectionSpikeSetupOrchestrator:
                 runtime_role_arn=self.config.runtime_role_arn,
                 session_name=f"{self.config.role_session_prefix}-rt-{suffix}",
             )
-            sts = source.client("sts", region_name=self.config.region)
+            sts = source.client(
+                "sts",
+                region_name=self.config.region,
+                config=_AWS_CLIENT_CONFIG,
+            )
             response = sts.assume_role(
                 RoleArn=self.config.baseline_control_role_arn,
                 RoleSessionName=f"{self.config.role_session_prefix}-{suffix}"[:64],
@@ -2078,13 +2288,16 @@ class LiveConnectionSpikeSetupOrchestrator:
                     "STS did not return the sealed Round 5 baseline control role"
                 )
             expiration = credentials["Expiration"]
-            if isinstance(expiration, datetime):
-                if expiration.tzinfo is None:
-                    expiration = expiration.replace(tzinfo=UTC)
-                if expiration <= datetime.now(UTC) + timedelta(seconds=SETUP_DEADLINE_SECONDS + 60):
-                    raise ConnectionSpikeLiveConfigurationError(
-                        "Round 5 assumed credentials expire before the setup deadline"
-                    )
+            if not isinstance(expiration, datetime):
+                raise ConnectionSpikeLiveConfigurationError(
+                    "STS omitted the Round 5 setup credential expiration"
+                )
+            if expiration.tzinfo is None:
+                expiration = expiration.replace(tzinfo=UTC)
+            if expiration <= datetime.now(UTC) + timedelta(seconds=minimum_lifetime_seconds):
+                raise ConnectionSpikeLiveConfigurationError(
+                    "Round 5 assumed credentials expire before the setup deadline"
+                )
             assumed = self._session_factory(
                 aws_access_key_id=credentials["AccessKeyId"],
                 aws_secret_access_key=credentials["SecretAccessKey"],
@@ -2092,11 +2305,32 @@ class LiveConnectionSpikeSetupOrchestrator:
                 region_name=self.config.region,
             )
             return _SetupAwsClients(
-                ssm=assumed.client("ssm", region_name=self.config.region),
-                rds=assumed.client("rds", region_name=self.config.region),
-                ec2=assumed.client("ec2", region_name=self.config.region),
-                iam=assumed.client("iam", region_name=self.config.region),
-                secretsmanager=assumed.client("secretsmanager", region_name=self.config.region),
+                ssm=assumed.client(
+                    "ssm",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                rds=assumed.client(
+                    "rds",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                ec2=assumed.client(
+                    "ec2",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                iam=assumed.client(
+                    "iam",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                secretsmanager=assumed.client(
+                    "secretsmanager",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                expires_at=expiration,
             )
 
         return await asyncio.to_thread(assume)
@@ -2110,15 +2344,25 @@ class LiveConnectionSpikeSetupOrchestrator:
         resources: _SetupResources,
     ) -> None:
         await self._fence.assert_current(scope)
-        source, managed = await asyncio.gather(
+        source, lakebase_managed, competitor_managed = await asyncio.gather(
             self._read_competitor_source(clients),
             self._call(
                 clients.ssm.describe_instance_information,
                 Filters=[{"Key": "InstanceIds", "Values": [self.config.runner_instance_id]}],
             ),
+            self._call(
+                clients.ssm.describe_instance_information,
+                Filters=[
+                    {
+                        "Key": "InstanceIds",
+                        "Values": [self.config.competitor_runner_instance_id],
+                    }
+                ],
+            ),
         )
-        runners = managed.get("InstanceInformationList") or []
-        if not source.identifier or len(runners) != 1:
+        lakebase_runners = lakebase_managed.get("InstanceInformationList") or []
+        competitor_runners = competitor_managed.get("InstanceInformationList") or []
+        if not source.identifier or len(lakebase_runners) != 1 or len(competitor_runners) != 1:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 clean baseline did not resolve exactly once"
             )
@@ -2129,8 +2373,10 @@ class LiveConnectionSpikeSetupOrchestrator:
             or source.status != "available"
             or source.vpc_id != self.config.vpc_id
             or len(source.security_group_ids) != 1
-            or runners[0].get("InstanceId") != self.config.runner_instance_id
-            or runners[0].get("PingStatus") != "Online"
+            or lakebase_runners[0].get("InstanceId") != self.config.runner_instance_id
+            or lakebase_runners[0].get("PingStatus") != "Online"
+            or competitor_runners[0].get("InstanceId") != self.config.competitor_runner_instance_id
+            or competitor_runners[0].get("PingStatus") != "Online"
         ):
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 source or runner differs from the sealed clean baseline"
@@ -2341,20 +2587,12 @@ class LiveConnectionSpikeSetupOrchestrator:
         }
         stem = resources.names.proxy_name
         specs = (
-            ResourceSpec(
-                1,
-                "proxy_security_group",
-                resources.names.proxy_security_group_name,
-                metadata=metadata,
-            ),
-            ResourceSpec(2, "proxy_default_egress", f"{stem}-default-egress", metadata=metadata),
-            ResourceSpec(3, "proxy_ingress", f"{stem}-proxy-ingress", metadata=metadata),
-            ResourceSpec(4, "proxy_egress", f"{stem}-proxy-egress", metadata=metadata),
-            ResourceSpec(5, "runner_egress", f"{stem}-runner-egress", metadata=metadata),
-            ResourceSpec(6, "rds_ingress", f"{stem}-rds-ingress", metadata=metadata),
-            ResourceSpec(7, "rds_proxy", resources.names.proxy_name, metadata=metadata),
-            ResourceSpec(8, "proxy_target_group", f"{stem}-target-group", metadata=metadata),
-            ResourceSpec(9, "proxy_target", f"{stem}-target", metadata=metadata),
+            # Static least-privilege network fixtures, role and secret were
+            # verified by warming. CreateDBProxy is therefore the first timed
+            # AWS mutation.
+            ResourceSpec(1, "rds_proxy", resources.names.proxy_name, metadata=metadata),
+            ResourceSpec(2, "proxy_target_group", f"{stem}-target-group", metadata=metadata),
+            ResourceSpec(3, "proxy_target", f"{stem}-target", metadata=metadata),
         )
         adapters: dict[str, ResourceAdapter] = {
             "proxy_secret": _SetupResourceAdapter(
@@ -2573,9 +2811,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                 children = [normalize(child) for child in item]
                 return sorted(
                     children,
-                    key=lambda child: json.dumps(
-                        child, sort_keys=True, separators=(",", ":")
-                    ),
+                    key=lambda child: json.dumps(child, sort_keys=True, separators=(",", ":")),
                 )
             return item
 
@@ -2759,9 +2995,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         }
 
     @classmethod
-    def _proxy_cleanup_policy_matches(
-        cls, response: Mapping[str, object], secret_arn: str
-    ) -> bool:
+    def _proxy_cleanup_policy_matches(cls, response: Mapping[str, object], secret_arn: str) -> bool:
         legacy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -2769,9 +3003,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                     "Effect": "Allow",
                     "Action": "secretsmanager:GetSecretValue",
                     "Resource": secret_arn,
-                    "Condition": {
-                        "StringEquals": {"secretsmanager:VersionStage": "AWSCURRENT"}
-                    },
+                    "Condition": {"StringEquals": {"secretsmanager:VersionStage": "AWSCURRENT"}},
                 }
             ],
         }
@@ -3171,12 +3403,8 @@ class LiveConnectionSpikeSetupOrchestrator:
         groups = response.get("TargetGroups") or []
         group = groups[0] if len(groups) == 1 else {}
         target_group_arn = str(group.get("TargetGroupArn") or "")
-        if (
-            group.get("TargetGroupName") != "default"
-            or not target_group_arn.startswith(
-                f"arn:aws:rds:{self.config.region}:"
-                f"{self.config.expected_account_id}:target-group:"
-            )
+        if group.get("TargetGroupName") != "default" or not target_group_arn.startswith(
+            f"arn:aws:rds:{self.config.region}:{self.config.expected_account_id}:target-group:"
         ):
             raise ConnectionSpikeLiveOperationError(
                 "RDS did not return the exact per-bout Proxy target group"
@@ -3223,12 +3451,8 @@ class LiveConnectionSpikeSetupOrchestrator:
             return None
         group = groups[0] if len(groups) == 1 else {}
         target_group_arn = str(group.get("TargetGroupArn") or "")
-        if (
-            group.get("TargetGroupName") != "default"
-            or not target_group_arn.startswith(
-                f"arn:aws:rds:{self.config.region}:"
-                f"{self.config.expected_account_id}:target-group:"
-            )
+        if group.get("TargetGroupName") != "default" or not target_group_arn.startswith(
+            f"arn:aws:rds:{self.config.region}:{self.config.expected_account_id}:target-group:"
         ):
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 per-bout Proxy target-group identity changed"
@@ -3239,10 +3463,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         )
         self._require_exact_tags(spec, tags.get("TagList") or [])
         pool = group.get("ConnectionPoolConfig") or {}
-        if (
-            pool.get("MaxConnectionsPercent") == 90
-            and pool.get("ConnectionBorrowTimeout") == 120
-        ):
+        if pool.get("MaxConnectionsPercent") == 90 and pool.get("ConnectionBorrowTimeout") == 120:
             return self._observation(spec, provider_id or f"{resources.names.proxy_name}:default")
         return None
 
@@ -3291,12 +3512,9 @@ class LiveConnectionSpikeSetupOrchestrator:
             require_available=True,
         )
 
-    def _aurora_targets_pending_capacity(
-        self, targets: Sequence[Mapping[str, object]]
-    ) -> bool:
-        if (
-            self.config.competitor_id != "aurora_serverless_v2"
-            or not self._proxy_targets_match(targets)
+    def _aurora_targets_pending_capacity(self, targets: Sequence[Mapping[str, object]]) -> bool:
+        if self.config.competitor_id != "aurora_serverless_v2" or not self._proxy_targets_match(
+            targets
         ):
             return False
         routable = [target for target in targets if target.get("Type") == "RDS_INSTANCE"]
@@ -3462,9 +3680,8 @@ class LiveConnectionSpikeSetupOrchestrator:
             ):
                 if self._proxy_targets_available(target_values):
                     return "available"
-                if (
-                    allow_aurora_pending_capacity
-                    and self._aurora_targets_pending_capacity(target_values)
+                if allow_aurora_pending_capacity and self._aurora_targets_pending_capacity(
+                    target_values
                 ):
                     return "pending_capacity"
             await self._sleep(self.config.poll_interval_seconds)
@@ -3505,58 +3722,85 @@ class LiveConnectionSpikeSetupOrchestrator:
         auth = proxy.get("Auth") or []
         pool = (groups[0].get("ConnectionPoolConfig") or {}) if len(groups) == 1 else {}
         network = networks[0] if len(networks) == 1 else {}
-        stem = resources.names.proxy_name
         ingress = self._security_group_permissions(network.get("IpPermissions") or [])
         egress = self._security_group_permissions(network.get("IpPermissionsEgress") or [])
-        if (
-            proxy.get("DBProxyName") != resources.names.proxy_name
-            or str(proxy.get("Status") or "").lower() != "available"
-            or proxy.get("Endpoint") != resources.proxy_endpoint
-            or proxy.get("RoleArn") != resources.proxy_role_arn
-            or proxy.get("VpcId") != self.config.vpc_id
-            or set(proxy.get("VpcSubnetIds") or []) != set(self.config.proxy_subnet_ids)
-            or set(proxy.get("VpcSecurityGroupIds") or []) != {resources.proxy_security_group_id}
-            or proxy.get("RequireTLS") is not True
-            or len(auth) != 1
-            or auth[0].get("SecretArn") != resources.secret_arn
-            or auth[0].get("IAMAuth") != "DISABLED"
-            or auth[0].get("ClientPasswordAuthType") != "POSTGRES_SCRAM_SHA_256"
-            or len(groups) != 1
-            or groups[0].get("TargetGroupName") != "default"
-            or pool.get("MaxConnectionsPercent") != 90
-            or pool.get("ConnectionBorrowTimeout") != 120
-            or not self._proxy_targets_available(targets)
-            or source.identifier != self.config.competitor_target_id
-            or source.resource_id != self.config.competitor_resource_id
-            or source.direct_host != self.config.competitor_direct_host
-            or source.status != "available"
-            or source.vpc_id != self.config.vpc_id
-            or source.security_group_ids != (resources.rds_security_group_id,)
-            or len(networks) != 1
-            or network.get("GroupId") != resources.proxy_security_group_id
-            or ingress
-            != (
-                (
-                    "tcp",
-                    5432,
-                    5432,
-                    self.config.runner_security_group_id,
-                    f"{stem}-proxy-ingress",
-                ),
-            )
-            or egress
-            != (
-                (
-                    "tcp",
-                    5432,
-                    5432,
-                    resources.rds_security_group_id,
-                    f"{stem}-proxy-egress",
-                ),
-            )
-        ):
+        checks = {
+            "proxy_identity": (
+                proxy.get("DBProxyName") == resources.names.proxy_name
+                and str(proxy.get("Status") or "").lower() == "available"
+                and proxy.get("Endpoint") == resources.proxy_endpoint
+            ),
+            "proxy_engine_role": (
+                proxy.get("RoleArn") == resources.proxy_role_arn
+                and proxy.get("EngineFamily") == "POSTGRESQL"
+            ),
+            "proxy_vpc": (
+                proxy.get("VpcId") == self.config.vpc_id
+                and set(proxy.get("VpcSubnetIds") or []) == set(self.config.proxy_subnet_ids)
+                and set(proxy.get("VpcSecurityGroupIds") or [])
+                == {resources.proxy_security_group_id}
+            ),
+            "proxy_tls_auth": (
+                proxy.get("RequireTLS") is True
+                and len(auth) == 1
+                and auth[0].get("AuthScheme") == "SECRETS"
+                and auth[0].get("SecretArn") == resources.secret_arn
+                and auth[0].get("IAMAuth") == "DISABLED"
+                and auth[0].get("UserName")
+                in {
+                    None,
+                    self.config.native_role,
+                }
+                and auth[0].get("ClientPasswordAuthType") == "POSTGRES_SCRAM_SHA_256"
+            ),
+            "target_group": (
+                len(groups) == 1
+                and groups[0].get("TargetGroupName") == "default"
+                and pool.get("MaxConnectionsPercent") == 90
+                and pool.get("ConnectionBorrowTimeout") == 120
+            ),
+            "target_exact": self._proxy_targets_available(targets),
+            "source_exact": (
+                source.identifier == self.config.competitor_target_id
+                and source.resource_id == self.config.competitor_resource_id
+                and source.direct_host == self.config.competitor_direct_host
+                and source.status == "available"
+                and source.vpc_id == self.config.vpc_id
+                and source.security_group_ids == (resources.rds_security_group_id,)
+            ),
+            "network_ingress": (
+                len(networks) == 1
+                and network.get("GroupId") == resources.proxy_security_group_id
+                and ingress
+                == (
+                    (
+                        "tcp",
+                        5432,
+                        5432,
+                        self.config.runner_security_group_id,
+                        "PostgreSQL from the sealed Round 5 physical runners",
+                    ),
+                )
+            ),
+            "network_egress": (
+                len(networks) == 1
+                and network.get("GroupId") == resources.proxy_security_group_id
+                and egress
+                == (
+                    (
+                        "tcp",
+                        5432,
+                        5432,
+                        resources.rds_security_group_id,
+                        "PostgreSQL to the exact sealed Round 5 source",
+                    ),
+                )
+            ),
+        }
+        failed = [name for name, passed in checks.items() if not passed]
+        if failed:
             raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 RDS Proxy topology reread did not exactly match the timed setup"
+                "Round 5 exact Proxy control gate failed: " + ",".join(failed)
             )
 
     @staticmethod
@@ -3615,6 +3859,11 @@ class LiveConnectionSpikeSetupOrchestrator:
         master_secret_arn: str = "",
         destination_secret_arn: str = "",
     ) -> None:
+        runner_instance_id = (
+            self.config.runner_instance_id
+            if lane_id == "lakebase"
+            else self.config.competitor_runner_instance_id
+        )
         nonce = hashlib.sha256(f"{bout_id}\0{lane_id}\0{action}".encode()).hexdigest()
         request: dict[str, object] = {
             "protocol": SETUP_RUNNER_PROTOCOL,
@@ -3646,7 +3895,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                 "Round 5 setup request exceeds the SSM command limit"
             )
         send_kwargs = {
-            "InstanceIds": [self.config.runner_instance_id],
+            "InstanceIds": [runner_instance_id],
             "DocumentName": self.config.ssm_document_name,
             "TimeoutSeconds": int(self.config.command_timeout_seconds),
             "Parameters": {
@@ -3676,7 +3925,14 @@ class LiveConnectionSpikeSetupOrchestrator:
             raise ConnectionSpikeLiveOperationError(
                 "SSM did not return a Round 5 setup command identifier"
             )
-        active = _SetupActiveCommand(bout_id, lane_id, action, command_id, ssm)
+        active = _SetupActiveCommand(
+            bout_id,
+            lane_id,
+            action,
+            command_id,
+            runner_instance_id,
+            ssm,
+        )
         self._active_commands[key] = active
         self._pending_sends.pop(key, None)
         if cancelled_during_send:
@@ -3732,7 +3988,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             return await self._call(
                 active.ssm.get_command_invocation,
                 CommandId=active.command_id,
-                InstanceId=self.config.runner_instance_id,
+                InstanceId=active.runner_instance_id,
             )
         except Exception as exc:
             if self._error_code(exc) == "InvocationDoesNotExist":
@@ -3743,7 +3999,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         await self._call(
             active.ssm.cancel_command,
             CommandId=active.command_id,
-            InstanceIds=[self.config.runner_instance_id],
+            InstanceIds=[active.runner_instance_id],
         )
         # Same caveat as the Proxy deletion deadline: this bounds the polling
         # below, but the `_call` above re-awaits its worker thread on
@@ -3948,6 +4204,7 @@ class LiveConnectionSpikeAdapter:
         session_factory: SessionFactory = boto3.Session,
         sleep: Sleeper = asyncio.sleep,
         cancel_teardown_timeout_seconds: float = DEFAULT_CANCEL_TEARDOWN_SECONDS,
+        resident_transport: Round5ResidentTransport | None = None,
     ) -> None:
         if cancel_teardown_timeout_seconds <= 0:
             raise ValueError("cancel_teardown_timeout_seconds must be positive")
@@ -3957,13 +4214,155 @@ class LiveConnectionSpikeAdapter:
         self.cancel_teardown_timeout_seconds = cancel_teardown_timeout_seconds
         self._active: _ActiveCommand | None = None
         self._pending: _PendingCommand | None = None
+        # A command identity remains here until remote socket cleanup and the
+        # runner flock release are both observed.  Task cancellation is only a
+        # local fact and must never erase the job provider cleanup is waiting on.
+        self._settlement_debt: dict[str, _ActiveCommand] = {}
         self._dispatch_lock = asyncio.Lock()
+        self._capsule_refresh_lock = asyncio.Lock()
+        self._prepared_clients: _AwsClients | None = None
+        self._prepared_boot_id = ""
+        self._prepared_capacity: CapacityPreflight | None = None
+        self._resident_transport = resident_transport
+        self._resident_process_boot_id = ""
+        self._resident_process_pid = 0
+        self._resident_warm_attempt_token = ""
+        self._resident_settlement_debt: dict[str, Round5ControlBinding] = {}
+        self._resident_release_events: dict[str, Round5ControlEvent] = {}
+
+    @property
+    def prepared_boot_id(self) -> str:
+        return self._prepared_boot_id
+
+    @property
+    def prepared_capacity(self) -> CapacityPreflight | None:
+        return self._prepared_capacity
+
+    @property
+    def prepared_expires_at(self) -> datetime | None:
+        return self._prepared_clients.expires_at if self._prepared_clients is not None else None
+
+    def settlement_pending(self, run_id: str) -> bool:
+        return run_id in self._settlement_debt or run_id in self._resident_settlement_debt
+
+    async def _settle_debt(self, active: _ActiveCommand) -> None:
+        self._settlement_debt[active.run_id] = active
+        await self._cancel_and_settle(active)
+        if self._settlement_debt.get(active.run_id) == active:
+            self._settlement_debt.pop(active.run_id, None)
+
+    @staticmethod
+    def _validated_progress(
+        payload: Mapping[str, object],
+        *,
+        sequence: int,
+    ) -> FanInProgress:
+        lane_id = str(payload.get("lane_id") or "")
+        phase = str(payload.get("phase") or "")
+        if (
+            payload.get("protocol") != FANIN_PROTOCOL
+            or payload.get("schema_version") != FANIN_SCHEMA_VERSION
+            or lane_id not in RUNTIME_LANE_IDS
+            or phase not in {"ramping", "holding"}
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 progress did not match the semantic fan-in contract"
+            )
+        counts: dict[str, int] = {}
+        for name, maximum in (
+            ("initiated_clients", 10_000),
+            ("authenticated_clients", 10_000),
+            ("held_clients", 10_000),
+            ("peak_held_clients", 10_000),
+            ("terminal_failures", 10_000),
+            ("sampled_queries_succeeded", 64),
+            ("sampled_queries_failed", 64),
+        ):
+            raw = payload.get(name, 0)
+            if isinstance(raw, bool) or not isinstance(raw, int) or not 0 <= raw <= maximum:
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 progress carried an invalid bounded counter"
+                )
+            counts[name] = raw
+        target = payload.get("time_to_target_ms")
+        target_valid = (
+            isinstance(target, (int, float))
+            and not isinstance(target, bool)
+            and math.isfinite(float(target))
+            and float(target) >= 0
+        )
+        exact = (
+            counts["initiated_clients"] == 10_000
+            and counts["authenticated_clients"] == 10_000
+            and counts["held_clients"] == 10_000
+            and counts["terminal_failures"] == 0
+        )
+        if (
+            counts["peak_held_clients"] < counts["held_clients"]
+            or (target is not None and (not exact or not target_valid))
+            or (phase == "holding" and (not exact or not target_valid))
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 progress advanced beyond its aggregate barrier proof"
+            )
+        milestone_times = {
+            name: payload.get(name)
+            for name in (
+                "first_socket_initiated_ms",
+                "first_client_authenticated_ms",
+            )
+        }
+        if any(
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            )
+            for value in milestone_times.values()
+        ) or (
+            milestone_times["first_socket_initiated_ms"] is not None
+            and milestone_times["first_client_authenticated_ms"] is not None
+            and float(milestone_times["first_client_authenticated_ms"])
+            < float(milestone_times["first_socket_initiated_ms"])
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 progress milestone chronology is invalid"
+            )
+        fields = {name: value for name, value in payload.items() if name in FanInProgress.__slots__}
+        fields["sequence"] = sequence
+        return FanInProgress(**fields)
+
+    @staticmethod
+    def _record_progress_identity(
+        payload: Mapping[str, object],
+        *,
+        sequence: int,
+        seen_digests: dict[int, str],
+    ) -> None:
+        canonical = dict(payload)
+        canonical["sequence"] = sequence
+        digest = hashlib.sha256(
+            json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        previous = seen_digests.get(sequence)
+        if previous is not None and previous != digest:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 equal progress revision changed payload"
+            )
+        seen_digests[sequence] = digest
 
     @staticmethod
     def _progress_from_output(
         output: str,
         *,
         after_sequence: int,
+        seen_digests: dict[int, str] | None = None,
     ) -> tuple[list[FanInProgress], int]:
         """Read the runner's progress lines out of one SSM output block.
 
@@ -3983,6 +4382,7 @@ class LiveConnectionSpikeAdapter:
         """
 
         parsed: list[FanInProgress] = []
+        identities = seen_digests if seen_digests is not None else {}
         last_seen = after_sequence
         expected: int | None = None
         wire_fields = {slot for slot in FanInProgress.__slots__}
@@ -4015,16 +4415,23 @@ class LiveConnectionSpikeAdapter:
                 )
             expected = sequence + 1
             last_seen = max(last_seen, sequence)
+            LiveConnectionSpikeAdapter._record_progress_identity(
+                payload,
+                sequence=sequence,
+                seen_digests=identities,
+            )
             if sequence <= after_sequence:
                 continue
             # Only the declared fields, so a field added to the runner's wire
             # cannot reach this dataclass as an unexpected keyword and turn a
             # newer runner into a crash on this side.
-            fields = {
-                name: value for name, value in payload.items() if name in wire_fields
-            }
-            fields["sequence"] = sequence
-            parsed.append(FanInProgress(**fields))
+            fields = {name: value for name, value in payload.items() if name in wire_fields}
+            parsed.append(
+                LiveConnectionSpikeAdapter._validated_progress(
+                    fields,
+                    sequence=sequence,
+                )
+            )
 
         return parsed, last_seen
 
@@ -4054,6 +4461,39 @@ class LiveConnectionSpikeAdapter:
         clients = await self._assumed_clients("preflight")
         await self._preflight_runner(clients)
         await self._preflight_targets(clients.rds)
+        self._prepared_clients = clients
+
+    async def refresh_launch_context(self, context_id: str) -> datetime:
+        """Rotate the ephemeral dispatch context while the old one stays usable."""
+
+        clients = await self._assumed_clients(context_id)
+        await self._preflight_runner(clients)
+        self._prepared_clients = clients
+        return clients.expires_at
+
+    async def ensure_dispatch_capsule(
+        self,
+        context_id: str,
+        *,
+        refresh_lead_seconds: float = DISPATCH_CAPSULE_REFRESH_LEAD_SECONDS,
+    ) -> datetime:
+        """Retain the full dispatch safety window without rerunning capacity."""
+
+        async with self._capsule_refresh_lock:
+            now = datetime.now(UTC)
+            clients = self._prepared_clients
+            refresh_before = now + timedelta(
+                seconds=DISPATCH_CAPSULE_SAFETY_SECONDS + refresh_lead_seconds
+            )
+            if clients is not None and clients.expires_at > refresh_before:
+                return clients.expires_at
+            refreshed = await self._assumed_clients(context_id)
+            if refreshed.expires_at <= now + timedelta(seconds=DISPATCH_CAPSULE_SAFETY_SECONDS):
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 refreshed dispatch capsule cannot retain its safety margin"
+                )
+            self._prepared_clients = refreshed
+            return refreshed.expires_at
 
     async def execute(
         self,
@@ -4069,9 +4509,10 @@ class LiveConnectionSpikeAdapter:
         bounded schedule to a runner whose result the finaliser read as a fan-in bout.
         """
 
-        if self._dispatch_lock.locked():
+        if self._dispatch_lock.locked() or self._settlement_debt:
             raise ConnectionSpikeLiveOperationError(
-                "A Round 5 runner command is already active in this app replica"
+                "A Round 5 runner command or unsettled prior job is already active "
+                "in this app replica"
             )
         await self._dispatch_lock.acquire()
         try:
@@ -4079,25 +4520,198 @@ class LiveConnectionSpikeAdapter:
         finally:
             self._dispatch_lock.release()
 
+    async def execute_prepared(
+        self,
+        run_id: str,
+        request: Mapping[str, object],
+        *,
+        targets: Sequence[ConnectionSpikeTarget] | None = None,
+        on_progress: Callable[[FanInProgress], Awaitable[None]] | None = None,
+        resident_binding: Round5ControlBinding | None = None,
+    ) -> dict[str, object]:
+        """Use the staged resident generation; never start post-bell SSM."""
+
+        clients = self._prepared_clients
+        if clients is None or clients.expires_at <= datetime.now(UTC) + timedelta(
+            seconds=DISPATCH_CAPSULE_SAFETY_SECONDS
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 dispatch capsule is absent or inside its safety margin"
+            )
+        transport = self._resident_transport
+        if transport is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident runner transport is not configured"
+            )
+        lane_ids = self._requested_lane_ids(request)
+        generation = request.get("resident_generation")
+        if (
+            len(lane_ids) != 1
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation <= 0
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident request omitted one lane or its generation"
+            )
+        lane_id = next(iter(lane_ids))
+        if (
+            resident_binding is None
+            or resident_binding.job_id != run_id
+            or resident_binding.lane_id != lane_id
+            or resident_binding.generation != generation
+            or canonical_request_sha256(request) != resident_binding.request_sha256
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident request binding is incomplete"
+            )
+        if self._dispatch_lock.locked() or self._settlement_debt:
+            raise ConnectionSpikeLiveOperationError(
+                "A Round 5 runner command or unsettled prior job is already active "
+                "in this app replica"
+            )
+        await self._dispatch_lock.acquire()
+        self._resident_settlement_debt[run_id] = resident_binding
+        try:
+            if lane_id == "competitor":
+                staged = getattr(self, "_resident_release_events", {}).get(run_id)
+                if staged is None:
+                    await transport.stage_and_release(
+                        binding=resident_binding,
+                        request=request,
+                    )
+                else:
+                    if (
+                        staged.binding != resident_binding
+                        or staged.kind != Round5ControlKind.RELEASE
+                    ):
+                        raise ConnectionSpikeLiveConfigurationError(
+                            "Round 5 staged competitor release binding changed"
+                        )
+                    # Synchronous permission edge: all durable I/O and resident
+                    # PREPARED work completed before the exact Proxy gate.
+                    transport.dispatcher.allow_release(staged.event_id)
+
+            async def report(value: Mapping[str, object]) -> None:
+                if on_progress is None:
+                    return
+                sequence = value.get("sequence")
+                if isinstance(sequence, bool) or not isinstance(sequence, int):
+                    raise ConnectionSpikeLiveOperationError(
+                        "Resident progress omitted its sequence"
+                    )
+                await on_progress(self._validated_progress(value, sequence=sequence))
+
+            result = await transport.result(resident_binding, on_progress=report)
+            self._resident_settlement_debt.pop(run_id, None)
+            getattr(self, "_resident_release_events", {}).pop(run_id, None)
+            return result
+        finally:
+            self._dispatch_lock.release()
+
+    async def stage_prepared_release(
+        self,
+        *,
+        binding: Round5ControlBinding,
+        request: Mapping[str, object],
+    ) -> None:
+        """Prepare one exact resident request without opening its release gate."""
+
+        transport = self._resident_transport
+        if transport is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident runner transport is not configured"
+            )
+        existing = self._resident_release_events.get(binding.job_id)
+        if existing is not None:
+            if existing.binding != binding:
+                raise ConnectionSpikeLiveConfigurationError(
+                    "Round 5 staged competitor binding changed"
+                )
+            return
+        # Record settlement debt before the first delivery await.  A STAGE may
+        # be accepted remotely even when this caller loses its acknowledgement.
+        self._resident_settlement_debt[binding.job_id] = binding
+        event = await transport.stage_for_release(
+            binding=binding,
+            request=request,
+        )
+        self._resident_release_events[binding.job_id] = event
+
+    async def stage_resident_generation(
+        self,
+        *,
+        generation: int,
+        lane_id: str,
+        warm_attempt_token: str,
+        request_template: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        transport = self._resident_transport
+        if transport is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident runner transport is not configured"
+            )
+        generation_job = hashlib.sha256(
+            f"round5-resident\0{generation}\0{warm_attempt_token}\0{lane_id}".encode()
+        ).hexdigest()
+        request_sha256 = canonical_request_sha256(request_template)
+        binding = Round5ControlBinding(
+            installation_id=self.config.resident_installation_id,
+            lane_id=lane_id,
+            generation=generation,
+            warm_attempt_token=warm_attempt_token,
+            claim_id=None,
+            bout_id=None,
+            bell_id=None,
+            fence=0,
+            job_id=generation_job,
+            runner_boot_id=self._prepared_boot_id,
+            runner_process_boot_id="unattested",
+            runner_harness_sha256=self.config.runner_harness_sha256,
+            request_sha256=request_sha256,
+        )
+        readiness_not_before = datetime.now(UTC)
+        await transport.preload(
+            binding=binding,
+            request=request_template,
+        )
+        readiness = await transport.wait_agent_ready(
+            binding,
+            not_before=readiness_not_before,
+        )
+        self._resident_process_boot_id = str(readiness["runner_process_boot_id"])
+        self._resident_process_pid = int(readiness["process_pid"])
+        self._resident_warm_attempt_token = warm_attempt_token
+        return readiness
+
     async def _execute_reserved(
         self,
         run_id: str,
         request: Mapping[str, object],
         *,
         targets: Sequence[ConnectionSpikeTarget] | None = None,
+        prepared_clients: _AwsClients | None = None,
+        on_progress: Callable[[FanInProgress], Awaitable[None]] | None = None,
     ) -> dict[str, object]:
         self._validate_run_id(run_id)
         self._validate_request(run_id, request)
         is_preflight = request.get("action") == "preflight"
         timeout_seconds = _dispatch_timeout_seconds(request, self.config.command_timeout_seconds)
-        clients = await self._assumed_clients(run_id)
-        await self._preflight_runner(clients)
-        await self._preflight_targets(clients.rds, targets=targets)
+        clients = prepared_clients or await self._assumed_clients(run_id)
+        if prepared_clients is None:
+            await self._preflight_runner(clients)
+            await self._preflight_targets(clients.rds, targets=targets)
         started_at = datetime.now(UTC)
         send_task = asyncio.create_task(
             self._send_command(clients.ssm, request, timeout_seconds=timeout_seconds)
         )
-        pending = _PendingCommand(run_id=run_id, send_task=send_task, clients=clients)
+        job_id = str(request.get("job_id")) if request.get("action") == "run_lane_v3" else None
+        pending = _PendingCommand(
+            run_id=run_id,
+            send_task=send_task,
+            clients=clients,
+            job_id=job_id,
+        )
         self._pending = pending
         try:
             command_id = await asyncio.shield(send_task)
@@ -4107,6 +4721,7 @@ class LiveConnectionSpikeAdapter:
                 run_id=run_id,
                 command_id=command_id,
                 clients=clients,
+                job_id=job_id,
             )
             self._active = active
             if self._pending == pending:
@@ -4114,8 +4729,9 @@ class LiveConnectionSpikeAdapter:
             # Bounds the wait, never the settlement: `_cancel_and_settle` runs
             # on its own task and keeps going after this returns, so a slow
             # runner still gets its cancel issued and its flock released.
+            self._settlement_debt[run_id] = active
             await abandon_on_cancel(
-                lambda: self._cancel_and_settle(active),
+                lambda: self._settle_debt(active),
                 identifier=self._cancelled_burst_identifier(active),
                 timeout_seconds=self.cancel_teardown_timeout_seconds,
             )
@@ -4125,26 +4741,55 @@ class LiveConnectionSpikeAdapter:
             if self._pending == pending:
                 self._pending = None
             raise
-        active = _ActiveCommand(run_id=run_id, command_id=command_id, clients=clients)
+        active = _ActiveCommand(
+            run_id=run_id,
+            command_id=command_id,
+            clients=clients,
+            job_id=job_id,
+        )
         self._active = active
         if self._pending == pending:
             self._pending = None
         try:
-            invocation = await self._wait_for_terminal(active, timeout_seconds=timeout_seconds)
+            invocation = await self._wait_for_terminal(
+                active,
+                timeout_seconds=timeout_seconds,
+                on_progress=on_progress,
+            )
             output = str(invocation.get("StandardOutputContent") or "")
-            self._require_settlement(run_id, output)
             if invocation.get("Status") != "Success":
+                self._require_settlement(run_id, output)
                 code = _runner_error_code(output)
                 raise ConnectionSpikeLiveOperationError(
                     "Round 5 runner command did not succeed after cleanup"
                     + (f": the runner refused with {code}" if code else "")
                 )
             if is_preflight:
+                self._require_settlement(run_id, output)
                 # No CloudWatch witness. The witness corroborates a bout's backend
                 # session count against a second source; a preflight opens no
                 # connection, so there is nothing for it to corroborate and asking
                 # would add a metric read that only ever returns nothing.
-                return self._parse_preflight_output(run_id, output)
+                parsed = self._parse_preflight_output(run_id, output)
+                self._prepared_clients = clients
+                return parsed
+            if job_id is not None:
+                job_status = await self._query_job_status(
+                    clients.ssm,
+                    job_id=job_id,
+                )
+                encoded_result = await self._query_job_result(
+                    clients.ssm,
+                    job_id=job_id,
+                    status=job_status,
+                )
+                output = (
+                    f"CLEANUP_CONFIRMED:{run_id}\n"
+                    f"RESULT_GZIP_BASE64:{encoded_result}\n"
+                    f"RUNNER_FLOCK_RELEASED:{run_id}\n"
+                )
+            else:
+                self._require_settlement(run_id, output)
             result = self._parse_runner_output(
                 run_id,
                 output,
@@ -4158,17 +4803,30 @@ class LiveConnectionSpikeAdapter:
             result["cloudwatch_witness"] = witness
             return result
         except asyncio.CancelledError:
+            self._settlement_debt[run_id] = active
             await abandon_on_cancel(
-                lambda: self._cancel_and_settle(active),
+                lambda: self._settle_debt(active),
                 identifier=self._cancelled_burst_identifier(active),
                 timeout_seconds=self.cancel_teardown_timeout_seconds,
             )
             raise
         except TimeoutError as exc:
-            await self._cancel_and_settle(active)
+            await self._settle_debt(active)
             raise ConnectionSpikeLiveOperationError(
                 f"Round 5 SSM command exceeded its {timeout_seconds:.0f}-second boundary"
             ) from exc
+        except Exception:
+            # A local observer/parser fault does not mean the remote job
+            # stopped. Settle the exact logical job first, then preserve the
+            # original exception as the bout's primary failure.
+            try:
+                await self._settle_debt(active)
+            except Exception:
+                logger.error(
+                    "Round 5 active job settlement failed after a primary adapter error",
+                    exc_info=True,
+                )
+            raise
         finally:
             if self._active == active:
                 self._active = None
@@ -4178,6 +4836,8 @@ class LiveConnectionSpikeAdapter:
     async def cancel(self, run_id: str) -> None:
         self._validate_run_id(run_id)
         active = self._active
+        if active is None:
+            active = self._settlement_debt.get(run_id)
         if active is None:
             pending = self._pending
             if pending is None:
@@ -4191,6 +4851,7 @@ class LiveConnectionSpikeAdapter:
                 run_id=run_id,
                 command_id=command_id,
                 clients=pending.clients,
+                job_id=pending.job_id,
             )
             self._active = active
             if self._pending == pending:
@@ -4199,7 +4860,30 @@ class LiveConnectionSpikeAdapter:
             raise ConnectionSpikeCleanupError(
                 "Refusing to cancel a Round 5 command owned by another run"
             )
-        await self._cancel_and_settle(active)
+        await self._settle_debt(active)
+
+    async def cancel_resident(
+        self,
+        *,
+        binding: Round5ControlBinding,
+    ) -> None:
+        transport = self._resident_transport
+        if transport is None:
+            raise ConnectionSpikeCleanupError(
+                "Resident runner cancellation transport is unavailable"
+            )
+        await transport.cancel(binding=binding, await_settlement=True)
+        self._resident_settlement_debt.pop(binding.job_id, None)
+        self._resident_release_events.pop(binding.job_id, None)
+
+    async def cancel_job(self, job_id: str) -> None:
+        """Cancel and observe one durable logical job during restart cleanup."""
+
+        self._validate_run_id(job_id)
+        transport = self._resident_transport
+        if transport is None:
+            raise ConnectionSpikeCleanupError("Resident runner registry is unavailable")
+        await transport.settle_registry_job(job_id)
 
     async def _assumed_clients(self, run_id: str) -> _AwsClients:
         def assume() -> _AwsClients:
@@ -4215,7 +4899,11 @@ class LiveConnectionSpikeAdapter:
                 runtime_role_arn=self.config.runtime_role_arn,
                 session_name=f"{self.config.role_session_prefix}-rt-{suffix}",
             )
-            sts = source.client("sts", region_name=self.config.region)
+            sts = source.client(
+                "sts",
+                region_name=self.config.region,
+                config=_AWS_CLIENT_CONFIG,
+            )
             response = sts.assume_role(
                 RoleArn=self.config.execution_role_arn,
                 RoleSessionName=f"{self.config.role_session_prefix}-{suffix}"[:64],
@@ -4242,13 +4930,16 @@ class LiveConnectionSpikeAdapter:
                     "STS did not return the sealed Round 5 assumed role"
                 )
             expiration = credentials["Expiration"]
-            if isinstance(expiration, datetime):
-                if expiration.tzinfo is None:
-                    expiration = expiration.replace(tzinfo=UTC)
-                if expiration <= datetime.now(UTC) + timedelta(seconds=150):
-                    raise ConnectionSpikeLiveConfigurationError(
-                        "Round 5 assumed credentials expire before the bounded run can settle"
-                    )
+            if not isinstance(expiration, datetime):
+                raise ConnectionSpikeLiveConfigurationError(
+                    "STS omitted the Round 5 dispatch credential expiration"
+                )
+            if expiration.tzinfo is None:
+                expiration = expiration.replace(tzinfo=UTC)
+            if expiration <= datetime.now(UTC) + timedelta(seconds=FANIN_SSM_TIMEOUT_SECONDS + 60):
+                raise ConnectionSpikeLiveConfigurationError(
+                    "Round 5 assumed credentials expire before the bounded run can settle"
+                )
             assumed = self._session_factory(
                 aws_access_key_id=credentials["AccessKeyId"],
                 aws_secret_access_key=credentials["SecretAccessKey"],
@@ -4256,10 +4947,27 @@ class LiveConnectionSpikeAdapter:
                 region_name=self.config.region,
             )
             return _AwsClients(
-                ssm=assumed.client("ssm", region_name=self.config.region),
-                rds=assumed.client("rds", region_name=self.config.region),
-                cloudwatch=assumed.client("cloudwatch", region_name=self.config.region),
-                ec2=assumed.client("ec2", region_name=self.config.region),
+                ssm=assumed.client(
+                    "ssm",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                rds=assumed.client(
+                    "rds",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                cloudwatch=assumed.client(
+                    "cloudwatch",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                ec2=assumed.client(
+                    "ec2",
+                    region_name=self.config.region,
+                    config=_AWS_CLIENT_CONFIG,
+                ),
+                expires_at=expiration,
             )
 
         return await asyncio.to_thread(assume)
@@ -4448,17 +5156,37 @@ class LiveConnectionSpikeAdapter:
             raise ConnectionSpikeLiveConfigurationError(
                 "Compressed Round 5 runner request exceeds the SSM command limit"
             )
-        response = await asyncio.to_thread(
-            ssm.send_command,
-            InstanceIds=[self.config.runner_instance_id],
-            DocumentName=self.config.ssm_document_name,
-            TimeoutSeconds=int(timeout_seconds),
-            Parameters={
+        send_kwargs = {
+            "InstanceIds": [self.config.runner_instance_id],
+            "DocumentName": self.config.ssm_document_name,
+            "TimeoutSeconds": int(timeout_seconds),
+            "Parameters": {
                 "commands": [command],
                 "executionTimeout": [str(int(timeout_seconds))],
             },
-            CloudWatchOutputConfig={"CloudWatchOutputEnabled": False},
-        )
+            "CloudWatchOutputConfig": {"CloudWatchOutputEnabled": False},
+        }
+        try:
+            response = await asyncio.to_thread(ssm.send_command, **send_kwargs)
+        except (
+            TimeoutError,
+            OSError,
+            ConnectTimeoutError,
+            ReadTimeoutError,
+            EndpointConnectionError,
+            ConnectionClosedError,
+        ):
+            if request.get("action") != "run_lane_v3":
+                raise
+            # SendCommand has no client token. Query the runner's durable
+            # logical registry, then resend the identical job. Whether the
+            # first acknowledgement was lost before or after execution, the
+            # atomic job claim makes this an attach rather than a second fan-in.
+            await self._query_job_status(
+                ssm,
+                job_id=str(request["job_id"]),
+            )
+            response = await asyncio.to_thread(ssm.send_command, **send_kwargs)
         command_id = str((response.get("Command") or {}).get("CommandId") or "")
         if not command_id:
             raise ConnectionSpikeLiveOperationError(
@@ -4466,20 +5194,208 @@ class LiveConnectionSpikeAdapter:
             )
         return command_id
 
+    async def _query_job_status(
+        self,
+        ssm: Any,
+        *,
+        job_id: str,
+    ) -> Mapping[str, object]:
+        command_id = await self._send_job_control(
+            ssm,
+            action="job_status",
+            job_id=job_id,
+        )
+        async with asyncio.timeout(60):
+            while True:
+                try:
+                    invocation = await asyncio.to_thread(
+                        ssm.get_command_invocation,
+                        CommandId=command_id,
+                        InstanceId=self.config.runner_instance_id,
+                    )
+                except Exception as exc:
+                    if self._error_code(exc) == "InvocationDoesNotExist":
+                        await self._sleep(0.1)
+                        continue
+                    raise
+                if invocation.get("Status") not in _TERMINAL:
+                    await self._sleep(0.1)
+                    continue
+                output = str(invocation.get("StandardOutputContent") or "")
+                rows = [
+                    line.removeprefix("JOB_STATUS:")
+                    for line in output.splitlines()
+                    if line.startswith("JOB_STATUS:")
+                ]
+                if invocation.get("Status") != "Success" or len(rows) != 1:
+                    raise ConnectionSpikeLiveOperationError(
+                        "Round 5 logical job status could not be verified"
+                    )
+                try:
+                    status = json.loads(rows[0])
+                except json.JSONDecodeError as exc:
+                    raise ConnectionSpikeLiveOperationError(
+                        "Round 5 logical job status was malformed"
+                    ) from exc
+                if (
+                    not isinstance(status, Mapping)
+                    or status.get("protocol") != "round5-job-v3"
+                    or status.get("job_id") != job_id
+                ):
+                    raise ConnectionSpikeLiveOperationError(
+                        "Round 5 logical job status named another job"
+                    )
+                return status
+
+    async def _query_job_result(
+        self,
+        ssm: Any,
+        *,
+        job_id: str,
+        status: Mapping[str, object],
+    ) -> str:
+        chunk_count = int(status.get("result_chunks") or 0)
+        result_size = int(status.get("result_size") or 0)
+        expected_sha256 = str(status.get("result_sha256") or "")
+        if (
+            status.get("state") != "completed"
+            or status.get("settled") is not True
+            or status.get("result_available") is not True
+            or not 1 <= chunk_count <= 4
+            or not 1 <= result_size <= 23_500
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 durable runner result metadata is invalid"
+            )
+        chunks: list[str] = []
+        for chunk_index in range(chunk_count):
+            command_id = await self._send_job_control(
+                ssm,
+                action="job_result",
+                job_id=job_id,
+                chunk_index=chunk_index,
+            )
+            async with asyncio.timeout(60):
+                while True:
+                    try:
+                        invocation = await asyncio.to_thread(
+                            ssm.get_command_invocation,
+                            CommandId=command_id,
+                            InstanceId=self.config.runner_instance_id,
+                        )
+                    except Exception as exc:
+                        if self._error_code(exc) == "InvocationDoesNotExist":
+                            await self._sleep(0.1)
+                            continue
+                        raise
+                    if invocation.get("Status") not in _TERMINAL:
+                        await self._sleep(0.1)
+                        continue
+                    output = str(invocation.get("StandardOutputContent") or "")
+                    rows = [
+                        line.removeprefix("JOB_RESULT:")
+                        for line in output.splitlines()
+                        if line.startswith("JOB_RESULT:")
+                    ]
+                    if invocation.get("Status") != "Success" or len(rows) != 1:
+                        raise ConnectionSpikeLiveOperationError(
+                            "Round 5 durable runner result chunk was unavailable"
+                        )
+                    try:
+                        document = json.loads(rows[0])
+                    except json.JSONDecodeError as exc:
+                        raise ConnectionSpikeLiveOperationError(
+                            "Round 5 durable runner result chunk was malformed"
+                        ) from exc
+                    if (
+                        not isinstance(document, Mapping)
+                        or document.get("protocol") != "round5-job-v3"
+                        or document.get("job_id") != job_id
+                        or document.get("chunk_index") != chunk_index
+                        or document.get("chunk_count") != chunk_count
+                        or document.get("result_sha256") != expected_sha256
+                        or not isinstance(document.get("payload"), str)
+                    ):
+                        raise ConnectionSpikeLiveOperationError(
+                            "Round 5 durable runner result chunk identity changed"
+                        )
+                    chunks.append(str(document["payload"]))
+                    break
+        encoded = "".join(chunks)
+        if (
+            len(encoded) != result_size
+            or hashlib.sha256(encoded.encode("ascii")).hexdigest() != expected_sha256
+        ):
+            raise ConnectionSpikeLiveOperationError("Round 5 durable runner result digest changed")
+        return encoded
+
     async def _wait_for_terminal(
         self,
         active: _ActiveCommand,
         *,
         timeout_seconds: float | None = None,
+        on_progress: Callable[[FanInProgress], Awaitable[None]] | None = None,
     ) -> Mapping[str, object]:
+        sequence = 0
+        progress_digests: dict[int, str] = {}
+        next_registry_poll = 0.0
         async with asyncio.timeout(
             self.config.command_timeout_seconds if timeout_seconds is None else timeout_seconds
         ):
             while True:
                 invocation = await self._get_invocation(active)
+                if on_progress is not None:
+                    updates, sequence = self._progress_from_output(
+                        str(invocation.get("StandardOutputContent") or ""),
+                        after_sequence=sequence,
+                        seen_digests=progress_digests,
+                    )
+                    for update in updates:
+                        await on_progress(update)
+                    now = time.monotonic()
+                    if (
+                        active.job_id is not None
+                        and invocation.get("Status") not in _TERMINAL
+                        and now >= next_registry_poll
+                    ):
+                        status = await self._query_job_status(
+                            active.clients.ssm,
+                            job_id=active.job_id,
+                        )
+                        latest = status.get("latest_progress")
+                        if isinstance(latest, Mapping):
+                            latest_sequence = int(latest.get("sequence") or 0)
+                            if latest_sequence <= 0:
+                                raise ConnectionSpikeLiveOperationError(
+                                    "Round 5 durable progress carried no usable sequence"
+                                )
+                            self._record_progress_identity(
+                                latest,
+                                sequence=latest_sequence,
+                                seen_digests=progress_digests,
+                            )
+                            if latest_sequence > sequence:
+                                await on_progress(
+                                    self._validated_progress(
+                                        latest,
+                                        sequence=latest_sequence,
+                                    )
+                                )
+                                sequence = latest_sequence
+                        next_registry_poll = now + 2.0
                 if invocation.get("Status") in _TERMINAL:
                     return invocation
                 await self._sleep(self.config.poll_interval_seconds)
+
+    @staticmethod
+    def _error_code(exc: BaseException) -> str:
+        response = getattr(exc, "response", None)
+        if isinstance(response, Mapping):
+            error = response.get("Error")
+            if isinstance(error, Mapping):
+                return str(error.get("Code") or "")
+        return ""
 
     async def _get_invocation(self, active: _ActiveCommand) -> Mapping[str, object]:
         try:
@@ -4497,17 +5413,20 @@ class LiveConnectionSpikeAdapter:
     async def _cancel_and_settle(self, active: _ActiveCommand) -> None:
         try:
             async with asyncio.timeout(self.config.settlement_timeout_seconds):
-                # Issued inside the bound, not before it. `cancel_command`
-                # reaches AWS on a worker thread, and an unreachable endpoint
-                # parks this await for as long as that thread runs. Outside the
-                # deadline it was the one call the deadline could not cover, so
-                # a wedged cancel never reached the polling the timeout guarded
-                # and the whole block read as protection while providing none.
-                await asyncio.to_thread(
-                    active.clients.ssm.cancel_command,
-                    CommandId=active.command_id,
-                    InstanceIds=[self.config.runner_instance_id],
-                )
+                # Cancellation addresses the logical job, not whichever SSM
+                # acknowledgement happened to reach this process.
+                if active.job_id is not None:
+                    await self._send_job_control(
+                        active.clients.ssm,
+                        action="cancel_job",
+                        job_id=active.job_id,
+                    )
+                else:
+                    await asyncio.to_thread(
+                        active.clients.ssm.cancel_command,
+                        CommandId=active.command_id,
+                        InstanceIds=[self.config.runner_instance_id],
+                    )
                 while True:
                     invocation = await self._get_invocation(active)
                     output = str(invocation.get("StandardOutputContent") or "")
@@ -4521,6 +5440,48 @@ class LiveConnectionSpikeAdapter:
                 "Round 5 runner cancellation did not confirm cleanup and flock "
                 f"release within {self.config.settlement_timeout_seconds:.0f}s"
             ) from exc
+
+    async def _send_job_control(
+        self,
+        ssm: Any,
+        *,
+        action: Literal["cancel_job", "job_status", "job_result"],
+        job_id: str,
+        chunk_index: int | None = None,
+    ) -> str:
+        request = {
+            "protocol": "round5-job-v3",
+            "schema_version": 3,
+            "action": action,
+            "job_id": job_id,
+        }
+        if action == "job_result":
+            if chunk_index is None or chunk_index < 0:
+                raise ConnectionSpikeLiveConfigurationError("Round 5 result chunk index is invalid")
+            request["chunk_index"] = chunk_index
+        encoded = base64.urlsafe_b64encode(
+            gzip.compress(
+                json.dumps(request, sort_keys=True, separators=(",", ":")).encode(),
+                mtime=0,
+            )
+        ).decode()
+        response = await asyncio.to_thread(
+            ssm.send_command,
+            InstanceIds=[self.config.runner_instance_id],
+            DocumentName=self.config.ssm_document_name,
+            TimeoutSeconds=60,
+            Parameters={
+                "commands": [f"{self.config.runner_path} {encoded}"],
+                "executionTimeout": ["60"],
+            },
+            CloudWatchOutputConfig={"CloudWatchOutputEnabled": False},
+        )
+        command_id = str((response.get("Command") or {}).get("CommandId") or "")
+        if not command_id:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 logical job cancellation was not acknowledged"
+            )
+        return command_id
 
     @staticmethod
     def _settled(run_id: str, output: str) -> bool:
@@ -4673,15 +5634,52 @@ class LiveConnectionSpikeAdapter:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 runner returned an unexpected capacity preflight shape"
             )
-        if raw.get("protocol") != FANIN_PROTOCOL or raw.get("action") != "preflight":
+        expected_seal = {
+            "protocol": FANIN_PROTOCOL,
+            "schema_version": FANIN_SCHEMA_VERSION,
+            "action": "preflight",
+            "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
+            "contract_sha256": FanInContract().sha256,
+            "config_sha256": fanin_config_sha256(),
+            "capacity_model_sha256": fanin_capacity_model_sha256(),
+            "generator_sha256": fanin_generator_sha256(),
+            "runner_harness_sha256": self.config.runner_harness_sha256,
+        }
+        if any(raw.get(name) != expected for name, expected in expected_seal.items()):
             raise ConnectionSpikeLiveOperationError(
-                "Round 5 capacity preflight does not match the fan-in protocol"
+                "Round 5 capacity preflight provenance does not match the sealed protocol"
             )
-        expected_model = fanin_capacity_model_sha256()
-        if raw.get("capacity_model_sha256") != expected_model:
+        assets = raw.get("runner_asset_sha256s")
+        if (
+            not isinstance(assets, Mapping)
+            or set(assets) != set(RUNNER_ASSETS)
+            or any(
+                not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in assets.values()
+            )
+            or assets.get("round5_fanin.py") != raw.get("generator_sha256")
+        ):
             raise ConnectionSpikeLiveOperationError(
-                "Round 5 runner measured capacity against a different capacity model "
-                "than this server projects with, so its verdict cannot be re-derived"
+                "Round 5 capacity preflight omitted complete five-file harness evidence"
+            )
+        shard = raw.get("shard_process_preflight")
+        if (
+            not isinstance(shard, Mapping)
+            or shard.get("worker_count") != WORKER_COUNT
+            or shard.get("unique_processes") != WORKER_COUNT
+            or shard.get("unique_cpus") != WORKER_COUNT
+            or shard.get("sufficient") is not True
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 capacity preflight omitted exact shard evidence"
+            )
+        advisories = raw.get("telemetry_advisories")
+        if not isinstance(advisories, list) or any(
+            not isinstance(value, str) or value not in ADVISORY_TELEMETRY_CODES
+            for value in advisories
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 capacity preflight carried unknown advisory evidence"
             )
         return dict(raw)
 
@@ -4705,6 +5703,11 @@ class LiveConnectionSpikeAdapter:
                 )
             return float(value)
 
+        boot_id = str(raw.get("boot_id") or "")
+        if not boot_id or len(boot_id) > 64 or _RUN_ID.fullmatch(boot_id) is None:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 capacity preflight omitted its boot identity"
+            )
         try:
             return evaluate_capacity_preflight(
                 instance_type=str(raw.get("instance_type") or ""),
@@ -4727,6 +5730,9 @@ class LiveConnectionSpikeAdapter:
                 event_loop_selector_fanout_peak_deferred=integer(
                     "event_loop_selector_fanout_peak_deferred"
                 ),
+                boot_id=boot_id,
+                runner_harness_sha256=str(raw.get("runner_harness_sha256") or ""),
+                runner_asset_sha256s=dict(raw.get("runner_asset_sha256s") or {}),
             )
         except ValueError as exc:
             raise ConnectionSpikeLiveOperationError(
@@ -4753,9 +5759,27 @@ class LiveConnectionSpikeAdapter:
                 config_sha256=config_sha256,
                 generator_sha256=generator_sha256,
                 capacity_model_sha256=capacity_model_sha256,
+                runner_harness_sha256=self.config.runner_harness_sha256,
             ),
         )
-        return self._capacity_from_preflight(raw)
+        boot_id = str(raw.get("boot_id") or "")
+        if not boot_id or len(boot_id) > 128:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 capacity receipt omitted the runner boot identity"
+            )
+        capacity = self._capacity_from_preflight(raw)
+        if (
+            raw.get("sufficient") is not capacity.sufficient
+            or raw.get("protocol_failures") != list(capacity.protocol_failures)
+            or raw.get("hard_safety_failures") != list(capacity.hard_safety_failures)
+            or raw.get("failures") != list(capacity.failures)
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 runner preflight verdict does not match re-derived evidence"
+            )
+        self._prepared_boot_id = boot_id
+        self._prepared_capacity = capacity
+        return capacity
 
     @staticmethod
     def _validate_run_id(run_id: str) -> None:
@@ -4795,9 +5819,7 @@ def _competitor_manifest_bindings(
         else None
     )
     if competitor_id == "aurora_serverless_v2":
-        environment = (
-            round5_environment.aurora if round5_environment is not None else None
-        )
+        environment = round5_environment.aurora if round5_environment is not None else None
         bindings = (
             resources.aurora_cluster_id,
             resources.aurora_cluster_resource_id,
@@ -4855,6 +5877,8 @@ def _warn_if_expired(manifest: DemoManifest) -> None:
 def connection_spike_live_config_from_manifest(
     manifest: DemoManifest,
     competitor_id: str,
+    *,
+    runner_lane: Literal["lakebase", "competitor"] = "lakebase",
 ) -> ConnectionSpikeLiveConfig:
     _warn_if_expired(manifest)
     resources = manifest.require_round5_resources()
@@ -4865,10 +5889,22 @@ def connection_spike_live_config_from_manifest(
         region=manifest.aws.region,
         expected_account_id=manifest.aws.account_id,
         execution_role_arn=resources.control_role_arn,
-        runner_instance_id=resources.runner_instance_id,
-        runner_instance_profile_arn=resources.runner_instance_profile_arn,
+        runner_instance_id=(
+            resources.runner_instance_id
+            if runner_lane == "lakebase"
+            else str(resources.competitor_runner_instance_id or "")
+        ),
+        runner_instance_profile_arn=(
+            resources.runner_instance_profile_arn
+            if runner_lane == "lakebase"
+            else str(resources.competitor_runner_instance_profile_arn or "")
+        ),
         runner_subnet_id=resources.runner_subnet_id,
-        runner_security_group_id=resources.runner_security_group_id,
+        runner_security_group_id=(
+            resources.runner_security_group_id
+            if runner_lane == "lakebase"
+            else str(resources.competitor_runner_security_group_id or "")
+        ),
         targets=(
             ConnectionSpikeTarget(
                 lane_id="lakebase",
@@ -4876,9 +5912,7 @@ def connection_spike_live_config_from_manifest(
                 endpoint_host=resources.lakebase_pooled_host,
                 credential_host=resources.lakebase_direct_host,
                 credential_sha256=resources.lakebase_credential_sha256,
-                observer_credential_sha256=(
-                    resources.lakebase_observer_credential_sha256 or ""
-                ),
+                observer_credential_sha256=(resources.lakebase_observer_credential_sha256 or ""),
             ),
             ConnectionSpikeTarget(
                 lane_id="competitor",
@@ -4896,6 +5930,20 @@ def connection_spike_live_config_from_manifest(
         ),
         ssm_document_name=resources.ssm_document_name,
         runner_path=resources.runner_path,
+        resident_control_queue_url=(
+            str(resources.lakebase_control_queue_url)
+            if runner_lane == "lakebase"
+            else str(resources.competitor_control_queue_url)
+        ),
+        resident_control_secret_arn=str(
+            resources.runner_control_secret_arn
+            if runner_lane == "lakebase"
+            else resources.competitor_runner_control_secret_arn
+        ),
+        resident_installation_id=(
+            getattr(manifest, "installation_id", None)
+            or getattr(manifest, "run_id", "test-installation")
+        ),
         runner_harness_sha256=resources.runner_harness_sha256,
         trust_bundle_path=resources.trust_bundle_path,
         trust_bundle_sha256=resources.trust_bundle_sha256,
@@ -4938,6 +5986,7 @@ def connection_spike_setup_config_from_manifest(
         expected_account_id=manifest.aws.account_id,
         baseline_control_role_arn=resources.control_role_arn,
         runner_instance_id=resources.runner_instance_id,
+        competitor_runner_instance_id=str(resources.competitor_runner_instance_id or ""),
         vpc_id=resources.vpc_id,
         proxy_subnet_ids=tuple(resources.proxy_subnet_ids),
         lakebase_direct_host=resources.lakebase_direct_host,
@@ -4947,7 +5996,12 @@ def connection_spike_setup_config_from_manifest(
         competitor_resource_id=resource_id,
         competitor_direct_host=direct_host,
         competitor_security_group_id=competitor_security_group_id,
-        runner_security_group_id=resources.runner_security_group_id,
+        runner_security_group_id=str(resources.competitor_runner_security_group_id or ""),
+        proxy_security_group_id=str(
+            resources.aurora_proxy_security_group_id
+            if competitor_id == "aurora_serverless_v2"
+            else resources.rds_proxy_security_group_id
+        ),
         proxy_service_role_arn=resources.proxy_service_role_arn,
         proxy_service_policy_name=resources.proxy_service_policy_name,
         aurora_proxy_secret_arn=resources.aurora_proxy_secret_arn,
@@ -4962,9 +6016,7 @@ def connection_spike_setup_config_from_manifest(
         lakebase_credential_sha256=resources.lakebase_credential_sha256,
         competitor_credential_sha256=credential_sha256,
         runner_role_arn=getattr(resources, "runner_role_arn", ""),
-        proxy_role_permissions_boundary_arn=getattr(
-            resources, "per_bout_role_boundary_arn", ""
-        ),
+        proxy_role_permissions_boundary_arn=getattr(resources, "per_bout_role_boundary_arn", ""),
         secret_name_prefix=getattr(resources, "secret_name_prefix", ""),
         competitor_master_secret_arn=getattr(
             resources,
@@ -5077,7 +6129,12 @@ def _runner_result_has_forbidden_credential(raw: object) -> bool:
     return False
 
 
-def _require_sealed_payload(arm: FanInArm, raw: Mapping[str, object]) -> None:
+def _require_sealed_payload(
+    arm: FanInArm,
+    raw: Mapping[str, object],
+    *,
+    lane_id: str | None = None,
+) -> None:
     """Refuse a payload produced by a different contract, config or generator than was armed.
 
     Reported all at once, and as staleness rather than as malformed evidence, because the
@@ -5086,6 +6143,7 @@ def _require_sealed_payload(arm: FanInArm, raw: Mapping[str, object]) -> None:
     like a measurement.
     """
 
+    preflight = arm.preflights.get(lane_id, arm.preflight) if lane_id else arm.preflight
     expected_seal = {
         "schema_version": FANIN_SCHEMA_VERSION,
         "protocol": FANIN_PROTOCOL,
@@ -5093,6 +6151,8 @@ def _require_sealed_payload(arm: FanInArm, raw: Mapping[str, object]) -> None:
         "config_sha256": arm.config_sha256,
         "generator_sha256": arm.generator_sha256,
         "capacity_model_sha256": arm.capacity_model_sha256,
+        "runner_harness_sha256": preflight.runner_harness_sha256,
+        "runner_boot_id": preflight.boot_id,
     }
     stale: list[str] = []
     for name, expected in expected_seal.items():
@@ -5115,6 +6175,19 @@ def _require_sealed_payload(arm: FanInArm, raw: Mapping[str, object]) -> None:
             "Round 5 runner evidence is stale: "
             f"{', '.join(stale)} does not match the sealed arm, so this payload was "
             "produced by a different contract, config or generator than the one armed"
+        )
+    assets = raw.get("runner_asset_sha256s")
+    if (
+        not isinstance(assets, Mapping)
+        or set(assets) != set(RUNNER_ASSETS)
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in assets.values()
+        )
+        or assets.get("round5_fanin.py") != arm.generator_sha256
+    ):
+        raise ConnectionSpikeLiveOperationError(
+            "Round 5 result omitted complete five-file harness evidence"
         )
 
 
@@ -5164,11 +6237,9 @@ def _finalize_raw_result(
         if not lane_id:
             raise ConnectionSpikeLiveOperationError("Round 5 runner returned an unnamed lane")
         if lane_id in raw_lanes:
-            raise ConnectionSpikeLiveOperationError(
-                f"Round 5 runner returned lane {lane_id} twice"
-            )
+            raise ConnectionSpikeLiveOperationError(f"Round 5 runner returned lane {lane_id} twice")
         raw_lanes[lane_id] = value
-    if len(raw_lanes) != RUNNER_LANE_COUNT:
+    if len(raw_lanes) != len(RUNTIME_LANE_IDS):
         raise ConnectionSpikeLiveOperationError(
             f"Round 5 is a two-lane round; the runner returned {len(raw_lanes)} lane(s)"
         )
@@ -5225,7 +6296,7 @@ def _finalize_lane_payload(
     inherited from the first.
     """
 
-    _require_sealed_payload(arm, raw)
+    _require_sealed_payload(arm, raw, lane_id=lane_id)
     diagnostics = raw.get("runtime_diagnostics")
     if not isinstance(diagnostics, Mapping):
         raise ConnectionSpikeLiveOperationError(
@@ -5234,9 +6305,7 @@ def _finalize_lane_payload(
         )
     raw_lanes_value = raw.get("lanes")
     if not isinstance(raw_lanes_value, Sequence) or isinstance(raw_lanes_value, (str, bytes)):
-        raise ConnectionSpikeLiveOperationError(
-            f"Round 5 lane {lane_id} evidence carried no lanes"
-        )
+        raise ConnectionSpikeLiveOperationError(f"Round 5 lane {lane_id} evidence carried no lanes")
     payloads = [
         value
         for value in raw_lanes_value
@@ -5275,11 +6344,10 @@ def _merge_lane_results(
     start, which is the point: neither lane's number is held hostage to the other's setup.
     """
 
-    if len(lanes) != RUNNER_LANE_COUNT:
+    if len(lanes) != len(RUNTIME_LANE_IDS):
         raise ConnectionSpikeLiveOperationError(
             f"Round 5 is a two-lane comparison; {len(lanes)} lane(s) completed"
         )
-    left_id, right_id = sorted(lanes)
     return FanInRunResult(
         schema_version=FANIN_SCHEMA_VERSION,
         protocol=FANIN_PROTOCOL,
@@ -5288,13 +6356,22 @@ def _merge_lane_results(
         generator_sha256=arm.generator_sha256,
         capacity_model_sha256=arm.capacity_model_sha256,
         lanes=dict(lanes),
-        # None when either lane did not verify. That is not an error: a lane that held 9,999
-        # clients has failed this protocol, and the round shows it failing rather than
-        # comparing it.
-        comparison=compare_fanin_lanes(lanes[left_id], lanes[right_id]),
+        # Physical runner monotonic clocks are never compared. The manager
+        # builds the v3 result from one server-authoritative bell origin.
+        comparison=None,
         # Kept per lane, because each lane ran its own dispatch and its own runtime gates.
         runtime_diagnostics={"by_lane": dict(diagnostics)},
     )
+
+
+@dataclass(frozen=True)
+class LiveRound5WarmEngineReceipt:
+    arm: FanInArm
+    setup_context: ConnectionSpikeWarmSetupContext
+    runner_boot_ids: Mapping[str, str]
+    runner_process_boot_ids: Mapping[str, str]
+    warm_attempt_token: str
+    dispatch_expires_at: Mapping[str, datetime]
 
 
 class LiveConnectionSpikeEngine:
@@ -5304,14 +6381,24 @@ class LiveConnectionSpikeEngine:
         self,
         adapter: LiveConnectionSpikeAdapter,
         *,
+        lane_adapters: Mapping[str, LiveConnectionSpikeAdapter] | None = None,
         setup_orchestrator: LiveConnectionSpikeSetupOrchestrator | None = None,
         run_id_factory: Callable[[], str] = lambda: f"r5-{uuid4().hex}",
     ) -> None:
         self._adapter = adapter
+        self._lane_adapters = dict(
+            lane_adapters
+            or {
+                "lakebase": adapter,
+                "competitor": adapter,
+            }
+        )
+        if set(self._lane_adapters) != {"lakebase", "competitor"}:
+            raise ValueError("Round 5 requires one adapter per lane")
         self._setup_orchestrator = setup_orchestrator
         self._run_id_factory = run_id_factory
         self._armed: FanInArm | None = None
-        self._active_run_id: str | None = None
+        self._active_run_ids: dict[str, str] = {}
         self._setup_result: ConnectionSpikeSetupResult | None = None
         self._setup_bout_id: str | None = None
         self._setup_task: asyncio.Task[Any] | None = None
@@ -5322,10 +6409,264 @@ class LiveConnectionSpikeEngine:
         #: building its Proxy.
         self._lane_bursts: dict[str, asyncio.Task[ConnectionSpikeLaneResult]] = {}
         self._lane_stops: dict[str, ConnectionSpikeSetupLaneStop] = {}
+        self._lane_progress_callback: ProgressCallback | None = None
+        self._lane_result_callback: ProgressCallback | None = None
+        self._fatal_lane_error: BaseException | None = None
+        self._capsule_refresh_error: BaseException | None = None
+        self._job_ids: dict[str, str] = {}
+        self._bell_t0_ns: int | None = None
+        self._warm_generation = 0
+        self._warm_attempt_token = ""
+        self._bound_claim: object | None = None
+        self._resident_bindings: dict[str, Round5ControlBinding] = {}
+        self._durable_lakebase_release: Round5ControlEvent | None = None
 
     @property
     def has_timed_setup(self) -> bool:
         return self._setup_orchestrator is not None
+
+    def bind_claim(self, claim: object) -> None:
+        lakebase = str(getattr(claim, "lakebase_job_id", ""))
+        competitor = str(getattr(claim, "competitor_job_id", ""))
+        if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in (lakebase, competitor)):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 claim omitted deterministic lane job identities"
+            )
+        self._job_ids = {
+            "lakebase": lakebase,
+            "competitor": competitor,
+        }
+        generation = getattr(claim, "capsule_generation", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 claim omitted its resident generation"
+            )
+        self._warm_generation = generation
+        warm_attempt_token = str(getattr(claim, "warm_attempt_token", ""))
+        if not warm_attempt_token or (
+            self._warm_attempt_token and warm_attempt_token != self._warm_attempt_token
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 claim does not match the resident warm attempt"
+            )
+        self._warm_attempt_token = warm_attempt_token
+        self._bound_claim = claim
+
+    def bind_bell(self, context: Any) -> None:
+        t0_ns = context.t0_monotonic_ns
+        if isinstance(t0_ns, bool) or not isinstance(t0_ns, int) or t0_ns <= 0:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 bell context omitted its server origin"
+            )
+        self._bell_t0_ns = t0_ns
+        release = self._durable_lakebase_release
+        if (
+            release is None
+            or release.binding.bell_id != context.bell_id
+            or release.binding.claim_id != context.claim_id
+        ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Lakebase durable release is unavailable after bell acceptance"
+            )
+        transport = self._lane_adapters["lakebase"]._resident_transport
+        if transport is None:
+            raise ConnectionSpikeLiveConfigurationError("Round 5 resident transport is unavailable")
+        # The atomic transaction made RELEASE durable.  Only this process-local
+        # edge, after T0 exists, permits the dispatcher to publish it.
+        transport.dispatcher.allow_release(release.event_id)
+
+    def lakebase_release_event(self, bell_at: datetime) -> Round5ControlEvent:
+        binding = self._resident_bindings.get("lakebase")
+        if binding is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Lakebase resident request was not staged before bell"
+            )
+        event = Round5ControlEvent.create(
+            binding=binding,
+            sequence=2,
+            kind=Round5ControlKind.RELEASE,
+            created_at=bell_at,
+            payload={"bell_id": binding.bell_id},
+        )
+        self._durable_lakebase_release = event
+        return event
+
+    async def warm(
+        self,
+        generation: int,
+        warm_attempt_token: str,
+    ) -> LiveRound5WarmEngineReceipt:
+        """Prepare setup and both physical runner capsules backstage."""
+
+        if self._setup_orchestrator is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 automatic warm setup is not configured"
+            )
+        setup_context, arm = await asyncio.gather(
+            self._setup_orchestrator.warm(generation),
+            self.check(),
+        )
+        self._warm_generation = generation
+        self._warm_attempt_token = warm_attempt_token
+        targets_by_lane = {target.lane_id: target for target in self._adapter.config.targets}
+        await asyncio.gather(
+            *(
+                adapter.stage_resident_generation(
+                    generation=generation,
+                    lane_id=lane_id,
+                    warm_attempt_token=warm_attempt_token,
+                    request_template=self._fanin_request(
+                        hashlib.sha256(
+                            (
+                                f"round5-resident\0{generation}\0{warm_attempt_token}\0{lane_id}"
+                            ).encode()
+                        ).hexdigest(),
+                        arm,
+                        (targets_by_lane[lane_id],),
+                        lane_ids=(lane_id,),
+                    ),
+                )
+                for lane_id, adapter in self._lane_adapters.items()
+            )
+        )
+        expirations = {
+            lane_id: adapter.prepared_expires_at for lane_id, adapter in self._lane_adapters.items()
+        }
+        if any(value is None for value in expirations.values()):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 warm dispatch credentials were not retained"
+            )
+        return LiveRound5WarmEngineReceipt(
+            arm=arm,
+            setup_context=setup_context,
+            runner_boot_ids={
+                lane_id: adapter.prepared_boot_id
+                for lane_id, adapter in self._lane_adapters.items()
+            },
+            runner_process_boot_ids={
+                lane_id: adapter._resident_process_boot_id
+                for lane_id, adapter in self._lane_adapters.items()
+            },
+            warm_attempt_token=warm_attempt_token,
+            dispatch_expires_at={
+                lane_id: value for lane_id, value in expirations.items() if value is not None
+            },
+        )
+
+    async def refresh_warm(self, generation: int) -> LiveRound5WarmEngineReceipt:
+        """Rotate launch credentials without rerunning the capacity benchmark."""
+
+        if self._setup_orchestrator is None or self._armed is None:
+            raise ConnectionSpikeLiveOperationError("Round 5 cannot refresh before a complete warm")
+        setup_context, *dispatch_expirations = await asyncio.gather(
+            self._setup_orchestrator.warm(generation),
+            *(
+                adapter.refresh_launch_context(f"warm-{generation}-{lane_id}-{uuid4().hex[:8]}")
+                for lane_id, adapter in self._lane_adapters.items()
+            ),
+        )
+        return LiveRound5WarmEngineReceipt(
+            arm=self._armed,
+            setup_context=setup_context,
+            runner_boot_ids={
+                lane_id: adapter.prepared_boot_id
+                for lane_id, adapter in self._lane_adapters.items()
+            },
+            runner_process_boot_ids={
+                lane_id: adapter._resident_process_boot_id
+                for lane_id, adapter in self._lane_adapters.items()
+            },
+            warm_attempt_token=self._warm_attempt_token,
+            dispatch_expires_at=dict(zip(self._lane_adapters, dispatch_expirations, strict=True)),
+        )
+
+    async def validate_ready_provenance(
+        self,
+        shared_receipt: object,
+        warm_attempt_token: str,
+    ) -> bool:
+        """Re-read physical boot and five-file harness evidence off the request path."""
+
+        # Capacity is benchmarked once while WARMING. READY validation must not
+        # continuously dispatch that expensive SSM preflight; the resident
+        # heartbeat below proves that the same boot, process, and loaded harness
+        # are still serving the prepared generation.
+        arm = self._armed
+        if arm is None:
+            return False
+        expected = {
+            "lakebase": shared_receipt.lakebase_runner,
+            "competitor": shared_receipt.competitor_runner,
+        }
+        static_current = all(
+            lane_id in arm.preflights
+            and arm.preflights[lane_id].boot_id == receipt.boot_id
+            and self._lane_adapters[lane_id]._resident_process_boot_id == receipt.process_boot_id
+            and self._lane_adapters[lane_id]._resident_process_pid == receipt.process_pid
+            and arm.preflights[lane_id].runner_harness_sha256 == receipt.loaded_harness_sha256
+            and arm.preflights[lane_id].model_sha256 == receipt.capacity_model_sha256
+            for lane_id, receipt in expected.items()
+        )
+        if not static_current:
+            return False
+        checks = []
+        for lane_id, receipt in expected.items():
+            transport = self._lane_adapters[lane_id]._resident_transport
+            if transport is None:
+                return False
+            checks.append(
+                transport.resident_is_current(
+                    installation_id=(self._lane_adapters[lane_id].config.resident_installation_id),
+                    lane_id=lane_id,
+                    warm_attempt_token=warm_attempt_token,
+                    runner_boot_id=receipt.boot_id,
+                    process_boot_id=receipt.process_boot_id,
+                    process_pid=receipt.process_pid,
+                    harness_sha256=receipt.loaded_harness_sha256,
+                    now=datetime.now(UTC),
+                )
+            )
+        return all(await asyncio.gather(*checks))
+
+    async def warm_with_physical_runners_from(
+        self,
+        source: LiveConnectionSpikeEngine,
+        generation: int,
+    ) -> LiveRound5WarmEngineReceipt:
+        """Warm another target variant without benchmarking the runners again."""
+
+        if self._setup_orchestrator is None or source._armed is None:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 shared physical runner receipt is unavailable"
+            )
+        self._lane_adapters = source._lane_adapters
+        self._armed = source._armed
+        self._warm_generation = generation
+        self._warm_attempt_token = source._warm_attempt_token
+        setup_context = await self._setup_orchestrator.warm(generation)
+        expirations = {
+            lane_id: adapter.prepared_expires_at for lane_id, adapter in self._lane_adapters.items()
+        }
+        if any(value is None for value in expirations.values()):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 shared dispatch credentials are unavailable"
+            )
+        return LiveRound5WarmEngineReceipt(
+            arm=self._armed,
+            setup_context=setup_context,
+            runner_boot_ids={
+                lane_id: adapter.prepared_boot_id
+                for lane_id, adapter in self._lane_adapters.items()
+            },
+            runner_process_boot_ids={
+                lane_id: adapter._resident_process_boot_id
+                for lane_id, adapter in self._lane_adapters.items()
+            },
+            warm_attempt_token=self._warm_attempt_token,
+            dispatch_expires_at={
+                lane_id: value for lane_id, value in expirations.items() if value is not None
+            },
+        )
 
     async def prepare(self, bout_id: str, fencing_token: int) -> None:
         """Run the untimed preparation now, so the bell starts the clock.
@@ -5337,12 +6678,62 @@ class LiveConnectionSpikeEngine:
         if self._setup_orchestrator is None:
             return
         await self._setup_orchestrator.prepare(bout_id, fencing_token)
+        claim = self._bound_claim
+        arm = self._armed
+        if claim is None or arm is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 resident claim was not bound before ARM"
+            )
+        lakebase_target = next(
+            target for target in self._adapter.config.targets if target.lane_id == "lakebase"
+        )
+        request = self._fanin_request(
+            self._job_ids["lakebase"],
+            arm,
+            (lakebase_target,),
+            lane_ids=("lakebase",),
+        )
+        binding = self._resident_binding("lakebase", request)
+        transport = self._lane_adapters["lakebase"]._resident_transport
+        if transport is None:
+            raise ConnectionSpikeLiveConfigurationError("Round 5 resident transport is unavailable")
+        # Record ownership of the resident stage BEFORE enqueuing it.  ``stage``
+        # publishes the STAGE control event (which boots/prepares the resident
+        # agent) and then blocks on ``wait_prepared``; if that wait fails or the
+        # process dies mid-stage, a later cancellation must still be able to find
+        # this binding to cancel and settle the resident.  Recording it only
+        # after ``stage`` returns would strand a prepared resident with no owner.
+        self._resident_bindings["lakebase"] = binding
+        # ARM is O(1)-shaped against a READY warm slot: automatic backstage warm
+        # (LiveConnectionSpikeEngine.warm -> stage_resident_generation) has
+        # already staged this lane's resident pool and benchmarked capacity, so
+        # this call is a fast rebind of the warm pool, not a cold per-bout
+        # PREPARED build. Bound it to the ARM budget rather than the 720s
+        # bout-execution deadline: if the warm pool is not actually PREPARED the
+        # ARM fails fast with a clear "ring was not warm" error instead of
+        # blocking the operator for up to twelve minutes. The slow cold staging
+        # stays backstage, where the contract requires it.
+        try:
+            async with asyncio.timeout(ROUND5_ARM_STAGE_DEADLINE_SECONDS):
+                await transport.stage(
+                    binding=binding,
+                    request=request,
+                )
+        except TimeoutError as exc:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 ARM exceeded its bounded staging budget "
+                f"({ROUND5_ARM_STAGE_DEADLINE_SECONDS:.0f}s): the Lakebase resident pool "
+                "was not already warm/PREPARED. ARM must be a fast rebind against a READY "
+                "warm slot; a cold per-bout stage here means the ring was not actually warm."
+            ) from exc
 
     async def setup(
         self,
         bout_id: str,
         fencing_token: int,
         on_progress: SetupProgressCallback | None = None,
+        on_lane_progress: ProgressCallback | None = None,
+        on_lane_result: ProgressCallback | None = None,
     ) -> ConnectionSpikeSetupResult:
         if self._setup_orchestrator is None:
             raise ConnectionSpikeLiveConfigurationError(
@@ -5351,21 +6742,121 @@ class LiveConnectionSpikeEngine:
         self._setup_bout_id = bout_id
         self._lane_bursts = {}
         self._lane_stops = {}
+        self._lane_progress_callback = on_lane_progress
+        self._lane_result_callback = on_lane_result
+        self._fatal_lane_error = None
+        self._capsule_refresh_error = None
         setup_task = asyncio.current_task()
         assert setup_task is not None
         self._setup_task = setup_task
+        capsule_stop = asyncio.Event()
+        capsule_task = asyncio.create_task(
+            self._keep_competitor_capsule_fresh(bout_id, capsule_stop),
+            name=f"round5-competitor-capsule-{bout_id}",
+        )
+
+        def stop_setup_on_capsule_failure(done: asyncio.Task[None]) -> None:
+            if done.cancelled():
+                return
+            failure = done.exception()
+            if failure is None:
+                return
+            self._capsule_refresh_error = failure
+            if not setup_task.done():
+                setup_task.cancel()
+
+        capsule_task.add_done_callback(stop_setup_on_capsule_failure)
         try:
-            result = await self._setup_orchestrator.setup(
-                bout_id,
-                fencing_token,
-                on_progress,
-                self._start_lane_burst,
-            )
+            try:
+                result = await (
+                    self._setup_orchestrator.setup(
+                        bout_id,
+                        fencing_token,
+                        on_progress,
+                        self._start_lane_burst,
+                        self._stage_competitor_burst,
+                        t0_ns=self._bell_t0_ns,
+                    )
+                    if self._bell_t0_ns is not None
+                    else self._setup_orchestrator.setup(
+                        bout_id,
+                        fencing_token,
+                        on_progress,
+                        self._start_lane_burst,
+                        self._stage_competitor_burst,
+                    )
+                )
+            except asyncio.CancelledError:
+                fatal = self._fatal_lane_error or self._capsule_refresh_error
+                if fatal is not None:
+                    raise fatal from None
+                raise
             self._setup_result = result
             return result
         finally:
+            capsule_stop.set()
+            capsule_task.cancel()
+            await asyncio.gather(capsule_task, return_exceptions=True)
             if self._setup_task is setup_task:
                 self._setup_task = None
+
+    async def _keep_competitor_capsule_fresh(
+        self,
+        bout_id: str,
+        stop: asyncio.Event,
+    ) -> None:
+        adapter = self._lane_adapters["competitor"]
+        sequence = 0
+        while not stop.is_set():
+            await adapter.ensure_dispatch_capsule(
+                f"{bout_id}-proxy-wait-{sequence}",
+            )
+            sequence += 1
+            try:
+                await asyncio.wait_for(
+                    stop.wait(),
+                    timeout=DISPATCH_CAPSULE_REFRESH_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
+                continue
+
+    async def _stage_competitor_burst(
+        self,
+        stop: ConnectionSpikeSetupLaneStop,
+    ) -> None:
+        """Prepare the exact late-bound Proxy request before its ready gate."""
+
+        if stop.lane_id != "competitor":
+            raise ConnectionSpikeLiveConfigurationError(
+                "Only the competitor lane may stage behind the Proxy gate"
+            )
+        arm = self._armed
+        if arm is None:
+            raise ConnectionSpikeLiveOperationError("Round 5 warm capacity receipt is unavailable")
+        if stop.lane_id in self._resident_bindings:
+            raise ConnectionSpikeLiveOperationError("Round 5 competitor lane was already staged")
+        target = self._runtime_target_for(stop)
+        if target is None:
+            raise ConnectionSpikeLiveOperationError("Round 5 competitor warm binding is incomplete")
+        run_id = self._job_ids.get(stop.lane_id) or self._run_id_factory()
+        request = self._fanin_request(
+            run_id,
+            arm,
+            (target,),
+            lane_ids=(stop.lane_id,),
+        )
+        binding = self._resident_binding(stop.lane_id, request)
+        self._resident_bindings[stop.lane_id] = binding
+        self._active_run_ids[stop.lane_id] = run_id
+        try:
+            await self._lane_adapters[stop.lane_id].stage_prepared_release(
+                binding=binding,
+                request=request,
+            )
+        except BaseException:
+            # Keep the active id and binding: STAGE may have crossed the
+            # delivery boundary, so cleanup must cancel this exact job.
+            raise
 
     async def _start_lane_burst(self, stop: ConnectionSpikeSetupLaneStop) -> None:
         """Launch this lane's 10,000 now that its own setup has verified.
@@ -5379,18 +6870,42 @@ class LiveConnectionSpikeEngine:
 
         arm = self._armed
         if arm is None:
-            # Nothing to score against. The bout will arm at the bell and dispatch there, which is
-            # the pre-existing path, so this is a slower round rather than a broken one.
-            return
+            raise ConnectionSpikeLiveOperationError("Round 5 warm capacity receipt is unavailable")
+        if stop.lane_id in self._lane_bursts:
+            raise ConnectionSpikeLiveOperationError(
+                f"Round 5 {stop.lane_id} lane was already dispatched"
+            )
         self._lane_stops[stop.lane_id] = stop
         target = self._runtime_target_for(stop)
         if target is None:
-            return
-        run_id = self._run_id_factory()
-        self._lane_bursts[stop.lane_id] = asyncio.create_task(
+            raise ConnectionSpikeLiveOperationError(
+                f"Round 5 {stop.lane_id} warm binding is incomplete"
+            )
+        run_id = self._job_ids.get(stop.lane_id) or self._run_id_factory()
+        launched = asyncio.create_task(
             self._dispatch_lane(run_id, arm, target),
             name=f"round5-burst-{stop.lane_id}",
         )
+        self._lane_bursts[stop.lane_id] = launched
+
+        def stop_sibling_on_failure(done: asyncio.Task[ConnectionSpikeLaneResult]) -> None:
+            if done.cancelled():
+                return
+            try:
+                failure = done.exception()
+            except asyncio.CancelledError:
+                return
+            if failure is None:
+                return
+            self._fatal_lane_error = failure
+            for lane_id, sibling in self._lane_bursts.items():
+                if lane_id != stop.lane_id and not sibling.done():
+                    sibling.cancel()
+            setup_task = self._setup_task
+            if setup_task is not None and not setup_task.done():
+                setup_task.cancel()
+
+        launched.add_done_callback(stop_sibling_on_failure)
 
     def _runtime_target_for(
         self, stop: ConnectionSpikeSetupLaneStop
@@ -5408,11 +6923,10 @@ class LiveConnectionSpikeEngine:
             return None
         try:
             return self._bind_lane(stop, lane)
-        except (AttributeError, ConnectionSpikeLiveConfigurationError):
-            # An incomplete binding means this lane cannot start early, not that the bout is
-            # broken: `run` still dispatches it. Starting a lane the moment its setup verifies is
-            # an optimisation, and an optimisation must never be the reason a round cannot ring.
-            return None
+        except (AttributeError, ConnectionSpikeLiveConfigurationError) as exc:
+            raise ConnectionSpikeLiveConfigurationError(
+                f"Round 5 {stop.lane_id} warm binding is incomplete"
+            ) from exc
 
     @staticmethod
     def _bind_lane(
@@ -5439,17 +6953,51 @@ class LiveConnectionSpikeEngine:
     ) -> ConnectionSpikeLaneResult:
         """One lane's ramp, hold and sampling, scored on arrival."""
 
-        self._active_run_id = run_id
+        adapter = self._lane_adapters[target.lane_id]
+        self._active_run_ids[target.lane_id] = run_id
         try:
-            raw = await self._adapter.execute(
+
+            async def report(progress: FanInProgress) -> None:
+                callback = self._lane_progress_callback
+                if callback is not None:
+                    await callback(progress)
+
+            request = self._fanin_request(
                 run_id,
-                self._fanin_request(run_id, arm, (target,), lane_ids=(target.lane_id,)),
-                targets=(target,),
+                arm,
+                (target,),
+                lane_ids=(target.lane_id,),
             )
-            return _finalize_lane_payload(arm, raw, lane_id=target.lane_id)
+            binding = self._resident_bindings.get(target.lane_id)
+            if self._bound_claim is not None:
+                if binding is None:
+                    binding = self._resident_binding(target.lane_id, request)
+                    self._resident_bindings[target.lane_id] = binding
+                elif binding.request_sha256 != canonical_request_sha256(request):
+                    raise ConnectionSpikeLiveConfigurationError(
+                        "Round 5 staged request changed before release"
+                    )
+            execute_kwargs: dict[str, object] = {
+                "targets": (target,),
+                "on_progress": report,
+            }
+            if binding is not None:
+                execute_kwargs["resident_binding"] = binding
+            raw = await adapter.execute_prepared(
+                run_id,
+                request,
+                **execute_kwargs,
+            )
+            result = _finalize_lane_payload(arm, raw, lane_id=target.lane_id)
+            callback = self._lane_result_callback
+            if callback is not None:
+                await callback(result)
+            return result
         finally:
-            if self._active_run_id == run_id:
-                self._active_run_id = None
+            if self._active_run_ids.get(
+                target.lane_id
+            ) == run_id and not adapter.settlement_pending(run_id):
+                self._active_run_ids.pop(target.lane_id, None)
 
     async def check(self) -> FanInArm:
         """Arm one fan-in bout, refusing before a runner that cannot hold it.
@@ -5471,21 +7019,35 @@ class LiveConnectionSpikeEngine:
         config_sha256 = fanin_config_sha256()
         generator_sha256 = fanin_generator_sha256()
         capacity_model_sha256 = fanin_capacity_model_sha256()
-        preflight = await self._adapter.preflight_capacity(
-            self._run_id_factory(),
-            contract_sha256=contract.sha256,
-            config_sha256=config_sha256,
-            generator_sha256=generator_sha256,
-            capacity_model_sha256=capacity_model_sha256,
+        preflights = await asyncio.gather(
+            *(
+                adapter.preflight_capacity(
+                    self._run_id_factory(),
+                    contract_sha256=contract.sha256,
+                    config_sha256=config_sha256,
+                    generator_sha256=generator_sha256,
+                    capacity_model_sha256=capacity_model_sha256,
+                )
+                for adapter in self._lane_adapters.values()
+            )
         )
-        if not preflight.sufficient:
+        failed = [
+            f"{lane_id}:{','.join(preflight.failures)}"
+            for (lane_id, _adapter), preflight in zip(
+                self._lane_adapters.items(),
+                preflights,
+                strict=True,
+            )
+            if not preflight.sufficient
+        ]
+        if failed:
             # Named failures, because each one sends the operator somewhere different: a
             # small instance shape, a file-descriptor limit, an event loop already under
             # pressure. A bare "insufficient" would send them to all three.
             raise ConnectionSpikeLiveOperationError(
-                "Round 5 runner cannot hold 10,000 clients per lane: "
-                + ", ".join(preflight.failures)
+                "Round 5 runner cannot hold 10,000 clients per lane: " + ", ".join(failed)
             )
+        preflight = preflights[0]
         arm = FanInArm(
             arm_id=secrets.token_urlsafe(18),
             contract_sha256=contract.sha256,
@@ -5493,6 +7055,14 @@ class LiveConnectionSpikeEngine:
             generator_sha256=generator_sha256,
             capacity_model_sha256=capacity_model_sha256,
             preflight=preflight,
+            preflights={
+                lane_id: lane_preflight
+                for (lane_id, _adapter), lane_preflight in zip(
+                    self._lane_adapters.items(),
+                    preflights,
+                    strict=True,
+                )
+            },
         )
         self._armed = arm
         return arm
@@ -5557,21 +7127,60 @@ class LiveConnectionSpikeEngine:
                     "aurora" if lane.competitor_id == "aurora_serverless_v2" else "rds"
                 )
             baseline_auth[lane.lane_id] = entry
-        return {
+        request: dict[str, object] = {
             "protocol": FANIN_PROTOCOL,
             "schema_version": FANIN_SCHEMA_VERSION,
-            "action": "run",
+            "action": "run_lane_v3",
             "run_id": run_id,
+            "job_id": run_id,
+            "resident_generation": self._warm_generation,
             "runner_instance_type": self._adapter.config.runner_instance_type,
             "contract_sha256": arm.contract_sha256,
             "config_sha256": arm.config_sha256,
             "generator_sha256": arm.generator_sha256,
             "capacity_model_sha256": arm.capacity_model_sha256,
+            "runner_harness_sha256": (
+                arm.preflights.get(lanes[0].lane_id, arm.preflight).runner_harness_sha256
+            ),
+            "capacity_receipt": (arm.preflights.get(lanes[0].lane_id, arm.preflight).receipt),
             "trust_bundle_path": FANIN_TRUST_BUNDLE_PATH,
             "trust_bundle_sha256": self._adapter.config.trust_bundle_sha256,
             "baseline_auth": baseline_auth,
             "targets": [lane.runner_value() for lane in lanes],
         }
+        request["prepared_request_digest"] = hashlib.sha256(
+            json.dumps(
+                request,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return request
+
+    def _resident_binding(
+        self,
+        lane_id: str,
+        request: Mapping[str, object],
+    ) -> Round5ControlBinding:
+        claim = self._bound_claim
+        adapter = self._lane_adapters[lane_id]
+        if claim is None:
+            raise ConnectionSpikeLiveConfigurationError("Round 5 resident claim is unavailable")
+        return Round5ControlBinding(
+            installation_id=adapter.config.resident_installation_id,
+            lane_id=lane_id,
+            generation=self._warm_generation,
+            warm_attempt_token=self._warm_attempt_token,
+            claim_id=str(claim.claim_id),
+            bout_id=str(claim.bout_id),
+            bell_id=str(claim.bell_id),
+            fence=int(claim.bout_fence),
+            job_id=str(request["job_id"]),
+            runner_boot_id=adapter.prepared_boot_id,
+            runner_process_boot_id=adapter._resident_process_boot_id,
+            runner_harness_sha256=adapter.config.runner_harness_sha256,
+            request_sha256=canonical_request_sha256(request),
+        )
 
     async def run(
         self,
@@ -5590,49 +7199,63 @@ class LiveConnectionSpikeEngine:
             )
         targets = self._runtime_targets()
         effective = tuple(targets if targets is not None else self._adapter.config.targets)
-        # Lakebase first among anything still to dispatch. It is ready in seconds while the AWS
-        # path is still building a Proxy, and it must never be held behind that.
-        order = sorted(
-            (target.lane_id for target in effective),
-            key=lambda lane_id: (lane_id != "lakebase", lane_id),
-        )
+        lane_ids = tuple(sorted(target.lane_id for target in effective))
         merged: dict[str, ConnectionSpikeLaneResult] = {}
         diagnostics: dict[str, object] = {}
         try:
-            for lane_id in order:
-                launched = self._lane_bursts.pop(lane_id, None)
-                if launched is not None:
-                    # Started when this lane's own setup verified, which for Lakebase is seconds
-                    # into the round. Awaiting it here collects a measurement already taken;
-                    # dispatching again would ramp ten thousand clients a second time and score
-                    # the wrong attempt.
-                    await self._report(
-                        on_progress,
-                        "verifying",
-                        f"Collecting the {lane_id} fan-in that started at its own setup stop",
-                    )
-                    merged[lane_id] = await launched
-                    continue
-                run_id = self._run_id_factory()
-                self._active_run_id = run_id
-                await self._report(
-                    on_progress,
-                    "dispatching",
-                    f"Dispatching the isolated runner for {lane_id}",
+            launched = {lane_id: self._lane_bursts.pop(lane_id, None) for lane_id in lane_ids}
+            missing = [lane_id for lane_id, task in launched.items() if task is None]
+            if missing:
+                raise ConnectionSpikeLiveOperationError(
+                    f"Round 5 {', '.join(missing)} was not dispatched at its eligibility edge; "
+                    "no after-bell fallback is permitted"
                 )
-                raw = await self._adapter.execute(
-                    run_id,
-                    self._fanin_request(run_id, arm, effective, lane_ids=(lane_id,)),
-                    targets=targets,
+            tasks = {task for task in launched.values() if task is not None}
+            await self._report(
+                on_progress,
+                "verifying",
+                "Supervising both independently dispatched physical runners",
+            )
+            done, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_EXCEPTION,
+            )
+            failed = next(
+                (
+                    task.exception()
+                    for task in done
+                    if not task.cancelled() and task.exception() is not None
+                ),
+                None,
+            )
+            if failed is not None:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                cancellation_results = await asyncio.gather(
+                    *(
+                        self._cancel_resident_lane(lane_id, run_id)
+                        for lane_id, run_id in tuple(self._active_run_ids.items())
+                    ),
+                    return_exceptions=True,
                 )
-                merged[lane_id] = _finalize_lane_payload(arm, raw, lane_id=lane_id)
-                diagnostics[lane_id] = raw.get("runtime_diagnostics") or {}
-                self._active_run_id = None
+                if any(isinstance(result, BaseException) for result in cancellation_results):
+                    raise ConnectionSpikeCleanupError(
+                        "Round 5 sibling jobs did not settle after a lane failure"
+                    ) from failed
+                raise failed
+            if pending:
+                await asyncio.gather(*pending)
+            for lane_id, task in launched.items():
+                assert task is not None
+                merged[lane_id] = task.result()
             result = _merge_lane_results(arm, merged, diagnostics)
             await self._report(on_progress, "verified", "Runner evidence verified")
             return result
         finally:
-            self._active_run_id = None
+            for lane_id, run_id in tuple(self._active_run_ids.items()):
+                if not self._lane_adapters[lane_id].settlement_pending(run_id):
+                    self._active_run_ids.pop(lane_id, None)
 
     async def stop_and_begin_cleanup(self, arm: FanInArm) -> None:
         """Settle active commands and start Round 5 cleanup idempotently.
@@ -5649,12 +7272,30 @@ class LiveConnectionSpikeEngine:
         )
         await asyncio.shield(starter)
 
+    async def _cancel_resident_lane(self, lane_id: str, run_id: str) -> None:
+        adapter = self._lane_adapters[lane_id]
+        binding = self._resident_bindings.get(lane_id)
+        if binding is not None:
+            await adapter.cancel_resident(binding=binding)
+            return
+        await adapter.cancel_resident(
+            generation=self._warm_generation,
+            lane_id=lane_id,
+            job_id=run_id,
+        )
+
     async def _stop_and_begin_cleanup_once(self) -> None:
         async with self._cleanup_start_lock:
             if self._cleanup_bout_id is not None:
                 return
-            if self._active_run_id is not None:
-                await self._adapter.cancel(self._active_run_id)
+            for lane_id, run_id in tuple(self._active_run_ids.items()):
+                await self._cancel_resident_lane(lane_id, run_id)
+                if self._active_run_ids.get(lane_id) == run_id:
+                    self._active_run_ids.pop(lane_id, None)
+            if self._active_run_ids:
+                raise ConnectionSpikeCleanupError(
+                    "Round 5 active jobs did not settle before provider cleanup"
+                )
             setup = self._setup_result
             if setup is None or self._setup_orchestrator is None:
                 return
@@ -5679,12 +7320,24 @@ class LiveConnectionSpikeEngine:
         if setup_task is not None and setup_task is not asyncio.current_task():
             setup_task.cancel()
             await asyncio.gather(setup_task, return_exceptions=True)
+        bursts = tuple(self._lane_bursts.values())
+        for burst in bursts:
+            if not burst.done():
+                burst.cancel()
+        if bursts:
+            await asyncio.gather(*bursts, return_exceptions=True)
+        for lane_id, run_id in tuple(self._active_run_ids.items()):
+            await self._cancel_resident_lane(lane_id, run_id)
+            if self._active_run_ids.get(lane_id) == run_id:
+                self._active_run_ids.pop(lane_id, None)
+        if self._active_run_ids:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 active jobs did not settle before provider cleanup"
+            )
         async with self._cleanup_start_lock:
             if self._cleanup_bout_id is not None:
                 if self._cleanup_bout_id != bout_id:
-                    raise ConnectionSpikeCleanupError(
-                        "Another Round 5 cleanup is already active"
-                    )
+                    raise ConnectionSpikeCleanupError("Another Round 5 cleanup is already active")
                 return
             if self._setup_orchestrator is None:
                 raise ConnectionSpikeCleanupError(
@@ -5725,9 +7378,7 @@ class LiveConnectionSpikeEngine:
 
         if self._cleanup_bout_id is None or self._setup_orchestrator is None:
             raise ConnectionSpikeCleanupError("Round 5 cleanup has not been started")
-        await self._setup_orchestrator.wait_for_proxy_delete_accepted(
-            self._cleanup_bout_id
-        )
+        await self._setup_orchestrator.wait_for_proxy_delete_accepted(self._cleanup_bout_id)
 
     async def wait_for_cleanup_complete(self) -> None:
         """Await full exact absence and reverse cleanup in the background task."""
@@ -5764,6 +7415,28 @@ class LiveConnectionSpikeEngine:
         )
         if self._setup_result is not None and self._setup_result.bout_id == bout_id:
             self._setup_result = None
+
+    async def reconcile_claim(self, claim: Any) -> None:
+        """Settle both logical jobs and prove exact provider absence on restart."""
+
+        self.bind_claim(claim)
+        settlement_results = await asyncio.gather(
+            self._lane_adapters["lakebase"].cancel_job(self._job_ids["lakebase"]),
+            self._lane_adapters["competitor"].cancel_job(self._job_ids["competitor"]),
+            return_exceptions=True,
+        )
+        if any(isinstance(result, BaseException) for result in settlement_results):
+            raise ConnectionSpikeCleanupError(
+                "Round 5 restart reconciliation could not prove both logical jobs settled"
+            )
+        bout_id = str(claim.bout_id)
+        unresolved = await self.unresolved_bout_ids()
+        if bout_id not in unresolved:
+            if self._setup_orchestrator is None:
+                raise ConnectionSpikeCleanupError("Round 5 setup orchestrator is unavailable")
+            await self._setup_orchestrator.prove_bout_absent(bout_id)
+            return
+        await self.reconcile_failed_cleanup(bout_id, int(claim.bout_fence))
 
     async def unresolved_bout_ids(self) -> tuple[str, ...]:
         """Return durable unresolved Round 5 bout IDs without mutating them."""
@@ -5848,16 +7521,34 @@ def build_connection_spike_live_engine(
     journal: CreationJournalStore | None = None,
     fence: FenceGuard | None = None,
     fresh_lakebase_host: FreshLakebaseHost | None = None,
+    resident_transport: Round5ResidentTransport | None = None,
 ) -> LiveConnectionSpikeEngine:
     effective_manifest = manifest or load_manifest()
-    config = connection_spike_live_config_from_manifest(effective_manifest, competitor_id)
-    if config.runner_harness_sha256 and config.runner_harness_sha256 != runner_harness_sha256():
+    lakebase_config = connection_spike_live_config_from_manifest(
+        effective_manifest,
+        competitor_id,
+        runner_lane="lakebase",
+    )
+    competitor_config = connection_spike_live_config_from_manifest(
+        effective_manifest,
+        competitor_id,
+        runner_lane="competitor",
+    )
+    if (
+        lakebase_config.runner_harness_sha256
+        and lakebase_config.runner_harness_sha256 != runner_harness_sha256()
+    ):
         raise ConnectionSpikeLiveConfigurationError(
             "Installed Round 5 runner assets do not match the sealed harness digest"
         )
-    if journal is None or fence is None or fresh_lakebase_host is None:
+    if (
+        journal is None
+        or fence is None
+        or fresh_lakebase_host is None
+        or resident_transport is None
+    ):
         raise ConnectionSpikeLiveConfigurationError(
-            "Round 5 live engine requires the durable journal, active fence, and fresh host reader"
+            "Round 5 live engine requires journal, fence, fresh host, and resident transport"
         )
     setup = LiveConnectionSpikeSetupOrchestrator(
         connection_spike_setup_config_from_manifest(effective_manifest, competitor_id),
@@ -5866,7 +7557,426 @@ def build_connection_spike_live_engine(
         fresh_lakebase_host=fresh_lakebase_host,
         session_factory=session_factory,
     )
+    lakebase_adapter = LiveConnectionSpikeAdapter(
+        lakebase_config,
+        session_factory=session_factory,
+        resident_transport=resident_transport,
+    )
+    competitor_adapter = LiveConnectionSpikeAdapter(
+        competitor_config,
+        session_factory=session_factory,
+        resident_transport=resident_transport,
+    )
     return LiveConnectionSpikeEngine(
-        LiveConnectionSpikeAdapter(config, session_factory=session_factory),
+        lakebase_adapter,
+        lane_adapters={
+            "lakebase": lakebase_adapter,
+            "competitor": competitor_adapter,
+        },
         setup_orchestrator=setup,
     )
+
+
+class LiveRound5WarmProvider:
+    """Materialize both target variants and rotate their ephemeral capsules."""
+
+    def __init__(
+        self,
+        manifest: DemoManifest,
+        engine_factory: Callable[[CompetitorId], LiveConnectionSpikeEngine],
+    ) -> None:
+        self._manifest = manifest
+        self._engine_factory = engine_factory
+        self._engines: dict[str, LiveConnectionSpikeEngine] = {}
+        self._receipts: dict[str, LiveRound5WarmEngineReceipt] = {}
+        self._credential_generation = 0
+
+    async def reconcile(self, slot: object) -> bool:
+        from .round5_warm import (
+            BlockedWarmError,
+            RetryableWarmError,
+            Round5Variant,
+            Round5WarmState,
+        )
+
+        if (
+            slot.state not in {Round5WarmState.RUNNING, Round5WarmState.CLEANING}
+            or slot.claim is None
+        ):
+            return False
+        competitor_id = (
+            CompetitorId.AURORA_SERVERLESS_V2
+            if slot.claim.selected_variant == Round5Variant.AURORA
+            else CompetitorId.RDS_POSTGRES
+        )
+        try:
+            engine = self._engine_factory(competitor_id)
+            await engine.reconcile_claim(slot.claim)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._retryable(exc):
+                raise RetryableWarmError("cleanup_reconcile_retryable") from exc
+            raise BlockedWarmError("cleanup_reconcile_blocked") from exc
+
+    async def validate_ready(self, slot: object, capsule: object) -> bool:
+        del capsule
+        if slot.shared_receipt is None or not self._engines:
+            return False
+        engine = self._engines.get("aurora_serverless_v2")
+        if engine is None:
+            return False
+        try:
+            current = await engine.validate_ready_provenance(
+                slot.shared_receipt,
+                slot.warm_attempt_token or "",
+            )
+            if current:
+                for variant_engine in self._engines.values():
+                    variant_engine._armed = engine._armed
+            return current
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            from .round5_warm import RetryableWarmError
+
+            if self._retryable(exc):
+                raise RetryableWarmError("runner_provenance_probe_retryable") from exc
+            return False
+
+    @staticmethod
+    def _retryable(error: BaseException) -> bool:
+        if isinstance(
+            error,
+            (
+                TimeoutError,
+                ConnectionError,
+                ConnectTimeoutError,
+                ReadTimeoutError,
+                EndpointConnectionError,
+                ConnectionClosedError,
+            ),
+        ):
+            return True
+        response = getattr(error, "response", None)
+        if not isinstance(response, Mapping):
+            return False
+        code = str((response.get("Error") or {}).get("Code") or "")
+        status = int((response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+        return (
+            status >= 500
+            or code.startswith("Throttl")
+            or code
+            in {
+                "RequestLimitExceeded",
+                "ServiceUnavailable",
+                "InternalFailure",
+                "PriorRequestNotComplete",
+            }
+        )
+
+    async def prepare(
+        self,
+        *,
+        generation: int,
+        coordinator_fence: int,
+        process_epoch: str,
+        broker_epoch: str,
+        warm_attempt_token: str,
+    ) -> object:
+        from .round5_warm import (
+            BlockedWarmError,
+            RetryableWarmError,
+            Round5RunnerReceipt,
+            Round5SharedReceipt,
+            Round5Variant,
+            Round5WarmPreparation,
+        )
+
+        del process_epoch
+        variants = {
+            Round5Variant.AURORA: CompetitorId.AURORA_SERVERLESS_V2,
+            Round5Variant.RDS: CompetitorId.RDS_POSTGRES,
+        }
+        try:
+            engines = {
+                variant: self._engine_factory(competitor_id)
+                for variant, competitor_id in variants.items()
+            }
+            aurora_receipt = await engines[Round5Variant.AURORA].warm(
+                generation,
+                warm_attempt_token,
+            )
+            rds_receipt = await engines[Round5Variant.RDS].warm_with_physical_runners_from(
+                engines[Round5Variant.AURORA],
+                generation,
+            )
+            warmed = (aurora_receipt, rds_receipt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._retryable(exc):
+                raise RetryableWarmError("warm_provider_retryable") from exc
+            raise BlockedWarmError("warm_baseline_invalid") from exc
+        receipts = dict(zip(engines, warmed, strict=True))
+        self._engines = {variants[variant].value: engine for variant, engine in engines.items()}
+        self._receipts = {variants[variant].value: receipt for variant, receipt in receipts.items()}
+        self._credential_generation += 1
+
+        resources = self._manifest.require_round5_resources()
+        now = datetime.now(UTC)
+        runner_expiration = now + timedelta(minutes=45)
+        reference = receipts[Round5Variant.AURORA]
+        other = receipts[Round5Variant.RDS]
+        if (
+            reference.runner_boot_ids != other.runner_boot_ids
+            or reference.runner_process_boot_ids != other.runner_process_boot_ids
+            or reference.warm_attempt_token != warm_attempt_token
+            or other.warm_attempt_token != warm_attempt_token
+        ):
+            raise BlockedWarmError("runner_boot_identity_changed")
+        capacity_digest = fanin_capacity_model_sha256()
+        physical_harnesses = {
+            lane_id: reference.arm.preflights[lane_id].runner_harness_sha256
+            for lane_id in ("lakebase", "competitor")
+        }
+        if (
+            any(
+                other.arm.preflights[lane_id].runner_harness_sha256 != physical_harnesses[lane_id]
+                for lane_id in physical_harnesses
+            )
+            or len(set(physical_harnesses.values())) != 1
+            or next(iter(physical_harnesses.values())) != resources.runner_harness_sha256
+        ):
+            raise BlockedWarmError("runner_harness_identity_changed")
+        image_digest = next(iter(physical_harnesses.values()))
+        runners = {
+            "lakebase": Round5RunnerReceipt(
+                lane_id="lakebase",
+                instance_id=resources.runner_instance_id,
+                boot_id=reference.runner_boot_ids["lakebase"],
+                process_boot_id=reference.runner_process_boot_ids["lakebase"],
+                process_pid=self._engines["aurora_serverless_v2"]
+                ._lane_adapters["lakebase"]
+                ._resident_process_pid,
+                instance_type=FANIN_RUNNER_INSTANCE_TYPE,
+                image_sha256=image_digest,
+                loaded_harness_sha256=physical_harnesses["lakebase"],
+                capacity_model_sha256=capacity_digest,
+                expires_at=runner_expiration,
+            ),
+            "competitor": Round5RunnerReceipt(
+                lane_id="competitor",
+                instance_id=str(resources.competitor_runner_instance_id),
+                boot_id=reference.runner_boot_ids["competitor"],
+                process_boot_id=reference.runner_process_boot_ids["competitor"],
+                process_pid=self._engines["aurora_serverless_v2"]
+                ._lane_adapters["competitor"]
+                ._resident_process_pid,
+                instance_type=FANIN_RUNNER_INSTANCE_TYPE,
+                image_sha256=image_digest,
+                loaded_harness_sha256=physical_harnesses["competitor"],
+                capacity_model_sha256=capacity_digest,
+                expires_at=runner_expiration,
+            ),
+        }
+        static_network_digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "aurora": resources.aurora_proxy_security_group_id,
+                    "rds": resources.rds_proxy_security_group_id,
+                    "lakebase_runner": resources.runner_security_group_id,
+                    "competitor_runner": (resources.competitor_runner_security_group_id),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        shared = Round5SharedReceipt(
+            source_sha256=resources.baseline_sha256,
+            config_sha256=resources.config_sha256,
+            runner_image_sha256=image_digest,
+            fanin_contract_sha256=FanInContract().sha256,
+            capacity_model_sha256=capacity_digest,
+            lakebase_binding_sha256=hashlib.sha256(
+                (resources.lakebase_direct_host + "\0" + resources.lakebase_pooled_host).encode()
+            ).hexdigest(),
+            static_network_fixture_sha256=static_network_digest,
+            lakebase_runner=runners["lakebase"],
+            competitor_runner=runners["competitor"],
+        )
+        public_variants = {
+            variant: self._variant_receipt(
+                variant,
+                receipts[variant],
+                expires_at=runner_expiration,
+            )
+            for variant in variants
+        }
+        capsule = self._capsule(
+            generation=generation,
+            coordinator_fence=coordinator_fence,
+            broker_epoch=broker_epoch,
+            engines=engines,
+            receipts=receipts,
+        )
+        return Round5WarmPreparation(
+            shared_receipt=shared,
+            variants=public_variants,
+            capsule=capsule,
+        )
+
+    async def refresh_capsule(
+        self,
+        slot: object,
+        previous: object,
+    ) -> object:
+        from .round5_warm import (
+            BlockedWarmError,
+            RetryableWarmError,
+            Round5Variant,
+        )
+
+        del previous
+        engines = {
+            Round5Variant.AURORA: self._engines.get("aurora_serverless_v2"),
+            Round5Variant.RDS: self._engines.get("rds_postgres"),
+        }
+        if any(engine is None for engine in engines.values()):
+            raise BlockedWarmError("launch_capsule_missing")
+        try:
+            aurora_engine = engines[Round5Variant.AURORA]
+            rds_engine = engines[Round5Variant.RDS]
+            assert aurora_engine is not None and rds_engine is not None
+            aurora_receipt = await aurora_engine.refresh_warm(slot.generation)
+            rds_receipt = await rds_engine.warm_with_physical_runners_from(
+                aurora_engine,
+                slot.generation,
+            )
+            refreshed = (aurora_receipt, rds_receipt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._retryable(exc):
+                raise RetryableWarmError("credential_refresh_retryable") from exc
+            raise BlockedWarmError("credential_refresh_failed") from exc
+        receipts = dict(zip(engines, refreshed, strict=True))
+        self._credential_generation += 1
+        return self._capsule(
+            generation=slot.generation,
+            coordinator_fence=slot.coordinator_fence,
+            broker_epoch=f"broker-{uuid4().hex}",
+            engines=engines,
+            receipts=receipts,
+        )
+
+    def _variant_receipt(
+        self,
+        variant: object,
+        receipt: LiveRound5WarmEngineReceipt,
+        *,
+        expires_at: datetime,
+    ) -> object:
+        from .round5_warm import Round5Variant, Round5VariantReceipt
+
+        resources = self._manifest.require_round5_resources()
+        aurora = variant == Round5Variant.AURORA
+        values = {
+            "target": (
+                resources.aurora_cluster_resource_id if aurora else resources.rds_resource_id
+            ),
+            "source": (resources.aurora_direct_host if aurora else resources.rds_direct_host),
+            "secret": (
+                resources.aurora_proxy_secret_arn if aurora else resources.rds_proxy_secret_arn
+            ),
+            "role": resources.proxy_service_role_arn,
+            "auth": "POSTGRES_SCRAM_SHA_256:DISABLED",
+            "tls": "require_tls:true",
+            "sg": (
+                resources.aurora_proxy_security_group_id
+                if aurora
+                else resources.rds_proxy_security_group_id
+            ),
+            "subnets": ",".join(sorted(resources.proxy_subnet_ids)),
+            "vpc": resources.vpc_id,
+            "request": (
+                self._engines[
+                    "aurora_serverless_v2" if aurora else "rds_postgres"
+                ]._adapter.config.contract_sha256
+            ),
+        }
+
+        def hashed(name: str) -> str:
+            return hashlib.sha256(str(values[name]).encode()).hexdigest()
+
+        return Round5VariantReceipt(
+            variant=variant,
+            target_sha256=hashed("target"),
+            source_sha256=hashed("source"),
+            secret_ref_sha256=hashed("secret"),
+            role_sha256=hashed("role"),
+            auth_sha256=hashed("auth"),
+            tls_sha256=hashed("tls"),
+            security_group_sha256=hashed("sg"),
+            subnet_sha256=hashed("subnets"),
+            vpc_sha256=hashed("vpc"),
+            proxy_absent=True,
+            proxy_absence_observed_at=receipt.setup_context.observed_at,
+            request_template_sha256=hashed("request"),
+            expires_at=expires_at,
+        )
+
+    def _capsule(
+        self,
+        *,
+        generation: int,
+        coordinator_fence: int,
+        broker_epoch: str,
+        engines: Mapping[object, LiveConnectionSpikeEngine | None],
+        receipts: Mapping[object, LiveRound5WarmEngineReceipt],
+    ) -> object:
+        from .round5_warm import Round5LaunchCapsule, Round5Variant
+
+        if any(engine is None for engine in engines.values()):
+            raise ValueError("Round 5 capsule requires both variant engines")
+        control_expires = min(
+            receipt.setup_context.clients.expires_at for receipt in receipts.values()
+        )
+        dispatch_expires = {
+            lane_id: min(receipt.dispatch_expires_at[lane_id] for receipt in receipts.values())
+            for lane_id in ("lakebase", "competitor")
+        }
+        expires_at = min(control_expires, *dispatch_expires.values())
+        renew_by = min(
+            control_expires - timedelta(seconds=SETUP_DEADLINE_SECONDS + 60),
+            *(
+                value - timedelta(seconds=FANIN_SSM_TIMEOUT_SECONDS + 60)
+                for value in dispatch_expires.values()
+            ),
+        )
+        warm_attempt_tokens = {receipt.warm_attempt_token for receipt in receipts.values()}
+        if len(warm_attempt_tokens) != 1:
+            raise ValueError("Round 5 capsule warm attempts disagree")
+        return Round5LaunchCapsule(
+            generation=generation,
+            coordinator_fence=coordinator_fence,
+            credential_generation=self._credential_generation,
+            broker_epoch=broker_epoch,
+            runner_contexts={
+                "lakebase": receipts[Round5Variant.AURORA].dispatch_expires_at["lakebase"],
+                "competitor": receipts[Round5Variant.AURORA].dispatch_expires_at["competitor"],
+            },
+            aws_control_contexts={
+                variant: receipt.setup_context for variant, receipt in receipts.items()
+            },
+            lakebase_context=receipts[Round5Variant.AURORA].setup_context,
+            variant_contexts={
+                variant: engine for variant, engine in engines.items() if engine is not None
+            },
+            control_expires_at=control_expires,
+            dispatch_expires_at=dispatch_expires,
+            expires_at=expires_at,
+            renew_by=renew_by,
+            warm_attempt_token=next(iter(warm_attempt_tokens)),
+        )

@@ -116,15 +116,13 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
     # Each id is a field the fan-in lane result actually carries, so a label cannot be
     # attached to a number the runner never reported.
     assert [metric.id for metric in ready.metric_specs] == [
-        "time_to_target_ms",
+        "bell_to_10000_observed_ms",
         "setup_elapsed_ms",
         "peak_backend_sessions",
         "held_clients_at_gate",
         "terminal_failures",
     ]
-    # The primary is what the round claims: 10,000 held clients per lane from one shared
-    # start. Setup time is the finding it exists to show and stays secondary, because
-    # scoring it under a "time to 10,000" heading made the margin the Proxy build.
+    # The primary is one server bell to the exact held-client observation.
     assert ready.metric_specs[0].role.value == "primary"
     assert ready.metric_specs[1].role.value == "secondary"
     assert ready.metric_specs[0].direction.value == "lower_is_better"
@@ -132,17 +130,13 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
     held = next(item for item in ready.metric_specs if item.id == "held_clients_at_gate")
     assert held.role.value == "guardrail"
     assert held.direction.value == "exact"
-    assert "0 separately provisioned per-bout pooling components" in ready.non_claims[0]
-    assert "0 per-bout pooling infrastructure mutations" in ready.non_claims[0]
-    assert "native-login, ordinary-role, and runner-credential preparation" in ready.non_claims[0]
-    assert "9 journaled competitor mutations" in ready.non_claims[1]
-    assert "1 per-bout Proxy security group" in ready.non_claims[1]
-    assert "1 default-egress change" in ready.non_claims[1]
-    assert "4 exact security-group rules" in ready.non_claims[1]
-    assert "1 RDS Proxy" in ready.non_claims[1]
-    assert "1 target-group configuration" in ready.non_claims[1]
-    assert "1 target registration" in ready.non_claims[1]
-    assert "exact application transaction" in ready.non_claims[1]
+    assert "first retained pooled client immediately at the bell" in ready.non_claims[0]
+    assert "prepared automatically backstage" in ready.non_claims[0]
+    assert "3 journaled timed mutations" in ready.non_claims[1]
+    assert "CreateDBProxy first" in ready.non_claims[1]
+    assert "target-group configuration" in ready.non_claims[1]
+    assert "target registration" in ready.non_claims[1]
+    assert "Proxy does not" in ready.non_claims[1]
     assert "sealed install-time prerequisites outside the setup clock" in ready.non_claims[2]
     assert "IAM service role, runner permission" in ready.non_claims[2]
     assert "AWS managed pooling option selected for this reference path" in ready.non_claims[2]
@@ -152,7 +146,7 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
         "Published rates include the new RDS Proxy selected for the AWS reference path"
     )
     assert ready.scorecard_by_corner[Corner.SIMPLICITY] == (
-        "Included Lakebase pooled endpoint versus 9 journaled mutations for the "
+        "Included Lakebase pooled endpoint versus 3 timed Proxy mutations on the "
         "selected AWS managed pooling path"
     )
     assert not any(
@@ -160,15 +154,13 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
         for claim in ready.non_claims
     )
     # The exact target, stated with no room for a near miss.
-    assert "exactly 10,000 authenticated client connections per lane" in ready.non_claims[3]
-    assert "9,999 held clients is a failed lane" in ready.non_claims[3]
-    # Both lanes share one machine, so neither can be given a quieter one.
-    assert "same process on one isolated runner" in ready.non_claims[3]
+    assert "exactly 10,000 authenticated retained clients" in ready.non_claims[3]
+    assert "9,999 fails" in ready.non_claims[3]
+    assert "distinct physical c7i.2xlarge runner" in ready.non_claims[3]
     # Multiplexing is read during the hold, never inferred from the client count.
     assert "second database role on its own" in ready.non_claims[4]
     assert "never inferred from the client count" in ready.non_claims[4]
-    # Setup time is the finding, and it is still not the scored measurement.
-    assert "never added to the time to 10,000" in ready.non_claims[4]
+    assert "server-observed bell to exact 10,000 held" in ready.non_claims[4]
     assert "10,000 client connections" in ready.non_claims[5]
     assert "not PostgreSQL backend sessions or simultaneous transactions" in ready.non_claims[5]
     assert "holds exactly that many per lane" in ready.non_claims[5]

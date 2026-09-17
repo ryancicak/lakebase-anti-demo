@@ -450,12 +450,11 @@ def test_an_engine_that_cannot_name_its_proxy_still_reports_the_leak() -> None:
     assert "MAY STILL BE RUNNING AND BILLING" in owed.detail
 
 
-async def test_giving_up_writes_the_proxy_name_onto_the_towel_and_the_setup() -> None:
+async def test_failed_cleanup_writes_the_proxy_name_onto_the_towel_and_the_setup() -> None:
     """The diagnostic an operator actually reads has to carry the resource.
 
-    ``cleanup_failure`` was already populated on abandonment and already sealed
-    into the receipt -- both predate this work and neither was the defect. What
-    it said was "cleanup did not converge", which is true and names nothing, so
+    ``cleanup_failure`` is sealed into the receipt as soon as automatic cleanup
+    hands control back to the operator. A generic "cleanup failed" names nothing, so
     the receipt for the live bout would have recorded a tidy-up failure and not
     the RDS Proxy that failure left billing. This is the join between the two
     halves: one sentence, from the same writer ``/readyz`` reads, on both the
@@ -474,6 +473,7 @@ async def test_giving_up_writes_the_proxy_name_onto_the_towel_and_the_setup() ->
         state=None,
         towel=towel,
         round5_setup=setup,
+        round5_runtime=None,
         updated_at=None,
         model_copy=lambda deep=False: SimpleNamespace(towel=towel, model_dump=lambda mode: {}),
     )
@@ -487,7 +487,9 @@ async def test_giving_up_writes_the_proxy_name_onto_the_towel_and_the_setup() ->
         ),
     )
 
-    await _manager()._abandon_connection_spike_cleanup_retry(record, 120)
+    manager = _manager()
+    manager._revalidated_snapshot = lambda value: value.model_copy(deep=True)
+    await manager._mark_connection_spike_cleanup_pending(record)
 
     expected = "anti-demo-r5-session-i-proxy"
     assert expected in towel.cleanup_failure
@@ -498,7 +500,7 @@ async def test_giving_up_writes_the_proxy_name_onto_the_towel_and_the_setup() ->
     notice = round5_cleanup_owed_notice()
     assert notice is not None
     assert notice.detail == towel.cleanup_failure
-    assert [event for event, _ in published] == ["towel_update"]
+    assert [event for event, _ in published] == ["cleanup_update"]
 
 
 def test_only_one_place_in_the_tree_writes_the_leaked_proxy_sentence() -> None:

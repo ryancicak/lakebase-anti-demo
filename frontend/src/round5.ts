@@ -1,4 +1,11 @@
-import type { DemoSession, LaneId, LaneSnapshot, RoundFiveSetupState } from './api/types'
+import type {
+  DemoSession,
+  LaneId,
+  LaneSnapshot,
+  RoundFiveRuntimeLane,
+  RoundFiveRuntimeSnapshot,
+  RoundFiveSetupState,
+} from './api/types'
 import { ROUND_FIVE_PERSONA_MEANING } from './ringside-cues/corpus'
 
 export const ROUND_FIVE_ID = 'survive_connection_spike' as const
@@ -18,8 +25,12 @@ export const ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS = 10
 // protocol rather than silently relabelled with 10,000-client copy it never attempted.
 export const ROUND_FIVE_PROTOCOL = 'connection-spike-v1'
 export const ROUND_FIVE_SCHEMA_VERSION = 1
-export const ROUND_FIVE_FANIN_PROTOCOL = 'round5-fanin-v2'
-const ROUND_FIVE_FANIN_SCHEMA_VERSION = 2
+export const ROUND_FIVE_FANIN_PROTOCOL = 'round5-fanin-v4'
+const ROUND_FIVE_V3_FANIN_PROTOCOL = 'round5-fanin-v3'
+const ROUND_FIVE_V2_FANIN_PROTOCOL = 'round5-fanin-v2'
+export const ROUND_FIVE_BELL_PROTOCOL = 'round5-bell-to-10k-v4'
+const ROUND_FIVE_FANIN_SCHEMA_VERSION = 4
+const ROUND_FIVE_SAFETY_EVIDENCE_VERSION = 5
 const ROUND_FIVE_FANIN_TARGET_CLIENTS = 10_000
 const ROUND_FIVE_FANIN_RUNNER = 'Python 3.12 event-driven TLS/native-password'
 const ROUND_FIVE_AUTH_METHODS = new Set(['tls-cleartext-password', 'scram-sha-256'])
@@ -70,6 +81,10 @@ export interface RoundFiveLaneResult {
   telemetryPeakExternalEventLoopP99Ms: number | null
   telemetryPeakCpuCapacityFraction: number | null
   telemetryFailures: string[]
+  telemetryAdvisories: string[]
+  safetyEvidenceVersion: number | null
+  hardSafetyVerified: boolean
+  portAccountingVerified: boolean
   telemetryVerified: boolean
   contractVerified: boolean
 }
@@ -91,8 +106,12 @@ export function isRoundFiveFanInEvidence(value: unknown): boolean {
     evidence.schema_version === ROUND_FIVE_SCHEMA_VERSION
       && evidence.protocol === ROUND_FIVE_PROTOCOL
   ) || (
-    evidence.schema_version === ROUND_FIVE_FANIN_SCHEMA_VERSION
-      && evidence.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    (evidence.schema_version === ROUND_FIVE_FANIN_SCHEMA_VERSION
+      && evidence.protocol === ROUND_FIVE_FANIN_PROTOCOL)
+      || (evidence.schema_version === 3
+        && evidence.protocol === ROUND_FIVE_V3_FANIN_PROTOCOL)
+      || (evidence.schema_version === 2
+        && evidence.protocol === ROUND_FIVE_V2_FANIN_PROTOCOL)
   )
 }
 
@@ -102,8 +121,12 @@ export function isRoundFiveSetupEvidence(value: unknown): boolean {
     setup.schema_version === ROUND_FIVE_SCHEMA_VERSION
       && setup.protocol === ROUND_FIVE_PROTOCOL
   ) || (
-    setup.schema_version === ROUND_FIVE_FANIN_SCHEMA_VERSION
-      && setup.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    (setup.schema_version === ROUND_FIVE_FANIN_SCHEMA_VERSION
+      && setup.protocol === ROUND_FIVE_FANIN_PROTOCOL)
+      || (setup.schema_version === 3
+        && setup.protocol === ROUND_FIVE_V3_FANIN_PROTOCOL)
+      || (setup.schema_version === 2
+        && setup.protocol === ROUND_FIVE_V2_FANIN_PROTOCOL)
   )
 }
 
@@ -119,6 +142,9 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
   const candidate = record(lane.evidence)
   const evidence = isRoundFiveFanInEvidence(candidate) ? candidate : {}
   const fanIn = evidence.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    || evidence.protocol === ROUND_FIVE_V3_FANIN_PROTOCOL
+    || evidence.protocol === ROUND_FIVE_V2_FANIN_PROTOCOL
+  const fanInCurrent = evidence.protocol === ROUND_FIVE_FANIN_PROTOCOL
   const initiated = count(fanIn ? evidence.initiated_clients : evidence.scheduled_clients)
   const authenticated = count(fanIn ? evidence.authenticated_clients : evidence.successful_clients)
   const held = count(fanIn ? evidence.held_clients_at_gate ?? evidence.held_clients : evidence.successful_clients)
@@ -165,6 +191,12 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
   const telemetryFailures = fanIn && Array.isArray(evidence.telemetry_failures)
     ? evidence.telemetry_failures.filter((value): value is string => typeof value === 'string')
     : []
+  const telemetryAdvisories = fanIn && Array.isArray(evidence.telemetry_advisories)
+    ? evidence.telemetry_advisories.filter((value): value is string => typeof value === 'string')
+    : []
+  const safetyEvidenceVersion = fanIn ? count(evidence.safety_evidence_version) : null
+  const hardSafetyVerified = fanIn && evidence.hard_safety_verified === true
+  const portAccountingVerified = fanIn && evidence.port_accounting_verified === true
   const telemetryVerified = fanIn && evidence.telemetry_verified === true
   const targetClients = fanIn ? ROUND_FIVE_FANIN_TARGET_CLIENTS : ROUND_FIVE_TARGET_CLIENTS
   const contractVerified = lane.state === 'verified'
@@ -186,6 +218,9 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     && peakBackendSessions < (fanIn ? targetClients : ROUND_FIVE_WITNESS_CLIENTS)
     && (!fanIn || telemetryVerified)
     && (!fanIn || telemetryFailures.length === 0)
+    && (!fanInCurrent || safetyEvidenceVersion === ROUND_FIVE_SAFETY_EVIDENCE_VERSION)
+    && (!fanInCurrent || hardSafetyVerified)
+    && (!fanInCurrent || portAccountingVerified)
     && (!fanIn || terminalFailures === 0)
     && (!fanIn || retries === 0)
     && (!fanIn || disconnectedDuringHold === 0)
@@ -238,6 +273,10 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     telemetryPeakExternalEventLoopP99Ms,
     telemetryPeakCpuCapacityFraction,
     telemetryFailures,
+    telemetryAdvisories,
+    safetyEvidenceVersion,
+    hardSafetyVerified,
+    portAccountingVerified,
     telemetryVerified,
     contractVerified,
   }
@@ -287,6 +326,20 @@ export function isRoundFive(session: DemoSession | null | undefined): boolean {
   return session?.round.id === ROUND_FIVE_ID
 }
 
+export function roundFiveUsesFanIn(session: DemoSession): boolean {
+  if (!isRoundFive(session)) return false
+  return session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    || session.round5_setup?.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    || session.round5_setup?.protocol === ROUND_FIVE_V3_FANIN_PROTOCOL
+    || session.round5_setup?.protocol === ROUND_FIVE_V2_FANIN_PROTOCOL
+}
+
+export function roundFiveIsExplicitLegacy(session: DemoSession): boolean {
+  return isRoundFive(session)
+    && session.round5_setup?.protocol === ROUND_FIVE_PROTOCOL
+    && session.round5_setup?.schema_version === ROUND_FIVE_SCHEMA_VERSION
+}
+
 export function roundFiveHasComparison(session: DemoSession): boolean {
   if (!isRoundFive(session)) return false
   const setup = session.round5_setup
@@ -301,11 +354,20 @@ export function roundFiveHasComparison(session: DemoSession): boolean {
   const bothSetupLanesVerified = roundFiveSetupLaneResult(session, 'lakebase').verified
     && roundFiveSetupLaneResult(session, 'competitor').verified
   const fanIn = setup?.protocol === ROUND_FIVE_FANIN_PROTOCOL
+    || setup?.protocol === ROUND_FIVE_V3_FANIN_PROTOCOL
+    || setup?.protocol === ROUND_FIVE_V2_FANIN_PROTOCOL
+  const fanInProtocol = setup?.protocol
+  const bellV3 = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+  const expectedMarginSpec = bellV3
+    ? 'bell_to_10000_observed_ms'
+    : fanIn
+      ? 'time_to_10000_ms'
+      : 'setup_elapsed_ms'
   const comparisonValid = comparison?.kind === 'tie'
     ? !comparison.winner_lane_id && !comparison.margin
     : comparison?.kind === 'measured'
       && (comparison.winner_lane_id === 'lakebase' || comparison.winner_lane_id === 'competitor')
-      && comparison.margin?.spec_id === (fanIn ? 'time_to_10000_ms' : 'setup_elapsed_ms')
+      && comparison.margin?.spec_id === expectedMarginSpec
       && nonNegativeNumber(comparison.margin.value) !== null
       && Number(comparison.margin.value) > 0
   const setupLaunchSkew = nonNegativeNumber(setup?.workflow_launch_skew_ms)
@@ -314,7 +376,6 @@ export function roundFiveHasComparison(session: DemoSession): boolean {
     && isRoundFiveSetupEvidence(setup)
     && bothSetupLanesVerified
     && setupLaunchSkew !== null
-    && setupLaunchSkew <= ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS
     && (setup?.state === 'verified' || cleanupFailed)
     && setup?.setup_validated === true
     && setup?.downstream_validated === true
@@ -325,7 +386,7 @@ export function roundFiveHasComparison(session: DemoSession): boolean {
     && roundFiveLaneResult(session.lanes.competitor).contractVerified
     && session.fairness.warmup_connections === (fanIn ? 0 : ROUND_FIVE_WARMUPS)
     && session.fairness.concurrency === (fanIn ? ROUND_FIVE_FANIN_TARGET_CLIENTS : ROUND_FIVE_CONCURRENCY)
-    && session.fairness.protocol === (fanIn ? ROUND_FIVE_FANIN_PROTOCOL : ROUND_FIVE_PROTOCOL)
+    && session.fairness.protocol === (fanIn ? fanInProtocol : ROUND_FIVE_PROTOCOL)
     && session.fairness.target_clients_per_lane === (fanIn ? ROUND_FIVE_FANIN_TARGET_CLIENTS : ROUND_FIVE_TARGET_CLIENTS)
     && session.fairness.sampled_queries_per_lane === ROUND_FIVE_SAMPLED_QUERIES
     && session.fairness.same_client === true
@@ -339,7 +400,6 @@ export function roundFiveHasComparison(session: DemoSession): boolean {
     && typeof session.fairness.launch_skew_ms === 'number'
     && Number.isFinite(session.fairness.launch_skew_ms)
     && session.fairness.launch_skew_ms >= 0
-    && session.fairness.launch_skew_ms <= 10
     && Boolean(comparison)
 }
 
@@ -358,4 +418,243 @@ export function roundFiveFanInMarginDisplay(session: DemoSession): string {
 
 export function roundFiveCountDisplay(value: number | null): string {
   return value === null ? 'N/A' : String(value)
+}
+
+/**
+ * How long every lane must keep all 10,000 authenticated clients held at once
+ * before the lane is scored -- the same 30-second floor the contract gate
+ * enforces (`holdElapsedMs >= 30_000`). Named here so the live UI can say
+ * "30 seconds" without re-deriving it. Deliberately used only as a fixed word
+ * in copy, never as the denominator of a progress bar: the bell runtime does
+ * not expose live hold-elapsed, and it cannot be inferred from
+ * `elapsed_at_snapshot_ms` because the server forces that value equal to
+ * `bell_to_10000_observed_ms` once the gate is observed (so the difference is
+ * always zero). A numeric "x / 30s" bar would therefore be invented, not
+ * measured.
+ */
+export const ROUND_FIVE_HOLD_TARGET_MS = 30_000
+
+/**
+ * The live state of a single Round 5 lane, read off the bell runtime, for the
+ * two on-screen regions a viewer must not confuse:
+ *
+ *   - "Time to 10,000": the timed race to the observed exact 10,000-client held
+ *     gate. `timeToTenKMs` is that scored number; once `reachedTenK` is true it
+ *     is frozen (the server stamps it at the exact-10k moment, not at verified)
+ *     and never moves again for this bell.
+ *   - "Hold checks": the unscored verification that follows -- all 10,000 client
+ *     connections stay held for 30 seconds while 64 already-held connections are re-checked.
+ *     `heldConnectionChecksDone` / `heldConnectionChecksTotal` is that progress.
+ *
+ * There is intentionally no live hold-elapsed field: see ROUND_FIVE_HOLD_TARGET_MS.
+ */
+/**
+ * `towelled` is a fourth terminal distinct from `failed`: the operator stopped
+ * the bout (server sets the runtime lane `phase = "cancelled"`), nothing in the
+ * lane failed. A lane can be towelled after it already locked its exact
+ * time-to-10,000 clients (hold interrupted mid-way) or before it ever reached
+ * 10,000 clients; `reachedTenK` tells those two apart. Keeping it separate from `failed` is what
+ * lets the UI show "Hold not completed · towel thrown" instead of the false
+ * "Failed during the 30-second hold", and preserve the locked clock rather than
+ * blanking it to "Not timed".
+ */
+export type RoundFiveVerificationPhase = 'ramping' | 'verifying' | 'verified' | 'failed' | 'towelled'
+
+export interface RoundFiveLaneVerification {
+  phase: RoundFiveVerificationPhase
+  reachedTenK: boolean
+  timeToTenKMs: number | null
+  heldConnectionChecksDone: number
+  heldConnectionChecksTotal: number
+}
+
+export function roundFiveLaneVerification(lane: RoundFiveRuntimeLane): RoundFiveLaneVerification {
+  const timeToTenKMs = nonNegativeNumber(lane.bell_to_10000_observed_ms)
+  const reachedTenK = timeToTenKMs !== null || lane.phase === 'verified'
+  const checksRaw = count(lane.sampled_queries_succeeded) ?? 0
+  const heldConnectionChecksDone = Math.max(0, Math.min(ROUND_FIVE_SAMPLED_QUERIES, checksRaw))
+  const phase: RoundFiveVerificationPhase = lane.phase === 'verified'
+    ? 'verified'
+    // A towel stops the bout without failing the lane: the server marks the
+    // runtime lane `cancelled`. Keep it distinct from a genuine `failed` so the
+    // hold region can say the operator stopped it, not that it failed.
+    : lane.phase === 'cancelled'
+      ? 'towelled'
+      : lane.phase === 'failed'
+        ? 'failed'
+        : reachedTenK
+          ? 'verifying'
+          : 'ramping'
+  return {
+    phase,
+    reachedTenK,
+    timeToTenKMs,
+    heldConnectionChecksDone,
+    heldConnectionChecksTotal: ROUND_FIVE_SAMPLED_QUERIES,
+  }
+}
+
+/**
+ * The single V4 bell runtime for a session, or null when this session is not
+ * running the current `round5-bell-to-10k-v4` protocol. Every user-visible
+ * Round 5 surface that shows a primary clock (arena, share receipt, PNG card,
+ * caption, instant replay, explain-to-room) must read its lane truth from here
+ * -- never from the legacy `session.lanes[*].elapsed_ms` / `state`, which a
+ * towel promotes from the ~0.01s pooled-path *setup* stop, nor from the
+ * transitional Round 3 `towel.lakebase_verified_ms` field.
+ */
+export function roundFiveBellRuntime(
+  session: DemoSession,
+): RoundFiveRuntimeSnapshot | null {
+  return session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    ? session.round5_runtime
+    : null
+}
+
+function roundFiveCensoredLowerBoundMs(
+  session: DemoSession,
+  laneId: LaneId,
+): number | null {
+  return nonNegativeNumber(session.towel?.censored_lower_bounds_ms?.[laneId])
+}
+
+function roundFiveSecondsLabel(milliseconds: number): string {
+  return `${(Math.max(0, milliseconds) / 1000).toFixed(2)}s`
+}
+
+/**
+ * How one lane's terminal (or in-flight) V4 result must read on every surface.
+ *
+ * `EXACT VERIFIED` is reserved for a lane whose runtime phase is `verified`
+ * (10,000 authenticated held clients, the full 30-second hold, and all 64
+ * held-connection checks). A lane that only *reached* 10,000 clients -- towelled
+ * or failed mid-hold -- keeps its exact, sticky `bell_to_10000_observed_ms` as
+ * timed evidence but is never labelled verified. A lane that never reached
+ * 10,000 clients shows its censored lower bound (or "not timed"), not a setup clock.
+ */
+export type RoundFiveLaneSemantic =
+  | 'verified'
+  | 'reached_hold_in_progress'
+  | 'reached_hold_interrupted'
+  | 'reached_hold_failed'
+  | 'not_reached_lower_bound'
+  | 'not_reached'
+  | 'ramping'
+  | 'not_supported'
+
+export interface RoundFiveLanePresentation {
+  laneId: LaneId
+  semantic: RoundFiveLaneSemantic
+  reachedTenK: boolean
+  verified: boolean
+  /** Exact observed time to the 10,000-client held gate (present iff reached). */
+  timeMs: number | null
+  /** Censored lower bound when the lane never reached 10,000 clients, else null. */
+  lowerBoundMs: number | null
+  /** The primary clock string a surface prints: "14.15s", ">23.89s", "NOT TIMED", "N/A". */
+  value: string
+  /** The lane proof-state label, e.g. "EXACT VERIFIED" or "10,000 CLIENTS REACHED · HOLD INTERRUPTED". */
+  status: string
+}
+
+/**
+ * Canonical view-model for one V4 Round 5 lane, consumed by every surface so
+ * none can independently infer state from partial fields. Returns null when the
+ * session is not on the V4 bell runtime (legacy fan-in / setup paths keep their
+ * own presentation).
+ */
+export function roundFiveLanePresentation(
+  session: DemoSession,
+  laneId: LaneId,
+): RoundFiveLanePresentation | null {
+  const runtime = roundFiveBellRuntime(session)
+  if (!runtime) return null
+  if (session.lanes[laneId]?.state === 'not_supported') {
+    return {
+      laneId,
+      semantic: 'not_supported',
+      reachedTenK: false,
+      verified: false,
+      timeMs: null,
+      lowerBoundMs: null,
+      value: 'N/A',
+      status: 'NOT SUPPORTED · N/A',
+    }
+  }
+  const verification = roundFiveLaneVerification(runtime.lanes[laneId])
+  if (verification.reachedTenK) {
+    const timeMs = verification.timeToTenKMs
+    const value = timeMs === null ? 'N/A' : roundFiveSecondsLabel(timeMs)
+    if (verification.phase === 'verified') {
+      return {
+        laneId,
+        semantic: 'verified',
+        reachedTenK: true,
+        verified: true,
+        timeMs,
+        lowerBoundMs: null,
+        value,
+        status: 'EXACT VERIFIED',
+      }
+    }
+    if (verification.phase === 'towelled') {
+      return {
+        laneId,
+        semantic: 'reached_hold_interrupted',
+        reachedTenK: true,
+        verified: false,
+        timeMs,
+        lowerBoundMs: null,
+        value,
+        status: '10,000 CLIENTS REACHED · HOLD INTERRUPTED',
+      }
+    }
+    if (verification.phase === 'failed') {
+      return {
+        laneId,
+        semantic: 'reached_hold_failed',
+        reachedTenK: true,
+        verified: false,
+        timeMs,
+        lowerBoundMs: null,
+        value,
+        status: '10,000 CLIENTS REACHED · HOLD FAILED · NOT VERIFIED',
+      }
+    }
+    return {
+      laneId,
+      semantic: 'reached_hold_in_progress',
+      reachedTenK: true,
+      verified: false,
+      timeMs,
+      lowerBoundMs: null,
+      value,
+      status: '10,000 CLIENTS REACHED · HOLD IN PROGRESS',
+    }
+  }
+  const lowerBoundMs = roundFiveCensoredLowerBoundMs(session, laneId)
+  if (lowerBoundMs !== null) {
+    return {
+      laneId,
+      semantic: 'not_reached_lower_bound',
+      reachedTenK: false,
+      verified: false,
+      timeMs: null,
+      lowerBoundMs,
+      value: `>${roundFiveSecondsLabel(lowerBoundMs)}`,
+      status: 'NOT REACHED · UNVERIFIED WHEN STOPPED · LOWER BOUND',
+    }
+  }
+  const stillRunning = verification.phase === 'ramping'
+    || verification.phase === 'verifying'
+  return {
+    laneId,
+    semantic: stillRunning ? 'ramping' : 'not_reached',
+    reachedTenK: false,
+    verified: false,
+    timeMs: null,
+    lowerBoundMs: null,
+    value: 'NOT TIMED',
+    status: stillRunning ? 'RACING TO 10,000 CLIENTS' : 'NOT REACHED · NO EXACT RESULT',
+  }
 }

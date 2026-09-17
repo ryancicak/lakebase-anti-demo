@@ -210,12 +210,57 @@ output "round5_rds_resource_id" {
 }
 
 output "round5_runner_instance_id" {
-  description = "Instance ID of the neutral SSM-managed Round 5 runner."
+  description = "Compatibility alias for the dedicated Lakebase Round 5 runner."
   value       = aws_instance.round5_runner.id
 }
 
+output "round5_lakebase_runner_instance_id" {
+  description = "Instance ID of the dedicated Lakebase Round 5 runner."
+  value       = aws_instance.round5_runner.id
+}
+
+output "round5_competitor_runner_instance_id" {
+  description = "Instance ID of the dedicated Aurora/RDS Round 5 runner."
+  value       = aws_instance.round5_competitor_runner.id
+}
+
+output "round5_lakebase_control_queue_url" {
+  description = "Static FIFO control queue URL for the resident Lakebase runner."
+  value       = aws_sqs_queue.round5_lakebase_control.url
+}
+
+output "round5_lakebase_control_queue_arn" {
+  description = "Static FIFO control queue ARN for the resident Lakebase runner."
+  value       = aws_sqs_queue.round5_lakebase_control.arn
+}
+
+output "round5_competitor_control_queue_url" {
+  description = "Static FIFO control queue URL for the resident competitor runner."
+  value       = aws_sqs_queue.round5_competitor_control.url
+}
+
+output "round5_competitor_control_queue_arn" {
+  description = "Static FIFO control queue ARN for the resident competitor runner."
+  value       = aws_sqs_queue.round5_competitor_control.arn
+}
+
+output "round5_runner_control_secret_arn" {
+  description = "Compatibility alias for the lane-scoped Lakebase runner event DSN secret."
+  value       = aws_secretsmanager_secret.round5_runner_control.arn
+}
+
+output "round5_lakebase_runner_control_secret_arn" {
+  description = "Secrets Manager ARN containing only the Lakebase runner's PostgreSQL event DSN."
+  value       = aws_secretsmanager_secret.round5_runner_control.arn
+}
+
+output "round5_competitor_runner_control_secret_arn" {
+  description = "Secrets Manager ARN containing only the competitor runner's PostgreSQL event DSN."
+  value       = aws_secretsmanager_secret.round5_competitor_runner_control.arn
+}
+
 output "round5_runner_instance_type" {
-  description = "Capacity-validated EC2 shape of the neutral Round 5 runner."
+  description = "Capacity-validated EC2 shape shared by both physical Round 5 runners."
   value       = aws_instance.round5_runner.instance_type
 }
 
@@ -227,6 +272,11 @@ output "round5_runner_instance_arn" {
 output "round5_runner_public_ip" {
   description = "Public IPv4 address assigned to the outbound-only Round 5 runner."
   value       = aws_instance.round5_runner.public_ip
+}
+
+output "round5_competitor_runner_public_ip" {
+  description = "Public IPv4 address assigned to the outbound-only competitor runner."
+  value       = aws_instance.round5_competitor_runner.public_ip
 }
 
 output "round5_runner_subnet_id" {
@@ -244,6 +294,16 @@ output "round5_runner_instance_profile_arn" {
   value       = aws_iam_instance_profile.round5_runner.arn
 }
 
+output "round5_competitor_runner_role_arn" {
+  description = "ARN of the competitor runner role restricted to its FIFO queue."
+  value       = aws_iam_role.round5_competitor_runner.arn
+}
+
+output "round5_competitor_runner_instance_profile_arn" {
+  description = "ARN of the competitor runner's isolated EC2 instance profile."
+  value       = aws_iam_instance_profile.round5_competitor_runner.arn
+}
+
 output "round5_control_role_arn" {
   description = "ARN of the exact-principal-trusted role that creates, observes, and removes journaled per-bout add-ons."
   value       = aws_iam_role.round5_execution.arn
@@ -255,8 +315,13 @@ output "round5_execution_role_arn" {
 }
 
 output "round5_runner_permissions_boundary_arn" {
-  description = "Permissions boundary that caps the runner at SSM core plus exact baseline and Proxy credential secret access."
+  description = "Permissions boundary that caps the Lakebase runner at SSM, its FIFO queue, and its event DSN."
   value       = aws_iam_policy.round5_runner_boundary.arn
+}
+
+output "round5_competitor_runner_permissions_boundary_arn" {
+  description = "Permissions boundary that caps the competitor runner at SSM, its FIFO queue, and exact competitor secrets."
+  value       = aws_iam_policy.round5_competitor_runner_boundary.arn
 }
 
 output "round5_proxy_service_role_arn" {
@@ -295,13 +360,50 @@ output "round5_app_principal_arn" {
 }
 
 output "round5_runner_security_group_id" {
-  description = "ID of the ingress-free Round 5 runner security group."
+  description = "Compatibility alias for the ingress-free Lakebase runner security group."
   value       = aws_security_group.round5_runner.id
 }
 
+output "round5_lakebase_runner_security_group_id" {
+  description = "ID of the ingress-free Lakebase runner security group."
+  value       = aws_security_group.round5_runner.id
+}
+
+output "round5_competitor_runner_security_group_id" {
+  description = "ID of the ingress-free competitor runner security group."
+  value       = aws_security_group.round5_competitor_runner.id
+}
+
+output "round5_aurora_proxy_security_group_id" {
+  description = "Static least-privilege network fixture for per-bout Aurora Proxies."
+  value       = aws_security_group.round5_proxy["aurora"].id
+}
+
+output "round5_rds_proxy_security_group_id" {
+  description = "Static least-privilege network fixture for per-bout RDS Proxies."
+  value       = aws_security_group.round5_proxy["rds"].id
+}
+
 output "round5_runner_egress_rule_id" {
-  description = "ID of the Terraform-owned outbound rule in the immutable Round 5 baseline."
-  value       = aws_vpc_security_group_egress_rule.round5_runner_outbound.id
+  description = "Compatibility alias for the Lakebase runner's public PostgreSQL egress rule."
+  value       = aws_vpc_security_group_egress_rule.round5_lakebase_runner_postgres.id
+}
+
+output "round5_lakebase_runner_egress_rule_ids" {
+  description = "Exact Terraform-owned HTTPS and public PostgreSQL egress rules for the Lakebase runner."
+  value = [
+    aws_vpc_security_group_egress_rule.round5_lakebase_runner_https.id,
+    aws_vpc_security_group_egress_rule.round5_lakebase_runner_postgres.id,
+  ]
+}
+
+output "round5_competitor_runner_egress_rule_ids" {
+  description = "Exact Terraform-owned HTTPS and SG-targeted PostgreSQL egress rules for the competitor runner."
+  value = concat(
+    [aws_vpc_security_group_egress_rule.round5_competitor_runner_https.id],
+    [for rule in aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy : rule.id],
+    [for rule in aws_vpc_security_group_egress_rule.round5_competitor_runner_to_database : rule.id],
+  )
 }
 
 output "anti_demo_runtime_role_arn" {

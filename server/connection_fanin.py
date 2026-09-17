@@ -1,7 +1,7 @@
 """Pure Round 5 exact 10,000-client fan-in contract.
 
 The live adapter and the sealed runner exchange aggregate evidence only.  This
-module decides whether that evidence proves the v2 protocol; it deliberately
+module decides whether that evidence proves the v3 protocol; it deliberately
 contains no socket, database, AWS, or wall-clock code.
 """
 
@@ -14,15 +14,19 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-FANIN_PROTOCOL = "round5-fanin-v2"
-FANIN_SCHEMA_VERSION = 2
+FANIN_PROTOCOL = "round5-fanin-v4"
+FANIN_SCHEMA_VERSION = 4
+SAFETY_EVIDENCE_VERSION = 5
 TARGET_CLIENTS_PER_LANE = 10_000
 # Mirrors runner.round5_fanin. Selected because m6i.xlarge has exactly WORKER_COUNT
 # vCPUs, leaving nothing for the parent process, the SSM agent, or kernel packet
 # processing across 20,000 sockets -- the starvation docs/ROUND5_10K_PROTOCOL.md
 # records. c7i.2xlarge keeps four cores free for that housekeeping.
 RUNNER_INSTANCE_TYPE = "c7i.2xlarge"
-RUNNER_LANE_COUNT = 2
+# v3 provisions one physical runner per lane. Capacity is therefore evaluated
+# against one 10,000-client fan-in, never a projection of both lanes onto one
+# machine.
+RUNNER_LANE_COUNT = 1
 WORKER_COUNT = 4
 MIN_RUNNER_CPU_COUNT = WORKER_COUNT
 HOLD_SECONDS = 30
@@ -33,6 +37,10 @@ MAX_RETRIES = 0
 INITIAL_WAVE_SIZE = 100
 MIN_WAVE_SIZE = 20
 MICRO_BATCH_SIZE = 2
+MIN_ADMISSION_CONCURRENCY_PER_LANE = 2
+ADMISSION_RECOVERY_STEP_PER_LANE = 1
+ADMISSION_PRESSURE_INTERVALS = 2
+ADMISSION_RECOVERY_CLEAN_INTERVALS = 3
 # Mirrors runner.round5_fanin. The mirrored creation quantum and the launch
 # pipeline depth are separate concerns: MICRO_BATCH_SIZE keeps both lanes
 # interleaved identically, LANE_CONNECT_CONCURRENCY bounds how many of those
@@ -92,13 +100,15 @@ RAW_WALL_LAG_WARNING_MS = 50.0
 RAW_WALL_LAG_CEILING_MS = 250.0
 RAW_WALL_LAG_MAX_BREACHES = 3
 OWNED_STALL_MIN_THREAD_CPU_MS = 5.0
-#: A ready batch large enough to be our own amplification rather than the work we asked for.
+#: Diagnostic ready-batch threshold only. Batch size cannot independently
+#: attribute a stall; proportional CPU or GC evidence is required.
 #:
-#: Derived from the connects this protocol deliberately keeps in flight across both lanes, so a
-#: full healthy batch is never suspicious. A flat 16 was below that number, which meant a
-#: perfectly ordinary turn counted as amplification and helped gate a ramp on lag it had not
-#: caused.
-OWNED_STALL_READY_BATCH = LANE_CONNECT_CONCURRENCY * RUNNER_LANE_COUNT
+#: This is deliberately independent of physical lane count.  One worker normally owns
+#: ``LANE_CONNECT_CONCURRENCY`` in-flight connects, so a threshold derived from lane count would
+#: collide with ordinary one-lane work.
+OWNED_STALL_READY_BATCH = LANE_CONNECT_CONCURRENCY * 2
+EVENT_LOOP_P99_MIN_SAMPLES = 100
+EVENT_LOOP_P99_WINDOW_SAMPLES = 1_000
 RUNTIME_MAX_CPU_CAPACITY_FRACTION = 0.85
 LOOP_MONITOR_INTERVAL_SECONDS = 0.01
 RESOURCE_TELEMETRY_INTERVAL_SECONDS = 0.25
@@ -111,6 +121,29 @@ RAMP_HEADROOM_FRACTION = 0.15
 AUTH_CLEARTEXT = "tls-cleartext-password"
 AUTH_SCRAM = "scram-sha-256"
 SUPPORTED_AUTH_METHODS = frozenset({AUTH_CLEARTEXT, AUTH_SCRAM})
+HARD_SAFETY_CODES = frozenset(
+    {
+        "rss_reserve_exhausted",
+        "available_memory_reserve_exhausted",
+        "file_descriptor_reserve_exhausted",
+        "ephemeral_port_reserve_exhausted",
+        "mandatory_safety_evidence_missing",
+        "mandatory_safety_evidence_malformed",
+    }
+)
+ADVISORY_TELEMETRY_CODES = frozenset(
+    {
+        "event_loop_pressure",
+        "host_scheduling_instability",
+        "cpu_pressure",
+        "event_loop_calibration",
+        "event_loop_microbatch_pressure",
+        "event_loop_selector_fanout_pressure",
+        "event_loop_selector_fanout_amplified",
+        "event_loop_selector_fanout_deferred",
+        "cpu_calibration",
+    }
+)
 # Mirrors runner.round5_fanin's progress wire. A bout runs for minutes behind a
 # single SSM command, so the only way the ring can show a ramp in flight is the
 # runner printing bounded progress lines that the adapter reads back. The budget
@@ -118,13 +151,16 @@ SUPPORTED_AUTH_METHODS = frozenset({AUTH_CLEARTEXT, AUTH_SCRAM})
 # JSON line is indistinguishable from a corrupted one on this side.
 PROGRESS_PREFIX = "PROGRESS_JSON:"
 PROGRESS_OUTPUT_BUDGET_BYTES = 12_000
+CONNECTION_DIAGNOSTIC_LIMIT = 16
 PROGRESS_WIRE_FIELDS = (
     "protocol",
     "schema_version",
     "lane_id",
     "phase",
+    "initiated_clients",
     "authenticated_clients",
     "held_clients",
+    "peak_held_clients",
     "terminal_failures",
     "elapsed_ms",
     "time_to_target_ms",
@@ -132,6 +168,9 @@ PROGRESS_WIRE_FIELDS = (
     "sampled_queries_succeeded",
     "sampled_queries_failed",
     "event_loop_p99_ms",
+    "milestone",
+    "first_socket_initiated_ms",
+    "first_client_authenticated_ms",
 )
 # A fresh install cannot inspect /proc before EC2 exists.  Discount AWS's
 # nominal memory by more than the observed m6i.large guest/kernel loss
@@ -204,6 +243,10 @@ class ConnectionSpikeContract:
     initial_wave_size: int = INITIAL_WAVE_SIZE
     min_wave_size: int = MIN_WAVE_SIZE
     micro_batch_size: int = MICRO_BATCH_SIZE
+    min_admission_concurrency_per_lane: int = MIN_ADMISSION_CONCURRENCY_PER_LANE
+    admission_recovery_step_per_lane: int = ADMISSION_RECOVERY_STEP_PER_LANE
+    admission_pressure_intervals: int = ADMISSION_PRESSURE_INTERVALS
+    admission_recovery_clean_intervals: int = ADMISSION_RECOVERY_CLEAN_INTERVALS
     lane_connect_concurrency: int = LANE_CONNECT_CONCURRENCY
     ready_callback_batch_limit: int = READY_CALLBACK_BATCH_LIMIT
     selector_event_batch_limit: int = SELECTOR_EVENT_BATCH_LIMIT
@@ -227,6 +270,13 @@ class ConnectionSpikeContract:
             and self.initial_wave_size == INITIAL_WAVE_SIZE
             and self.min_wave_size == MIN_WAVE_SIZE
             and self.micro_batch_size == MICRO_BATCH_SIZE
+            and self.min_admission_concurrency_per_lane
+            == MIN_ADMISSION_CONCURRENCY_PER_LANE
+            and self.admission_recovery_step_per_lane
+            == ADMISSION_RECOVERY_STEP_PER_LANE
+            and self.admission_pressure_intervals == ADMISSION_PRESSURE_INTERVALS
+            and self.admission_recovery_clean_intervals
+            == ADMISSION_RECOVERY_CLEAN_INTERVALS
             and self.lane_connect_concurrency == LANE_CONNECT_CONCURRENCY
             and self.ready_callback_batch_limit == READY_CALLBACK_BATCH_LIMIT
             and self.selector_event_batch_limit == SELECTOR_EVENT_BATCH_LIMIT
@@ -256,6 +306,16 @@ class ConnectionSpikeContract:
             "initial_wave_size": self.initial_wave_size,
             "min_wave_size": self.min_wave_size,
             "micro_batch_size": self.micro_batch_size,
+            "min_admission_concurrency_per_lane": (
+                self.min_admission_concurrency_per_lane
+            ),
+            "admission_recovery_step_per_lane": (
+                self.admission_recovery_step_per_lane
+            ),
+            "admission_pressure_intervals": self.admission_pressure_intervals,
+            "admission_recovery_clean_intervals": (
+                self.admission_recovery_clean_intervals
+            ),
             "lane_connect_concurrency": self.lane_connect_concurrency,
             "ready_callback_batch_limit": self.ready_callback_batch_limit,
             "selector_event_batch_limit": self.selector_event_batch_limit,
@@ -298,10 +358,16 @@ class CapacityPreflight:
     projected_peak_rss_bytes: int
     projected_fds: int
     model_sha256: str
+    boot_id: str = "local-test-boot"
+    runner_harness_sha256: str = "0" * 64
+    runner_asset_sha256s: Mapping[str, str] = field(default_factory=dict)
     event_loop_microbatch_p99_ms: float = 0.0
     event_loop_selector_fanout_peak_ms: float = 0.0
     event_loop_selector_fanout_baseline_peak_ms: float = 0.0
     event_loop_selector_fanout_peak_deferred: int = 0
+    protocol_failures: tuple[str, ...] = ()
+    hard_safety_failures: tuple[str, ...] = ()
+    telemetry_advisories: tuple[str, ...] = ()
     failures: tuple[str, ...] = ()
 
     @property
@@ -311,6 +377,18 @@ class CapacityPreflight:
     @property
     def sufficient(self) -> bool:
         return not self.failures
+
+    @property
+    def receipt(self) -> dict[str, object]:
+        return {
+            "protocol": FANIN_PROTOCOL,
+            "schema_version": FANIN_SCHEMA_VERSION,
+            "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
+            "boot_id": self.boot_id,
+            "capacity_model_sha256": self.model_sha256,
+            "runner_harness_sha256": self.runner_harness_sha256,
+            "hard_safety_verified": self.sufficient,
+        }
 
 
 def capacity_model_sha256() -> str:
@@ -323,12 +401,17 @@ def capacity_model_sha256() -> str:
         "min_runner_cpu_count": MIN_RUNNER_CPU_COUNT,
         "runtime_max_cpu_capacity_fraction": RUNTIME_MAX_CPU_CAPACITY_FRACTION,
         "runtime_max_event_loop_p99_ms": RUNTIME_MAX_EVENT_LOOP_P99_MS,
-        "event_loop_gate_semantics": "wall_plus_cpu_and_internal_work",
+        "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
+        "event_loop_gate_semantics": "advisory_pacing_proportional_cpu_or_gc_only",
+        "pressure_hysteresis_cadence": "cpu_and_loop_independent",
+        "port_accounting_semantics": "every_sample_count_equals_used_plus_remaining",
         "raw_wall_lag_warning_ms": RAW_WALL_LAG_WARNING_MS,
         "raw_wall_lag_ceiling_ms": RAW_WALL_LAG_CEILING_MS,
         "raw_wall_lag_max_breaches": RAW_WALL_LAG_MAX_BREACHES,
         "owned_stall_min_thread_cpu_ms": OWNED_STALL_MIN_THREAD_CPU_MS,
         "owned_stall_ready_batch": OWNED_STALL_READY_BATCH,
+        "event_loop_p99_min_samples": EVENT_LOOP_P99_MIN_SAMPLES,
+        "event_loop_p99_window_samples": EVENT_LOOP_P99_WINDOW_SAMPLES,
         "ready_callback_batch_limit": READY_CALLBACK_BATCH_LIMIT,
         "selector_event_batch_limit": SELECTOR_EVENT_BATCH_LIMIT,
         "lane_connect_concurrency": LANE_CONNECT_CONCURRENCY,
@@ -379,7 +462,7 @@ def evaluate_runner_provisioning_capacity(instance_type: str) -> RunnerProvision
 
 
 def require_runner_provisioning_capacity(instance_type: str) -> RunnerProvisioningCapacity:
-    """Refuse a shape that cannot carry the frozen dual-lane protocol."""
+    """Refuse a shape that cannot carry one isolated v3 lane."""
 
     capacity = evaluate_runner_provisioning_capacity(instance_type)
     if capacity.sufficient and instance_type == RUNNER_INSTANCE_TYPE:
@@ -399,7 +482,7 @@ def fanin_config_sha256() -> str:
         **ConnectionSpikeContract().public_dict,
         "lane_ids": ["competitor", "lakebase"],
         "scheduler": (
-            "four-pinned-process-shared-t0-mirrored-two-pair-micro-batches-"
+            "four-pinned-process-one-physical-lane-micro-batches-"
             "bounded-in-flight-unbounded-drain"
         ),
         "sample_schedule": "eight-groups-offset-250ms",
@@ -440,6 +523,9 @@ def evaluate_capacity_preflight(
     event_loop_selector_fanout_peak_ms: float = 0.0,
     event_loop_selector_fanout_baseline_peak_ms: float = 0.0,
     event_loop_selector_fanout_peak_deferred: int = 0,
+    boot_id: str = "local-test-boot",
+    runner_harness_sha256: str = "0" * 64,
+    runner_asset_sha256s: Mapping[str, str] | None = None,
 ) -> CapacityPreflight:
     """Evaluate measured runner facts without opening test sockets."""
 
@@ -473,29 +559,32 @@ def evaluate_capacity_preflight(
     projected_peak = math.ceil(projected_held * (1 + RAMP_HEADROOM_FRACTION))
     projected_fds = open_fds + RUNNER_LANE_COUNT * TARGET_CLIENTS_PER_LANE + FD_CONTROL_RESERVE
     port_count = ephemeral_port_last - ephemeral_port_first + 1
-    failures: list[str] = []
+    protocol_failures: list[str] = []
+    hard_safety_failures: list[str] = []
+    advisories: list[str] = []
     if instance_type != RUNNER_INSTANCE_TYPE:
-        failures.append("runner_instance_type")
+        protocol_failures.append("runner_instance_type")
     if cpu_count < MIN_RUNNER_CPU_COUNT:
-        failures.append("runner_cpu_count")
+        protocol_failures.append("runner_cpu_count")
     if physical_memory_bytes < projected_peak + MEMORY_RESERVE_BYTES:
-        failures.append("physical_memory_projection")
+        hard_safety_failures.append("physical_memory_projection")
     if available_memory_bytes < (projected_peak - baseline_rss_bytes + MEMORY_RESERVE_BYTES):
-        failures.append("available_memory_projection")
+        hard_safety_failures.append("available_memory_projection")
     if projected_fds > math.floor(fd_soft_limit * FD_USAGE_FRACTION):
-        failures.append("file_descriptor_projection")
+        hard_safety_failures.append("file_descriptor_projection")
     if port_count < TARGET_CLIENTS_PER_LANE + EPHEMERAL_PORT_RESERVE_PER_LANE:
-        failures.append("ephemeral_port_projection")
+        hard_safety_failures.append("ephemeral_port_projection")
     if event_loop_p99_ms > 20.0:
-        failures.append("event_loop_calibration")
+        advisories.append("event_loop_calibration")
     if event_loop_microbatch_p99_ms > RUNTIME_MAX_EVENT_LOOP_P99_MS:
-        failures.append("event_loop_microbatch_pressure")
+        advisories.append("event_loop_microbatch_pressure")
     if event_loop_selector_fanout_peak_ms > RUNTIME_MAX_EVENT_LOOP_P99_MS:
-        failures.append("event_loop_selector_fanout_pressure")
+        advisories.append("event_loop_selector_fanout_pressure")
     if event_loop_selector_fanout_peak_deferred < 0:
-        failures.append("event_loop_selector_fanout_invalid")
+        protocol_failures.append("event_loop_selector_fanout_invalid")
     if cpu_calibration_ms > 2_000.0:
-        failures.append("cpu_calibration")
+        advisories.append("cpu_calibration")
+    failures = [*protocol_failures, *hard_safety_failures]
     return CapacityPreflight(
         instance_type=instance_type,
         cpu_count=cpu_count,
@@ -513,10 +602,16 @@ def evaluate_capacity_preflight(
         projected_peak_rss_bytes=projected_peak,
         projected_fds=projected_fds,
         model_sha256=capacity_model_sha256(),
+        boot_id=boot_id,
+        runner_harness_sha256=runner_harness_sha256,
+        runner_asset_sha256s=dict(runner_asset_sha256s or {}),
         event_loop_microbatch_p99_ms=event_loop_microbatch_p99_ms,
         event_loop_selector_fanout_peak_ms=event_loop_selector_fanout_peak_ms,
         event_loop_selector_fanout_baseline_peak_ms=(event_loop_selector_fanout_baseline_peak_ms),
         event_loop_selector_fanout_peak_deferred=(event_loop_selector_fanout_peak_deferred),
+        protocol_failures=tuple(protocol_failures),
+        hard_safety_failures=tuple(hard_safety_failures),
+        telemetry_advisories=tuple(advisories),
         failures=tuple(failures),
     )
 
@@ -578,8 +673,10 @@ class FanInProgress:
     phase: str = ""
     protocol: str = ""
     schema_version: int = 0
+    initiated_clients: int = 0
     authenticated_clients: int = 0
     held_clients: int = 0
+    peak_held_clients: int = 0
     terminal_failures: int = 0
     elapsed_ms: float = 0.0
     time_to_target_ms: float | None = None
@@ -587,6 +684,9 @@ class FanInProgress:
     sampled_queries_succeeded: int = 0
     sampled_queries_failed: int = 0
     event_loop_p99_ms: float | None = None
+    milestone: str | None = None
+    first_socket_initiated_ms: float | None = None
+    first_client_authenticated_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,10 +733,21 @@ class ConnectionSpikeLaneResult:
     telemetry_fd_soft_limit: int
     telemetry_peak_open_fds: int
     telemetry_ephemeral_port_count: int
+    telemetry_peak_ephemeral_ports_in_use: int
     telemetry_min_ephemeral_port_reserve: int
     telemetry_peak_event_loop_p99_ms: float
     telemetry_peak_cpu_capacity_fraction: float
     telemetry_failures: tuple[str, ...]
+    telemetry_advisories: tuple[str, ...]
+    safety_evidence_version: int
+    hard_safety_verified: bool
+    port_accounting_verified: bool
+    admission_controller_min_concurrency: int
+    admission_controller_reductions: int
+    admission_controller_recoveries: int
+    admission_controller_throttled_ms: float
+    admission_controller_recovery_hysteresis_intervals: int
+    admission_controller_pressure_hysteresis_intervals: int
     launch_skew_ms: float
     achieved_elapsed_ms: float
     gates: ConnectionSpikeGates
@@ -651,6 +762,8 @@ class ConnectionSpikeLaneResult:
     observer_failure_codes: tuple[str, ...] = ()
     observer_sqlstates: tuple[str, ...] = ()
     observer_connection_states: tuple[str, ...] = ()
+    cancelled_clients: int = 0
+    connection_diagnostics: tuple[Mapping[str, object], ...] = ()
 
     @property
     def verified(self) -> bool:
@@ -664,7 +777,11 @@ class ConnectionSpikeLaneResult:
 
     @property
     def terminal_clients(self) -> int:
-        return self.authenticated_clients + self.terminal_failures
+        return (
+            self.authenticated_clients
+            + self.terminal_failures
+            + self.cancelled_clients
+        )
 
     @property
     def successful_clients(self) -> int:
@@ -697,6 +814,7 @@ class ConnectionSpikeArm:
     generator_sha256: str
     capacity_model_sha256: str
     preflight: CapacityPreflight
+    preflights: Mapping[str, CapacityPreflight] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -716,7 +834,11 @@ def compare_lanes(
     left: ConnectionSpikeLaneResult,
     right: ConnectionSpikeLaneResult,
 ) -> ConnectionSpikeComparison | None:
-    """Compare exact shared-T0 time-to-10k only after both lanes verify."""
+    """Decode legacy same-runner v2 comparisons.
+
+    V3 never calls this result authoritative across physical machines; the
+    manager compares its own bell-relative observation clocks instead.
+    """
 
     if (
         not left.verified
@@ -784,6 +906,7 @@ def finalize_lane(
         raise FanInError("lane_id_invalid")
     initiated = _count(raw, "initiated_clients")
     authenticated = _count(raw, "authenticated_clients")
+    cancelled = _count(raw, "cancelled_clients") if "cancelled_clients" in raw else 0
     held = _count(raw, "held_clients_at_gate")
     terminal_failures = _count(raw, "terminal_failures")
     raw_failure_codes = raw.get("failure_codes")
@@ -799,6 +922,30 @@ def finalize_lane(
     ):
         raise FanInError("failure_codes_invalid")
     failure_codes = {str(key): int(value) for key, value in raw_failure_codes.items()}
+    raw_connection_diagnostics = raw.get("connection_diagnostics", [])
+    if (
+        not isinstance(raw_connection_diagnostics, list)
+        or len(raw_connection_diagnostics) > CONNECTION_DIAGNOSTIC_LIMIT
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {"worker_index", "ordinal", "stage", "code"}
+            or isinstance(item.get("worker_index"), bool)
+            or not isinstance(item.get("worker_index"), int)
+            or not 0 <= int(item["worker_index"]) < WORKER_COUNT
+            or isinstance(item.get("ordinal"), bool)
+            or not isinstance(item.get("ordinal"), int)
+            or not 0 <= int(item["ordinal"]) < PARTITION_CLIENTS_PER_LANE
+            or not all(
+                isinstance(item.get(name), str)
+                and 0 < len(str(item[name])) <= 64
+                and str(item[name]).replace("_", "").isalnum()
+                for name in ("stage", "code")
+            )
+            for item in raw_connection_diagnostics
+        )
+    ):
+        raise FanInError("connection_diagnostics_invalid")
+    connection_diagnostics = tuple(dict(item) for item in raw_connection_diagnostics)
     retries = _count(raw, "retries")
     disconnected = _count(raw, "disconnected_during_hold")
     attempted = _count(raw, "sampled_queries_attempted")
@@ -826,6 +973,9 @@ def finalize_lane(
     telemetry_fd_soft_limit = _count(raw, "telemetry_fd_soft_limit")
     telemetry_peak_open_fds = _count(raw, "telemetry_peak_open_fds")
     telemetry_ephemeral_port_count = _count(raw, "telemetry_ephemeral_port_count")
+    telemetry_peak_ephemeral_ports_in_use = _count(
+        raw, "telemetry_peak_ephemeral_ports_in_use"
+    )
     telemetry_min_ephemeral_reserve = _count(raw, "telemetry_min_ephemeral_port_reserve")
     telemetry_peak_loop = _number(raw, "telemetry_peak_event_loop_p99_ms")
     telemetry_peak_raw_loop = _number(raw, "telemetry_peak_raw_event_loop_p99_ms", optional=True)
@@ -873,6 +1023,23 @@ def finalize_lane(
             raise FanInError(f"{field_name}_invalid")
         observer_lists[field_name] = tuple(values)
     telemetry_peak_cpu = _number(raw, "telemetry_peak_cpu_capacity_fraction")
+    safety_evidence_version = _count(raw, "safety_evidence_version")
+    hard_safety_verified = raw.get("hard_safety_verified") is True
+    port_accounting_verified = raw.get("port_accounting_verified") is True
+    admission_min_concurrency = _count(
+        raw, "admission_controller_min_concurrency"
+    )
+    admission_reductions = _count(raw, "admission_controller_reductions")
+    admission_recoveries = _count(raw, "admission_controller_recoveries")
+    admission_throttled_ms = _number(
+        raw, "admission_controller_throttled_ms"
+    )
+    admission_recovery_hysteresis = _count(
+        raw, "admission_controller_recovery_hysteresis_intervals"
+    )
+    admission_pressure_hysteresis = _count(
+        raw, "admission_controller_pressure_hysteresis_intervals"
+    )
     raw_telemetry_failures = raw.get("telemetry_failures")
     if not isinstance(raw_telemetry_failures, list) or any(
         not isinstance(value, str)
@@ -883,6 +1050,22 @@ def finalize_lane(
     ):
         raise FanInError("telemetry_failures_invalid")
     telemetry_failures = tuple(raw_telemetry_failures)
+    raw_telemetry_advisories = raw.get("telemetry_advisories", [])
+    if not isinstance(raw_telemetry_advisories, list) or any(
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or not value.replace("_", "").isalnum()
+        for value in raw_telemetry_advisories
+    ):
+        raise FanInError("telemetry_advisories_invalid")
+    telemetry_advisories = tuple(raw_telemetry_advisories)
+    if (
+        any(value not in HARD_SAFETY_CODES for value in telemetry_failures)
+        or any(value not in ADVISORY_TELEMETRY_CODES for value in telemetry_advisories)
+        or set(telemetry_failures) & set(telemetry_advisories)
+    ):
+        raise FanInError("telemetry_code_unknown")
     assert (
         hold_ms is not None
         and launch_skew is not None
@@ -923,6 +1106,8 @@ def finalize_lane(
     )
     zero_failures = (
         terminal_failures == 0
+        and cancelled == 0
+        and initiated == authenticated + terminal_failures + cancelled
         and sum(failure_codes.values()) == terminal_failures
         and retries == MAX_RETRIES
         and disconnected == 0
@@ -970,7 +1155,10 @@ def finalize_lane(
     clean_start = preexisting <= MAX_PREEXISTING_CLIENT_SESSIONS
     fairness = launch_skew <= MAX_LAUNCH_SKEW_MS and raw.get("fairness_verified") is True
     telemetry = (
-        raw.get("telemetry_verified") is True
+        safety_evidence_version == SAFETY_EVIDENCE_VERSION
+        and hard_safety_verified
+        and port_accounting_verified
+        and raw.get("telemetry_verified") is True
         and telemetry_samples >= 1
         and not telemetry_failures
         and telemetry_physical_memory >= telemetry_peak_rss + MEMORY_RESERVE_BYTES
@@ -978,9 +1166,18 @@ def finalize_lane(
         and telemetry_peak_open_fds <= math.floor(telemetry_fd_soft_limit * FD_USAGE_FRACTION)
         and telemetry_ephemeral_port_count
         >= TARGET_CLIENTS_PER_LANE + EPHEMERAL_PORT_RESERVE_PER_LANE
+        and telemetry_peak_ephemeral_ports_in_use <= telemetry_ephemeral_port_count
+        and telemetry_min_ephemeral_reserve
+        == telemetry_ephemeral_port_count - telemetry_peak_ephemeral_ports_in_use
         and telemetry_min_ephemeral_reserve >= EPHEMERAL_PORT_RESERVE_PER_LANE
-        and telemetry_peak_loop <= RUNTIME_MAX_EVENT_LOOP_P99_MS
-        and telemetry_peak_cpu <= RUNTIME_MAX_CPU_CAPACITY_FRACTION
+        and MIN_ADMISSION_CONCURRENCY_PER_LANE
+        <= admission_min_concurrency
+        <= LANE_CONNECT_CONCURRENCY
+        and admission_recovery_hysteresis == ADMISSION_RECOVERY_CLEAN_INTERVALS
+        and admission_pressure_hysteresis == ADMISSION_PRESSURE_INTERVALS
+        # Loop lag, scheduling and CPU saturation are advisory pacing
+        # evidence.  Only the resource-exhaustion checks above may invalidate
+        # an otherwise exact retained-socket proof.
     )
     failures: list[str] = []
     for passed, label in (
@@ -1003,6 +1200,7 @@ def finalize_lane(
         lane_id=lane_id,
         initiated_clients=initiated,
         authenticated_clients=authenticated,
+        cancelled_clients=cancelled,
         held_clients_at_gate=held,
         terminal_failures=terminal_failures,
         failure_codes=failure_codes,
@@ -1042,6 +1240,9 @@ def finalize_lane(
         telemetry_fd_soft_limit=telemetry_fd_soft_limit,
         telemetry_peak_open_fds=telemetry_peak_open_fds,
         telemetry_ephemeral_port_count=telemetry_ephemeral_port_count,
+        telemetry_peak_ephemeral_ports_in_use=(
+            telemetry_peak_ephemeral_ports_in_use
+        ),
         telemetry_min_ephemeral_port_reserve=telemetry_min_ephemeral_reserve,
         telemetry_peak_event_loop_p99_ms=telemetry_peak_loop,
         telemetry_peak_raw_event_loop_p99_ms=(
@@ -1059,8 +1260,23 @@ def finalize_lane(
         observer_failure_codes=observer_lists["observer_failure_codes"],
         observer_sqlstates=observer_lists["observer_sqlstates"],
         observer_connection_states=observer_lists["observer_connection_states"],
+        connection_diagnostics=connection_diagnostics,
         telemetry_peak_cpu_capacity_fraction=telemetry_peak_cpu,
         telemetry_failures=telemetry_failures,
+        telemetry_advisories=telemetry_advisories,
+        safety_evidence_version=safety_evidence_version,
+        hard_safety_verified=hard_safety_verified,
+        port_accounting_verified=port_accounting_verified,
+        admission_controller_min_concurrency=admission_min_concurrency,
+        admission_controller_reductions=admission_reductions,
+        admission_controller_recoveries=admission_recoveries,
+        admission_controller_throttled_ms=float(admission_throttled_ms or 0.0),
+        admission_controller_recovery_hysteresis_intervals=(
+            admission_recovery_hysteresis
+        ),
+        admission_controller_pressure_hysteresis_intervals=(
+            admission_pressure_hysteresis
+        ),
         launch_skew_ms=launch_skew,
         achieved_elapsed_ms=achieved_elapsed,
         gates=ConnectionSpikeGates(
@@ -1096,8 +1312,9 @@ def fanin_preflight_request(
     config_sha256: str,
     generator_sha256: str,
     capacity_model_sha256: str,
+    runner_harness_sha256: str,
 ) -> dict[str, object]:
-    """The capacity-preflight request, which carries exactly nine keys.
+    """The capacity-preflight request, including the complete runner harness seal.
 
     The runner compares the key set for equality, not containment, so an extra field is
     a refusal rather than something ignored. That is deliberate: a preflight is what
@@ -1115,6 +1332,7 @@ def fanin_preflight_request(
         "config_sha256": config_sha256,
         "generator_sha256": generator_sha256,
         "capacity_model_sha256": capacity_model_sha256,
+        "runner_harness_sha256": runner_harness_sha256,
     }
 
 
@@ -1126,6 +1344,7 @@ def fanin_run_request(
     config_sha256: str,
     generator_sha256: str,
     capacity_model_sha256: str,
+    runner_harness_sha256: str,
     trust_bundle_sha256: str,
     lakebase_credential_sha256: str,
     lakebase_observer_credential_sha256: str,
@@ -1134,7 +1353,7 @@ def fanin_run_request(
     competitor_credential_id: str,
     targets: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
-    """The bout request: two lanes, one shared start, no retries.
+    """Build a legacy v2 aggregate request for stored-evidence compatibility.
 
     `baseline_auth` is asymmetric on purpose and the runner enforces it. The competitor
     lane carries `credential_id` because Aurora and RDS are two separately sealed
@@ -1147,7 +1366,9 @@ def fanin_run_request(
     to catch.
     """
 
-    if len(targets) != RUNNER_LANE_COUNT:
+    # Transitional aggregate-request builder only. The v3 live path builds a
+    # one-lane request per physical runner in `connection_spike_live`.
+    if len(targets) != len(RUNTIME_LANE_IDS):
         raise FanInError("targets_invalid")
     lane_ids = {str(target.get("lane_id") or "") for target in targets}
     if lane_ids != set(RUNTIME_LANE_IDS):
@@ -1168,6 +1389,7 @@ def fanin_run_request(
         "config_sha256": config_sha256,
         "generator_sha256": generator_sha256,
         "capacity_model_sha256": capacity_model_sha256,
+        "runner_harness_sha256": runner_harness_sha256,
         "trust_bundle_path": TRUST_BUNDLE_PATH,
         "trust_bundle_sha256": trust_bundle_sha256,
         "baseline_auth": {

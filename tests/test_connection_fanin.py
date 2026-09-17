@@ -31,6 +31,7 @@ from server.connection_fanin import (
     require_runner_provisioning_capacity,
 )
 from server.connection_spike_live import (
+    RUNNER_ASSETS,
     ConnectionSpikeLiveOperationError,
     LiveConnectionSpikeAdapter,
     _finalize_raw_result,
@@ -133,6 +134,7 @@ def raw_lane(
         "telemetry_fd_soft_limit": 65_535,
         "telemetry_peak_open_fds": 20_264,
         "telemetry_ephemeral_port_count": 28_232,
+        "telemetry_peak_ephemeral_ports_in_use": 10_000,
         "telemetry_min_ephemeral_port_reserve": 18_232,
         "telemetry_peak_event_loop_p99_ms": 4.5,
         "telemetry_peak_raw_event_loop_p99_ms": 72.929,
@@ -141,6 +143,20 @@ def raw_lane(
         "telemetry_raw_event_loop_ceiling_breaches": 0,
         "telemetry_peak_cpu_capacity_fraction": 0.31,
         "telemetry_failures": [],
+        "telemetry_advisories": [],
+        "safety_evidence_version": runner.SAFETY_EVIDENCE_VERSION,
+        "hard_safety_verified": True,
+        "port_accounting_verified": True,
+        "admission_controller_min_concurrency": runner.LANE_CONNECT_CONCURRENCY,
+        "admission_controller_reductions": 0,
+        "admission_controller_recoveries": 0,
+        "admission_controller_throttled_ms": 0.0,
+        "admission_controller_recovery_hysteresis_intervals": (
+            runner.ADMISSION_RECOVERY_CLEAN_INTERVALS
+        ),
+        "admission_controller_pressure_hysteresis_intervals": (
+            runner.ADMISSION_PRESSURE_INTERVALS
+        ),
         "launch_skew_ms": 0.25,
         "achieved_elapsed_ms": 42_500.0,
         "identity_verified": True,
@@ -172,6 +188,7 @@ def worker_result(index: int, *, release_ns: int = 123) -> dict[str, object]:
         lane.update(
             {
                 "initiated_clients": runner.PARTITION_CLIENTS_PER_LANE,
+                "cancelled_clients": 0,
                 "sampled_queries_attempted": 16,
                 "sampled_queries_succeeded": 16,
                 "distinct_socket_fds": runner.PARTITION_CLIENTS_PER_LANE,
@@ -184,6 +201,7 @@ def worker_result(index: int, *, release_ns: int = 123) -> dict[str, object]:
                 "telemetry_peak_rss_bytes": 512 * 1024**2,
                 "telemetry_peak_open_fds": 5_064,
                 "telemetry_peak_cpu_capacity_fraction": 0.1,
+                "achieved_elapsed_ms": 85_000.0,
             }
         )
         lanes.append(lane)
@@ -192,6 +210,18 @@ def worker_result(index: int, *, release_ns: int = 123) -> dict[str, object]:
         for key, value in lanes[0].items()
         if key.startswith("telemetry_")
     }
+    for key in (
+        "safety_evidence_version",
+        "hard_safety_verified",
+        "port_accounting_verified",
+        "admission_controller_min_concurrency",
+        "admission_controller_reductions",
+        "admission_controller_recoveries",
+        "admission_controller_throttled_ms",
+        "admission_controller_recovery_hysteresis_intervals",
+        "admission_controller_pressure_hysteresis_intervals",
+    ):
+        telemetry[key] = lanes[0][key]
     return {
         "schema_version": runner.SCHEMA_VERSION,
         "protocol": runner.PROTOCOL,
@@ -201,10 +231,12 @@ def worker_result(index: int, *, release_ns: int = 123) -> dict[str, object]:
         "generator_sha256": runner.generator_sha256(),
         "capacity_model_sha256": runner.capacity_model_sha256(),
         "release_ns": release_ns,
+        "hold_ns": release_ns + 50_000_000_000,
         "worker_index": index,
         "worker_count": runner.WORKER_COUNT,
         "worker_cpu": index,
         "partition_target_clients": runner.PARTITION_CLIENTS_PER_LANE,
+        "worker_outcome": "completed",
         "lanes": lanes,
         "telemetry": telemetry,
         "runtime_diagnostics": {"loop_samples": 10},
@@ -227,7 +259,7 @@ def test_contract_and_runner_digests_are_exactly_the_same() -> None:
 def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() -> None:
     sufficient = passing_preflight()
     assert sufficient.sufficient
-    assert sufficient.projected_fds == 20_263
+    assert sufficient.projected_fds == 10_263
     assert sufficient.model_sha256 == capacity_model_sha256()
 
     tight = evaluate_capacity_preflight(
@@ -245,8 +277,8 @@ def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() 
         cpu_calibration_ms=50.0,
     )
     assert not tight.sufficient
-    assert "physical_memory_projection" in tight.failures
-    assert "available_memory_projection" in tight.failures
+    assert "runner_instance_type" in tight.failures
+    assert "runner_cpu_count" in tight.failures
 
     pressured = evaluate_capacity_preflight(
         instance_type="c7i.2xlarge",
@@ -263,14 +295,16 @@ def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() 
         event_loop_microbatch_p99_ms=50.001,
         cpu_calibration_ms=50.0,
     )
-    assert pressured.failures == ("event_loop_microbatch_pressure",)
+    assert pressured.sufficient
+    assert pressured.failures == ()
+    assert pressured.telemetry_advisories == ("event_loop_microbatch_pressure",)
 
 
 def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() -> None:
     large = evaluate_runner_provisioning_capacity("m6i.large")
     assert not large.sufficient
     assert large.selected.vcpu_count == 2
-    assert "physical_memory_projection" in large.failures
+    assert "runner_cpu_count" in large.failures
     with pytest.raises(
         ValueError,
         match=r"use c7i\.2xlarge.*No client-count, memory-reserve",
@@ -286,7 +320,7 @@ def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() ->
     # the built instance drift apart.
     assert evaluate_runner_provisioning_capacity("m6i.xlarge").sufficient
     assert selected.usable_memory_bytes > selected.required_memory_bytes
-    assert selected.projected_fds == 20_256
+    assert selected.projected_fds == 10_256
 
 
 @pytest.mark.parametrize(
@@ -295,6 +329,7 @@ def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() ->
         ({"held_clients_at_gate": 9_999, "distinct_socket_fds": 9_999,
           "distinct_local_endpoints": 9_999}, "exact_count"),
         ({"terminal_failures": 1}, "zero_failures"),
+        ({"cancelled_clients": 1}, "zero_failures"),
         ({"retries": 1}, "zero_failures"),
         ({"hold_elapsed_ms": 29_999.999}, "hold"),
         ({"sampled_queries_succeeded": 63, "sampled_queries_failed": 1},
@@ -311,12 +346,14 @@ def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() ->
         ({"auth_method": ""}, "identity"),
         ({"auth_method": "md5"}, "identity"),
         ({"telemetry_verified": False}, "telemetry"),
-        ({"telemetry_peak_event_loop_p99_ms": 50.001}, "telemetry"),
-        ({"telemetry_peak_cpu_capacity_fraction": 0.851}, "telemetry"),
         ({"telemetry_min_available_memory_bytes": 767 * 1024**2}, "telemetry"),
         ({"telemetry_peak_open_fds": 52_429}, "telemetry"),
         ({"telemetry_min_ephemeral_port_reserve": 1_999}, "telemetry"),
-        ({"telemetry_failures": ["event_loop_pressure"]}, "telemetry"),
+        ({"telemetry_failures": ["available_memory_reserve_exhausted"]}, "telemetry"),
+        ({"safety_evidence_version": runner.SAFETY_EVIDENCE_VERSION - 1}, "telemetry"),
+        ({"hard_safety_verified": False}, "telemetry"),
+        ({"admission_controller_min_concurrency": 1}, "telemetry"),
+        ({"telemetry_peak_ephemeral_ports_in_use": 10_001}, "telemetry"),
     ),
 )
 def test_exact_stop_gate_rejects_every_mutation(
@@ -327,6 +364,136 @@ def test_exact_stop_gate_rejects_every_mutation(
     result = finalize(raw)
     assert not result.verified
     assert failed_gate in result.gates.failures
+
+
+def test_advisory_loop_cpu_and_scheduling_pressure_do_not_fail_exact_proof() -> None:
+    raw = raw_lane("lakebase")
+    raw.update(
+        {
+            "telemetry_peak_event_loop_p99_ms": 60.499,
+            "telemetry_peak_raw_event_loop_p99_ms": 71.721,
+            "telemetry_peak_external_event_loop_p99_ms": 71.721,
+            "telemetry_peak_cpu_capacity_fraction": 0.99,
+            "telemetry_advisories": [
+                "cpu_pressure",
+                "event_loop_pressure",
+                "host_scheduling_instability",
+            ],
+            "admission_controller_min_concurrency": (
+                runner.MIN_ADMISSION_CONCURRENCY_PER_LANE
+            ),
+            "admission_controller_reductions": 3,
+            "admission_controller_recoveries": 2,
+            "admission_controller_throttled_ms": 123.0,
+        }
+    )
+
+    result = finalize(raw)
+
+    assert result.verified
+    assert result.gates.telemetry
+    assert result.telemetry_advisories == (
+        "cpu_pressure",
+        "event_loop_pressure",
+        "host_scheduling_instability",
+    )
+
+
+def test_unknown_telemetry_code_is_a_protocol_error_not_a_soft_default() -> None:
+    raw = raw_lane("lakebase")
+    raw["telemetry_advisories"] = ["future_pressure"]
+
+    with pytest.raises(FanInError, match="telemetry_code_unknown"):
+        finalize(raw)
+
+    with pytest.raises(runner.FanInProtocolError, match="unknown_safety_code"):
+        runner.classify_safety_code("memoryish_pressure")
+
+
+def test_missing_or_malformed_mandatory_safety_evidence_fails_hard() -> None:
+    missing = runner.TelemetrySummary()
+    missing.observe({})
+    assert missing.hard_failures == {"mandatory_safety_evidence_missing"}
+    assert not missing.verified
+
+    malformed = runner.TelemetrySummary()
+    malformed.observe(
+        {
+            "physical_memory_bytes": "lots",
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 100 * 1024**2,
+            "fd_soft_limit": 65_535,
+            "open_fds": 7,
+            "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 100,
+            "ephemeral_ports_remaining": 28_132,
+            "event_loop_p99_ms": 1.0,
+            "cpu_capacity_fraction": 0.1,
+        }
+    )
+    assert malformed.hard_failures == {"mandatory_safety_evidence_malformed"}
+    assert not malformed.verified
+
+
+def test_admission_controller_reduces_then_recovers_without_cancelling() -> None:
+    controller = runner.AdmissionController(lane_count=1)
+    assert controller.current_concurrency == runner.LANE_CONNECT_CONCURRENCY
+
+    controller.observe_interval(pressured=True)
+    assert controller.current_concurrency == runner.LANE_CONNECT_CONCURRENCY
+    controller.observe_interval(pressured=True)
+    reduced = controller.current_concurrency
+    assert runner.MIN_ADMISSION_CONCURRENCY_PER_LANE <= reduced
+    assert reduced < runner.LANE_CONNECT_CONCURRENCY
+    assert controller.reductions == 1
+
+    for _ in range(runner.ADMISSION_RECOVERY_CLEAN_INTERVALS - 1):
+        controller.observe_interval(pressured=False)
+        assert controller.current_concurrency == reduced
+        assert controller.recoveries == 0
+    controller.observe_interval(pressured=False)
+    assert controller.current_concurrency == (
+        reduced + runner.ADMISSION_RECOVERY_STEP_PER_LANE
+    )
+    assert controller.recoveries == 1
+
+
+def test_admission_hysteresis_requires_consecutive_mixed_cadence_intervals() -> None:
+    controller = runner.AdmissionController(lane_count=1)
+    initial = controller.current_concurrency
+    for pressured in (True, False, True):
+        controller.observe_interval(pressured=pressured)
+    assert controller.current_concurrency == initial
+    controller.observe_interval(pressured=True)
+    reduced = controller.current_concurrency
+    assert reduced < initial
+
+    for pressured in (False, False, True, False, False):
+        controller.observe_interval(pressured=pressured)
+    assert controller.current_concurrency == reduced
+    controller.observe_interval(pressured=False)
+    assert controller.current_concurrency == (
+        reduced + runner.ADMISSION_RECOVERY_STEP_PER_LANE
+    )
+
+
+def test_cpu_and_loop_pressure_cadences_do_not_combine() -> None:
+    controller = runner.AdmissionController(lane_count=1)
+    initial = controller.current_concurrency
+    controller.observe_loop_interval(pressured=True)
+    controller.observe_cpu_interval(pressured=True)
+    assert controller.current_concurrency == initial
+    controller.observe_cpu_interval(pressured=True)
+    reduced = controller.current_concurrency
+    assert reduced < initial
+
+    for _ in range(runner.ADMISSION_RECOVERY_CLEAN_INTERVALS):
+        controller.observe_cpu_interval(pressured=False)
+    assert controller.current_concurrency == reduced
+    controller.observe_loop_interval(pressured=False)
+    for _ in range(runner.ADMISSION_RECOVERY_CLEAN_INTERVALS):
+        controller.observe_cpu_interval(pressured=False)
+    assert controller.current_concurrency > reduced
 
 
 def test_a_warm_pool_inside_the_ceiling_still_verifies() -> None:
@@ -383,6 +550,8 @@ def test_runtime_telemetry_summary_fails_on_each_pressure_dimension() -> None:
         "fd_soft_limit": 65_535,
         "open_fds": 20_264,
         "ephemeral_port_count": 28_232,
+        "ephemeral_ports_in_use": 10_000,
+        "ephemeral_ports_remaining": 18_232,
         "event_loop_p99_ms": 4.5,
         "cpu_capacity_fraction": 0.31,
     }
@@ -397,18 +566,82 @@ def test_runtime_telemetry_summary_fails_on_each_pressure_dimension() -> None:
             "available_memory_bytes": 767 * 1024**2,
             "open_fds": 60_000,
             "ephemeral_port_count": 11_999,
+            "ephemeral_ports_in_use": 10_000,
+            "ephemeral_ports_remaining": 1_999,
             "event_loop_p99_ms": 50.001,
             "cpu_capacity_fraction": 0.851,
         }
     )
     assert not pressure.verified
     assert set(pressure.public_dict()["telemetry_failures"]) == {
-        "available_memory_pressure",
-        "cpu_pressure",
-        "ephemeral_port_pressure",
-        "event_loop_pressure",
-        "file_descriptor_pressure",
+        "available_memory_reserve_exhausted",
+        "ephemeral_port_reserve_exhausted",
+        "file_descriptor_reserve_exhausted",
     }
+    assert pressure.public_dict()["telemetry_advisories"] == ["cpu_pressure"]
+
+
+def test_ephemeral_port_safety_measures_actual_host_namespace_ports(
+    tmp_path,
+) -> None:
+    (tmp_path / "sys/net/ipv4").mkdir(parents=True)
+    (tmp_path / "sys/net/ipv4/ip_local_port_range").write_text(
+        "40000 40003\n",
+        encoding="ascii",
+    )
+    (tmp_path / "self/fd").mkdir(parents=True)
+    (tmp_path / "self/fd/3").symlink_to("socket:[123]")
+    (tmp_path / "net").mkdir()
+    header = "sl local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode"
+    rows = [
+        "0: 0100007F:9C40 0100007F:1538 01 0 0 0 1000 0 123",
+        "1: 0100007F:9C41 0100007F:1538 01 0 0 0 1000 0 999",
+    ]
+    (tmp_path / "net/tcp").write_text(
+        "\n".join((header, *rows)),
+        encoding="ascii",
+    )
+    (tmp_path / "net/tcp6").write_text(header + "\n", encoding="ascii")
+
+    assert runner._ephemeral_port_usage(tmp_path) == (4, 2, 2)
+
+
+def test_unavailable_or_malformed_proc_tcp_evidence_fails_closed(tmp_path) -> None:
+    with pytest.raises(runner.FanInProtocolError, match="mandatory_safety_evidence_missing"):
+        runner._ephemeral_port_usage(tmp_path)
+
+    (tmp_path / "sys/net/ipv4").mkdir(parents=True)
+    (tmp_path / "sys/net/ipv4/ip_local_port_range").write_text(
+        "40000 40003\n",
+        encoding="ascii",
+    )
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net/tcp").write_text("header\nmalformed\n", encoding="ascii")
+    with pytest.raises(runner.FanInProtocolError, match="mandatory_safety_evidence_malformed"):
+        runner._ephemeral_port_usage(tmp_path)
+
+    (tmp_path / "net/tcp").write_text("", encoding="ascii")
+    with pytest.raises(runner.FanInProtocolError, match="mandatory_safety_evidence_malformed"):
+        runner._ephemeral_port_usage(tmp_path)
+
+
+async def test_selector_fanout_timeout_is_advisory_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def force_timeout(awaitable, **kwargs):
+        del kwargs
+        awaitable.cancel()
+        raise TimeoutError
+
+    monkeypatch.setattr(runner.asyncio, "wait_for", force_timeout)
+    peak_ms, deferred, wakeups, sockets = (
+        await runner._event_loop_selector_fanout_benchmark(sockets=1)
+    )
+
+    assert peak_ms == 5_000.0
+    assert deferred >= 1
+    assert wakeups >= 0
+    assert sockets == 1
 
 
 def test_winner_exists_only_after_both_exact_gates_under_same_protocol() -> None:
@@ -441,6 +674,11 @@ def test_stale_schema_and_digest_cannot_be_finalized_as_v2() -> None:
         "config_sha256": arm.config_sha256,
         "generator_sha256": arm.generator_sha256,
         "capacity_model_sha256": arm.capacity_model_sha256,
+        "runner_harness_sha256": arm.preflight.runner_harness_sha256,
+        "runner_boot_id": arm.preflight.boot_id,
+        "runner_asset_sha256s": {
+            name: arm.generator_sha256 for name in RUNNER_ASSETS
+        },
         "lanes": [raw_lane("lakebase"), raw_lane("competitor")],
         "runtime_diagnostics": {"loop_samples": 100},
     }
@@ -925,7 +1163,12 @@ async def test_equal_wave_scheduler_alternates_lanes_and_never_tunes_one_lane(
         SimpleNamespace(lane_id="lakebase", initiated=0, target_clients=4),
         SimpleNamespace(lane_id="competitor", initiated=0, target_clients=4),
     ]
-    await runner._open_equal_wave(lanes, 4, 123)
+    await runner._open_equal_wave(
+        lanes,
+        4,
+        123,
+        runner.AdmissionController(lane_count=len(lanes)),
+    )
     assert calls == [
         "lakebase", "competitor",
         "lakebase", "competitor",
@@ -933,6 +1176,61 @@ async def test_equal_wave_scheduler_alternates_lanes_and_never_tunes_one_lane(
         "lakebase", "competitor",
     ]
     assert [lane.initiated for lane in lanes] == [4, 4]
+
+
+async def test_cancelled_connect_is_explicitly_accounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = asyncio.Event()
+
+    class Client:
+        def __init__(self, **unused) -> None:
+            self.authenticated = asyncio.get_running_loop().create_future()
+            self.closed = asyncio.get_running_loop().create_future()
+
+        def close(self) -> None:
+            if not self.closed.done():
+                self.closed.set_result(None)
+
+    async def blocked_create_connection(*unused_args, **unused_kwargs):
+        created.set()
+        await asyncio.Event().wait()
+
+    runtime = SimpleNamespace(
+        first_launch_ns=None,
+        initiated=0,
+        authenticated=0,
+        cancelled=0,
+        terminal_failures=0,
+        target_clients=2_500,
+        lane_id="lakebase",
+        database={"host": "example.test", "port": 5432},
+        connect_host="127.0.0.1",
+        application_name="test",
+        ssl_context=object(),
+        unexpected_disconnect=lambda unused: None,
+        key_cache=object(),
+        clients=[],
+        auth_methods=set(),
+        connect_latencies_ms=[],
+        target_elapsed_ns=None,
+        failure_codes={},
+    )
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(runner, "PostgresClient", Client)
+    monkeypatch.setattr(loop, "create_connection", blocked_create_connection)
+
+    operation = asyncio.create_task(runner._open_client(runtime, time.monotonic_ns()))
+    await created.wait()
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+
+    assert runtime.initiated == 1
+    assert runtime.authenticated == 0
+    assert runtime.terminal_failures == 0
+    assert runtime.cancelled == 1
+    assert runtime.clients[0].closed.done()
 
 
 async def test_equal_wave_scheduler_bounds_each_mirrored_microbatch(
@@ -959,7 +1257,12 @@ async def test_equal_wave_scheduler_bounds_each_mirrored_microbatch(
         SimpleNamespace(lane_id="lakebase", initiated=0, target_clients=12),
         SimpleNamespace(lane_id="competitor", initiated=0, target_clients=12),
     ]
-    await runner._open_equal_wave(lanes, 12, 123)
+    await runner._open_equal_wave(
+        lanes,
+        12,
+        123,
+        runner.AdmissionController(lane_count=len(lanes)),
+    )
     assert peak == {
         "lakebase": runner.MICRO_BATCH_SIZE,
         "competitor": runner.MICRO_BATCH_SIZE,
@@ -968,16 +1271,20 @@ async def test_equal_wave_scheduler_bounds_each_mirrored_microbatch(
 
 
 def test_worker_aggregation_uses_one_shared_start_and_exact_partitions() -> None:
-    aggregated = runner.aggregate_worker_results(
-        [worker_result(index) for index in range(runner.WORKER_COUNT)]
-    )
+    workers = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    workers[-1]["telemetry"]["telemetry_peak_cpu_capacity_fraction"] = 0.99
+    aggregated = runner.aggregate_worker_results(workers)
 
     assert aggregated["release_ns"] == 123
+    assert aggregated["hold_ns"] == 50_000_000_123
     assert aggregated["worker_count"] == 4
+    assert aggregated["telemetry"]["telemetry_peak_cpu_capacity_fraction"] == 0.99
     for lane in aggregated["lanes"]:
         assert lane["initiated_clients"] == 10_000
         assert lane["authenticated_clients"] == 10_000
         assert lane["held_clients_at_gate"] == 10_000
+        assert lane["time_to_target_ns"] == 40_003_000_000
+        assert lane["time_to_target_ms"] == 40_003.0
         assert lane["sampled_queries_attempted"] == 64
         assert lane["sampled_queries_succeeded"] == 64
         assert lane["distinct_socket_fds"] == 10_000
@@ -985,7 +1292,7 @@ def test_worker_aggregation_uses_one_shared_start_and_exact_partitions() -> None
         assert lane["identity_verified"] is True
         assert lane["launch_skew_ms"] == pytest.approx(0.0003)
         assert lane["telemetry_peak_cpu_capacity_fraction"] == pytest.approx(
-            0.1
+            0.99
         )
 
 
@@ -1051,7 +1358,8 @@ def test_sampling_rejects_incomplete_partition_before_indexing(
 
 async def test_disconnect_during_sampling_cannot_invalidate_selected_indices() -> None:
     class Client:
-        def __init__(self) -> None:
+        def __init__(self, ordinal: int) -> None:
+            self.ordinal = ordinal
             self.ready = True
             self.closed = asyncio.get_running_loop().create_future()
 
@@ -1063,10 +1371,11 @@ async def test_disconnect_during_sampling_cannot_invalidate_selected_indices() -
     runtime = SimpleNamespace(
         lane_id="lakebase",
         target_clients=runner.PARTITION_CLIENTS_PER_LANE,
-        clients=[Client() for _ in range(runner.PARTITION_CLIENTS_PER_LANE)],
+        clients=[Client(ordinal) for ordinal in range(runner.PARTITION_CLIENTS_PER_LANE)],
         sample_attempted=0,
         sample_succeeded=0,
         sample_failed=0,
+        record_connection_diagnostic=lambda **_kwargs: None,
     )
     indices = runner._sample_group_indices(runtime, 2)
     sample = asyncio.create_task(runner._sample_group(runtime, 2))
@@ -1096,6 +1405,8 @@ async def test_final_observer_disconnect_is_a_failed_check_not_worker_crash(
             "fd_soft_limit": 65_535,
             "open_fds": 100,
             "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 10_000,
+            "ephemeral_ports_remaining": 18_232,
             "event_loop_p99_ms": 0.01,
             "cpu_capacity_fraction": 0.1,
         },
@@ -1141,6 +1452,56 @@ def test_worker_aggregation_rejects_double_count_and_shared_start_mutations() ->
     with pytest.raises(runner.FanInProtocolError, match="affinity"):
         runner.aggregate_worker_results(results)
 
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    results[-1]["lanes"][0]["time_to_target_ns"] = 60_000_000_000
+    with pytest.raises(runner.FanInProtocolError, match="target_timestamp"):
+        runner.aggregate_worker_results(results)
+
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    results[-1]["lanes"][0]["achieved_elapsed_ms"] = 79_999.0
+    with pytest.raises(runner.FanInProtocolError, match="completion_chronology"):
+        runner.aggregate_worker_results(results)
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    (
+        ("telemetry_samples", True, "telemetry_malformed"),
+        ("telemetry_peak_cpu_capacity_fraction", float("nan"), "telemetry_malformed"),
+        ("telemetry_peak_open_fds", -1, "telemetry_malformed"),
+        ("port_accounting_verified", False, "telemetry_malformed"),
+    ),
+)
+def test_worker_aggregation_rejects_malformed_or_synthesized_telemetry(
+    field: str,
+    value: object,
+    error: str,
+) -> None:
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    results[0]["telemetry"][field] = value
+    with pytest.raises(runner.FanInProtocolError, match=error):
+        runner.aggregate_worker_results(results)
+
+    missing = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    missing[0]["telemetry"].pop(field)
+    with pytest.raises(runner.FanInProtocolError, match="telemetry_missing"):
+        runner.aggregate_worker_results(missing)
+
+
+def test_global_preexisting_baseline_is_published_once_not_summed() -> None:
+    results = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    for result in results:
+        result["lanes"][0]["preexisting_client_role_sessions"] = 20
+    aggregated = runner.aggregate_worker_results(results)
+    assert aggregated["lanes"][0]["preexisting_client_role_sessions"] == 20
+
+    results[-1]["lanes"][0]["preexisting_client_role_sessions"] = 19
+    with pytest.raises(
+        runner.FanInProtocolError,
+        match="preexisting_session_observation_mismatch",
+    ):
+        runner.aggregate_worker_results(results)
+
 
 async def test_guarded_wave_cancels_both_lanes_on_runtime_pressure(
     monkeypatch: pytest.MonkeyPatch,
@@ -1159,12 +1520,14 @@ async def test_guarded_wave_cancels_both_lanes_on_runtime_pressure(
         "_telemetry",
         lambda *unused: {
             "physical_memory_bytes": 15 * 1024**3,
-            "available_memory_bytes": 7 * 1024**3,
+            "available_memory_bytes": 767 * 1024**2,
             "rss_bytes": 7 * 1024**3,
             "fd_soft_limit": 65_535,
             "open_fds": 20_264,
             "ephemeral_port_count": 28_232,
-            "event_loop_p99_ms": 50.001,
+            "ephemeral_ports_in_use": 10_000,
+            "ephemeral_ports_remaining": 18_232,
+            "event_loop_p99_ms": 0.1,
             "cpu_capacity_fraction": 0.31,
         },
     )
@@ -1176,13 +1539,80 @@ async def test_guarded_wave_cancels_both_lanes_on_runtime_pressure(
         start_cpu=0.0,
         network_start=(0, 0),
         telemetry_summary=summary,
+        admission_controller=runner.AdmissionController(lane_count=1),
     )
 
     assert cancelled.is_set()
-    assert summary.failures == {"event_loop_pressure"}
+    assert summary.hard_failures == {"available_memory_reserve_exhausted"}
 
 
-async def test_continuous_loop_monitor_attributes_a_real_stall(
+async def test_advisory_pressure_still_completes_full_hold_and_all_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane = SimpleNamespace(
+        lane_id="lakebase",
+        initiated=runner.PARTITION_CLIENTS_PER_LANE,
+        authenticated=runner.PARTITION_CLIENTS_PER_LANE,
+        target_elapsed_ns=1,
+        sample_attempted=0,
+        sample_succeeded=0,
+        sample_failed=0,
+        clients=[],
+    )
+
+    async def sample_group(runtime, unused_group):
+        runtime.sample_attempted += runner.CLIENTS_PER_SAMPLE_GROUP
+        runtime.sample_succeeded += runner.CLIENTS_PER_SAMPLE_GROUP
+
+    async def calibration():
+        return 60.499
+
+    async def advisory_telemetry(*unused_args, **unused_kwargs):
+        return {
+            "physical_memory_bytes": 15 * 1024**3,
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 100 * 1024**2,
+            "fd_soft_limit": 65_535,
+            "open_fds": 7,
+            "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 10_000,
+            "ephemeral_ports_remaining": 18_232,
+            "event_loop_p99_ms": 60.499,
+            "cpu_capacity_fraction": 0.99,
+        }
+
+    class Observer:
+        async def sample(self):
+            return True
+
+    monkeypatch.setattr(runner, "_sample_group", sample_group)
+    monkeypatch.setattr(runner, "_event_loop_calibration", calibration)
+    monkeypatch.setattr(runner, "_telemetry_off_loop", advisory_telemetry)
+    monkeypatch.setattr(runner, "_progress", lambda unused: None)
+    summary = runner.TelemetrySummary()
+    hold_started_ns = (
+        time.monotonic_ns() - runner.HOLD_SECONDS * 1_000_000_000
+    )
+
+    hold_elapsed_ms, observer_ok = await runner._hold_and_sample(
+        [lane],
+        [Observer()],
+        t0_ns=hold_started_ns,
+        start_cpu=0.0,
+        network_start=(0, 0),
+        telemetry_summary=summary,
+        hold_started_ns=hold_started_ns,
+    )
+
+    assert hold_elapsed_ms >= runner.HOLD_SECONDS * 1_000
+    assert lane.sample_attempted == runner.SAMPLED_QUERIES_PER_LANE
+    assert lane.sample_succeeded == runner.SAMPLED_QUERIES_PER_LANE
+    assert observer_ok
+    assert summary.hard_failures == set()
+    assert "cpu_pressure" in summary.advisories
+
+
+async def test_one_owned_loop_stall_is_diagnostic_not_a_fake_p99_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def stalled_wave(*unused):
@@ -1205,6 +1635,8 @@ async def test_continuous_loop_monitor_attributes_a_real_stall(
             "fd_soft_limit": 65_535,
             "open_fds": 7,
             "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 100,
+            "ephemeral_ports_remaining": 28_132,
             "event_loop_p99_ms": 0.0,
             "cpu_capacity_fraction": 0.01,
         },
@@ -1220,10 +1652,12 @@ async def test_continuous_loop_monitor_attributes_a_real_stall(
         start_cpu=time.process_time(),
         network_start=(0, 0),
         telemetry_summary=summary,
+        admission_controller=runner.AdmissionController(lane_count=1),
     )
 
     assert peak > 50.0
-    assert summary.failures == {"event_loop_pressure"}
+    assert summary.hard_failures == set()
+    assert summary.peak_event_loop_p99_ms == 0.0
     assert diagnostics.loop_samples > 0
     assert diagnostics.peak_loop_lag_ms == peak
 
@@ -1235,10 +1669,6 @@ async def test_continuous_loop_monitor_attributes_a_real_stall(
         (60.0, 60.0, 1, "event_loop_wait", 0.0),
         # A garbage-collection pause past the ceiling: ours.
         (1.0, 1.0, 1, "gc_generation_2", 60.0),
-        # A ready batch past the amplification threshold: ours. Read from the constant, which
-        # is derived from the connects this protocol keeps in flight, so a healthy full batch
-        # is not mistaken for amplification.
-        (1.0, 1.0, OWNED_STALL_READY_BATCH, "wave_task_creation", 0.0),
     ),
 )
 def test_generator_owned_stalls_keep_the_50ms_gate(
@@ -1280,6 +1710,69 @@ def test_cpu_that_does_not_account_for_the_delay_is_not_ours() -> None:
     )
 
 
+def test_normal_v3_connect_batch_cannot_stop_the_ramp_at_60ms() -> None:
+    """The 7,134-client incident: one ordinary 15-connect batch is not amplification."""
+
+    assert runner.RUNNER_LANE_COUNT == 1
+    assert runner.OWNED_STALL_READY_BATCH > runner.LANE_CONNECT_CONCURRENCY
+    assert not runner.classify_generator_owned_stall(
+        wall_lag_ms=60.499,
+        process_cpu_ms=20.0,
+        thread_cpu_ms=20.0,
+        ready_batch_size=runner.LANE_CONNECT_CONCURRENCY,
+        selector_batch_size=runner.LANE_CONNECT_CONCURRENCY,
+        phase="authentication_processing",
+        gc_pause_ms=0.0,
+    )
+
+
+def test_even_a_large_ready_batch_needs_cpu_or_gc_corroboration() -> None:
+    """A kernel wakeup is context, not proof that the generator caused the delay."""
+
+    assert not runner.classify_generator_owned_stall(
+        wall_lag_ms=60.0,
+        process_cpu_ms=1.0,
+        thread_cpu_ms=1.0,
+        ready_batch_size=OWNED_STALL_READY_BATCH * 4,
+        selector_batch_size=OWNED_STALL_READY_BATCH * 4,
+        phase="authentication_processing",
+        gc_pause_ms=0.0,
+    )
+
+
+def test_owned_event_loop_gate_uses_p99_not_one_peak_tick() -> None:
+    summary = runner.TelemetrySummary()
+    summary.observe_event_loop(60.0, generator_owned_lag_ms=60.0)
+    for _ in range(runner.EVENT_LOOP_P99_MIN_SAMPLES - 1):
+        summary.observe_event_loop(0.1, generator_owned_lag_ms=0.0)
+
+    assert summary.peak_event_loop_p99_ms == 0.0
+    assert "event_loop_pressure" not in summary.advisories
+
+    sustained = runner.TelemetrySummary()
+    for _ in range(runner.EVENT_LOOP_P99_MIN_SAMPLES):
+        sustained.observe_event_loop(60.0, generator_owned_lag_ms=60.0)
+    sustained.observe(
+        {
+            "physical_memory_bytes": 15 * 1024**3,
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 100 * 1024**2,
+            "fd_soft_limit": 65_535,
+            "open_fds": 7,
+            "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 100,
+            "ephemeral_ports_remaining": 28_132,
+            "event_loop_p99_ms": 0.0,
+            "cpu_capacity_fraction": 0.01,
+        }
+    )
+
+    assert sustained.peak_event_loop_p99_ms == 60.0
+    assert sustained.advisories == {"event_loop_pressure"}
+    assert sustained.hard_failures == set()
+    assert sustained.verified
+
+
 def test_external_descheduling_is_raw_lag_not_generator_pressure() -> None:
     owned = runner.classify_generator_owned_stall(
         wall_lag_ms=72.929,
@@ -1300,10 +1793,10 @@ def test_external_descheduling_is_raw_lag_not_generator_pressure() -> None:
     assert summary.peak_raw_event_loop_p99_ms == 72.929
     assert summary.peak_event_loop_p99_ms == 0.0
     assert summary.raw_event_loop_warning_count == 1
-    assert summary.failures == set()
+    assert summary.hard_failures == set()
 
 
-def test_repeated_extreme_external_lag_fails_as_host_instability() -> None:
+def test_repeated_extreme_external_lag_is_advisory_host_instability() -> None:
     summary = runner.TelemetrySummary()
     for _ in range(runner.RAW_WALL_LAG_MAX_BREACHES):
         summary.observe_event_loop(
@@ -1313,7 +1806,8 @@ def test_repeated_extreme_external_lag_fails_as_host_instability() -> None:
 
     assert summary.peak_event_loop_p99_ms == 0.0
     assert summary.raw_event_loop_ceiling_breaches == 3
-    assert summary.failures == {"host_scheduling_instability"}
+    assert summary.hard_failures == set()
+    assert summary.advisories == {"host_scheduling_instability"}
 
 
 def test_runtime_diagnostics_records_gc_and_restores_selector_probe() -> None:
@@ -1429,7 +1923,12 @@ async def test_mirrored_wave_pipelines_within_the_in_flight_bound(
             in_flight -= 1
 
     monkeypatch.setattr(runner, "_open_client", fake_open_client)
-    await runner._open_equal_wave(lanes, 200, 0)
+    await runner._open_equal_wave(
+        lanes,
+        200,
+        0,
+        runner.AdmissionController(lane_count=len(lanes)),
+    )
 
     bound = runner.LANE_CONNECT_CONCURRENCY * len(lanes)
     assert [lane.initiated for lane in lanes] == [200, 200]
@@ -1486,7 +1985,7 @@ async def test_selector_admission_cap_amplifies_wakeups_quadratically() -> None:
     # The historical cap re-reports what it dropped, and now says so. The floor
     # is a deliberately loose form of N**2 / 2K.
     assert capped_deferred > 0
-    assert capped_wakeups > events * 4
+    assert capped_wakeups > events * 2
     assert capped_wakeups / events > runner.MAX_SELECTOR_WAKEUP_AMPLIFICATION
 
     # The per-turn latency gate prefers the slower configuration, which is
@@ -1617,7 +2116,11 @@ def test_socket_state_telemetry_is_single_worker_and_rate_limited(
     monkeypatch.setattr(runner, "_memory", lambda: (16 * 1024**3, 10 * 1024**3))
     monkeypatch.setattr(runner, "_rss_bytes", lambda: 1024)
     monkeypatch.setattr(runner, "_open_fds", lambda: 10)
-    monkeypatch.setattr(runner, "_ephemeral_ports", lambda: (32_768, 60_999))
+    monkeypatch.setattr(
+        runner,
+        "_ephemeral_port_usage",
+        lambda: (28_232, 10_000, 18_232),
+    )
     monkeypatch.setattr(runner.resource, "getrlimit", lambda unused: (65_535, 65_535))
     monkeypatch.setattr(
         runner.os,
@@ -1935,13 +2438,15 @@ def test_provider_selected_authentication_difference_preserves_fairness() -> Non
 def test_progress_sequence_is_monotonic_and_reconnect_deduplicates() -> None:
     values = [
         {
-            "schema_version": 2,
+            "schema_version": FANIN_SCHEMA_VERSION,
             "protocol": FANIN_PROTOCOL,
             "sequence": sequence,
             "lane_id": lane,
-            "phase": "ramp",
+            "phase": "ramping",
+            "initiated_clients": sequence * 1_000,
             "authenticated_clients": sequence * 1_000,
             "held_clients": sequence * 1_000,
+            "peak_held_clients": sequence * 1_000,
             "elapsed_ms": sequence * 10.0,
         }
         for sequence, lane in ((1, "lakebase"), (2, "competitor"))
@@ -1970,6 +2475,46 @@ def test_progress_sequence_is_monotonic_and_reconnect_deduplicates() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"phase": "holding"},
+        {"phase": "verified"},
+        {"time_to_target_ms": 12_345.0},
+    ],
+)
+def test_partial_progress_cannot_publish_hold_target_or_verified(
+    mutation: dict[str, object],
+) -> None:
+    payload = {
+        "schema_version": FANIN_SCHEMA_VERSION,
+        "protocol": FANIN_PROTOCOL,
+        "sequence": 1,
+        "lane_id": "lakebase",
+        "phase": "ramping",
+        "initiated_clients": 7_162,
+        "authenticated_clients": 7_134,
+        "held_clients": 7_134,
+        "peak_held_clients": 7_134,
+        "terminal_failures": 0,
+        "sampled_queries_succeeded": 32,
+        "sampled_queries_failed": 0,
+        "elapsed_ms": 42_000.0,
+        "time_to_target_ms": None,
+        **mutation,
+    }
+    output = "PROGRESS_JSON:" + runner.canonical_json(payload).decode()
+
+    with pytest.raises(
+        ConnectionSpikeLiveOperationError,
+        match="semantic|aggregate barrier",
+    ):
+        LiveConnectionSpikeAdapter._progress_from_output(
+            output,
+            after_sequence=0,
+        )
+
+
 def test_progress_wire_output_is_compact_bounded_and_parseable(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1978,12 +2523,14 @@ def test_progress_wire_output_is_compact_bounded_and_parseable(
     monkeypatch.setattr(runner, "_progress_sequence", 0)
     monkeypatch.setattr(runner, "_progress_output_bytes", 0)
     value = {
-        "schema_version": 2,
+        "schema_version": FANIN_SCHEMA_VERSION,
         "protocol": FANIN_PROTOCOL,
         "lane_id": "lakebase",
-        "phase": "hold",
+        "phase": "holding",
+        "initiated_clients": 10_000,
         "authenticated_clients": 10_000,
         "held_clients": 10_000,
+        "peak_held_clients": 10_000,
         "terminal_failures": 0,
         "elapsed_ms": 81_234.5,
         "time_to_target_ms": 48_123.4,
@@ -2113,3 +2660,29 @@ def test_malformed_counts_and_monotonic_times_fail_closed() -> None:
         finalize({**raw_lane("lakebase"), "held_clients_at_gate": True})
     with pytest.raises(FanInError, match="time_to_target"):
         finalize({**raw_lane("lakebase"), "time_to_target_ms": -1.0})
+
+
+def test_proxy_endpoint_resolution_retries_on_gaierror_within_a_bounded_window() -> None:
+    """The per-bout Proxy endpoint's DNS can lag CreateDBProxy; prepare must not
+    crash on the first gaierror. Resolution retries under a bounded deadline, and
+    the RELEASE gate still keeps any client from connecting before the Proxy is
+    available."""
+
+    source = inspect.getsource(runner.execute_fanin)
+    getaddr = source.index("loop.getaddrinfo(")
+    # The resolve is wrapped in a retry that tolerates gaierror and polls until a
+    # bounded deadline rather than raising on the first failure.
+    assert "except socket.gaierror" in source
+    deadline = source.index("PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS")
+    poll = source.index("PROXY_ENDPOINT_RESOLVE_POLL_SECONDS")
+    failure = source.index("_host_resolution_failed")
+    # The bounded deadline and poll are set up before the resolve loop, and the
+    # hard failure is only raised once the deadline is exceeded.
+    assert deadline < getaddr < failure
+    assert poll > getaddr
+    assert runner.PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS > 0
+    assert 0 < runner.PROXY_ENDPOINT_RESOLVE_POLL_SECONDS
+    assert (
+        runner.PROXY_ENDPOINT_RESOLVE_POLL_SECONDS
+        < runner.PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS
+    )

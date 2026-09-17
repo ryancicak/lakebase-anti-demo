@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { KeyboardEvent } from 'react'
+import type { KeyboardEvent, ReactNode } from 'react'
 import { api, ApiError, subscribeToSession } from './api/client'
 import type {
   AllBoutStatus,
@@ -16,7 +16,6 @@ import type {
   LaneSnapshot,
   PersonaId,
   RoundId,
-  RunEvent,
 } from './api/types'
 import {
   playConfirm,
@@ -56,6 +55,7 @@ import {
   buildRingsideCue,
   classifyOutcome,
   priorityKeyFor,
+  type ClassifiedSessionOutcome,
   type FormalWinner,
 } from './ringside-cues'
 import { compactDuration, preciseDuration } from './time'
@@ -65,7 +65,6 @@ export type { ScorecardEntry } from './scorecard-storage'
 import {
   ROUND_FOUR_LEGEND,
   acceptsReconciledSession,
-  applyRunEventSnapshot,
   canStartRoundFourRedo,
   isRoundFour,
   metricDisplay,
@@ -73,22 +72,32 @@ import {
   modelScoreEvidence,
   roundFourPresentation,
   roundFourUnsupportedReason,
+  reconcileRunEventSession,
   selectRound4Session,
 } from './round4'
 import {
+  ROUND_FIVE_BELL_PROTOCOL,
   ROUND_FIVE_DISPLAY_TITLE,
+  ROUND_FIVE_FANIN_PROTOCOL,
   ROUND_FIVE_ID,
   ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS,
   ROUND_FIVE_SAMPLED_QUERIES,
   isRoundFiveFanInEvidence,
   isRoundFiveSetupEvidence,
   isRoundFive,
+  roundFiveIsExplicitLegacy,
   roundFiveCountDisplay,
   roundFiveFightCardOpening,
+  roundFiveBellRuntime,
+  roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFiveLaneVerification,
   roundFiveSetupElapsedDisplay,
   roundFiveSetupLaneResult,
   roundFiveFanInMarginDisplay,
+  roundFiveUsesFanIn,
+  type RoundFiveLanePresentation,
+  type RoundFiveLaneVerification,
 } from './round5'
 import { RoundSixProof } from './round6'
 import {
@@ -1198,11 +1207,17 @@ function cleanupAllowsTerminalActions(session: DemoSession): boolean {
 }
 
 function proofNavigationAllowsExit(session: DemoSession): boolean {
-  // `towelled` is the terminal stopped-short result for every round. Leaving
-  // that posted result only drops this browser's view; it neither cancels the
-  // cleanup task, releases its per-round lease, nor marks cleanup complete.
-  // Declared and failed results retain their existing cleanup requirements.
-  return session.state === 'towelled' || cleanupAllowsTerminalActions(session)
+  // `towelled` is the terminal stopped-short result for every round, Round 5
+  // included. The moment the result is posted the operator can leave it:
+  // dropping this browser's view neither cancels the backstage cleanup task,
+  // releases its per-round lease, nor marks cleanup complete. Round 5's built-in
+  // pooled path plus the selected AWS proxy teardown keep settling backstage
+  // regardless, so there is no reason to trap the operator on the posted towel.
+  if (session.state === 'towelled') return true
+  // Declared and failed results retain their existing cleanup requirements: a
+  // verified or failed Round 5 that has not confirmed teardown may still own a
+  // run-created proxy, so those exits stay gated on cleanup settling.
+  return cleanupAllowsTerminalActions(session)
 }
 
 function competitorReceiptValue(session: DemoSession): string {
@@ -1315,8 +1330,17 @@ function roundFiveSetupSeconds(session: DemoSession, laneId: LaneId): string {
   return laneReceiptTime(roundFiveSetupMilliseconds(session, laneId))
 }
 
-function roundFiveUsesFanIn(session: DemoSession): boolean {
-  return session.round5_setup?.protocol !== 'connection-spike-v1'
+/**
+ * The winner-chip word under a Round 5 receipt lane. Under the fan-in protocol
+ * the win is reaching exactly 10,000 held clients first (or together), never a
+ * setup-clock comparison -- so it must not read "Earlier pooled path" / "Same
+ * setup time". The legacy scorecard keeps the older setup wording.
+ */
+function roundFiveWinnerChip(session: DemoSession, winner: ReceiptWinner): string {
+  if (roundFiveUsesFanIn(session)) {
+    return winner === 'tie' ? 'Reached 10,000 clients together' : 'Reached 10,000 clients first'
+  }
+  return winner === 'tie' ? 'Same setup time' : 'Earlier pooled path'
 }
 
 function roundFiveVerifiedVerdict(session: DemoSession): string {
@@ -1324,7 +1348,9 @@ function roundFiveVerifiedVerdict(session: DemoSession): string {
   if (!classified.contractComplete) return classified.headline
   const recurringFanIn = roundFiveUsesFanIn(session)
   if (!recurringFanIn) {
-    return 'Legacy Round 5 scorecard decoded · current 10,000-client fan-in result not recorded'
+    return roundFiveIsExplicitLegacy(session)
+      ? 'Legacy Round 5 scorecard decoded · current 10,000-client fan-in result not recorded'
+      : 'Round 5 protocol evidence unavailable · no result inferred'
   }
   if (classified.formalWinner === 'tie') {
     return 'Both lanes reached exactly 10,000 held clients together'
@@ -1385,8 +1411,14 @@ function linkedInHook(session: DemoSession): string {
     return `I threw in the towel at ${laneReceiptTime(towelCutoffMs(session))} — ${result}; ${session.lanes.lakebase.name} · ${towelLaneValue(session, 'lakebase')}; ${session.lanes.competitor.name} · ${towelLaneValue(session, 'competitor')}. 🥊`
   }
   if (isRoundFive(session)) {
+    const runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+      ? session.round5_runtime
+      : null
+    if (runtime) {
+      return `One accepted bell: Lakebase ${laneReceiptTime(runtime.lanes.lakebase.bell_to_10000_observed_ms)}; selected AWS path ${laneReceiptTime(runtime.lanes.competitor.bell_to_10000_observed_ms)} to the observed exact 10,000-client held gate. ${roundFiveVerifiedVerdict(session)}. Both held for 30 seconds, passed 64 held-connection checks, and proved backend multiplexing. Direct AWS connections, an existing Proxy, and transaction throughput were not tested. 🥊`
+    }
     if (roundFiveUsesFanIn(session)) {
-      return `Supporting pooled-path setup: Lakebase included pool ${roundFiveSetupSeconds(session, 'lakebase')}; selected ${session.competitor.short_name} + RDS Proxy reference path ${roundFiveSetupSeconds(session, 'competitor')}. Primary shared-T0 fan-in: Lakebase ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}; selected AWS path ${laneReceiptTime(session.lanes.competitor.elapsed_ms)}. ${roundFiveVerifiedVerdict(session)}. Both reached exactly 10,000 authenticated held clients, held for 30 seconds, passed 64 sparse checks, and proved backend multiplexing. Direct AWS connections, an existing Proxy, and transaction throughput were not tested. 🥊`
+      return `One accepted bell: Lakebase ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}; selected AWS path ${laneReceiptTime(session.lanes.competitor.elapsed_ms)} to the observed exact 10,000-client held gate. ${roundFiveVerifiedVerdict(session)}. Both held for 30 seconds, passed 64 held-connection checks, and proved backend multiplexing. Direct AWS connections, an existing Proxy, and transaction throughput were not tested. 🥊`
     }
     return 'Legacy Round 5 scorecard decoded. The current 10,000-client fan-in result was not recorded, so no fan-in claim is shown. 🥊'
   }
@@ -1439,7 +1471,7 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       ? 'The 10,000-client fan-in never started'
       : 'The current 10,000-client fan-in was not recorded by this legacy scorecard'
     const receiptBoundary = fanIn
-      ? 'Setup evidence only; the shared-T0 10,000-client fan-in never started'
+      ? 'Setup evidence only; the one-bell 10,000-client fan-in never started'
       : 'Legacy setup evidence only; current 10,000-client fan-in evidence was not recorded'
     const lines = [
       `${exactName} reached verified pooled-path setup in ${laneReceiptTime(exact)}. ${unfinishedName} was still unverified ${lowerBound === null ? 'without an exact lower bound' : `beyond ${laneReceiptTime(lowerBound)}`}. ${downstream}, so Round 5 declared no winner or margin. 🥊`,
@@ -1450,6 +1482,30 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       `ROUND ${roundNumber} · ${ROUND_FIVE_DISPLAY_TITLE}`,
       classified.headline,
       `Receipt ${receiptId(session)} · ${receiptBoundary} · One live run, not a benchmark.`,
+    ]
+    if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
+    lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+    return lines.join('\n')
+  }
+  // A V4 bell towel is shared from the same enabled Share control the arena
+  // offers, so its caption must be a real receipt that agrees with the poster --
+  // the canonical runtime lane values and the honest no-winner verdict -- rather
+  // than the generic "not shareable" fallback below.
+  if (isRoundFive(session) && roundFiveBellRuntime(session) && session.towel) {
+    const lakebase = roundFiveLanePresentationOrThrow(session, 'lakebase')
+    const competitor = roundFiveLanePresentationOrThrow(session, 'competitor')
+    const lakebaseName = session.round5_setup?.lanes?.lakebase?.name ?? 'Lakebase'
+    const competitorName = session.round5_setup?.lanes?.competitor?.name
+      ?? session.lanes.competitor.name
+    const lines = [
+      `${classified.headline} 🥊`,
+      '',
+      `🔴 ${lakebaseName} · ${lakebase.value} · ${lakebase.status}`,
+      `🔵 ${competitorName} · ${competitor.value} · ${competitor.status}`,
+      '',
+      `ROUND ${roundNumber} · ${ROUND_FIVE_DISPLAY_TITLE}`,
+      roundFiveFairness(session),
+      `Receipt ${receiptId(session)} · Towel thrown mid-bout · The 30-second hold and 64 held-connection checks did not complete · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
     lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
@@ -1478,7 +1534,7 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       roundFiveIntegrityDetail(session),
       'Database-only declared start · Lakebase included pooling · selected AWS reference path provisioned a new RDS Proxy and dependencies.',
       fanIn
-        ? `Receipt ${receiptId(session)} · exact 10,000 authenticated held clients per lane; 30-second hold, 64 sparse samples, direct-observer multiplexing, fairness, contracts, and cleanup are exact gates · Direct AWS connections, an existing Proxy, and transaction throughput were not tested · One live run, not a benchmark.`
+    ? `Receipt ${receiptId(session)} · exact 10,000 authenticated held clients per lane; 30-second hold, 64 held-connection checks, direct-observer multiplexing, fairness, contracts, and cleanup are exact gates · Direct AWS connections, an existing Proxy, and transaction throughput were not tested · One live run, not a benchmark.`
         : `Receipt ${receiptId(session)} · legacy scorecard decoded; current 10,000-client fan-in evidence was not recorded · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
@@ -1634,6 +1690,65 @@ function linkedInIdleReceipt(session: DemoSession): string {
   return lines.join('\n')
 }
 
+function roundFiveLanePresentationOrThrow(
+  session: DemoSession,
+  laneId: LaneId,
+): RoundFiveLanePresentation {
+  const presentation = roundFiveLanePresentation(session, laneId)
+  if (!presentation) {
+    throw new Error('Round 5 V4 lane presentation requires the bell runtime.')
+  }
+  return presentation
+}
+
+/**
+ * The receipt for a V4 bell Round 5 bout, built from the canonical runtime lane
+ * presentation rather than the legacy `lanes.*.elapsed_ms` / setup stop. This is
+ * what keeps the shared receipt (poster + PNG) and its caption in lockstep with
+ * the arena: a lane that reached 10,000 clients but was towelled mid-hold shows
+ * its exact `bell_to_10000_observed_ms` labelled "10,000 clients reached · hold
+ * interrupted", never a 0.01s setup clock and never "EXACT VERIFIED".
+ */
+function roundFiveBellReceiptPresentation(
+  session: DemoSession,
+  kind: ReceiptKind,
+  classified: ClassifiedSessionOutcome,
+): ReceiptPresentation {
+  const lakebase = roundFiveLanePresentationOrThrow(session, 'lakebase')
+  const competitor = roundFiveLanePresentationOrThrow(session, 'competitor')
+  const contractComplete = classified.contractComplete
+  const towelled = Boolean(session.towel)
+  return {
+    kind,
+    title: ROUND_FIVE_DISPLAY_TITLE,
+    focus: 'EXACT 10,000-CLIENT FAN-IN · 30S HOLD',
+    winner: classified.formalWinner,
+    lakebaseLabel: session.round5_setup?.lanes?.lakebase?.name ?? 'Lakebase',
+    competitorLabel: session.round5_setup?.lanes?.competitor?.name
+      ?? session.lanes.competitor.name,
+    lakebaseValue: lakebase.value,
+    competitorValue: competitor.value,
+    lakebaseStatus: lakebase.status,
+    competitorStatus: competitor.status,
+    competitorCapabilityGap: false,
+    verdictLabel: contractComplete
+      ? 'BOTH PATHS CONNECTED AND HELD 10,000 CLIENTS FROM THE SAME START · ALL GATES PASSED'
+      : towelled
+        ? 'TOWEL RESULT · THIS ROUND'
+        : 'EXACT FAN-IN COMPARISON INCOMPLETE',
+    verdict: classified.headline,
+    fairness: roundFiveFairness(session),
+    measuredAt: towelled ? session.towel!.requested_at : measuredAt(session),
+    verifiedStamp: contractComplete
+      ? 'FAN-IN VERIFIED'
+      : towelled
+        ? 'TOWELED LIVE'
+        : 'NOT DECLARED',
+    receiptLabel: towelled ? 'BOUT RECEIPT' : '10K FAN-IN RECEIPT',
+    integrityDetail: contractComplete ? roundFiveIntegrityDetail(session) : undefined,
+  }
+}
+
 // Exported for the all-surface contract matrix; it remains a pure renderer.
 // eslint-disable-next-line react-refresh/only-export-components
 export function receiptPresentation(
@@ -1669,6 +1784,14 @@ export function receiptPresentation(
     }
   }
   const classified = classifyOutcome(session)
+  // Round 5 on the V4 bell runtime is the one protocol where a towel can promote
+  // a ~0.01s pooled-path *setup* stop into `lanes.lakebase` as VERIFIED. Route
+  // every V4 receipt (verified / towelled / failed) through the canonical
+  // runtime view-model so the poster, PNG and caption read the same
+  // bell_to_10000 truth the arena shows, and never the setup clock.
+  if (isRoundFive(session) && roundFiveBellRuntime(session)) {
+    return roundFiveBellReceiptPresentation(session, kind, classified)
+  }
   if (session.towel) {
     return {
       kind,
@@ -2193,10 +2316,10 @@ function finaleCaption(session: DemoSession): string {
     '02 · Branch safely → isolated schema change, source untouched',
     '03 · Recover exactly → deleted row restored, source deletion preserved',
     '04 · Analytics Delta → verified live application row',
-    '05 · Both pooled paths → exactly 10,000 held clients per lane, 30s hold, sparse samples, multiplexing',
+    '05 · Both pooled paths → exactly 10,000 held clients per lane, 30s hold, held-connection checks, multiplexing',
     `06 · Live checkout → exact Delta answer in ${finaleElapsed(session)}`,
     '',
-    'Rounds 4 and 6 are capability proofs; the added AWS data-movement stacks were not built or timed. Round 5 scores shared-T0 time to exactly 10,000 held clients per lane; pooled-path setup is supporting evidence. Direct AWS connections, existing pools, transaction throughput, and storm resilience were not tested.',
+    'Rounds 4 and 6 are capability proofs; the added AWS data-movement stacks were not built or timed. Round 5 scores one server bell to exactly 10,000 held clients per lane. Direct AWS connections, existing pools, transaction throughput, and storm resilience were not tested.',
     '',
     `Latest live proof: Round 6 produced the exact Delta answer in ${finaleElapsed(session)} while a separate checkout committed.`,
     'Each result is one observed run, not a benchmark. Ring the bell yourself. 🥊',
@@ -2858,6 +2981,18 @@ function App() {
       sessionId,
       (event) => {
         if (event.sequence <= lastSequence) return
+        const current = sessionRef.current
+        const reconciliationResult = reconcileRunEventSession(current, event)
+        const selected = reconciliationResult.session
+        lastSequence = event.sequence
+        if (!reconciliationResult.accepted) {
+          reconcile()
+          return
+        }
+        if (selected) {
+          sessionRef.current = selected
+          setSession(selected)
+        }
         // Counted before the dedup would hide it and before anything else runs:
         // this arrives on the first event of a resume the server had to serve
         // past its retention floor, and it is the only notice there will be.
@@ -2872,7 +3007,6 @@ function App() {
           // though the replacement SSE connection itself is healthy.
           reconcile()
         }
-        lastSequence = event.sequence
         streamInterrupted = false
         setLiveEvidenceConnected(true)
         if (reconciliationTimer !== undefined) {
@@ -2924,7 +3058,6 @@ function App() {
             entry.session_id === sessionId ? withCooldown(entry, event.payload.cooldown) : entry
           )))
         }
-        applyServerEvent(event, setSession)
         if (event.event === 'armed' && stageRef.current === 'matchup') {
           navigate('ready', 'card', 'replace')
         }
@@ -3255,6 +3388,10 @@ function App() {
       sessionRef.current = latest
       setSession((current) => selectRound4Session(current, latest))
       if (latest.state === 'running' || latest.run_started_at) {
+        // The bell is now confirmed to have landed, so this is the authoritative
+        // point to sound the cue -- the aborted press produced none.
+        if (sound) playOriginalBell()
+        startOriginalRoundTheme(latest.round.id)
         setError(null)
         navigate('proof', 'card', 'replace')
         releaseRing()
@@ -3285,17 +3422,24 @@ function App() {
     let reconciling = false
     try {
       setError(null)
-      // The bell is a one-shot and stays gated; the cue is not, because a
-      // presenter who unmutes mid-bout should hear the round they are in
-      // rather than nothing until the next bell.
-      if (sound) playOriginalBell()
-      startOriginalRoundTheme(session.round.id)
+      // The audible bell cue and the round theme play only on an accepted,
+      // authoritative server bell -- the moment `/run` is confirmed and a real
+      // server T0 exists. A rejected or never-landed `/run` must produce no bell
+      // cue, so nothing sounds on the press itself. The theme is idempotent and
+      // still resumes for a presenter who unmutes mid-bout; it just starts from a
+      // confirmed run rather than from the tap.
+      const playAcceptedBellCue = () => {
+        if (sound) playOriginalBell()
+        startOriginalRoundTheme(session.round.id)
+      }
       if (uiReview) {
+        playAcceptedBellCue()
         navigate('proof', 'card')
         return
       }
       try {
         const running = await api.runSession(session.id)
+        playAcceptedBellCue()
         setSession((current) => selectRound4Session(current, running))
         navigate('proof', 'card')
       } catch (cause) {
@@ -3306,6 +3450,9 @@ function App() {
           sessionRef.current = recovered
           setSession((current) => selectRound4Session(current, recovered))
           if (recovered.state === 'running' || recovered.run_started_at) {
+            // The bell landed despite the client-side abort: the run is real, so
+            // the cue is honest here.
+            playAcceptedBellCue()
             navigate('proof', 'card', 'replace')
             return
           }
@@ -3318,7 +3465,8 @@ function App() {
         } catch {
           // Preserve the original mutation error if the read-back is also unavailable.
         }
-        stopOriginalRoundTheme()
+        // No cue was started on this rejected/failed path, so there is nothing to
+        // stop; report the failure only.
         setError(cause instanceof Error ? cause.message : 'The run did not start. No result was recorded.')
       }
     } finally {
@@ -3450,10 +3598,10 @@ function App() {
         const latest = await api.getSession(sessionId)
         setSession((current) => selectRound4Session(current, latest))
         if (latest.round5_setup?.cleanup_retryable === true) {
-          setError('The fallback retry was not confirmed. Automatic cleanup remains active.')
+          setError('Cleanup retry was not confirmed. Use Retry Cleanup to try again.')
         }
       } catch {
-        setError('Cleanup status could not be refreshed. Automatic cleanup remains active; live updates will reconnect.')
+        setError('Cleanup status could not be refreshed. Use Retry Cleanup after live updates reconnect.')
       }
     } finally {
       setRoundFiveCleanupPending(false)
@@ -3462,8 +3610,12 @@ function App() {
 
   async function throwInTowel() {
     if (!session) return
-    const retryingCleanup = session.towel?.state === 'failed'
-    if (!retryingCleanup && (session.state !== 'running' || session.towel)) return
+    const retryingNonRoundFiveCleanup = session.towel?.state === 'failed'
+      && !isRoundFive(session)
+    if (
+      !retryingNonRoundFiveCleanup
+      && (session.state !== 'running' || session.towel)
+    ) return
     setError(null)
     try {
       const latest = await api.throwTowel(session.id)
@@ -4464,7 +4616,7 @@ function RoundFiveBurstCard({
         <div><dt>Initiated</dt><dd>{roundFiveCountDisplay(result.initiated)} / {target}</dd></div>
         <div><dt>Authenticated + held</dt><dd>{roundFiveCountDisplay(result.held)} / {target}</dd></div>
         <div><dt>30-second hold</dt><dd>{result.holdElapsedMs === null ? 'N/A' : `${(result.holdElapsedMs / 1000).toFixed(2)}s`}</dd></div>
-        <div><dt>Sparse SELECT 1</dt><dd>{roundFiveCountDisplay(result.sampledQueriesSucceeded)} / {ROUND_FIVE_SAMPLED_QUERIES}</dd></div>
+        <div><dt>Held-connection checks</dt><dd>{roundFiveCountDisplay(result.sampledQueriesSucceeded)} / {ROUND_FIVE_SAMPLED_QUERIES}</dd></div>
         <div><dt>Failures / retries</dt><dd>{roundFiveCountDisplay(result.terminalFailures)} / {roundFiveCountDisplay(result.retries)}</dd></div>
         <div className="round5-p99"><dt>Connect p50 / p95 / p99</dt><dd>{[result.connectP50Ms, result.connectP95Ms, result.connectP99Ms].map((value) => value === null ? 'N/A' : `${value.toFixed(2)} ms`).join(' / ')}</dd><small>TLS + provider-selected native-password exchange; not transaction throughput</small></div>
         <div><dt>Password exchange</dt><dd>{result.authMethod === 'scram-sha-256' ? 'Challenge-response' : result.authMethod === 'tls-cleartext-password' ? 'TLS-protected password' : 'N/A'}</dd><small>Selected by the provider; included in connection timing</small></div>
@@ -4473,6 +4625,35 @@ function RoundFiveBurstCard({
         <div><dt>Peak backend sessions</dt><dd>{roundFiveCountDisplay(result.peakBackendSessions)}</dd><small>Direct observer; fewer than clients proves multiplexing</small></div>
       </dl>
       {lane.error && <p role="alert">Exact fan-in evidence did not validate.</p>}
+    </section>
+  )
+}
+
+function RoundFiveRuntimeBurstCard({
+  session,
+  laneId,
+  corner,
+}: {
+  session: DemoSession
+  laneId: LaneId
+  corner: 'red' | 'blue'
+}) {
+  const runtime = session.round5_runtime
+  if (!runtime || runtime.protocol !== ROUND_FIVE_BELL_PROTOCOL) return null
+  const lane = runtime.lanes[laneId]
+  const name = session.round5_setup?.lanes?.[laneId]?.name
+    ?? session.lanes[laneId].name
+  return (
+    <section className="round5-lane" data-corner={corner} aria-label={`${name} V4 runtime evidence`}>
+      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : lane.phase.toUpperCase()}</span></header>
+      <dl>
+        <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString()} / 10,000 clients</dd></div>
+        <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString()} / 10,000 clients</dd></div>
+        <div><dt>Currently held</dt><dd>{lane.held_clients.toLocaleString()} / 10,000 clients</dd></div>
+        <div><dt>Peak held</dt><dd>{(lane.peak_held_clients ?? lane.held_clients).toLocaleString()} / 10,000 clients</dd></div>
+        <div><dt>Held-connection checks</dt><dd>{lane.sampled_queries_succeeded} / {ROUND_FIVE_SAMPLED_QUERIES}</dd></div>
+        <div><dt>Bell to exact 10K</dt><dd>{lane.bell_to_10000_observed_ms == null ? 'N/A' : preciseDuration(lane.bell_to_10000_observed_ms)}</dd></div>
+      </dl>
     </section>
   )
 }
@@ -4489,36 +4670,56 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
   const awsEngineName = session.competitor.short_name
   const complete = classifyOutcome(session).contractComplete
   const telemetry = roundFiveLaneResult(session.lanes.lakebase)
-  const legacy = !roundFiveUsesFanIn(session)
+  const fanIn = roundFiveUsesFanIn(session)
+  const legacy = roundFiveIsExplicitLegacy(session)
+  const protocolUnavailable = !fanIn && !legacy
+  const v4 = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
   return (
     <section className="round5-explain-proof" aria-label="Round 5 detailed proof">
       <header>
         <span>{complete ? 'Full verified proof' : 'Recorded proof status'}</span>
-        <strong>{legacy ? 'Legacy scorecard decoded · current 10,000-client fan-in evidence not recorded' : '10,000-client fan-in is scored · pooled-path setup is supporting'}</strong>
+        <strong>{legacy
+          ? 'Legacy scorecard decoded · current 10,000-client fan-in evidence not recorded'
+          : protocolUnavailable
+            ? 'Protocol evidence unavailable · no result inferred'
+          : v4
+            ? 'One server bell to observed exact 10,000 held is scored'
+            : '10,000-client fan-in is scored · pooled-path setup is supporting'}</strong>
       </header>
       <section className="round5-explain-phase" aria-label="Pooled-path setup evidence">
-        <h3>Phase 1 · Pooled-path setup time (supporting) · workflow launch skew {typeof setupSkew === 'number' ? `${setupSkew.toFixed(3)} ms` : 'N/A'}</h3>
+        <h3>{v4 ? 'Bell pipeline readiness (supporting)' : 'Phase 1 · Pooled-path setup time (supporting)'} · workflow launch skew {typeof setupSkew === 'number' ? `${setupSkew.toFixed(3)} ms` : 'N/A'}</h3>
         <div className="round5-explain-grid">
           <RoundFiveSetupCard session={session} laneId="lakebase" corner="red" />
           <RoundFiveSetupCard session={session} laneId="competitor" corner="blue" />
         </div>
       </section>
-      <section className="round5-explain-phase" aria-label={legacy ? 'legacy Round 5 evidence' : '10,000-client fan-in evidence'}>
-        <h3>{legacy ? 'Phase 2 · current 10,000-client fan-in evidence not recorded' : `Phase 2 · exactly 10,000 authenticated held clients / lane (scored) · 30s hold · ${ROUND_FIVE_SAMPLED_QUERIES} sparse samples`} · launch skew {typeof burstSkew === 'number' ? `${burstSkew.toFixed(3)} ms` : 'N/A'}</h3>
+      <section className="round5-explain-phase" aria-label={legacy ? 'legacy Round 5 evidence' : protocolUnavailable ? 'unavailable Round 5 protocol evidence' : '10,000-client fan-in evidence'}>
+        <h3>{legacy
+          ? 'Phase 2 · current 10,000-client fan-in evidence not recorded'
+          : protocolUnavailable
+            ? 'Protocol evidence unavailable · no scored phase inferred'
+            : `${v4 ? 'One bell' : 'Phase 2'} · exactly 10,000 authenticated held clients / lane (scored) · 30s hold · ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks`} · launch skew {typeof burstSkew === 'number' ? `${burstSkew.toFixed(3)} ms` : 'N/A'}</h3>
         <div className="round5-explain-grid">
-          <RoundFiveBurstCard lane={session.lanes.lakebase} corner="red" legacy={legacy} />
-          <RoundFiveBurstCard lane={session.lanes.competitor} corner="blue" legacy={legacy} />
+          {v4
+            ? <>
+              <RoundFiveRuntimeBurstCard session={session} laneId="lakebase" corner="red" />
+              <RoundFiveRuntimeBurstCard session={session} laneId="competitor" corner="blue" />
+            </>
+            : <>
+              <RoundFiveBurstCard lane={session.lanes.lakebase} corner="red" legacy={legacy} />
+              <RoundFiveBurstCard lane={session.lanes.competitor} corner="blue" legacy={legacy} />
+            </>}
         </div>
       </section>
       <div className="round5-fairness" aria-label="Round 5 fair proof contract">
         <strong>PHASE 2 FAIRNESS</strong>
         <span>{legacy ? 'Current 10,000-client target not recorded' : `${session.fairness.target_clients_per_lane?.toLocaleString() ?? 'N/A'} target clients / lane`}</span>
         <span>{legacy ? 'Legacy scorecard decoded' : `${session.fairness.hold_seconds ?? 'N/A'}s common hold · zero retries`}</span>
-        <span>Identical neutral runner · {session.fairness.runner ?? 'N/A'}</span>
+        <span>{v4 ? 'Two isolated physical runners' : 'Identical neutral runner'} · {session.fairness.runner ?? 'N/A'}</span>
         <span>TLS {session.fairness.tls ?? 'N/A'} · timeout {session.fairness.timeout ?? 'N/A'}</span>
       </div>
-      {!legacy && <div className="round5-telemetry" aria-label="Generator telemetry evidence">
-        <strong>GENERATOR TELEMETRY {telemetry.telemetryVerified ? '✓' : 'NOT VERIFIED'}</strong>
+      {!legacy && !v4 && <div className="round5-telemetry" aria-label="Generator telemetry evidence">
+        <strong>GENERATOR TELEMETRY · HARD SAFETY {telemetry.hardSafetyVerified || (telemetry.safetyEvidenceVersion === null && telemetry.telemetryVerified) ? '✓' : 'NOT VERIFIED'}</strong>
         <span>Peak CPU capacity · {telemetry.telemetryPeakCpuCapacityFraction === null ? 'N/A' : `${(telemetry.telemetryPeakCpuCapacityFraction * 100).toFixed(1)}%`}</span>
         <span>Peak RSS · {roundFiveMemoryDisplay(telemetry.telemetryPeakRssBytes)} / {roundFiveMemoryDisplay(telemetry.telemetryPhysicalMemoryBytes)}</span>
         <span>Minimum available memory · {roundFiveMemoryDisplay(telemetry.telemetryMinAvailableMemoryBytes)}</span>
@@ -4527,11 +4728,12 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
         <span>Raw event-loop wall-lag peak · {telemetry.telemetryPeakRawEventLoopP99Ms === null ? 'N/A' : `${telemetry.telemetryPeakRawEventLoopP99Ms.toFixed(2)} ms`}</span>
         <span>External scheduling-lag peak · {telemetry.telemetryPeakExternalEventLoopP99Ms === null ? 'N/A' : `${telemetry.telemetryPeakExternalEventLoopP99Ms.toFixed(2)} ms`}</span>
         <span>Ephemeral-port reserve / lane · {roundFiveCountDisplay(telemetry.telemetryMinEphemeralPortReserve)}</span>
+        <span>Advisory pacing signals · {telemetry.telemetryAdvisories.length ? telemetry.telemetryAdvisories.join(', ') : 'none'}</span>
       </div>}
       <div className="round5-explain-components" aria-label="Managed component disclosure">
         <strong>COMPONENT DISCLOSURE</strong>
         <p>Lakebase · included pooled endpoint · 0 extra per-bout pooling components · 0 per-bout pooling infrastructure changes.</p>
-        <p>{awsEngineName} · selected AWS managed pooling path · this database-only declared-start bout provisioned a new RDS Proxy + 8 supporting changes.</p>
+        <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
         <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
       </div>
     </section>
@@ -4628,10 +4830,52 @@ function roundFiveArenaLane(
   session: DemoSession,
   laneId: LaneId,
 ): DemoSession['lanes'][LaneId] {
+  const runtimeLane = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    ? session.round5_runtime.lanes[laneId]
+    : undefined
+  const fallbackLane = session.lanes[laneId]
+  if (runtimeLane) {
+    const projectedElapsed = (
+      session.round5_clock_projection?.protocol === 'round5-clock-projection-v1'
+      && session.round5_clock_projection.bell_id === session.round5_runtime?.bell_id
+    )
+      ? session.round5_clock_projection.elapsed_ms[laneId]
+      : runtimeLane.elapsed_at_snapshot_ms
+    const terminal = session.round5_runtime?.state !== 'running'
+      || runtimeLane.phase === 'verified'
+      || runtimeLane.phase === 'failed'
+      || runtimeLane.phase === 'cancelled'
+    const state: DemoSession['lanes'][LaneId]['state'] = runtimeLane.phase === 'verified'
+      ? 'verified'
+      : runtimeLane.phase === 'failed' || session.round5_runtime?.state === 'failed'
+        ? 'failed'
+        : runtimeLane.phase === 'cancelled'
+          ? 'towelled'
+          : runtimeLane.phase === 'holding'
+            ? 'verifying'
+            : 'connecting'
+    return {
+      ...fallbackLane,
+      state,
+      // Once the server stamps the exact-10,000-client gate the timed result is final,
+      // so the big clock freezes at that stamp and never moves again for this
+      // bell -- through the whole hold-check phase and any post-10k failure.
+      // (The server also forces `elapsed_at_snapshot_ms` equal to the stamp, so
+      // the projection agrees; this just makes the freeze explicit.)
+      elapsed_ms: runtimeLane.bell_to_10000_observed_ms
+        ?? (terminal ? runtimeLane.elapsed_at_snapshot_ms : projectedElapsed),
+      elapsed_at_snapshot_ms: projectedElapsed,
+      attempts: runtimeLane.held_clients || runtimeLane.clients_authenticated,
+      status: runtimeLane.status,
+      activity: {
+        phase: runtimeLane.phase,
+        wire_call: null,
+      },
+    }
+  }
   const setupLane = isRoundFiveSetupEvidence(session.round5_setup)
     ? session.round5_setup?.lanes?.[laneId]
     : undefined
-  const fallbackLane = session.lanes[laneId]
   if (isRoundFiveFanInEvidence(fallbackLane.evidence)) {
     const result = roundFiveLaneResult(fallbackLane)
     const held = result.held ?? result.authenticated ?? fallbackLane.attempts
@@ -4648,7 +4892,7 @@ function roundFiveArenaLane(
       attempts: held,
       elapsed_ms: result.timeToTargetMs ?? fallbackLane.elapsed_ms,
       status: fallbackLane.activity?.phase === 'hold'
-        ? `${held.toLocaleString()} / 10,000 clients held · ${result.sampledQueriesSucceeded ?? 0} / ${ROUND_FIVE_SAMPLED_QUERIES} sparse samples`
+        ? `${held.toLocaleString()} / 10,000 clients held · ${result.sampledQueriesSucceeded ?? 0} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks so far`
         : `${held.toLocaleString()} / 10,000 clients authenticated + held`,
     }
   }
@@ -4715,6 +4959,110 @@ function roundFiveArenaLane(
   }
 }
 
+/** The frozen-number label for a lane's "Time to 10,000" client-connection clock region. */
+function roundFiveTimerCaption(verification: RoundFiveLaneVerification): string {
+  // A lane that reached exactly 10,000 clients keeps its locked clock whether it
+  // then verified, failed the hold, or was towelled: the time-to-10,000-client
+  // clock is real. These captions read as "Time to 10,000 [clients]".
+  if (verification.reachedTenK) return 'Time to 10,000 — stopped' // 10,000 clients
+  if (verification.phase === 'failed' || verification.phase === 'towelled') return 'Time to 10,000 (not reached)' // 10,000 clients
+  return 'Time to 10,000 (in progress)' // 10,000 clients
+}
+
+/**
+ * The lane's "Hold checks" region: the second of the two on-screen regions every
+ * Round 5 lane always shows (its sibling is the big "Time to 10,000" client-connection
+ * clock). It exists to answer the one question the live demo kept raising -- why work
+ * continues after the clock has stopped -- in plain language, without inventing
+ * a hold countdown the runtime does not expose.
+ *
+ * Both lanes render this region at all times so the two never look asymmetric:
+ * a lane still racing shows a greyed "Waiting to reach 10,000 clients", not an empty
+ * space that reads as a stall or a finish-line flourish.
+ */
+function RoundFiveHoldChecks({
+  verification,
+  awaitingOtherLane,
+}: {
+  verification: RoundFiveLaneVerification
+  awaitingOtherLane: boolean
+}) {
+  const { phase, reachedTenK, heldConnectionChecksDone: done, heldConnectionChecksTotal: total } = verification
+  const waiting = phase === 'ramping' || ((phase === 'failed' || phase === 'towelled') && !reachedTenK)
+  return (
+    <div className="lane-hold-checks" data-phase={phase} data-waiting={waiting} role="status" aria-live="polite">
+      <p className="lane-hold-checks-title">Hold checks</p>
+      {phase === 'verifying' && (
+        // The 10,000 held client connections stay open through the 30-second hold.
+        <>
+          <p className="lane-hold-checks-line">Now holding all 10,000 connections for 30 seconds</p>
+          <p className="lane-hold-checks-line">During hold · {done} / {total} checks on held connections</p>
+        </>
+      )}
+      {phase === 'verified' && (
+        awaitingOtherLane
+          ? <p className="lane-hold-checks-line">This lane verified · waiting for the other</p>
+          : <p className="lane-hold-checks-line">This lane verified</p>
+      )}
+      {phase === 'failed' && (
+        reachedTenK
+          ? <p className="lane-hold-checks-line" data-failed="true">Failed during the 30-second hold</p>
+          : <p className="lane-hold-checks-line" data-failed="true">Stopped before reaching 10,000 clients</p>
+      )}
+      {phase === 'towelled' && (
+        // A towel is not a failure. If the lane already reached 10,000 the hold
+        // was simply cut short by the operator; if it had not, it never reached.
+        reachedTenK
+          ? <p className="lane-hold-checks-line" data-interrupted="true">Hold not completed · towel thrown</p>
+          : <p className="lane-hold-checks-line" data-waiting="true">Stopped before reaching 10,000 clients</p>
+      )}
+      {phase === 'ramping' && (
+        <p className="lane-hold-checks-line" data-waiting="true">Waiting to reach 10,000 clients</p>
+      )}
+    </div>
+  )
+}
+
+function RoundFivePartialEvidence({ session }: { session: DemoSession }) {
+  const runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    ? session.round5_runtime
+    : null
+  if (!runtime || runtime.state === 'verified') return null
+  return (
+    <section className="round5-partial-evidence" aria-label="Round 5 partial evidence">
+      <header>
+        <strong>Unscored partial evidence</strong>
+        <span>Clocks frozen at the terminal snapshot · no winner or margin</span>
+      </header>
+      <div>
+        {(['lakebase', 'competitor'] as const).map((laneId) => {
+          const lane = runtime.lanes[laneId]
+          const peakHeld = Math.max(lane.held_clients, lane.peak_held_clients ?? 0)
+          const name = session.round5_setup?.lanes?.[laneId]?.name
+            ?? session.lanes[laneId].name
+          return (
+            <article key={laneId} data-corner={laneId === 'lakebase' ? 'red' : 'blue'}>
+              <strong>{name}</strong>
+              <span>{lane.clients_initiated.toLocaleString()} initiated</span>
+              <span>{lane.clients_authenticated.toLocaleString()} authenticated</span>
+              <span>{lane.held_clients.toLocaleString()} currently held</span>
+              <span>{peakHeld.toLocaleString()} peak held retained</span>
+              <span>{lane.sampled_queries_succeeded} of {ROUND_FIVE_SAMPLED_QUERIES} held-connection checks completed</span>
+              <span>Release published · {lane.release_published_observed_ms == null ? 'pending' : preciseDuration(lane.release_published_observed_ms)}</span>
+              <span>Runner observed release · {lane.runner_release_observed_ms == null ? 'pending' : preciseDuration(lane.runner_release_observed_ms)}</span>
+              <span>First socket initiated · {lane.first_socket_initiated_observed_ms == null ? 'pending' : preciseDuration(lane.first_socket_initiated_observed_ms)}</span>
+              <span>First client authenticated · {lane.first_client_authenticated_observed_ms == null ? 'pending' : preciseDuration(lane.first_client_authenticated_observed_ms)}</span>
+              <small>{lane.phase === 'verified'
+                ? `Independently verified at ${preciseDuration(lane.bell_to_10000_observed_ms ?? lane.elapsed_at_snapshot_ms)}`
+                : `Stopped at ${preciseDuration(lane.elapsed_at_snapshot_ms)} · target not verified`}</small>
+            </article>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 export function RoundFiveProof({
   session,
   roundNumber,
@@ -4763,10 +5111,21 @@ export function RoundFiveProof({
      only on abandonment, so its presence is the distinction. */
   const cleanupAbandoned = session.round5_setup?.cleanup_failure || null
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
-  const classified = classifyOutcome(session)
+  const v3Runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+  const runtimeLanes = v3Runtime
+    ? {
+        lakebase: roundFiveArenaLane(session, 'lakebase'),
+        competitor: roundFiveArenaLane(session, 'competitor'),
+      }
+    : null
+  const presentationSession = runtimeLanes
+    ? { ...session, lanes: runtimeLanes }
+    : session
+  const classified = classifyOutcome(presentationSession)
   const hasComparison = classified.contractComplete
   const shareable = classified.shareable
-  const oneSidedSetupTowel = classified.outcome.outcome_id === 'one_sided_setup_verified_towel'
+  const oneSidedSetupTowel = Boolean(session.towel)
+    && classified.outcome.outcome_id === 'one_sided_setup_verified_towel'
   const oneSidedExactLane = oneSidedSetupTowel ? classified.evidence.exactLane : null
   const oneSidedUnverifiedLane: LaneId | null = oneSidedExactLane === 'lakebase'
     ? 'competitor'
@@ -4781,29 +5140,54 @@ export function RoundFiveProof({
     && !session.towel
     && !uiReview
     && Boolean(onRetryCleanup)
-  if (uiReview || session.state !== 'failed') {
-    const lakebaseSetupLane = roundFiveArenaLane(session, 'lakebase')
-    const competitorSetupLane = roundFiveArenaLane(session, 'competitor')
+  if (uiReview || session.state !== 'failed' || v3Runtime) {
+    const lakebaseSetupLane = runtimeLanes?.lakebase
+      ?? roundFiveArenaLane(session, 'lakebase')
+    const competitorSetupLane = runtimeLanes?.competitor
+      ?? roundFiveArenaLane(session, 'competitor')
+    // The bell runtime is the only path that drives the two-region live lane
+    // (big "Time to 10,000" client-connection clock + "Hold checks"). Both lanes read their state
+    // off it so they always share the same scaffold; a lane still racing shows a
+    // greyed hold-checks region rather than a missing one.
+    const bellRuntime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+      ? session.round5_runtime
+      : null
+    const lakebaseVerification = bellRuntime ? roundFiveLaneVerification(bellRuntime.lanes.lakebase) : null
+    const competitorVerification = bellRuntime ? roundFiveLaneVerification(bellRuntime.lanes.competitor) : null
+    const lakebaseAwaitingOther = lakebaseVerification?.phase === 'verified'
+      && competitorVerification?.phase !== 'verified'
+    const competitorAwaitingOther = competitorVerification?.phase === 'verified'
+      && lakebaseVerification?.phase !== 'verified'
     const verified = session.state === 'verified'
     const towelled = session.state === 'towelled'
+    const failed = session.state === 'failed'
+      || session.round5_runtime?.state === 'failed'
+      || Boolean(session.round5_runtime && Object.values(session.round5_runtime.lanes).some(
+        (lane) => lane.phase === 'failed',
+      ))
     const liveEvidenceInterrupted = session.state === 'running' && !uiReview && !liveEvidenceConnected
-    const verdict = roundFiveVerifiedVerdict(session)
+    const verdict = roundFiveVerifiedVerdict(presentationSession)
     const recurringFanIn = roundFiveUsesFanIn(session)
+    const explicitLegacy = roundFiveIsExplicitLegacy(session)
     return (
       <>
-        <main className="proof-screen round5-arena" data-session-state={liveEvidenceInterrupted ? 'offline' : session.state}>
+        <main className="proof-screen round5-arena" data-session-state={liveEvidenceInterrupted ? 'offline' : failed ? 'failed' : session.state}>
           <header className="proof-header">
             <HomeLogo className="home-logo-compact" onHome={onHome} />
             <div className="proof-title">
               <p>
                 {recurringFanIn
-                  ? `Round ${roundNumber} · Phase 1 setup supports · Phase 2 scores exact 10,000-client fan-in · 30s hold`
-                  : `Round ${roundNumber} · Legacy scorecard · current 10,000-client fan-in evidence not recorded`}
+                  ? session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+                    ? `Round ${roundNumber} · One bell · Exact 10,000-client fan-in · 30s hold`
+                    : `Round ${roundNumber} · Phase 1 setup supports · Phase 2 scores exact 10,000-client fan-in · 30s hold`
+                  : explicitLegacy
+                    ? `Round ${roundNumber} · Legacy scorecard · current 10,000-client fan-in evidence not recorded`
+                    : `Round ${roundNumber} · Protocol evidence unavailable · no result inferred`}
               </p>
               <h1>{ROUND_FIVE_DISPLAY_TITLE}</h1>
             </div>
-            <div className="proof-state" data-state={liveEvidenceInterrupted ? 'offline' : session.state}>
-              {uiReview ? 'UI review' : liveEvidenceInterrupted ? 'Proof paused · reconnecting' : stateLabel(session.state)}
+            <div className="proof-state" data-state={liveEvidenceInterrupted ? 'offline' : failed ? 'failed' : session.state}>
+              {uiReview ? 'UI review' : liveEvidenceInterrupted ? 'Live evidence reconnecting · clock live' : failed ? 'Failed' : stateLabel(session.state)}
             </div>
             <SoundToggle sound={sound} onToggle={onToggleSound} arena />
           </header>
@@ -4816,8 +5200,21 @@ export function RoundFiveProof({
               sessionState={session.state}
               liveEvidenceConnected={liveEvidenceConnected}
               uiReview={uiReview}
+              animationFrameClock={session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL}
+              sharedServerT0Clock
+              clockFinal={session.round5_runtime?.lanes.lakebase.bell_to_10000_observed_ms != null}
+              timerCaption={lakebaseVerification ? roundFiveTimerCaption(lakebaseVerification) : undefined}
+              preserveTimerOnFailure={lakebaseVerification?.reachedTenK ?? false}
+              holdChecks={lakebaseVerification
+                ? <RoundFiveHoldChecks verification={lakebaseVerification} awaitingOtherLane={lakebaseAwaitingOther} />
+                : undefined}
               censoredMs={towelled ? roundFiveCensoredLowerBoundMilliseconds(session, 'lakebase') ?? undefined : undefined}
               notTimed={towelled
+                // A lane that reached exactly 10,000 clients IS timed: its locked
+                // time-to-10,000-client clock survives a towel thrown mid-hold. Only
+                // a lane that never reached 10,000 clients and has no censored lower
+                // bound is genuinely "not timed".
+                && !(lakebaseVerification?.reachedTenK ?? false)
                 && lakebaseSetupLane.state !== 'verified'
                 && roundFiveCensoredLowerBoundMilliseconds(session, 'lakebase') === null}
             />
@@ -4830,17 +5227,28 @@ export function RoundFiveProof({
               sessionState={session.state}
               liveEvidenceConnected={liveEvidenceConnected}
               uiReview={uiReview}
+              animationFrameClock={session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL}
+              sharedServerT0Clock
+              clockFinal={session.round5_runtime?.lanes.competitor.bell_to_10000_observed_ms != null}
+              timerCaption={competitorVerification ? roundFiveTimerCaption(competitorVerification) : undefined}
+              preserveTimerOnFailure={competitorVerification?.reachedTenK ?? false}
+              holdChecks={competitorVerification
+                ? <RoundFiveHoldChecks verification={competitorVerification} awaitingOtherLane={competitorAwaitingOther} />
+                : undefined}
               censoredMs={towelled ? roundFiveCensoredLowerBoundMilliseconds(session, 'competitor') ?? undefined : undefined}
               notTimed={towelled
+                // Same rule as the Lakebase lane: a locked 10,000 clients result is timed.
+                && !(competitorVerification?.reachedTenK ?? false)
                 && competitorSetupLane.state !== 'verified'
                 && roundFiveCensoredLowerBoundMilliseconds(session, 'competitor') === null}
             />
           </div>
+          {failed && <RoundFivePartialEvidence session={session} />}
           <footer className="proof-footer round5-arena-footer">
             {error && !verified && <p className="proof-error" role="alert">{error}</p>}
             {!uiReview && (
               <RingsideCommentator
-                session={session}
+                session={presentationSession}
                 open={commentaryOpen}
                 onToggle={onToggleCommentary}
                 liveEvidenceConnected={verified || liveEvidenceConnected}
@@ -4854,8 +5262,12 @@ export function RoundFiveProof({
                   <strong>{verdict}</strong>
                 </div>
                 <p className="final-fairness">{recurringFanIn
-                  ? 'Time to exactly 10,000 held clients is scored per lane on its own clock · setup is supporting · every lane holds its 10,000 for 30s · 64 sparse checks per lane'
-                  : 'Legacy scorecard decoded · current 10,000-client fan-in contract not recorded'}</p>
+                  ? session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+                    ? 'One server bell to observed exact 10,000 held is scored · every lane holds for 30s · 64 held-connection checks per lane'
+                    : 'Time to exactly 10,000 held clients is scored per lane on its own clock · setup is supporting · every lane holds its 10,000 for 30s · 64 held-connection checks per lane'
+                  : explicitLegacy
+                    ? 'Legacy scorecard decoded · current 10,000-client fan-in contract not recorded'
+                    : 'Protocol evidence unavailable · no timing or fan-in claim inferred'}</p>
                 {/* A verified Round 5 keeps its win and can still fail to tidy
                     up, which is the case this screen used to render as a bare
                     "settling backstage" line whether cleanup was still trying
@@ -4898,29 +5310,73 @@ export function RoundFiveProof({
                     ? 'No declared winner · comparison incomplete · margin N/A'
                     : classified.headline}</strong>
                 </div>
-                <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
-                {!uiReview && proofNavigationAllowsExit(session) && (
+                <TowelControl
+                  session={session}
+                  uiReview={uiReview}
+                  onTowel={onTowel}
+                  onRetryCleanup={onRetryCleanup}
+                />
+                {/* A posted towel is terminal the instant it lands. The same
+                    post-bout action row every other terminal outcome shows
+                    appears immediately -- it does not wait for cleanup to
+                    settle, for `ready`, or for a verified win. Instant replay,
+                    the ringside explanation and the shared receipt all read the
+                    towelled/comparison-incomplete evidence and never present it
+                    as a win; Next round returns to the fight card. */}
+                {!uiReview && (
                   <div className="proof-actions">
-                    {cleanupAllowsActions && <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>}
+                    <button className="proof-replay" onClick={() => setShowInstantReplay(true)}>Select · Instant replay</button>
                     <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
+                    <button className="proof-share" onClick={() => setShowShareReceipt(true)}>Start · Share the receipt</button>
                     <button type="button" className="proof-next" onClick={onContinue}>A · {hasNextRound ? 'Next round' : 'Fight card'}</button>
                   </div>
                 )}
               </>
+            ) : failed ? (
+              <>
+                <div className="remembered" role="status" aria-label="Round 5 setup status" aria-atomic="true">
+                  <span>Bout stopped · cleanup underway</span>
+                  <strong>Partial counters and elapsed time are unscored evidence · no winner or margin</strong>
+                </div>
+                {cleanupAbandoned && (
+                  <div className="cleanup-abandoned" data-state="failed" role="alert">
+                    <strong>{CLEANUP_ABANDONED_TITLE}</strong>
+                    <span>{cleanupAbandoned}</span>
+                  </div>
+                )}
+                {showCleanupFallback && (
+                  <button
+                    className="round5-retry-cleanup"
+                    disabled={cleanupPending}
+                    onClick={onRetryCleanup}
+                  >
+                    B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
+                  </button>
+                )}
+              </>
             ) : (
               <>
-                <div className="fairness">
-                  <span aria-hidden="true">◆</span>
-                  {recurringFanIn
-                    ? 'Per-lane fan-in · 10,000 authenticated held clients per lane · 30s hold'
-                    : 'Legacy scorecard · current 10,000-client fan-in evidence not recorded'}
-                  <span aria-hidden="true">◆</span>
-                </div>
+                {bellRuntime ? (
+                  <div className="round5-live-explainer" role="status" aria-label="Round 5 live explainer">
+                    <p className="round5-live-verdict">No winner until both lanes verify</p>
+                    <p className="round5-live-copy">
+                      Each lane holds all 10,000 client connections for 30 seconds while 64 checks run on the held connections.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="fairness">
+                    <span aria-hidden="true">◆</span>
+                    {explicitLegacy
+                      ? 'Legacy scorecard · current 10,000-client fan-in evidence not recorded'
+                      : 'Protocol evidence unavailable · no result inferred'}
+                    <span aria-hidden="true">◆</span>
+                  </div>
+                )}
                 <TowelControl
                   session={session}
                   uiReview={uiReview}
-                  disabled={!liveEvidenceConnected}
                   onTowel={onTowel}
+                  onRetryCleanup={onRetryCleanup}
                 />
               </>
             )}
@@ -4967,7 +5423,9 @@ export function RoundFiveProof({
   const compactResult = cleanupFailed
     ? 'BACKSTAGE RECOVERY'
     : session.state === 'failed'
-      ? oneSidedSetupTowel || exactSetupLane
+      ? session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+        ? 'BOUT STOPPED'
+        : oneSidedSetupTowel || exactSetupLane
         ? 'ONE SETUP VERIFIED'
         : setupValidated
           ? recurringFanIn ? '10K FAN-IN NOT VERIFIED' : 'LEGACY SCORECARD'
@@ -4984,7 +5442,9 @@ export function RoundFiveProof({
   const compactReason = cleanupFailed
     ? cleanupAbandoned ?? 'Automatic cleanup is retrying backstage. The ring stays protected until a clean baseline is verified.'
     : session.state === 'failed'
-      ? oneSidedSetupTowel
+      ? session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+        ? 'Bout stopped · cleanup underway. Partial counters remain visible as unscored evidence; no winner or margin was declared.'
+        : oneSidedSetupTowel
         ? classified.headline
         : exactSetupLane && unfinishedSetupLane
           ? `${session.round5_setup?.lanes?.[exactSetupLane]?.name ?? session.lanes[exactSetupLane].name} setup verified ${roundFiveSetupElapsedDisplay(setupResults[exactSetupLane])}. ${session.round5_setup?.lanes?.[unfinishedSetupLane]?.name ?? session.lanes[unfinishedSetupLane].name} not verified. ${recurringFanIn ? 'The exact dual-10,000-client fan-in did not run' : 'The current 10,000-client fan-in was not recorded by this legacy scorecard'}; no declared winner, comparison incomplete, margin N/A.`
@@ -4995,7 +5455,7 @@ export function RoundFiveProof({
         : 'Both lanes did not reach the exact setup stop gate. No timing comparison was declared.'
       : setupValidated
         ? recurringFanIn
-          ? 'Both pooled-path setup workflows verified. The shared-T0 dual-10,000-client fan-in is now running.'
+          ? 'Both independent one-bell pipelines are running toward exact 10,000 held.'
           : 'Both pooled-path setup workflows verified in a legacy scorecard. Current 10,000-client fan-in evidence was not recorded.'
         : `Lakebase and ${awsEngineName} are completing their setup workflows. Timing stops only after each exact transaction verifies.`
 
@@ -5014,6 +5474,7 @@ export function RoundFiveProof({
         </header>
 
         <div className="round5-compact-body">
+            <RoundFivePartialEvidence session={session} />
             <section className="round5-result-card" aria-label="Round 5 setup status" role="status">
               <p>PRIMARY SETUP RESULT</p>
               <h2>{compactResult}</h2>
@@ -5565,15 +6026,22 @@ function TowelControl({
   uiReview,
   disabled = false,
   onTowel,
+  onRetryCleanup,
 }: {
   session: DemoSession
   uiReview: boolean
   disabled?: boolean
   onTowel: () => Promise<void>
+  onRetryCleanup?: () => Promise<void> | void
 }) {
   const [submitting, setSubmitting] = useState(false)
   if (uiReview) return null
-  if (session.towel) return <TowelProgress session={session} onRetry={onTowel} />
+  if (session.towel) {
+    const retry = isRoundFive(session) && onRetryCleanup
+      ? async () => { await onRetryCleanup() }
+      : onTowel
+    return <TowelProgress session={session} onRetry={retry} />
+  }
   if (session.state !== 'running') return null
   const submit = async () => {
     if (submitting) return
@@ -5873,7 +6341,36 @@ function replaySteps(session: DemoSession): ReplayStep[] {
   if (session.round.id === 'survive_connection_spike') {
     const lakebaseBurst = roundFiveLaneResult(session.lanes.lakebase)
     const competitorBurst = roundFiveLaneResult(session.lanes.competitor)
-    const legacy = !roundFiveUsesFanIn(session)
+    const fanIn = roundFiveUsesFanIn(session)
+    const legacy = roundFiveIsExplicitLegacy(session)
+    const v4 = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+    const replayLane = (
+      laneId: LaneId,
+      evidence: ReturnType<typeof roundFiveLaneResult>,
+    ) => {
+      const runtime = v4 ? session.round5_runtime?.lanes[laneId] : null
+      return {
+        held: runtime ? runtime.held_clients : evidence.held,
+        timeToTargetMs: runtime?.bell_to_10000_observed_ms
+          ?? (runtime ? null : evidence.timeToTargetMs),
+        samples: runtime
+          ? runtime.sampled_queries_succeeded
+          : evidence.sampledQueriesSucceeded,
+        holdElapsedMs: runtime && runtime.phase !== 'verified'
+          ? null
+          : evidence.holdElapsedMs,
+      }
+    }
+    const lakebaseReplay = replayLane('lakebase', lakebaseBurst)
+    const competitorReplay = replayLane('competitor', competitorBurst)
+    if (!fanIn && !legacy) {
+      return [{
+        summary: 'Round 5 protocol evidence is unavailable. No setup, fan-in, timing, or winner claim is inferred.',
+        shared: [{ label: 'Evidence status', code: 'Protocol unavailable · no result inferred' }],
+        lakebase: [],
+        competitor: [],
+      }]
+    }
     const latencyTriplet = (result: ReturnType<typeof roundFiveLaneResult>) =>
       [result.connectP50Ms, result.connectP95Ms, result.connectP99Ms]
         .map((value) => value === null ? 'N/A' : `${value.toFixed(2)} ms`)
@@ -5884,31 +6381,39 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         ]
       : [
           { label: 'Exact client fan-in', code: '10,000 authenticated held clients / lane · zero retries' },
-          { label: 'Shared release', code: 'one monotonic T0 → alternating equal waves for both lanes', note: 'Every ramp pause remains scored.' },
-          { label: 'Common hold', code: `10,000 clients / lane held for at least 30s · ${ROUND_FIVE_SAMPLED_QUERIES} sparse SELECT 1 checks / lane` },
+          { label: v4 ? 'Authoritative bell' : 'Shared release', code: v4 ? 'one server T0 → release both independent physical lane gates' : 'one monotonic T0 → alternating equal waves for both lanes', note: 'Every provider and ramp delay remains scored.' },
+          { label: 'Common hold', code: `10,000 clients / lane held for at least 30s · ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks / lane` },
           { label: 'Multiplexing check', code: 'separate direct observers count dedicated-role PostgreSQL backend PIDs', note: 'This is not a transaction-throughput test.' },
         ]
     return [
       {
         summary: legacy
           ? 'This stored scorecard predates the current 10,000-client fan-in contract. Its compatible fields decoded without being presented as current fan-in evidence.'
-          : 'The generator preflight measured the sealed m6i.xlarge for both simultaneous 10,000-client lanes before either pooled path was built. Phase 1 setup remained a separate supporting metric.',
+          : 'Automatic warming measured one sealed c7i.2xlarge per physical 10,000-client lane before the bell.',
         shared: [
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
-          { label: 'Setup start barrier', code: 'time.monotonic_ns() → release both setup workflows', note: `Both launches must occur within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of the shared T0 or the setup race is void.` },
+          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Both launches must occur within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of the shared T0 or the setup race is void.` },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
-          { label: 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
+          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge, resident registry, lock, and cancellation owner per lane.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
         ],
         lakebase: [{ label: 'No new pool to provision', code: 'Connection pooling is built into the Lakebase endpoint.', note: 'No per-bout pooling resource is created, so no creation is journaled.' }],
         competitor: [{ label: 'Journaled per-bout build', code: 'Every RDS Proxy resource is written to the creation journal before AWS is called.', note: 'The journal is what lets an interrupted bout be cleaned up instead of leaking.' }],
       },
       {
-        summary: 'Lakebase validated its included pool. The selected AWS reference path needed nine journaled resource mutations, then drained and rebound its setup target before fan-in.',
-        lakebase: [
+        summary: v4 ? 'Lakebase scheduled its retained first client at the bell. AWS called CreateDBProxy first and dispatched only after its exact control-plane gate.' : 'Lakebase validated its included pool. The selected AWS reference path needed nine journaled resource mutations, then drained and rebound its setup target before fan-in.',
+        lakebase: v4 ? [
+          { label: 'run_lane_v3', code: 'Client 1 → pooled transaction → retain → fan in clients 2–10,000' },
+        ] : [
           { label: 'validating_host', code: 'Check the built-in Lakebase pooled endpoint' },
           { label: 'verifying_transaction', code: 'Fresh pooled connection → full application transaction' },
         ],
-        competitor: [
+        competitor: v4 ? [
+          { label: 'creating_proxy', code: 'journal intent → RDS.CreateDBProxy', note: 'First timed AWS mutation.' },
+          { label: 'freezing_proxy_settings', code: 'journal: proxy_target_group' },
+          { label: 'registering_proxy_target', code: 'journal: proxy_target' },
+          { label: 'verifying_proxy', code: 'Exact identity + target + role + auth + TLS + VPC + subnet + security-group gate' },
+          { label: 'run_lane_v3', code: 'Client 1 → Proxy transaction → retain → fan in clients 2–10,000' },
+        ] : [
           { label: 'creating_proxy_network', code: 'journal: proxy_security_group' },
           { label: 'freezing_proxy_egress', code: 'journal: proxy_default_egress' },
           { label: 'authorizing_proxy_ingress', code: 'journal: proxy_ingress' },
@@ -5925,21 +6430,23 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         ],
       },
       {
-        summary: 'Each supporting setup clock stopped at its own exact pooled-path gate. Only after both were ready could the primary shared fan-in clock start.',
+        summary: v4 ? 'Both clocks started at the bell. Lakebase never waited for Proxy readiness; the AWS lane dispatched at its own exact gate.' : 'Each supporting setup clock stopped at its own exact pooled-path gate. Only after both were ready could the primary shared fan-in clock start.',
         shared: [{ label: 'Stop rule', code: 'event: lane_update · activity.phase=setup_stop · setup_elapsed_ms=<exact scored elapsed>' }],
         lakebase: [
-          { label: 'Gate lakebase_fresh_pooled_transaction', code: 'fresh_pooled_path_verified=true · runner_verify_full_transaction=true' },
+          { label: v4 ? 'Gate lakebase_dispatch_eligibility' : 'Gate lakebase_fresh_pooled_transaction', code: v4 ? 'warm_launch_capsule_current=true · pooled_endpoint_binding_exact=true' : 'fresh_pooled_path_verified=true · runner_verify_full_transaction=true' },
           { label: 'Supporting clock boundary', code: 'Setup T0 → exact Lakebase setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'lakebase') },
         ],
         competitor: [
-          { label: 'Gate rds_proxy_topology_transaction', code: 'sealed_proxy_auth_verified=true · proxy_target_state=AVAILABLE · max_connections_percent=90 · max_idle_connections_percent=0 · setup_backend_target_rebound=true · connection_borrow_timeout_seconds=120 · runner_verify_full_transaction=true' },
+          { label: v4 ? 'Gate rds_proxy_exact_control_plane' : 'Gate rds_proxy_topology_transaction', code: v4 ? 'identity + target + role + auth + TLS + VPC + subnet + network fixture exact' : 'sealed_proxy_auth_verified=true · proxy_target_state=AVAILABLE · max_connections_percent=90 · max_idle_connections_percent=0 · setup_backend_target_rebound=true · connection_borrow_timeout_seconds=120 · runner_verify_full_transaction=true' },
           { label: 'Supporting clock boundary', code: 'Setup T0 → exact RDS Proxy setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'competitor') },
         ],
       },
       {
         summary: legacy
           ? 'Legacy Round 5 evidence decoded, but the current exact 10,000-client fan-in contract was not recorded.'
-          : 'The primary phase released both lanes from one monotonic T0. Each exact 10,000-client gate, 30-second hold, sparse samples, multiplexing, telemetry, fairness, and cleanup had to verify.',
+          : v4
+            ? 'One server bell released both independent physical lanes. Each exact 10,000-client gate, 30-second hold, held-connection checks, multiplexing, telemetry, fairness, and cleanup had to verify.'
+            : 'The primary phase released both lanes from one monotonic T0. Each exact 10,000-client gate, 30-second hold, held-connection checks, multiplexing, telemetry, fairness, and cleanup had to verify.',
         shared: [
           ...burstContract,
           { label: 'PID witness', code: legacy ? 'Legacy multiplexing metadata decoded' : 'Direct observers → current/peak dedicated-role backend PIDs', note: legacy ? 'Not presented as current fan-in evidence.' : 'Backend sessions must be at least one and strictly fewer than 10,000 held clients.' },
@@ -5950,9 +6457,9 @@ function replaySteps(session: DemoSession): ReplayStep[] {
               { label: 'Current fan-in', code: '10,000-client evidence not recorded' },
             ]
           : [
-              { label: 'Exact held gate', code: `${roundFiveCountDisplay(lakebaseBurst.held)} / 10,000 clients at ${lakebaseBurst.timeToTargetMs === null ? 'N/A' : preciseDuration(lakebaseBurst.timeToTargetMs)}` },
+              { label: 'Exact held gate', code: `${roundFiveCountDisplay(lakebaseReplay.held)} / 10,000 clients at ${lakebaseReplay.timeToTargetMs === null ? 'N/A' : preciseDuration(lakebaseReplay.timeToTargetMs)}` },
               { label: 'Connection churn p50 / p95 / p99', code: latencyTriplet(lakebaseBurst), note: 'Secondary; not transaction capacity.' },
-              { label: 'Hold + sparse samples', code: `${lakebaseBurst.holdElapsedMs === null ? 'N/A' : `${(lakebaseBurst.holdElapsedMs / 1000).toFixed(2)}s`} · ${roundFiveCountDisplay(lakebaseBurst.sampledQueriesSucceeded)} / 64 SELECT 1` },
+              { label: 'Hold + held-connection checks', code: `${lakebaseReplay.holdElapsedMs === null ? 'N/A' : `${(lakebaseReplay.holdElapsedMs / 1000).toFixed(2)}s`} · ${roundFiveCountDisplay(lakebaseReplay.samples)} / 64 held-connection checks` },
               { label: 'Multiplexing', code: `${roundFiveCountDisplay(lakebaseBurst.uniqueBackendPids)} unique backend PIDs · peak ${roundFiveCountDisplay(lakebaseBurst.peakBackendSessions)} backend sessions` },
             ],
         competitor: legacy
@@ -5960,9 +6467,9 @@ function replaySteps(session: DemoSession): ReplayStep[] {
               { label: 'Current fan-in', code: '10,000-client evidence not recorded' },
             ]
           : [
-              { label: 'Exact held gate', code: `${roundFiveCountDisplay(competitorBurst.held)} / 10,000 clients at ${competitorBurst.timeToTargetMs === null ? 'N/A' : preciseDuration(competitorBurst.timeToTargetMs)}` },
+              { label: 'Exact held gate', code: `${roundFiveCountDisplay(competitorReplay.held)} / 10,000 clients at ${competitorReplay.timeToTargetMs === null ? 'N/A' : preciseDuration(competitorReplay.timeToTargetMs)}` },
               { label: 'Connection churn p50 / p95 / p99', code: latencyTriplet(competitorBurst), note: 'Secondary; not transaction capacity.' },
-              { label: 'Hold + sparse samples', code: `${competitorBurst.holdElapsedMs === null ? 'N/A' : `${(competitorBurst.holdElapsedMs / 1000).toFixed(2)}s`} · ${roundFiveCountDisplay(competitorBurst.sampledQueriesSucceeded)} / 64 SELECT 1` },
+              { label: 'Hold + held-connection checks', code: `${competitorReplay.holdElapsedMs === null ? 'N/A' : `${(competitorReplay.holdElapsedMs / 1000).toFixed(2)}s`} · ${roundFiveCountDisplay(competitorReplay.samples)} / 64 held-connection checks` },
               { label: 'Multiplexing', code: `${roundFiveCountDisplay(competitorBurst.uniqueBackendPids)} unique backend PIDs · peak ${roundFiveCountDisplay(competitorBurst.peakBackendSessions)} backend sessions` },
             ],
       },
@@ -6451,7 +6958,7 @@ function ReceiptPoster({
   const skew = receiptStartSkewDisplay(session)
   const competitorFighter = session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS'
   return (
-    <article className="receipt-poster" aria-label={kind === 'idle' ? 'Verified back to idle poster preview' : 'Verified result poster preview'}>
+    <article className="receipt-poster" aria-label={kind === 'idle' ? 'Verified back to idle poster preview' : session.towel ? 'Bout result poster preview' : 'Verified result poster preview'}>
       <header className="receipt-ticket-top">
         <div className="receipt-ticket-brand" aria-label="Lakebase: The Anti-Demo">
           <div><strong>Lakebase</strong><span>The Anti-Demo</span></div>
@@ -6467,13 +6974,13 @@ function ReceiptPoster({
         <section className="receipt-preview-lane" data-corner="red" data-winner={receipt.winner === 'lakebase' || receipt.winner === 'tie'} aria-label="Lakebase receipt result">
           <DatabaseFighter label="LB" corner="red" />
           <div><strong>{receipt.lakebaseLabel ?? 'Lakebase'}</strong><b>{receipt.lakebaseValue}</b><span>{receipt.lakebaseStatus}</span></div>
-          {(receipt.winner === 'lakebase' || receipt.winner === 'tie') && <em>{isRoundFour(session) ? 'Verified path' : isRoundFive(session) ? receipt.winner === 'tie' ? 'Same setup time' : 'Earlier pooled path' : receipt.winner === 'tie' ? 'Verified' : 'Winner'}</em>}
+          {(receipt.winner === 'lakebase' || receipt.winner === 'tie') && <em>{isRoundFour(session) ? 'Verified path' : isRoundFive(session) ? roundFiveWinnerChip(session, receipt.winner) : receipt.winner === 'tie' ? 'Verified' : 'Winner'}</em>}
         </section>
         <span className="receipt-preview-vs" aria-hidden="true">VS</span>
         <section className="receipt-preview-lane" data-corner="blue" data-winner={receipt.winner === 'competitor' || receipt.winner === 'tie'} data-capability={receipt.competitorCapabilityGap} aria-label={`${session.competitor.short_name} receipt result`}>
           <DatabaseFighter label={competitorFighter} corner="blue" />
           <div><strong>{receipt.competitorLabel ?? session.competitor.short_name}</strong><b>{receipt.competitorValue}</b><span>{receipt.competitorStatus}</span></div>
-          {(receipt.winner === 'competitor' || receipt.winner === 'tie') && <em>{isRoundFive(session) ? receipt.winner === 'tie' ? 'Same setup time' : 'Earlier pooled path' : receipt.winner === 'tie' ? 'Verified' : 'Winner'}</em>}
+          {(receipt.winner === 'competitor' || receipt.winner === 'tie') && <em>{isRoundFive(session) ? roundFiveWinnerChip(session, receipt.winner) : receipt.winner === 'tie' ? 'Verified' : 'Winner'}</em>}
         </section>
       </div>
       <div className="receipt-verdict" data-width={resultWidth}>
@@ -7209,8 +7716,14 @@ function scorecardProofLabel(entry: ScorecardEntry): string {
   if (entry.round_id === 'wake_idle_app') return 'Wake → verified'
   if (entry.round_id === 'put_model_score_in_app') return 'Delta score → exact app read'
   if (entry.round_id === 'survive_connection_spike') {
-    if (entry.round5_protocol === 'round5-fanin-v2') {
-      return 'Setup evidence → exact dual-10K fan-in'
+    if (entry.round5_protocol === ROUND_FIVE_BELL_PROTOCOL) {
+      return 'One bell → exact dual-10K fan-in'
+    }
+    if (
+      entry.round5_protocol === ROUND_FIVE_FANIN_PROTOCOL
+      || entry.round5_protocol === 'round5-fanin-v2'
+    ) {
+      return 'Setup evidence → earlier dual-10K fan-in'
     }
     if (entry.round5_protocol === 'connection-spike-v1') {
       return 'Pooled-path setup → earlier protocol'
@@ -7550,6 +8063,25 @@ function proofCommentary(
     }
   }
   if (isRoundFive(session)) {
+    const runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
+      ? session.round5_runtime
+      : null
+    if (runtime) {
+      const lines = (['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
+        const lane = runtime.lanes[laneId]
+        const name = session.round5_setup?.lanes?.[laneId]?.name
+          ?? session.lanes[laneId].name
+        return `${name} · ${lane.held_clients.toLocaleString()} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`
+      })
+      return {
+        lanes: lines,
+        verdict: runtime.state === 'verified'
+          ? roundFiveVerifiedVerdict(session)
+          : runtime.state === 'running'
+            ? 'V4 resident fan-in live · no winner until both canonical runtime lanes verify'
+            : 'V4 runtime stopped · cleanup must settle before the receipt is final',
+      }
+    }
     const fanInActive = (['lakebase', 'competitor'] as LaneId[]).some(
       (laneId) => isRoundFiveFanInEvidence(session.lanes[laneId].evidence),
     )
@@ -7569,8 +8101,8 @@ function proofCommentary(
       const update = session.state === 'verified'
         ? roundFiveVerifiedVerdict(session)
         : !liveEvidenceConnected
-          ? 'Live evidence interrupted · Counters frozen while reconnecting'
-          : 'Per-lane fan-in live · no winner until both exact gates, hold, samples, multiplexing, and cleanup verify'
+          ? 'Live evidence interrupted · Counters stale · clocks continue while reconnecting'
+          : 'Per-lane fan-in live · no winner until both exact gates, hold, held-connection checks, multiplexing, and cleanup verify'
       return {
         lanes: lines,
         verdict: `${update} · Client fan-in is not backend count or transaction throughput`,
@@ -7593,7 +8125,7 @@ function proofCommentary(
       if (state === 'running') {
         line = liveEvidenceConnected
           ? `${name} · Setup clock live · ${status}`
-          : `${name} · Live evidence interrupted · Display clock frozen while reconnecting`
+          : `${name} · Live evidence interrupted · Clock continues · evidence stale while reconnecting`
       } else if (state === 'verified') {
         line = `${name} · Exact setup gate verified · Clock stopped${elapsedMs === null ? '' : ` at ${preciseDuration(elapsedMs)}`} · ${status}`
       } else if (state === 'failed') {
@@ -7618,7 +8150,7 @@ function proofCommentary(
         ? roundFiveVerifiedVerdict(session)
       : verified.length === 2
         ? roundFiveUsesFanIn(session)
-          ? 'Both pooled-path setup clocks stopped · shared-T0 10,000-client fan-in in progress · No comparison until every gate verifies'
+          ? 'Both one-bell lane pipelines are in progress · No comparison until every gate verifies'
           : 'Both pooled-path setup clocks stopped in a legacy scorecard · current 10,000-client fan-in evidence not recorded'
       : verified.length === 1 && other?.state === 'running'
         ? `${stopped.name} reached pooled-path setup${stopped.elapsedMs === null ? '' : ` at ${preciseDuration(stopped.elapsedMs)}`} · ${other.name} setup clock still running · No comparison yet`
@@ -7829,6 +8361,12 @@ function Lane({
   uiReview,
   censoredMs,
   notTimed = false,
+  animationFrameClock = false,
+  clockFinal = false,
+  sharedServerT0Clock = false,
+  timerCaption,
+  holdChecks,
+  preserveTimerOnFailure = false,
 }: {
   lane: DemoSession['lanes'][LaneId]
   fallbackLabel: string
@@ -7839,11 +8377,31 @@ function Lane({
   uiReview: boolean
   censoredMs?: number
   notTimed?: boolean
+  animationFrameClock?: boolean
+  clockFinal?: boolean
+  // Round 5 runs a single shared server-T0 clock that keeps advancing locally
+  // through an SSE interruption (evidence goes stale; the clock does not stop
+  // until the exact 10,000-client observed gate). Other rounds' clocks are
+  // evidence-driven and correctly freeze when the stream drops.
+  sharedServerT0Clock?: boolean
+  /** Persistent label under the big number: the "Time to 10,000" client-connection clock caption. */
+  timerCaption?: string
+  /** The "Hold checks" region (Round 5). Rendered below the timer + caption. */
+  holdChecks?: ReactNode
+  /**
+   * Keep showing the frozen number instead of "Could not verify" when a lane
+   * fails after it already reached its exact 10,000 client connections. The time-to-10,000 is real
+   * evidence and must survive a later verification failure.
+   */
+  preserveTimerOnFailure?: boolean
 }) {
   const failed = lane.state === 'failed'
   const unsupported = lane.state === 'not_supported'
   const censored = censoredMs !== undefined
-  const couldBeActive = !uiReview && sessionState === 'running' && (
+  // A lane that reached 10k and then failed verification keeps its frozen clock.
+  const showFrozenFailure = failed && preserveTimerOnFailure
+    && typeof lane.elapsed_ms === 'number' && Number.isFinite(lane.elapsed_ms)
+  const couldBeActive = !clockFinal && !uiReview && sessionState === 'running' && (
     lane.state === 'connecting' || lane.state === 'verifying'
   )
   const snapshotFloor = lane.elapsed_at_snapshot_ms
@@ -7853,8 +8411,15 @@ function Lane({
     && snapshotFloor >= 0
     ? Math.max(lane.elapsed_ms ?? 0, snapshotFloor)
     : lane.elapsed_ms
-  const active = couldBeActive && liveEvidenceConnected
-  const disconnected = couldBeActive && !liveEvidenceConnected
+  // A shared server-T0 clock (Round 5) is monotonic wall time from one server T0:
+  // an SSE interruption stops new evidence but not the passage of time, so it
+  // keeps running locally through a disconnect and stops only at its exact
+  // 10,000-client observed stop (`clockFinal`). The staleness of the *evidence*
+  // is surfaced separately via `evidenceStale`. Every other round's clock is
+  // evidence-driven with no monotonic server anchor to extrapolate from, so it
+  // correctly freezes when the stream drops.
+  const active = couldBeActive && (sharedServerT0Clock || liveEvidenceConnected)
+  const evidenceStale = couldBeActive && !liveEvidenceConnected
   const status = censored
     ? 'UNVERIFIED WHEN STOPPED · LOWER BOUND'
     : notTimed
@@ -7863,8 +8428,14 @@ function Lane({
       ? 'Capability preview · no live check'
       : uiReview
         ? 'No live transaction'
-        : disconnected
-          ? `LIVE BACKEND OFFLINE · DISPLAY FROZEN · ${lane.status}`
+        : evidenceStale
+          ? sharedServerT0Clock
+            // Sentence case on purpose: mid-demo this used to shout in all caps
+            // ("LIVE EVIDENCE OFFLINE"), which read as a crash. The clock is
+            // still trustworthy from the shared server T0, so keep it calm and
+            // subordinate.
+            ? `Live evidence catching up · clock still running · ${lane.status}`
+            : `Live backend offline · display frozen · ${lane.status}`
           : lane.status
   return (
     <section className="proof-lane" data-state={lane.state} data-corner={corner} aria-label={`${lane.name || fallbackLabel} result`}>
@@ -7872,20 +8443,28 @@ function Lane({
         <div className="proof-fighter"><DatabaseFighter label={fighterLabel} corner={corner} /></div>
         <div><p className="lane-corner">{corner} corner</p><p className="lane-name">{lane.name || fallbackLabel}</p></div>
       </div>
-      <div className="lane-time" data-failed={failed} data-unsupported={unsupported} data-censored={censored} data-untimed={notTimed} data-live={active}>
+      <div className="lane-time" data-failed={failed && !showFrozenFailure} data-unsupported={unsupported} data-censored={censored} data-untimed={notTimed} data-live={active} data-evidence-stale={evidenceStale}>
         {unsupported
           ? 'No scale-to-zero'
           : uiReview
             ? '—'
-            : failed
+            : failed && !showFrozenFailure
               ? 'Could not verify'
               : notTimed
                 ? 'Not timed'
               : censored
                 ? <span className="timer-readout" data-width="long">&gt;{(censoredMs / 1000).toFixed(2)}<span className="timer-unit">s</span></span>
-                : <TimerValue elapsedMs={elapsedMs} active={active} disconnected={disconnected} />}
+                : <TimerValue
+                    elapsedMs={elapsedMs}
+                    active={active}
+                    animationFrameClock={animationFrameClock}
+                  />}
       </div>
-      <p className="lane-status"><span aria-hidden="true">{lane.state === 'verified' ? '✓' : lane.state === 'failed' ? '!' : unsupported ? '—' : '•'}</span>{status}</p>
+      {timerCaption && !unsupported && !uiReview && (
+        <p className="lane-timer-caption" data-frozen={clockFinal || showFrozenFailure}>{timerCaption}</p>
+      )}
+      {holdChecks}
+      <p className="lane-status" data-subordinate={holdChecks ? 'true' : undefined}><span aria-hidden="true">{lane.state === 'verified' ? '✓' : lane.state === 'failed' ? '!' : unsupported ? '—' : '•'}</span>{status}</p>
       {failed && lane.error && (
         <p className="lane-error" role="alert" title={lane.error}>{lane.error}</p>
       )}
@@ -7896,11 +8475,11 @@ function Lane({
 function TimerValue({
   elapsedMs,
   active,
-  disconnected,
+  animationFrameClock,
 }: {
   elapsedMs: number | null
   active: boolean
-  disconnected: boolean
+  animationFrameClock: boolean
 }) {
   const [timer, setTimer] = useState<{
     observedElapsedMs: number | null
@@ -7913,7 +8492,7 @@ function TimerValue({
     observedActive: active,
     authoritativeMs: elapsedMs ?? (active ? 0 : null),
     displayMs: elapsedMs ?? 0,
-    lastTickAt: null,
+    lastTickAt: active && animationFrameClock ? window.performance.now() : null,
   }))
 
   if (elapsedMs !== timer.observedElapsedMs || active !== timer.observedActive) {
@@ -7929,19 +8508,38 @@ function TimerValue({
       observedElapsedMs: elapsedMs,
       observedActive: active,
       authoritativeMs,
-      displayMs: disconnected
-        ? timer.displayMs
-        : !active && elapsedMs !== null
+      // No disconnect freeze: while the bout is running the clock advances on the
+      // local animation-frame/interval tick from the last authoritative floor, so
+      // an SSE gap never stops elapsed time. A fresh server floor is reconciled by
+      // Math.max when evidence resumes.
+      displayMs: !active && elapsedMs !== null
         ? elapsedMs
         : acceptsElapsed
           ? Math.max(timer.displayMs, elapsedMs)
           : timer.displayMs,
-      lastTickAt: null,
+      lastTickAt: active && animationFrameClock ? window.performance.now() : null,
     })
   }
 
   useEffect(() => {
     if (!active) return
+    if (animationFrameClock) {
+      let frame = 0
+      const tick = (now: number) => {
+        setTimer((current) => {
+          if (!current.observedActive || current.authoritativeMs === null) return current
+          if (current.lastTickAt === null) return { ...current, lastTickAt: now }
+          return {
+            ...current,
+            displayMs: current.displayMs + now - current.lastTickAt,
+            lastTickAt: now,
+          }
+        })
+        frame = window.requestAnimationFrame(tick)
+      }
+      frame = window.requestAnimationFrame(tick)
+      return () => window.cancelAnimationFrame(frame)
+    }
     const interval = window.setInterval(() => {
       setTimer((current) => {
         if (!current.observedActive || current.authoritativeMs === null) return current
@@ -7955,7 +8553,7 @@ function TimerValue({
       })
     }, 32)
     return () => window.clearInterval(interval)
-  }, [active])
+  }, [active, animationFrameClock])
   const display = (timer.displayMs / 1000).toFixed(2)
   const width = display.length >= 6 ? 'long' : display.length >= 5 ? 'medium' : 'short'
   return <span className="timer-readout" data-width={width}>{display}<span className="timer-unit">s</span></span>
@@ -8064,7 +8662,7 @@ function buildReviewSession(
       stop_condition: stopCondition(
         round.id,
         competitorId,
-        round.round5_protocol === 'round5-fanin-v2',
+        round.round5_protocol === ROUND_FIVE_BELL_PROTOCOL,
       ),
       remembered_metric: recommendation.metric,
       primary: lens(primary),
@@ -8109,7 +8707,7 @@ function fairnessCopy(roundId: RoundId, fanInRoundFive = false): string {
   }
   if (roundId === 'survive_connection_spike') {
     return fanInRoundFive
-      ? 'Phase 1 pooled-path setup is supporting · Phase 2 holds exactly 10,000 authenticated clients in each lane, each on its own clock · 30-second hold, sparse SELECT 1 checks, multiplexing, fairness, telemetry, and cleanup are exact gates'
+      ? 'One server bell starts both independent physical lanes · exactly 10,000 authenticated clients each · 30-second hold, held-connection checks, multiplexing, fairness, telemetry, and cleanup are exact gates'
       : 'Legacy Round 5 scorecard decoded · current 10,000-client fan-in contract not recorded'
   }
   return 'Non-executable round · No live fairness or timing contract'
@@ -8139,13 +8737,6 @@ function armWaitingCopy(status: string): string {
     return 'Lakebase is still returning to idle · Re-arming automatically when zero is verified'
   }
   return status
-}
-
-function applyServerEvent(
-  event: RunEvent,
-  setSession: React.Dispatch<React.SetStateAction<DemoSession | null>>,
-) {
-  setSession((current) => selectRound4Session(current, applyRunEventSnapshot(current, event)))
 }
 
 export default App

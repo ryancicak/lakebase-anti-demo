@@ -75,6 +75,7 @@ from server.recovery import (
     RecoveryRunResult,
     RecoveryStoppedResult,
 )
+from server.round5_warm import Round5WarmState, WarmStoreConflictError
 from server.round_availability import GRANT_REFUSAL_HEADLINE
 from server.safe_change import (
     SafeChangeArm,
@@ -1923,7 +1924,7 @@ async def test_round_five_lease_loss_verifies_cleanup_and_forbids_comparison() -
         await manager.start_arm(created.id, operator)
 
 
-async def test_round_five_verdict_releases_main_before_full_backstage_cleanup() -> None:
+async def test_round_five_keeps_both_leases_until_full_backstage_cleanup() -> None:
     engine = BackgroundCleanupConnectionSpikeEngine()
     main_store = InMemoryBoutLeaseStore()
     round5_store = InMemoryBoutLeaseStore(ring_key="round5")
@@ -1973,12 +1974,8 @@ async def test_round_five_verdict_releases_main_before_full_backstage_cleanup() 
     assert revalidated.metrics == verified.metrics
 
     engine.delete_accepted.set()
-    for _ in range(100):
-        if await main_store.current() is None:
-            break
-        await asyncio.sleep(0.005)
-    else:
-        raise AssertionError("Main ring was not released after Proxy delete acceptance")
+    await asyncio.sleep(0)
+    assert await main_store.current() is not None
     assert await round5_store.current() is not None
 
     round6 = await manager.create(
@@ -1990,9 +1987,8 @@ async def test_round_five_verdict_releases_main_before_full_backstage_cleanup() 
         )
     )
     round6_record = manager._records[round6.id]
-    await manager._claim_bout(round6_record, operator)
-    assert await main_store.current() is not None
-    await manager._release_bout(round6_record)
+    with pytest.raises(InvalidStateError):
+        await manager._claim_bout(round6_record, operator)
 
     second_round5 = await manager.create(
         SessionCreate(
@@ -2002,9 +1998,9 @@ async def test_round_five_verdict_releases_main_before_full_backstage_cleanup() 
             round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
         )
     )
-    with pytest.raises(InvalidStateError, match="BACKSTAGE CLEANUP"):
+    with pytest.raises(InvalidStateError, match="BOUT IN PROGRESS"):
         await manager.start_arm(second_round5.id, operator)
-    assert await main_store.current() is None
+    assert await main_store.current() is not None
 
     engine.cleanup_complete.set()
     cleanup_task = manager._records[created.id].connection_spike_cleanup_task
@@ -2014,6 +2010,184 @@ async def test_round_five_verdict_releases_main_before_full_backstage_cleanup() 
     final = await manager.get(created.id)
     assert final.state == SessionState.VERIFIED
     assert final.comparison is not None
+
+
+async def test_round_five_leases_wait_for_durable_rewarm_transition() -> None:
+    main_store = InMemoryBoutLeaseStore()
+    round5_store = InMemoryBoutLeaseStore(ring_key="round5")
+    transition_entered = asyncio.Event()
+    release_transition = asyncio.Event()
+
+    class WarmCoordinator:
+        store = SimpleNamespace()
+        ring_ready = True
+
+        async def finish_cleanup_and_rewarm(self, claim_id):
+            assert claim_id == "claim-one"
+            transition_entered.set()
+            await release_transition.wait()
+            return SimpleNamespace(
+                state=Round5WarmState.WARMING,
+                claim=None,
+            )
+
+    class CleanEngine:
+        async def wait_for_proxy_delete_accepted(self):
+            return None
+
+        async def wait_for_cleanup_complete(self):
+            return None
+
+    manager = RunManager(
+        lease_store=main_store,
+        round5_lease_store=round5_store,
+        round5_warm_coordinator=WarmCoordinator(),
+    )
+    operator = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    record = manager._records[created.id]
+    record.operator = operator
+    await manager._claim_bout(record, operator)
+    await manager._mark_bout_armed(
+        record,
+        datetime.now(UTC) + timedelta(seconds=90),
+    )
+    await manager._commit_bout(record, operator)
+    record.snapshot.state = SessionState.FAILED
+    await manager._transition_bout_to_cleanup(record, SessionState.FAILED)
+    record.round5_warm_slot = SimpleNamespace(
+        state=Round5WarmState.CLEANING,
+        claim=SimpleNamespace(claim_id="claim-one"),
+    )
+
+    task = asyncio.create_task(
+        manager._complete_connection_spike_cleanup_handoff(
+            record,
+            CleanEngine(),
+        )
+    )
+    await asyncio.wait_for(transition_entered.wait(), timeout=1)
+
+    assert await main_store.current() is not None
+    assert await round5_store.current() is not None
+    with pytest.raises(
+        InvalidStateError,
+        match="rewarm transition is not confirmed",
+    ):
+        await manager._mark_connection_spike_cleanup_complete(record)
+    assert await main_store.current() is not None
+    assert await round5_store.current() is not None
+
+    release_transition.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert await main_store.current() is None
+    assert await round5_store.current() is None
+    await manager.close()
+
+
+async def test_begin_cleanup_conflict_retries_under_retained_authority() -> None:
+    main_store = InMemoryBoutLeaseStore()
+    round5_store = InMemoryBoutLeaseStore(ring_key="round5")
+    claim = SimpleNamespace(claim_id="claim-one")
+
+    class WarmCoordinator:
+        store = SimpleNamespace()
+        ring_ready = True
+        begin_calls = 0
+        finish_calls = 0
+
+        async def begin_cleanup(self, claim_id):
+            assert claim_id == claim.claim_id
+            self.begin_calls += 1
+            if self.begin_calls == 1:
+                raise WarmStoreConflictError("forced first CAS conflict")
+            return SimpleNamespace(
+                state=Round5WarmState.CLEANING,
+                claim=claim,
+            )
+
+        async def finish_cleanup_and_rewarm(self, claim_id):
+            assert claim_id == claim.claim_id
+            self.finish_calls += 1
+            return SimpleNamespace(
+                state=Round5WarmState.WARMING,
+                claim=None,
+            )
+
+    class CleanEngine:
+        reconcile_calls = 0
+
+        async def reconcile_failed_cleanup(self, bout_id, fencing_token):
+            assert bout_id
+            assert fencing_token > 0
+            self.reconcile_calls += 1
+
+        async def stop_setup_and_begin_cleanup(self, bout_id):
+            del bout_id
+
+    warm = WarmCoordinator()
+    engine = CleanEngine()
+    manager = RunManager(
+        lease_store=main_store,
+        round5_lease_store=round5_store,
+        round5_warm_coordinator=warm,
+    )
+    operator = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    record = manager._records[created.id]
+    record.operator = operator
+    record.connection_spike_engine = engine
+    record.round5_warm_slot = SimpleNamespace(
+        state=Round5WarmState.RUNNING,
+        claim=claim,
+    )
+    await manager._claim_bout(record, operator)
+    await manager._mark_bout_armed(
+        record,
+        datetime.now(UTC) + timedelta(seconds=90),
+    )
+    await manager._commit_bout(record, operator)
+    record.snapshot.state = SessionState.FAILED
+    await manager._transition_bout_to_cleanup(record, SessionState.FAILED)
+    manager._closed = True
+
+    await manager._begin_connection_spike_cleanup_handoff(record)
+
+    assert warm.begin_calls == 1
+    assert record.round5_lease is not None
+    assert record.round5_lease.phase == "round5_cleanup"
+    assert await main_store.current() is not None
+    assert await round5_store.current() is not None
+    assert warm.finish_calls == 0
+
+    manager._closed = False
+    completed = await manager._retry_connection_spike_cleanup(
+        record,
+        engine,
+    )
+
+    assert completed is True
+    assert warm.begin_calls == 2
+    assert engine.reconcile_calls == 1
+    assert warm.finish_calls == 1
+    assert await main_store.current() is None
+    assert await round5_store.current() is None
+    assert record.round5_warm_slot.state == Round5WarmState.WARMING
+    await manager.close()
 
 
 async def test_round_five_prearm_guard_refuses_before_engine_or_setup_mutation() -> None:
@@ -2607,9 +2781,24 @@ async def test_round_five_setup_failure_retains_absorbed_exact_stop(caplog) -> N
         assert lakebase.state.value == "verified"
         assert lakebase.setup_elapsed_ms == 420.5
         assert lakebase.status == "Built-in Lakebase pool verified"
-        assert failed.round5_setup.lanes["competitor"].setup_elapsed_ms == 750.0
+        competitor = failed.round5_setup.lanes["competitor"]
+        assert competitor.setup_elapsed_ms is not None
+        assert competitor.setup_elapsed_ms >= 750.0
+        assert competitor.state.value == "failed"
+        assert competitor.elapsed_at_snapshot_ms == competitor.setup_elapsed_ms
+        assert competitor.status == "Stopped after the Round 5 proof failed"
         assert failed.comparison is None
         assert failed.metrics == []
+        # The browser may submit the towel from its preceding RUNNING revision
+        # after the server has already failed and stopped the proof.  That edge
+        # is an idempotent stop, not a misleading 409.
+        stopped_again = await manager.start_towel(created.id)
+        assert stopped_again.state == SessionState.FAILED
+        assert stopped_again.round5_setup is not None
+        assert (
+            stopped_again.round5_setup.lanes["competitor"].setup_elapsed_ms
+            == competitor.setup_elapsed_ms
+        )
         setup_failures = [
             record
             for record in caplog.records
@@ -2653,10 +2842,6 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         return engine
 
     manager = RunManager(connection_spike_factory=factory)
-    if cleanup_abandoned:
-        manager._cleanup_retry_initial = 0.001
-        manager._cleanup_retry_max = 0.001
-        manager._cleanup_retry_attempts = 2
     operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
     selected_competitor = (
         CompetitorId.AURORA_SERVERLESS_V2
@@ -2785,18 +2970,28 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
     if cleanup_failure:
         for _ in range(100):
             retried = await manager.get(created.id)
-            if retried.round5_setup and not retried.round5_setup.cleanup_retryable:
+            if (
+                retried.round5_setup
+                and retried.round5_setup.cleanup_retryable
+            ):
                 break
             await asyncio.sleep(0.005)
         else:
-            raise AssertionError("Cleanup retry did not settle")
+            raise AssertionError("Cleanup failure did not become operator-retryable")
+        assert engine.reconcile_calls == []
+        await manager.retry_connection_spike_cleanup(created.id, operator)
+        record = manager._records[created.id]
+        assert record.task is not None
+        await record.task
+        retried = await manager.get(created.id)
         assert retried.round5_setup is not None
         assert retried.round5_setup.state.value == "failed"
+        assert retried.round5_setup.cleanup_retryable is False
         assert all(
             lane.status == "The live Round 5 proof failed unexpectedly."
             and lane.error == lane.status
             and lane.activity is not None
-            and lane.activity.phase == "cleanup_failed"
+            and lane.activity.phase == "failed"
             for lane in retried.lanes.values()
         )
         assert retried.comparison is None
@@ -2822,7 +3017,7 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         assert sealed is not None, "an abandoned Round 5 cleanup sealed nothing"
         assert sealed.outcome == "declared"
         assert sealed.cleanup_failure is not None
-        assert "did not converge" in sealed.cleanup_failure
+        assert "Retry cleanup" in sealed.cleanup_failure
 
         abandoned = await manager.get(created.id)
         assert abandoned.state == SessionState.VERIFIED
@@ -2836,6 +3031,8 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         # legible: the artifacts were never proved gone.
         assert abandoned.round5_setup.cleanup_retryable is True
         assert (await manager.bout_status()).active is True
+        assert engine.reconcile_calls == []
+        assert manager._releasable(manager._records[created.id]) is False
 
     public = str(terminal.model_dump(mode="json")).lower()
     for forbidden in (
@@ -3161,7 +3358,7 @@ async def test_shutdown_performs_the_round_four_pipeline_stop_no_record_owns() -
     assert api.running is False
 
 
-async def test_round_five_towel_holds_main_until_proxy_delete_acceptance() -> None:
+async def test_round_five_towel_holds_both_leases_until_cleanup_complete() -> None:
     engine = BlockingTowelConnectionSpikeEngine()
     main_store = InMemoryBoutLeaseStore()
     round5_store = InMemoryBoutLeaseStore(ring_key="round5")
@@ -3187,15 +3384,13 @@ async def test_round_five_towel_holds_main_until_proxy_delete_acceptance() -> No
     await asyncio.wait_for(engine.cleanup_started.wait(), timeout=1)
     assert await main_store.current() is not None
     engine.delete_accepted.set()
-    for _ in range(100):
-        if await main_store.current() is None:
-            break
-        await asyncio.sleep(0)
-    assert await main_store.current() is None
+    await asyncio.sleep(0)
+    assert await main_store.current() is not None
     assert await round5_store.current() is not None
     engine.cleanup_complete.set()
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.state == SessionState.TOWELLED
+    assert await main_store.current() is None
     assert await round5_store.current() is None
 
     # And it leaves a receipt. Round 5's towel finishes inside the backstage
@@ -6351,20 +6546,6 @@ async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() ->
         lease_store=main_store,
         round5_lease_store=round5_store,
     )
-    # The backoff runs at its shipped defaults here, and only the waiting is
-    # skipped. Shrinking the attempt count instead -- which this test used to do
-    # -- tests that the loop terminates while saying nothing about *when*, and
-    # that blind spot is how the default sat at roughly eight minutes while a
-    # measured RDS Proxy deletion took 31.5. Cleanup abandoned five minutes
-    # early, wrote `cleanup_failure` onto a healthy bout's receipt, and never
-    # reached the security group behind the proxy at all.
-    slept: list[float] = []
-
-    async def record_sleep(delay: float) -> None:
-        slept.append(delay)
-        await asyncio.sleep(0)
-
-    manager._cleanup_retry_sleep = record_sleep
     created = await manager.create(
         SessionCreate(
             competitor=CompetitorId.RDS_POSTGRES,
@@ -6381,18 +6562,9 @@ async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() ->
     await manager.start_towel(created.id)
     failed = await wait_for_towel(manager, created.id, "failed")
 
-    assert engine.reconcile_attempts == manager._cleanup_retry_attempts
-    # The budget, not the attempt count: a count is meaningless without the
-    # backoff, and this is the sum the loop itself asked to wait for. The floor
-    # is the one slow deletion actually measured against the deployed app --
-    # 31.5 minutes from an accepted `DeleteDBProxy` to the proxy disappearing.
-    # A budget under it puts a false cleanup failure on a healthy receipt.
-    assert sum(slept) >= 31.5 * 60, (
-        f"automatic cleanup gives up after {sum(slept) / 60:.1f} minutes, which is "
-        "shorter than a measured RDS Proxy deletion"
-    )
+    assert engine.reconcile_attempts == 0
     assert failed.towel is not None
-    assert "did not converge" in failed.towel.cleanup_failure
+    assert "Retry cleanup" in failed.towel.cleanup_failure
     record = manager._records[created.id]
     retry_task = record.connection_spike_cleanup_task
     assert retry_task is None or retry_task.done()
@@ -6411,11 +6583,19 @@ async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() ->
     # a round reported success while its cleanup silently failed four times; a
     # receipt that omits the tidy-up is how a reader repeats that mistake.
     assert abandoned.cleanup_failure is not None
-    assert "did not converge" in abandoned.cleanup_failure
+    assert "Retry cleanup" in abandoned.cleanup_failure
 
-    # And the state the operator is left in is one they can act on.
-    engine.relent()
+    # Terminal state is absorbing. Cleanup retries only through Retry Cleanup.
     await manager.start_towel(created.id)
+    assert engine.reconcile_attempts == 0
+    await manager.retry_connection_spike_cleanup(created.id)
+    record = manager._records[created.id]
+    assert record.task is not None
+    await record.task
+    assert engine.reconcile_attempts == 1
+
+    engine.relent()
+    await manager.retry_connection_spike_cleanup(created.id)
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.towel is not None and settled.towel.cleanup_failure is None
     assert await main_store.current() is None

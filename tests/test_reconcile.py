@@ -463,5 +463,5 @@ def test_rates_are_taken_from_the_shared_card_not_reinvented() -> None:
     orphan = next(
         finding for finding in report.orphans if finding.identifier == "i-orphaned-runner"
     )
-    expected = (rates.ec2_m6i_large_hour.usd + rates.public_ipv4_hour.usd) * Decimal(24)
+    expected = (rates.ec2_c7i_2xlarge_hour.usd + rates.public_ipv4_hour.usd) * Decimal(24)
     assert orphan.usd_per_day == expected

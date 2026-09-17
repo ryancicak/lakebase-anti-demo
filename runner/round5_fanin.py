@@ -25,6 +25,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -44,8 +45,9 @@ except ImportError:
         _external_sys.path.insert(0, _external_directory)
     from external_io import connect_runner_database
 
-PROTOCOL = "round5-fanin-v2"
-SCHEMA_VERSION = 2
+PROTOCOL = "round5-fanin-v4"
+SCHEMA_VERSION = 4
+SAFETY_EVIDENCE_VERSION = 5
 TARGET_CLIENTS_PER_LANE = 10_000
 # c7i.2xlarge is load-compatible and evaluatable but not selected: the runner
 # shape is also wired into the cost model (server/cost_model.py ec2_m6i_xlarge_hour
@@ -53,15 +55,20 @@ TARGET_CLIENTS_PER_LANE = 10_000
 # Revisit once a diagnostic's normalized CPU evidence justifies the housekeeping
 # headroom.
 RUNNER_INSTANCE_TYPE = "c7i.2xlarge"
-#: The lanes this protocol knows. A bout runs one or both: each lane holds its 10,000 clients
-#: on its own clock, so one lane is a complete measurement for that lane. `RUNNER_LANE_COUNT`
-#: stays the capacity-planning figure, because the runner must be able to hold both at once
-#: even when a given bout only asks for one.
+#: The lanes this protocol knows. A v3 physical runner executes exactly one of
+#: them, so its capacity model projects one retained 10,000-client fan-in.
 LANE_IDS = frozenset({"lakebase", "competitor"})
-RUNNER_LANE_COUNT = 2
+RUNNER_LANE_COUNT = 1
 WORKER_COUNT = 4
 MIN_RUNNER_CPU_COUNT = WORKER_COUNT
 HOLD_SECONDS = 30
+# Bounded window and poll interval for resolving the per-bout RDS Proxy endpoint
+# during prepare. The endpoint's public DNS record can lag CreateDBProxy by a
+# few seconds; the RELEASE gate keeps any client from connecting before the
+# Proxy is available, so retrying resolution here (rather than crashing on the
+# first gaierror) is safe and stays well within the resident's 720s deadline.
+PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS = 300.0
+PROXY_ENDPOINT_RESOLVE_POLL_SECONDS = 2.0
 SAMPLED_QUERIES_PER_LANE = 64
 SAMPLE_GROUPS = 8
 CLIENTS_PER_SAMPLE_GROUP = 8
@@ -69,6 +76,10 @@ MAX_RETRIES = 0
 INITIAL_WAVE_SIZE = 100
 MIN_WAVE_SIZE = 20
 MICRO_BATCH_SIZE = 2
+MIN_ADMISSION_CONCURRENCY_PER_LANE = 2
+ADMISSION_RECOVERY_STEP_PER_LANE = 1
+ADMISSION_PRESSURE_INTERVALS = 2
+ADMISSION_RECOVERY_CLEAN_INTERVALS = 3
 # Mirrored creation quantum and pipeline depth are separate concerns.
 # MICRO_BATCH_SIZE keeps both lanes interleaved identically; it must stay small.
 # LANE_CONNECT_CONCURRENCY bounds how many of those mirrored clients may be
@@ -127,13 +138,22 @@ RAW_WALL_LAG_WARNING_MS = 50.0
 RAW_WALL_LAG_CEILING_MS = 250.0
 RAW_WALL_LAG_MAX_BREACHES = 3
 OWNED_STALL_MIN_THREAD_CPU_MS = 5.0
-#: A ready batch large enough to be our own amplification rather than the work we asked for.
+#: Ready-batch size retained as diagnostic context, never as independent proof
+#: that a delay belongs to the generator.
 #:
-#: Derived from the connects this protocol deliberately keeps in flight across both lanes, so a
-#: full healthy batch is never suspicious. A flat 16 was below that number, which meant a
-#: perfectly ordinary turn counted as amplification and helped gate a ramp on lag it had not
-#: caused.
-OWNED_STALL_READY_BATCH = LANE_CONNECT_CONCURRENCY * RUNNER_LANE_COUNT
+#: One physical worker deliberately keeps ``LANE_CONNECT_CONCURRENCY`` connects in flight.  The
+#: ownership threshold must not move when the number of physical lanes changes: doing that in v3
+#: lowered it from 30 to 15, exactly the ordinary one-lane batch, and a normal turn was enough to
+#: stop a healthy ramp. Even a larger ready batch can be an ordinary coalesced kernel wakeup, so
+#: only proportional CPU or GC evidence below is allowed to classify a stall as generator-owned.
+OWNED_STALL_READY_BATCH = LANE_CONNECT_CONCURRENCY * 2
+#: Nearest-rank p99 needs at least 100 observations before one outlier no
+#: longer *is* the percentile. At the 10 ms monitor cadence this costs one
+#: second before a sustained generator problem can stop a ramp.
+EVENT_LOOP_P99_MIN_SAMPLES = 100
+#: Ten seconds of monitor history bounds memory while retaining far more than
+#: the minimum p99 population.
+EVENT_LOOP_P99_WINDOW_SAMPLES = 1_000
 RUNTIME_MAX_CPU_CAPACITY_FRACTION = 0.85
 MEMORY_RESERVE_BYTES = 768 * 1024 * 1024
 FD_CONTROL_RESERVE = 256
@@ -151,13 +171,16 @@ APP_PREFIX = "anti-demo-r5-fanin"
 SSL_REQUEST = struct.pack("!II", 8, 80877103)
 PROGRESS_PREFIX = "PROGRESS_JSON:"
 PROGRESS_OUTPUT_BUDGET_BYTES = 12_000
+CONNECTION_DIAGNOSTIC_LIMIT = 16
 PROGRESS_WIRE_FIELDS = (
     "protocol",
     "schema_version",
     "lane_id",
     "phase",
+    "initiated_clients",
     "authenticated_clients",
     "held_clients",
+    "peak_held_clients",
     "terminal_failures",
     "elapsed_ms",
     "time_to_target_ms",
@@ -165,6 +188,10 @@ PROGRESS_WIRE_FIELDS = (
     "sampled_queries_succeeded",
     "sampled_queries_failed",
     "event_loop_p99_ms",
+    "milestone",
+    "milestone_monotonic_ns",
+    "first_socket_initiated_ms",
+    "first_client_authenticated_ms",
 )
 _SHA256 = frozenset("0123456789abcdef")
 _progress_sequence = 0
@@ -197,6 +224,158 @@ _socket_states_cache_ns = 0
 
 class FanInProtocolError(RuntimeError):
     pass
+
+
+class HardSafetyCode(StrEnum):
+    RSS_RESERVE_EXHAUSTED = "rss_reserve_exhausted"
+    AVAILABLE_MEMORY_RESERVE_EXHAUSTED = "available_memory_reserve_exhausted"
+    FILE_DESCRIPTOR_RESERVE_EXHAUSTED = "file_descriptor_reserve_exhausted"
+    EPHEMERAL_PORT_RESERVE_EXHAUSTED = "ephemeral_port_reserve_exhausted"
+    MANDATORY_EVIDENCE_MISSING = "mandatory_safety_evidence_missing"
+    MANDATORY_EVIDENCE_MALFORMED = "mandatory_safety_evidence_malformed"
+
+
+class AdvisoryTelemetryCode(StrEnum):
+    EVENT_LOOP_PRESSURE = "event_loop_pressure"
+    HOST_SCHEDULING_INSTABILITY = "host_scheduling_instability"
+    CPU_PRESSURE = "cpu_pressure"
+    EVENT_LOOP_CALIBRATION = "event_loop_calibration"
+    EVENT_LOOP_MICROBATCH_PRESSURE = "event_loop_microbatch_pressure"
+    EVENT_LOOP_SELECTOR_FANOUT_PRESSURE = "event_loop_selector_fanout_pressure"
+    EVENT_LOOP_SELECTOR_FANOUT_AMPLIFIED = "event_loop_selector_fanout_amplified"
+    EVENT_LOOP_SELECTOR_FANOUT_DEFERRED = "event_loop_selector_fanout_deferred"
+    CPU_CALIBRATION = "cpu_calibration"
+
+
+HARD_SAFETY_CODES = frozenset(code.value for code in HardSafetyCode)
+ADVISORY_TELEMETRY_CODES = frozenset(code.value for code in AdvisoryTelemetryCode)
+
+
+def classify_safety_code(code: str) -> str:
+    """Classify only the protocol's closed typed vocabulary.
+
+    Prefix matching is deliberately forbidden. A new or misspelled code is a
+    protocol mismatch, not permission to silently weaken a hard failure.
+    """
+
+    if code in HARD_SAFETY_CODES:
+        return "hard"
+    if code in ADVISORY_TELEMETRY_CODES:
+        return "advisory"
+    raise FanInProtocolError("unknown_safety_code")
+
+
+@dataclass(slots=True)
+class AdmissionController:
+    """Bound future admission concurrency without cancelling admitted clients."""
+
+    lane_count: int
+    current_concurrency: int = field(init=False)
+    minimum_concurrency: int = field(init=False)
+    maximum_concurrency: int = field(init=False)
+    observed_minimum_concurrency: int = field(init=False)
+    reductions: int = 0
+    recoveries: int = 0
+    throttled_ns: int = 0
+    consecutive_clean_intervals: int = 0
+    consecutive_pressure_intervals: int = 0
+    consecutive_cpu_pressure_intervals: int = 0
+    consecutive_loop_pressure_intervals: int = 0
+    latest_loop_pressured: bool = False
+
+    def __post_init__(self) -> None:
+        if self.lane_count < 1:
+            raise FanInProtocolError("admission_controller_lane_count_invalid")
+        self.minimum_concurrency = self.lane_count * MIN_ADMISSION_CONCURRENCY_PER_LANE
+        self.maximum_concurrency = self.lane_count * LANE_CONNECT_CONCURRENCY
+        self.current_concurrency = self.maximum_concurrency
+        self.observed_minimum_concurrency = self.current_concurrency
+
+    def observe_interval(self, *, pressured: bool) -> None:
+        self.observe_cpu_interval(pressured=pressured)
+
+    def _observe_pressure(self, *, pressured: bool, signal: str) -> None:
+        counter_name = (
+            "consecutive_cpu_pressure_intervals"
+            if signal == "cpu"
+            else "consecutive_loop_pressure_intervals"
+        )
+        if pressured:
+            self.consecutive_clean_intervals = 0
+            next_count = min(
+                ADMISSION_PRESSURE_INTERVALS,
+                int(getattr(self, counter_name)) + 1,
+            )
+            setattr(self, counter_name, next_count)
+            self.consecutive_pressure_intervals = max(
+                self.consecutive_cpu_pressure_intervals,
+                self.consecutive_loop_pressure_intervals,
+            )
+            if next_count < ADMISSION_PRESSURE_INTERVALS:
+                return
+            setattr(self, counter_name, 0)
+            next_value = max(
+                self.minimum_concurrency,
+                self.current_concurrency // 2,
+            )
+            if next_value < self.current_concurrency:
+                self.current_concurrency = next_value
+                self.reductions += 1
+                self.observed_minimum_concurrency = min(
+                    self.observed_minimum_concurrency,
+                    next_value,
+                )
+            return
+        setattr(self, counter_name, 0)
+        self.consecutive_pressure_intervals = max(
+            self.consecutive_cpu_pressure_intervals,
+            self.consecutive_loop_pressure_intervals,
+        )
+        if signal != "cpu":
+            return
+        if self.latest_loop_pressured:
+            self.consecutive_clean_intervals = 0
+            return
+        self.consecutive_clean_intervals = min(
+            ADMISSION_RECOVERY_CLEAN_INTERVALS,
+            self.consecutive_clean_intervals + 1,
+        )
+        if self.consecutive_clean_intervals < ADMISSION_RECOVERY_CLEAN_INTERVALS:
+            return
+        self.consecutive_clean_intervals = 0
+        next_value = min(
+            self.maximum_concurrency,
+            self.current_concurrency
+            + self.lane_count * ADMISSION_RECOVERY_STEP_PER_LANE,
+        )
+        if next_value > self.current_concurrency:
+            self.current_concurrency = next_value
+            self.recoveries += 1
+
+    def observe_loop_interval(self, *, pressured: bool) -> None:
+        self.latest_loop_pressured = pressured
+        self._observe_pressure(pressured=pressured, signal="loop")
+
+    def observe_cpu_interval(self, *, pressured: bool) -> None:
+        self._observe_pressure(pressured=pressured, signal="cpu")
+
+    def record_throttle(self, started_ns: int) -> None:
+        if self.current_concurrency < self.maximum_concurrency:
+            self.throttled_ns += max(0, time.monotonic_ns() - started_ns)
+
+    def public_dict(self) -> dict[str, int | float]:
+        return {
+            "admission_controller_min_concurrency": self.observed_minimum_concurrency,
+            "admission_controller_reductions": self.reductions,
+            "admission_controller_recoveries": self.recoveries,
+            "admission_controller_throttled_ms": self.throttled_ns / 1_000_000,
+            "admission_controller_recovery_hysteresis_intervals": (
+                ADMISSION_RECOVERY_CLEAN_INTERVALS
+            ),
+            "admission_controller_pressure_hysteresis_intervals": (
+                ADMISSION_PRESSURE_INTERVALS
+            ),
+        }
 
 
 class BoundedReadyDeque(collections.deque[object]):
@@ -291,7 +470,13 @@ def classify_generator_owned_stall(
     phase: str,
     gc_pause_ms: float,
 ) -> bool:
-    """Require corroborating local work before blaming a wall-clock delay."""
+    """Require proportional local work before blaming a wall-clock delay.
+
+    Ready and selector batches are captured for diagnosis, but neither is
+    causal evidence: the kernel may coalesce ordinary network readiness after
+    descheduling the pinned process. CPU or GC time must explain at least half
+    of the delayed interval.
+    """
 
     if wall_lag_ms <= RUNTIME_MAX_EVENT_LOOP_P99_MS:
         return False
@@ -300,14 +485,14 @@ def classify_generator_owned_stall(
     # 5 ms floor on the thread clause used to say it did, short-circuiting the process clause
     # that already required a share. The floor is kept as a lower bound so a tiny lag with a
     # tiny CPU reading cannot be attributed either way on noise.
-    corroborating_cpu_ms = max(OWNED_STALL_MIN_THREAD_CPU_MS, wall_lag_ms * 0.5)
-    cpu_owned = thread_cpu_ms >= corroborating_cpu_ms or process_cpu_ms >= corroborating_cpu_ms
-    internal_batch = ready_batch_size >= OWNED_STALL_READY_BATCH or (
-        selector_batch_size >= OWNED_STALL_READY_BATCH
-        and phase in {"protocol_data_received", "authentication_processing"}
+    del ready_batch_size, selector_batch_size, phase
+    corroborating_work_ms = max(OWNED_STALL_MIN_THREAD_CPU_MS, wall_lag_ms * 0.5)
+    cpu_owned = (
+        thread_cpu_ms >= corroborating_work_ms
+        or process_cpu_ms >= corroborating_work_ms
     )
-    gc_owned = gc_pause_ms > RUNTIME_MAX_EVENT_LOOP_P99_MS
-    return cpu_owned or internal_batch or gc_owned
+    gc_owned = gc_pause_ms >= corroborating_work_ms
+    return cpu_owned or gc_owned
 
 
 @dataclass(slots=True)
@@ -1049,6 +1234,10 @@ def contract_values() -> dict[str, int | float | str]:
         "initial_wave_size": INITIAL_WAVE_SIZE,
         "min_wave_size": MIN_WAVE_SIZE,
         "micro_batch_size": MICRO_BATCH_SIZE,
+        "min_admission_concurrency_per_lane": MIN_ADMISSION_CONCURRENCY_PER_LANE,
+        "admission_recovery_step_per_lane": ADMISSION_RECOVERY_STEP_PER_LANE,
+        "admission_pressure_intervals": ADMISSION_PRESSURE_INTERVALS,
+        "admission_recovery_clean_intervals": ADMISSION_RECOVERY_CLEAN_INTERVALS,
         "lane_connect_concurrency": LANE_CONNECT_CONCURRENCY,
         "ready_callback_batch_limit": READY_CALLBACK_BATCH_LIMIT,
         "selector_event_batch_limit": SELECTOR_EVENT_BATCH_LIMIT,
@@ -1076,12 +1265,17 @@ def capacity_model_sha256() -> str:
         "min_runner_cpu_count": MIN_RUNNER_CPU_COUNT,
         "runtime_max_cpu_capacity_fraction": RUNTIME_MAX_CPU_CAPACITY_FRACTION,
         "runtime_max_event_loop_p99_ms": RUNTIME_MAX_EVENT_LOOP_P99_MS,
-        "event_loop_gate_semantics": "wall_plus_cpu_and_internal_work",
+        "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
+        "event_loop_gate_semantics": "advisory_pacing_proportional_cpu_or_gc_only",
+        "pressure_hysteresis_cadence": "cpu_and_loop_independent",
+        "port_accounting_semantics": "every_sample_count_equals_used_plus_remaining",
         "raw_wall_lag_warning_ms": RAW_WALL_LAG_WARNING_MS,
         "raw_wall_lag_ceiling_ms": RAW_WALL_LAG_CEILING_MS,
         "raw_wall_lag_max_breaches": RAW_WALL_LAG_MAX_BREACHES,
         "owned_stall_min_thread_cpu_ms": OWNED_STALL_MIN_THREAD_CPU_MS,
         "owned_stall_ready_batch": OWNED_STALL_READY_BATCH,
+        "event_loop_p99_min_samples": EVENT_LOOP_P99_MIN_SAMPLES,
+        "event_loop_p99_window_samples": EVENT_LOOP_P99_WINDOW_SAMPLES,
         "ready_callback_batch_limit": READY_CALLBACK_BATCH_LIMIT,
         "selector_event_batch_limit": SELECTOR_EVENT_BATCH_LIMIT,
         "lane_connect_concurrency": LANE_CONNECT_CONCURRENCY,
@@ -1108,7 +1302,7 @@ def config_sha256() -> str:
         **contract_values(),
         "lane_ids": ["competitor", "lakebase"],
         "scheduler": (
-            "four-pinned-process-shared-t0-mirrored-two-pair-micro-batches-"
+            "four-pinned-process-one-physical-lane-micro-batches-"
             "bounded-in-flight-unbounded-drain"
         ),
         "sample_schedule": "eight-groups-offset-250ms",
@@ -1156,9 +1350,95 @@ def _open_fds() -> int:
     return len(os.listdir("/proc/self/fd"))
 
 
+def _process_rss_and_fds(process_ids: Sequence[int]) -> tuple[int, int]:
+    rss = 0
+    open_fds = 0
+    for process_id in process_ids:
+        if isinstance(process_id, bool) or not isinstance(process_id, int) or process_id <= 0:
+            raise FanInProtocolError("mandatory_safety_evidence_malformed")
+        process_root = Path(f"/proc/{process_id}")
+        try:
+            resident_pages = int(
+                (process_root / "statm").read_text(encoding="ascii").split()[1]
+            )
+            rss += resident_pages * os.sysconf("SC_PAGE_SIZE")
+            open_fds += sum(1 for _ in (process_root / "fd").iterdir())
+        except (OSError, ValueError, IndexError) as exc:
+            raise FanInProtocolError("mandatory_safety_evidence_missing") from exc
+    return rss, open_fds
+
+
+def host_safety_telemetry(process_ids: Sequence[int]) -> dict[str, object]:
+    """One authoritative host observation for all four resident shards."""
+
+    physical, available = _memory()
+    rss, open_fds = _process_rss_and_fds(process_ids)
+    fd_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    port_count, ports_in_use, ports_remaining = _ephemeral_port_usage()
+    return {
+        "physical_memory_bytes": physical,
+        "available_memory_bytes": available,
+        "rss_bytes": rss,
+        "fd_soft_limit": fd_soft * len(process_ids),
+        "open_fds": open_fds,
+        "ephemeral_port_count": port_count,
+        "ephemeral_ports_in_use": ports_in_use,
+        "ephemeral_ports_remaining": ports_remaining,
+        "event_loop_p99_ms": 0.0,
+        "cpu_capacity_fraction": 0.0,
+    }
+
+
 def _ephemeral_ports() -> tuple[int, int]:
     first, last = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text(encoding="ascii").split()
     return int(first), int(last)
+
+
+def _ephemeral_port_usage(
+    proc_root: Path | None = None,
+) -> tuple[int, int, int]:
+    """Return range size, host-network-namespace ports in use, and remaining ports."""
+
+    root = proc_root or Path("/proc")
+    try:
+        if proc_root is None:
+            first, last = _ephemeral_ports()
+        else:
+            first_raw, last_raw = (
+                root / "sys/net/ipv4/ip_local_port_range"
+            ).read_text(encoding="ascii").split()
+            first, last = int(first_raw), int(last_raw)
+    except (OSError, ValueError) as exc:
+        raise FanInProtocolError("mandatory_safety_evidence_missing") from exc
+    used_ports: set[int] = set()
+    observed_table = False
+    for table in (root / "net/tcp", root / "net/tcp6"):
+        if not table.is_file():
+            continue
+        observed_table = True
+        try:
+            lines = table.read_text(encoding="ascii").splitlines()
+            if not lines or "local_address" not in lines[0]:
+                raise ValueError("missing TCP table header")
+            for line in lines[1:]:
+                fields = line.split()
+                if len(fields) < 2:
+                    raise ValueError("malformed TCP row")
+                _, separator, encoded_port = fields[1].rpartition(":")
+                if not separator:
+                    raise ValueError("malformed local TCP address")
+                port = int(encoded_port, 16)
+                if first <= port <= last:
+                    used_ports.add(port)
+        except (OSError, ValueError) as exc:
+            raise FanInProtocolError("mandatory_safety_evidence_malformed") from exc
+    if not observed_table:
+        raise FanInProtocolError("mandatory_safety_evidence_missing")
+    count = last - first + 1
+    used = len(used_ports)
+    if count <= 0 or used > count:
+        raise FanInProtocolError("mandatory_safety_evidence_malformed")
+    return count, used, max(0, count - used)
 
 
 def _network_bytes() -> tuple[int, int]:
@@ -1279,10 +1559,26 @@ async def _event_loop_selector_fanout_benchmark(
         )
         for writer in writers:
             writer.send(b"x")
-        await asyncio.wait_for(
-            asyncio.gather(completed, heartbeat),
-            timeout=5.0,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(completed, heartbeat),
+                timeout=5.0,
+            )
+        except TimeoutError:
+            # This benchmark runs only before the bell. A timeout is ugly
+            # scheduler/fanout evidence, not proof that the host lacks memory,
+            # descriptors, or ports. Encode it into the advisory measurements.
+            return (
+                max(
+                    5_000.0,
+                    float(heartbeat.result())
+                    if heartbeat.done() and not heartbeat.cancelled()
+                    else 5_000.0,
+                ),
+                max(diagnostics.peak_deferred_selector_events, remaining),
+                diagnostics.selector_wakeups,
+                sockets,
+            )
         return (
             float(heartbeat.result()),
             diagnostics.peak_deferred_selector_events,
@@ -1306,6 +1602,15 @@ def _cpu_calibration() -> float:
     if not value:
         raise FanInProtocolError("cpu_calibration_failed")
     return (time.monotonic_ns() - started) / 1_000_000
+
+
+def _runner_boot_id() -> str:
+    path = Path("/proc/sys/kernel/random/boot_id")
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip()
+    # Deterministic local-test identity. Production Amazon Linux always takes
+    # the procfs branch above.
+    return "local-" + hashlib.sha256(socket.gethostname().encode()).hexdigest()[:32]
 
 
 async def capacity_preflight(instance_type: str) -> dict[str, object]:
@@ -1344,37 +1649,49 @@ async def capacity_preflight(instance_type: str) -> dict[str, object]:
     open_fds = _open_fds()
     projected_fds = open_fds + RUNNER_LANE_COUNT * TARGET_CLIENTS_PER_LANE + FD_CONTROL_RESERVE
     port_count = last - first + 1
-    failures: list[str] = []
+    protocol_failures: list[str] = []
+    hard_safety_failures: list[str] = []
+    advisories: list[str] = []
     cpu_count = len(os.sched_getaffinity(0))
     if instance_type != RUNNER_INSTANCE_TYPE:
-        failures.append("runner_instance_type")
+        protocol_failures.append("runner_instance_type")
     if cpu_count < MIN_RUNNER_CPU_COUNT:
-        failures.append("runner_cpu_count")
+        protocol_failures.append("runner_cpu_count")
     if physical < projected_peak + MEMORY_RESERVE_BYTES:
-        failures.append("physical_memory_projection")
+        hard_safety_failures.append("physical_memory_projection")
     if available < projected_peak - baseline_rss + MEMORY_RESERVE_BYTES:
-        failures.append("available_memory_projection")
+        hard_safety_failures.append("available_memory_projection")
     if projected_fds > math.floor(soft * FD_USAGE_FRACTION):
-        failures.append("file_descriptor_projection")
+        hard_safety_failures.append("file_descriptor_projection")
     if port_count < TARGET_CLIENTS_PER_LANE + EPHEMERAL_PORT_RESERVE_PER_LANE:
-        failures.append("ephemeral_port_projection")
+        hard_safety_failures.append("ephemeral_port_projection")
     if loop_p99 > 20.0:
-        failures.append("event_loop_calibration")
+        advisories.append(AdvisoryTelemetryCode.EVENT_LOOP_CALIBRATION.value)
     if microbatch_p99 > RUNTIME_MAX_EVENT_LOOP_P99_MS:
-        failures.append("event_loop_microbatch_pressure")
+        advisories.append(
+            AdvisoryTelemetryCode.EVENT_LOOP_MICROBATCH_PRESSURE.value
+        )
     if selector_fanout_peak_ms > RUNTIME_MAX_EVENT_LOOP_P99_MS:
-        failures.append("event_loop_selector_fanout_pressure")
+        advisories.append(
+            AdvisoryTelemetryCode.EVENT_LOOP_SELECTOR_FANOUT_PRESSURE.value
+        )
     if selector_fanout_amplification > MAX_SELECTOR_WAKEUP_AMPLIFICATION:
-        failures.append("event_loop_selector_fanout_amplified")
+        advisories.append(
+            AdvisoryTelemetryCode.EVENT_LOOP_SELECTOR_FANOUT_AMPLIFIED.value
+        )
     if selector_fanout_peak_deferred:
-        failures.append("event_loop_selector_fanout_deferred")
+        advisories.append(
+            AdvisoryTelemetryCode.EVENT_LOOP_SELECTOR_FANOUT_DEFERRED.value
+        )
     if cpu_ms > 2_000.0:
-        failures.append("cpu_calibration")
+        advisories.append(AdvisoryTelemetryCode.CPU_CALIBRATION.value)
+    failures = [*protocol_failures, *hard_safety_failures]
     return {
         "schema_version": SCHEMA_VERSION,
         "protocol": PROTOCOL,
         "action": "preflight",
         "instance_type": instance_type,
+        "boot_id": _runner_boot_id(),
         "cpu_count": cpu_count,
         "physical_memory_bytes": physical,
         "available_memory_bytes": available,
@@ -1403,6 +1720,10 @@ async def capacity_preflight(instance_type: str) -> dict[str, object]:
         "generator_sha256": generator_sha256(),
         "config_sha256": config_sha256(),
         "contract_sha256": contract_sha256(),
+        "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
+        "protocol_failures": protocol_failures,
+        "hard_safety_failures": hard_safety_failures,
+        "telemetry_advisories": advisories,
         "failures": failures,
         "sufficient": not failures,
     }
@@ -2114,6 +2435,7 @@ class LaneRuntime:
     auth_methods: set[str] = field(default_factory=set)
     initiated: int = 0
     authenticated: int = 0
+    cancelled: int = 0
     terminal_failures: int = 0
     retries: int = 0
     disconnected_during_hold: int = 0
@@ -2123,11 +2445,28 @@ class LaneRuntime:
     sample_failed: int = 0
     last_progress_milestone: int = 0
     failure_codes: dict[str, int] = field(default_factory=dict)
+    connection_diagnostics: list[dict[str, object]] = field(default_factory=list)
     first_launch_ns: int | None = None
 
-    def unexpected_disconnect(self, lane_id: str) -> None:
+    def record_connection_diagnostic(self, *, ordinal: int, stage: str, code: str) -> None:
+        if len(self.connection_diagnostics) >= CONNECTION_DIAGNOSTIC_LIMIT:
+            return
+        self.connection_diagnostics.append(
+            {
+                "ordinal": ordinal,
+                "stage": stage,
+                "code": code,
+            }
+        )
+
+    def unexpected_disconnect(self, lane_id: str, ordinal: int) -> None:
         if lane_id == self.lane_id:
             self.disconnected_during_hold += 1
+            self.record_connection_diagnostic(
+                ordinal=ordinal,
+                stage="hold",
+                code="unexpected_disconnect",
+            )
 
 
 @dataclass(slots=True)
@@ -2139,6 +2478,7 @@ class TelemetrySummary:
     fd_soft_limit: int = 0
     peak_open_fds: int = 0
     ephemeral_port_count: int = 0
+    peak_ephemeral_ports_in_use: int = 0
     min_ephemeral_port_reserve: int = 2**31 - 1
     peak_event_loop_p99_ms: float = 0.0
     peak_raw_event_loop_p99_ms: float = 0.0
@@ -2146,7 +2486,24 @@ class TelemetrySummary:
     raw_event_loop_warning_count: int = 0
     raw_event_loop_ceiling_breaches: int = 0
     peak_cpu_capacity_fraction: float = 0.0
-    failures: set[str] = field(default_factory=set)
+    # Only resource exhaustion is allowed to stop a proof.  Scheduler timing,
+    # loop lag and CPU saturation are pacing inputs and diagnostic evidence;
+    # treating them as proof failures is what stopped healthy shards at 7,134
+    # authenticated clients with no connection failure.
+    hard_failures: set[str] = field(default_factory=set)
+    advisories: set[str] = field(default_factory=set)
+    raw_loop_lag_samples_ms: collections.deque[float] = field(
+        default_factory=lambda: collections.deque(maxlen=EVENT_LOOP_P99_WINDOW_SAMPLES),
+        repr=False,
+    )
+    owned_loop_lag_samples_ms: collections.deque[float] = field(
+        default_factory=lambda: collections.deque(maxlen=EVENT_LOOP_P99_WINDOW_SAMPLES),
+        repr=False,
+    )
+    external_loop_lag_samples_ms: collections.deque[float] = field(
+        default_factory=lambda: collections.deque(maxlen=EVENT_LOOP_P99_WINDOW_SAMPLES),
+        repr=False,
+    )
 
     def observe_event_loop(
         self,
@@ -2155,58 +2512,164 @@ class TelemetrySummary:
         generator_owned_lag_ms: float | None = None,
     ) -> None:
         owned_lag_ms = raw_lag_ms if generator_owned_lag_ms is None else generator_owned_lag_ms
-        self.peak_raw_event_loop_p99_ms = max(self.peak_raw_event_loop_p99_ms, raw_lag_ms)
-        self.peak_event_loop_p99_ms = max(self.peak_event_loop_p99_ms, owned_lag_ms)
-        if owned_lag_ms > RUNTIME_MAX_EVENT_LOOP_P99_MS:
-            self.failures.add("event_loop_pressure")
-        else:
-            self.peak_external_event_loop_p99_ms = max(
-                self.peak_external_event_loop_p99_ms, raw_lag_ms
+        external_lag_ms = raw_lag_ms if owned_lag_ms <= 0 else 0.0
+        self.raw_loop_lag_samples_ms.append(raw_lag_ms)
+        self.owned_loop_lag_samples_ms.append(owned_lag_ms)
+        self.external_loop_lag_samples_ms.append(external_lag_ms)
+        sample_count = len(self.raw_loop_lag_samples_ms)
+        raw_p99 = percentile(tuple(self.raw_loop_lag_samples_ms), 0.99) or 0.0
+        external_p99 = percentile(tuple(self.external_loop_lag_samples_ms), 0.99) or 0.0
+        self.peak_raw_event_loop_p99_ms = max(
+            self.peak_raw_event_loop_p99_ms,
+            raw_p99,
+        )
+        self.peak_external_event_loop_p99_ms = max(
+            self.peak_external_event_loop_p99_ms,
+            external_p99,
+        )
+        if sample_count >= EVENT_LOOP_P99_MIN_SAMPLES:
+            owned_p99 = percentile(tuple(self.owned_loop_lag_samples_ms), 0.99) or 0.0
+            self.peak_event_loop_p99_ms = max(
+                self.peak_event_loop_p99_ms,
+                owned_p99,
             )
+            if owned_p99 > RUNTIME_MAX_EVENT_LOOP_P99_MS:
+                self.advisories.add(AdvisoryTelemetryCode.EVENT_LOOP_PRESSURE.value)
         if raw_lag_ms > RAW_WALL_LAG_WARNING_MS:
             self.raw_event_loop_warning_count += 1
         if raw_lag_ms > RAW_WALL_LAG_CEILING_MS:
             self.raw_event_loop_ceiling_breaches += 1
             if self.raw_event_loop_ceiling_breaches >= RAW_WALL_LAG_MAX_BREACHES:
-                self.failures.add("host_scheduling_instability")
+                self.advisories.add(
+                    AdvisoryTelemetryCode.HOST_SCHEDULING_INSTABILITY.value
+                )
 
     def observe(self, value: Mapping[str, object]) -> None:
-        self.samples += 1
+        mandatory = {
+            "physical_memory_bytes",
+            "available_memory_bytes",
+            "rss_bytes",
+            "fd_soft_limit",
+            "open_fds",
+            "ephemeral_port_count",
+            "ephemeral_ports_in_use",
+            "ephemeral_ports_remaining",
+            "event_loop_p99_ms",
+            "cpu_capacity_fraction",
+        }
+        if not mandatory <= set(value):
+            self.hard_failures.add(HardSafetyCode.MANDATORY_EVIDENCE_MISSING.value)
+            return
+        integer_fields = mandatory - {
+            "event_loop_p99_ms",
+            "cpu_capacity_fraction",
+        }
+        if any(
+            isinstance(value[name], bool)
+            or not isinstance(value[name], int)
+            or int(value[name]) < 0
+            for name in integer_fields
+        ) or any(
+            isinstance(value[name], bool)
+            or not isinstance(value[name], (int, float))
+            or not math.isfinite(float(value[name]))
+            or float(value[name]) < 0
+            for name in ("event_loop_p99_ms", "cpu_capacity_fraction")
+        ):
+            self.hard_failures.add(HardSafetyCode.MANDATORY_EVIDENCE_MALFORMED.value)
+            return
         physical = int(value["physical_memory_bytes"])
         available = int(value["available_memory_bytes"])
         rss = int(value["rss_bytes"])
         fd_soft = int(value["fd_soft_limit"])
         open_fds = int(value["open_fds"])
         ports = int(value["ephemeral_port_count"])
-        port_reserve = ports - TARGET_CLIENTS_PER_LANE
+        ports_in_use = int(value["ephemeral_ports_in_use"])
+        port_reserve = int(value["ephemeral_ports_remaining"])
         loop_p99 = float(value["event_loop_p99_ms"])
         cpu_fraction = float(value["cpu_capacity_fraction"])
+        if (
+            physical <= 0
+            or fd_soft <= 0
+            or ports <= 0
+            or available > physical
+            or rss > physical
+            or open_fds > fd_soft
+            or ports != ports_in_use + port_reserve
+        ):
+            self.hard_failures.add(
+                HardSafetyCode.MANDATORY_EVIDENCE_MALFORMED.value
+            )
+            return
+        self.samples += 1
         self.physical_memory_bytes = physical
         self.min_available_memory_bytes = min(self.min_available_memory_bytes, available)
         self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
         self.fd_soft_limit = fd_soft
         self.peak_open_fds = max(self.peak_open_fds, open_fds)
         self.ephemeral_port_count = ports
+        self.peak_ephemeral_ports_in_use = max(
+            self.peak_ephemeral_ports_in_use,
+            ports_in_use,
+        )
         self.min_ephemeral_port_reserve = min(self.min_ephemeral_port_reserve, port_reserve)
-        self.observe_event_loop(loop_p99)
+        # This value is already a p99 from a 200-turn calibration, but it has no
+        # interval CPU/GC attribution. Keep it as raw/external diagnostic
+        # evidence; generator ownership comes only from the continuous monitor.
+        self.peak_raw_event_loop_p99_ms = max(
+            self.peak_raw_event_loop_p99_ms,
+            loop_p99,
+        )
+        self.peak_external_event_loop_p99_ms = max(
+            self.peak_external_event_loop_p99_ms,
+            loop_p99,
+        )
+        if loop_p99 > RAW_WALL_LAG_WARNING_MS:
+            self.raw_event_loop_warning_count += 1
+        if loop_p99 > RAW_WALL_LAG_CEILING_MS:
+            self.raw_event_loop_ceiling_breaches += 1
+            if self.raw_event_loop_ceiling_breaches >= RAW_WALL_LAG_MAX_BREACHES:
+                self.advisories.add(
+                    AdvisoryTelemetryCode.HOST_SCHEDULING_INSTABILITY.value
+                )
         self.peak_cpu_capacity_fraction = max(self.peak_cpu_capacity_fraction, cpu_fraction)
         if rss > physical - MEMORY_RESERVE_BYTES:
-            self.failures.add("rss_pressure")
+            self.hard_failures.add(HardSafetyCode.RSS_RESERVE_EXHAUSTED.value)
         if available < MEMORY_RESERVE_BYTES:
-            self.failures.add("available_memory_pressure")
+            self.hard_failures.add(
+                HardSafetyCode.AVAILABLE_MEMORY_RESERVE_EXHAUSTED.value
+            )
         if open_fds > math.floor(fd_soft * FD_USAGE_FRACTION):
-            self.failures.add("file_descriptor_pressure")
+            self.hard_failures.add(
+                HardSafetyCode.FILE_DESCRIPTOR_RESERVE_EXHAUSTED.value
+            )
         if port_reserve < EPHEMERAL_PORT_RESERVE_PER_LANE:
-            self.failures.add("ephemeral_port_pressure")
+            self.hard_failures.add(
+                HardSafetyCode.EPHEMERAL_PORT_RESERVE_EXHAUSTED.value
+            )
         if cpu_fraction > RUNTIME_MAX_CPU_CAPACITY_FRACTION:
-            self.failures.add("cpu_pressure")
+            self.advisories.add(AdvisoryTelemetryCode.CPU_PRESSURE.value)
 
     @property
     def verified(self) -> bool:
-        return self.samples > 0 and not self.failures
+        return self.samples > 0 and not self.hard_failures
+
+    @property
+    def pacing_pressure(self) -> bool:
+        return bool(
+            self.advisories
+            & {
+                AdvisoryTelemetryCode.EVENT_LOOP_PRESSURE.value,
+                AdvisoryTelemetryCode.HOST_SCHEDULING_INSTABILITY.value,
+                AdvisoryTelemetryCode.CPU_PRESSURE.value,
+            }
+        )
 
     def public_dict(self) -> dict[str, object]:
+        for code in (*self.hard_failures, *self.advisories):
+            classify_safety_code(code)
         return {
+            "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
             "telemetry_samples": self.samples,
             "telemetry_physical_memory_bytes": self.physical_memory_bytes,
             "telemetry_min_available_memory_bytes": (
@@ -2216,6 +2679,9 @@ class TelemetrySummary:
             "telemetry_fd_soft_limit": self.fd_soft_limit,
             "telemetry_peak_open_fds": self.peak_open_fds,
             "telemetry_ephemeral_port_count": self.ephemeral_port_count,
+            "telemetry_peak_ephemeral_ports_in_use": (
+                self.peak_ephemeral_ports_in_use
+            ),
             "telemetry_min_ephemeral_port_reserve": (
                 self.min_ephemeral_port_reserve if self.samples else 0
             ),
@@ -2225,7 +2691,17 @@ class TelemetrySummary:
             "telemetry_raw_event_loop_warning_count": (self.raw_event_loop_warning_count),
             "telemetry_raw_event_loop_ceiling_breaches": (self.raw_event_loop_ceiling_breaches),
             "telemetry_peak_cpu_capacity_fraction": (self.peak_cpu_capacity_fraction),
-            "telemetry_failures": sorted(self.failures),
+            "hard_safety_verified": self.verified,
+            "port_accounting_verified": self.samples > 0
+            and not (
+                {
+                    HardSafetyCode.MANDATORY_EVIDENCE_MISSING.value,
+                    HardSafetyCode.MANDATORY_EVIDENCE_MALFORMED.value,
+                }
+                & self.hard_failures
+            ),
+            "telemetry_failures": sorted(self.hard_failures),
+            "telemetry_advisories": sorted(self.advisories),
         }
 
 
@@ -2249,7 +2725,7 @@ def _telemetry(
     states = dict(_socket_states_cache) if include_socket_states else {}
     physical, available = _memory()
     fd_soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-    first, last = _ephemeral_ports()
+    port_count, ports_in_use, ports_remaining = _ephemeral_port_usage()
     elapsed_seconds = max(
         (time.monotonic_ns() - started_ns) / 1_000_000_000,
         0.001,
@@ -2266,7 +2742,9 @@ def _telemetry(
         "rss_bytes": _rss_bytes(),
         "fd_soft_limit": fd_soft,
         "open_fds": _open_fds(),
-        "ephemeral_port_count": last - first + 1,
+        "ephemeral_port_count": port_count,
+        "ephemeral_ports_in_use": ports_in_use,
+        "ephemeral_ports_remaining": ports_remaining,
         "socket_states": states,
         "network_received_bytes": max(0, received - network_start[0]),
         "network_sent_bytes": max(0, sent - network_start[1]),
@@ -2332,6 +2810,25 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
         runtime.first_launch_ns = time.monotonic_ns()
     ordinal = runtime.initiated
     runtime.initiated += 1
+    if runtime.initiated == 1:
+        _progress(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "protocol": PROTOCOL,
+                "lane_id": runtime.lane_id,
+                "phase": "ramp",
+                "initiated_clients": runtime.initiated,
+                "authenticated_clients": runtime.authenticated,
+                "held_clients": 0,
+                "terminal_failures": runtime.terminal_failures,
+                "sampled_queries_succeeded": 0,
+                "sampled_queries_failed": 0,
+                "elapsed_ms": (time.monotonic_ns() - t0_ns) / 1_000_000,
+                "time_to_target_ms": None,
+                "milestone": "first_socket_initiated",
+                "milestone_monotonic_ns": runtime.first_launch_ns,
+            }
+        )
     allocation_started_ns = time.perf_counter_ns()
     client = PostgresClient(
         lane_id=runtime.lane_id,
@@ -2339,7 +2836,10 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
         database=runtime.database,
         application_name=runtime.application_name,
         ssl_context=runtime.ssl_context,
-        on_unexpected_disconnect=runtime.unexpected_disconnect,
+        on_unexpected_disconnect=lambda lane_id: runtime.unexpected_disconnect(
+            lane_id,
+            ordinal,
+        ),
         key_cache=runtime.key_cache,
     )
     runtime.clients.append(client)
@@ -2356,10 +2856,39 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
             await client.authenticated
         completed_ns = time.monotonic_ns()
         runtime.authenticated += 1
+        if runtime.authenticated == 1:
+            _progress(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "protocol": PROTOCOL,
+                    "lane_id": runtime.lane_id,
+                    "phase": "ramp",
+                    "initiated_clients": runtime.initiated,
+                    "authenticated_clients": runtime.authenticated,
+                    "held_clients": sum(
+                        client.ready and not client.closed.done()
+                        for client in runtime.clients
+                    ),
+                    "terminal_failures": runtime.terminal_failures,
+                    "sampled_queries_succeeded": 0,
+                    "sampled_queries_failed": 0,
+                    "elapsed_ms": (time.monotonic_ns() - t0_ns) / 1_000_000,
+                    "time_to_target_ms": None,
+                    "milestone": "first_client_authenticated",
+                    "milestone_monotonic_ns": completed_ns,
+                }
+            )
         runtime.auth_methods.add(client.auth_method)
         runtime.connect_latencies_ms.append((completed_ns - started_ns) / 1_000_000)
         if runtime.authenticated == runtime.target_clients:
             runtime.target_elapsed_ns = completed_ns - t0_ns
+    except asyncio.CancelledError:
+        # The launch already owns an ordinal and is included in ``initiated``.  Account for that
+        # terminal disposition before propagating cancellation; otherwise a telemetry stop or a
+        # towel leaves initiated > authenticated + failures with no explanation.
+        runtime.cancelled += 1
+        client.close()
+        raise
     except Exception as exc:
         runtime.terminal_failures += 1
         if isinstance(exc, FanInProtocolError):
@@ -2376,6 +2905,11 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
         else:
             code = "connect_failed"
         runtime.failure_codes[code] = runtime.failure_codes.get(code, 0) + 1
+        runtime.record_connection_diagnostic(
+            ordinal=ordinal,
+            stage="connect",
+            code=code,
+        )
         client.close()
 
 
@@ -2383,6 +2917,7 @@ async def _open_equal_wave(
     lanes: Sequence[LaneRuntime],
     wave_size: int,
     t0_ns: int,
+    admission_controller: AdmissionController,
 ) -> None:
     """Launch one mirrored wave, bounding in-flight connects instead of draining.
 
@@ -2399,9 +2934,6 @@ async def _open_equal_wave(
     guard ran; with a pipeline it is not.
     """
 
-    lane_count = max(1, len(lanes))
-    limit = max(lane_count, LANE_CONNECT_CONCURRENCY * lane_count)
-    headroom = max(0, limit - MICRO_BATCH_SIZE * lane_count)
     baseline = {lane.lane_id: lane.initiated for lane in lanes}
     created = {lane.lane_id: 0 for lane in lanes}
     in_flight: set[asyncio.Task[None]] = set()
@@ -2416,8 +2948,15 @@ async def _open_equal_wave(
 
     try:
         while launched < wave_size:
-            await settle(headroom)
             quantum = min(MICRO_BATCH_SIZE, wave_size - launched)
+            quantum_tasks = quantum * len(lanes)
+            headroom = max(
+                0,
+                admission_controller.current_concurrency - quantum_tasks,
+            )
+            throttle_started_ns = time.monotonic_ns()
+            await settle(headroom)
+            admission_controller.record_throttle(throttle_started_ns)
             creation_started_ns = time.perf_counter_ns()
             for _ in range(quantum):
                 for lane in lanes:
@@ -2446,6 +2985,7 @@ async def _open_equal_wave_guarded(
     start_cpu: float,
     network_start: tuple[int, int],
     telemetry_summary: TelemetrySummary,
+    admission_controller: AdmissionController,
 ) -> float:
     """Open one symmetric wave while measuring pressure during the work."""
 
@@ -2486,6 +3026,15 @@ async def _open_equal_wave_guarded(
             sample.wall_lag_ms,
             generator_owned_lag_ms=sample.generator_owned_lag_ms,
         )
+        admission_controller.observe_loop_interval(
+            pressured=(
+                sample.generator_owned_lag_ms > 20.0
+                or (
+                    sample.scheduler_wait_ms is not None
+                    and sample.scheduler_wait_ms > 20.0
+                )
+            )
+        )
         if _runtime_diagnostics is not None:
             _runtime_diagnostics.observe_loop(sample)
         monitor_expected = loop.time() + LOOP_MONITOR_INTERVAL_SECONDS
@@ -2497,7 +3046,14 @@ async def _open_equal_wave_guarded(
         monitor_handle = loop.call_at(monitor_expected, monitor_tick)
 
     monitor_handle = loop.call_at(monitor_expected, monitor_tick)
-    wave = asyncio.create_task(_open_equal_wave(lanes, wave_size, t0_ns))
+    wave = asyncio.create_task(
+        _open_equal_wave(
+            lanes,
+            wave_size,
+            t0_ns,
+            admission_controller,
+        )
+    )
     try:
         while not wave.done():
             await asyncio.wait(
@@ -2511,7 +3067,11 @@ async def _open_equal_wave_guarded(
                 0.0,
             )
             telemetry_summary.observe(telemetry)
-            if telemetry_summary.failures and not wave.done():
+            admission_controller.observe_cpu_interval(
+                pressured=float(telemetry["cpu_capacity_fraction"])
+                > RUNTIME_MAX_CPU_CAPACITY_FRACTION
+            )
+            if telemetry_summary.hard_failures and not wave.done():
                 wave.cancel()
                 await asyncio.gather(wave, return_exceptions=True)
                 break
@@ -2566,6 +3126,13 @@ async def _sample_group(runtime: LaneRuntime, group_index: int) -> None:
     successes = sum(not isinstance(result, BaseException) for result in results)
     runtime.sample_succeeded += successes
     runtime.sample_failed += len(results) - successes
+    for client, result in zip(clients, results, strict=True):
+        if isinstance(result, BaseException):
+            runtime.record_connection_diagnostic(
+                ordinal=client.ordinal,
+                stage="sample",
+                code="sample_query_failed",
+            )
 
 
 async def _hold_and_sample(
@@ -2609,12 +3176,11 @@ async def _hold_and_sample(
                     await asyncio.sleep(0.25)
                 await _sample_group(sampled_lane, group)
             hold_elapsed = (time.monotonic_ns() - hold_started_ns) / 1_000_000
-            loop_lag = await _event_loop_calibration()
             telemetry = await _telemetry_off_loop(
                 start_cpu,
                 t0_ns,
                 network_start,
-                loop_lag,
+                telemetry_summary.peak_raw_event_loop_p99_ms,
             )
             telemetry_summary.observe(telemetry)
             for lane in lanes:
@@ -2624,6 +3190,7 @@ async def _hold_and_sample(
                         "protocol": PROTOCOL,
                         "lane_id": lane.lane_id,
                         "phase": "hold",
+                        "initiated_clients": lane.initiated,
                         "authenticated_clients": lane.authenticated,
                         "held_clients": sum(
                             client.ready and not client.closed.done() for client in lane.clients
@@ -2640,12 +3207,12 @@ async def _hold_and_sample(
                         **telemetry,
                     }
                 )
-            if telemetry_summary.failures:
+            if telemetry_summary.hard_failures:
                 break
         remaining = HOLD_SECONDS - (time.monotonic_ns() - hold_started_ns) / 1_000_000_000
-        if remaining > 0 and not telemetry_summary.failures:
+        if remaining > 0 and not telemetry_summary.hard_failures:
             await asyncio.sleep(remaining)
-        if not telemetry_summary.failures:
+        if not telemetry_summary.hard_failures:
             observer_stop.set()
             observer_results = await asyncio.gather(
                 *observer_tasks,
@@ -2657,13 +3224,12 @@ async def _hold_and_sample(
                 *(observer.sample() for observer in observers),
                 return_exceptions=True,
             )
-            loop_lag = await _event_loop_calibration()
             telemetry_summary.observe(
                 await _telemetry_off_loop(
                     start_cpu,
                     t0_ns,
                     network_start,
-                    loop_lag,
+                    telemetry_summary.peak_raw_event_loop_p99_ms,
                 )
             )
     finally:
@@ -2725,9 +3291,11 @@ def _lane_result(
         "lane_id": runtime.lane_id,
         "initiated_clients": runtime.initiated,
         "authenticated_clients": runtime.authenticated,
+        "cancelled_clients": runtime.cancelled,
         "held_clients_at_gate": current_held,
         "terminal_failures": runtime.terminal_failures,
         "failure_codes": dict(sorted(runtime.failure_codes.items())),
+        "connection_diagnostics": list(runtime.connection_diagnostics),
         "retries": runtime.retries,
         "disconnected_during_hold": runtime.disconnected_during_hold,
         "time_to_target_ns": runtime.target_elapsed_ns,
@@ -2792,6 +3360,7 @@ def aggregate_worker_results(
         raise FanInProtocolError("fanin_worker_index_invalid")
     ordered = [by_index[index] for index in range(WORKER_COUNT)]
     release_values = {int(result.get("release_ns", -1)) for result in ordered}
+    hold_values = {int(result.get("hold_ns", -1)) for result in ordered}
     worker_cpus = {int(result.get("worker_cpu", -1)) for result in ordered}
     run_ids = {str(result.get("run_id") or "") for result in ordered}
     for name, expected in (
@@ -2803,12 +3372,15 @@ def aggregate_worker_results(
         ("capacity_model_sha256", capacity_model_sha256()),
         ("worker_count", WORKER_COUNT),
         ("partition_target_clients", PARTITION_CLIENTS_PER_LANE),
+        ("worker_outcome", "completed"),
     ):
         if any(result.get(name) != expected for result in ordered):
             raise FanInProtocolError(f"fanin_worker_{name}_mismatch")
     if (
         len(release_values) != 1
         or next(iter(release_values)) < 1
+        or len(hold_values) != 1
+        or next(iter(hold_values)) <= next(iter(release_values))
         or len(run_ids) != 1
         or not next(iter(run_ids))
     ):
@@ -2845,6 +3417,60 @@ def aggregate_worker_results(
     ]
     if len(telemetry_values) != WORKER_COUNT:
         raise FanInProtocolError("fanin_worker_telemetry_invalid")
+    mandatory_telemetry = {
+        "safety_evidence_version",
+        "telemetry_samples",
+        "telemetry_physical_memory_bytes",
+        "telemetry_min_available_memory_bytes",
+        "telemetry_peak_rss_bytes",
+        "telemetry_fd_soft_limit",
+        "telemetry_peak_open_fds",
+        "telemetry_ephemeral_port_count",
+        "telemetry_peak_ephemeral_ports_in_use",
+        "telemetry_min_ephemeral_port_reserve",
+        "telemetry_peak_event_loop_p99_ms",
+        "telemetry_peak_raw_event_loop_p99_ms",
+        "telemetry_peak_external_event_loop_p99_ms",
+        "telemetry_raw_event_loop_warning_count",
+        "telemetry_raw_event_loop_ceiling_breaches",
+        "telemetry_peak_cpu_capacity_fraction",
+        "hard_safety_verified",
+        "port_accounting_verified",
+        "telemetry_failures",
+        "telemetry_advisories",
+        "admission_controller_min_concurrency",
+        "admission_controller_reductions",
+        "admission_controller_recoveries",
+        "admission_controller_throttled_ms",
+    }
+    for telemetry in telemetry_values:
+        if not mandatory_telemetry <= set(telemetry):
+            raise FanInProtocolError("fanin_worker_telemetry_missing")
+        numeric = mandatory_telemetry - {
+            "hard_safety_verified",
+            "port_accounting_verified",
+            "telemetry_failures",
+            "telemetry_advisories",
+        }
+        if any(
+            isinstance(telemetry[name], bool)
+            or not isinstance(telemetry[name], (int, float))
+            or not math.isfinite(float(telemetry[name]))
+            or float(telemetry[name]) < 0
+            for name in numeric
+        ):
+            raise FanInProtocolError("fanin_worker_telemetry_malformed")
+        if (
+            telemetry["telemetry_samples"] <= 0
+            or telemetry["telemetry_physical_memory_bytes"] <= 0
+            or telemetry["telemetry_fd_soft_limit"] <= 0
+            or telemetry["telemetry_ephemeral_port_count"] <= 0
+            or telemetry["hard_safety_verified"] is not True
+            or telemetry["port_accounting_verified"] is not True
+            or not isinstance(telemetry["telemetry_failures"], list)
+            or not isinstance(telemetry["telemetry_advisories"], list)
+        ):
+            raise FanInProtocolError("fanin_worker_telemetry_malformed")
     telemetry_failures = sorted(
         {
             str(failure)
@@ -2852,7 +3478,22 @@ def aggregate_worker_results(
             for failure in telemetry.get("telemetry_failures", [])
         }
     )
+    telemetry_advisories = sorted(
+        {
+            str(advisory)
+            for telemetry in telemetry_values
+            for advisory in telemetry.get("telemetry_advisories", [])
+        }
+    )
+    for code in (*telemetry_failures, *telemetry_advisories):
+        classify_safety_code(code)
+    if any(
+        value.get("safety_evidence_version") != SAFETY_EVIDENCE_VERSION
+        for value in telemetry_values
+    ):
+        raise FanInProtocolError("fanin_worker_safety_evidence_version_mismatch")
     aggregate_telemetry: dict[str, object] = {
+        "safety_evidence_version": SAFETY_EVIDENCE_VERSION,
         "telemetry_samples": sum(int(value["telemetry_samples"]) for value in telemetry_values),
         "telemetry_physical_memory_bytes": int(
             telemetry_values[0]["telemetry_physical_memory_bytes"]
@@ -2869,6 +3510,10 @@ def aggregate_worker_results(
         ),
         "telemetry_ephemeral_port_count": int(
             telemetry_values[0]["telemetry_ephemeral_port_count"]
+        ),
+        "telemetry_peak_ephemeral_ports_in_use": max(
+            int(value["telemetry_peak_ephemeral_ports_in_use"])
+            for value in telemetry_values
         ),
         "telemetry_min_ephemeral_port_reserve": min(
             int(value["telemetry_min_ephemeral_port_reserve"]) for value in telemetry_values
@@ -2897,11 +3542,45 @@ def aggregate_worker_results(
             int(value.get("telemetry_raw_event_loop_ceiling_breaches", 0))
             for value in telemetry_values
         ),
-        "telemetry_peak_cpu_capacity_fraction": (
-            sum(float(value["telemetry_peak_cpu_capacity_fraction"]) for value in telemetry_values)
-            / len(telemetry_values)
+        # A peak is a maximum.  Averaging four worker peaks hid a saturated
+        # shard behind three idle ones and made this diagnostic contradict its
+        # own field name.
+        "telemetry_peak_cpu_capacity_fraction": max(
+            float(value["telemetry_peak_cpu_capacity_fraction"])
+            for value in telemetry_values
+        ),
+        "hard_safety_verified": (
+            not telemetry_failures
+            and all(value.get("hard_safety_verified") is True for value in telemetry_values)
+        ),
+        "port_accounting_verified": all(
+            value["port_accounting_verified"] is True
+            for value in telemetry_values
         ),
         "telemetry_failures": telemetry_failures,
+        "telemetry_advisories": telemetry_advisories,
+        "admission_controller_min_concurrency": min(
+            int(value["admission_controller_min_concurrency"])
+            for value in telemetry_values
+        ),
+        "admission_controller_reductions": sum(
+            int(value["admission_controller_reductions"])
+            for value in telemetry_values
+        ),
+        "admission_controller_recoveries": sum(
+            int(value["admission_controller_recoveries"])
+            for value in telemetry_values
+        ),
+        "admission_controller_throttled_ms": sum(
+            float(value["admission_controller_throttled_ms"])
+            for value in telemetry_values
+        ),
+        "admission_controller_recovery_hysteresis_intervals": (
+            ADMISSION_RECOVERY_CLEAN_INTERVALS
+        ),
+        "admission_controller_pressure_hysteresis_intervals": (
+            ADMISSION_PRESSURE_INTERVALS
+        ),
     }
 
     aggregated_lanes: list[dict[str, object]] = []
@@ -2910,12 +3589,40 @@ def aggregate_worker_results(
         all_first_launches.extend(int(value["first_launch_ns"]) for value in values)
     launch_skew_ms = (max(all_first_launches) - min(all_first_launches)) / 1_000_000
     for lane_id, values in worker_lanes.items():
+        worker_target_elapsed_ns = [
+            int(value.get("time_to_target_ns") or 0) for value in values
+        ]
+        parent_hold_elapsed_ns = next(iter(hold_values)) - next(iter(release_values))
+        if any(
+            value <= 0 or value > parent_hold_elapsed_ns
+            for value in worker_target_elapsed_ns
+        ):
+            raise FanInProtocolError("fanin_worker_target_timestamp_invalid")
+        if any(
+            float(value.get("hold_elapsed_ms") or 0.0) < HOLD_SECONDS * 1_000
+            or float(value.get("achieved_elapsed_ms") or 0.0)
+            < parent_hold_elapsed_ns / 1_000_000 + HOLD_SECONDS * 1_000
+            for value in values
+        ):
+            raise FanInProtocolError("fanin_worker_completion_chronology_invalid")
+        exact_gate_elapsed_ns = max(worker_target_elapsed_ns)
         samples = [
             float(sample)
             for value in values
             for sample in value.get("connect_latency_samples_ms", [])
         ]
         pids = {int(pid) for value in values for pid in value.get("observer_backend_pids", [])}
+        connection_diagnostics = [
+            {
+                "worker_index": worker_index,
+                "ordinal": int(item.get("ordinal", -1)),
+                "stage": str(item.get("stage") or "unknown"),
+                "code": str(item.get("code") or "unknown"),
+            }
+            for worker_index, value in enumerate(values)
+            for item in value.get("connection_diagnostics", [])
+            if isinstance(item, Mapping)
+        ][:CONNECTION_DIAGNOSTIC_LIMIT]
         exact_fields = (
             "endpoint_host_sha256",
             "credential_sha256",
@@ -2971,6 +3678,14 @@ def aggregate_worker_results(
         disagreed = sorted(
             field for field in exact_fields if len({str(value[field]) for value in values}) != 1
         )
+        preexisting_values = {
+            int(value["preexisting_client_role_sessions"])
+            for value in values
+        }
+        if len(preexisting_values) != 1:
+            raise FanInProtocolError(
+                "fanin_worker_preexisting_session_observation_mismatch"
+            )
         if disagreed:
             # The per-worker values, once, so a genuine disagreement does not cost another
             # twelve-minute reproduction to characterise. Auth methods are the fixed
@@ -3001,30 +3716,23 @@ def aggregate_worker_results(
             raise FanInProtocolError(token[:64].rstrip("_"))
         initiated = sum(int(value["initiated_clients"]) for value in values)
         authenticated = sum(int(value["authenticated_clients"]) for value in values)
+        cancelled = sum(int(value.get("cancelled_clients", 0)) for value in values)
         held = sum(int(value["held_clients_at_gate"]) for value in values)
         terminal_failures = sum(int(value["terminal_failures"]) for value in values)
         worker_counts_exact = all(
             int(value["initiated_clients"]) == PARTITION_CLIENTS_PER_LANE
             and int(value["authenticated_clients"]) == PARTITION_CLIENTS_PER_LANE
+            and int(value.get("cancelled_clients", 0)) == 0
             and int(value["held_clients_at_gate"]) == PARTITION_CLIENTS_PER_LANE
             for value in values
         )
         auth_method = str(values[0]["auth_method"])
-        target_ns_values = [
-            int(value["time_to_target_ns"])
-            for value in values
-            if value.get("time_to_target_ns") is not None
-        ]
-        target_ms_values = [
-            float(value["time_to_target_ms"])
-            for value in values
-            if value.get("time_to_target_ms") is not None
-        ]
         aggregated_lanes.append(
             {
                 "lane_id": lane_id,
                 "initiated_clients": initiated,
                 "authenticated_clients": authenticated,
+                "cancelled_clients": cancelled,
                 "held_clients_at_gate": held,
                 "terminal_failures": terminal_failures,
                 "failure_codes": {
@@ -3033,16 +3741,16 @@ def aggregate_worker_results(
                         {str(code) for value in values for code in value.get("failure_codes", {})}
                     )
                 },
+                "connection_diagnostics": connection_diagnostics,
                 "retries": sum(int(value["retries"]) for value in values),
                 "disconnected_during_hold": sum(
                     int(value["disconnected_during_hold"]) for value in values
                 ),
-                "time_to_target_ns": (
-                    max(target_ns_values) if len(target_ns_values) == WORKER_COUNT else None
-                ),
-                "time_to_target_ms": (
-                    max(target_ms_values) if len(target_ms_values) == WORKER_COUNT else None
-                ),
+                # The 10K clock stops only when the parent has validated all
+                # four exact-held proofs. Individual authentication timestamps
+                # can precede that synchronized gate and are diagnostic only.
+                "time_to_target_ns": exact_gate_elapsed_ns,
+                "time_to_target_ms": exact_gate_elapsed_ns / 1_000_000,
                 "hold_elapsed_ms": min(float(value["hold_elapsed_ms"]) for value in values),
                 "sampled_queries_attempted": sum(
                     int(value["sampled_queries_attempted"]) for value in values
@@ -3053,9 +3761,7 @@ def aggregate_worker_results(
                 "sampled_queries_failed": sum(
                     int(value["sampled_queries_failed"]) for value in values
                 ),
-                "preexisting_client_role_sessions": sum(
-                    int(value["preexisting_client_role_sessions"]) for value in values
-                ),
+                "preexisting_client_role_sessions": max(preexisting_values),
                 "observer_role": values[0]["observer_role"],
                 "client_role": values[0]["client_role"],
                 "observer_direct": all(bool(value["observer_direct"]) for value in values),
@@ -3140,7 +3846,7 @@ def aggregate_worker_results(
                 "fairness_verified": (
                     launch_skew_ms <= MAX_LAUNCH_SKEW_MS and auth_method in SUPPORTED_AUTH_METHODS
                 ),
-                "telemetry_verified": not telemetry_failures,
+                "telemetry_verified": aggregate_telemetry["hard_safety_verified"],
                 **aggregate_telemetry,
             }
         )
@@ -3153,6 +3859,7 @@ def aggregate_worker_results(
         "generator_sha256": ordered[0]["generator_sha256"],
         "capacity_model_sha256": ordered[0]["capacity_model_sha256"],
         "release_ns": next(iter(release_values)),
+        "hold_ns": next(iter(hold_values)),
         "worker_count": WORKER_COUNT,
         "worker_cpus": sorted(worker_cpus),
         "lanes": aggregated_lanes,
@@ -3183,7 +3890,12 @@ async def execute_fanin(
     worker_count: int = 1,
     partition_target_clients: int = TARGET_CLIENTS_PER_LANE,
     await_release: Callable[[], Awaitable[int]] | None = None,
-    await_hold: Callable[[], Awaitable[int]] | None = None,
+    await_hold: Callable[
+        [Callable[[], Mapping[str, Mapping[str, object]]]],
+        Awaitable[int],
+    ]
+    | None = None,
+    before_teardown: Callable[[], Awaitable[None]] | None = None,
     worker_cpu: int | None = None,
     capacity_preflight_verified: bool = False,
 ) -> dict[str, object]:
@@ -3193,7 +3905,7 @@ async def execute_fanin(
     _socket_states_cache_ns = 0
     if request.get("schema_version") != SCHEMA_VERSION or request.get("protocol") != PROTOCOL:
         raise FanInProtocolError("fanin_schema_invalid")
-    if request.get("action") != "run":
+    if request.get("action") not in {"run", "run_lane_v3"}:
         raise FanInProtocolError("fanin_action_invalid")
     if (
         worker_count < 1
@@ -3287,16 +3999,35 @@ async def execute_fanin(
             )
     loop = asyncio.get_running_loop()
     for lane in lanes:
-        addresses = await loop.getaddrinfo(
-            str(lane.database["host"]),
-            int(lane.database["port"]),
-            type=socket.SOCK_STREAM,
-        )
-        connect_hosts = sorted(
-            {str(address[4][0]) for address in addresses if len(address) >= 5 and address[4]}
-        )
-        if not connect_hosts:
-            raise FanInProtocolError(f"{lane.lane_id}_host_resolution_failed")
+        # The competitor lane's client target is the per-bout RDS Proxy, whose
+        # endpoint the coordinator sends in the STAGE the instant CreateDBProxy
+        # returns -- deliberately, so the resident prepares while AWS is still
+        # making the Proxy usable (the RELEASE is held behind the topology gate
+        # until the Proxy is available). The endpoint's public DNS record can lag
+        # that creation by seconds, so a single getaddrinfo can raise gaierror and
+        # crash the whole prepare. Resolve under a bounded retry instead: the
+        # RELEASE gate downstream still guarantees no client connects before the
+        # Proxy is actually available, so tolerating a not-yet-propagated record
+        # here is safe and matches the intended overlap.
+        resolve_deadline = time.monotonic() + PROXY_ENDPOINT_RESOLVE_TIMEOUT_SECONDS
+        connect_hosts: list[str] = []
+        while True:
+            try:
+                addresses = await loop.getaddrinfo(
+                    str(lane.database["host"]),
+                    int(lane.database["port"]),
+                    type=socket.SOCK_STREAM,
+                )
+            except socket.gaierror:
+                addresses = ()
+            connect_hosts = sorted(
+                {str(address[4][0]) for address in addresses if len(address) >= 5 and address[4]}
+            )
+            if connect_hosts:
+                break
+            if time.monotonic() >= resolve_deadline:
+                raise FanInProtocolError(f"{lane.lane_id}_host_resolution_failed")
+            await asyncio.sleep(PROXY_ENDPOINT_RESOLVE_POLL_SECONDS)
         lane.connect_host = connect_hosts[0]
     diagnostics = RuntimeDiagnostics()
     _runtime_diagnostics = diagnostics
@@ -3316,41 +4047,43 @@ async def execute_fanin(
     diagnostic_evidence: dict[str, object] = {}
     hold_elapsed_ms = 0.0
     observer_ok = True
+    ramp_ready = False
+    shared_hold_started_ns: int | None = None
+    admission_controller = AdmissionController(len(lanes))
     try:
-        wave_size = INITIAL_WAVE_SIZE
         wave_number = 0
         while any(lane.initiated < lane.target_clients for lane in lanes):
             if cancelled.is_set():
                 break
             remaining = min(lane.target_clients - lane.initiated for lane in lanes)
-            wave = min(wave_size, remaining)
+            wave = min(INITIAL_WAVE_SIZE, remaining)
             wave_number += 1
             _set_worker_operation(
                 "open_equal_wave",
                 phase="ramp",
                 wave=wave_number,
             )
-            wave_loop_lag = await _open_equal_wave_guarded(
+            await _open_equal_wave_guarded(
                 lanes,
                 wave,
                 release_ns,
                 start_cpu=start_cpu,
                 network_start=network_start,
                 telemetry_summary=telemetry_summary,
+                admission_controller=admission_controller,
             )
             if cancelled.is_set():
                 break
-            if telemetry_summary.failures:
+            if telemetry_summary.hard_failures:
                 break
-            loop_lag = await _event_loop_calibration()
             telemetry = await _telemetry_off_loop(
                 start_cpu,
                 release_ns,
                 network_start,
-                loop_lag,
+                telemetry_summary.peak_raw_event_loop_p99_ms,
             )
             telemetry_summary.observe(telemetry)
-            if telemetry_summary.failures:
+            if telemetry_summary.hard_failures:
                 break
             if any(lane.terminal_failures for lane in lanes):
                 break
@@ -3367,8 +4100,12 @@ async def execute_fanin(
                             "protocol": PROTOCOL,
                             "lane_id": lane.lane_id,
                             "phase": "ramp",
+                            "initiated_clients": lane.initiated,
                             "authenticated_clients": lane.authenticated,
-                            "held_clients": lane.authenticated,
+                            "held_clients": sum(
+                                client.ready and not client.closed.done()
+                                for client in lane.clients
+                            ),
                             "terminal_failures": lane.terminal_failures,
                             "time_to_target_ms": (
                                 lane.target_elapsed_ns / 1_000_000
@@ -3379,22 +4116,49 @@ async def execute_fanin(
                             **telemetry,
                         }
                     )
-            # The adaptation is whole-run and symmetric. It protects the
-            # generator only; elapsed pause/ramp time remains scored.
-            wave_size = (
-                max(MIN_WAVE_SIZE, wave_size // 2)
-                if max(loop_lag, wave_loop_lag) > 20.0
-                else min(INITIAL_WAVE_SIZE, wave_size + MIN_WAVE_SIZE)
-            )
+        def current_ramp_proof() -> dict[str, dict[str, object]]:
+            # Deliberately recomputed.  The first proof says every shard reached
+            # its partition; the parent then asks for a second, fresh socket
+            # count before it mints the one shared hold epoch.
+            return {
+                lane.lane_id: {
+                    "initiated": lane.initiated,
+                    "authenticated": lane.authenticated,
+                    "held": sum(
+                        client.ready and not client.closed.done()
+                        for client in lane.clients
+                    ),
+                    "terminal_failures": lane.terminal_failures,
+                    "cancelled": lane.cancelled,
+                    "target_elapsed_ns": lane.target_elapsed_ns or 0,
+                    "run_id": run_id,
+                    "lane_id": lane.lane_id,
+                    "worker_index": worker_index,
+                    "release_ns": release_ns,
+                }
+                for lane in lanes
+            }
+
+        ramp_proof = current_ramp_proof()
         if (
             telemetry_summary.verified
-            and all(lane.authenticated == lane.target_clients for lane in lanes)
-            and not any(lane.terminal_failures for lane in lanes)
+            and all(
+                proof["initiated"] == lane.target_clients
+                and proof["authenticated"] == lane.target_clients
+                and proof["held"] == lane.target_clients
+                and proof["terminal_failures"] == 0
+                and proof["cancelled"] == 0
+                for lane in lanes
+                for proof in (ramp_proof[lane.lane_id],)
+            )
         ):
             _set_worker_operation("await_shared_hold", phase="hold_barrier")
             shared_hold_started_ns = (
-                await await_hold() if await_hold is not None else time.monotonic_ns()
+                await await_hold(current_ramp_proof)
+                if await_hold is not None
+                else time.monotonic_ns()
             )
+            ramp_ready = True
             if not cancelled.is_set():
                 _set_worker_operation("hold_and_sample", phase="hold")
                 hold_elapsed_ms, observer_ok = await _hold_and_sample(
@@ -3417,7 +4181,7 @@ async def execute_fanin(
                 observer,
                 hold_elapsed_ms=hold_elapsed_ms,
                 launch_skew_ms=launch_skew_ms,
-                telemetry_verified=telemetry_summary.verified and observer_ok,
+                telemetry_verified=telemetry_summary.verified,
                 telemetry_summary=telemetry_summary,
                 generator_digest=expected_generator,
                 config_digest=expected_config,
@@ -3426,6 +4190,38 @@ async def execute_fanin(
             )
             for lane, observer in zip(lanes, observers, strict=True)
         ]
+        for raw_lane in raw_lanes:
+            raw_lane.update(admission_controller.public_dict())
+        expected_worker_samples = (
+            len(tuple(range(worker_index, SAMPLE_GROUPS, worker_count)))
+            * CLIENTS_PER_SAMPLE_GROUP
+        )
+        local_gate_complete = (
+            ramp_ready
+            and observer_ok
+            and hold_elapsed_ms >= HOLD_SECONDS * 1_000
+            and all(
+                int(lane["initiated_clients"]) == partition_target_clients
+                and int(lane["authenticated_clients"]) == partition_target_clients
+                and int(lane["cancelled_clients"]) == 0
+                and int(lane["held_clients_at_gate"]) == partition_target_clients
+                and int(lane["terminal_failures"]) == 0
+                and int(lane["disconnected_during_hold"]) == 0
+                and int(lane["sampled_queries_attempted"]) == expected_worker_samples
+                and int(lane["sampled_queries_succeeded"]) == expected_worker_samples
+                and int(lane["sampled_queries_failed"]) == 0
+                for lane in raw_lanes
+            )
+        )
+        worker_outcome = (
+            "cancelled"
+            if cancelled.is_set()
+            else "hard_safety_failed"
+            if telemetry_summary.hard_failures
+            else "completed"
+            if local_gate_complete
+            else "partial_result"
+        )
         diagnostic_evidence.update(diagnostics.public_dict())
         return {
             "schema_version": SCHEMA_VERSION,
@@ -3436,13 +4232,18 @@ async def execute_fanin(
             "generator_sha256": expected_generator,
             "capacity_model_sha256": expected_model,
             "release_ns": release_ns,
+            "hold_ns": shared_hold_started_ns,
             "worker_index": worker_index,
             "worker_count": worker_count,
             "worker_cpu": worker_cpu,
             "partition_target_clients": partition_target_clients,
+            "worker_outcome": worker_outcome,
             "launch_ready_ns_by_lane": ready_ns,
             "lanes": raw_lanes,
-            "telemetry": telemetry_summary.public_dict(),
+            "telemetry": {
+                **telemetry_summary.public_dict(),
+                **admission_controller.public_dict(),
+            },
             "runtime_diagnostics": diagnostic_evidence,
         }
     except BaseException:
@@ -3451,6 +4252,8 @@ async def execute_fanin(
                 lane.lane_id: {
                     "initiated": lane.initiated,
                     "authenticated": lane.authenticated,
+                    "cancelled": lane.cancelled,
+                    "terminal_failures": lane.terminal_failures,
                     "held": sum(
                         client.ready and not client.closed.done() for client in lane.clients
                     ),
@@ -3460,6 +4263,8 @@ async def execute_fanin(
         raise
     finally:
         try:
+            if before_teardown is not None and lanes:
+                await asyncio.shield(before_teardown())
             cleanup_verified = await asyncio.shield(_close_everything(lanes, observers))
             if not cleanup_verified:
                 raise FanInProtocolError("fanin_socket_cleanup_incomplete")

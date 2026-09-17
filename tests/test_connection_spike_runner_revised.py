@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import hashlib
 import inspect
 import json
 import queue
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -15,12 +17,14 @@ import pytest
 
 from runner import connection_spike_runner as runner
 from server.connection_spike_live import SETUP_SSM_TIMEOUT_SECONDS
+from tests.test_connection_fanin import worker_result as exact_worker_result
 
 
-def test_production_preflight_executes_four_process_affinity_probe() -> None:
+def test_affinity_probe_runs_only_during_explicit_preflight() -> None:
     source = inspect.getsource(runner.main)
+    assert source.count("shard_process_preflight()") == 1
+    assert 'fanin_request["action"] == "preflight"' in source
     assert "shard_preflight = shard_process_preflight()" in source
-    assert 'RunnerContractError("fanin_shard_preflight_failed")' in source
 
 
 class _FakeValue:
@@ -87,6 +91,112 @@ def _encode_request(request: dict[str, object]) -> str:
             mtime=0,
         )
     ).decode()
+
+
+def test_v3_job_registry_atomically_owns_or_rejoins_one_logical_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(runner, "JOB_ROOT", tmp_path / "jobs")
+    request = {
+        "job_id": "a" * 64,
+        "prepared_request_digest": "b" * 64,
+    }
+
+    job, first_owner, first_lock = runner._claim_job(request)
+    same_job, second_owner, second_lock = runner._claim_job(request)
+
+    assert first_owner is True
+    assert second_owner is False
+    assert same_job == job
+    # The contender never acquires the ownership lock; the owner holds it.
+    assert second_lock is None
+    assert runner._read_job_value(job, "state") == "claimed"
+    runner._release_job_lock(first_lock)
+
+
+def test_v3_job_registry_refuses_same_job_id_with_different_request(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(runner, "JOB_ROOT", tmp_path / "jobs")
+    runner._claim_job(
+        {
+            "job_id": "a" * 64,
+            "prepared_request_digest": "b" * 64,
+        }
+    )
+
+    with pytest.raises(runner.RunnerContractError, match="fanin_job_identity_conflict"):
+        runner._claim_job(
+            {
+                "job_id": "a" * 64,
+                "prepared_request_digest": "c" * 64,
+            }
+        )
+
+
+def test_v3_job_registry_rejoins_the_persisted_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(runner, "JOB_ROOT", tmp_path / "jobs")
+    request = {
+        "job_id": "a" * 64,
+        "prepared_request_digest": "b" * 64,
+    }
+    job, _owner, lock = runner._claim_job(request)
+    runner._atomic_job_write(job, "result_gzip_base64", "encoded-result")
+    runner._atomic_job_write(job, "state", "completed")
+    runner._atomic_job_write(job, "settled", "true")
+    # The owner exited after settling; a rejoining invocation replays its result.
+    runner._release_job_lock(lock)
+
+    rejoin = runner._rejoin_or_takeover_job(job, "ignored-run", request)
+    assert rejoin.disposition == "replay"
+    assert rejoin.encoded_result == "encoded-result"
+    assert rejoin.was_cancelled is False
+
+
+def test_v3_job_registry_returns_a_large_result_in_bounded_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(runner, "JOB_ROOT", tmp_path / "jobs")
+    job, _owner, lock = runner._claim_job(
+        {
+            "job_id": "a" * 64,
+            "prepared_request_digest": "b" * 64,
+        }
+    )
+    runner._release_job_lock(lock)
+    encoded = "A" * 23_500
+    runner._atomic_job_write(job, "result_gzip_base64", encoded)
+    runner._atomic_job_write(job, "state", "completed")
+    runner._atomic_job_write(job, "settled", "true")
+    expected_digest = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+    rebuilt: list[str] = []
+
+    for chunk_index in range(4):
+        runner._job_control(
+            {
+                "protocol": runner.JOB_PROTOCOL,
+                "schema_version": 3,
+                "action": "job_result",
+                "job_id": "a" * 64,
+                "chunk_index": chunk_index,
+            }
+        )
+        document = json.loads(
+            capsys.readouterr().out.split(runner.JOB_RESULT_PREFIX, 1)[1]
+        )
+        assert document["chunk_index"] == chunk_index
+        assert document["chunk_count"] == 4
+        assert document["result_sha256"] == expected_digest
+        rebuilt.append(document["payload"])
+
+    assert "".join(rebuilt) == encoded
 
 
 def _setup_verify_material(lane_id: str) -> tuple[dict[str, object], dict[str, object]]:
@@ -985,6 +1095,700 @@ async def test_sharded_fanin_detects_crash_and_cleans_remaining_processes(
     assert not any(process.is_alive() for process in context.processes)
 
 
+async def test_safety_sampling_failure_still_terminates_every_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Process(_FakeProcess):
+        pid = 12345
+
+    class Context(_FakeProcessContext):
+        def Process(self, **kwargs):
+            process = Process(name=kwargs["name"])
+            self.processes.append(process)
+            return process
+
+    context = Context()
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+    monkeypatch.setattr(
+        runner.fanin,
+        "host_safety_telemetry",
+        lambda unused: (_ for _ in ()).throw(
+            runner.RunnerContractError("safety_sampling_failed")
+        ),
+    )
+
+    with pytest.raises(
+        runner.RunnerContractError,
+        match="safety_sampling_failed",
+    ):
+        await runner._execute_sharded_fanin({}, asyncio.Event())
+    assert all(process.terminated for process in context.processes)
+    assert not any(process.is_alive() for process in context.processes)
+
+
+async def test_four_fresh_hold_prepares_commit_one_shared_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_run_id = {"value": "run"}
+
+    class BarrierProcess:
+        def __init__(self, args, name: str) -> None:
+            self.args = args
+            self.name = name
+            self.exitcode = None
+            self.alive = False
+            self.terminated = False
+            self.thread: threading.Thread | None = None
+            self.error: BaseException | None = None
+
+        def start(self) -> None:
+            self.alive = True
+
+            def run() -> None:
+                (
+                    request,
+                    index,
+                    control_queue,
+                    result_queue,
+                    release_event,
+                    release_ns,
+                    hold_prepare_event,
+                    hold_epoch_event,
+                    hold_ns,
+                    sample_release_event,
+                    teardown_event,
+                    cancel_event,
+                ) = self.args
+                try:
+                    control_queue.put(("ready", index))
+                    assert release_event.wait(2)
+                    proof = {
+                        "lakebase": {
+                            "initiated": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                            "authenticated": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                            "held": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                            "terminal_failures": 0,
+                            "cancelled": 0,
+                            "target_elapsed_ns": 1,
+                            "run_id": request["run_id"],
+                            "lane_id": "lakebase",
+                            "worker_index": index,
+                            "release_ns": release_ns.value,
+                        }
+                    }
+                    for milestone, offset in (
+                        ("first_socket_initiated", 10 + index),
+                        ("first_client_authenticated", 20 + index),
+                    ):
+                        control_queue.put(
+                            (
+                                "milestone",
+                                index,
+                                {
+                                    "protocol": runner.fanin.PROTOCOL,
+                                    "schema_version": runner.fanin.SCHEMA_VERSION,
+                                    "lane_id": "lakebase",
+                                    "milestone": milestone,
+                                    "milestone_monotonic_ns": (
+                                        release_ns.value + offset
+                                    ),
+                                },
+                            )
+                        )
+                    control_queue.put(
+                        (
+                            "progress",
+                            index,
+                            {
+                                "protocol": runner.fanin.PROTOCOL,
+                                "schema_version": runner.fanin.SCHEMA_VERSION,
+                                "lane_id": "lakebase",
+                                "phase": "ramp",
+                                "initiated_clients": 2_500,
+                                "authenticated_clients": 2_500,
+                                "held_clients": 2_500,
+                                "terminal_failures": 0,
+                                "sampled_queries_succeeded": 0,
+                                "sampled_queries_failed": 0,
+                                "time_to_target_ms": 0.000001,
+                                "elapsed_ms": 99_000.0,
+                                "release_ns": release_ns.value,
+                                "hold_ns": None,
+                                "snapshot_epoch": "ramp:2500:0",
+                            },
+                        )
+                    )
+                    control_queue.put(("ramp_ready", index, proof))
+                    assert hold_prepare_event.wait(2)
+                    assert not cancel_event.is_set()
+                    control_queue.put(("hold_prepared", index, proof))
+                    assert hold_epoch_event.wait(2)
+                    assert not cancel_event.is_set()
+                    control_queue.put(
+                        ("hold_committed", index, proof, hold_ns.value)
+                    )
+                    assert sample_release_event.wait(2)
+                    assert not cancel_event.is_set()
+                    control_queue.put(("teardown_ready", index))
+                    assert teardown_event.wait(2)
+                    result = exact_worker_result(index, release_ns=release_ns.value)
+                    result["lanes"] = [
+                        lane for lane in result["lanes"]
+                        if lane["lane_id"] == "lakebase"
+                    ]
+                    result["hold_ns"] = hold_ns.value
+                    result["run_id"] = result_run_id["value"]
+                    result["lanes"][0]["time_to_target_ns"] = 1
+                    result["lanes"][0]["time_to_target_ms"] = 0.000001
+                    result["lanes"][0]["achieved_elapsed_ms"] = (
+                        (hold_ns.value - release_ns.value) / 1_000_000
+                        + runner.fanin.HOLD_SECONDS * 1_000
+                        + 1
+                    )
+                    result_queue.put(("completed", index, result))
+                    self.exitcode = 0
+                except BaseException as exc:
+                    self.error = exc
+                    self.exitcode = 1
+                finally:
+                    self.alive = False
+
+            self.thread = threading.Thread(target=run, daemon=True)
+            self.thread.start()
+
+        def join(self, timeout: float) -> None:
+            if self.thread is not None:
+                self.thread.join(timeout)
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.alive = False
+            self.exitcode = -15
+
+    class BarrierContext:
+        def __init__(self) -> None:
+            self.processes: list[BarrierProcess] = []
+            self.events: list[threading.Event] = []
+            self.values: list[_FakeValue] = []
+
+        def Queue(self):
+            return queue.Queue()
+
+        def Event(self):
+            value = threading.Event()
+            self.events.append(value)
+            return value
+
+        def Value(self, unused_kind: str, value: int):
+            result = _FakeValue(value)
+            self.values.append(result)
+            return result
+
+        def Process(self, **kwargs):
+            process = BarrierProcess(kwargs["args"], kwargs["name"])
+            self.processes.append(process)
+            return process
+
+    context = BarrierContext()
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+    monkeypatch.setattr(
+        runner.fanin,
+        "_progress_callback",
+        lambda value: published.append(dict(value)),
+    )
+
+    try:
+        aggregate = await runner._execute_sharded_fanin(
+            {
+                "run_id": "run",
+                "targets": [{"lane_id": "lakebase"}],
+            },
+            asyncio.Event(),
+        )
+    except runner.RunnerContractError as exc:
+        pytest.fail(
+            f"parent barrier failed: {exc}; worker errors="
+            f"{[repr(process.error) for process in context.processes]}"
+        )
+
+    assert aggregate["barrier_state"] == "COMPLETE"
+    assert aggregate["hold_commit_count"] == 1
+    assert aggregate["lanes"][0]["time_to_target_ms"] == 0.000001
+    assert context.values[0].value > 0
+    assert context.values[1].value > context.values[0].value
+    assert all(process.exitcode == 0 for process in context.processes)
+    assert not any(process.terminated for process in context.processes)
+    ramp = next(value for value in published if value["phase"] == "ramping")
+    assert ramp["initiated_clients"] == 10_000
+    assert ramp["held_clients"] == 10_000
+    assert ramp["time_to_target_ms"] is None
+    assert ramp["sampled_queries_succeeded"] == 0
+    assert ramp["elapsed_ms"] < 1_000
+    assert ramp["first_socket_initiated_ms"] > 0
+    assert ramp["first_socket_initiated_ms"] == pytest.approx(0.00001)
+    assert ramp["first_client_authenticated_ms"] == pytest.approx(0.00002)
+    assert (
+        ramp["first_client_authenticated_ms"]
+        > ramp["first_socket_initiated_ms"]
+    )
+
+    result_run_id["value"] = "other-run"
+    mismatched = BarrierContext()
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: mismatched)
+    with pytest.raises(
+        runner.RunnerContractError,
+        match="result_epoch_identity",
+    ):
+        await runner._execute_sharded_fanin(
+            {
+                "run_id": "run",
+                "targets": [{"lane_id": "lakebase"}],
+            },
+            asyncio.Event(),
+        )
+
+
+async def test_resident_pool_executes_real_parent_worker_and_fanin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import multiprocessing as multiprocessing_module
+
+    fork_context = multiprocessing_module.get_context("fork")
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: fork_context)
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda index: index)
+
+    class SslContext:
+        check_hostname = True
+        verify_mode = 2
+
+    class Observer:
+        def __init__(self, *unused):
+            self.backend_pids = {101}
+
+        async def open_and_preflight(self):
+            return None
+
+    class Diagnostics:
+        def gc_callback(self, *unused):
+            return None
+
+        def install_selector_probe(self, unused_loop):
+            return None
+
+        def install_ready_batch_limit(self, unused_loop):
+            return None
+
+        def install_execution_probes(self, unused_loop):
+            return None
+
+        def restore_selector_probe(self):
+            return None
+
+        def restore_ready_batch_limit(self):
+            return None
+
+        def restore_execution_probes(self):
+            return None
+
+        def record(self, unused_phase, unused_started_ns):
+            return None
+
+        def public_dict(self):
+            return {}
+
+    class ControlledGC:
+        def __init__(self, unused):
+            pass
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    class Client:
+        ready = True
+
+        def __init__(self):
+            self.closed = asyncio.get_running_loop().create_future()
+
+    telemetry = {
+        "physical_memory_bytes": 16 * 1024**3,
+        "available_memory_bytes": 8 * 1024**3,
+        "rss_bytes": 256 * 1024**2,
+        "fd_soft_limit": 65_535,
+        "open_fds": 2_600,
+        "ephemeral_port_count": 28_232,
+        "ephemeral_ports_in_use": 2_500,
+        "ephemeral_ports_remaining": 25_732,
+        "event_loop_p99_ms": 0.0,
+        "cpu_capacity_fraction": 0.1,
+    }
+    parent_safety_samples: list[float] = []
+    opened = fork_context.Value("i", 0)
+
+    async def open_wave(lanes, unused_wave, t0_ns, **kwargs):
+        del kwargs
+        with opened.get_lock():
+            opened.value += 1
+        for lane in lanes:
+            lane.initiated = runner.fanin.PARTITION_CLIENTS_PER_LANE
+            lane.authenticated = runner.fanin.PARTITION_CLIENTS_PER_LANE
+            lane.target_elapsed_ns = 1
+            lane.first_launch_ns = t0_ns + 1
+            lane.clients = [Client()] * runner.fanin.PARTITION_CLIENTS_PER_LANE
+
+    async def telemetry_off_loop(*unused):
+        return dict(telemetry)
+
+    async def hold_and_sample(lanes, unused_observers, **kwargs):
+        worker_index = int(runner.fanin._worker_execution_context["worker_id"])
+        expected = len(
+            tuple(
+                range(
+                    worker_index,
+                    runner.fanin.SAMPLE_GROUPS,
+                    runner.fanin.WORKER_COUNT,
+                )
+            )
+        ) * runner.fanin.CLIENTS_PER_SAMPLE_GROUP
+        for lane in lanes:
+            lane.sample_attempted = expected
+            lane.sample_succeeded = expected
+            lane.sample_failed = 0
+        kwargs["telemetry_summary"].observe(dict(telemetry))
+        return runner.fanin.HOLD_SECONDS * 1_000, True
+
+    def lane_result(lane, unused_observer, **kwargs):
+        worker_index = int(runner.fanin._worker_execution_context["worker_id"])
+        raw = dict(exact_worker_result(worker_index)["lanes"][0])
+        raw.update(
+            {
+                "initiated_clients": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                "authenticated_clients": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                "held_clients_at_gate": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                "peak_authenticated_clients": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                "peak_held_clients": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                "sampled_queries_attempted": lane.sample_attempted,
+                "sampled_queries_succeeded": lane.sample_succeeded,
+                "sampled_queries_failed": 0,
+                "first_launch_ns": lane.first_launch_ns,
+                "time_to_target_ns": 1,
+                "time_to_target_ms": 0.000001,
+                "hold_elapsed_ms": runner.fanin.HOLD_SECONDS * 1_000,
+                "achieved_elapsed_ms": (
+                    kwargs["hold_elapsed_ms"]
+                    + 1_000
+                ),
+                "telemetry_verified": True,
+            }
+        )
+        return raw
+
+    async def close_everything(unused_lanes, unused_observers):
+        return True
+
+    monkeypatch.setattr(runner.fanin.ssl, "create_default_context", lambda **unused: SslContext())
+    monkeypatch.setattr(runner.fanin, "DirectObserver", Observer)
+    monkeypatch.setattr(runner.fanin, "RuntimeDiagnostics", Diagnostics)
+    monkeypatch.setattr(runner.fanin, "ControlledGC", ControlledGC)
+    monkeypatch.setattr(runner.fanin, "_network_bytes", lambda: (0, 0))
+    monkeypatch.setattr(runner.fanin, "_open_equal_wave_guarded", open_wave)
+    monkeypatch.setattr(runner.fanin, "_telemetry_off_loop", telemetry_off_loop)
+    monkeypatch.setattr(runner.fanin, "_hold_and_sample", hold_and_sample)
+    monkeypatch.setattr(runner.fanin, "_lane_result", lane_result)
+    monkeypatch.setattr(runner.fanin, "_close_everything", close_everything)
+    def host_safety(unused):
+        parent_safety_samples.append(time.monotonic())
+        return {
+            **telemetry,
+            "fd_soft_limit": telemetry["fd_soft_limit"] * runner.fanin.WORKER_COUNT,
+            "open_fds": 10_400,
+            "ephemeral_ports_in_use": 10_000,
+            "ephemeral_ports_remaining": 18_232,
+        }
+
+    monkeypatch.setattr(runner.fanin, "host_safety_telemetry", host_safety)
+
+    request = {
+        "schema_version": runner.fanin.SCHEMA_VERSION,
+        "protocol": runner.fanin.PROTOCOL,
+        "action": "run_lane_v3",
+        "run_id": "resident-composed-run",
+        "contract_sha256": runner.fanin.contract_sha256(),
+        "config_sha256": runner.fanin.config_sha256(),
+        "generator_sha256": runner.fanin.generator_sha256(),
+        "capacity_model_sha256": runner.fanin.capacity_model_sha256(),
+        "runner_instance_type": runner.fanin.RUNNER_INSTANCE_TYPE,
+        "targets": [
+            {
+                "lane_id": "lakebase",
+                "database": {
+                    "host": "127.0.0.1",
+                    "port": 5432,
+                    "dbname": "anti_demo",
+                    "user": runner.fanin.CLIENT_ROLE,
+                    "password": "unused",
+                    "credential_sha256": "a" * 64,
+                },
+                "observer_database": {
+                    "host": "127.0.0.1",
+                    "port": 5432,
+                    "dbname": "anti_demo",
+                    "user": runner.fanin.OBSERVER_ROLE,
+                    "password": "unused",
+                    "credential_sha256": "b" * 64,
+                },
+            }
+        ],
+    }
+    pool = await asyncio.to_thread(runner.ResidentShardPool.start)
+    release_gate = asyncio.Event()
+    prepared = asyncio.Event()
+    execution = asyncio.create_task(
+        runner._execute_sharded_fanin(
+            request,
+            asyncio.Event(),
+            resident_pool=pool,
+            resident_release_gate=release_gate,
+            on_resident_prepared=lambda: asyncio.sleep(
+                0,
+                result=prepared.set(),
+            ),
+        )
+    )
+    await asyncio.wait_for(prepared.wait(), timeout=2)
+    assert opened.value == 0
+    assert not execution.done()
+    release_gate.set()
+    result = await asyncio.wait_for(execution, timeout=5)
+
+    assert result["barrier_state"] == "COMPLETE"
+    assert result["hold_commit_count"] == 1
+    assert result["lanes"][0]["authenticated_clients"] == 10_000
+    assert result["lanes"][0]["sampled_queries_succeeded"] == 64
+    assert opened.value == runner.fanin.WORKER_COUNT
+    assert result["telemetry"]["telemetry_peak_cpu_capacity_fraction"] == 0.1
+    assert len(parent_safety_samples) >= 3
+
+
+async def test_parent_fails_closed_on_retired_telemetry_stop_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ScriptedContext(_FakeProcessContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.queues: list[queue.Queue] = []
+            self.events: list[threading.Event] = []
+
+        def Queue(self):
+            value: queue.Queue = queue.Queue()
+            self.queues.append(value)
+            if len(self.queues) == 1:
+                for index in range(runner.fanin.WORKER_COUNT):
+                    value.put(("ready", index))
+                value.put(
+                    (
+                        "telemetry_failed",
+                        2,
+                        "fanin_worker_telemetry_failed",
+                        {
+                            "worker_id": 2,
+                            "worker_cpu": 2,
+                            "outcome": "telemetry_failed",
+                            "lanes": [],
+                            "telemetry_failures": ["event_loop_pressure"],
+                            "telemetry_peak_generator_owned_loop_lag_ms": 60.499,
+                            "worst_stall": None,
+                        },
+                    )
+                )
+            return value
+
+        def Event(self):
+            value = threading.Event()
+            self.events.append(value)
+            return value
+
+    context = ScriptedContext()
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+
+    with pytest.raises(
+        runner.RunnerContractError,
+        match="fanin_worker_barrier_invalid",
+    ):
+        await runner._execute_sharded_fanin(
+            {"targets": [{"lane_id": "lakebase"}]},
+            asyncio.Event(),
+        )
+
+    cancel_event = context.events[4]
+    assert cancel_event.is_set()
+    assert all(process.terminated for process in context.processes)
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "available_memory_reserve_exhausted",
+        "file_descriptor_reserve_exhausted",
+        "ephemeral_port_reserve_exhausted",
+    ],
+)
+async def test_parent_preserves_each_typed_hard_safety_cause(
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+) -> None:
+    class HardFailureContext(_FakeProcessContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.queues: list[queue.Queue] = []
+            self.events: list[threading.Event] = []
+
+        def Queue(self):
+            value: queue.Queue = queue.Queue()
+            self.queues.append(value)
+            if len(self.queues) == 1:
+                for index in range(runner.fanin.WORKER_COUNT):
+                    value.put(("ready", index))
+                value.put(
+                    (
+                        "hard_safety_failed",
+                        2,
+                        "fanin_worker_hard_safety_failed",
+                        {
+                            "worker_id": 2,
+                            "worker_cpu": 2,
+                            "outcome": "hard_safety_failed",
+                            "lanes": [],
+                            "telemetry_failures": [code],
+                            "telemetry_peak_generator_owned_loop_lag_ms": 0.0,
+                            "worst_stall": None,
+                        },
+                    )
+                )
+            return value
+
+        def Event(self):
+            value = threading.Event()
+            self.events.append(value)
+            return value
+
+    context = HardFailureContext()
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+
+    with pytest.raises(runner.RunnerContractError, match=f"^{code}$"):
+        await runner._execute_sharded_fanin(
+            {"run_id": "run", "targets": [{"lane_id": "lakebase"}]},
+            asyncio.Event(),
+        )
+
+    assert context.events[4].is_set()
+
+
+async def test_7134_partial_topology_never_commits_hold_or_publishes_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PartialContext(_FakeProcessContext):
+        def __init__(self) -> None:
+            super().__init__()
+            self.queues: list[queue.Queue] = []
+            self.events: list[threading.Event] = []
+            self.values: list[_FakeValue] = []
+
+        def Queue(self):
+            value: queue.Queue = queue.Queue()
+            self.queues.append(value)
+            if len(self.queues) == 1:
+                for index in range(runner.fanin.WORKER_COUNT):
+                    value.put(("ready", index))
+                counts = (
+                    (2_500, 2_500),
+                    (2_500, 2_500),
+                    (1_081, 1_067),
+                    (1_081, 1_067),
+                )
+                for index, (initiated, held) in enumerate(counts):
+                    value.put(
+                        (
+                            "progress",
+                            index,
+                            {
+                                "protocol": runner.fanin.PROTOCOL,
+                                "schema_version": runner.fanin.SCHEMA_VERSION,
+                                "lane_id": "lakebase",
+                                "phase": "ramping",
+                                "initiated_clients": initiated,
+                                "authenticated_clients": held,
+                                "held_clients": held,
+                                "terminal_failures": 0,
+                                "sampled_queries_succeeded": 0,
+                                "sampled_queries_failed": 0,
+                                "elapsed_ms": 99_000.0 - index * 10_000,
+                                "time_to_target_ms": (
+                                    40_000.0 + index if held == 2_500 else None
+                                ),
+                            },
+                        )
+                    )
+                value.put(
+                    (
+                        "partial_result",
+                        2,
+                        "fanin_worker_partial_result",
+                        {
+                            "worker_id": 2,
+                            "outcome": "partial_result",
+                            "lanes": [
+                                {
+                                    "lane_id": "lakebase",
+                                    "initiated": 7_162,
+                                    "authenticated": 7_134,
+                                    "held": 7_134,
+                                    "samples_succeeded": 32,
+                                }
+                            ],
+                        },
+                    )
+                )
+            return value
+
+        def Event(self):
+            value = threading.Event()
+            self.events.append(value)
+            return value
+
+        def Value(self, unused_kind: str, value: int):
+            result = _FakeValue(value)
+            self.values.append(result)
+            return result
+
+    context = PartialContext()
+    published: list[dict[str, object]] = []
+    monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
+    monkeypatch.setattr(
+        runner.fanin,
+        "_progress_callback",
+        lambda value: published.append(dict(value)),
+    )
+
+    with pytest.raises(
+        runner.RunnerContractError,
+        match="fanin_worker_partial_result",
+    ):
+        await runner._execute_sharded_fanin(
+            {"run_id": "run", "targets": [{"lane_id": "lakebase"}]},
+            asyncio.Event(),
+        )
+
+    assert published == []
+    assert context.values[1].value == 0
+
+
 def test_worker_normal_completion_does_not_wait_for_unset_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -996,21 +1800,278 @@ def test_worker_normal_completion_does_not_wait_for_unset_cancellation(
         **unused,
     ):
         del unused_request, unused
-        await await_release()
-        await await_hold()
-        return {"worker_index": 0}
+        release_ns = await await_release()
+        await await_hold(
+            lambda: {
+                "lakebase": {
+                    "initiated": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                    "authenticated": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                    "held": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                    "terminal_failures": 0,
+                    "cancelled": 0,
+                    "target_elapsed_ns": 1,
+                    "run_id": "run",
+                    "lane_id": "lakebase",
+                    "worker_index": 0,
+                    "release_ns": release_ns,
+                }
+            }
+        )
+        return {"worker_index": 0, "worker_outcome": "completed"}
 
     monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 0)
     monkeypatch.setattr(runner.fanin, "execute_fanin", complete)
     control_queue: queue.Queue = queue.Queue()
     result_queue: queue.Queue = queue.Queue()
     release_event = threading.Event()
-    hold_event = threading.Event()
+    hold_prepare_event = threading.Event()
+    hold_epoch_event = threading.Event()
+    sample_release_event = threading.Event()
+    teardown_event = threading.Event()
     cancel_event = threading.Event()
     release_event.set()
-    hold_event.set()
+    hold_prepare_event.set()
+    hold_epoch_event.set()
+    sample_release_event.set()
+    teardown_event.set()
     baseline_threads = set(threading.enumerate())
     started = time.monotonic()
+
+    runner._fanin_worker_process(
+        {"run_id": "run"},
+        0,
+        control_queue,
+        result_queue,
+        release_event,
+        _FakeValue(1),
+        hold_prepare_event,
+        hold_epoch_event,
+        _FakeValue(2),
+        sample_release_event,
+        teardown_event,
+        cancel_event,
+    )
+
+    assert time.monotonic() - started < 1.0
+    assert result_queue.get_nowait() == (
+        "completed",
+        0,
+        {"worker_index": 0, "worker_outcome": "completed"},
+    )
+    assert result_queue.empty()
+    controls = []
+    while not control_queue.empty():
+        controls.append(control_queue.get_nowait())
+    assert [message[0] for message in controls] == [
+        "ready",
+        "ramp_ready",
+        "hold_prepared",
+        "hold_committed",
+    ]
+    assert set(threading.enumerate()) == baseline_threads
+
+
+def test_disconnect_between_ramp_ready_and_hold_prepare_prevents_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def disconnect_before_prepare(
+        unused_request,
+        *,
+        await_release,
+        await_hold,
+        **unused,
+    ):
+        del unused_request, unused
+        release_ns = await await_release()
+        reads = 0
+
+        def proof():
+            nonlocal reads
+            reads += 1
+            held = runner.fanin.PARTITION_CLIENTS_PER_LANE - (reads > 1)
+            return {
+                "lakebase": {
+                    "initiated": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                    "authenticated": held,
+                    "held": held,
+                    "terminal_failures": 0,
+                    "cancelled": 0,
+                    "target_elapsed_ns": 1,
+                    "run_id": "run",
+                    "lane_id": "lakebase",
+                    "worker_index": 0,
+                    "release_ns": release_ns,
+                }
+            }
+
+        await await_hold(proof)
+        raise AssertionError("hold must not commit after the socket disappears")
+
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 0)
+    monkeypatch.setattr(runner.fanin, "execute_fanin", disconnect_before_prepare)
+    control_queue: queue.Queue = queue.Queue()
+    result_queue: queue.Queue = queue.Queue()
+    release_event = threading.Event()
+    hold_prepare_event = threading.Event()
+    hold_epoch_event = threading.Event()
+    sample_release_event = threading.Event()
+    release_event.set()
+    hold_prepare_event.set()
+    hold_epoch_event.set()
+    sample_release_event.set()
+
+    runner._fanin_worker_process(
+        {"run_id": "run"},
+        0,
+        control_queue,
+        result_queue,
+        release_event,
+        _FakeValue(1),
+        hold_prepare_event,
+        hold_epoch_event,
+        _FakeValue(2),
+        sample_release_event,
+        threading.Event(),
+        threading.Event(),
+    )
+
+    controls = []
+    while not control_queue.empty():
+        controls.append(control_queue.get_nowait())
+    assert [message[0] for message in controls] == ["ready", "ramp_ready", "crashed"]
+    assert all(message[0] != "hold_prepared" for message in controls)
+    assert result_queue.get_nowait()[:3] == (
+        "crashed",
+        0,
+        "fanin_worker_ramp_proof_invalid",
+    )
+
+
+def test_socket_loss_after_hold_prepared_prevents_commit_and_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampled = False
+
+    async def disconnect_before_commit(
+        unused_request,
+        *,
+        await_release,
+        await_hold,
+        **unused,
+    ):
+        nonlocal sampled
+        del unused_request, unused
+        release_ns = await await_release()
+        reads = 0
+
+        def proof():
+            nonlocal reads
+            reads += 1
+            held = runner.fanin.PARTITION_CLIENTS_PER_LANE - (reads > 2)
+            return {
+                "lakebase": {
+                    "initiated": runner.fanin.PARTITION_CLIENTS_PER_LANE,
+                    "authenticated": held,
+                    "held": held,
+                    "terminal_failures": 0,
+                    "cancelled": 0,
+                    "target_elapsed_ns": 1,
+                    "run_id": "run",
+                    "lane_id": "lakebase",
+                    "worker_index": 0,
+                    "release_ns": release_ns,
+                }
+            }
+
+        await await_hold(proof)
+        sampled = True
+        return {"worker_index": 0, "worker_outcome": "completed"}
+
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 0)
+    monkeypatch.setattr(runner.fanin, "execute_fanin", disconnect_before_commit)
+    control_queue: queue.Queue = queue.Queue()
+    result_queue: queue.Queue = queue.Queue()
+    release_event = threading.Event()
+    hold_prepare_event = threading.Event()
+    hold_epoch_event = threading.Event()
+    sample_release_event = threading.Event()
+    for event in (
+        release_event,
+        hold_prepare_event,
+        hold_epoch_event,
+        sample_release_event,
+    ):
+        event.set()
+
+    runner._fanin_worker_process(
+        {"run_id": "run"},
+        0,
+        control_queue,
+        result_queue,
+        release_event,
+        _FakeValue(1),
+        hold_prepare_event,
+        hold_epoch_event,
+        _FakeValue(2),
+        sample_release_event,
+        threading.Event(),
+        threading.Event(),
+    )
+
+    controls = []
+    while not control_queue.empty():
+        controls.append(control_queue.get_nowait())
+    assert [message[0] for message in controls] == [
+        "ready",
+        "ramp_ready",
+        "hold_prepared",
+        "crashed",
+    ]
+    assert sampled is False
+    assert result_queue.get_nowait()[:3] == (
+        "crashed",
+        0,
+        "fanin_worker_ramp_proof_invalid",
+    )
+
+
+def test_retired_telemetry_outcome_is_partial_and_never_announces_ramp_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def telemetry_stop(
+        unused_request,
+        *,
+        await_release,
+        **unused,
+    ):
+        del unused_request, unused
+        await await_release()
+        return {
+            "worker_outcome": "telemetry_failed",
+            "lanes": [
+                {
+                    "lane_id": "lakebase",
+                    "initiated_clients": 2_162,
+                    "authenticated_clients": 2_134,
+                    "cancelled_clients": 28,
+                    "held_clients_at_gate": 2_134,
+                    "terminal_failures": 0,
+                    "sampled_queries_succeeded": 0,
+                }
+            ],
+            "telemetry": {"telemetry_failures": ["event_loop_pressure"]},
+            "runtime_diagnostics": {
+                "peak_generator_owned_loop_lag_ms": 60.499,
+                "significant_stall_envelopes": [],
+            },
+        }
+
+    monkeypatch.setattr(runner, "_pin_fanin_worker", lambda unused: 0)
+    monkeypatch.setattr(runner.fanin, "execute_fanin", telemetry_stop)
+    control_queue: queue.Queue = queue.Queue()
+    result_queue: queue.Queue = queue.Queue()
+    release_event = threading.Event()
+    release_event.set()
 
     runner._fanin_worker_process(
         {},
@@ -1019,15 +2080,36 @@ def test_worker_normal_completion_does_not_wait_for_unset_cancellation(
         result_queue,
         release_event,
         _FakeValue(1),
-        hold_event,
-        _FakeValue(2),
-        cancel_event,
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+        _FakeValue(0),
+        threading.Event(),
+        threading.Event(),
     )
 
-    assert time.monotonic() - started < 1.0
-    assert result_queue.get_nowait() == ("ok", 0, {"worker_index": 0})
-    assert result_queue.empty()
-    assert set(threading.enumerate()) == baseline_threads
+    controls = []
+    while not control_queue.empty():
+        controls.append(control_queue.get_nowait())
+    assert [message[0] for message in controls] == ["ready", "partial_result"]
+    assert all(message[0] != "ramp_ready" for message in controls)
+    stopped = result_queue.get_nowait()
+    assert stopped[:3] == (
+        "partial_result",
+        0,
+        "fanin_worker_partial_result",
+    )
+    assert stopped[3]["lanes"][0]["cancelled"] == 28
+
+
+async def test_cancellation_wins_when_cleanup_also_releases_a_barrier() -> None:
+    released = threading.Event()
+    cancelled = threading.Event()
+    released.set()
+    cancelled.set()
+
+    with pytest.raises(runner.RunnerCancelled, match="fanin_cancelled"):
+        await runner._await_process_event(released, cancel_event=cancelled)
 
 
 def test_worker_cancellation_is_bounded_and_publishes_one_result(
@@ -1064,13 +2146,16 @@ def test_worker_cancellation_is_bounded_and_publishes_one_result(
         release_event,
         _FakeValue(1),
         threading.Event(),
+        threading.Event(),
         _FakeValue(0),
+        threading.Event(),
+        threading.Event(),
         cancel_event,
     )
     trigger.join()
 
     assert time.monotonic() - started < 1.0
-    assert result_queue.get_nowait() == ("error", 0, "fanin_cancelled")
+    assert result_queue.get_nowait() == ("cancelled", 0, "fanin_cancelled")
     assert result_queue.empty()
     assert set(threading.enumerate()) == baseline_threads
 
@@ -1115,12 +2200,15 @@ def test_worker_crash_envelope_retains_sanitized_context(
         threading.Event(),
         _FakeValue(1),
         threading.Event(),
+        threading.Event(),
+        threading.Event(),
         _FakeValue(1),
+        threading.Event(),
         threading.Event(),
     )
 
     result = result_queue.get_nowait()
-    assert result[:3] == ("error", 2, "IndexError")
+    assert result[:3] == ("crashed", 2, "IndexError")
     envelope = result[3]
     assert envelope["phase"] == "hold_sample"
     assert envelope["operation"] == "sample_group_2"
@@ -1135,7 +2223,7 @@ def test_worker_crash_envelope_retains_sanitized_context(
     assert "secret" not in flattened
 
 
-async def test_parent_capacity_failure_names_observed_gate(
+async def test_run_requires_boot_bound_capacity_receipt_without_rerunning_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     target = runner.Target(
@@ -1155,18 +2243,18 @@ async def test_parent_capacity_failure_names_observed_gate(
         lambda unused: {"user": runner.fanin.OBSERVER_ROLE, "password": "unused"},
     )
 
-    async def insufficient(unused_instance_type):
-        return {"sufficient": False, "failures": ["event_loop_microbatch_pressure"]}
+    async def must_not_run_preflight(unused_instance_type):
+        raise AssertionError("post-bell capacity benchmark must not run")
 
     async def must_not_spawn(*unused_args, **unused_kwargs):
         raise AssertionError("workers must not spawn after a failed parent preflight")
 
-    monkeypatch.setattr(runner.fanin, "capacity_preflight", insufficient)
+    monkeypatch.setattr(runner.fanin, "capacity_preflight", must_not_run_preflight)
     monkeypatch.setattr(runner, "_execute_sharded_fanin", must_not_spawn)
 
     with pytest.raises(
         runner.RunnerContractError,
-        match="runner_capacity_insufficient_event_loop_microbatch_pressure",
+        match="fanin_capacity_receipt_invalid",
     ):
         await runner._execute_fanin_request(
             {"runner_instance_type": "m6i.xlarge"},
@@ -1175,12 +2263,84 @@ async def test_parent_capacity_failure_names_observed_gate(
         )
 
 
+async def test_valid_boot_receipt_uses_only_live_hard_safety_before_workers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = runner.Target(
+        lane_id="lakebase",
+        secret_arn="unused",
+        endpoint_host="lakebase.example.test",
+        credential_host="lakebase.example.test",
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_baseline_database",
+        lambda unused: {"user": runner.fanin.CLIENT_ROLE, "password": "unused"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_observer_database",
+        lambda unused: {"user": runner.fanin.OBSERVER_ROLE, "password": "unused"},
+    )
+    monkeypatch.setattr(runner.fanin, "_runner_boot_id", lambda: "boot-one")
+    monkeypatch.setattr(runner.fanin, "_network_bytes", lambda: (0, 0))
+
+    async def live_safety(*unused_args, **unused_kwargs):
+        return {
+            "physical_memory_bytes": 15 * 1024**3,
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 100 * 1024**2,
+            "fd_soft_limit": 65_535,
+            "open_fds": 7,
+            "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 100,
+            "ephemeral_ports_remaining": 28_132,
+            "event_loop_p99_ms": 71.721,
+            "cpu_capacity_fraction": 0.99,
+        }
+
+    async def must_not_run_preflight(unused_instance_type):
+        raise AssertionError("post-bell capacity benchmark must not run")
+
+    async def execute(expanded, unused_cancelled, **unused_kwargs):
+        del unused_kwargs
+        assert expanded["targets"][0]["lane_id"] == "lakebase"
+        return {"raw": "available"}
+
+    monkeypatch.setattr(runner.fanin, "_telemetry_off_loop", live_safety)
+    monkeypatch.setattr(runner.fanin, "capacity_preflight", must_not_run_preflight)
+    monkeypatch.setattr(runner, "_execute_sharded_fanin", execute)
+
+    result = await runner._execute_fanin_request(
+        {
+            "run_id": "run",
+            "runner_instance_type": runner.fanin.RUNNER_INSTANCE_TYPE,
+            "capacity_receipt": {
+                "protocol": runner.fanin.PROTOCOL,
+                "schema_version": runner.fanin.SCHEMA_VERSION,
+                "safety_evidence_version": runner.fanin.SAFETY_EVIDENCE_VERSION,
+                "boot_id": "boot-one",
+                "capacity_model_sha256": runner.fanin.capacity_model_sha256(),
+                    "runner_harness_sha256": runner.runner_harness_sha256(),
+                "hard_safety_verified": True,
+            },
+        },
+        (target,),
+        asyncio.Event(),
+    )
+
+    assert result["raw"] == "available"
+    assert result["runner_harness_sha256"] == runner.runner_harness_sha256()
+    assert set(result["runner_asset_sha256s"]) == set(runner.RUNNER_HARNESS_ASSETS)
+    assert result["runner_boot_id"] == "boot-one"
+
+
 async def test_sharded_worker_ready_timeout_is_not_capacity_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _FakeProcessContext()
     monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
-    monkeypatch.setattr(runner, "FANIN_WORKER_READY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(runner, "FANIN_WORKER_RUN_TIMEOUT_SECONDS", 0.01)
 
     with pytest.raises(runner.RunnerContractError, match="fanin_worker_ready_timeout"):
         await runner._execute_sharded_fanin({}, asyncio.Event())

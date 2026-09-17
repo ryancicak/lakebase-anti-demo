@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class CompetitorId(StrEnum):
@@ -267,6 +268,10 @@ class RoundDefinition(BaseModel):
     scorecard_by_corner: dict[Corner, str]
     competitors: list[CompetitorId]
     availability: Availability
+    round5_protocol: Literal["round5-bell-to-10k-v4"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     #: Machine-readable context for a live refusal that is expected to clear
     #: without operator action. The refusal copy remains present for older
     #: clients and diagnostics; new clients branch on this field, never on the
@@ -422,9 +427,25 @@ class RoundFiveSetupLaneSnapshot(BaseModel):
     stop_gate_evidence: RoundFiveSetupGateSnapshot | None = None
     verified: bool = False
     error: str | None = None
+    # Absolute launch delay of this lane's workflow after the shared setup T0,
+    # persisted per lane.  Inter-lane skew alone (``workflow_launch_skew_ms``)
+    # cannot prove each lane launched within the bounded window; this can.
+    workflow_launch_delay_ms: float | None = None
+    # Secret-free finalizer subcode that survives auto-cleanup and the terminal
+    # receipt.  Distinguishes a genuine stop-gate failure (e.g.
+    # ``stop_gate_evidence``/``workflow_launch_window``/``setup_deadline``) from
+    # a public-projection rejection (``public_fact_key_rejected``), instead of
+    # collapsing every case into the generic "Setup verification failed".
+    setup_diagnostic: str | None = None
 
 
 class RoundFiveSetupSnapshot(BaseModel):
+    protocol: Literal[
+        "round5-fanin-v2",
+        "round5-fanin-v3",
+        "round5-fanin-v4",
+    ] = "round5-fanin-v4"
+    schema_version: Literal[2, 3, 4] = 4
     state: RoundFiveSetupState = RoundFiveSetupState.PENDING
     lanes: dict[str, RoundFiveSetupLaneSnapshot]
     workflow_launch_skew_ms: float | None = None
@@ -444,6 +465,123 @@ class RoundFiveSetupSnapshot(BaseModel):
     # abandoned, which is what left an abandoned cleanup indistinguishable from
     # an in-flight one.
     cleanup_failure: str | None = None
+
+    @model_validator(mode="after")
+    def validate_protocol_pair(self) -> RoundFiveSetupSnapshot:
+        if (self.protocol, self.schema_version) not in {
+            ("round5-fanin-v2", 2),
+            ("round5-fanin-v3", 3),
+            ("round5-fanin-v4", 4),
+        }:
+            raise ValueError("Round 5 fan-in protocol and schema version do not pair")
+        return self
+
+
+class RoundFiveRuntimeLaneSnapshot(BaseModel):
+    """One bell-relative lane projection for the v3 Round 5 protocol."""
+
+    id: Literal["lakebase", "competitor"]
+    phase: Literal[
+        "dispatching",
+        "provisioning_proxy",
+        "verifying_proxy",
+        "verifying_path",
+        "ramping",
+        "holding",
+        "verified",
+        "failed",
+        "cancelled",
+    ]
+    elapsed_at_snapshot_ms: float = Field(ge=0)
+    bell_to_10000_observed_ms: float | None = Field(default=None, ge=0)
+    observation_uncertainty_ms: float | None = Field(default=None, ge=0)
+    pooled_path_ready_observed_ms: float | None = Field(default=None, ge=0)
+    ramp_started_observed_ms: float | None = Field(default=None, ge=0)
+    ramp_time_to_10000_ms: float | None = Field(default=None, ge=0)
+    release_published_observed_ms: float | None = Field(default=None, ge=0)
+    runner_release_observed_ms: float | None = Field(default=None, ge=0)
+    first_socket_initiated_observed_ms: float | None = Field(default=None, ge=0)
+    first_client_authenticated_observed_ms: float | None = Field(default=None, ge=0)
+    clients_initiated: int = Field(default=0, ge=0, le=10_000)
+    clients_authenticated: int = Field(default=0, ge=0, le=10_000)
+    held_clients: int = Field(default=0, ge=0, le=10_000)
+    peak_clients_authenticated: int = Field(default=0, ge=0, le=10_000)
+    peak_held_clients: int = Field(default=0, ge=0, le=10_000)
+    progress_revision: int = Field(default=0, ge=0)
+    sampled_queries_succeeded: int = Field(default=0, ge=0, le=64)
+    status: str = Field(min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def validate_stopped_clock(self) -> RoundFiveRuntimeLaneSnapshot:
+        # Snapshots created before the current/peak split carry neither peak.
+        # Promote their current counters on decode so in-flight sessions remain
+        # readable across an app deployment; all new progress updates maintain
+        # the peaks explicitly.
+        self.peak_clients_authenticated = max(
+            self.peak_clients_authenticated,
+            self.clients_authenticated,
+        )
+        self.peak_held_clients = max(self.peak_held_clients, self.held_clients)
+        if self.phase == "verified" and (
+            self.held_clients != 10_000
+            or self.clients_initiated != 10_000
+            or self.clients_authenticated != 10_000
+            or self.peak_clients_authenticated != 10_000
+            or self.peak_held_clients != 10_000
+            or self.bell_to_10000_observed_ms is None
+        ):
+            raise ValueError(
+                "a verified Round 5 lane requires the exact 10,000-client stop"
+            )
+        if self.bell_to_10000_observed_ms is not None:
+            if self.peak_held_clients != 10_000:
+                raise ValueError(
+                    "the bell-to-10,000 stop requires a peak of exactly 10,000 held clients"
+                )
+            if self.elapsed_at_snapshot_ms != self.bell_to_10000_observed_ms:
+                raise ValueError("a stopped Round 5 clock must stay at its 10,000 observation")
+        return self
+
+
+class RoundFiveRuntimeSnapshot(BaseModel):
+    """Versioned V4 runtime state; setup lanes remain supporting evidence only."""
+
+    protocol: Literal["round5-bell-to-10k-v4"] = "round5-bell-to-10k-v4"
+    warm_generation: int = Field(gt=0)
+    bell_id: str = Field(min_length=1, max_length=128)
+    revision: int = Field(gt=0)
+    state: Literal["running", "verified", "failed", "towelled"]
+    bell_at_utc: datetime
+    lanes: dict[Literal["lakebase", "competitor"], RoundFiveRuntimeLaneSnapshot]
+
+    @model_validator(mode="after")
+    def validate_two_lane_clock(self) -> RoundFiveRuntimeSnapshot:
+        if set(self.lanes) != {"lakebase", "competitor"} or any(
+            lane_id != lane.id for lane_id, lane in self.lanes.items()
+        ):
+            raise ValueError("Round 5 V4 requires exactly two bell-relative lane clocks")
+        return self
+
+
+class RoundFiveClockProjectionSnapshot(BaseModel):
+    """Read-time clock floors outside the immutable revisioned runtime."""
+
+    protocol: Literal["round5-clock-projection-v1"] = "round5-clock-projection-v1"
+    bell_id: str = Field(min_length=1, max_length=128)
+    projection_revision: int = Field(gt=0)
+    elapsed_ms: dict[Literal["lakebase", "competitor"], float]
+
+    @field_validator("elapsed_ms")
+    @classmethod
+    def validate_projection_lanes(
+        cls,
+        value: dict[Literal["lakebase", "competitor"], float],
+    ) -> dict[Literal["lakebase", "competitor"], float]:
+        if set(value) != {"lakebase", "competitor"} or any(
+            not math.isfinite(elapsed) or elapsed < 0 for elapsed in value.values()
+        ):
+            raise ValueError("Round 5 clock projection requires two finite lane floors")
+        return value
 
 
 class RedoSnapshot(BaseModel):
@@ -562,6 +700,30 @@ class FairnessSnapshot(BaseModel):
     runner: str | None = Field(default=None, exclude_if=lambda value: value is None)
     tls: str | None = Field(default=None, exclude_if=lambda value: value is None)
     timeout: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    protocol: Literal[
+        "round5-fanin-v2",
+        "round5-fanin-v3",
+        "round5-fanin-v4",
+    ] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    target_clients_per_lane: int | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    hold_seconds: int | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    sampled_queries_per_lane: int | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    max_retries: int | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class CapacityLaneDisclosure(BaseModel):
@@ -1360,6 +1522,14 @@ class SessionSnapshot(BaseModel):
         default=None,
         exclude_if=lambda value: value is None,
     )
+    round5_runtime: RoundFiveRuntimeSnapshot | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    round5_clock_projection: RoundFiveClockProjectionSnapshot | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     redo: RedoSnapshot | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -1381,6 +1551,79 @@ class SessionSnapshot(BaseModel):
             or any(lane_id != lane.id for lane_id, lane in setup.lanes.items())
         ):
             raise ValueError("Round 5 setup requires exactly the Lakebase and opponent lanes")
+        runtime = self.round5_runtime
+        if runtime is not None:
+            if self.run_started_at is None:
+                raise ValueError("Round 5 V4 runtime requires an accepted bell")
+            if runtime.state == "running" and self.state != SessionState.RUNNING:
+                raise ValueError("Round 5 V4 running state must match its session")
+            if runtime.state == "verified" and self.state != SessionState.VERIFIED:
+                raise ValueError("Round 5 V4 verified state must match its session")
+            if runtime.state == "failed" and self.state != SessionState.FAILED:
+                raise ValueError("Round 5 V4 failure state is incoherent")
+            if runtime.state == "towelled" and self.state != SessionState.TOWELLED:
+                raise ValueError("Round 5 V4 towel state must match its session")
+            phases = {lane.phase for lane in runtime.lanes.values()}
+            if runtime.state == "verified" and phases != {"verified"}:
+                raise ValueError("Round 5 verified runtime requires verified lanes")
+            if runtime.state == "failed" and (
+                (
+                    "failed" not in phases
+                    and phases != {"verified"}
+                )
+                or phases & {
+                    "dispatching",
+                    "provisioning_proxy",
+                    "verifying_proxy",
+                    "verifying_path",
+                    "ramping",
+                    "holding",
+                }
+            ):
+                raise ValueError("Round 5 failed runtime has active lane phases")
+            if runtime.state == "towelled" and phases - {"verified", "cancelled"}:
+                raise ValueError("Round 5 towel runtime has active lane phases")
+            # One exact lane may finish while its sibling is still provisioning
+            # or ramping. That evidence is retained, but no comparison is legal
+            # until both exact lane gates have verified.
+            exact = [
+                lane
+                for lane in runtime.lanes.values()
+                if lane.bell_to_10000_observed_ms is not None
+            ]
+            if len(exact) < 2 and self.comparison is not None:
+                raise ValueError("one-sided Round 5 V4 evidence cannot declare a winner")
+            if self.state == SessionState.RUNNING:
+                return self
+            if self.state == SessionState.VERIFIED:
+                if (
+                    runtime.state != "verified"
+                    or len(exact) != 2
+                    or not all(
+                        lane.state == LaneState.VERIFIED
+                        for lane in self.lanes.values()
+                    )
+                    or self.comparison is None
+                ):
+                    raise ValueError(
+                        "Round 5 V4 verified state requires both exact lane gates"
+                    )
+                if (
+                    self.comparison.kind == ComparisonKind.MEASURED
+                    and (
+                        self.comparison.margin is None
+                        or self.comparison.margin.spec_id
+                        != "bell_to_10000_observed_ms"
+                    )
+                ):
+                    raise ValueError(
+                        "Round 5 V4 comparison requires a bell-relative margin"
+                    )
+                return self
+            if self.state == SessionState.FAILED:
+                if self.comparison is not None:
+                    raise ValueError("failed Round 5 V4 cannot declare a winner")
+                return self
         if self.towel is not None:
             if self.state != SessionState.TOWELLED:
                 raise ValueError("Round 5 towel evidence requires a toweled session")

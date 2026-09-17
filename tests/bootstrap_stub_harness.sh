@@ -126,7 +126,7 @@ case "$args" in
     [[ "${STUB_APP_NOT_SERVING:-0}" == "1" ]] && exit 22
     echo '{"status":"ok","database_connections":"sealed"}' ;;
   *"/readyz"*)
-    echo '{"status":"ready","credentials_state":"ok","degraded":false,"ring_ready":true}' ;;
+    echo '{"status":"ready","credentials_state":"ok","degraded":false,"ring_ready":true,"round5_ring_ready":true}' ;;
   *"/api/catalog"*)
     echo '{"rounds":[{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"}]}' ;;
   *"checkip.amazonaws.com"*) echo "203.0.113.7" ;;
@@ -334,7 +334,8 @@ PY
 run() {
   local sb="$1"
   shift
-  OUT="$(HOME="$sb/home" PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+  OUT="$(HOME="$sb/home" ANTI_DEMO_ROUND5_WARM_DEADLINE_SECONDS=3 \
+    PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
     bash ./bootstrap.sh --env-file "$sb/env" "$@" 2>&1)"
   return $?
 }
@@ -500,7 +501,8 @@ run_in_isolated_tree() { # <sandbox> <banned_file_name> <contents>
   tree="$(mktemp -d)"
   cp bootstrap.sh "$tree/bootstrap.sh"
   printf '%s\n' "$contents" >"$tree/$name"
-  OUT="$(HOME="$sb/home" PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+  OUT="$(HOME="$sb/home" ANTI_DEMO_ROUND5_WARM_DEADLINE_SECONDS=3 \
+    PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
     bash "$tree/bootstrap.sh" --env-file "$sb/env" 2>&1)"
   local status=$?
   rm -rf "$tree"

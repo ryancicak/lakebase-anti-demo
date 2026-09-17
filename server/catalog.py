@@ -25,16 +25,16 @@ from .models import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
-#: The protocol Round 5 runs. The bounded 128-attempt protocol is retired: it measured
-#: pooled-path setup and a capped burst, which is not the claim Round 5 makes, and both
-#: lanes now hold exactly 10,000 authenticated clients from a shared start.
+#: The protocol Round 5 runs. The runner evidence remains fan-in v2, but the
+#: installation lifecycle, bell origin, clocks and physical isolation are v3.
 #:
 #: `ROUND5_BOUNDED_PROTOCOL` survives as a name only so that a stored scorecard written
 #: under it can still be recognised and labelled as a legacy result rather than silently
 #: relabelled with 10,000-client copy it never attempted. It is not selectable.
 ROUND5_BOUNDED_PROTOCOL = "connection-spike-v1"
-ROUND5_FANIN_PROTOCOL = "round5-fanin-v2"
-ROUND5_PROTOCOLS = frozenset({ROUND5_FANIN_PROTOCOL})
+ROUND5_FANIN_PROTOCOL = "round5-fanin-v4"
+ROUND5_BELL_PROTOCOL = "round5-bell-to-10k-v4"
+ROUND5_PROTOCOLS = frozenset({ROUND5_BELL_PROTOCOL})
 
 
 COMPETITORS = [
@@ -87,11 +87,9 @@ MODEL_SCORE_METRICS = [
 
 CONNECTION_SPIKE_METRICS = [
     MetricSpec(
-        # The scored result: from one shared start, how long each lane takes to hold
-        # 10,000 authenticated clients. Setup time used to sit here, which meant the
-        # margin shown under "time to 10,000" was the time to build an RDS Proxy.
-        id="time_to_target_ms",
-        label="Time to 10,000 clients",
+        # The scored result: one server bell to the observed exact held gate.
+        id="bell_to_10000_observed_ms",
+        label="Bell to 10,000 held clients",
         role=MetricRole.PRIMARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
@@ -267,13 +265,12 @@ ROUNDS = [
                 "Published rates include the new RDS Proxy selected for the AWS reference path"
             ),
             Corner.SIMPLICITY: (
-                "Included Lakebase pooled endpoint versus 9 journaled mutations for the "
+                "Included Lakebase pooled endpoint versus 3 timed Proxy mutations on the "
                 "selected AWS managed pooling path"
             ),
             Corner.PERFORMANCE: (
-                "Primary time to hold 10,000 authenticated clients per lane from a shared "
-                "start; secondary pooled-path setup time and peak backend sessions, with "
-                "held clients and failures as guardrails"
+                "One server bell to observed exact 10,000 held client connections per lane; "
+                "runner-local ramp time and peak backend sessions are supporting evidence"
             ),
         },
         competitors=[CompetitorId.RDS_POSTGRES, CompetitorId.AURORA_SERVERLESS_V2],
@@ -282,17 +279,14 @@ ROUNDS = [
         comparison_kind=ComparisonKind.MEASURED,
         non_claims=[
             (
-                "From a database-only declared start, Lakebase verifies its included pooled "
-                "endpoint with 0 separately provisioned per-bout pooling components and 0 "
-                "per-bout pooling infrastructure mutations. Baseline native-login, "
-                "ordinary-role, and runner-credential preparation remains outside the clock."
+                "Lakebase dispatches its first retained pooled client immediately at the "
+                "bell. Native login, ordinary roles, capacity, credentials, and endpoint "
+                "bindings are prepared automatically backstage."
             ),
             (
-                "The selected AWS managed pooling path provisions a new RDS Proxy and performs "
-                "9 journaled competitor mutations: 1 per-bout Proxy security group, 1 "
-                "default-egress change, 4 exact security-group rules, 1 RDS Proxy, 1 "
-                "target-group configuration, and 1 target registration. Its setup clock "
-                "stops at the exact application transaction."
+                "The selected AWS path performs 3 journaled timed mutations: CreateDBProxy "
+                "first, exact target-group configuration, and exact target registration. "
+                "Least-privilege Proxy network fixtures stand warm but the Proxy does not."
             ),
             (
                 "The IAM service role, runner permission, and dedicated proxy credential "
@@ -302,18 +296,16 @@ ROUNDS = [
                 "existing RDS Proxy, PgBouncer, and application pooling were not compared."
             ),
             (
-                "Phase 2 opens exactly 10,000 authenticated client connections per lane from "
-                "one shared start, holds them for 30 seconds, and answers 64 sparse queries "
-                "per lane with no retries. 9,999 held clients is a failed lane, not a near "
-                "miss. Both lanes run in the same process on one isolated runner, four "
-                "pinned workers each, so neither lane can be given a quieter machine."
+                "Each independent lane opens exactly 10,000 authenticated retained clients, "
+                "holds them for 30 seconds, and answers 64 sparse queries with no retries. "
+                "9,999 fails. Each lane owns a distinct physical c7i.2xlarge runner."
             ),
             (
                 "Multiplexing is read during the hold by a second database role on its own "
                 "direct connection, never inferred from the client count. Connect latency "
                 "p50, p95 and p99 are nearest-rank over raw, unrounded per-client "
-                "measurements. Pooled-path setup time is reported separately and is never "
-                "added to the time to 10,000."
+                "measurements. Runner-local ramp time is supporting evidence; the large "
+                "comparison clock is always server-observed bell to exact 10,000 held."
             ),
             (
                 "Lakebase's built-in PgBouncer product limit is up to 10,000 client "
@@ -355,7 +347,7 @@ def catalog(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
-    round5_protocol: str = ROUND5_FANIN_PROTOCOL,
+    round5_protocol: str = ROUND5_BELL_PROTOCOL,
 ) -> CatalogResponse:
     return CatalogResponse(
         competitors=COMPETITORS,
@@ -390,7 +382,7 @@ def round_by_id(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
-    round5_protocol: str = ROUND5_FANIN_PROTOCOL,
+    round5_protocol: str = ROUND5_BELL_PROTOCOL,
 ) -> RoundDefinition:
     if round5_protocol not in ROUND5_PROTOCOLS:
         raise ValueError(f"Unknown Round 5 protocol: {round5_protocol}")
@@ -411,7 +403,8 @@ def round_by_id(
                     Availability.READY
                     if connection_spike_available
                     else Availability.PLANNED
-                )
+                ),
+                "round5_protocol": ROUND5_BELL_PROTOCOL,
             },
             deep=True,
         )
@@ -433,7 +426,7 @@ def recommend_round(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
-    round5_protocol: str = ROUND5_FANIN_PROTOCOL,
+    round5_protocol: str = ROUND5_BELL_PROTOCOL,
 ) -> tuple[RoundDefinition, str]:
     for preferred in primary.recommended_rounds:
         if preferred == "inherit_primary_round":

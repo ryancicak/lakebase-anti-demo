@@ -11,13 +11,127 @@ from server.models import (
     LaneSnapshot,
     LaneState,
     MetricValue,
+    RoundFiveRuntimeLaneSnapshot,
     RoundFiveSetupLaneSnapshot,
     RoundFiveSetupState,
     RoundId,
     TowelSnapshot,
     TowelState,
 )
-from server.towel import adjudicate_round_five_towel, adjudicate_towel
+from server.towel import (
+    adjudicate_round_five_bell_towel,
+    adjudicate_round_five_towel,
+    adjudicate_towel,
+)
+
+
+def _runtime_lane(
+    lane_id: str,
+    *,
+    phase: str,
+    bell_to_10000_observed_ms: float | None,
+    elapsed_at_snapshot_ms: float,
+    held: int,
+    sampled: int,
+) -> RoundFiveRuntimeLaneSnapshot:
+    return RoundFiveRuntimeLaneSnapshot(
+        id=lane_id,
+        phase=phase,
+        elapsed_at_snapshot_ms=elapsed_at_snapshot_ms,
+        bell_to_10000_observed_ms=bell_to_10000_observed_ms,
+        clients_initiated=held,
+        clients_authenticated=held,
+        held_clients=held,
+        peak_clients_authenticated=held,
+        peak_held_clients=held,
+        sampled_queries_succeeded=sampled,
+        status=f"{lane_id} runtime",
+    )
+
+
+def test_v4_bell_towel_reads_runtime_and_never_promotes_the_setup_stop() -> None:
+    # The reported live state: Lakebase reached 10,000 at 14.15s and was
+    # towelled mid-hold; Aurora never reached 10,000 (lower bound 23.89s). The
+    # generic lanes still carry the ~6ms setup stop the orchestrator promoted --
+    # the adjudication must ignore it entirely.
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.VERIFIED, elapsed_ms=6.0),
+        "competitor": _lane("competitor", LaneState.CONNECTING),
+    }
+    runtime_lanes = {
+        "lakebase": _runtime_lane(
+            "lakebase",
+            phase="cancelled",
+            bell_to_10000_observed_ms=14_150.0,
+            elapsed_at_snapshot_ms=14_150.0,
+            held=10_000,
+            sampled=41,
+        ),
+        "competitor": _runtime_lane(
+            "competitor",
+            phase="cancelled",
+            bell_to_10000_observed_ms=None,
+            elapsed_at_snapshot_ms=23_890.0,
+            held=8_400,
+            sampled=0,
+        ),
+    }
+    original_lanes = deepcopy(lanes)
+
+    result = adjudicate_round_five_bell_towel(lanes=lanes, runtime_lanes=runtime_lanes)
+
+    assert lanes == original_lanes  # inputs are never mutated
+    # Lakebase: reached 10,000 but never VERIFIED, and the setup stop never leaks.
+    assert result.lanes["lakebase"].state == LaneState.TOWELLED
+    assert result.lanes["lakebase"].elapsed_ms is None
+    assert result.lanes["lakebase"].evidence["reached_10000"] is True
+    assert result.lanes["lakebase"].evidence["verified"] is False
+    assert result.lanes["lakebase"].evidence["bell_to_10000_observed_ms"] == 14_150.0
+    assert "0.01" not in result.lanes["lakebase"].status
+    # Aurora: never reached, censored lower bound from its own runtime clock.
+    assert result.lanes["competitor"].state == LaneState.TOWELLED
+    assert result.censored_lower_bounds_ms == {"competitor": 23_890.0}
+    # No winner, no margin: the full contract never completed.
+    assert result.comparison.kind == ComparisonKind.NOT_COMPARABLE
+    assert result.comparison.winner_lane_id is None
+    assert result.comparison.margin is None
+    assert result.public_result == (
+        "Toweled · No exact verified result · No declared winner · "
+        "Comparison incomplete · Margin N/A"
+    )
+
+
+def test_v4_bell_towel_keeps_a_genuinely_verified_lane_verified() -> None:
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.VERIFIED, elapsed_ms=6.0),
+        "competitor": _lane("competitor", LaneState.CONNECTING),
+    }
+    runtime_lanes = {
+        "lakebase": _runtime_lane(
+            "lakebase",
+            phase="verified",
+            bell_to_10000_observed_ms=14_150.0,
+            elapsed_at_snapshot_ms=14_150.0,
+            held=10_000,
+            sampled=64,
+        ),
+        "competitor": _runtime_lane(
+            "competitor",
+            phase="cancelled",
+            bell_to_10000_observed_ms=None,
+            elapsed_at_snapshot_ms=23_890.0,
+            held=8_400,
+            sampled=0,
+        ),
+    }
+
+    result = adjudicate_round_five_bell_towel(lanes=lanes, runtime_lanes=runtime_lanes)
+
+    # A lane that completed the hold before the towel keeps its exact verified
+    # bell time -- and it is the bell observation, not the 6ms setup stop.
+    assert result.lanes["lakebase"].state == LaneState.VERIFIED
+    assert result.lanes["lakebase"].elapsed_ms == 14_150.0
+    assert result.lanes["lakebase"].evidence["verified"] is True
 
 
 def _lane(lane_id: str, state: LaneState, elapsed_ms: float | None = None) -> LaneSnapshot:

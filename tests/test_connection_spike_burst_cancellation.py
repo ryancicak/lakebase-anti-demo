@@ -188,6 +188,7 @@ async def test_the_settlement_bound_now_covers_the_cancel_command() -> None:
         run_id=RUN_ID,
         command_id="11111111-2222-4333-8444-555555555555",
         clients=SimpleNamespace(ssm=ssm),
+        job_id=None,
     )
 
     started = time.monotonic()
@@ -333,6 +334,7 @@ async def test_burst_cancellation_uses_the_exact_ssm_call_shapes() -> None:
         run_id=RUN_ID,
         command_id=command_id,
         clients=SimpleNamespace(ssm=ssm),
+        job_id=None,
     )
 
     with stubber:

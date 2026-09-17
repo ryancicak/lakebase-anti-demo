@@ -395,17 +395,17 @@ export interface FairnessSnapshot {
    * assuming absence means the current protocol.
    */
   protocol?: string
-  /** 10,000 under `round5-fanin-v2`. Absent on a snapshot that predates it. */
+  /** 10,000 under the exact fan-in protocol. Absent on an older snapshot. */
   target_clients_per_lane?: number
-  /** 64 sparse samples per lane under `round5-fanin-v2`. */
+  /** 64 verification samples per lane under the exact fan-in protocol. */
   sampled_queries_per_lane?: number
   /**
    * How long every client is held open after the target is reached: 30 seconds
-   * under `round5-fanin-v2`, and 0 under the bounded protocol, which never held.
+   * under the exact fan-in protocol, and 0 under the bounded protocol, which never held.
    */
   hold_seconds?: number
   /**
-   * Retries allowed per client: 0 under `round5-fanin-v2`.
+   * Retries allowed per client: 0 under the exact fan-in protocol.
    *
    * Disclosed because it is the difference between "10,000 connected" and "10,000
    * connected on the first attempt". A protocol that retried could reach the target
@@ -929,6 +929,57 @@ export interface SetupPhaseResult {
   cleanup_failure?: string | null
 }
 
+export type RoundFiveRuntimePhase =
+  | 'dispatching'
+  | 'provisioning_proxy'
+  | 'verifying_proxy'
+  | 'verifying_path'
+  | 'ramping'
+  | 'holding'
+  | 'verified'
+  | 'failed'
+  | 'cancelled'
+
+export interface RoundFiveRuntimeLane {
+  id: LaneId
+  phase: RoundFiveRuntimePhase
+  elapsed_at_snapshot_ms: number
+  bell_to_10000_observed_ms: number | null
+  observation_uncertainty_ms: number | null
+  pooled_path_ready_observed_ms: number | null
+  ramp_started_observed_ms: number | null
+  ramp_time_to_10000_ms: number | null
+  release_published_observed_ms?: number | null
+  runner_release_observed_ms?: number | null
+  first_socket_initiated_observed_ms?: number | null
+  first_client_authenticated_observed_ms?: number | null
+  clients_initiated: number
+  clients_authenticated: number
+  held_clients: number
+  peak_clients_authenticated?: number
+  peak_held_clients?: number
+  progress_revision?: number
+  sampled_queries_succeeded: number
+  status: string
+}
+
+export interface RoundFiveRuntimeSnapshot {
+  protocol: 'round5-bell-to-10k-v4'
+  warm_generation: number
+  bell_id: string
+  revision: number
+  state: 'running' | 'verified' | 'failed' | 'towelled'
+  bell_at_utc: string
+  lanes: Record<LaneId, RoundFiveRuntimeLane>
+}
+
+export interface RoundFiveClockProjectionSnapshot {
+  protocol: 'round5-clock-projection-v1'
+  bell_id: string
+  projection_revision: number
+  elapsed_ms: Record<LaneId, number>
+}
+
 export interface DemoSession {
   id: string
   state: SessionState
@@ -959,6 +1010,8 @@ export interface DemoSession {
   metrics?: MetricValue[]
   comparison?: ComparisonSnapshot | null
   round5_setup?: SetupPhaseResult | null
+  round5_runtime?: RoundFiveRuntimeSnapshot | null
+  round5_clock_projection?: RoundFiveClockProjectionSnapshot | null
   redo?: RedoSnapshot | null
 }
 

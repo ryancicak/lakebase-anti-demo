@@ -61,7 +61,7 @@ _NO_MANIFEST_SELECTED = (
     "of the generation you mean to operate on, or start the run through the launcher, "
     "which sets it for you. There is no default: silently resolving one would act on a "
     "previous generation's state. "
-    'Run \'eval "$(./bootstrap.sh --print-env)"\' to set it for the current shell; '
+    "Run 'eval \"$(./bootstrap.sh --print-env)\"' to set it for the current shell; "
     "plain ./bootstrap.sh reports the generation it resolves but cannot export into "
     "the shell that called it. That command re-runs the whole preflight and prints "
     "nothing at all when any check fails, so an eval of it can quietly set nothing and "
@@ -97,9 +97,7 @@ class AwsManifest(BaseModel):
     #: before this existed, which is why they are `None` rather than `""`/`()`:
     #: `save_manifest` writes with `exclude_none=True`, so an older manifest
     #: round-trips byte-identical instead of silently gaining two empty keys.
-    runtime_role_arn: str | None = Field(
-        default=None, pattern=r"^arn:[^:]+:iam::\d{12}:role/.+$"
-    )
+    runtime_role_arn: str | None = Field(default=None, pattern=r"^arn:[^:]+:iam::\d{12}:role/.+$")
     #: Exactly the principals the runtime role's trust policy names. Sealed as a
     #: set, because the trust document is what `antidemo doctor` holds AWS against
     #: after the fortnightly sweep deletes and the installer recreates the IAM
@@ -170,9 +168,7 @@ class AwsManifest(BaseModel):
                     f"serverless_egress_cidrs entries must be exact IPv4 CIDRs; got {entry!r}"
                 ) from exc
             if network.version != 4:
-                raise ValueError(
-                    f"serverless_egress_cidrs must be IPv4; got {entry!r}"
-                )
+                raise ValueError(f"serverless_egress_cidrs must be IPv4; got {entry!r}")
             if network.prefixlen < SERVERLESS_EGRESS_MIN_PREFIXLEN:
                 raise ValueError(
                     f"serverless_egress_cidrs refuses anything wider than a "
@@ -229,9 +225,7 @@ class AwsManifest(BaseModel):
         prevent. A timestamp with no list claims a seal that admits nobody.
         """
 
-        if (self.serverless_egress_cidrs is None) != (
-            self.serverless_egress_published_at is None
-        ):
+        if (self.serverless_egress_cidrs is None) != (self.serverless_egress_published_at is None):
             raise ValueError(
                 "serverless_egress_cidrs and serverless_egress_published_at are sealed "
                 "together or not at all"
@@ -644,6 +638,37 @@ class Round5OwnershipTags(BaseModel):
         return tags
 
 
+#: Repeated Round 5 seal fields that were added *after* the clean baseline hash
+#: was first sealed. Unlike the nullable Aurora migration fields, these default
+#: to an empty tuple rather than ``None``, so ``exclude_none`` keeps them in the
+#: canonical payload as ``[]`` and shifts ``baseline_sha256`` for any seal that
+#: predates them. A security-group egress rule list that is empty and one that is
+#: absent describe the same topology, so the canonical payload drops them when
+#: empty: a pre-field seal then hashes exactly as it did before the field
+#: existed, while a factory-ready seal carries the populated rule IDs and is
+#: hashed and verified in full. This is a load-compat bridge, not a relaxation of
+#: the hash — a populated field is never dropped.
+_MIGRATABLE_EMPTY_ROUND5_SEAL_FIELDS = (
+    "lakebase_runner_egress_rule_ids",
+    "competitor_runner_egress_rule_ids",
+)
+
+
+def canonical_round5_seal_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Return the payload used to derive and verify a Round 5 seal hash.
+
+    Drops the migratable repeated fields above when they are empty so that the
+    baseline and config hashes are stable across the addition of those fields.
+    Non-empty values are always preserved and therefore always hashed.
+    """
+
+    canonical = dict(payload)
+    for field in _MIGRATABLE_EMPTY_ROUND5_SEAL_FIELDS:
+        if canonical.get(field) in ([], ()):
+            canonical.pop(field, None)
+    return canonical
+
+
 class Round5Resources(BaseModel):
     """Secret-free Round 5 seal for the clean, Terraform-owned baseline."""
 
@@ -692,13 +717,74 @@ class Round5Resources(BaseModel):
         default=None, pattern=r"^arn:[^:]+:iam::\d{12}:policy/.+$"
     )
     runner_permissions_boundary_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:policy/.+$")
+    competitor_runner_permissions_boundary_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:iam::\d{12}:policy/.+$",
+    )
+    # The original runner becomes the dedicated Lakebase runner under v3. The
+    # second physical instance is optional only so older seals remain loadable;
+    # `factory_ready` refuses Round 5 until a reseal records it.
     runner_instance_id: str = Field(pattern=r"^i-[0-9a-f]{8,17}$")
+    competitor_runner_instance_id: str | None = Field(
+        default=None,
+        pattern=r"^i-[0-9a-f]{8,17}$",
+    )
     runner_instance_profile_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:instance-profile/.+$")
     runner_role_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:role/.+$")
+    competitor_runner_instance_profile_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:iam::\d{12}:instance-profile/.+$",
+    )
+    competitor_runner_role_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:iam::\d{12}:role/.+$",
+    )
     runner_subnet_id: str = Field(pattern=r"^subnet-[0-9a-f]{8,17}$")
     runner_security_group_id: str = Field(pattern=r"^sg-[0-9a-f]{8,17}$")
     runner_egress_rule_id: str = Field(pattern=r"^sgr-[0-9a-f]{8,17}$")
+    lakebase_runner_egress_rule_ids: tuple[str, ...] = ()
+    competitor_runner_security_group_id: str | None = Field(
+        default=None,
+        pattern=r"^sg-[0-9a-f]{8,17}$",
+    )
+    competitor_runner_egress_rule_ids: tuple[str, ...] = ()
+    aurora_proxy_security_group_id: str | None = Field(
+        default=None,
+        pattern=r"^sg-[0-9a-f]{8,17}$",
+    )
+    rds_proxy_security_group_id: str | None = Field(
+        default=None,
+        pattern=r"^sg-[0-9a-f]{8,17}$",
+    )
     runner_public_key_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    competitor_runner_public_key_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    lakebase_control_queue_url: str | None = Field(
+        default=None,
+        pattern=r"^https://sqs\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/\d{12}/[A-Za-z0-9_-]+\.fifo$",
+    )
+    competitor_control_queue_url: str | None = Field(
+        default=None,
+        pattern=r"^https://sqs\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?/\d{12}/[A-Za-z0-9_-]+\.fifo$",
+    )
+    lakebase_control_queue_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:sqs:[^:]+:\d{12}:.+\.fifo$",
+    )
+    competitor_control_queue_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:sqs:[^:]+:\d{12}:.+\.fifo$",
+    )
+    runner_control_secret_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:secretsmanager:[^:]+:\d{12}:secret:.+$",
+    )
+    competitor_runner_control_secret_arn: str | None = Field(
+        default=None,
+        pattern=r"^arn:[^:]+:secretsmanager:[^:]+:\d{12}:secret:.+$",
+    )
     lakebase_credential_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     aurora_credential_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     rds_credential_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -714,15 +800,9 @@ class Round5Resources(BaseModel):
     #: existed stays loadable and keeps serving; it simply cannot run the fan-in
     #: protocol until the next reseal fills them in, which is a truthful state rather
     #: than a broken one.
-    lakebase_observer_credential_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
-    aurora_observer_credential_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
-    rds_observer_credential_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
+    lakebase_observer_credential_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    aurora_observer_credential_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    rds_observer_credential_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     bout_name_prefix: str = Field(min_length=1, max_length=48)
     # Legacy per-bout secret discovery prefix, load-compatible for migration.
     secret_name_prefix: str | None = Field(default=None, min_length=1, max_length=128)
@@ -787,6 +867,40 @@ class Round5Resources(BaseModel):
             )
         )
 
+    @property
+    def v3_factory_ready(self) -> bool:
+        """Whether the seal includes both physical runners and static fixtures."""
+
+        return (
+            self.factory_ready
+            and all(
+                getattr(self, field, None) is not None
+                for field in (
+                    "competitor_runner_instance_id",
+                    "competitor_runner_permissions_boundary_arn",
+                    "aurora_proxy_security_group_id",
+                    "rds_proxy_security_group_id",
+                    "competitor_runner_public_key_sha256",
+                    "lakebase_control_queue_url",
+                    "competitor_control_queue_url",
+                    "lakebase_control_queue_arn",
+                    "competitor_control_queue_arn",
+                    "runner_control_secret_arn",
+                    "competitor_runner_control_secret_arn",
+                    "competitor_runner_instance_profile_arn",
+                    "competitor_runner_role_arn",
+                    "competitor_runner_security_group_id",
+                )
+            )
+            and (
+                self.competitor_runner_instance_id != self.runner_instance_id
+                and self.competitor_runner_security_group_id != self.runner_security_group_id
+                and self.competitor_runner_control_secret_arn != self.runner_control_secret_arn
+                and bool(self.lakebase_runner_egress_rule_ids)
+                and bool(self.competitor_runner_egress_rule_ids)
+            )
+        )
+
     @field_validator("proxy_subnet_ids")
     @classmethod
     def require_exact_proxy_subnets(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -794,6 +908,23 @@ class Round5Resources(BaseModel):
             re.fullmatch(r"subnet-[0-9a-f]{8,17}", subnet) is None for subnet in value
         ):
             raise ValueError("proxy_subnet_ids must contain distinct exact subnet IDs")
+        return value
+
+    @field_validator(
+        "lakebase_runner_egress_rule_ids",
+        "competitor_runner_egress_rule_ids",
+    )
+    @classmethod
+    def require_exact_runner_egress_rules(
+        cls,
+        value: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if len(set(value)) != len(value) or any(
+            re.fullmatch(r"sgr-[0-9a-f]{8,17}", rule_id) is None for rule_id in value
+        ):
+            raise ValueError(
+                "runner egress rule IDs must contain distinct exact security-group rule IDs"
+            )
         return value
 
     @property
@@ -856,10 +987,12 @@ class Round5Resources(BaseModel):
         aurora_values = [getattr(self, field) for field in aurora_fields]
         if any(value is not None for value in aurora_values) and not self.aurora_baseline_ready:
             raise ValueError("Aurora clean baseline seal is incomplete")
-        payload = self.model_dump(
-            mode="json",
-            exclude={"baseline_sha256", "config_sha256"},
-            exclude_none=True,
+        payload = canonical_round5_seal_payload(
+            self.model_dump(
+                mode="json",
+                exclude={"baseline_sha256", "config_sha256"},
+                exclude_none=True,
+            )
         )
         expected_baseline = hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1280,9 +1413,7 @@ def apply_manifest_environment(manifest: DemoManifest) -> None:
     if "@" in manifest.owner:
         values.update(
             {
-                LOCAL_OPERATOR_ENV: manifest.owner.split("@", 1)[0]
-                .replace(".", " ")
-                .title(),
+                LOCAL_OPERATOR_ENV: manifest.owner.split("@", 1)[0].replace(".", " ").title(),
                 LOCAL_OPERATOR_EMAIL_ENV: manifest.owner,
                 LOCAL_OPERATOR_ID_ENV: f"local:{manifest.owner.casefold()}",
             }

@@ -27,6 +27,7 @@ data "aws_iam_policy_document" "round5_execution" {
     actions = ["ssm:SendCommand"]
     resources = [
       aws_instance.round5_runner.arn,
+      aws_instance.round5_competitor_runner.arn,
       "arn:${data.aws_partition.current.partition}:ssm:${var.aws_region}::document/AWS-RunShellScript",
     ]
 
@@ -41,6 +42,17 @@ data "aws_iam_policy_document" "round5_execution" {
       variable = "aws:RequestedRegion"
       values   = [var.aws_region]
     }
+  }
+
+  statement {
+    actions = [
+      "sqs:GetQueueAttributes",
+      "sqs:SendMessage",
+    ]
+    resources = [
+      aws_sqs_queue.round5_lakebase_control.arn,
+      aws_sqs_queue.round5_competitor_control.arn,
+    ]
   }
 
   statement {
@@ -212,40 +224,6 @@ data "aws_iam_policy_document" "round5_execution" {
   }
 
   statement {
-    actions   = ["ec2:AuthorizeSecurityGroupEgress"]
-    resources = [aws_security_group.round5_runner.arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:PrincipalAccount"
-      values   = [var.aws_account_id]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestedRegion"
-      values   = [var.aws_region]
-    }
-  }
-
-  statement {
-    actions   = ["ec2:RevokeSecurityGroupEgress"]
-    resources = [aws_security_group.round5_runner.arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:PrincipalAccount"
-      values   = [var.aws_account_id]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestedRegion"
-      values   = [var.aws_region]
-    }
-  }
-
-  statement {
     actions = ["ec2:AuthorizeSecurityGroupIngress"]
     resources = [
       local.round5_aurora_sg.arn,
@@ -369,20 +347,29 @@ data "aws_iam_policy_document" "round5_execution" {
 
   statement {
     actions = [
-      "rds:AddTagsToResource",
-      "rds:CreateDBProxy",
+      "rds:DeleteDBProxy",
+      "rds:ModifyDBProxy",
+      # ModifyDBProxyTargetGroup / (De)RegisterDBProxyTargets authorize against
+      # BOTH the target-group ARN (granted in the next statement) AND the parent
+      # db-proxy ARN. Without the db-proxy grant here, configuring the pool after
+      # CreateDBProxy fails at ModifyDBProxyTargetGroup with AccessDenied on the
+      # db-proxy resource, which failed the competitor setup ~56s in. The same
+      # bout-tag fencing below still scopes these to this bout's owned proxy.
+      "rds:ModifyDBProxyTargetGroup",
+      "rds:RegisterDBProxyTargets",
+      "rds:DeregisterDBProxyTargets",
     ]
-    resources = ["*"]
+    resources = ["arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:db-proxy:*"]
 
     condition {
       test     = "StringEquals"
-      variable = "aws:RequestTag/anti-demo-run-id"
+      variable = "aws:ResourceTag/anti-demo-run-id"
       values   = [var.run_id]
     }
 
     condition {
       test     = "StringEquals"
-      variable = "aws:RequestTag/managed-by"
+      variable = "aws:ResourceTag/managed-by"
       values   = ["round5-lifecycle"]
     }
 
@@ -390,32 +377,14 @@ data "aws_iam_policy_document" "round5_execution" {
       for_each = local.round5_ownership_tags
       content {
         test     = "StringEquals"
-        variable = "aws:RequestTag/${condition.key}"
+        variable = "aws:ResourceTag/${condition.key}"
         values   = [condition.value]
       }
     }
 
     condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Owner"
-      values   = [trimspace(var.owner)]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/owner"
-      values   = [trimspace(var.owner)]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/expires-at"
-      values   = [var.expires_at]
-    }
-
-    condition {
       test     = "Null"
-      variable = "aws:RequestTag/anti-demo-bout-id"
+      variable = "aws:ResourceTag/anti-demo-bout-id"
       values   = ["false"]
     }
 
@@ -434,13 +403,11 @@ data "aws_iam_policy_document" "round5_execution" {
 
   statement {
     actions = [
-      "rds:DeleteDBProxy",
       "rds:DeregisterDBProxyTargets",
-      "rds:ModifyDBProxy",
       "rds:ModifyDBProxyTargetGroup",
       "rds:RegisterDBProxyTargets",
     ]
-    resources = ["*"]
+    resources = ["arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:target-group:*"]
 
     condition {
       test     = "StringEquals"
@@ -535,4 +502,193 @@ resource "aws_iam_role_policy" "round5_execution" {
   name_prefix = local.round5_execution_policy_prefix
   role        = aws_iam_role.round5_execution.id
   policy      = data.aws_iam_policy_document.round5_execution.json
+}
+
+# The control role's full permission set exceeds the 10,240-character aggregate
+# limit for inline role policies, so RDS Proxy provisioning and its tag-hijack
+# guard are carried as an attached customer-managed policy instead (6,144-char
+# limit, and it does not count against the inline aggregate). This mirrors the
+# split the anti-demo-runtime role already uses. The union of permissions on the
+# role is byte-for-byte the same set; only where they are stored changed.
+data "aws_iam_policy_document" "round5_execution_proxy" {
+  statement {
+    actions   = ["rds:CreateDBProxy"]
+    resources = ["arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:db-proxy:*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/anti-demo-run-id"
+      values   = [var.run_id]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/managed-by"
+      values   = ["round5-lifecycle"]
+    }
+
+    dynamic "condition" {
+      for_each = local.round5_ownership_tags
+      content {
+        test     = "StringEquals"
+        variable = "aws:RequestTag/${condition.key}"
+        values   = [condition.value]
+      }
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Owner"
+      values   = [trimspace(var.owner)]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/owner"
+      values   = [trimspace(var.owner)]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/expires-at"
+      values   = [var.expires_at]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/anti-demo-bout-id"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalAccount"
+      values   = [var.aws_account_id]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.aws_region]
+    }
+  }
+
+  # CreateDBProxy evaluates AddTagsToResource as a dependent action, and the
+  # service creates its default target group without accepting tags. Keep that
+  # unavoidable tagging permission off every other RDS resource type and admit
+  # only the exact ownership-key set. The explicit deny below prevents changing
+  # an already-owned foreign proxy or target group into one this run can mutate.
+  statement {
+    actions = ["rds:AddTagsToResource"]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:db-proxy:*",
+      "arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:target-group:*",
+    ]
+
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "aws:TagKeys"
+      values   = local.round5_bout_tag_keys
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/anti-demo-run-id"
+      values   = [var.run_id]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/managed-by"
+      values   = ["round5-lifecycle"]
+    }
+
+    dynamic "condition" {
+      for_each = local.round5_ownership_tags
+      content {
+        test     = "StringEquals"
+        variable = "aws:RequestTag/${condition.key}"
+        values   = [condition.value]
+      }
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/Owner"
+      values   = [trimspace(var.owner)]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/owner"
+      values   = [trimspace(var.owner)]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/expires-at"
+      values   = [var.expires_at]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/anti-demo-bout-id"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/anti-demo:bout-token"
+      values   = ["false"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:PrincipalAccount"
+      values   = [var.aws_account_id]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestedRegion"
+      values   = [var.aws_region]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = toset(local.round5_bout_tag_keys)
+    content {
+      effect  = "Deny"
+      actions = ["rds:AddTagsToResource"]
+      resources = [
+        "arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:db-proxy:*",
+        "arn:${data.aws_partition.current.partition}:rds:${var.aws_region}:${var.aws_account_id}:target-group:*",
+      ]
+
+      condition {
+        test     = "Null"
+        variable = "aws:ResourceTag/${statement.value}"
+        values   = ["false"]
+      }
+
+      condition {
+        test     = "StringNotEquals"
+        variable = "aws:RequestTag/${statement.value}"
+        values   = ["$${aws:ResourceTag/${statement.value}}"]
+      }
+    }
+  }
+}
+
+resource "aws_iam_policy" "round5_execution_proxy" {
+  name_prefix = "${local.round5_iam_stem}-exec-proxy-"
+  description = "Round 5 control role: RDS Proxy provisioning and tag-hijack guard, split out to respect the inline policy size limit"
+  policy      = data.aws_iam_policy_document.round5_execution_proxy.json
+
+  tags = local.round5_policy_tags
+}
+
+resource "aws_iam_role_policy_attachment" "round5_execution_proxy" {
+  role       = aws_iam_role.round5_execution.name
+  policy_arn = aws_iam_policy.round5_execution_proxy.arn
 }

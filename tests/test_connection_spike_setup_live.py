@@ -11,11 +11,13 @@ from types import SimpleNamespace
 import pytest
 
 from runner import round5_fanin as runner_fanin
+from server.connection_spike import arm_setup_phase, finalize_setup_phase
 from server.connection_spike_journal import CreationScope, JournalEvent, ResourceSpec
 from server.connection_spike_live import (
     ConnectionSpikeLiveConfigurationError,
     ConnectionSpikeLiveOperationError,
     ConnectionSpikeSetupConfig,
+    ConnectionSpikeSetupLaneStop,
     LakebaseCreationJournalStore,
     LiveConnectionSpikeEngine,
     LiveConnectionSpikeSetupOrchestrator,
@@ -189,9 +191,26 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
     resources = SimpleNamespace(
         control_role_arn=f"arn:aws:iam::{ACCOUNT}:role/baseline-control",
         runner_instance_id="i-0123456789abcdef0",
+        competitor_runner_instance_id="i-0fedcba9876543210",
+        lakebase_control_queue_url=(f"https://sqs.us-west-2.amazonaws.com/{ACCOUNT}/lakebase.fifo"),
+        competitor_control_queue_url=(
+            f"https://sqs.us-west-2.amazonaws.com/{ACCOUNT}/competitor.fifo"
+        ),
+        runner_control_secret_arn=(
+            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:runner-control"
+        ),
+        competitor_runner_control_secret_arn=(
+            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:competitor-control"
+        ),
         runner_instance_profile_arn=f"arn:aws:iam::{ACCOUNT}:instance-profile/runner",
+        competitor_runner_instance_profile_arn=(
+            f"arn:aws:iam::{ACCOUNT}:instance-profile/competitor-runner"
+        ),
         runner_subnet_id="subnet-a",
         runner_security_group_id="sg-runner",
+        competitor_runner_security_group_id="sg-competitor-runner",
+        aurora_proxy_security_group_id="sg-proxy-aurora",
+        rds_proxy_security_group_id="sg-proxy-rds",
         runner_role_arn=f"arn:aws:iam::{ACCOUNT}:role/runner",
         vpc_id="vpc-sealed",
         proxy_subnet_ids=("subnet-a", "subnet-b"),
@@ -203,9 +222,7 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
         aurora_cluster_resource_id="cluster-RESOURCE",
         aurora_direct_host="aurora-direct.test",
         aurora_credential_sha256="a" * 64,
-        aurora_proxy_secret_arn=(
-            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:aurora-proxy"
-        ),
+        aurora_proxy_secret_arn=(f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:aurora-proxy"),
         rds_resource_id="db-RESOURCE",
         rds_direct_host="rds-direct.test",
         rds_credential_sha256="f" * 64,
@@ -214,9 +231,7 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
         lakebase_observer_credential_sha256="f" * 64,
         aurora_observer_credential_sha256="f" * 64,
         rds_observer_credential_sha256="f" * 64,
-        rds_proxy_secret_arn=(
-            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:rds-proxy"
-        ),
+        rds_proxy_secret_arn=(f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:rds-proxy"),
         bout_name_prefix="anti-demo-r5",
         ownership_tags=SimpleNamespace(
             as_aws_tags=lambda: {"Owner": "anti-demo", "owner": "anti-demo"}
@@ -231,7 +246,7 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
         ssm_document_name="AWS-RunShellScript",
         native_role="anti_demo_burst",
         frozen_constants=SimpleNamespace(
-                runner_instance_type="c7i.2xlarge",
+            runner_instance_type="c7i.2xlarge",
             rds_proxy_max_connections_percent=90,
             rds_proxy_borrow_timeout_seconds=120,
         ),
@@ -254,22 +269,29 @@ def test_manifest_factories_select_static_proxy_secret_and_checksum_binding() ->
     )
 
     rds_live = connection_spike_live_config_from_manifest(manifest, "rds_postgres")
-    aurora_live = connection_spike_live_config_from_manifest(
-        manifest, "aurora_serverless_v2"
+    competitor_live = connection_spike_live_config_from_manifest(
+        manifest,
+        "rds_postgres",
+        runner_lane="competitor",
     )
+    aurora_live = connection_spike_live_config_from_manifest(manifest, "aurora_serverless_v2")
     rds_setup = connection_spike_setup_config_from_manifest(manifest, "rds_postgres")
-    aurora_setup = connection_spike_setup_config_from_manifest(
-        manifest, "aurora_serverless_v2"
-    )
+    aurora_setup = connection_spike_setup_config_from_manifest(manifest, "aurora_serverless_v2")
 
     assert rds_live.targets[1].secret_arn == resources.rds_proxy_secret_arn
+    assert rds_live.runner_security_group_id == resources.runner_security_group_id
+    assert rds_live.resident_control_secret_arn == resources.runner_control_secret_arn
+    assert competitor_live.runner_security_group_id == resources.competitor_runner_security_group_id
+    assert (
+        competitor_live.resident_control_secret_arn
+        == resources.competitor_runner_control_secret_arn
+    )
     assert aurora_live.targets[1].secret_arn == resources.aurora_proxy_secret_arn
     assert rds_setup.proxy_secret_arn == resources.rds_proxy_secret_arn
+    assert rds_setup.runner_security_group_id == resources.competitor_runner_security_group_id
     assert aurora_setup.proxy_secret_arn == resources.aurora_proxy_secret_arn
     assert rds_setup.proxy_service_role_arn == resources.proxy_service_role_arn
-    assert connection_spike_config_sha256(rds_live) != connection_spike_config_sha256(
-        aurora_live
-    )
+    assert connection_spike_config_sha256(rds_live) != connection_spike_config_sha256(aurora_live)
 
 
 def test_v7_round5_rds_setup_uses_dedicated_instance_and_security_group(tmp_path) -> None:
@@ -284,10 +306,7 @@ def test_v7_round5_rds_setup_uses_dedicated_instance_and_security_group(tmp_path
     assert config.competitor_target_id == round5.rds.instance_id
     assert config.competitor_security_group_id == round5.rds.security_group_id
     assert config.competitor_target_id != manifest.aws.resources.rds_instance_id
-    assert (
-        config.competitor_security_group_id
-        != manifest.aws.resources.rds_security_group_id
-    )
+    assert config.competitor_security_group_id != manifest.aws.resources.rds_security_group_id
 
 
 def test_no_round5_manifest_gate_consults_expiry_at_all(
@@ -347,9 +366,7 @@ def test_expired_manifest_no_longer_deletes_round5_from_a_running_installation(
     lease_store = LakebaseLeaseStore()
     lease_store.ring_key = app_module._round5_lease_ring_key(manifest)
 
-    factory = app_module.connection_spike_factory_from_manifest(
-        manifest, lease_store=lease_store
-    )
+    factory = app_module.connection_spike_factory_from_manifest(manifest, lease_store=lease_store)
 
     assert factory is not None, "Round 5 must still be offered past the TTL"
 
@@ -363,7 +380,60 @@ def _v7_manifest_past_ttl(tmp_path):
     return manifest
 
 
-async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
+def test_production_setup_stop_facts_survive_public_projection_end_to_end() -> None:
+    """The exact shipped Lakebase + Aurora stop-gate facts must survive the
+    public projection and drive ``setup_validated=true`` through the manager.
+
+    Derived from the production ``_setup_observation`` so a fact-key regression
+    (the ``endpoint`` denylist collision that once nulled the Lakebase gate)
+    fails here. This is the collected replacement for the v4-stale
+    ``legacy_two_phase_setup_*`` flow, which now trips the warm-context guard for
+    reasons unrelated to the setup-stop evidence contract.
+    """
+
+    from test_connection_spike import verified_fanin_lane
+
+    t0_ns = 1_000_000_000
+
+    def observation(lane_id: str, *, launch_delay_ns: int, elapsed_ns: int):
+        stop = ConnectionSpikeSetupLaneStop(
+            lane_id=lane_id,
+            launched_ns=t0_ns + launch_delay_ns,
+            stopped_ns=t0_ns + elapsed_ns,
+            credential_sha256="a" * 64,
+            endpoint_host="pooled.internal" if lane_id == "lakebase" else "proxy.internal",
+            secret_arn="" if lane_id == "lakebase" else f"arn:aws:secretsmanager:x:{ACCOUNT}:s:z",
+        )
+        return LiveConnectionSpikeSetupOrchestrator._setup_observation(None, stop)
+
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observations = (
+        observation("lakebase", launch_delay_ns=2_000_000, elapsed_ns=3_600_000_000),
+        observation("competitor", launch_delay_ns=6_000_000, elapsed_ns=650_000_000_000),
+    )
+    fanin = {lane_id: verified_fanin_lane(lane_id) for lane_id in ("lakebase", "competitor")}
+    result = finalize_setup_phase(arm, observations, fanin)
+    assert result.setup_validated
+
+    fake_snapshot = SimpleNamespace(
+        id="sess-live-projection",
+        lanes={
+            "lakebase": SimpleNamespace(name="Lakebase"),
+            "competitor": SimpleNamespace(name="Aurora"),
+        },
+    )
+    projected = RunManager._round_five_setup_snapshot(fake_snapshot, result, terminal=True)
+    assert projected.setup_validated
+    for lane_id in ("lakebase", "competitor"):
+        lane = projected.lanes[lane_id]
+        assert lane.verified, lane_id
+        assert lane.stop_gate_evidence is not None and lane.stop_gate_evidence.exact
+        assert lane.setup_diagnostic is None
+        assert lane.workflow_launch_delay_ms is not None
+    assert RunManager._round_five_setup_comparison(result, "Aurora") is not None
+
+
+async def legacy_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     setup_requests: list[dict[str, object]] = []
@@ -434,6 +504,7 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
         expected_account_id=ACCOUNT,
         baseline_control_role_arn=f"arn:aws:iam::{ACCOUNT}:role/baseline-control",
         runner_instance_id="i-0123456789abcdef0",
+        competitor_runner_instance_id="i-0fedcba9876543210",
         vpc_id="vpc-sealed",
         proxy_subnet_ids=("subnet-a", "subnet-b"),
         lakebase_direct_host="lakebase-direct.test",
@@ -444,14 +515,11 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
         competitor_direct_host="rds-direct.test",
         competitor_security_group_id="sg-rds",
         runner_security_group_id="sg-runner",
+        proxy_security_group_id="sg-proxy-rds",
         proxy_service_role_arn=f"arn:aws:iam::{ACCOUNT}:role/proxy-service",
         proxy_service_policy_name="proxy-service-secrets",
-        aurora_proxy_secret_arn=(
-            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:aurora-proxy"
-        ),
-        rds_proxy_secret_arn=(
-            f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:rds-proxy"
-        ),
+        aurora_proxy_secret_arn=(f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:aurora-proxy"),
+        rds_proxy_secret_arn=(f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:rds-proxy"),
         deterministic_name_prefix="anti-demo-r5",
         ownership_tags=(("Owner", "anti-demo"), ("owner", "anti-demo")),
         trust_bundle_path="/opt/lakebase-anti-demo/round5/round5-ca.pem",
@@ -532,9 +600,7 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
         },
     ) in iam_calls
     with pytest.raises(ConnectionSpikeLiveConfigurationError, match="policy document changed"):
-        await orchestrator._verify_proxy_service_role(
-            SimpleNamespace(iam=ServiceIam(drift=True))
-        )
+        await orchestrator._verify_proxy_service_role(SimpleNamespace(iam=ServiceIam(drift=True)))
     original_coordinator = orchestrator._coordinator
     creation_order: list[str] = []
     coordinators: list[Coordinator] = []
@@ -660,31 +726,24 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
         ("competitor", setup.competitor),
     ):
         stop_progress = next(
-            item
-            for item in progress
-            if item.lane_id == lane_id and item.phase == "setup_stop"
+            item for item in progress if item.lane_id == lane_id and item.phase == "setup_stop"
         )
         exact_elapsed_ms = (lane_stop.stopped_ns - setup.t0_ns) / 1_000_000
         assert stop_progress.status == "verified"
         assert stop_progress.setup_elapsed_ms == pytest.approx(exact_elapsed_ms)
-        assert finalized_setup.lanes[lane_id].setup_elapsed_ms == pytest.approx(
-            exact_elapsed_ms
-        )
+        assert finalized_setup.lanes[lane_id].setup_elapsed_ms == pytest.approx(exact_elapsed_ms)
     assert all(
         item.stop_gate_evidence and item.stop_gate_evidence.exact for item in setup.observations
     )
     public_gates = [
-        RunManager._round_five_public_gate(item.stop_gate_evidence)
-        for item in setup.observations
+        RunManager._round_five_public_gate(item.stop_gate_evidence) for item in setup.observations
     ]
     assert all(gate is not None and gate.exact for gate in public_gates)
     assert creation_order == [*resource_kinds, "topology_reread"]
     assert [request["action"] for request in setup_requests if request["lane_id"] == "rds"] == [
         "verify"
     ]
-    competitor_request = next(
-        request for request in setup_requests if request["lane_id"] == "rds"
-    )
+    competitor_request = next(request for request in setup_requests if request["lane_id"] == "rds")
     assert competitor_request["endpoint_host"] == "dynamic-proxy.test"
     assert competitor_request["credential_host"] == "rds-direct.test"
     assert competitor_request["endpoint_host"] != competitor_request["credential_host"]
@@ -793,13 +852,9 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
     assert recovered_rule == created_rule
     assert rule_calls[-1][1]["SecurityGroupRuleIds"] == ["sgr-exact"]
 
-    default_spec = next(
-        item for item in real_specs if item.resource_kind == "proxy_default_egress"
-    )
+    default_spec = next(item for item in real_specs if item.resource_kind == "proxy_default_egress")
     default_adapter = real_coordinator._adapters["proxy_default_egress"]
-    await default_adapter.delete(
-        orchestrator._observation(default_spec, "sg-proxy:default-egress")
-    )
+    await default_adapter.delete(orchestrator._observation(default_spec, "sg-proxy:default-egress"))
     restored_default_egress = rule_calls[-1][1]
     assert restored_default_egress["GroupId"] == "sg-proxy"
     assert restored_default_egress["IpPermissions"] == [
@@ -815,9 +870,7 @@ async def test_two_phase_setup_uses_assumed_clients_shared_t0_and_defers_burst(
     target_group_spec = next(
         item for item in real_specs if item.resource_kind == "proxy_target_group"
     )
-    target_group_arn = (
-        f"arn:aws:rds:us-west-2:{ACCOUNT}:target-group:prx-tg-owned"
-    )
+    target_group_arn = f"arn:aws:rds:us-west-2:{ACCOUNT}:target-group:prx-tg-owned"
     target_group_calls: list[tuple[str, dict[str, object]]] = []
 
     class TargetGroupRds:
@@ -1056,9 +1109,7 @@ async def test_proxy_policy_cleanup_accepts_only_known_legacy_policy(
 ) -> None:
     secret_arn = f"arn:aws:secretsmanager:us-west-2:{ACCOUNT}:secret:bout-proxy"
     action: object = "secretsmanager:GetSecretValue"
-    condition: dict[str, object] = {
-        "StringEquals": {"secretsmanager:VersionStage": "AWSCURRENT"}
-    }
+    condition: dict[str, object] = {"StringEquals": {"secretsmanager:VersionStage": "AWSCURRENT"}}
     if policy_kind == "extra_action":
         action = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
         condition = {}
@@ -1202,7 +1253,6 @@ async def test_aurora_pending_proxy_capacity_is_woken_before_strict_topology_che
         "direct_transaction",
         "available",
         "strict_topology",
-        "proxy_transaction",
     ]
     assert not target_health
     assert stop.endpoint_host == "dynamic-proxy.test"

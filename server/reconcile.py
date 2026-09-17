@@ -201,8 +201,14 @@ def expected_resources(manifest: DemoManifest) -> tuple[ExpectedResource, ...]:
         rds = getattr(environment, "rds", None)
         if rds is not None:
             expected.append(ExpectedResource(RDS_INSTANCE, rds.instance_id, round_key))
-    runner = getattr(getattr(manifest, "round5", None), "runner_instance_id", "") or ""
-    if runner:
+    round5 = getattr(manifest, "round5", None)
+    runners = (
+        getattr(round5, "runner_instance_id", "") or "",
+        getattr(round5, "competitor_runner_instance_id", "") or "",
+    )
+    for runner in runners:
+        if not runner:
+            continue
         expected.append(
             ExpectedResource(EC2_RUNNER, runner, "survive_connection_spike")
         )
@@ -295,8 +301,8 @@ def _carrying_cost(
     elif kind == RDS_INSTANCE:
         usd, basis = _rds_hour(resource, rates)
     elif kind == EC2_RUNNER:
-        usd = rates.ec2_m6i_large_hour.usd * HOURS_PER_DAY
-        basis = "m6i.large compute"
+        usd = rates.ec2_c7i_2xlarge_hour.usd * HOURS_PER_DAY
+        basis = "c7i.2xlarge compute"
     elif kind == AURORA_CLUSTER:
         # A cluster with no writer parks at 0 ACU and bills only for storage,
         # which is cents. Reported so it is not lost, priced at zero so it is

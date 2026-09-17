@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import boto3
@@ -39,6 +39,7 @@ from server.connection_spike_journal import (
 )
 from server.connection_spike_live import (
     ConnectionSpikeSetupConfig,
+    ConnectionSpikeWarmSetupContext,
     LiveConnectionSpikeSetupOrchestrator,
 )
 
@@ -55,6 +56,7 @@ def _config(**overrides: object) -> ConnectionSpikeSetupConfig:
         expected_account_id=ACCOUNT,
         baseline_control_role_arn=f"arn:aws:iam::{ACCOUNT}:role/baseline-control",
         runner_instance_id="i-0123456789abcdef0",
+        competitor_runner_instance_id="i-0fedcba9876543210",
         vpc_id="vpc-sealed",
         proxy_subnet_ids=("subnet-a", "subnet-b"),
         lakebase_direct_host="lakebase-direct.test",
@@ -65,6 +67,7 @@ def _config(**overrides: object) -> ConnectionSpikeSetupConfig:
         competitor_direct_host="rds-direct.test",
         competitor_security_group_id="sg-rds",
         runner_security_group_id="sg-runner",
+        proxy_security_group_id="sg-proxy-rds",
         proxy_service_role_arn=f"arn:aws:iam::{ACCOUNT}:role/proxy-service",
         proxy_service_policy_name="proxy-service-secrets",
         aurora_proxy_secret_arn=(
@@ -242,6 +245,13 @@ def _orchestrator(
         ec2=SimpleNamespace(),
         iam=SimpleNamespace(),
         secretsmanager=SimpleNamespace(),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    orchestrator._warm_context = ConnectionSpikeWarmSetupContext(
+        clients=clients,
+        rds_security_group_id=config.competitor_security_group_id,
+        proxy_security_group_id=config.proxy_security_group_id,
+        observed_at=datetime.now(UTC),
     )
     created: list[str] = []
     real_coordinator = orchestrator._coordinator
@@ -274,12 +284,23 @@ def _orchestrator(
     async def noop(*args: object, **kwargs: object) -> None:
         del args, kwargs
 
-    monkeypatch.setattr(orchestrator, "_assumed_clients", lambda _bout: _value(clients))
+    monkeypatch.setattr(
+        orchestrator,
+        "_assumed_clients",
+        lambda _bout, **_kwargs: _value(clients),
+    )
     monkeypatch.setattr(orchestrator, "_coordinator", coordinator)
     monkeypatch.setattr(orchestrator, "_preflight_baseline", noop)
     monkeypatch.setattr(orchestrator, "_wait_proxy_available", noop)
     monkeypatch.setattr(orchestrator, "_verify_proxy_topology", noop)
     monkeypatch.setattr(orchestrator, "_verify_journaled_resources", noop)
+    original_setup = orchestrator.setup
+
+    async def prepared_setup(bout_id, fencing_token, *args, **kwargs):
+        await orchestrator.prepare(bout_id, fencing_token)
+        return await original_setup(bout_id, fencing_token, *args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "setup", prepared_setup)
     return orchestrator, created
 
 
@@ -294,23 +315,17 @@ async def _pooled_host() -> str:
 async def test_an_unresponsive_ssm_endpoint_cannot_stall_the_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Hangs without the bound: both lanes park in an uncancellable settle."""
+    """V3 setup sends no retired standalone runner verification command."""
 
     ssm = _Ssm()
-    orchestrator, _created = _orchestrator(monkeypatch, ssm=ssm)
-    task = asyncio.create_task(orchestrator.setup("bout-ssm-wedged", 11))
-    try:
-        await _until(lambda: len(ssm.requests) == 2, "both runner commands to be sent")
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(task), timeout=PATIENCE)
-        # The settlement really was issued and then abandoned, not skipped.
-        await _until(lambda: bool(ssm.cancel.calls), "the settlement to be issued")
-    finally:
-        ssm.cancel.release()
-        await asyncio.sleep(0.05)
+    orchestrator, created = _orchestrator(monkeypatch, ssm=ssm)
 
-    assert all(set(call) == {"CommandId", "InstanceIds"} for call in ssm.cancel.calls)
+    result = await orchestrator.setup("bout-ssm-wedged", 11)
+
+    assert result.bout_id == "bout-ssm-wedged"
+    assert ssm.requests == {}
+    assert ssm.cancel.calls == []
+    assert created == ["rds_proxy", "proxy_target_group", "proxy_target"]
 
 
 async def test_a_wedged_proxy_delete_cannot_stall_the_cancellation(
@@ -383,96 +398,35 @@ async def test_the_cancellation_propagates_when_the_teardown_itself_raises(
     await _until(settled.is_set, "the failing settlement to run")
 
 
-@pytest.mark.parametrize("hold_send", [False, True], ids=["send_resolves", "send_wedged"])
 async def test_the_orphan_risk_log_names_every_resource_that_may_have_survived(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    hold_send: bool,
 ) -> None:
-    """The whole reason not to wait longer: someone has to be able to find these.
+    """Only the three per-bout Proxy objects can survive v3 setup."""
 
-    Cancellation is delivered from inside the second ``SendCommand``, so at the
-    instant the handler runs SSM holds two commands and this process holds
-    neither identifier. That used to be a race the assertions below lost
-    occasionally; it is now the guaranteed starting state, because it is the
-    state the report has to survive. Both commands genuinely reached SSM in both
-    arms, so both must be accounted for either way: by identifier once the send
-    resolves, and by lane when it never does.
-    """
-
-    loop = asyncio.get_running_loop()
-    holder: dict[str, asyncio.Task[object]] = {}
-    requested = threading.Event()
-
-    def cancel_from_send() -> None:
-        def _cancel() -> None:
-            holder["task"].cancel()
-            requested.set()
-
-        loop.call_soon_threadsafe(_cancel)
-        requested.wait(PATIENCE)
-
-    ssm = _Ssm(cancel_on_send=cancel_from_send, hold_send=hold_send)
+    ssm = _Ssm()
     orchestrator, _created = _orchestrator(monkeypatch, ssm=ssm)
     names = orchestrator.names_for_bout("anti-demo-r5", "bout-named-orphans")
-    caplog.set_level(logging.ERROR, logger="server.safe_change")
-    task = asyncio.create_task(orchestrator.setup("bout-named-orphans", 11))
-    holder["task"] = task
-    try:
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(asyncio.shield(task), timeout=PATIENCE)
-    finally:
-        ssm.send.release()
-        ssm.cancel.release()
-
-    # This was `await asyncio.sleep(0.05)`, and the sleep was measured before it
-    # was replaced rather than after: with the wait removed entirely the report
-    # is already present on every one of ten runs, because the teardown that
-    # writes it runs inside the bound and therefore finishes before the `await`
-    # above returns. So the sleep was never load-bearing and this is hardening,
-    # not a repair -- it is recorded that way so nobody later reads it as the
-    # fix for a flake it did not cause.
-    #
-    # Kept as a wait rather than deleted because the ordering it depends on is
-    # real and unstated: if the teardown ever lands after the cancellation
-    # instead of within it, the `next()` below raises a bare `StopIteration`
-    # with no message attached, which is the least debuggable way for a public
-    # CI run to go red. Waiting on the report itself costs nothing when it is
-    # already there and names the problem when it is not.
-    await _until(
-        lambda: any("ORPHAN RISK" in record.getMessage() for record in caplog.records),
-        "the orphan risk report to be logged",
+    resources = SimpleNamespace(
+        names=names,
+        proxy_security_group_id=orchestrator.config.proxy_security_group_id,
+        security_group_rule_ids=[],
+        proxy_endpoint="",
+    )
+    _coordinator, specs = orchestrator._coordinator(
+        CreationScope("bout-named-orphans", 11, orchestrator.config.baseline_sha256),
+        SimpleNamespace(),
+        resources,
     )
 
-    orphan = next(
-        record.getMessage()
-        for record in caplog.records
-        if "ORPHAN RISK" in record.getMessage()
-    )
-    stem = names.proxy_name
-    # Everything a human needs to find and delete these by hand.
-    assert f"rds_proxy {stem}" in orphan
-    assert f"proxy_security_group {names.proxy_security_group_name}" in orphan
-    assert f"proxy_target {stem}-target" in orphan
-    assert f"proxy_target_group {stem}-target-group" in orphan
-    for rule in ("proxy-ingress", "proxy-egress", "runner-egress", "rds-ingress"):
-        assert f"{stem}-{rule}" in orphan
-    assert "proxy target rds_postgres rds-source" in orphan
-    assert "observed security group sg-round5-proxy" in orphan
-    assert "in-flight SSM commands on i-0123456789abcdef0" in orphan
-    assert len(ssm.requests) == 2
-    for command_id, request in ssm.requests.items():
-        lane = f"{request['lane_id']}:{request['action']}"
-        if f"{lane}={command_id}" in orphan:
-            continue
-        # The identifier never reached this process. The lane must still be
-        # named as a command of unknown fate rather than silently omitted: an
-        # unnamed command holds the runner's flock and wedges the next bout.
-        assert "SSM commands of unknown fate on i-0123456789abcdef0" in orphan
-        assert lane in orphan
-    assert "bout-named-orphans" in orphan
-    # The bound is what is being reported, not a generic failure.
-    assert f"{BOUND:.1f}s" in orphan
+    assert [spec.resource_kind for spec in specs] == [
+        "rds_proxy",
+        "proxy_target_group",
+        "proxy_target",
+    ]
+    assert "proxy_security_group" not in {
+        spec.resource_kind for spec in specs
+    }
+    assert ssm.requests == {}
 
 
 async def test_the_default_bound_matches_the_sibling_rounds() -> None:
@@ -517,59 +471,30 @@ async def test_a_successful_setup_never_reaches_the_cancellation_teardown(
     assert abandoned == []
     assert ssm.cancel.calls == []
     assert orchestrator._cleanup_tasks == {}
-    assert created == [
-        "proxy_security_group",
-        "proxy_default_egress",
-        "proxy_ingress",
-        "proxy_egress",
-        "runner_egress",
-        "rds_ingress",
-        "rds_proxy",
-        "proxy_target_group",
-        "proxy_target",
-    ]
+    assert created == ["rds_proxy", "proxy_target_group", "proxy_target"]
+    assert ssm.requests == {}
 
 
 async def test_a_failed_setup_still_settles_and_reconciles_without_the_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The non-cancellation failure path keeps its own ordering exactly."""
+    """The bell path never re-reads the Lakebase host after warming."""
 
     ssm = _Ssm(terminal_lanes=frozenset({"lakebase", "rds"}), wedge_cancel=False)
     orchestrator, _created = _orchestrator(monkeypatch, ssm=ssm)
-    order: list[str] = []
+    called = False
 
     async def failing_host() -> str:
+        nonlocal called
+        called = True
         raise RuntimeError("the sealed pooled host is unreachable")
 
-    async def settle(bout_id: str) -> None:
-        order.append(f"settle:{bout_id}")
-
     monkeypatch.setattr(orchestrator, "_fresh_lakebase_host", failing_host)
-    monkeypatch.setattr(orchestrator, "_settle_commands", settle)
-    monkeypatch.setattr(
-        orchestrator,
-        "_abandon_setup",
-        lambda bout_id, lanes: order.append("abandon"),
-    )
-    real_coordinator = orchestrator._coordinator
 
-    def coordinator(scope, clients, resources):
-        value, specs = real_coordinator(scope, clients, resources)
+    result = await orchestrator.setup("bout-failed", 11)
 
-        async def reconcile_incomplete(supplied_scope):
-            order.append(f"reconcile:{supplied_scope.bout_id}")
-            return SimpleNamespace(complete=True)
-
-        value.reconcile_incomplete = reconcile_incomplete
-        return value, specs
-
-    monkeypatch.setattr(orchestrator, "_coordinator", coordinator)
-
-    with pytest.raises(RuntimeError, match="unreachable"):
-        await orchestrator.setup("bout-failed", 11)
-
-    assert order == ["settle:bout-failed", "reconcile:bout-failed"]
+    assert result.bout_id == "bout-failed"
+    assert called is False
     assert orchestrator._cleanup_tasks == {}
 
 
@@ -692,6 +617,7 @@ async def test_settlement_uses_the_exact_ssm_cancellation_call_shape() -> None:
         lane_id="lakebase",
         action="verify",
         command_id=command_id,
+        runner_instance_id="i-0123456789abcdef0",
         ssm=ssm,
     )
 

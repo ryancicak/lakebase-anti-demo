@@ -63,6 +63,7 @@ def digests() -> dict[str, str]:
         "config_sha256": fanin.config_sha256(),
         "generator_sha256": fanin.generator_sha256(),
         "capacity_model_sha256": fanin.capacity_model_sha256(),
+        "runner_harness_sha256": runner.runner_harness_sha256(),
     }
 
 

@@ -236,7 +236,11 @@ class BoutReceipt(BaseModel):
     # flagged because a scoreboard should not show it as a result.
     has_measurements: bool
 
-    metric: Literal["bout_elapsed_ms", "setup_elapsed_ms"]
+    metric: Literal[
+        "bout_elapsed_ms",
+        "setup_elapsed_ms",
+        "bell_to_10000_observed_ms",
+    ]
     lakebase: LaneReceipt
     opponent_lane: LaneReceipt
 
@@ -310,11 +314,25 @@ def derive_receipt(
     run_id: str | None = None,
 ) -> BoutReceipt:
     """Reduce a session snapshot to the facts a recap needs."""
-    # Round 5 is judged on setup time, not bout elapsed. Reading its setup value as
-    # a bout time would understate the round by two orders of magnitude, so the
-    # metric travels with the numbers.
+    # V4 Round 5 is judged on the canonical bell-relative runtime. Older sealed
+    # receipts retain their setup metric only when no V4 runtime exists.
     setup = snapshot.round5_setup
-    if setup is not None:
+    runtime = snapshot.round5_runtime
+    if runtime is not None and runtime.protocol == "round5-bell-to-10k-v4":
+        metric = "bell_to_10000_observed_ms"
+        lb_runtime = runtime.lanes.get("lakebase")
+        competitor_runtime = runtime.lanes.get("competitor")
+        lb_ms = (
+            lb_runtime.bell_to_10000_observed_ms
+            if lb_runtime is not None
+            else None
+        )
+        opp_ms = (
+            competitor_runtime.bell_to_10000_observed_ms
+            if competitor_runtime is not None
+            else None
+        )
+    elif setup is not None:
         metric = "setup_elapsed_ms"
         lb_ms = setup.lanes["lakebase"].setup_elapsed_ms if "lakebase" in setup.lanes else None
         opp_ms = setup.lanes["competitor"].setup_elapsed_ms if "competitor" in setup.lanes else None
