@@ -1231,6 +1231,15 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .receipt-download { border: 4px solid var(--cream); color: var(--cream); background: #10183e; box-shadow: .4em .4em #000; }
 .receipt-linkedin { border: 4px solid #6bf39a; color: #081a10; background: #6bf39a; box-shadow: .4em .4em #000; }
 
+/* Share card style selector: a small, unobtrusive segmented control that picks
+   the layout of the PNG (health-bars default / knockout alternate) without
+   crowding the card itself. */
+.receipt-style-toggle { display: flex; flex-wrap: wrap; align-items: center; gap: .6vw; margin: 0; }
+.receipt-style-label { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(6px, .5vw, 10px); font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
+.receipt-style-option { min-height: clamp(30px, 2.6vw, 44px); padding: 0 1em; border: 3px solid #5e6c9b; color: #b6c1e6; background: #0d1432; font-family: "Press Start 2P", ui-monospace, monospace; font-size: clamp(6px, .55vw, 10px); text-transform: uppercase; cursor: pointer; }
+.receipt-style-option[data-selected="true"] { border-color: #6bf39a; color: #081a10; background: #6bf39a; box-shadow: .25em .25em #000; }
+.receipt-style-option:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
+
 @media (max-width: 1000px) {
   .receipt-modal { display: block; }
   .receipt-modal > header, .receipt-poster, .receipt-actions { margin-bottom: 1.5vh; }

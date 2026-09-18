@@ -497,9 +497,22 @@ async def test_failed_cleanup_writes_the_proxy_name_onto_the_towel_and_the_setup
     # One sentence, not two that can drift: the towel, the setup snapshot the
     # receipt is derived from, and `/readyz` all quote the same writer.
     assert setup.cleanup_failure == towel.cleanup_failure
-    notice = round5_cleanup_owed_notice()
+    # Automatic cleanup now keeps retrying, so the operator /readyz notice is
+    # grace-gated: a transient cleanup that converges in seconds never fires it.
+    # Within the grace window it is not yet due...
+    assert round5_cleanup_owed_notice() is None
+    # ...but if the failure persists past the grace window it becomes visible and
+    # still names the billing risk, because this bout's Proxy delete was never
+    # accepted (proxy_delete_accepted() is False here).
+    from datetime import UTC, datetime, timedelta
+
+    from server.round5_cleanup_owed import GRACE_SECONDS
+
+    later = datetime.now(UTC) + timedelta(seconds=GRACE_SECONDS + 1)
+    notice = round5_cleanup_owed_notice(now=lambda: later)
     assert notice is not None
     assert notice.detail == towel.cleanup_failure
+    assert "MAY STILL BE RUNNING AND BILLING" in notice.detail
     assert [event for event, _ in published] == ["cleanup_update"]
 
 

@@ -1374,6 +1374,10 @@ describe('backstage setup', () => {
     rejected.round5_runtime!.state = 'failed'
     rejected.round5_runtime!.lanes.lakebase.phase = 'failed'
 
+    // The live SSE stream is opened by a subscription effect that can settle a
+    // tick after the towel button paints; wait for it before emitting so the
+    // rejected snapshot lands on an established stream (not a race with connect()).
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0))
     FakeEventSource.instances.at(-1)!.emit({
       sequence: 1,
       event: 'session_failed',
@@ -2911,6 +2915,107 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /next round/i }))
     expect(screen.getByText(/· round \d+ of six/i)).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /make this schema change safely/i })).toBeInTheDocument()
+  })
+
+  it('share modal: health-bars is the default, and the selector switches to knockout with no stale card', async () => {
+    const running = session('running')
+    const verified: DemoSession = {
+      ...session('verified'),
+      lanes: {
+        lakebase: { ...running.lanes.lakebase, state: 'verified', elapsed_ms: 842.6, attempts: 1, status: 'Transaction verified' },
+        competitor: { ...running.lanes.competitor, state: 'verified', elapsed_ms: 1288.3, attempts: 1, status: 'Transaction verified' },
+      },
+      remembered_result: 'LAKEBASE WINS BY 0.45s',
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(running))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+
+    // Distinct, ordered object URLs so a stale preview would be observable, and
+    // the download/clipboard plumbing the Prepare button needs.
+    let urlSeq = 0
+    const createObjectURL = vi.fn(() => `blob:card-${++urlSeq}`)
+    const revokeObjectURL = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL })
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    vi.spyOn(window, 'open').mockReturnValue(null)
+    stubReceiptCanvas()
+
+    render(<App />)
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    const source = FakeEventSource.instances.at(-1)!
+    source.open()
+    source.emit({
+      sequence: 9,
+      event: 'run_finished',
+      occurred_at: '2026-08-17T00:00:01Z',
+      payload: { state: 'verified', session: verified },
+    })
+    expect(await screen.findByText('LAKEBASE WINS BY 0.45s')).toBeInTheDocument()
+
+    const openShare = () => user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    await openShare()
+    let receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+
+    // Default is Health Bars, with the PNG preview already rendered.
+    const group = within(receipt).getByRole('group', { name: /share card style/i })
+    const healthBtn = within(group).getByRole('button', { name: /health bars/i })
+    const knockoutBtn = within(group).getByRole('button', { name: /knockout/i })
+    expect(healthBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(knockoutBtn).toHaveAttribute('aria-pressed', 'false')
+    await within(receipt).findByRole('img', { name: /result card exactly as it will post/i })
+
+    // A status set, then a style switch clears it and swaps the layout.
+    await user.click(within(receipt).getByRole('button', { name: /copy caption/i }))
+    expect(receipt).toHaveTextContent(/caption copied/i)
+    const urlsBeforeSwitch = createObjectURL.mock.calls.length
+    await user.click(knockoutBtn)
+    expect(knockoutBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(healthBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(receipt).not.toHaveTextContent(/caption copied/i)
+    // A fresh object URL is minted for the knockout PNG and the previous one is
+    // revoked, so the preview never shows a stale image.
+    await waitFor(() => expect(createObjectURL.mock.calls.length).toBeGreaterThan(urlsBeforeSwitch))
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalled())
+
+    // The prepared download filename reflects the chosen style.
+    const prepare = within(receipt).getByRole('button', { name: /prepare linkedin post/i })
+    await waitFor(() => expect(prepare).toBeEnabled())
+    await user.click(prepare)
+    const knockoutAnchor = downloadClick.mock.instances.at(-1) as unknown as HTMLAnchorElement
+    expect(knockoutAnchor.download).toMatch(/-knockout\.png$/)
+
+    // Keyboard activation switches back to Health Bars (rapid re-switch is safe).
+    healthBtn.focus()
+    await user.keyboard('{Enter}')
+    expect(healthBtn).toHaveAttribute('aria-pressed', 'true')
+    await waitFor(() => expect(within(receipt).getByRole('button', { name: /prepare linkedin post/i })).toBeEnabled())
+    await user.click(within(receipt).getByRole('button', { name: /prepare linkedin post/i }))
+    const healthAnchor = downloadClick.mock.instances.at(-1) as unknown as HTMLAnchorElement
+    expect(healthAnchor.download).toMatch(/-health-bars\.png$/)
+
+    // Reopening the modal resets the default back to Health Bars.
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /share the proof/i })).not.toBeInTheDocument())
+    await openShare()
+    receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    expect(within(receipt).getByRole('button', { name: /health bars/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(receipt).getByRole('button', { name: /knockout/i })).toHaveAttribute('aria-pressed', 'false')
   })
 
   // The deployed app's own words for Round 1, copied from
@@ -5352,6 +5457,9 @@ describe('backstage setup', () => {
     expect(within(receipt).getByLabelText(/lakebase receipt result/i)).toHaveTextContent('14.38s')
     expect(within(receipt).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent('>90.00s')
     expect(within(receipt).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/unverified when stopped.*lower bound/i)
+    // A towel draws the scorecard for both layouts, so the style selector is
+    // withheld -- there is nothing to switch between.
+    expect(within(receipt).queryByRole('group', { name: /share card style/i })).not.toBeInTheDocument()
 
     await waitFor(() => {
       const entries = JSON.parse(

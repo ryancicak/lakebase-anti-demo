@@ -376,8 +376,14 @@ def derive_receipt(
     else:
         outcome = "pending"
 
-    # Prefer the orchestrator's own margin. Only fall back to arithmetic when both
-    # lanes verified, so an unverified lower bound can never become a margin.
+    # Prefer the orchestrator's own margin. Only fall back to arithmetic when the
+    # bout was actually declared, so an unverified lower bound can never become a
+    # margin. The individual lanes can both reach `state == "verified"` while the
+    # orchestrator still refuses to declare a comparison (e.g. a setup-phase gate
+    # failed): that is a `stopped_short` bout and it has no margin. Gating the
+    # fallback on `outcome == "declared"` -- not on the two lane states -- is what
+    # keeps a stopped-short receipt's margin `None`, matching the live
+    # 2026-09-17 bout where both runtime lanes verified but no result was declared.
     margin_ms: float | None = None
     comparison = snapshot.comparison
     if comparison is not None and comparison.margin is not None:
@@ -386,6 +392,7 @@ def derive_receipt(
             margin_ms = float(value)
     if (
         margin_ms is None
+        and outcome == "declared"
         and lakebase.state == "verified"
         and opponent.state == "verified"
         and lb_ms is not None

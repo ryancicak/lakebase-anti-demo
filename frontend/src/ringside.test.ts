@@ -696,7 +696,10 @@ describe('one generic evidence classifier with six round contracts', () => {
     ['R5 both bounds', noVerifiedRoundFiveSetupTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
     ['R5 bounded-check guardrail', failedSpike(), 'guardrail_failure', 'guardrail_failure', null, null],
     ['R5 cleanup before result', failedCleanup(), 'cleanup_failure', 'cleanup_failure', null, null],
-    ['R5 cleanup after result', verifiedCleanupFailure(), 'cleanup_failure', 'cleanup_failure', 'lakebase', 11_650],
+    // Round-5-scoped decouple: the evidence still records the cleanup shape, but
+    // the SEALED verified Round 5 result keeps its declared comparison and stays
+    // shareable regardless of backstage ring cleanup.
+    ['R5 cleanup after result', verifiedCleanupFailure(), 'cleanup_failure', 'declared_comparison', 'lakebase', 11_650],
     ['R6 guardrail', roundSixPartial, 'guardrail_failure', 'guardrail_failure', null, null],
   ] as const)(
     '%s has one evidence and contract decision',
@@ -760,17 +763,25 @@ describe('one generic evidence classifier with six round contracts', () => {
       const share = linkedInReceipt(session, 5)
 
       expect(classified.evidence.shape).toBe('cleanup_failure')
+      if (roundId === 'survive_connection_spike') {
+        // Round-5-scoped decouple: a SEALED verified Round 5 bout keeps its
+        // declared result and stays shareable regardless of backstage ring
+        // cleanup (which converges automatically). Cleanup never fences the user
+        // or produces a "CLEANUP FAILED · SHARING BLOCKED" headline here.
+        expect(classified.status).not.toBe('cleanup_failure')
+        expect(classified.outcome.outcome_id).not.toBe('cleanup_failed')
+        expect(classified.shareable).toBe(true)
+        expect(classified.headline).not.toMatch(/CLEANUP FAILED · SHARING BLOCKED/)
+        expect(cue.outcome.outcome_id).not.toBe('cleanup_failed')
+        expect(share).not.toMatch(/sharing (?:is )?blocked/i)
+        return
+      }
       expect(classified.status).toBe('cleanup_failure')
       expect(classified.outcome.outcome_id).toBe('cleanup_failed')
       expect(classified.shareable).toBe(false)
       expect(classified.headline).toMatch(/RESULT RETAINED · CLEANUP FAILED · SHARING BLOCKED/)
       expect(cue.outcome.outcome_id).toBe('cleanup_failed')
-      if (roundId === 'survive_connection_spike') {
-        expect(cue.say).toMatch(/up to 10,000 client connections/i)
-        expect(cue.say).not.toMatch(/cleanup|fenced|128 attempts|maximum 64 concurrent/i)
-      } else {
-        expect(cue.say).toMatch(/cleanup did not verify.*fenced/i)
-      }
+      expect(cue.say).toMatch(/cleanup did not verify.*fenced/i)
       expect(cue.show).toMatch(/sharing is blocked.*same round remains fenced/i)
       expect(receipt.verdict).toBe(classified.headline)
       expect(scorecard?.contract_status).toBe('cleanup_failure')
@@ -817,6 +828,24 @@ describe('one generic evidence classifier with six round contracts', () => {
       }
       if (session.towel || !classified.contractComplete || (receipt.winner !== 'lakebase' && receipt.winner !== 'competitor')) {
         expect(receipt.knockout).toBeUndefined()
+      }
+
+      // The health bars (the default layout) obey the same gate as the knockout
+      // card: never without a named winner on a complete, untowelled contract;
+      // the slower lane always fills the track; the verdict is never empty; and
+      // the capability flag matches the structured classification, not a string.
+      if (receipt.healthBars) {
+        expect(receipt.winner === 'lakebase' || receipt.winner === 'competitor').toBe(true)
+        expect(classified.contractComplete).toBe(true)
+        expect(session.towel).toBeFalsy()
+        expect(receipt.healthBars.winner).toBe(receipt.winner)
+        expect(receipt.healthBars.capabilityGap).toBe(receipt.competitorCapabilityGap)
+        expect(Math.max(receipt.healthBars.fill.lakebase, receipt.healthBars.fill.competitor)).toBe(1)
+        expect(receipt.healthBars.fill[receipt.healthBars.winner]).toBeGreaterThanOrEqual(0)
+        expect(receipt.healthBars.verdict.length).toBeGreaterThan(0)
+      }
+      if (session.towel || !classified.contractComplete || (receipt.winner !== 'lakebase' && receipt.winner !== 'competitor')) {
+        expect(receipt.healthBars).toBeUndefined()
       }
 
       const allCopy = [

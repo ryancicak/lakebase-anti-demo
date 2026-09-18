@@ -286,13 +286,27 @@ function baseDecision(
 /**
  * Apply the six small round contracts to the generic evidence shape.
  *
- * Cleanup is an operational overlay. It blocks sharing and keeps the round
- * fenced, but it does not erase a comparison that completed before cleanup
- * failed.
+ * Cleanup is an operational overlay that is now fully decoupled from a SEALED
+ * result. Backstage ring cleanup (Proxy deletion / rewarm) is the operator's
+ * concern and converges automatically; it must never gate the end user. So a
+ * completed contract (a verified/declared comparison or capability) stays
+ * shareable with its real status even while cleanup is still settling. The
+ * ``cleanup_failure`` status is retained ONLY when there is no completed result
+ * to show anyway (a genuine no-comparison bout), where nothing was shareable in
+ * the first place -- so this never hides a real result behind a cleanup notice.
  */
 export function resolveRoundContract(input: RoundContractInput): RoundContractDecision {
   const underlying = baseDecision(input)
   const cleanupFailed = input.evidence.shape === 'cleanup_failure'
+  // Round-5-scoped decouple: Round 5 is the only round whose backstage ring
+  // cleanup (per-bout Proxy teardown / rewarm) now converges automatically and
+  // must never block a SEALED, completed result. Its completed contract stays
+  // shareable with its real status. Every other round keeps the existing
+  // cleanup overlay (a failed cooldown cleanup fences sharing), and any round
+  // with no completed result still surfaces cleanup_failure (nothing to share).
+  const decoupledFromCleanup = underlying.contractComplete
+    && input.roundId === 'survive_connection_spike'
+  const cleanupBlocksResult = cleanupFailed && !decoupledFromCleanup
   const scorecardEligible = input.terminal && (
     input.recordNoEvidence === true
     || input.evidence.laneShape !== 'neither_verified'
@@ -303,9 +317,9 @@ export function resolveRoundContract(input: RoundContractInput): RoundContractDe
   return {
     evidence: input.evidence,
     ...underlying,
-    status: cleanupFailed ? 'cleanup_failure' : underlying.status,
+    status: cleanupBlocksResult ? 'cleanup_failure' : underlying.status,
     resultStatus: underlying.status,
-    shareable: cleanupFailed ? false : underlying.shareable,
+    shareable: cleanupBlocksResult ? false : underlying.shareable,
     scorecardEligible,
   }
 }

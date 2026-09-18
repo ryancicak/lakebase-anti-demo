@@ -269,6 +269,18 @@ def _orchestrator(
                 await create_hook(orchestrator, clients, spec)
             return SimpleNamespace(provider_id=f"provider-{spec.ordinal}")
 
+        async def precommit_intent(self, scope, spec):
+            # Pre-bell durable intent: no provider mutation, so nothing is
+            # appended to ``created`` here (it happens at complete_prestaged).
+            del scope
+            return SimpleNamespace(ordinal=spec.ordinal, resource_kind=spec.resource_kind)
+
+        async def complete_prestaged(self, scope, spec, *, intent):
+            # The timed CreateDBProxy mutation for a pre-staged intent behaves
+            # exactly like create_resource for this fake's purposes.
+            del intent
+            return await self.create_resource(scope, spec)
+
         async def seal(self, scope):
             del scope
             return SimpleNamespace()
