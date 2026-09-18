@@ -894,12 +894,24 @@ export interface SetupLaneResult {
   stop_gate_evidence: SetupStopGateEvidence | null
   verified: boolean
   /**
-   * Fixed, secret-free finalizer subcode explaining why a setup lane did not
-   * verify (e.g. `workflow_launch_window`, `workflow_launch_skew`,
-   * `stop_gate_evidence`). Present only on a non-verified lane. Lets a stopped
-   * bout name its actual reason instead of always blaming cleanup.
+   * Fixed, secret-free FATAL finalizer subcode explaining why a setup lane did
+   * not verify (e.g. `create_db_proxy_missing`, `create_db_proxy_pre_bell`,
+   * `stop_gate_evidence`). Present only on a non-verified lane. These void the
+   * bout; scheduling advisories do not appear here.
    */
   setup_diagnostic?: string | null
+  /**
+   * Fixed, secret-free NON-FATAL scheduling-conformance advisory subcode(s)
+   * (`create_db_proxy_window`, `workflow_launch_skew`). A lane can be fully
+   * `verified` and still carry an advisory; surfaced for the detailed
+   * play-by-play only, never as a FAILED reason.
+   */
+  scheduling_advisory?: string | null
+  /**
+   * Observed bell-relative latency of the competitor's real CreateDBProxy
+   * request, in ms. Advisory/observability only.
+   */
+  create_db_proxy_request_delta_ms?: number | null
 }
 
 export interface SetupPhaseResult {

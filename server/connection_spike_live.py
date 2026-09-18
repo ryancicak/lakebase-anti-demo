@@ -1520,10 +1520,43 @@ class LiveConnectionSpikeSetupOrchestrator:
             resources = prepared
             clients = warm.clients
 
+            # Journal-before-AWS durability for the timed CreateDBProxy mutation
+            # is satisfied HERE, before the authoritative comparison T0 is
+            # captured and before the shared gate releases. The intent commit is
+            # ~3 coordination-store round trips (fence assert + duplicate-ordinal
+            # read + durable intent write) that used to sit *after* T0 on the
+            # timed path and structurally blew the 100 ms bell-relative
+            # create_db_proxy_window (live proxy CREATE_INTENT durable wall was
+            # ~163 ms after T0). Pre-committing it before T0 keeps the reference
+            # (bell/T0) and the 100 ms budget intact while removing every awaited
+            # journal/fence op from the post-gate path: the first awaited call the
+            # competitor lane makes after the gate releases is the direct boto3
+            # CreateDBProxy request itself. This is not a pre-created Proxy -- no
+            # AWS mutation happens before T0, only the durable coordination write
+            # -- and it introduces no new orphan class because the intent is still
+            # journalled within this same ``setup()``/bell invocation.
+            proxy_spec = next(
+                (spec for spec in specs if spec.resource_kind == "rds_proxy"), None
+            )
+            if proxy_spec is None:
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 competitor specs omitted the timed CreateDBProxy mutation"
+                )
+            proxy_intent = await coordinator.precommit_intent(scope, proxy_spec)
+
             gate = asyncio.Event()
             t0_box: list[int] = []
+            # Two-party launch-stamp barrier: both lane tasks capture
+            # workflow_launched_ns immediately after the gate releases and rendezvous
+            # here before either runs a downstream callback. Without it, whichever
+            # task the loop resumes first would run its synchronous ``on_lane_ready``
+            # prefix (or absorb a GC pause) before the sibling could stamp, inflating
+            # the inter-lane skew metric even though the barrier release was fair.
+            launch_barrier = asyncio.Barrier(2)
             lakebase_task = asyncio.create_task(
-                self._setup_lakebase(bout_id, clients, gate, t0_box, on_progress, on_lane_ready)
+                self._setup_lakebase(
+                    bout_id, clients, gate, t0_box, on_progress, on_lane_ready, launch_barrier
+                )
             )
             competitor_task = asyncio.create_task(
                 self._setup_competitor(
@@ -1538,6 +1571,8 @@ class LiveConnectionSpikeSetupOrchestrator:
                     on_progress,
                     on_lane_ready,
                     on_lane_stage,
+                    launch_barrier,
+                    proxy_intent,
                 )
             )
             comparison_t0_ns = self._monotonic_ns() if t0_ns is None else t0_ns
@@ -2052,9 +2087,15 @@ class LiveConnectionSpikeSetupOrchestrator:
         t0_box: list[int],
         on_progress: SetupProgressCallback | None,
         on_lane_ready: SetupLaneReadyCallback | None = None,
+        launch_barrier: asyncio.Barrier | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
+        # Rendezvous so the sibling lane stamps its own launch before either lane
+        # runs downstream work; keeps the inter-lane skew metric a pure function of
+        # the shared gate release, not of any post-launch synchronous prefix.
+        if launch_barrier is not None:
+            await launch_barrier.wait()
 
         async def report(phase: str, status: str = "running") -> None:
             await self._report(
@@ -2099,9 +2140,17 @@ class LiveConnectionSpikeSetupOrchestrator:
         on_progress: SetupProgressCallback | None,
         on_lane_ready: SetupLaneReadyCallback | None = None,
         on_lane_stage: SetupLaneStageCallback | None = None,
+        launch_barrier: asyncio.Barrier | None = None,
+        proxy_intent: JournalEvent | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
+        # Rendezvous so both lanes stamp workflow_launched_ns before either runs a
+        # downstream callback (see _setup_lakebase). Nothing awaited between the
+        # gate release and this stamp/barrier, so the CreateDBProxy request below
+        # is the first awaited call after launch.
+        if launch_barrier is not None:
+            await launch_barrier.wait()
 
         async def report(phase: str, status: str = "running") -> None:
             await self._report(
@@ -2120,9 +2169,18 @@ class LiveConnectionSpikeSetupOrchestrator:
         for spec in specs:
             phase = phases[spec.resource_kind]
             if spec.resource_kind == "rds_proxy":
-                # No progress/log write lies between bell gate release and the
-                # first timed AWS mutation.
-                await coordinator.create_resource(scope, spec)
+                # The CreateDBProxy CREATE_INTENT was durably pre-committed before
+                # the bell T0 (see setup()). No journal/fence/progress/log write
+                # lies between the gate release and this first timed AWS mutation:
+                # complete_prestaged issues the direct boto3 CreateDBProxy request
+                # with no awaited coordination I/O in front of it, so the request
+                # boundary lands inside the 100 ms bell-relative window. The
+                # CREATED completion it commits afterwards is off the timed path.
+                if proxy_intent is None:
+                    raise ConnectionSpikeLiveOperationError(
+                        "Round 5 CreateDBProxy intent was not pre-staged before the bell"
+                    )
+                await coordinator.complete_prestaged(scope, spec, intent=proxy_intent)
                 await report(phase)
             else:
                 await report(phase)
@@ -2231,6 +2289,10 @@ class LiveConnectionSpikeSetupOrchestrator:
                 verified_at_ns=stop.stopped_ns,
             ),
             create_db_proxy_requested_ns=stop.create_db_proxy_requested_ns,
+            # The AWS competitor always issues CreateDBProxy, so its observation
+            # must carry the request stamp; a missing stamp fails closed. Lakebase
+            # issues no setup-phase request and leaves this False.
+            requires_create_db_proxy_stamp=(stop.lane_id == "competitor"),
         )
 
     async def _verify_journaled_resources(

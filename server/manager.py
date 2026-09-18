@@ -7019,8 +7019,21 @@ class RunManager:
                     runtime.state = "verified"
             else:
                 record.snapshot.state = SessionState.FAILED
+                # Name the actual gate in the bout-level sentence so a future
+                # paid failure is self-describing (e.g. "... [competitor:
+                # create_db_proxy_window]") instead of the generic contract-gate
+                # line that forced a log dig on 2026-09-17.
+                setup_diagnostics = [
+                    f"{lane_id}:{lane.setup_diagnostic}"
+                    for lane_id, lane in setup_snapshot.lanes.items()
+                    if not lane.verified and lane.setup_diagnostic
+                ]
+                diagnostic_suffix = (
+                    f" [{'; '.join(setup_diagnostics)}]" if setup_diagnostics else ""
+                )
                 record.snapshot.failure = (
                     "Round 5 contract gate failed; no comparison was declared."
+                    + diagnostic_suffix
                 )
                 record.snapshot.remembered_result = None
                 setup_snapshot.state = RoundFiveSetupState.FAILED
@@ -7826,20 +7839,27 @@ class RunManager:
             comparison=comparison,
         )
 
-    #: Fixed, secret-free finalizer subcodes the snapshot may carry. Extended
-    #: only with new fixed labels; never with runtime/provider strings.
+    #: Fixed, secret-free FATAL evidence/anti-cheat subcodes that void the bout.
+    #: Extended only with new fixed labels; never with runtime/provider strings.
     _ROUND_FIVE_SETUP_LANE_FAILURES = (
-        # Retired label; still accepted so a legacy sealed receipt stays legible.
+        # Retired labels; still accepted so a legacy sealed receipt stays legible.
         "workflow_launch_window",
+        # Fatal evidence/provenance/clock-domain faults.
         "workflow_launch_ordering",
-        "workflow_launch_skew",
-        "create_db_proxy_window",
+        "create_db_proxy_pre_bell",
+        "create_db_proxy_missing",
         "stop_gate_evidence",
         "stop_gate_before_workflow_launch",
         "setup_deadline",
         "setup_error",
         "setup_failed",
         "setup_towelled",
+    )
+    #: Fixed, secret-free NON-FATAL scheduling-conformance advisories. These are
+    #: surfaced for play-by-play but never void an exact, honestly-obtained bout.
+    _ROUND_FIVE_SETUP_LANE_ADVISORIES = (
+        "create_db_proxy_window",
+        "workflow_launch_skew",
     )
     _ROUND_FIVE_PUBLIC_FACT_REJECTED = "public_fact_key_rejected"
 
@@ -7873,6 +7893,23 @@ class RunManager:
         return ";".join(subcodes) if subcodes else None
 
     @classmethod
+    def _round_five_setup_lane_advisories(cls, raw: object) -> str | None:
+        """Reduce a lane's NON-FATAL scheduling advisories to a fixed-label string.
+
+        Only known advisory labels are emitted, so an advisory can be surfaced in
+        the play-by-play without ever being confused for a fatal evidence fault.
+        """
+
+        codes: list[str] = []
+        raw_advisories = cls._round_five_value(raw, "scheduling_advisories", ())
+        if isinstance(raw_advisories, (list, tuple)):
+            for advisory in raw_advisories:
+                label = str(getattr(advisory, "value", advisory))
+                if label in cls._ROUND_FIVE_SETUP_LANE_ADVISORIES and label not in codes:
+                    codes.append(label)
+        return ";".join(codes) if codes else None
+
+    @classmethod
     def _round_five_setup_snapshot(
         cls,
         snapshot: SessionSnapshot,
@@ -7880,6 +7917,8 @@ class RunManager:
         *,
         terminal: bool,
     ) -> RoundFiveSetupSnapshot:
+        from .connection_spike import MAX_SETUP_REQUEST_LAUNCH_DELAY_MS
+
         public = cls._new_round_five_setup(snapshot)
         public.state = RoundFiveSetupState.FAILED if terminal else RoundFiveSetupState.RUNNING
         if result is None:
@@ -7908,6 +7947,9 @@ class RunManager:
             lane.workflow_launch_delay_ms = cls._round_five_number(
                 cls._round_five_value(raw, "workflow_launch_delay_ms")
             )
+            lane.create_db_proxy_request_delta_ms = cls._round_five_number(
+                cls._round_five_value(raw, "create_db_proxy_request_delta_ms")
+            )
             lane.stop_gate_evidence = gate
             lane.verified = verified
             # Durable, secret-free finalizer subcode. Fixed labels only: the core
@@ -7920,10 +7962,32 @@ class RunManager:
                 core_verified=core_verified,
                 gate_dropped=core_verified and gate is None,
             )
+            # Non-fatal scheduling advisories are recorded separately from the
+            # fatal diagnostic so a verified lane can still carry, e.g., a slow
+            # CreateDBProxy note for the play-by-play without being marked failed.
+            lane.scheduling_advisory = cls._round_five_setup_lane_advisories(raw)
             lane.status = (
                 "Setup stop gate verified" if verified else "Setup stop gate did not verify"
             )
             lane.error = None if verified else "Setup verification failed"
+            # Always publish the competitor's observed CreateDBProxy request delta
+            # (pass or fail) so "12 ms vs an advisory 163 ms" is visible in the
+            # log. None prints for a missing stamp, which IS a fatal fault.
+            if lane.create_db_proxy_request_delta_ms is not None or str(lane_id) == "competitor":
+                logger.warning(
+                    "Round 5 CreateDBProxy timing session=%s lane=%s "
+                    "create_db_proxy_request_delta_ms=%s advisory_ms=%.0f verified=%s advisory=%s",
+                    snapshot.id,
+                    str(lane_id),
+                    (
+                        f"{lane.create_db_proxy_request_delta_ms:.3f}"
+                        if lane.create_db_proxy_request_delta_ms is not None
+                        else "None"
+                    ),
+                    MAX_SETUP_REQUEST_LAUNCH_DELAY_MS,
+                    verified,
+                    lane.scheduling_advisory or "none",
+                )
             if not verified and lane.setup_diagnostic:
                 logger.warning(
                     "Round 5 setup lane finalizer session=%s lane=%s subcode=%s",

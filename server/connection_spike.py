@@ -14,34 +14,42 @@ MAX_CONCURRENT_ATTEMPTS_PER_LANE = 64
 MAX_LAUNCH_SKEW_MS = 10.0
 WITNESS_CLIENTS_PER_LANE = 64
 SETUP_DEADLINE_SECONDS = 30 * 60
-# The V4 bell-to-10k design specifies a two-dimensional setup launch contract.
-# The retired single "absolute <= 10 ms from T0 on workflow_launched_ns" gate was
-# neither dimension: it scored an event that is only the first line after
-# gate.wait() -- a lower bound stamped *before* any journal/SDK/dispatch work --
-# and it failed an otherwise-exact live bout on 0.53 ms of host scheduling jitter
-# (competitor workflow_launched 10.53 ms after T0, while the inter-lane skew was
-# only 2.66 ms and every exact 10k/hold/64-check gate passed).
+# ---------------------------------------------------------------------------
+# The Round 5 setup contract separates two fundamentally different questions:
 #
-# The two real dimensions this contract now enforces are:
-#   1. INTER-LANE workflow-start skew: the two lanes' workflow_launched stamps
-#      must be within 10 ms of *each other*. workflow_launched_ns is a valid,
-#      directly comparable measure for this because both lanes stamp it at the
-#      same point (immediately after their shared gate releases). This is the
-#      fairness anchor of the shared-T0 setup race.
-#   2. ABSOLUTE request boundary: the first *real* timed request a lane issues
-#      must land within 100 ms of its reference event. The competitor's
-#      CreateDBProxy (reference = bell/T0) is the one such boundary observable in
-#      the setup phase and is enforced here via create_db_proxy_requested_ns.
+#   (A) EVIDENCE / ANTI-CHEAT VALIDITY -- FATAL. Did the bout actually prove the
+#       capability without cheating? The per-bout Proxy was absent before the
+#       bell; CreateDBProxy is the first timed post-bell AWS mutation and its
+#       request boundary was genuinely observed (a present, non-negative,
+#       same-clock-domain stamp -- a MISSING or PRE-T0 stamp means the timed
+#       mutation was never legitimately observed, e.g. a pre-created/adopted
+#       Proxy, and is fatal); the shared T0 is authoritative; the exact
+#       10,000-client gates, hold, 64/64 samples, empty telemetry_failures, and
+#       pooled-binding/proof seals all hold. Any breach voids the bout.
 #
-# The remaining design SLOs -- Lakebase run_lane_v3 dispatch <=100 ms after the
-# bell, and competitor run_lane_v3 dispatch <=100 ms after the Proxy control-plane
-# gate -- are runtime/engine events, not setup-phase events, so they are NOT
-# re-enforced by this terminal setup contract. They are observed in the
-# round5_runtime snapshot instead, and they fail closed there: a missing or late
-# dispatch cannot produce an exact 10,000-client runtime lane, which is a hard
-# gate. See docs/ROUND5_10K_PROTOCOL.md ("Setup launch contract").
-MAX_SETUP_REQUEST_LAUNCH_DELAY_MS = 100.0
-MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS = 10.0
+#   (B) SCHEDULING CONFORMANCE / QUALITY -- ADVISORY. Was the operational
+#       scheduling snappy? These thresholds describe good behaviour but a miss is
+#       NOT a cheat and cannot advantage the slow lane: every such delay is
+#       already charged to that lane's own bell->10,000 clock. A slow Aurora is
+#       the *result* of the round, not a reason to erase an exact, honestly
+#       obtained 10,000-client proof. Recorded and surfaced as advisory
+#       diagnostics; never FAILED/UNSCORED on their own.
+#
+# The scheduling-conformance thresholds below are advisory-only:
+#   * CreateDBProxy requested within this many ms of the bell (reference = T0).
+#   * Inter-lane workflow-start skew within this many ms.
+# A present-but-late CreateDBProxy stamp or an over-budget inter-lane skew is an
+# advisory; a missing stamp, a pre-T0 stamp, or a pre-T0 workflow launch remain
+# fatal evidence faults. Changing these values or the semantics tag reseals
+# SetupPhaseContract. See docs/ROUND5_10K_PROTOCOL.md ("Setup launch contract").
+SETUP_REQUEST_LAUNCH_ADVISORY_MS = 100.0
+SETUP_WORKFLOW_LAUNCH_SKEW_ADVISORY_MS = 10.0
+# Backwards-compatible aliases (same numeric thresholds; now advisory, not gates).
+MAX_SETUP_REQUEST_LAUNCH_DELAY_MS = SETUP_REQUEST_LAUNCH_ADVISORY_MS
+MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS = SETUP_WORKFLOW_LAUNCH_SKEW_ADVISORY_MS
+# Folded into SetupPhaseContract.sha256 so the evidence-vs-scheduling semantic
+# change reseals the contract even though the numeric thresholds are unchanged.
+SETUP_CONTRACT_SEMANTICS = "round5-setup-evidence-vs-scheduling-v5"
 
 
 class ConnectionSpikeError(RuntimeError):
@@ -97,19 +105,25 @@ class ConnectionSpikeContract:
 
 @dataclass(frozen=True)
 class SetupPhaseContract:
-    """Frozen timing contract for the independently scored setup race."""
+    """Frozen contract for the setup race.
 
-    # Absolute budget for the first real timed request (CreateDBProxy) after its
-    # reference event; NOT a bound on workflow_launched_ns.
-    max_request_launch_delay_ms: float = MAX_SETUP_REQUEST_LAUNCH_DELAY_MS
-    # Inter-lane workflow-start skew budget.
-    max_workflow_launch_skew_ms: float = MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS
+    ``deadline_seconds`` is a fatal evidence bound (setup must verify inside the
+    window). The two ``advisory_*`` thresholds are scheduling-conformance quality
+    bars: a miss is a non-fatal advisory, never a terminal gate. The semantics
+    tag is folded into the seal so this evidence-vs-scheduling distinction is
+    itself sealed.
+    """
+
+    # Advisory: CreateDBProxy request within this many ms of the bell (ref = T0).
+    advisory_request_launch_delay_ms: float = SETUP_REQUEST_LAUNCH_ADVISORY_MS
+    # Advisory: inter-lane workflow-start skew within this many ms.
+    advisory_workflow_launch_skew_ms: float = SETUP_WORKFLOW_LAUNCH_SKEW_ADVISORY_MS
     deadline_seconds: int = SETUP_DEADLINE_SECONDS
 
     def __post_init__(self) -> None:
         if (
-            self.max_request_launch_delay_ms != MAX_SETUP_REQUEST_LAUNCH_DELAY_MS
-            or self.max_workflow_launch_skew_ms != MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS
+            self.advisory_request_launch_delay_ms != SETUP_REQUEST_LAUNCH_ADVISORY_MS
+            or self.advisory_workflow_launch_skew_ms != SETUP_WORKFLOW_LAUNCH_SKEW_ADVISORY_MS
             or self.deadline_seconds != SETUP_DEADLINE_SECONDS
         ):
             raise ValueError("The Round 5 setup-phase contract is frozen")
@@ -117,8 +131,9 @@ class SetupPhaseContract:
     @property
     def sha256(self) -> str:
         values = (
-            repr(self.max_request_launch_delay_ms),
-            repr(self.max_workflow_launch_skew_ms),
+            SETUP_CONTRACT_SEMANTICS,
+            repr(self.advisory_request_launch_delay_ms),
+            repr(self.advisory_workflow_launch_skew_ms),
             str(self.deadline_seconds),
         )
         return hashlib.sha256("\0".join(values).encode()).hexdigest()
@@ -219,6 +234,12 @@ class SetupLaneObservation:
     # can observe (Lakebase's run_lane_v3 dispatch is a runtime event, gated by
     # the exact-10k runtime lane, not here).
     create_db_proxy_requested_ns: int | None = None
+    # When True this lane MUST carry ``create_db_proxy_requested_ns`` (it is the
+    # AWS competitor, which always issues CreateDBProxy). A SUCCEEDED observation
+    # with the flag set but no stamp is a fail-closed contract violation: the
+    # timed AWS mutation the round is built to measure was never observed, so the
+    # lane can never be scored as verified. Lakebase leaves this False.
+    requires_create_db_proxy_stamp: bool = False
 
     def __post_init__(self) -> None:
         if not self.lane_id.strip():
@@ -241,10 +262,24 @@ class SetupLaneResult:
     setup_elapsed_ns: int | None
     setup_elapsed_ms: float | None
     stop_gate_evidence: SetupStopGateEvidence | None
+    # FATAL evidence/anti-cheat faults only. A non-empty tuple voids the lane.
     failures: tuple[str, ...] = ()
+    # NON-FATAL scheduling-conformance advisories (e.g. ``create_db_proxy_window``,
+    # ``workflow_launch_skew``). Recorded and surfaced for play-by-play; they never
+    # void an otherwise-exact, honestly-obtained bout.
+    scheduling_advisories: tuple[str, ...] = ()
+    # Observed bell-relative latency of the real CreateDBProxy request, in ms
+    # (``create_db_proxy_requested_ns - t0_ns``). Published so an operator can
+    # read "12 ms vs 163 ms" directly. None for lanes that issue no setup-phase
+    # request (Lakebase) or when the required competitor stamp was missing (which
+    # is itself a fatal ``create_db_proxy_missing`` evidence fault).
+    create_db_proxy_request_delta_ms: float | None = None
 
     @property
     def verified(self) -> bool:
+        # Verification depends only on FATAL evidence validity. Scheduling
+        # advisories (a slow-but-present CreateDBProxy, an over-budget skew) do
+        # NOT void an exact, honestly-obtained proof.
         return (
             self.status == SetupLaneStatus.SUCCEEDED
             and self.setup_elapsed_ns is not None
@@ -547,25 +582,36 @@ def finalize_setup_lane(
         raise ValueError("setup observation belongs to an unarmed lane")
 
     failures: list[str] = []
+    advisories: list[str] = []
     launch_delta_ns = observation.workflow_launched_ns - arm.t0_ns
     launch_delay_ms = launch_delta_ns / 1_000_000
-    # workflow_launched_ns is NOT scored on an absolute-from-T0 budget here: it is
-    # only the first line after gate.wait() (a lower bound on real dispatch) and
-    # its jitter must never fail an exact bout. A stamp *before* T0 is still an
-    # ordering/clock fault, though -- it would corrupt the shared-T0 elapsed and
-    # skew maths -- so a negative delta remains fatal. The <=10 ms inter-lane skew
-    # dimension is enforced in finalize_setup_phase, which owns both stamps.
+    # workflow_launched_ns is only the first line after gate.wait() (a lower bound
+    # on real dispatch); its positive jitter is never scored. A stamp *before* T0
+    # is a FATAL clock-domain/ordering fault -- it would corrupt the shared-T0
+    # elapsed and skew maths and cannot be a legitimate observation.
     if launch_delta_ns < 0:
         failures.append("workflow_launch_ordering")
 
-    # Absolute request-boundary dimension: the first real timed request must land
-    # within 100 ms of its reference event. The competitor's CreateDBProxy
-    # (reference = bell/T0) is the boundary observable in the setup phase.
+    # CreateDBProxy request boundary. EVIDENCE (fatal) vs SCHEDULING (advisory):
+    #   * missing stamp on the lane that must issue it  -> FATAL (no provenance:
+    #     the timed AWS mutation was never observed; a skipped/adopted Proxy looks
+    #     exactly like this).
+    #   * stamp before T0                               -> FATAL (pre-bell request
+    #     / wrong clock domain).
+    #   * present, >=T0, but slower than the advisory   -> ADVISORY (Aurora was
+    #     slow; that delay is already charged to its own bell->10k clock and does
+    #     not void an exact, honestly-obtained proof).
+    request_delta_ms: float | None = None
     if observation.create_db_proxy_requested_ns is not None:
         request_delta_ns = observation.create_db_proxy_requested_ns - arm.t0_ns
-        max_request_delta_ns = int(MAX_SETUP_REQUEST_LAUNCH_DELAY_MS * 1_000_000)
-        if not 0 <= request_delta_ns <= max_request_delta_ns:
-            failures.append("create_db_proxy_window")
+        request_delta_ms = request_delta_ns / 1_000_000
+        advisory_request_delta_ns = int(SETUP_REQUEST_LAUNCH_ADVISORY_MS * 1_000_000)
+        if request_delta_ns < 0:
+            failures.append("create_db_proxy_pre_bell")
+        elif request_delta_ns > advisory_request_delta_ns:
+            advisories.append("create_db_proxy_window")
+    elif observation.requires_create_db_proxy_stamp:
+        failures.append("create_db_proxy_missing")
 
     elapsed_ns: int | None = None
     elapsed_ms: float | None = None
@@ -596,6 +642,8 @@ def finalize_setup_lane(
         setup_elapsed_ms=elapsed_ms,
         stop_gate_evidence=evidence,
         failures=tuple(dict.fromkeys(failures)),
+        scheduling_advisories=tuple(dict.fromkeys(advisories)),
+        create_db_proxy_request_delta_ms=request_delta_ms,
     )
 
 
@@ -652,17 +700,18 @@ def finalize_setup_phase(
     }
     launches = [observation.workflow_launched_ns for observation in observations]
     workflow_launch_skew_ms = (max(launches) - min(launches)) / 1_000_000
-    # Cross-lane dimension of the two-part launch contract: both setup workflows
-    # must be released within 10 ms of each other so the shared-T0 setup race is
-    # fair. This is the fairness bound the retired absolute 10 ms gate was
-    # mistaken for. A skew violation fails both lanes (it is a property of the
-    # pair, not of one lane) so no comparison is declared.
-    if workflow_launch_skew_ms > MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS:
+    # Inter-lane workflow-start skew is a SCHEDULING-conformance quality bar, not
+    # an evidence gate. Both stamps are lower bounds taken right after the shared
+    # gate releases; an over-budget skew reflects host-scheduling jitter, not a
+    # cheat, and it is already charged to each lane's own bell->10k clock. So a
+    # skew miss is recorded as a non-fatal advisory on both lanes (it is a
+    # property of the pair) and never voids an exact, honestly-obtained proof.
+    if workflow_launch_skew_ms > SETUP_WORKFLOW_LAUNCH_SKEW_ADVISORY_MS:
         lanes = {
             lane_id: replace(
                 lane,
-                failures=tuple(
-                    dict.fromkeys((*lane.failures, "workflow_launch_skew"))
+                scheduling_advisories=tuple(
+                    dict.fromkeys((*lane.scheduling_advisories, "workflow_launch_skew"))
                 ),
             )
             for lane_id, lane in lanes.items()

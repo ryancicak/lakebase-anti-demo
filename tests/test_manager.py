@@ -3157,6 +3157,76 @@ async def test_round_five_setup_launch_jitter_still_verifies() -> None:
     assert terminal.comparison is not None
 
 
+class LateCreateDbProxyTwoPhaseConnectionSpikeEngine(
+    LaunchJitterTwoPhaseConnectionSpikeEngine
+):
+    """Both runtime lanes reach exactly 10,000 held clients and the competitor's
+    real CreateDBProxy request lands 163.51 ms after the bell (the 2026-09-17
+    old-path latency). Per the product override, a slow-but-present CreateDBProxy
+    is a NON-FATAL scheduling advisory: the bout must DECLARE a winner, carry the
+    advisory for the play-by-play, and never show FAILED."""
+
+    async def setup(self, bout_id, fencing_token, on_progress):
+        base = await super().setup(bout_id, fencing_token, on_progress)
+        t0_ns = 1_000_000_000
+        lakebase, competitor = base.observations
+        competitor = replace(
+            competitor,
+            create_db_proxy_requested_ns=t0_ns + 163_510_000,  # 163.51 ms after T0
+            requires_create_db_proxy_stamp=True,
+        )
+        base.observations = (lakebase, competitor)
+        return base
+
+
+async def test_round_five_late_create_db_proxy_declares_with_advisory() -> None:
+    engine = LateCreateDbProxyTwoPhaseConnectionSpikeEngine(burst_valid=True)
+
+    def factory(competitor: CompetitorId):
+        return engine
+
+    manager = RunManager(connection_spike_factory=factory)
+    operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    terminal = await wait_for_state(manager, created.id, SessionState.VERIFIED)
+
+    # A scheduling advisory does not void an exact, honestly-obtained proof: the
+    # bout DECLARES a winner end-to-end through the manager.
+    assert terminal.state == SessionState.VERIFIED
+    assert terminal.comparison is not None
+    assert terminal.failure is None
+    assert terminal.round5_setup is not None
+    assert terminal.round5_setup.setup_validated
+    competitor_setup = terminal.round5_setup.lanes["competitor"]
+    assert competitor_setup.verified
+    assert competitor_setup.setup_diagnostic is None
+    # The advisory is recorded (for play-by-play) with the observed delta.
+    assert competitor_setup.scheduling_advisory == "create_db_proxy_window"
+    assert competitor_setup.create_db_proxy_request_delta_ms == pytest.approx(163.51)
+
+
+# NOTE on the FATAL manager-level path (missing stamp / pre-T0 / stop-gate):
+# ``test_competitor_missing_create_db_proxy_stamp_is_fatal`` and
+# ``test_competitor_pre_bell_create_db_proxy_is_fatal`` in test_connection_spike.py
+# prove the fatal finalize behavior deterministically, and
+# ``test_global_failure_after_two_verified_lanes_is_terminal_once`` (v3 acceptance)
+# proves the coherent V4 terminal state where both runtime lanes verified exact
+# 10,000 yet the session is FAILED with no comparison and evidence preserved. The
+# setup-only harness in this module has no ``round5_runtime`` and so exercises the
+# legacy scoring branch, which is not the V4 production path for a fatal setup
+# fault; the V4 coverage above is authoritative.
+
+
 async def wait_for_cooldown(
     manager: RunManager,
     session_id: str,

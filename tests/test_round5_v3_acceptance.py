@@ -5,6 +5,7 @@ import base64
 import gzip
 import hashlib
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,13 @@ import pytest
 
 from runner import connection_spike_runner as runner
 from server import connection_spike_live as live
+from server.connection_spike_journal import (
+    CreationScope,
+    JournalMutationError,
+    LifecycleState,
+    ResourceSpec,
+    Round5CreationCoordinator,
+)
 from server.connection_spike_live import (
     ConnectionSpikeLiveOperationError,
     ConnectionSpikeSetupLaneStop,
@@ -121,6 +129,12 @@ async def test_create_proxy_is_first_timed_aws_mutation_and_dispatch_waits_for_g
             del scope
             order.append(f"mutate:{spec.resource_kind}")
 
+        async def complete_prestaged(self, scope, spec, *, intent) -> None:
+            # The proxy CREATE_INTENT is pre-committed before the bell T0; the
+            # timed path issues the mutation with no coordination I/O in front.
+            del scope, intent
+            order.append(f"mutate:{spec.resource_kind}")
+
     async def report(callback, lane_id, phase, status, **kwargs) -> None:
         del callback, lane_id, status, kwargs
         order.append(f"progress:{phase}")
@@ -172,12 +186,197 @@ async def test_create_proxy_is_first_timed_aws_mutation_and_dispatch_waits_for_g
         None,
         lane_ready,
         lane_stage,
+        None,
+        SimpleNamespace(ordinal=1, resource_kind="rds_proxy"),
     )
 
     assert order[0] == "mutate:rds_proxy"
     assert order.index("resident_prepared") < order.index("proxy_gate_exact")
     assert order.index("proxy_gate_exact") < order.index("dispatch_scheduled")
     assert not any("verifying_transaction" in item for item in order)
+
+
+class _SlowJournal:
+    """In-memory journal whose every round trip costs real wall time, standing in
+    for the deployed cold-TLS coordination connect that the pre-stage fix moves
+    off the timed path. Records the monotonic instant of each op so a test can
+    assert none landed inside the [T0, boto3-request] window."""
+
+    def __init__(self, clock, *, latency_s: float = 0.05) -> None:
+        self._clock = clock
+        self._latency_s = latency_s
+        self.committed: list = []
+        self.op_ns: list[tuple[str, int]] = []
+
+    async def commit(self, event, *, authority_scope=None) -> None:
+        del authority_scope
+        await asyncio.sleep(self._latency_s)  # a fresh coordination connect
+        self.committed.append(event)
+        self.op_ns.append((f"commit:{event.lifecycle_state.value}", self._clock()))
+
+    async def events(self, scope):
+        del scope
+        await asyncio.sleep(self._latency_s)
+        self.op_ns.append(("events", self._clock()))
+        return tuple(self.committed)
+
+    async def scopes(self, bout_id):
+        del bout_id
+        return ()
+
+
+class _SlowFence:
+    def __init__(self, clock, *, latency_s: float = 0.05) -> None:
+        self._clock = clock
+        self._latency_s = latency_s
+        self.op_ns: list[int] = []
+
+    async def assert_current(self, scope: CreationScope) -> None:
+        del scope
+        await asyncio.sleep(self._latency_s)
+        self.op_ns.append(self._clock())
+
+
+def _proxy_stamp_orchestrator():
+    """A real orchestrator wired for the production CreateDBProxy stamp path with
+    a fake boto3 rds client. ``_create_proxy`` (the shipped adapter body) stamps
+    ``resources.proxy_create_requested_ns`` immediately before the boto3 call."""
+
+    orchestrator = object.__new__(live.LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._monotonic_ns = time.monotonic_ns
+    orchestrator.config = SimpleNamespace(
+        region="us-west-2",
+        expected_account_id="123456789012",
+        proxy_subnet_ids=("subnet-aaaa", "subnet-bbbb"),
+    )
+    boto = SimpleNamespace(request_ns=None)
+
+    def create_db_proxy(**kwargs):
+        boto.request_ns = time.monotonic_ns()
+        boto.kwargs = kwargs
+        return {}
+
+    def describe_db_proxies(**kwargs):
+        del kwargs
+        return {
+            "DBProxies": [
+                {
+                    "Endpoint": "proxy.internal",
+                    "DBProxyArn": (
+                        "arn:aws:rds:us-west-2:123456789012:db-proxy:pb-1"
+                    ),
+                }
+            ]
+        }
+
+    clients = SimpleNamespace(
+        rds=SimpleNamespace(
+            create_db_proxy=create_db_proxy,
+            describe_db_proxies=describe_db_proxies,
+        )
+    )
+    resources = SimpleNamespace(
+        names=SimpleNamespace(proxy_name="pb-1", token="tok"),
+        secret_arn="arn:aws:secretsmanager:us-west-2:123456789012:secret:s",
+        proxy_role_arn="arn:aws:iam::123456789012:role/r",
+        proxy_security_group_id="sg-1",
+        proxy_endpoint="",
+        proxy_create_requested_ns=None,
+    )
+    return orchestrator, clients, resources, boto
+
+
+def _proxy_spec():
+    return ResourceSpec(
+        1,
+        "rds_proxy",
+        "pb-1",
+        metadata={"tags": {"anti-demo-bout-id": "bout-stamp"}},
+    )
+
+
+async def test_production_stamp_path_keeps_createdbproxy_under_100ms_despite_slow_journal() -> None:
+    """FINDING 1: the REAL Round5CreationCoordinator + REAL _create_proxy stamp
+    path. Injected 50 ms-per-op journal/fence latency (five ops on the old path)
+    is pre-committed BEFORE the bell T0, so the direct boto3 CreateDBProxy request
+    lands <=100 ms after T0 without hiding any coordination latency -- and the
+    stamp is at the true request boundary, in the same monotonic domain as T0."""
+
+    orchestrator, clients, resources, boto = _proxy_stamp_orchestrator()
+    clock = orchestrator._monotonic_ns
+    journal = _SlowJournal(clock, latency_s=0.05)
+    fence = _SlowFence(clock, latency_s=0.05)
+
+    class ProxyAdapter:
+        async def create(self, spec):
+            return await orchestrator._create_proxy(clients, resources, spec)
+
+    coordinator = Round5CreationCoordinator(
+        journal=journal, fence=fence, adapters={"rds_proxy": ProxyAdapter()}
+    )
+    scope = CreationScope("bout-stamp", 7, "d" * 64)
+    spec = _proxy_spec()
+
+    # --- pre-bell (untimed): durable intent + fence, the slow coordination hop ---
+    intent = await coordinator.precommit_intent(scope, spec)
+    assert intent.lifecycle_state is LifecycleState.CREATE_INTENT
+    assert journal.committed[0].lifecycle_state is LifecycleState.CREATE_INTENT
+
+    # --- authoritative bell T0 captured AFTER the coordination hop ---
+    t0_ns = orchestrator._monotonic_ns()
+
+    # --- post-gate timed path: direct mutation, no coordination I/O in front ---
+    completed = await coordinator.complete_prestaged(scope, spec, intent=intent)
+    assert completed.lifecycle_state is LifecycleState.CREATED
+
+    # Stamp exists, in the same monotonic domain as T0, at the true boundary.
+    assert resources.proxy_create_requested_ns is not None
+    assert resources.proxy_create_requested_ns >= t0_ns
+    assert boto.request_ns is not None
+    assert boto.request_ns >= resources.proxy_create_requested_ns
+
+    # The scored bell->CreateDBProxy delta is tiny despite 250 ms of coordination
+    # latency, because all of it happened before T0.
+    delta_ms = (resources.proxy_create_requested_ns - t0_ns) / 1_000_000
+    assert delta_ms <= 100.0, delta_ms
+
+    # No journal/fence op landed inside the [T0, boto3-request] window: the only
+    # coordination between T0 and the mutation is nothing at all.
+    window = range(t0_ns, boto.request_ns + 1)
+    assert not [op for op, ns in journal.op_ns if ns in window]
+    assert not [ns for ns in fence.op_ns if ns in window]
+    # Durability preserved: CREATED committed only AFTER the boto3 request.
+    created_commit_ns = [ns for op, ns in journal.op_ns if op == "commit:created"][0]
+    assert created_commit_ns > boto.request_ns
+
+
+async def test_old_inline_create_resource_would_blow_the_100ms_window() -> None:
+    """Contrast (does NOT mock create_resource away): running the SAME real
+    coordinator via the OLD inline create_resource AFTER T0 charges the slow
+    journal/fence hop to the window, so the stamp lands well past 100 ms. Proves
+    the gate is not hollow and that the pre-stage placement is what fixes it."""
+
+    orchestrator, clients, resources, boto = _proxy_stamp_orchestrator()
+    clock = orchestrator._monotonic_ns
+    journal = _SlowJournal(clock, latency_s=0.05)
+    fence = _SlowFence(clock, latency_s=0.05)
+
+    class ProxyAdapter:
+        async def create(self, spec):
+            return await orchestrator._create_proxy(clients, resources, spec)
+
+    coordinator = Round5CreationCoordinator(
+        journal=journal, fence=fence, adapters={"rds_proxy": ProxyAdapter()}
+    )
+    scope = CreationScope("bout-stamp", 7, "d" * 64)
+    spec = _proxy_spec()
+
+    t0_ns = orchestrator._monotonic_ns()
+    await coordinator.create_resource(scope, spec)  # old path: intent + fences after T0
+
+    delta_ms = (resources.proxy_create_requested_ns - t0_ns) / 1_000_000
+    # >= 3 coordination ops (events + intent commit + fence) each 50 ms.
+    assert delta_ms > 100.0, delta_ms
 
 
 async def test_lane_failure_cancels_sibling_without_waiting_for_lane_order() -> None:

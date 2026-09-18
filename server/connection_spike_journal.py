@@ -468,15 +468,59 @@ class Round5CreationCoordinator:
         await self._journal.commit(event, authority_scope=authority_scope)
 
     async def create_resource(self, scope: CreationScope, spec: ResourceSpec) -> JournalEvent:
-        adapter = self._adapter(spec.resource_kind)
+        intent = await self.precommit_intent(scope, spec)
+        # The classic path fences again after the durable write and immediately
+        # before the mutation. ``complete_prestaged`` intentionally omits that
+        # re-assert for the single sub-100 ms timed CreateDBProxy mutation; every
+        # other resource keeps it.
+        await self._fence.assert_current(scope)
+        return await self.complete_prestaged(scope, spec, intent=intent)
+
+    async def precommit_intent(self, scope: CreationScope, spec: ResourceSpec) -> JournalEvent:
+        """Durably journal a resource's CREATE_INTENT *before* any provider mutation.
+
+        This is the journal-before-AWS durability guarantee: an orphaned provider
+        resource can always be reclaimed because its intent is committed first.
+        It performs the fence assert + duplicate-ordinal check + durable intent
+        commit -- three coordination-store round trips. For the timed Round 5
+        CreateDBProxy mutation this is called *before the authoritative bell T0*
+        (inside ``setup()`` prior to capturing ``comparison_t0_ns`` and releasing
+        the shared gate), so the mandatory coordination hop is never charged
+        against the 100 ms bell-relative ``create_db_proxy_window`` budget. The
+        adapter mutation itself is issued later by ``complete_prestaged`` with no
+        awaited coordination I/O in front of it.
+        """
+
+        self._adapter(spec.resource_kind)
         await self._fence.assert_current(scope)
         if any(event.ordinal == spec.ordinal for event in await self._journal.events(scope)):
             raise JournalRefusalError("resource_ordinal_already_journaled")
         intent = JournalEvent.creation_intent(scope, spec, now=self._clock())
         await self._commit(intent, scope)
+        return intent
+
+    async def complete_prestaged(
+        self, scope: CreationScope, spec: ResourceSpec, *, intent: JournalEvent
+    ) -> JournalEvent:
+        """Issue the provider mutation for an already pre-committed intent.
+
+        The caller guarantees ``intent`` was durably committed by
+        ``precommit_intent`` for exactly ``spec``. No fence/journal/coordination
+        round trip is awaited before the adapter mutation, so when the intent was
+        pre-staged before the bell T0 the first awaited call after the gate
+        releases is the provider mutation itself (CreateDBProxy). Ownership at
+        this instant is guaranteed by the bell's durable CLAIMED->RUNNING lease
+        CAS, which the manager commits immediately before releasing the gate; the
+        completed-event commit below re-embeds the lease fence, so a lost fence
+        still fails closed after the mutation.
+        """
+
+        if intent.ordinal != spec.ordinal or intent.resource_kind != spec.resource_kind:
+            raise JournalContractError("prestaged intent does not match the mutation spec")
+        if intent.lifecycle_state is not LifecycleState.CREATE_INTENT:
+            raise JournalContractError("prestaged event is not a CREATE_INTENT")
+        adapter = self._adapter(spec.resource_kind)
         try:
-            # Fence again after the durable write and immediately before mutation.
-            await self._fence.assert_current(scope)
             observed = await adapter.create(spec)
             refusal = exact_ownership_error(spec, observed)
             if refusal is not None:

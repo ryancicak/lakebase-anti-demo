@@ -12,6 +12,7 @@ import {
   roundFiveHasComparison,
   roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFiveSchedulingAdvisorySummary,
   roundFiveSetupDiagnosticSummary,
   roundFiveStoppedVerdict,
 } from './round5'
@@ -2821,8 +2822,9 @@ it('knockout: a towel keeps the scorecard card', () => {
 })
 
 function stoppedContractGateSession(overrides: Partial<DemoSession> = {}): DemoSession {
-  // Minimal shape of the live 2026-09-17 failed bout: contract gate failed,
-  // cleanup completed, competitor setup lane carries a real diagnostic.
+  // A genuinely FATAL setup fault: the competitor never stamped its CreateDBProxy
+  // request boundary (missing provenance). Cleanup completed. The verdict must
+  // name the real gate, not blame cleanup.
   return {
     state: 'failed',
     failure: 'Round 5 contract gate failed; no comparison was declared.',
@@ -2835,7 +2837,7 @@ function stoppedContractGateSession(overrides: Partial<DemoSession> = {}): DemoS
           id: 'competitor',
           name: 'Aurora Serverless v2 + RDS Proxy',
           verified: false,
-          setup_diagnostic: 'workflow_launch_skew',
+          setup_diagnostic: 'create_db_proxy_missing',
         },
       },
     },
@@ -2853,8 +2855,8 @@ it('a stopped contract-gate bout with settled cleanup reports the diagnostic, no
   const verdict = roundFiveStoppedVerdict(session)
   expect(verdict).not.toMatch(/cleanup must settle/i)
   expect(verdict).toContain('Aurora Serverless v2 + RDS Proxy')
-  expect(verdict).toContain('inter-lane skew')
-  expect(roundFiveSetupDiagnosticSummary(session)).toContain('inter-lane skew')
+  expect(verdict).toContain('CreateDBProxy request boundary')
+  expect(roundFiveSetupDiagnosticSummary(session)).toContain('CreateDBProxy request boundary')
 })
 
 it('a stopped bout whose cleanup is genuinely unsettled still says cleanup must settle', () => {
@@ -2868,11 +2870,46 @@ it('a stopped bout whose cleanup is genuinely unsettled still says cleanup must 
           id: 'competitor',
           name: 'Aurora Serverless v2 + RDS Proxy',
           verified: false,
-          setup_diagnostic: 'workflow_launch_skew',
+          setup_diagnostic: 'create_db_proxy_missing',
         },
       },
     },
   } as unknown as Partial<DemoSession>)
 
   expect(roundFiveStoppedVerdict(session)).toMatch(/cleanup must settle/i)
+})
+
+it('a slow-but-present CreateDBProxy is a non-fatal advisory, not a stopped verdict', () => {
+  // OVERRIDE: exact bout that DECLARES a winner but the competitor's CreateDBProxy
+  // was requested >100 ms after the bell. The advisory is surfaced for the
+  // play-by-play; it never produces a FAILED verdict or diagnostic.
+  const session = {
+    state: 'verified',
+    round5_setup: {
+      cleanup_failure: null,
+      cleanup_retryable: false,
+      lanes: {
+        lakebase: { id: 'lakebase', name: 'Lakebase', verified: true, setup_diagnostic: null },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          verified: true,
+          setup_diagnostic: null,
+          scheduling_advisory: 'create_db_proxy_window',
+          create_db_proxy_request_delta_ms: 163.51,
+        },
+      },
+    },
+    lanes: {
+      lakebase: { name: 'Lakebase' },
+      competitor: { name: 'Aurora Serverless v2 + RDS Proxy' },
+    },
+  } as unknown as DemoSession
+
+  // No fatal diagnostic, so the stopped-verdict summary is empty.
+  expect(roundFiveSetupDiagnosticSummary(session)).toBeNull()
+  // The advisory IS available for the detailed play-by-play.
+  const advisory = roundFiveSchedulingAdvisorySummary(session)
+  expect(advisory).toContain('Aurora Serverless v2 + RDS Proxy')
+  expect(advisory).toContain('100 ms after the bell')
 })
