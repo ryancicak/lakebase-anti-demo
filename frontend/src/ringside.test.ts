@@ -830,6 +830,24 @@ describe('one generic evidence classifier with six round contracts', () => {
         expect(receipt.knockout).toBeUndefined()
       }
 
+      // The health bars (the default layout) obey the same gate as the knockout
+      // card: never without a named winner on a complete, untowelled contract;
+      // the slower lane always fills the track; the verdict is never empty; and
+      // the capability flag matches the structured classification, not a string.
+      if (receipt.healthBars) {
+        expect(receipt.winner === 'lakebase' || receipt.winner === 'competitor').toBe(true)
+        expect(classified.contractComplete).toBe(true)
+        expect(session.towel).toBeFalsy()
+        expect(receipt.healthBars.winner).toBe(receipt.winner)
+        expect(receipt.healthBars.capabilityGap).toBe(receipt.competitorCapabilityGap)
+        expect(Math.max(receipt.healthBars.fill.lakebase, receipt.healthBars.fill.competitor)).toBe(1)
+        expect(receipt.healthBars.fill[receipt.healthBars.winner]).toBeGreaterThanOrEqual(0)
+        expect(receipt.healthBars.verdict.length).toBeGreaterThan(0)
+      }
+      if (session.towel || !classified.contractComplete || (receipt.winner !== 'lakebase' && receipt.winner !== 'competitor')) {
+        expect(receipt.healthBars).toBeUndefined()
+      }
+
       const allCopy = [
         classified.headline,
         cue.say,
