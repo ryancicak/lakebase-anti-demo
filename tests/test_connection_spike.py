@@ -427,7 +427,7 @@ def test_competitor_pre_bell_create_db_proxy_is_fatal() -> None:
         (-1, True, False),  # before T0: FATAL (pre-bell / wrong domain)
         (0, False, False),  # exactly at T0: clean
         (int(MAX_SETUP_REQUEST_LAUNCH_DELAY_MS * 1_000_000), False, False),  # exactly 100 ms
-        (int(MAX_SETUP_REQUEST_LAUNCH_DELAY_MS * 1_000_000) + 1, False, True),  # 100 ms+1ns: advisory
+        (int(MAX_SETUP_REQUEST_LAUNCH_DELAY_MS * 1_000_000) + 1, False, True),  # +1ns: advisory
     ],
 )
 def test_create_db_proxy_window_boundaries(delta_ns: int, fatal: bool, advisory: bool) -> None:

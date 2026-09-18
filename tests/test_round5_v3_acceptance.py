@@ -16,7 +16,6 @@ from runner import connection_spike_runner as runner
 from server import connection_spike_live as live
 from server.connection_spike_journal import (
     CreationScope,
-    JournalMutationError,
     LifecycleState,
     ResourceSpec,
     Round5CreationCoordinator,
