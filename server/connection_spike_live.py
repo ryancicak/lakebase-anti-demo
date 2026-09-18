@@ -7794,8 +7794,27 @@ class LiveRound5WarmProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Observability: the warm-slot public status carries only the fixed,
+            # secret-free code (``warm_baseline_invalid`` / ``warm_provider_retryable``)
+            # and the underlying cause was previously swallowed, so a blocked warm
+            # could not be diagnosed without a redeploy. Name the cause type and its
+            # (internal, non-secret) message at WARNING so an operator can see WHY the
+            # baseline was rejected. Provider ARNs/secrets never appear in these
+            # internal ConnectionSpikeLive* messages.
             if self._retryable(exc):
+                logger.warning(
+                    "round5_warm_provider_retryable generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
                 raise RetryableWarmError("warm_provider_retryable") from exc
+            logger.warning(
+                "round5_warm_baseline_invalid generation=%s cause=%s: %s",
+                generation,
+                type(exc).__name__,
+                exc,
+            )
             raise BlockedWarmError("warm_baseline_invalid") from exc
         receipts = dict(zip(engines, warmed, strict=True))
         self._engines = {variants[variant].value: engine for variant, engine in engines.items()}
