@@ -1374,6 +1374,10 @@ describe('backstage setup', () => {
     rejected.round5_runtime!.state = 'failed'
     rejected.round5_runtime!.lanes.lakebase.phase = 'failed'
 
+    // The live SSE stream is opened by a subscription effect that can settle a
+    // tick after the towel button paints; wait for it before emitting so the
+    // rejected snapshot lands on an established stream (not a race with connect()).
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0))
     FakeEventSource.instances.at(-1)!.emit({
       sequence: 1,
       event: 'session_failed',
