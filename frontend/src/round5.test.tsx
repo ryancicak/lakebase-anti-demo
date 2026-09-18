@@ -12,6 +12,8 @@ import {
   roundFiveHasComparison,
   roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFiveSetupDiagnosticSummary,
+  roundFiveStoppedVerdict,
 } from './round5'
 
 afterEach(() => {
@@ -2816,4 +2818,61 @@ it('knockout: the ratio is floored and only printed from 2× up', () => {
 
 it('knockout: a towel keeps the scorecard card', () => {
   expect(receiptPresentation(screenshotTowelRoundFiveSession(), 'round').knockout).toBeUndefined()
+})
+
+function stoppedContractGateSession(overrides: Partial<DemoSession> = {}): DemoSession {
+  // Minimal shape of the live 2026-09-17 failed bout: contract gate failed,
+  // cleanup completed, competitor setup lane carries a real diagnostic.
+  return {
+    state: 'failed',
+    failure: 'Round 5 contract gate failed; no comparison was declared.',
+    round5_setup: {
+      cleanup_failure: null,
+      cleanup_retryable: false,
+      lanes: {
+        lakebase: { id: 'lakebase', name: 'Lakebase', verified: true, setup_diagnostic: null },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          verified: false,
+          setup_diagnostic: 'workflow_launch_skew',
+        },
+      },
+    },
+    lanes: {
+      lakebase: { name: 'Lakebase' },
+      competitor: { name: 'Aurora Serverless v2 + RDS Proxy' },
+    },
+    ...overrides,
+  } as unknown as DemoSession
+}
+
+it('a stopped contract-gate bout with settled cleanup reports the diagnostic, not cleanup', () => {
+  const session = stoppedContractGateSession()
+
+  const verdict = roundFiveStoppedVerdict(session)
+  expect(verdict).not.toMatch(/cleanup must settle/i)
+  expect(verdict).toContain('Aurora Serverless v2 + RDS Proxy')
+  expect(verdict).toContain('inter-lane skew')
+  expect(roundFiveSetupDiagnosticSummary(session)).toContain('inter-lane skew')
+})
+
+it('a stopped bout whose cleanup is genuinely unsettled still says cleanup must settle', () => {
+  const session = stoppedContractGateSession({
+    round5_setup: {
+      cleanup_failure: 'RDS Proxy delete not yet confirmed',
+      cleanup_retryable: true,
+      lanes: {
+        lakebase: { id: 'lakebase', name: 'Lakebase', verified: true, setup_diagnostic: null },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          verified: false,
+          setup_diagnostic: 'workflow_launch_skew',
+        },
+      },
+    },
+  } as unknown as Partial<DemoSession>)
+
+  expect(roundFiveStoppedVerdict(session)).toMatch(/cleanup must settle/i)
 })

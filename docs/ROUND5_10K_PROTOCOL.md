@@ -55,6 +55,41 @@ stops at `bell_to_10000_observed_ms`; its sibling continues from the same bell. 
 uses `performance.now()` seeded from the server floor, accepts only non-regressing revisions, and
 never changes the clock to setup time or runner-local ramp time.
 
+## Setup launch contract
+
+The setup phase (`round5-fanin-v4`) scores each lane's setup from one shared monotonic `T0`. Its
+launch fairness is a **two-dimensional** contract; it is not a single absolute ceiling on when a
+lane's task first wakes.
+
+1. **Inter-lane workflow-start skew ≤ 10 ms.** Both lanes stamp `workflow_launched_ns` at the same
+   point — the first line after their shared gate releases — so the two stamps are directly
+   comparable. Their difference must be ≤ 10 ms or the setup race is void (both lanes fail;
+   `workflow_launch_skew`). This is the fairness anchor.
+2. **Absolute request boundary ≤ 100 ms.** The first *real* timed request a lane issues must land
+   within 100 ms of its reference event. The competitor's `CreateDBProxy` (reference = bell/`T0`) is
+   the boundary the setup phase can observe; it is stamped at the request boundary
+   (`create_db_proxy_requested_ns`) and gated here (`create_db_proxy_window`).
+
+`workflow_launched_ns` is **only** the inter-lane skew input and a lower bound on real dispatch. It
+is **never** scored on an absolute-from-`T0` budget: it is stamped before any journal/SDK/dispatch
+work, so its sub-millisecond host-scheduling jitter must never fail an otherwise-exact bout. (A stamp
+*before* `T0` is still a fatal ordering fault, `workflow_launch_ordering`.) The retired absolute
+"≤ 10 ms from `T0` on `workflow_launched_ns`" gate conflated these dimensions and voided a live bout
+whose lanes both reached exactly 10,000 held clients — competitor `workflow_launched` was 10.53 ms
+after `T0` while the inter-lane skew was only 2.66 ms.
+
+Two design SLOs are **not** re-enforced by the setup terminal contract because they are
+runtime/engine events, not setup-phase events: the Lakebase `run_lane_v3` dispatch ≤ 100 ms after the
+bell, and the competitor `run_lane_v3` dispatch ≤ 100 ms after the Proxy control-plane gate. These
+are observed in the `round5_runtime` snapshot and **fail closed** there — a missing or late dispatch
+cannot produce an exact 10,000-client runtime lane, which is a hard gate. Stamping `lane_job_requested_ns`
+at those two engine request boundaries and promoting them to scored gates is deliberately left as a
+runtime-layer follow-up; until then the setup contract records the gap rather than pretending
+`workflow_launched_ns` measures them.
+
+Changing either budget reseals `SetupPhaseContract` (`max_request_launch_delay_ms`,
+`max_workflow_launch_skew_ms`, `deadline_seconds`) via its `sha256`.
+
 ## Lakebase lane
 
 The first post-bell external operation is the deterministic `run_lane_v3` dispatch to the dedicated

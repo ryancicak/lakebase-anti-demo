@@ -893,6 +893,13 @@ export interface SetupLaneResult {
   status: string
   stop_gate_evidence: SetupStopGateEvidence | null
   verified: boolean
+  /**
+   * Fixed, secret-free finalizer subcode explaining why a setup lane did not
+   * verify (e.g. `workflow_launch_window`, `workflow_launch_skew`,
+   * `stop_gate_evidence`). Present only on a non-verified lane. Lets a stopped
+   * bout name its actual reason instead of always blaming cleanup.
+   */
+  setup_diagnostic?: string | null
 }
 
 export interface SetupPhaseResult {

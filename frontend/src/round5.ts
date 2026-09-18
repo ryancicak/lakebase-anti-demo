@@ -340,6 +340,87 @@ export function roundFiveIsExplicitLegacy(session: DemoSession): boolean {
     && session.round5_setup?.schema_version === ROUND_FIVE_SCHEMA_VERSION
 }
 
+/**
+ * Human-readable text for each fixed, secret-free setup finalizer subcode the
+ * server may attach to a non-verified setup lane (`setup_diagnostic`). Lets a
+ * stopped bout name its actual reason instead of always blaming cleanup.
+ */
+const ROUND_FIVE_SETUP_DIAGNOSTIC_TEXT: Record<string, string> = {
+  // Retired label kept legible for a legacy sealed receipt.
+  workflow_launch_window: 'setup dispatch window exceeded',
+  workflow_launch_ordering: 'setup workflow launched before the shared start',
+  workflow_launch_skew: 'lane setup launches exceeded the 10 ms inter-lane skew budget',
+  create_db_proxy_window: 'CreateDBProxy was not requested within 100 ms of the bell',
+  stop_gate_evidence: 'setup stop gate did not verify exactly',
+  stop_gate_before_workflow_launch: 'setup stop gate preceded the workflow launch',
+  setup_deadline: 'setup exceeded its 30-minute deadline',
+  setup_error: 'setup reported an error',
+  setup_failed: 'setup failed',
+  setup_towelled: 'setup was toweled',
+  setup_unverified: 'setup did not verify',
+  public_fact_key_rejected: 'setup evidence was redacted before it could be scored',
+}
+
+/**
+ * Whether backstage cleanup for this Round 5 bout has NOT settled: it either
+ * failed, is still being retried, or a cooldown watcher failed. Only in that
+ * case is "cleanup must settle before the receipt is final" the honest verdict.
+ */
+export function roundFiveCleanupUnsettled(session: DemoSession): boolean {
+  const setup = session.round5_setup
+  return Boolean(
+    setup?.cleanup_failure
+    || setup?.cleanup_retryable === true
+    || session.towel?.cleanup_failure
+    || session.cooldown?.state === 'failed'
+    || session.cooldown?.failure,
+  )
+}
+
+/**
+ * Reduce the non-verified setup lanes to a readable reason, e.g.
+ * "Aurora Serverless v2 + RDS Proxy: lane setup launches exceeded the 10 ms
+ * inter-lane skew budget". Returns null when no lane carries a diagnostic.
+ */
+export function roundFiveSetupDiagnosticSummary(session: DemoSession): string | null {
+  const setup = session.round5_setup
+  if (!setup) return null
+  const parts: string[] = []
+  for (const laneId of ['lakebase', 'competitor'] as LaneId[]) {
+    const lane = setup.lanes?.[laneId]
+    if (!lane || lane.verified) continue
+    const diagnostic = lane.setup_diagnostic
+    if (!diagnostic) continue
+    const name = lane.name || session.lanes[laneId]?.name || laneId
+    const readable = diagnostic
+      .split(';')
+      .map((code) => ROUND_FIVE_SETUP_DIAGNOSTIC_TEXT[code] ?? code)
+      .join(' · ')
+    parts.push(`${name}: ${readable}`)
+  }
+  return parts.length > 0 ? parts.join(' · ') : null
+}
+
+/**
+ * The verdict line for a stopped (failed/towelled) V4 runtime. When cleanup is
+ * genuinely still unsettled it says so; otherwise it names the actual setup
+ * diagnostic (or the session failure) rather than falsely claiming cleanup is
+ * still underway -- the live 2026-09-17 bug, where a contract-gate failure with
+ * completed cleanup always read "cleanup must settle before the receipt is final".
+ */
+export function roundFiveStoppedVerdict(session: DemoSession): string {
+  if (roundFiveCleanupUnsettled(session)) {
+    return 'V4 runtime stopped · cleanup must settle before the receipt is final'
+  }
+  const diagnostic = roundFiveSetupDiagnosticSummary(session)
+  if (diagnostic) {
+    return `V4 runtime stopped · ${diagnostic} · no comparison declared`
+  }
+  return session.failure
+    ? `V4 runtime stopped · ${session.failure}`
+    : 'V4 runtime stopped · no comparison declared'
+}
+
 export function roundFiveHasComparison(session: DemoSession): boolean {
   if (!isRoundFive(session)) return false
   const setup = session.round5_setup

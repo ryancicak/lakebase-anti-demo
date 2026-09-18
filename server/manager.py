@@ -7829,7 +7829,11 @@ class RunManager:
     #: Fixed, secret-free finalizer subcodes the snapshot may carry. Extended
     #: only with new fixed labels; never with runtime/provider strings.
     _ROUND_FIVE_SETUP_LANE_FAILURES = (
+        # Retired label; still accepted so a legacy sealed receipt stays legible.
         "workflow_launch_window",
+        "workflow_launch_ordering",
+        "workflow_launch_skew",
+        "create_db_proxy_window",
         "stop_gate_evidence",
         "stop_gate_before_workflow_launch",
         "setup_deadline",

@@ -793,6 +793,9 @@ class ConnectionSpikeSetupLaneStop:
     credential_sha256: str
     endpoint_host: str
     secret_arn: str = field(default="", repr=False)
+    # Real CreateDBProxy request-boundary stamp (competitor only). None for lanes
+    # that issue no setup-phase request the contract can score.
+    create_db_proxy_requested_ns: int | None = None
 
     @property
     def elapsed_ms(self) -> float:
@@ -891,6 +894,11 @@ class _SetupResources:
     proxy_security_group_id: str = ""
     rds_security_group_id: str = ""
     proxy_endpoint: str = ""
+    # Monotonic stamp taken at the CreateDBProxy request boundary (before the SDK
+    # call leaves this process), so the setup contract can score the real
+    # bell -> CreateDBProxy request latency instead of the workflow_launched
+    # lower bound.
+    proxy_create_requested_ns: int | None = None
     security_group_rule_ids: list[str] = field(default_factory=list)
 
 
@@ -2173,6 +2181,9 @@ class LiveConnectionSpikeSetupOrchestrator:
             credential_sha256=self.config.competitor_credential_sha256,
             endpoint_host=resources.proxy_endpoint,
             secret_arn=resources.secret_arn,
+            create_db_proxy_requested_ns=getattr(
+                resources, "proxy_create_requested_ns", None
+            ),
         )
         # Ready the instant the Proxy verifies, so its 10,000 starts then rather than after
         # some other lane finishes something unrelated to it.
@@ -2219,6 +2230,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                 observed=facts,
                 verified_at_ns=stop.stopped_ns,
             ),
+            create_db_proxy_requested_ns=stop.create_db_proxy_requested_ns,
         )
 
     async def _verify_journaled_resources(
@@ -3358,6 +3370,10 @@ class LiveConnectionSpikeSetupOrchestrator:
     async def _create_proxy(
         self, clients: _SetupAwsClients, resources: _SetupResources, spec: ResourceSpec
     ) -> ResourceObservation:
+        # Stamp the request boundary before the SDK call leaves this process. This
+        # is the real, scored bell -> CreateDBProxy latency; workflow_launched_ns
+        # is only a lower bound taken right after gate.wait().
+        resources.proxy_create_requested_ns = self._monotonic_ns()
         await self._call(
             clients.rds.create_db_proxy,
             DBProxyName=resources.names.proxy_name,

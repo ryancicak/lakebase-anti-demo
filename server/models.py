@@ -433,9 +433,10 @@ class RoundFiveSetupLaneSnapshot(BaseModel):
     workflow_launch_delay_ms: float | None = None
     # Secret-free finalizer subcode that survives auto-cleanup and the terminal
     # receipt.  Distinguishes a genuine stop-gate failure (e.g.
-    # ``stop_gate_evidence``/``workflow_launch_window``/``setup_deadline``) from
-    # a public-projection rejection (``public_fact_key_rejected``), instead of
-    # collapsing every case into the generic "Setup verification failed".
+    # ``stop_gate_evidence``/``workflow_launch_skew``/``create_db_proxy_window``/
+    # ``setup_deadline``) from a public-projection rejection
+    # (``public_fact_key_rejected``), instead of collapsing every case into the
+    # generic "Setup verification failed".
     setup_diagnostic: str | None = None
 
 

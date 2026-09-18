@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
+import pytest
+
 from server.connection_fanin import (
     LANE_CONNECT_CONCURRENCY,
     SAFETY_EVIDENCE_VERSION,
@@ -10,11 +12,14 @@ from server.connection_fanin import (
     ConnectionSpikeLaneResult,
 )
 from server.connection_spike import (
+    MAX_SETUP_REQUEST_LAUNCH_DELAY_MS,
+    MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS,
     PublicSetupEvidence,
     SetupLaneObservation,
     SetupLaneStatus,
     SetupStopGateEvidence,
     arm_setup_phase,
+    finalize_setup_lane,
     finalize_setup_phase,
 )
 
@@ -155,6 +160,146 @@ def test_setup_phase_is_supporting_and_gated_by_downstream_fanin() -> None:
     public = json.loads(json.dumps(result.to_public_dict()))
     assert "t0_ns" not in public
     assert "verified_at_ns" not in public["lanes"]["lakebase"]["stop_gate_evidence"]
+
+
+# Exact live monotonic launch stamps from bout eb2b79b7173544fc92ff3a0da2ecec9f,
+# relative to the shared setup T0. Pinned as literals (not constant+offset) so the
+# regression is anchored to the field values the deployed HEAD actually recorded.
+_LIVE_LAKEBASE_LAUNCH_DELTA_NS = 7_873_272
+_LIVE_COMPETITOR_LAUNCH_DELTA_NS = 10_530_956
+_LIVE_INTER_LANE_SKEW_NS = _LIVE_COMPETITOR_LAUNCH_DELTA_NS - _LIVE_LAKEBASE_LAUNCH_DELTA_NS
+
+
+def test_live_inter_lane_launch_skew_passes() -> None:
+    # The live pair's inter-lane workflow-start skew was 2.657684 ms -- well within
+    # the 10 ms fairness bound -- even though the competitor's absolute delta
+    # (10.530956 ms) exceeded the retired 10 ms absolute gate. workflow_launched_ns
+    # is no longer scored absolutely; the exact live pair must verify.
+    assert _LIVE_INTER_LANE_SKEW_NS == 2_657_684
+    t0_ns = 1_000_000_000
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observations = (
+        SetupLaneObservation(
+            lane_id="lakebase",
+            workflow_launched_ns=t0_ns + _LIVE_LAKEBASE_LAUNCH_DELTA_NS,
+            status=SetupLaneStatus.SUCCEEDED,
+            stop_gate_evidence=setup_stop_gate(t0_ns + 7_874_849),
+        ),
+        SetupLaneObservation(
+            lane_id="competitor",
+            workflow_launched_ns=t0_ns + _LIVE_COMPETITOR_LAUNCH_DELTA_NS,
+            status=SetupLaneStatus.SUCCEEDED,
+            # CreateDBProxy requested ~2 ms after the competitor workflow launched,
+            # far inside the 100 ms absolute request budget.
+            create_db_proxy_requested_ns=t0_ns + 12_500_000,
+            stop_gate_evidence=setup_stop_gate(t0_ns + 607_808_521_774),
+        ),
+    )
+    fanin = {
+        lane_id: verified_fanin_lane(lane_id)
+        for lane_id in ("lakebase", "competitor")
+    }
+    result = finalize_setup_phase(arm, observations, fanin)
+
+    assert result.workflow_launch_skew_ms == pytest.approx(2.657684)
+    assert result.workflow_launch_skew_ms <= MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS
+    assert result.lanes["lakebase"].failures == ()
+    assert result.lanes["competitor"].failures == ()
+    assert result.setup_validated
+    assert result.downstream_validated
+    assert result.comparison is not None
+    assert result.comparison.winner_lane_id == "lakebase"
+
+
+def test_workflow_launched_ns_is_no_longer_scored_absolutely() -> None:
+    # A lane whose workflow_launched stamp is far past the retired 10 ms ceiling
+    # (here 90 ms) still verifies, as long as it issues no over-budget real
+    # request. workflow_launched_ns is only a lower bound, never scored absolutely.
+    t0_ns = 1_000_000_000
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observation = SetupLaneObservation(
+        lane_id="competitor",
+        workflow_launched_ns=t0_ns + 90_000_000,  # 90 ms after T0
+        status=SetupLaneStatus.SUCCEEDED,
+        create_db_proxy_requested_ns=t0_ns + 92_000_000,  # within 100 ms
+        stop_gate_evidence=setup_stop_gate(t0_ns + 607_808_521_774),
+    )
+    lane = finalize_setup_lane(arm, observation)
+
+    assert lane.failures == ()
+    assert lane.verified
+
+
+def test_create_db_proxy_request_beyond_100ms_fails() -> None:
+    # The absolute request-boundary dimension: the *real* CreateDBProxy request,
+    # not workflow_launched_ns, must land within 100 ms of the bell.
+    t0_ns = 1_000_000_000
+    beyond_ns = int(MAX_SETUP_REQUEST_LAUNCH_DELAY_MS * 1_000_000) + 1
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observation = SetupLaneObservation(
+        lane_id="competitor",
+        workflow_launched_ns=t0_ns + 5_000_000,  # workflow launch itself is prompt
+        status=SetupLaneStatus.SUCCEEDED,
+        create_db_proxy_requested_ns=t0_ns + beyond_ns,
+        stop_gate_evidence=setup_stop_gate(t0_ns + 607_808_521_774),
+    )
+    lane = finalize_setup_lane(arm, observation)
+
+    assert "create_db_proxy_window" in lane.failures
+    assert not lane.verified
+
+
+def test_inter_lane_launch_skew_beyond_10ms_fails_the_phase() -> None:
+    # The cross-lane dimension: both lanes can be inside the 100 ms absolute
+    # budget yet more than 10 ms apart from each other, which is an unfair start.
+    # That fails both lanes and declares no comparison.
+    t0_ns = 1_000_000_000
+    skew_ns = int(MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS * 1_000_000) + 1_000_000  # ~11 ms apart
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observations = (
+        SetupLaneObservation(
+            lane_id="lakebase",
+            workflow_launched_ns=t0_ns + 1_000_000,
+            status=SetupLaneStatus.SUCCEEDED,
+            stop_gate_evidence=setup_stop_gate(t0_ns + 8_000_000),
+        ),
+        SetupLaneObservation(
+            lane_id="competitor",
+            workflow_launched_ns=t0_ns + 1_000_000 + skew_ns,
+            status=SetupLaneStatus.SUCCEEDED,
+            create_db_proxy_requested_ns=t0_ns + 1_000_000 + skew_ns + 500_000,
+            stop_gate_evidence=setup_stop_gate(t0_ns + 607_808_521_774),
+        ),
+    )
+    fanin = {
+        lane_id: verified_fanin_lane(lane_id)
+        for lane_id in ("lakebase", "competitor")
+    }
+    result = finalize_setup_phase(arm, observations, fanin)
+
+    assert result.workflow_launch_skew_ms > MAX_SETUP_WORKFLOW_LAUNCH_SKEW_MS
+    assert "workflow_launch_skew" in result.lanes["lakebase"].failures
+    assert "workflow_launch_skew" in result.lanes["competitor"].failures
+    assert not result.setup_validated
+    assert result.comparison is None
+
+
+def test_workflow_launch_before_t0_is_still_fatal() -> None:
+    # A stamp before the shared T0 is a genuine ordering/clock fault -- it would
+    # corrupt the shared-T0 elapsed and skew maths -- and remains fatal, unlike
+    # positive scheduling jitter.
+    t0_ns = 1_000_000_000
+    arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+    observation = SetupLaneObservation(
+        lane_id="lakebase",
+        workflow_launched_ns=t0_ns - 1,
+        status=SetupLaneStatus.SUCCEEDED,
+        stop_gate_evidence=setup_stop_gate(t0_ns + 1_000_000_000),
+    )
+    lane = finalize_setup_lane(arm, observation)
+
+    assert "workflow_launch_ordering" in lane.failures
+    assert not lane.verified
 
 
 def test_setup_failure_or_invalid_gate_never_validates_downstream() -> None:

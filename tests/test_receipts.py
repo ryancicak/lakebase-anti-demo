@@ -385,6 +385,74 @@ async def test_v4_bell_towel_receipt_reads_the_runtime_not_the_setup_stop() -> N
     assert BoutReceipt.model_validate(receipt.model_dump(mode="json")) == receipt
 
 
+async def test_stopped_short_bout_with_both_lanes_verified_records_no_margin() -> None:
+    """Replays the live 2026-09-17 bout eb2b79b7173544fc92ff3a0da2ecec9f: both
+    runtime lanes reached the exact 10,000-client gate and both session lanes are
+    ``VERIFIED``, yet the orchestrator declared no comparison (a setup-phase gate
+    failed) so the session is ``FAILED``/stopped_short. The receipt must not
+    subtract the two verified lane times into a margin the bout never declared."""
+    from server.models import (
+        RoundFiveRuntimeLaneSnapshot,
+        RoundFiveRuntimeSnapshot,
+    )
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.round = snapshot.round.model_copy(
+        update={
+            "id": RoundId.SURVIVE_CONNECTION_SPIKE,
+            "title": "Ready a pooled application path",
+        }
+    )
+    snapshot.state = SessionState.FAILED
+    snapshot.failure = "Round 5 contract gate failed; no comparison was declared."
+    snapshot.comparison = None
+    snapshot.remembered_result = None
+    # Both lanes verified their own load/witness/cleanup gates.
+    snapshot.lanes["lakebase"].state = LaneState.VERIFIED
+    snapshot.lanes["competitor"].state = LaneState.VERIFIED
+    snapshot.round5_runtime = RoundFiveRuntimeSnapshot(
+        protocol="round5-bell-to-10k-v4",
+        warm_generation=1,
+        bell_id="bell-4ad57f21842b425aa58eff5be9220f66",
+        revision=31,
+        state="failed",
+        bell_at_utc=snapshot.updated_at,
+        lanes={
+            "lakebase": RoundFiveRuntimeLaneSnapshot(
+                id="lakebase",
+                phase="verified",
+                elapsed_at_snapshot_ms=13_740.241493,
+                bell_to_10000_observed_ms=13_740.241493,
+                clients_initiated=10_000,
+                clients_authenticated=10_000,
+                held_clients=10_000,
+                peak_clients_authenticated=10_000,
+                peak_held_clients=10_000,
+                sampled_queries_succeeded=64,
+                status="Exact 10,000-client retained gate verified",
+            ),
+            "competitor": RoundFiveRuntimeLaneSnapshot(
+                id="competitor",
+                phase="verified",
+                elapsed_at_snapshot_ms=642_472.948717,
+                bell_to_10000_observed_ms=642_472.948717,
+                clients_initiated=10_000,
+                clients_authenticated=10_000,
+                held_clients=10_000,
+                peak_clients_authenticated=10_000,
+                peak_held_clients=10_000,
+                sampled_queries_succeeded=64,
+                status="Exact 10,000-client retained gate verified",
+            ),
+        },
+    )
+
+    receipt = derive_receipt(snapshot, "session_failed")
+
+    assert receipt.outcome == "stopped_short"
+    assert receipt.margin_ms is None
+
+
 async def test_a_verified_lane_is_never_flagged_as_a_lower_bound() -> None:
     snapshot = await verified_round_one_snapshot()
 

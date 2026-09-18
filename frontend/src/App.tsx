@@ -94,6 +94,7 @@ import {
   roundFiveLaneVerification,
   roundFiveSetupElapsedDisplay,
   roundFiveSetupLaneResult,
+  roundFiveStoppedVerdict,
   roundFiveFanInMarginDisplay,
   roundFiveUsesFanIn,
   type RoundFiveLanePresentation,
@@ -6673,7 +6674,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           : 'Automatic warming measured one sealed c7i.2xlarge per physical 10,000-client lane before the bell.',
         shared: [
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
-          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Both launches must occur within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of the shared T0 or the setup race is void.` },
+          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Both lane workflows must launch within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other (inter-lane skew) or the setup race is void; each lane's own launch time is charged to its own clock.` },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
           { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge, resident registry, lock, and cancellation owner per lane.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
         ],
@@ -8409,7 +8410,7 @@ function proofCommentary(
           ? roundFiveVerifiedVerdict(session)
           : runtime.state === 'running'
             ? 'V4 resident fan-in live · no winner until both canonical runtime lanes verify'
-            : 'V4 runtime stopped · cleanup must settle before the receipt is final',
+            : roundFiveStoppedVerdict(session),
       }
     }
     const fanInActive = (['lakebase', 'competitor'] as LaneId[]).some(

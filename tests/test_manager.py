@@ -3071,6 +3071,92 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
     assert set(selected_opponents) == {selected_competitor}
 
 
+class LaunchJitterTwoPhaseConnectionSpikeEngine(SuccessfulTwoPhaseConnectionSpikeEngine):
+    """Replays the live 2026-09-17 bout where the competitor setup workflow
+    launched 10.53 ms after the shared T0 -- 0.53 ms past the old 10.00 ms
+    ceiling -- while every exact gate (10,000 held clients, 30 s hold, 64
+    held-connection checks, exact stop gates) passed. The bout must verify."""
+
+    async def setup(self, bout_id, fencing_token, on_progress):
+        assert bout_id and fencing_token > 0
+        await on_progress(SimpleNamespace(lane_id="lakebase", phase="setup"))
+        t0_ns = 1_000_000_000
+        arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+
+        def observation(
+            lane_id: str,
+            launched_ns: int,
+            stopped_ns: int,
+            create_db_proxy_requested_ns: int | None = None,
+        ):
+            facts = (
+                PublicSetupEvidence("transaction_verified", True),
+                PublicSetupEvidence("tls_verified", True),
+            )
+            return SetupLaneObservation(
+                lane_id=lane_id,
+                workflow_launched_ns=launched_ns,
+                status=SetupLaneStatus.SUCCEEDED,
+                stop_gate_evidence=SetupStopGateEvidence(
+                    gate_id="application_transaction",
+                    expected=facts,
+                    observed=facts,
+                    verified_at_ns=stopped_ns,
+                ),
+                create_db_proxy_requested_ns=create_db_proxy_requested_ns,
+            )
+
+        return SimpleNamespace(
+            bout_id=bout_id,
+            arm=arm,
+            observations=(
+                observation("lakebase", t0_ns + 7_873_272, t0_ns + 7_874_849),
+                # 10.53 ms workflow launch (over the retired 10 ms absolute gate),
+                # with CreateDBProxy requested ~2 ms later -- inside the 100 ms
+                # real-request budget. Inter-lane skew is 2.657684 ms.
+                observation(
+                    "competitor",
+                    t0_ns + 10_530_956,
+                    t0_ns + 607_808_521_774,
+                    create_db_proxy_requested_ns=t0_ns + 12_500_000,
+                ),
+            ),
+            credential_sha256="must-not-reach-browser",
+            secret_arn="arn:must-not-reach-browser",
+            fencing_token=fencing_token,
+        )
+
+
+async def test_round_five_setup_launch_jitter_still_verifies() -> None:
+    engine = LaunchJitterTwoPhaseConnectionSpikeEngine(burst_valid=True)
+
+    def factory(competitor: CompetitorId):
+        return engine
+
+    manager = RunManager(connection_spike_factory=factory)
+    operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    terminal = await wait_for_state(manager, created.id, SessionState.VERIFIED)
+
+    assert terminal.state == SessionState.VERIFIED
+    assert terminal.failure is None
+    assert terminal.round5_setup is not None
+    assert terminal.round5_setup.setup_validated
+    assert terminal.round5_setup.lanes["competitor"].verified
+    assert terminal.round5_setup.lanes["competitor"].state.value == "verified"
+    assert terminal.comparison is not None
+
+
 async def wait_for_cooldown(
     manager: RunManager,
     session_id: str,
