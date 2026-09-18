@@ -701,6 +701,13 @@ class SessionRecord:
     connection_spike_arm: object | None = None
     connection_spike_setup_result: object | None = None
     connection_spike_cleanup_task: asyncio.Task[None] | None = None
+    #: Durable, automatic cleanup-convergence loop. When a backstage cleanup /
+    #: rewarm handoff fails (e.g. a warm-slot ``WarmStoreConflictError`` CAS race,
+    #: or a delete that has not yet been re-verified absent), this loop keeps
+    #: re-running the reconcile+rewarm with bounded backoff until it converges,
+    #: instead of surfacing a human "Retry Cleanup". No end-user action ever
+    #: depends on it.
+    connection_spike_cleanup_retry_task: asyncio.Task[None] | None = None
     live_orders_engine: LiveOrdersEngine | None = None
     live_orders_arm: LiveOrdersArm | None = None
     live_orders_result: LiveOrdersResult | None = None
@@ -1502,6 +1509,7 @@ class RunManager:
                         record.task,
                         record.cooldown_task,
                         record.connection_spike_cleanup_task,
+                        record.connection_spike_cleanup_retry_task,
                         record.settlement_task,
                     )
                     if operation is not None
@@ -2638,10 +2646,12 @@ class RunManager:
                 "cleanup_update",
                 {"session": snapshot.model_dump(mode="json")},
             )
-            record.task = asyncio.create_task(
-                self._retry_connection_spike_cleanup(record, engine),
-                name=f"retry-cleanup-{session_id}",
-            )
+            # Only WAKE the durable auto-convergence worker; never start a second
+            # concurrent reconcile racing it. The worker keeps retrying the
+            # journal-based reconcile + rewarm CAS (with backoff) until the exact
+            # per-bout Proxy is confirmed absent and the ring rewarms, so a manual
+            # Retry Cleanup is now just an operator nudge, idempotent by design.
+            self._schedule_connection_spike_cleanup_convergence(record)
             return snapshot
 
     async def start_towel(
@@ -6676,18 +6686,129 @@ class RunManager:
                 "Round 5 durable rewarm transition is not confirmed"
             )
 
+    def _schedule_connection_spike_cleanup_convergence(
+        self,
+        record: SessionRecord,
+    ) -> None:
+        """Drive a stalled Round 5 backstage cleanup to convergence automatically.
+
+        The observed live failure was a warm-slot ``WarmStoreConflictError`` CAS
+        race at the cleanup->rewarm handoff: the handoff gave up, latched a
+        process-local "cleanup owed" notice, and stopped -- leaving a stale
+        billing banner even though AWS had already deleted (or never had) the
+        Proxy. This loop removes the human "Retry Cleanup": it keeps re-running
+        the journal-based reconcile with bounded backoff until the exact per-bout
+        Proxy is confirmed absent (NotFound) and the rewarm CAS wins. It never
+        clears the owed notice on an empty-orchestrator no-op -- only
+        ``_retry_connection_spike_cleanup`` (which calls the journal
+        ``reconcile_failed_cleanup`` and clears owed solely via
+        ``_mark_connection_spike_cleanup_complete`` after reconcile+rewarm
+        succeed) does. No end-user action ever waits on this loop.
+        """
+
+        # Defensive getattr: some unit tests exercise cleanup helpers on a
+        # manager built via object.__new__ (no __init__), so these attributes may
+        # be absent. In that case there is nothing to schedule against.
+        if getattr(self, "_closed", False):
+            return
+        round_obj = getattr(getattr(record, "snapshot", None), "round", None)
+        if getattr(round_obj, "id", None) != RoundId.SURVIVE_CONNECTION_SPIKE:
+            return
+        if getattr(self, "_connection_spike_factory", None) is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        del loop
+        existing = record.connection_spike_cleanup_retry_task
+        if existing is not None and not existing.done():
+            return
+        record.connection_spike_cleanup_retry_task = asyncio.create_task(
+            self._auto_converge_connection_spike_cleanup(record),
+            name=f"round5-auto-cleanup-{record.snapshot.id}",
+        )
+
+    async def _auto_converge_connection_spike_cleanup(
+        self,
+        record: SessionRecord,
+    ) -> None:
+        task = asyncio.current_task()
+        delay = max(0.05, self._cleanup_retry_initial)
+        maximum_delay = max(delay, self._cleanup_retry_max)
+        attempts = 0
+        try:
+            # Let the sealed receipt event reach the room before any backstage
+            # reconcile churn.
+            await asyncio.sleep(delay)
+            while not self._closed:
+                # A live bout task or an in-flight backstage cleanup owns the
+                # ring; never race them, just wait and re-check.
+                if record.task is not None and not record.task.done():
+                    await asyncio.sleep(delay)
+                    continue
+                if (
+                    record.connection_spike_cleanup_task is not None
+                    and not record.connection_spike_cleanup_task.done()
+                ):
+                    await asyncio.sleep(delay)
+                    continue
+                async with record.lock:
+                    setup = record.snapshot.round5_setup
+                    still_owed = bool(setup is not None and setup.cleanup_retryable)
+                if not still_owed:
+                    return
+                engine = record.connection_spike_engine
+                if engine is None or getattr(engine, "reconcile_failed_cleanup", None) is None:
+                    engine = self._connection_spike_factory(record.snapshot.competitor.id)
+                    record.connection_spike_engine = engine
+                attempts += 1
+                converged = False
+                try:
+                    converged = await self._retry_connection_spike_cleanup(record, engine)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Round 5 automatic cleanup convergence attempt %d "
+                        "session=%s diagnostic=%s",
+                        attempts,
+                        record.snapshot.id,
+                        _redacted_exception_chain(exc),
+                    )
+                if converged:
+                    logger.warning(
+                        "Round 5 automatic cleanup converged after %d attempt(s) "
+                        "session=%s",
+                        attempts,
+                        record.snapshot.id,
+                    )
+                    return
+                # Bounded exponential backoff (capped): retry the CAS/reconcile
+                # persistently without storming. AWS delete/absence is proven by
+                # reconcile_failed_cleanup before the rewarm CAS is attempted.
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, maximum_delay)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if record.connection_spike_cleanup_retry_task is task:
+                record.connection_spike_cleanup_retry_task = None
+
     async def _mark_connection_spike_cleanup_pending(
         self,
         record: SessionRecord,
     ) -> None:
         owed = self._note_round5_proxy_at_risk(
             record,
-            still_retrying=False,
+            # Automatic convergence keeps retrying (below), so the operator
+            # notice reflects "still retrying", never "gave up, ask a human".
+            still_retrying=True,
         )
         cleanup_failure = (
             owed.detail
             if owed is not None
-            else "Automatic backstage cleanup failed; use Retry Cleanup."
+            else "Automatic backstage cleanup is retrying."
         )
         async with record.lock:
             setup = record.snapshot.round5_setup
@@ -6708,6 +6829,11 @@ class RunManager:
                 "cleanup_update",
                 {"session": snapshot.model_dump(mode="json")},
             )
+        # Never leave a stalled cleanup waiting on a human. This is a no-op when a
+        # convergence loop (or a live bout / in-flight cleanup task) is already
+        # running, so a reconcile that itself marks pending cannot spawn a second
+        # loop.
+        self._schedule_connection_spike_cleanup_convergence(record)
 
     def _note_round5_proxy_at_risk(
         self,

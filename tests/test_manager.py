@@ -2968,22 +2968,21 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         assert terminal.metrics == []
 
     if cleanup_failure:
-        for _ in range(100):
+        # Automatic convergence, no human Retry Cleanup: the durable loop re-runs
+        # the journal-based reconcile (which converges for this engine) and
+        # settles the bout to a clean 'failed' with the ring released on its own.
+        retried = await manager.get(created.id)
+        for _ in range(400):
             retried = await manager.get(created.id)
+            status = await manager.bout_status()
             if (
-                retried.round5_setup
-                and retried.round5_setup.cleanup_retryable
+                retried.round5_setup is not None
+                and retried.round5_setup.state.value == "failed"
+                and retried.round5_setup.cleanup_retryable is False
+                and status.active is False
             ):
                 break
-            await asyncio.sleep(0.005)
-        else:
-            raise AssertionError("Cleanup failure did not become operator-retryable")
-        assert engine.reconcile_calls == []
-        await manager.retry_connection_spike_cleanup(created.id, operator)
-        record = manager._records[created.id]
-        assert record.task is not None
-        await record.task
-        retried = await manager.get(created.id)
+            await asyncio.sleep(0.02)
         assert retried.round5_setup is not None
         assert retried.round5_setup.state.value == "failed"
         assert retried.round5_setup.cleanup_retryable is False
@@ -2996,8 +2995,11 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         )
         assert retried.comparison is None
         assert (await manager.bout_status()).active is False
+        # The automatic loop ran the reconcile itself; no manual retry was needed.
         assert len(engine.reconcile_calls) == 1
         assert engine.reconcile_calls[0][1] == 1
+        # A manual Retry Cleanup now only wakes the (idle) worker; cleanup has
+        # already converged, so it starts no second reconcile.
         repeated = await manager.retry_connection_spike_cleanup(created.id, operator)
         assert repeated.round5_setup is not None
         assert repeated.round5_setup.cleanup_retryable is False
@@ -3031,7 +3033,16 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         # legible: the artifacts were never proved gone.
         assert abandoned.round5_setup.cleanup_retryable is True
         assert (await manager.bout_status()).active is True
-        assert engine.reconcile_calls == []
+        # The durable convergence loop keeps automatically re-running the
+        # journal-based reconcile even for a genuinely abandoned cleanup (only the
+        # artifacts actually going away can end it), so a human is never required.
+        # It never clears owed here, because reconcile keeps raising -- an empty
+        # in-memory no-op never masquerades as a confirmed deletion.
+        for _ in range(400):
+            if engine.reconcile_calls:
+                break
+            await asyncio.sleep(0.02)
+        assert engine.reconcile_calls, "abandoned cleanup did not auto-retry reconcile"
         assert manager._releasable(manager._records[created.id]) is False
 
     public = str(terminal.model_dump(mode="json")).lower()
@@ -3069,6 +3080,10 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
 
     assert selected_opponents
     assert set(selected_opponents) == {selected_competitor}
+
+    # Stop any durable cleanup-convergence loop still retrying an abandoned
+    # cleanup so it does not outlive the test.
+    await manager.close()
 
 
 class LaunchJitterTwoPhaseConnectionSpikeEngine(SuccessfulTwoPhaseConnectionSpikeEngine):
@@ -6692,8 +6707,12 @@ async def test_readiness_gate_refuses_the_arm_but_never_the_towel() -> None:
         await manager.start_arm(challenger.id)
 
 
-# T2 · Round 5 cleanup that will not converge must stop retrying and say so.
-async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() -> None:
+# T2 · Round 5 cleanup that cannot yet converge MUST keep retrying automatically
+# (never "stop and ask a human") and converge on its own the moment it can.
+async def test_round_five_towel_cleanup_auto_converges_without_manual_retry(monkeypatch) -> None:
+    # Fast automatic retries so the durable convergence loop settles quickly.
+    monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "0.02")
+    monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "0.05")
     engine = UnconvergingTowelConnectionSpikeEngine()
     main_store = InMemoryBoutLeaseStore()
     round5_store = InMemoryBoutLeaseStore(ring_key="round5")
@@ -6718,49 +6737,44 @@ async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() ->
     await manager.start_towel(created.id)
     failed = await wait_for_towel(manager, created.id, "failed")
 
-    assert engine.reconcile_attempts == 0
     assert failed.towel is not None
-    assert "Retry cleanup" in failed.towel.cleanup_failure
-    record = manager._records[created.id]
-    retry_task = record.connection_spike_cleanup_task
-    assert retry_task is None or retry_task.done()
-    # Keeping the ring is deliberate; being unable to leave `cleaning` was not.
-    assert await main_store.current() is not None
-    assert await round5_store.current() is not None
-
-    # The worst bout to lose is this one. A towel whose cleanup failed is the
-    # exact failure a verification campaign exists to hunt, and it used to seal
-    # nothing -- the abandonment published `towel_update`, which was not a
-    # sealing event, so the only trace was a log line and a held ring.
+    # The interim operator notice names the proxy and keeps the affordance, but
+    # it says cleanup is retrying -- never that a human must intervene -- and the
+    # end-user UI decouples from it entirely.
+    assert failed.towel.cleanup_failure is not None
+    # A towel whose cleanup has not converged still seals a stopped_short receipt
+    # that does not read clean.
     abandoned = await sealed_receipt(created.id)
     assert abandoned is not None, "a towel with failed cleanup sealed no receipt"
     assert abandoned.outcome == "stopped_short"
-    # And it must not read clean. This project has a recorded defect class where
-    # a round reported success while its cleanup silently failed four times; a
-    # receipt that omits the tidy-up is how a reader repeats that mistake.
     assert abandoned.cleanup_failure is not None
-    assert "Retry cleanup" in abandoned.cleanup_failure
 
-    # Terminal state is absorbing. Cleanup retries only through Retry Cleanup.
-    await manager.start_towel(created.id)
-    assert engine.reconcile_attempts == 0
-    await manager.retry_connection_spike_cleanup(created.id)
-    record = manager._records[created.id]
-    assert record.task is not None
-    await record.task
-    assert engine.reconcile_attempts == 1
+    # No human touched Retry Cleanup, yet the automatic convergence loop is
+    # already re-running the journal-based reconcile with backoff.
+    for _ in range(300):
+        if engine.reconcile_attempts > 0:
+            break
+        await asyncio.sleep(0.02)
+    assert engine.reconcile_attempts > 0
+    # Keeping the ring held until cleanup actually converges is deliberate.
+    assert await main_store.current() is not None
+    assert await round5_store.current() is not None
 
+    # Let cleanup succeed. The AUTOMATIC loop converges with no manual retry:
+    # reconcile now proves the Proxy absent, the rewarm CAS wins, the ring is
+    # released, and the owed notice clears.
     engine.relent()
-    await manager.retry_connection_spike_cleanup(created.id)
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.towel is not None and settled.towel.cleanup_failure is None
     assert await main_store.current() is None
     assert await round5_store.current() is None
 
-    # The successful retry supersedes the record: cleanup did complete in the
-    # end, so the receipt stops claiming otherwise.
+    # The automatic convergence supersedes the record: cleanup did complete in
+    # the end, so the receipt stops claiming otherwise.
     cleared = await sealed_receipt(created.id, until=lambda item: item.cleanup_failure is None)
     assert cleared is not None and cleared.cleanup_failure is None
+
+    await manager.close()
 
 
 # T6 · a refused lease transition must not have already killed the bout.

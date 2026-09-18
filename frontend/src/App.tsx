@@ -1203,8 +1203,17 @@ function towelCleanupAllowsExit(session: DemoSession): boolean {
 }
 
 function cleanupAllowsTerminalActions(session: DemoSession): boolean {
+  // Round 5 is the only round that creates a per-bout billable Proxy and whose
+  // backstage ring cleanup could stall (a warm-slot CAS race). Its sealed
+  // receipt/score is the end user's outcome, so Share, See Details / Instant
+  // Replay, What it cost, and Next Round must be immediately available
+  // regardless of ring cleanup — which now converges automatically backstage
+  // and is an operator concern only. (Next Round is safe on an unclean ring: it
+  // navigates to a different round or the recap, and starting a NEW Round 5
+  // bout independently requires the ring to be READY, which the fight card /
+  // arm path still gates on.) Other rounds keep their existing towel-exit gate.
+  if (isRoundFive(session)) return true
   return towelCleanupAllowsExit(session)
-    && session.round5_setup?.cleanup_retryable !== true
 }
 
 function proofNavigationAllowsExit(session: DemoSession): boolean {
@@ -5385,13 +5394,13 @@ export function RoundFiveProof({
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
   const [showCostRoom, setShowCostRoom] = useState(false)
-  const cleanupRetryable = session.round5_setup?.cleanup_retryable === true
-  /* The one fact `cleanup_retryable` cannot carry. It is true while cleanup is
-     still retrying and true again once the server has given up, so a screen
-     reading it alone cannot tell a tidy-up in flight from an abandoned one --
-     and the second is the one where a run-owned proxy may still exist. Set
-     only on abandonment, so its presence is the distinction. */
-  const cleanupAbandoned = session.round5_setup?.cleanup_failure || null
+  /* Backstage ring cleanup is fully decoupled from the end user. It now
+     converges automatically (the server keeps reconciling the per-bout Proxy to
+     confirmed-absent and rewarms without a human "Retry Cleanup"), so the
+     end-user proof view never surfaces a cleanup/billing banner and never gates
+     an action on it. The operator surface (`/readyz` `round5_cleanup_owed`)
+     still carries the backstage state for ops. */
+  const cleanupAbandoned: string | null = null
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
   const v3Runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
   const runtimeLanes = v3Runtime
@@ -5418,10 +5427,8 @@ export function RoundFiveProof({
   const oneSidedSetupLead = oneSidedExactLane && oneSidedUnverifiedLane
     ? `${session.round5_setup?.lanes?.[oneSidedExactLane]?.name ?? session.lanes[oneSidedExactLane].name} verified first · ${session.round5_setup?.lanes?.[oneSidedUnverifiedLane]?.name ?? session.lanes[oneSidedUnverifiedLane].name} unverified${oneSidedLowerBound === null ? '' : ` beyond ${laneReceiptTime(oneSidedLowerBound)}`}`
     : 'Bout stopped · Setup clocks frozen'
-  const showCleanupFallback = cleanupRetryable
-    && !session.towel
-    && !uiReview
-    && Boolean(onRetryCleanup)
+  // No end-user "Retry cleanup" button: cleanup is automatic and never blocks.
+  const showCleanupFallback = false
   if (uiReview || session.state !== 'failed' || v3Runtime) {
     const lakebaseSetupLane = runtimeLanes?.lakebase
       ?? roundFiveArenaLane(session, 'lakebase')
@@ -5550,27 +5557,10 @@ export function RoundFiveProof({
                   : explicitLegacy
                     ? 'Legacy scorecard decoded · current 10,000-client fan-in contract not recorded'
                     : 'Protocol evidence unavailable · no timing or fan-in claim inferred'}</p>
-                {/* A verified Round 5 keeps its win and can still fail to tidy
-                    up, which is the case this screen used to render as a bare
-                    "settling backstage" line whether cleanup was still trying
-                    or had been given up on hours ago. */}
-                {cleanupAbandoned ? (
-                  <div className="cleanup-abandoned" data-state="failed" role="alert" aria-live="polite">
-                    <strong>{CLEANUP_ABANDONED_TITLE}</strong>
-                    <span>{cleanupAbandoned}</span>
-                  </div>
-                ) : cleanupRetryable ? (
-                  <p className="proof-error" role="status">Automatic cleanup is settling backstage · Ring protected</p>
-                ) : null}
-                {showCleanupFallback && (
-                  <button
-                    className="round5-retry-cleanup"
-                    disabled={cleanupPending}
-                    onClick={onRetryCleanup}
-                  >
-                    B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
-                  </button>
-                )}
+                {/* A verified Round 5 keeps its win. Backstage ring cleanup is
+                    decoupled from the end user: it converges automatically and
+                    is never surfaced here as a billing/attention banner, and it
+                    never gates Share / Instant Replay / What it cost / Next. */}
                 {!uiReview && !cleanupAllowsActions && (
                   <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
                 )}

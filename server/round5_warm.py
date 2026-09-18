@@ -49,7 +49,7 @@ DEFAULT_CLAIM_TTL_SECONDS = 180
 DEFAULT_COORDINATOR_TTL_SECONDS = 90
 DEFAULT_RETRY_CEILING_SECONDS = 60
 PROVENANCE_FRESHNESS_SECONDS = 15
-CLEANUP_FINALIZE_CONFLICT_ATTEMPTS = 16
+CLEANUP_FINALIZE_CONFLICT_ATTEMPTS = 40
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -3531,7 +3531,18 @@ class Round5WarmCoordinator:
                     warm_contract_sha256=self.warm_contract_sha256,
                 )
             except WarmStoreConflictError:
-                await asyncio.sleep(0)
+                # The CLEANING->WARMING compare-and-swap lost to a concurrent
+                # writer -- in practice the continuous warm-capsule renewal that
+                # bumps the slot revision every few seconds. Immediate retries
+                # (the old sleep(0)) just lose again in lockstep. Back off with
+                # full jitter so the renewal can settle between attempts and a
+                # retry can win, instead of exhausting the attempts and raising.
+                # The Proxy is already confirmed absent before this transition,
+                # so this is a rewarm-liveness retry, never a billing risk; the
+                # manager's automatic convergence loop retries the whole
+                # reconcile if even this bounded window is somehow exhausted.
+                ceiling = min(0.25, 0.01 * (2 ** min(_attempt, 5)))
+                await self._sleep(self._random.uniform(0.0, ceiling))
                 continue
             if (
                 warmed.generation != generation + 1

@@ -1789,6 +1789,10 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(screen.queryByRole('button', { name: /ring again/i })).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: /fight card/i })).toBeInTheDocument()
 
+  // Backstage cleanup is now DECOUPLED from the end user (Round-5-scoped): a
+  // failed bout with cleanup still pending shows NO "Retry cleanup" button, NO
+  // "Cleanup needs attention" / "MAY STILL BE RUNNING AND BILLING" banner, and
+  // does not fence terminal navigation. Cleanup converges automatically backstage.
   const cleanupFailed: DemoSession = {
     ...failed,
     round5_setup: {
@@ -1813,19 +1817,13 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(/backstage recovery/i)
-  expect(screen.queryByLabelText('Round 5 final receipt')).not.toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /ring again|fight card|next round/i })).not.toBeInTheDocument()
-  fireEvent.click(screen.getByRole('button', { name: /retry cleanup/i }))
-  expect(retryCleanup).toHaveBeenCalledOnce()
-  // No diagnostic yet, so the screen keeps its own sentence: `cleanup_failed`
-  // is set while retries are still running too, and that is what this is.
-  expect(screen.getByText(/automatic cleanup is retrying backstage.*ring stays protected.*clean baseline/i)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText(/MAY STILL BE RUNNING AND BILLING/i)).not.toBeInTheDocument()
+  expect(screen.queryByText(/cleanup needs attention/i)).not.toBeInTheDocument()
 
-  /* Verbatim from `_abandon_connection_spike_cleanup_retry`. Quoted rather
-     than paraphrased: printing the server's own sentence instead of a house
-     one is the behaviour being asserted, and a paraphrase here would pass
-     while the screen said something the server never said. */
+  // A cleanup_failure diagnostic string on a failed bout is likewise never shown
+  // to the end user as a billing/attention banner.
   const abandonedDiagnostic = 'Round 5 backstage cleanup did not converge after 6 automatic attempts. '
     + 'The ring stays held until cleanup is confirmed; retry cleanup.'
   const cleanupAbandoned: DemoSession = {
@@ -1847,27 +1845,13 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(abandonedDiagnostic)
-  expect(screen.queryByText(/automatic cleanup is retrying backstage/i)).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText(abandonedDiagnostic)).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
 
-  rerender(
-    <RoundFiveProof
-      session={cleanupFailed}
-      roundNumber={5}
-      error={null}
-      liveEvidenceConnected
-      uiReview={false}
-      hasNextRound={false}
-      commentaryOpen
-      onContinue={vi.fn()}
-      onToggleCommentary={vi.fn()}
-      cleanupPending
-      onRetryCleanup={retryCleanup}
-      onHome={vi.fn()}
-    />,
-  )
-  expect(screen.getByRole('button', { name: /retrying cleanup/i })).toBeDisabled()
-
+  // A VERIFIED Round 5 with cleanup still pending keeps its win AND every
+  // end-user action: Instant replay, What it cost, Share, and Next round are
+  // available, with no retry button and no cleanup banner.
   const verifiedCleanupPending: DemoSession = {
     ...proof,
     round5_setup: { ...proof.round5_setup!, cleanup_retryable: true },
@@ -1887,15 +1871,14 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByText(/automatic cleanup is settling backstage.*ring protected/i)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /share the receipt/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
 
-  /* The case that had nowhere to appear. This bout verified and keeps its win,
-     and then the server gave up on tidying the proxy it built. `settling
-     backstage` was all the arena could say about that, which reads as work in
-     progress and is the opposite of what has happened. */
+  // Even with a cleanup_failure diagnostic string set, a verified bout shows no
+  // "Cleanup needs attention" alert and keeps its win and its actions.
   const verifiedCleanupAbandoned: DemoSession = {
     ...verifiedCleanupPending,
     round5_setup: { ...verifiedCleanupPending.round5_setup!, cleanup_failure: abandonedDiagnostic },
@@ -1915,16 +1898,11 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  const abandonedNotice = screen.getByRole('alert')
-  expect(abandonedNotice).toHaveTextContent('Cleanup needs attention')
-  expect(abandonedNotice).toHaveTextContent(abandonedDiagnostic)
-  expect(screen.queryByText(/settling backstage/i)).not.toBeInTheDocument()
-  /* Legibility only. The win still stands, the retry is still offered, and the
-     exits are still shut -- this notice explains the lockout, it does not
-     change who is allowed to walk away from a resource that may still exist. */
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText(/cleanup needs attention/i)).not.toBeInTheDocument()
   expect(screen.getByText(/verified exact 10,000-client fan-in comparison/i)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /next round|fight card/i })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
 
   const towelled: DemoSession = {
     ...failed,
