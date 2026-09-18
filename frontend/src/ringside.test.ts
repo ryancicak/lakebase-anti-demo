@@ -803,6 +803,22 @@ describe('one generic evidence classifier with six round contracts', () => {
       expect(scorecard?.margin_ms).toBe(classified.marginMs)
       expect(scorecard?.remembered_result).toBe(classified.headline)
 
+      // The knockout hero never appears without a named winner on a complete,
+      // untowelled contract, and it always leads with a figure the caption
+      // can stand behind.
+      if (receipt.knockout) {
+        expect(receipt.winner === 'lakebase' || receipt.winner === 'competitor').toBe(true)
+        expect(classified.contractComplete).toBe(true)
+        expect(session.towel).toBeFalsy()
+        expect(receipt.knockout.hero).toMatch(/^\d/)
+        expect(receipt.knockout.qualifier.length).toBeLessThanOrEqual(80)
+        expect(receipt.knockout.winner).toBe(receipt.winner)
+        expect(receipt.knockout.capabilityGap).toBe(receipt.competitorCapabilityGap)
+      }
+      if (session.towel || !classified.contractComplete || (receipt.winner !== 'lakebase' && receipt.winner !== 'competitor')) {
+        expect(receipt.knockout).toBeUndefined()
+      }
+
       const allCopy = [
         classified.headline,
         cue.say,
