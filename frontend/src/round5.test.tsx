@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import { RoundFiveProof, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
+import { RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { replayStory } from './instant-replay'
@@ -2890,4 +2890,136 @@ it('a slow-but-present CreateDBProxy is a non-fatal advisory, not a stopped verd
   const advisory = roundFiveSchedulingAdvisorySummary(session)
   expect(advisory).toContain('Aurora Serverless v2 + RDS Proxy')
   expect(advisory).toContain('100 ms after the bell')
+})
+
+// ---------------------------------------------------------------------------
+// Health-bars share card (Fable 5.1 / "1b", the default layout). The knockout
+// tests above are unchanged; these cover the parallel presentation and the
+// math the audit required to be honest before it can be the default.
+// ---------------------------------------------------------------------------
+
+it('health bars: a verified V4 win under 2× keeps the ledger headline as the verdict', () => {
+  const session = verifiedBellRoundFiveSession()
+  const receipt = receiptPresentation(session, 'round')
+  const clocks = session.round5_runtime!.lanes
+  expect(receipt.healthBars).toMatchObject({
+    title: 'BELL TO 10,000 HELD CLIENTS',
+    verdict: receipt.verdict,
+    aside: null,
+    winner: 'lakebase',
+    capabilityGap: false,
+  })
+  expect(receipt.healthBars?.fill.competitor).toBe(1)
+  expect(receipt.healthBars?.fill.lakebase).toBeCloseTo(
+    clocks.lakebase.bell_to_10000_observed_ms! / clocks.competitor.bell_to_10000_observed_ms!,
+    6,
+  )
+})
+
+it('health bars: a 45× gap reads in human units, winner first, with the exact margin beside it', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 141_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 141_000
+  session.lanes.competitor.elapsed_ms = 141_000
+  session.comparison = {
+    kind: 'measured',
+    winner_lane_id: 'lakebase',
+    margin: { spec_id: 'bell_to_10000_observed_ms', lane_id: 'lakebase', value: 137_887.327, display_value: '137887.33 ms' },
+    detail: 'Lakebase reached 10,000 first.',
+  }
+  const receipt = receiptPresentation(session, 'round')
+  const lakebaseMs = session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms!
+  expect(receipt.winner).toBe('lakebase')
+  expect(receipt.healthBars?.verdict).toBe(`${humanDuration(lakebaseMs, 'up').label} VS 2 MINUTES`)
+  expect(receipt.healthBars?.aside).toBe(`LAKEBASE · ${((141_000 - lakebaseMs) / 1000).toFixed(2)}s SOONER`)
+  expect(receipt.healthBars?.fill).toEqual({ lakebase: lakebaseMs / 141_000, competitor: 1 })
+})
+
+it('health bars: human units round the winner up and the loser down, and hold at unit boundaries', () => {
+  expect(humanDuration(13_690, 'up').label).toBe('14 SECONDS')
+  expect(humanDuration(621_260, 'down').label).toBe('10 MINUTES')
+  expect(humanDuration(2_310, 'up').label).toBe('2.4 SECONDS')
+  expect(humanDuration(41_860, 'down').label).toBe('41 SECONDS')
+  expect(humanDuration(165_000, 'down').label).toBe('2M 45S')
+  expect(humanDuration(65_000, 'up').label).toBe('1M 05S')
+  expect(humanDuration(60_000, 'down').label).toBe('1 MINUTE')
+  expect(humanDuration(700, 'up').label).toBe('0.7 SECONDS')
+  // The boundary the audit flagged: sub-millisecond noise must not tip the
+  // decisecond in the wrong direction. 2300.001ms up stays 2.3s (not 2.4s);
+  // 2399.999ms down stays 2.4s (not 2.3s). Winner still reads faster.
+  expect(humanDuration(2_300.001, 'up').label).toBe('2.3 SECONDS')
+  expect(humanDuration(2_399.999, 'down').label).toBe('2.4 SECONDS')
+  expect(humanDuration(2_300.001, 'up').seconds).toBeLessThan(humanDuration(2_399.999, 'down').seconds)
+})
+
+it('health bars: a towel keeps the scorecard card (no bars)', () => {
+  expect(receiptPresentation(screenshotTowelRoundFiveSession(), 'round').healthBars).toBeUndefined()
+})
+
+it('health bars: equal clocks fall back to the scorecard (no zero-margin bar)', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 3_112.673
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 3_112.673
+  session.lanes.competitor.elapsed_ms = 3_112.673
+  session.comparison!.margin!.value = 0
+  // Equal clocks cannot honestly credit a winner: the presentation must never
+  // draw a zero-margin bar, whether the classifier reports a tie or the
+  // health-bars strict guard rejects it.
+  expect(receiptPresentation(session, 'round').healthBars).toBeUndefined()
+})
+
+it('health bars: a non-finite, negative, or zero challenger clock falls back to the scorecard', () => {
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0]) {
+    const session = verifiedBellRoundFiveSession()
+    session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = bad
+    session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = Number.isFinite(bad) ? bad : 0
+    expect(receiptPresentation(session, 'round').healthBars).toBeUndefined()
+  }
+})
+
+it('health bars: a huge but finite challenger clock renders safely with the true (unfloored) ratio', () => {
+  const session = verifiedBellRoundFiveSession()
+  const lakebaseMs = session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms!
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 1_000_000_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 1_000_000_000
+  session.lanes.competitor.elapsed_ms = 1_000_000_000
+  session.comparison!.margin!.value = 1_000_000_000 - lakebaseMs
+  const receipt = receiptPresentation(session, 'round')
+  expect(receipt.healthBars).toBeDefined()
+  expect(receipt.healthBars!.fill.lakebase).toBeCloseTo(lakebaseMs / 1_000_000_000, 12)
+  expect(receipt.healthBars!.fill.competitor).toBe(1)
+  expect(receipt.healthBars!.verdict.length).toBeGreaterThan(0)
+})
+
+it('health bars: a human margin that disagrees with the ledger drops the aside and keeps the ledger verdict', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 141_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 141_000
+  session.lanes.competitor.elapsed_ms = 141_000
+  // The ledger margin (100 ms) contradicts the drawn clocks (≈137.9 s). The
+  // bars keep their true shape, but the misleading human aside is withheld and
+  // the verdict falls back to the authoritative ledger headline.
+  session.comparison!.margin!.value = 100
+  const receipt = receiptPresentation(session, 'round')
+  expect(classifyOutcome(session).marginMs).toBe(100)
+  expect(receipt.healthBars).toBeDefined()
+  expect(receipt.healthBars!.aside).toBeNull()
+  expect(receipt.healthBars!.verdict).toBe(receipt.verdict)
+  expect(receipt.healthBars!.fill.lakebase).toBeCloseTo(
+    session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms! / 141_000,
+    6,
+  )
+})
+
+it('health bars: Round 5 measures the bell runtime, never the setup clock (no V4 poison)', () => {
+  const session = verifiedBellRoundFiveSession()
+  // Corrupt the legacy setup clocks; the health bars must ignore them entirely.
+  if (session.round5_setup?.lanes?.lakebase) session.round5_setup.lanes.lakebase.setup_elapsed_ms = 0.01
+  if (session.round5_setup?.lanes?.competitor) session.round5_setup.lanes.competitor.setup_elapsed_ms = 999_999
+  const receipt = receiptPresentation(session, 'round')
+  expect(receipt.healthBars?.fill.lakebase).toBeCloseTo(
+    session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms!
+      / session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms!,
+    6,
+  )
 })
