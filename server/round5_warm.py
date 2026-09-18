@@ -49,6 +49,45 @@ DEFAULT_CLAIM_TTL_SECONDS = 180
 DEFAULT_COORDINATOR_TTL_SECONDS = 90
 DEFAULT_RETRY_CEILING_SECONDS = 60
 PROVENANCE_FRESHNESS_SECONDS = 15
+# A throttled/timed-out provenance probe (validate_ready RetryableWarmError) is a
+# transient READ failure, not a runner identity change: retry in place and stay
+# READY. Only escalate to freshness_lost (a full rewarm) after this many
+# consecutive probe failures, or when provenance is about to lapse.
+MAX_PROVENANCE_PROBE_FAILURES = 5
+PROVENANCE_PROBE_RETRY_SECONDS = 2.0
+PROVENANCE_PROBE_MIN_SLACK_SECONDS = 3.0
+# The 45-minute runner receipts cannot be extended in place without a fresh live
+# proxy-absence + runner attestation. Rather than slide the bound (which would
+# rest READY on stale evidence), rewarm cleanly this far ahead of the wall so the
+# full prepare() re-observes proxy absence and runner identity and publishes new
+# receipts.
+RUNNER_RECEIPT_REFRESH_MARGIN_SECONDS = 10 * 60
+# A retryable warm failure that persists this many consecutive attempts stops
+# being treated as transient: escalate to a DISTINCT terminal code instead of
+# retrying forever (still never first-failure BLOCKED).
+MAX_TRANSIENT_WARM_ATTEMPTS = 8
+# Some BLOCKED codes are SELF-VERIFIABLE: they describe a condition the coordinator
+# can re-check itself (a momentarily insufficient/expired credential margin, or a
+# transient that merely persisted past the escalation count). These are re-attempted
+# at a bounded interval so the same process recovers on its own -- never a latch a
+# human must clear. TRUE permanent anti-cheat/config blocks (identity change, orphan
+# Proxy, fixture drift, unexpected) stay latched and are surfaced honestly.
+SELF_VERIFIABLE_BLOCK_RETRY_SECONDS = 60.0
+SELF_VERIFIABLE_BLOCK_CODES = frozenset(
+    {
+        "credential_margin_insufficient",
+        "credential_refresh_expired",
+        "warm_provider_retryable_persistent",
+    }
+)
+
+
+def _blocked_is_terminal(slot: Round5WarmSlot) -> bool:
+    """A BLOCKED slot whose code is not self-verifiable will not self-recover."""
+    return (
+        slot.state == Round5WarmState.BLOCKED
+        and slot.last_error_code not in SELF_VERIFIABLE_BLOCK_CODES
+    )
 CLEANUP_FINALIZE_CONFLICT_ATTEMPTS = 40
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -105,11 +144,61 @@ def round5_warm_attempt_token(slot: Round5WarmSlot) -> str:
 def _receipt_expiry_bound(slot: Round5WarmSlot) -> datetime:
     if slot.shared_receipt is None or not slot.variants:
         raise WarmFenceLostError("READY receipt bounds are unavailable")
+    return _receipt_bound_of(slot.shared_receipt, slot.variants)
+
+
+def _receipt_bound_of(
+    shared_receipt: Round5SharedReceipt,
+    variants: Mapping[Round5Variant, Round5VariantReceipt],
+) -> datetime:
     return min(
-        slot.shared_receipt.lakebase_runner.expires_at,
-        slot.shared_receipt.competitor_runner.expires_at,
-        *(receipt.expires_at for receipt in slot.variants.values()),
+        shared_receipt.lakebase_runner.expires_at,
+        shared_receipt.competitor_runner.expires_at,
+        *(receipt.expires_at for receipt in variants.values()),
     )
+
+
+def _assert_immutable_receipt_identity(
+    slot: Round5WarmSlot,
+    shared_receipt: Round5SharedReceipt,
+    variants: Mapping[Round5Variant, Round5VariantReceipt],
+) -> None:
+    """A receipt RENEWAL may advance freshness but never the attested identity.
+
+    ``identity immutable, provenance renewable``: renewing the 45-minute receipt
+    horizon may move ``expires_at`` and the freshly-observed proxy-absence
+    timestamp forward, but the runner boot/process/image/harness digests and the
+    per-variant target/network digests must be byte-identical to what was
+    published at warm. A mismatch means the "renewal" is really a new identity
+    smuggled in without a full attested warm -- fail closed.
+    """
+
+    if slot.shared_receipt is None or not slot.variants:
+        raise WarmFenceLostError("READY receipt identity is unavailable")
+    for lane_old, lane_new in (
+        (slot.shared_receipt.lakebase_runner, shared_receipt.lakebase_runner),
+        (slot.shared_receipt.competitor_runner, shared_receipt.competitor_runner),
+    ):
+        if (
+            lane_old.boot_id != lane_new.boot_id
+            or lane_old.process_boot_id != lane_new.process_boot_id
+            or lane_old.instance_id != lane_new.instance_id
+            or lane_old.image_sha256 != lane_new.image_sha256
+            or lane_old.loaded_harness_sha256 != lane_new.loaded_harness_sha256
+            or lane_old.capacity_model_sha256 != lane_new.capacity_model_sha256
+        ):
+            raise WarmFenceLostError("renewed receipt runner identity changed")
+    if set(slot.variants) != set(variants):
+        raise WarmFenceLostError("renewed receipt variant set changed")
+    for key, old_variant in slot.variants.items():
+        new_variant = variants[key]
+        if (
+            old_variant.target_sha256 != new_variant.target_sha256
+            or old_variant.source_sha256 != new_variant.source_sha256
+            or old_variant.security_group_sha256 != new_variant.security_group_sha256
+            or old_variant.vpc_sha256 != new_variant.vpc_sha256
+        ):
+            raise WarmFenceLostError("renewed receipt variant identity changed")
 
 
 class Round5WarmState(StrEnum):
@@ -523,6 +612,20 @@ class Round5WarmProvider(Protocol):
         slot: Round5WarmSlot,
         previous: Round5LaunchCapsule,
     ) -> Round5LaunchCapsule: ...
+
+    async def refresh_preparation(
+        self,
+        slot: Round5WarmSlot,
+        previous: Round5LaunchCapsule,
+    ) -> Round5WarmPreparation:
+        """Renew credentials AND republish fresh receipts off a live probe.
+
+        Re-observes per-bout Proxy absence and re-reads runner identity, returning
+        a full preparation (fresh receipts + rotated capsule) on the SAME immutable
+        runner identity so READY can renew in place across the runner-receipt
+        horizon without a full ``prepare()`` rewarm.
+        """
+        ...
 
 
 class Round5WarmStore(Protocol):
@@ -1053,6 +1156,8 @@ class InMemoryRound5WarmStore:
         *,
         capsule: Round5LaunchCapsule,
         now: datetime,
+        shared_receipt: Round5SharedReceipt | None = None,
+        variants: Mapping[Round5Variant, Round5VariantReceipt] | None = None,
     ) -> Round5WarmSlot:
         if slot.state != Round5WarmState.READY:
             raise WarmFenceLostError("capsule refresh requires READY")
@@ -1066,7 +1171,16 @@ class InMemoryRound5WarmStore:
             raise BlockedWarmError("credential_margin_insufficient")
         if capsule.warm_attempt_token != slot.warm_attempt_token:
             raise WarmFenceLostError("refreshed capsule warm attempt changed")
-        receipt_bound = _receipt_expiry_bound(slot)
+        changes: dict[str, object] = {"broker_epoch": capsule.broker_epoch}
+        if shared_receipt is not None or variants is not None:
+            if shared_receipt is None or variants is None:
+                raise WarmFenceLostError("receipt renewal requires both receipt halves")
+            _assert_immutable_receipt_identity(slot, shared_receipt, variants)
+            receipt_bound = _receipt_bound_of(shared_receipt, variants)
+            changes["shared_receipt"] = shared_receipt
+            changes["variants"] = variants
+        else:
+            receipt_bound = _receipt_expiry_bound(slot)
         ready_expires_at = min(receipt_bound, capsule.expires_at)
         renew_by = min(ready_expires_at, capsule.renew_by)
         if renew_by <= now:
@@ -1075,9 +1189,9 @@ class InMemoryRound5WarmStore:
             slot,
             "warm_capsule_refreshed",
             now=now,
-            broker_epoch=capsule.broker_epoch,
             ready_expires_at=ready_expires_at,
             renew_by=renew_by,
+            **changes,
         )
 
     async def renew_provenance(
@@ -1878,9 +1992,23 @@ class LakebaseRound5WarmStore:
     ) -> Round5WarmSlot:
         capsule: Round5LaunchCapsule = kwargs["capsule"]
         now: datetime = kwargs["now"]
+        shared_receipt: Round5SharedReceipt | None = kwargs.get("shared_receipt")
+        variants: Mapping[Round5Variant, Round5VariantReceipt] | None = kwargs.get(
+            "variants"
+        )
         if not capsule.meets_launch_margin(now):
             raise BlockedWarmError("credential_margin_insufficient")
-        ready_expires_at = min(_receipt_expiry_bound(slot), capsule.expires_at)
+        changes: dict[str, object] = {"broker_epoch": capsule.broker_epoch}
+        if shared_receipt is not None or variants is not None:
+            if shared_receipt is None or variants is None:
+                raise WarmFenceLostError("receipt renewal requires both receipt halves")
+            _assert_immutable_receipt_identity(slot, shared_receipt, variants)
+            receipt_bound = _receipt_bound_of(shared_receipt, variants)
+            changes["shared_receipt"] = shared_receipt
+            changes["variants"] = variants
+        else:
+            receipt_bound = _receipt_expiry_bound(slot)
+        ready_expires_at = min(receipt_bound, capsule.expires_at)
         renew_by = min(ready_expires_at, capsule.renew_by)
         if renew_by <= now:
             raise BlockedWarmError("credential_refresh_expired")
@@ -1888,9 +2016,9 @@ class LakebaseRound5WarmStore:
             slot,
             "warm_capsule_refreshed",
             now=now,
-            broker_epoch=capsule.broker_epoch,
             ready_expires_at=ready_expires_at,
             renew_by=renew_by,
+            **changes,
         )
 
     async def renew_provenance(
@@ -2684,6 +2812,7 @@ class Round5WarmCoordinator:
         self._coordinator_ttl = timedelta(seconds=coordinator_ttl_seconds)
         self._retry_ceiling_seconds = retry_ceiling_seconds
         self._capsule: Round5LaunchCapsule | None = None
+        self._provenance_probe_failures = 0
         self._wake = asyncio.Event()
         self._closed = False
         self._task: asyncio.Task[None] | None = None
@@ -2965,16 +3094,51 @@ class Round5WarmCoordinator:
                 )
             except asyncio.CancelledError:
                 raise
-            except (RetryableWarmError, BlockedWarmError) as exc:
-                provenance_current = False
-                provenance_code = exc.code
-            else:
-                provenance_code = "runner_provenance_changed"
+            except RetryableWarmError as exc:
+                # A throttled/timed-out provenance probe is a transient READ
+                # failure off the request path -- NOT a runner identity change.
+                # Keep the capsule, stay READY, and retry in place. Escalate to a
+                # full rewarm (freshness_lost) only after repeated failures or when
+                # provenance is about to lapse. Never swallow the error and fall
+                # through to a "still current" success, which would fake READY.
+                probe_now = self._clock()
+                self._provenance_probe_failures += 1
+                provenance_slack = (
+                    (slot.provenance_expires_at - probe_now).total_seconds()
+                    if slot.provenance_expires_at is not None
+                    else 0.0
+                )
+                if (
+                    self._provenance_probe_failures >= MAX_PROVENANCE_PROBE_FAILURES
+                    or provenance_slack <= PROVENANCE_PROBE_MIN_SLACK_SECONDS
+                ):
+                    self._provenance_probe_failures = 0
+                    self._capsule = None
+                    self._last_slot = await self.store.freshness_lost(
+                        slot,
+                        code=exc.code,
+                        now=probe_now,
+                    )
+                    return 0.0
+                return max(
+                    0.1,
+                    min(PROVENANCE_PROBE_RETRY_SECONDS, provenance_slack / 2),
+                )
+            except BlockedWarmError as exc:
+                self._provenance_probe_failures = 0
+                self._capsule = None
+                self._last_slot = await self.store.freshness_lost(
+                    slot,
+                    code=exc.code,
+                    now=self._clock(),
+                )
+                return 0.0
+            self._provenance_probe_failures = 0
             if not provenance_current:
                 self._capsule = None
                 self._last_slot = await self.store.freshness_lost(
                     slot,
-                    code=provenance_code,
+                    code="runner_provenance_changed",
                     now=self._clock(),
                 )
                 return 0.0
@@ -2984,48 +3148,119 @@ class Round5WarmCoordinator:
                 ttl=timedelta(seconds=PROVENANCE_FRESHNESS_SECONDS),
             )
             self._last_slot = slot
-            if slot.renew_by is not None and slot.renew_by <= now:
+            # 45-minute runner receipts are RENEWABLE, not a full-rewarm wall:
+            # identity is immutable, provenance is renewable. When the credential
+            # renew_by lands, or the receipt horizon approaches, republish fresh
+            # receipts off a live probe (refresh_preparation re-observes per-bout
+            # Proxy absence and re-reads runner identity, then re-seals brand-new
+            # receipts on the SAME immutable identity). READY stays READY across the
+            # horizon; only a genuine identity change or lapsed credential escalates.
+            margin_now = self._clock()
+            receipt_slack = (
+                _receipt_expiry_bound(slot) - margin_now
+            ).total_seconds()
+            renew_due = slot.renew_by is not None and slot.renew_by <= margin_now
+            receipt_due = receipt_slack <= RUNNER_RECEIPT_REFRESH_MARGIN_SECONDS
+            if renew_due or receipt_due:
+                # Credential rotation must hold the coordinator lease for its whole
+                # duration: the AWS refresh can outlast the default lease TTL, and a
+                # second process must not prepare the same runners while a refresh
+                # is in flight.
+                holder = [slot]
                 try:
-                    refreshed = await self.provider.refresh_capsule(slot, self._capsule)
-                    if not refreshed.meets_launch_margin(now):
+
+                    async def refresh_preparation() -> Round5WarmPreparation:
+                        return await self.provider.refresh_preparation(
+                            holder[0], self._capsule
+                        )
+
+                    preparation = await self._run_holding_lease(
+                        holder, refresh_preparation
+                    )
+                    slot = holder[0]
+                    refresh_now = self._clock()
+                    if not preparation.capsule.meets_launch_margin(refresh_now):
                         raise BlockedWarmError("credential_margin_insufficient")
                     slot = await self.store.update_capsule_receipt(
                         slot,
-                        capsule=refreshed,
-                        now=now,
+                        capsule=preparation.capsule,
+                        shared_receipt=preparation.shared_receipt,
+                        variants=preparation.variants,
+                        now=refresh_now,
                     )
                     self._last_slot = slot
-                    self._capsule = refreshed
+                    self._capsule = preparation.capsule
                 except asyncio.CancelledError:
                     raise
-                except (RetryableWarmError, BlockedWarmError) as exc:
+                except RetryableWarmError:
+                    # Transient refresh failure (throttle/timeout). The existing
+                    # capsule is still valid, so stay READY in place and retry
+                    # shortly rather than tearing down to a full rewarm. Escalate to
+                    # freshness_lost only once the still-held credential can no
+                    # longer meet the launch margin.
+                    if self._capsule is None or not self._capsule.meets_launch_margin(
+                        self._clock()
+                    ):
+                        self._capsule = None
+                        self._last_slot = await self.store.freshness_lost(
+                            slot,
+                            code="credential_refresh_retryable",
+                            now=self._clock(),
+                        )
+                        return 0.0
+                    return max(0.1, PROVENANCE_PROBE_RETRY_SECONDS)
+                except BlockedWarmError as exc:
                     self._capsule = None
                     self._last_slot = await self.store.freshness_lost(
                         slot,
                         code=exc.code,
-                        now=now,
+                        now=self._clock(),
                     )
                     return 0.0
+            delay_now = self._clock()
             remaining = (
-                (slot.renew_by - now).total_seconds()
+                (slot.renew_by - delay_now).total_seconds()
                 if slot.renew_by is not None
                 else self._coordinator_ttl.total_seconds() / 2
             )
             provenance_remaining = (
-                (slot.provenance_expires_at - now).total_seconds()
+                (slot.provenance_expires_at - delay_now).total_seconds()
                 if slot.provenance_expires_at is not None
                 else 0.0
             )
+            # Wake before the receipt refresh margin so the clean pre-wall rewarm
+            # above always fires with time to spare.
+            receipt_remaining = (
+                _receipt_expiry_bound(slot) - delay_now
+            ).total_seconds() - RUNNER_RECEIPT_REFRESH_MARGIN_SECONDS
             return max(
                 0.1,
                 min(
                     remaining,
                     provenance_remaining / 2,
+                    receipt_remaining,
                     self._coordinator_ttl.total_seconds() / 2,
                 ),
             )
         if slot.state == Round5WarmState.BLOCKED:
-            return self._coordinator_ttl.total_seconds() / 2
+            # A TRUE permanent block (identity change, orphan Proxy, fixture drift,
+            # unexpected) stays latched for an operator and is surfaced honestly --
+            # the same process must not silently churn it. A SELF-VERIFIABLE block
+            # (a momentarily insufficient/expired credential margin, or a transient
+            # that merely persisted) is re-attempted at a bounded interval so the
+            # process recovers on its own without a human "retry".
+            if _blocked_is_terminal(slot) or slot.last_error_at is None:
+                return self._coordinator_ttl.total_seconds() / 2
+            elapsed = (now - slot.last_error_at).total_seconds()
+            if elapsed < SELF_VERIFIABLE_BLOCK_RETRY_SECONDS:
+                return max(0.1, SELF_VERIFIABLE_BLOCK_RETRY_SECONDS - elapsed)
+            slot = await self.store.freshness_lost(
+                slot,
+                code=f"{slot.last_error_code}_recheck",
+                now=now,
+            )
+            self._last_slot = slot
+            # fall through to re-attempt the warm below
         if slot.next_retry_at is not None and slot.next_retry_at > now:
             return max(0.1, (slot.next_retry_at - now).total_seconds())
 
@@ -3079,6 +3314,17 @@ class Round5WarmCoordinator:
             raise
         except RetryableWarmError as exc:
             slot = holder[0]
+            if slot.attempt_count >= MAX_TRANSIENT_WARM_ATTEMPTS:
+                # A transient failure that persists this many consecutive attempts
+                # is no longer plausibly transient. Stop retrying forever and
+                # escalate to a DISTINCT terminal code (operator-attention), rather
+                # than churn silently or pretend it will self-heal.
+                self._last_slot = await self.store.record_blocked(
+                    slot,
+                    code=f"{exc.code}_persistent",
+                    now=self._clock(),
+                )
+                return self._coordinator_ttl.total_seconds() / 2
             exponent = min(10, max(0, slot.attempt_count - 1))
             ceiling = min(self._retry_ceiling_seconds, float(2**exponent))
             delay = self._random.uniform(0.0, ceiling)
@@ -3654,6 +3900,10 @@ class Round5WarmCoordinator:
             "round5_warm_last_error_code": (
                 self._local_readiness_error_code or slot.last_error_code
             ),
+            # True only for a permanent block that will NOT self-recover; the
+            # catalog must not promise auto-unlock in that case. Self-verifiable
+            # blocks retry on a bounded interval and are not terminal.
+            "round5_warm_blocked_terminal": _blocked_is_terminal(slot),
             "round5_claim_id": slot.claim.claim_id if slot.claim else None,
             "round5_claim_expires_at": (
                 slot.claim.claim_expires_at.isoformat() if slot.claim else None

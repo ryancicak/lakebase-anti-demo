@@ -7766,10 +7766,7 @@ class LiveRound5WarmProvider:
         from .round5_warm import (
             BlockedWarmError,
             RetryableWarmError,
-            Round5RunnerReceipt,
-            Round5SharedReceipt,
             Round5Variant,
-            Round5WarmPreparation,
         )
 
         del process_epoch
@@ -7801,6 +7798,18 @@ class LiveRound5WarmProvider:
             # (internal, non-secret) message at WARNING so an operator can see WHY the
             # baseline was rejected. Provider ARNs/secrets never appear in these
             # internal ConnectionSpikeLive* messages.
+            # Split at the raise site -- a bare ``except Exception -> retry`` would
+            # silently retry a genuine anti-cheat/config defect forever, and a bare
+            # ``-> block`` would terminally freeze a transient throttle (the
+            # overnight outage). Classify explicitly:
+            #   * transient AWS/Lakebase read failures (throttles, timeouts, 5xx,
+            #     ping/connection errors) -> RETRYABLE with capped backoff.
+            #   * ConnectionSpikeLiveConfigurationError (runner identity change,
+            #     an orphaned per-bout Proxy present at warm, or fixture drift) ->
+            #     typed permanent BLOCK. These are real defects that must fail
+            #     closed for operator attention, never be papered over as READY.
+            #   * anything else unexpected -> fail closed rather than assume it is
+            #     safe to retry.
             if self._retryable(exc):
                 logger.warning(
                     "round5_warm_provider_retryable generation=%s cause=%s: %s",
@@ -7809,28 +7818,67 @@ class LiveRound5WarmProvider:
                     exc,
                 )
                 raise RetryableWarmError("warm_provider_retryable") from exc
-            # A baseline mismatch is RETRYABLE, not a terminal block. The overnight
-            # outage was exactly this: a transient baseline failure (eventual
-            # consistency / a briefly-reaped-then-restored fixture) raised
-            # BlockedWarmError, and a BLOCKED slot is never re-attempted by the
-            # same process -- so Round 5 stayed UNAVAILABLE for hours even though a
-            # baseline replay passed minutes later. Per the contract, only TYPED
-            # permanent anti-cheat/config defects block; a generic baseline failure
-            # retries with capped backoff until it self-heals. This never publishes
-            # READY on a bad baseline (publish_ready still OBSERVES proxy absence,
-            # runner identity, and network fixtures); it only keeps trying. The
-            # cause is logged above/below so an operator can see a persistent one.
+            if isinstance(exc, ConnectionSpikeLiveConfigurationError):
+                logger.warning(
+                    "round5_warm_baseline_invalid generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise BlockedWarmError("warm_baseline_invalid") from exc
             logger.warning(
-                "round5_warm_baseline_retryable generation=%s cause=%s: %s",
+                "round5_warm_baseline_unexpected generation=%s cause=%s: %s",
                 generation,
                 type(exc).__name__,
                 exc,
             )
-            raise RetryableWarmError("warm_baseline_invalid") from exc
+            raise BlockedWarmError("warm_baseline_unexpected") from exc
         receipts = dict(zip(engines, warmed, strict=True))
         self._engines = {variants[variant].value: engine for variant, engine in engines.items()}
         self._receipts = {variants[variant].value: receipt for variant, receipt in receipts.items()}
         self._credential_generation += 1
+
+        return self._assemble_preparation(
+            generation=generation,
+            coordinator_fence=coordinator_fence,
+            broker_epoch=broker_epoch,
+            warm_attempt_token=warm_attempt_token,
+            engines=engines,
+            receipts=receipts,
+        )
+
+    def _assemble_preparation(
+        self,
+        *,
+        generation: int,
+        coordinator_fence: int,
+        broker_epoch: str,
+        warm_attempt_token: str,
+        engines: Mapping[object, LiveConnectionSpikeEngine | None],
+        receipts: Mapping[object, LiveRound5WarmEngineReceipt],
+    ) -> object:
+        """Seal the READY preparation (runner/shared/variant receipts + capsule).
+
+        Shared by the initial warm (``prepare``) and the in-place credential +
+        receipt renewal (``refresh_preparation``). The runner IDENTITY (boot id,
+        process boot id, image/harness/capacity digests) is immutable and is
+        re-asserted here on every renewal -- a mismatch is a TYPED PERMANENT block
+        (``runner_boot_identity_changed`` / ``runner_harness_identity_changed``),
+        never a silently slid receipt. Only the freshness bound (``expires_at``)
+        and the freshly-observed proxy-absence timestamp
+        (``receipt.setup_context.observed_at``, carried into each variant receipt)
+        advance -- exactly "identity immutable, provenance renewable". So a
+        renewal publishes genuinely NEW receipts off a fresh live probe, it does
+        not rest READY on a stale/hardcoded absence.
+        """
+
+        from .round5_warm import (
+            BlockedWarmError,
+            Round5RunnerReceipt,
+            Round5SharedReceipt,
+            Round5Variant,
+            Round5WarmPreparation,
+        )
 
         resources = self._manifest.require_round5_resources()
         now = datetime.now(UTC)
@@ -7920,7 +7968,7 @@ class LiveRound5WarmProvider:
                 receipts[variant],
                 expires_at=runner_expiration,
             )
-            for variant in variants
+            for variant in receipts
         }
         capsule = self._capsule(
             generation=generation,
@@ -7933,6 +7981,68 @@ class LiveRound5WarmProvider:
             shared_receipt=shared,
             variants=public_variants,
             capsule=capsule,
+        )
+
+    async def refresh_preparation(self, slot: object, capsule: object) -> object:
+        """Renew credentials AND republish fresh receipts off a live probe.
+
+        The keep-alive path: ``refresh_warm`` re-runs the setup orchestrator
+        (which re-observes per-bout Proxy ABSENCE and refreshes launch/dispatch
+        credentials) and re-reads the resident runner boot identity, so the
+        preparation this returns carries a freshly-observed proxy-absence
+        timestamp, rotated credentials, and a fresh 45-minute receipt horizon --
+        on the SAME immutable runner identity (a change fails closed inside
+        ``_assemble_preparation``). This lets READY renew in place across the
+        45-minute receipt horizon without a full ``prepare()`` rewarm, while never
+        resting on a hardcoded/stale absence.
+        """
+
+        from .round5_warm import (
+            BlockedWarmError,
+            RetryableWarmError,
+            Round5Variant,
+        )
+
+        del capsule
+        engines = {
+            Round5Variant.AURORA: self._engines.get("aurora_serverless_v2"),
+            Round5Variant.RDS: self._engines.get("rds_postgres"),
+        }
+        if any(engine is None for engine in engines.values()):
+            raise BlockedWarmError("launch_capsule_missing")
+        try:
+            aurora_engine = engines[Round5Variant.AURORA]
+            rds_engine = engines[Round5Variant.RDS]
+            assert aurora_engine is not None and rds_engine is not None
+            aurora_receipt = await aurora_engine.refresh_warm(slot.generation)
+            rds_receipt = await rds_engine.warm_with_physical_runners_from(
+                aurora_engine,
+                slot.generation,
+            )
+            refreshed = (aurora_receipt, rds_receipt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._retryable(exc):
+                raise RetryableWarmError("credential_refresh_retryable") from exc
+            raise BlockedWarmError("credential_refresh_failed") from exc
+        receipts = dict(zip(engines, refreshed, strict=True))
+        self._receipts = {
+            (
+                "aurora_serverless_v2"
+                if variant == Round5Variant.AURORA
+                else "rds_postgres"
+            ): receipt
+            for variant, receipt in receipts.items()
+        }
+        self._credential_generation += 1
+        return self._assemble_preparation(
+            generation=slot.generation,
+            coordinator_fence=slot.coordinator_fence,
+            broker_epoch=f"broker-{uuid4().hex}",
+            warm_attempt_token=slot.warm_attempt_token,
+            engines=engines,
+            receipts=receipts,
         )
 
     async def refresh_capsule(
