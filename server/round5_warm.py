@@ -2945,7 +2945,11 @@ class Round5WarmCoordinator:
             self._last_slot = released
             return 0.0 if released.state == Round5WarmState.WARMING else 1.0
         if slot.state == Round5WarmState.READY:
-            if not self._capsule_current(slot, now):
+            # Freshness gate is capsule IDENTITY only, not launch margin: a capsule
+            # that has merely reached its renew_by must be refreshed (below), not
+            # torn down and full-rewarmed. Only a genuinely missing/wrong-generation
+            # capsule is freshness_lost.
+            if not self._capsule_belongs(slot):
                 self._capsule = None
                 self._last_slot = await self.store.freshness_lost(
                     slot,
@@ -3100,6 +3104,28 @@ class Round5WarmCoordinator:
             and capsule.generation == slot.generation
             and capsule.coordinator_fence == slot.coordinator_fence
             and capsule.meets_launch_margin(now)
+        )
+
+    def _capsule_belongs(self, slot: Round5WarmSlot) -> bool:
+        """Whether this process holds the capsule for exactly this slot generation.
+
+        Identity only -- deliberately NOT gated on launch margin. The READY
+        keep-alive uses this so that a capsule which has reached its ``renew_by``
+        (and therefore no longer meets the launch margin, because dispatch creds
+        are minted at margin+epsilon) is REFRESHED by the renew_by branch rather
+        than declared ``freshness_lost`` and full-``prepare()``-rewarmed. Charging
+        the launch-margin check ahead of the refresh was the ~3-minute rewarm
+        storm (151 warm_ready/freshness_lost cycles overnight). Launch-margin
+        remains the CLAIMABILITY gate (``_capsule_current`` / ``_claimable``); a
+        capsule the refresh cannot revive still fails there and in the refresh
+        branch's own margin check.
+        """
+
+        capsule = self._capsule
+        return bool(
+            capsule is not None
+            and capsule.generation == slot.generation
+            and capsule.coordinator_fence == slot.coordinator_fence
         )
 
     def _claimable(self, slot: Round5WarmSlot, now: datetime) -> bool:

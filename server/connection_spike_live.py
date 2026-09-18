@@ -7809,13 +7809,24 @@ class LiveRound5WarmProvider:
                     exc,
                 )
                 raise RetryableWarmError("warm_provider_retryable") from exc
+            # A baseline mismatch is RETRYABLE, not a terminal block. The overnight
+            # outage was exactly this: a transient baseline failure (eventual
+            # consistency / a briefly-reaped-then-restored fixture) raised
+            # BlockedWarmError, and a BLOCKED slot is never re-attempted by the
+            # same process -- so Round 5 stayed UNAVAILABLE for hours even though a
+            # baseline replay passed minutes later. Per the contract, only TYPED
+            # permanent anti-cheat/config defects block; a generic baseline failure
+            # retries with capped backoff until it self-heals. This never publishes
+            # READY on a bad baseline (publish_ready still OBSERVES proxy absence,
+            # runner identity, and network fixtures); it only keeps trying. The
+            # cause is logged above/below so an operator can see a persistent one.
             logger.warning(
-                "round5_warm_baseline_invalid generation=%s cause=%s: %s",
+                "round5_warm_baseline_retryable generation=%s cause=%s: %s",
                 generation,
                 type(exc).__name__,
                 exc,
             )
-            raise BlockedWarmError("warm_baseline_invalid") from exc
+            raise RetryableWarmError("warm_baseline_invalid") from exc
         receipts = dict(zip(engines, warmed, strict=True))
         self._engines = {variants[variant].value: engine for variant, engine in engines.items()}
         self._receipts = {variants[variant].value: receipt for variant, receipt in receipts.items()}

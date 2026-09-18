@@ -543,6 +543,76 @@ async def test_expired_renew_by_refresh_fails_closed_without_refresh_loop() -> N
     assert provider.refresh_calls == 1
 
 
+async def test_ready_capsule_past_launch_margin_refreshes_instead_of_full_rewarm() -> None:
+    # Regression for the overnight rewarm storm. Once a READY capsule reaches its
+    # renew_by it no longer meets the launch margin (dispatch/control creds are
+    # minted at margin+epsilon), and the keep-alive used to gate on launch margin
+    # BEFORE the renew_by refresh -- so it declared freshness_lost and full
+    # prepare()-rewarmed every ~3 minutes (151 cycles overnight). The keep-alive
+    # now gates on capsule IDENTITY only, so the capsule is refreshed in place and
+    # the slot stays READY.
+    clock = Clock()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider)
+    await warm_ready(manager, provider)
+    assert provider.prepare_calls == 1
+    before = manager.capsule
+    assert before is not None and before.meets_launch_margin(clock.now)
+    # Past renew_by (2000s) AND past the launch margin (control creds now within
+    # PROXY_SETUP_DEADLINE+margin = 1860s of the +4000s expiry) but not past any
+    # receipt/capsule expiry -- exactly the boundary that triggered the storm.
+    clock.advance(2_200)
+    assert not before.meets_launch_margin(clock.now)
+
+    delay = await manager.run_one_cycle()
+
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.READY  # NOT torn down to WARMING
+    assert provider.prepare_calls == 1  # NO full prepare() rewarm storm
+    assert provider.refresh_calls == 1  # refreshed in place instead
+    assert manager.capsule is not None
+    assert manager.capsule.credential_generation == 2
+    assert manager.capsule.meets_launch_margin(clock.now)
+    assert delay > 0
+    assert (await manager.public_status())["round5_ring_ready"] is True
+
+
+async def test_generic_warm_baseline_failure_retries_not_terminal_blocks() -> None:
+    # Regression for the overnight UNAVAILABLE. A generic (untyped) baseline
+    # failure in the warm provider must be RETRYABLE with capped backoff, never a
+    # terminal BlockedWarmError: a BLOCKED slot is never re-attempted by the same
+    # process, so classifying a transient baseline failure (eventual consistency /
+    # a briefly-reaped-then-restored fixture) as BLOCKED left Round 5 UNAVAILABLE
+    # for hours even though a baseline replay passed minutes later.
+    from server import connection_spike_live as live
+
+    class _GenericFailEngine:
+        async def warm(self, generation, warm_attempt_token):
+            del generation, warm_attempt_token
+            raise live.ConnectionSpikeLiveConfigurationError(
+                "Round 5 warm source or physical runner identity changed"
+            )
+
+        async def warm_with_physical_runners_from(self, other, generation):
+            del other, generation
+            return object()
+
+    prov = object.__new__(live.LiveRound5WarmProvider)
+    prov._engine_factory = lambda competitor_id: _GenericFailEngine()
+
+    with pytest.raises(RetryableWarmError) as excinfo:
+        await prov.prepare(
+            generation=1,
+            coordinator_fence=1,
+            process_epoch="p",
+            broker_epoch="b",
+            warm_attempt_token="t",
+        )
+    assert excinfo.value.code == "warm_baseline_invalid"
+    assert not isinstance(excinfo.value, BlockedWarmError)
+
+
 async def test_duplicate_bell_returns_one_server_context() -> None:
     clock = Clock()
     provider = Provider(clock)
