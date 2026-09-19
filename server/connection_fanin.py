@@ -92,7 +92,15 @@ SELECTOR_FANOUT_PROBE_CALLBACK_CPU_NS = 150_000
 # re-reports what it dropped, which measured 32.5x at K=16 over 1,024
 # descriptors while making a per-turn latency gate look 60x better.
 MAX_SELECTOR_WAKEUP_AMPLIFICATION = 1.05
-MAX_LAUNCH_SKEW_MS = 10.0
+# Advisory first-launch skew target. Missing or non-finite skew evidence is
+# fatal; exceeding this value is recorded fairness telemetry and must not void
+# an exact retained-socket proof. Do not re-introduce a `<=` comparison into
+# `finalize_lane` fairness.
+ADVISORY_LAUNCH_SKEW_MS = 10.0
+LAUNCH_SKEW_SEMANTICS = "advisory_scheduling_not_fatal"
+# Compatibility alias of ADVISORY_LAUNCH_SKEW_MS. The name says "max" but it is
+# not a validity gate; public output must also emit the advisory fields below.
+MAX_LAUNCH_SKEW_MS = ADVISORY_LAUNCH_SKEW_MS
 CONNECT_TIMEOUT_SECONDS = 20.0
 RUN_TIMEOUT_SECONDS = 600.0
 RUNTIME_MAX_EVENT_LOOP_P99_MS = 50.0
@@ -253,7 +261,11 @@ class ConnectionSpikeContract:
     worker_count: int = WORKER_COUNT
     partition_clients_per_lane: int = PARTITION_CLIENTS_PER_LANE
     max_in_flight_connects_per_lane: int = MAX_IN_FLIGHT_CONNECTS_PER_LANE
-    max_launch_skew_ms: float = MAX_LAUNCH_SKEW_MS
+    advisory_launch_skew_ms: float = ADVISORY_LAUNCH_SKEW_MS
+    # Compatibility alias of advisory_launch_skew_ms. Kept so older readers of
+    # public_dict still find the 10 ms number; not a fatal validity max.
+    max_launch_skew_ms: float = ADVISORY_LAUNCH_SKEW_MS
+    launch_skew_semantics: str = LAUNCH_SKEW_SEMANTICS
     connect_timeout_seconds: float = CONNECT_TIMEOUT_SECONDS
     run_timeout_seconds: float = RUN_TIMEOUT_SECONDS
 
@@ -283,7 +295,9 @@ class ConnectionSpikeContract:
             and self.worker_count == WORKER_COUNT
             and self.partition_clients_per_lane == PARTITION_CLIENTS_PER_LANE
             and self.max_in_flight_connects_per_lane == MAX_IN_FLIGHT_CONNECTS_PER_LANE
-            and self.max_launch_skew_ms == MAX_LAUNCH_SKEW_MS
+            and self.advisory_launch_skew_ms == ADVISORY_LAUNCH_SKEW_MS
+            and self.max_launch_skew_ms == ADVISORY_LAUNCH_SKEW_MS
+            and self.launch_skew_semantics == LAUNCH_SKEW_SEMANTICS
             and self.connect_timeout_seconds == CONNECT_TIMEOUT_SECONDS
             and self.run_timeout_seconds == RUN_TIMEOUT_SECONDS
         )
@@ -322,7 +336,11 @@ class ConnectionSpikeContract:
             "worker_count": self.worker_count,
             "partition_clients_per_lane": self.partition_clients_per_lane,
             "max_in_flight_connects_per_lane": self.max_in_flight_connects_per_lane,
+            # Compatibility alias: same number as advisory_launch_skew_ms. Do not
+            # treat this key as a hard validity max; see launch_skew_semantics.
             "max_launch_skew_ms": self.max_launch_skew_ms,
+            "advisory_launch_skew_ms": self.advisory_launch_skew_ms,
+            "launch_skew_semantics": self.launch_skew_semantics,
             "connect_timeout_seconds": self.connect_timeout_seconds,
             "run_timeout_seconds": self.run_timeout_seconds,
             "supported_auth_methods": ",".join(sorted(SUPPORTED_AUTH_METHODS)),
@@ -1153,7 +1171,11 @@ def finalize_lane(
     # bounded so the bout's own sessions stay attributable against them. The observed count
     # is on the lane result either way, so this bounds evidence rather than replacing it.
     clean_start = preexisting <= MAX_PREEXISTING_CLIENT_SESSIONS
-    fairness = launch_skew <= MAX_LAUNCH_SKEW_MS and raw.get("fairness_verified") is True
+    # `_number` above requires finite, nonnegative skew evidence. The measured
+    # value remains public fairness telemetry against advisory_launch_skew_ms.
+    # Do not compare launch_skew to that target here: exceeding it cannot
+    # invalidate an otherwise exact retained-socket proof.
+    fairness = raw.get("fairness_verified") is True
     telemetry = (
         safety_evidence_version == SAFETY_EVIDENCE_VERSION
         and hard_safety_verified

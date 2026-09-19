@@ -1,17 +1,21 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import { RoundFiveProof, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
+import { RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { replayStory } from './instant-replay'
 import { buildRingsideCue, classifyOutcome } from './ringside-cues'
 import { applyRunEventSnapshot, reconcileRunEventSession, selectRound4Session } from './round4'
+import { resetCanvasRecordings } from './test/setup'
 import {
   isRoundFiveSetupEvidence,
   roundFiveFightCardOpening,
   roundFiveHasComparison,
   roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFiveSchedulingAdvisorySummary,
+  roundFiveSetupDiagnosticSummary,
+  roundFiveStoppedVerdict,
 } from './round5'
 
 afterEach(() => {
@@ -1033,17 +1037,7 @@ it('uses V4 runtime over contradictory setup and lane evidence everywhere', () =
 })
 
 function stubReceiptCanvas() {
-  const context = {
-    fillRect: vi.fn(), strokeRect: vi.fn(), fillText: vi.fn(),
-    save: vi.fn(), translate: vi.fn(), rotate: vi.fn(), restore: vi.fn(),
-    measureText: vi.fn((value: string) => ({ width: value.length * 8 })),
-  }
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(
-    context as unknown as CanvasRenderingContext2D,
-  )
-  vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation(
-    (callback) => callback(new Blob(['pixel-card'], { type: 'image/png' })),
-  )
+  resetCanvasRecordings()
 }
 
 it('renders the running Round 5 race in the canonical two-clock arena', async () => {
@@ -1786,6 +1780,10 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(screen.queryByRole('button', { name: /ring again/i })).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: /fight card/i })).toBeInTheDocument()
 
+  // Backstage cleanup is now DECOUPLED from the end user (Round-5-scoped): a
+  // failed bout with cleanup still pending shows NO "Retry cleanup" button, NO
+  // "Cleanup needs attention" / "MAY STILL BE RUNNING AND BILLING" banner, and
+  // does not fence terminal navigation. Cleanup converges automatically backstage.
   const cleanupFailed: DemoSession = {
     ...failed,
     round5_setup: {
@@ -1810,19 +1808,13 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(/backstage recovery/i)
-  expect(screen.queryByLabelText('Round 5 final receipt')).not.toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /ring again|fight card|next round/i })).not.toBeInTheDocument()
-  fireEvent.click(screen.getByRole('button', { name: /retry cleanup/i }))
-  expect(retryCleanup).toHaveBeenCalledOnce()
-  // No diagnostic yet, so the screen keeps its own sentence: `cleanup_failed`
-  // is set while retries are still running too, and that is what this is.
-  expect(screen.getByText(/automatic cleanup is retrying backstage.*ring stays protected.*clean baseline/i)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText(/MAY STILL BE RUNNING AND BILLING/i)).not.toBeInTheDocument()
+  expect(screen.queryByText(/cleanup needs attention/i)).not.toBeInTheDocument()
 
-  /* Verbatim from `_abandon_connection_spike_cleanup_retry`. Quoted rather
-     than paraphrased: printing the server's own sentence instead of a house
-     one is the behaviour being asserted, and a paraphrase here would pass
-     while the screen said something the server never said. */
+  // A cleanup_failure diagnostic string on a failed bout is likewise never shown
+  // to the end user as a billing/attention banner.
   const abandonedDiagnostic = 'Round 5 backstage cleanup did not converge after 6 automatic attempts. '
     + 'The ring stays held until cleanup is confirmed; retry cleanup.'
   const cleanupAbandoned: DemoSession = {
@@ -1844,27 +1836,13 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByRole('status', { name: 'Round 5 setup status' })).toHaveTextContent(abandonedDiagnostic)
-  expect(screen.queryByText(/automatic cleanup is retrying backstage/i)).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText(abandonedDiagnostic)).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
 
-  rerender(
-    <RoundFiveProof
-      session={cleanupFailed}
-      roundNumber={5}
-      error={null}
-      liveEvidenceConnected
-      uiReview={false}
-      hasNextRound={false}
-      commentaryOpen
-      onContinue={vi.fn()}
-      onToggleCommentary={vi.fn()}
-      cleanupPending
-      onRetryCleanup={retryCleanup}
-      onHome={vi.fn()}
-    />,
-  )
-  expect(screen.getByRole('button', { name: /retrying cleanup/i })).toBeDisabled()
-
+  // A VERIFIED Round 5 with cleanup still pending keeps its win AND every
+  // end-user action: Instant replay, What it cost, Share, and Next round are
+  // available, with no retry button and no cleanup banner.
   const verifiedCleanupPending: DemoSession = {
     ...proof,
     round5_setup: { ...proof.round5_setup!, cleanup_retryable: true },
@@ -1884,15 +1862,14 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  expect(screen.getByText(/automatic cleanup is settling backstage.*ring protected/i)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /share the receipt/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /retry cleanup/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
 
-  /* The case that had nowhere to appear. This bout verified and keeps its win,
-     and then the server gave up on tidying the proxy it built. `settling
-     backstage` was all the arena could say about that, which reads as work in
-     progress and is the opposite of what has happened. */
+  // Even with a cleanup_failure diagnostic string set, a verified bout shows no
+  // "Cleanup needs attention" alert and keeps its win and its actions.
   const verifiedCleanupAbandoned: DemoSession = {
     ...verifiedCleanupPending,
     round5_setup: { ...verifiedCleanupPending.round5_setup!, cleanup_failure: abandonedDiagnostic },
@@ -1912,16 +1889,11 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
       onHome={vi.fn()}
     />,
   )
-  const abandonedNotice = screen.getByRole('alert')
-  expect(abandonedNotice).toHaveTextContent('Cleanup needs attention')
-  expect(abandonedNotice).toHaveTextContent(abandonedDiagnostic)
-  expect(screen.queryByText(/settling backstage/i)).not.toBeInTheDocument()
-  /* Legibility only. The win still stands, the retry is still offered, and the
-     exits are still shut -- this notice explains the lockout, it does not
-     change who is allowed to walk away from a resource that may still exist. */
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  expect(screen.queryByText(/cleanup needs attention/i)).not.toBeInTheDocument()
   expect(screen.getByText(/verified exact 10,000-client fan-in comparison/i)).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: /next round|fight card/i })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
 
   const towelled: DemoSession = {
     ...failed,
@@ -2816,4 +2788,229 @@ it('knockout: the ratio is floored and only printed from 2× up', () => {
 
 it('knockout: a towel keeps the scorecard card', () => {
   expect(receiptPresentation(screenshotTowelRoundFiveSession(), 'round').knockout).toBeUndefined()
+})
+
+function stoppedContractGateSession(overrides: Partial<DemoSession> = {}): DemoSession {
+  // A genuinely FATAL setup fault: the competitor never stamped its CreateDBProxy
+  // request boundary (missing provenance). Cleanup completed. The verdict must
+  // name the real gate, not blame cleanup.
+  return {
+    state: 'failed',
+    failure: 'Round 5 contract gate failed; no comparison was declared.',
+    round5_setup: {
+      cleanup_failure: null,
+      cleanup_retryable: false,
+      lanes: {
+        lakebase: { id: 'lakebase', name: 'Lakebase', verified: true, setup_diagnostic: null },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          verified: false,
+          setup_diagnostic: 'create_db_proxy_missing',
+        },
+      },
+    },
+    lanes: {
+      lakebase: { name: 'Lakebase' },
+      competitor: { name: 'Aurora Serverless v2 + RDS Proxy' },
+    },
+    ...overrides,
+  } as unknown as DemoSession
+}
+
+it('a stopped contract-gate bout with settled cleanup reports the diagnostic, not cleanup', () => {
+  const session = stoppedContractGateSession()
+
+  const verdict = roundFiveStoppedVerdict(session)
+  expect(verdict).not.toMatch(/cleanup must settle/i)
+  expect(verdict).toContain('Aurora Serverless v2 + RDS Proxy')
+  expect(verdict).toContain('CreateDBProxy request boundary')
+  expect(roundFiveSetupDiagnosticSummary(session)).toContain('CreateDBProxy request boundary')
+})
+
+it('a stopped bout whose cleanup is genuinely unsettled still says cleanup must settle', () => {
+  const session = stoppedContractGateSession({
+    round5_setup: {
+      cleanup_failure: 'RDS Proxy delete not yet confirmed',
+      cleanup_retryable: true,
+      lanes: {
+        lakebase: { id: 'lakebase', name: 'Lakebase', verified: true, setup_diagnostic: null },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          verified: false,
+          setup_diagnostic: 'create_db_proxy_missing',
+        },
+      },
+    },
+  } as unknown as Partial<DemoSession>)
+
+  expect(roundFiveStoppedVerdict(session)).toMatch(/cleanup must settle/i)
+})
+
+it('a slow-but-present CreateDBProxy is a non-fatal advisory, not a stopped verdict', () => {
+  // OVERRIDE: exact bout that DECLARES a winner but the competitor's CreateDBProxy
+  // was requested >100 ms after the bell. The advisory is surfaced for the
+  // play-by-play; it never produces a FAILED verdict or diagnostic.
+  const session = {
+    state: 'verified',
+    round5_setup: {
+      cleanup_failure: null,
+      cleanup_retryable: false,
+      lanes: {
+        lakebase: { id: 'lakebase', name: 'Lakebase', verified: true, setup_diagnostic: null },
+        competitor: {
+          id: 'competitor',
+          name: 'Aurora Serverless v2 + RDS Proxy',
+          verified: true,
+          setup_diagnostic: null,
+          scheduling_advisory: 'create_db_proxy_window',
+          create_db_proxy_request_delta_ms: 163.51,
+        },
+      },
+    },
+    lanes: {
+      lakebase: { name: 'Lakebase' },
+      competitor: { name: 'Aurora Serverless v2 + RDS Proxy' },
+    },
+  } as unknown as DemoSession
+
+  // No fatal diagnostic, so the stopped-verdict summary is empty.
+  expect(roundFiveSetupDiagnosticSummary(session)).toBeNull()
+  // The advisory IS available for the detailed play-by-play.
+  const advisory = roundFiveSchedulingAdvisorySummary(session)
+  expect(advisory).toContain('Aurora Serverless v2 + RDS Proxy')
+  expect(advisory).toContain('100 ms after the bell')
+})
+
+// ---------------------------------------------------------------------------
+// Health-bars share card (Fable 5.1 / "1b", the default layout). The knockout
+// tests above are unchanged; these cover the parallel presentation and the
+// math the audit required to be honest before it can be the default.
+// ---------------------------------------------------------------------------
+
+it('health bars: a verified V4 win under 2× keeps the ledger headline as the verdict', () => {
+  const session = verifiedBellRoundFiveSession()
+  const receipt = receiptPresentation(session, 'round')
+  const clocks = session.round5_runtime!.lanes
+  expect(receipt.healthBars).toMatchObject({
+    title: 'BELL TO 10,000 HELD CLIENTS',
+    verdict: receipt.verdict,
+    aside: null,
+    winner: 'lakebase',
+    capabilityGap: false,
+  })
+  expect(receipt.healthBars?.fill.competitor).toBe(1)
+  expect(receipt.healthBars?.fill.lakebase).toBeCloseTo(
+    clocks.lakebase.bell_to_10000_observed_ms! / clocks.competitor.bell_to_10000_observed_ms!,
+    6,
+  )
+})
+
+it('health bars: a 45× gap reads in human units, winner first, with the exact margin beside it', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 141_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 141_000
+  session.lanes.competitor.elapsed_ms = 141_000
+  session.comparison = {
+    kind: 'measured',
+    winner_lane_id: 'lakebase',
+    margin: { spec_id: 'bell_to_10000_observed_ms', lane_id: 'lakebase', value: 137_887.327, display_value: '137887.33 ms' },
+    detail: 'Lakebase reached 10,000 first.',
+  }
+  const receipt = receiptPresentation(session, 'round')
+  const lakebaseMs = session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms!
+  expect(receipt.winner).toBe('lakebase')
+  expect(receipt.healthBars?.verdict).toBe(`${humanDuration(lakebaseMs, 'up').label} VS 2 MINUTES`)
+  expect(receipt.healthBars?.aside).toBe(`LAKEBASE · ${((141_000 - lakebaseMs) / 1000).toFixed(2)}s SOONER`)
+  expect(receipt.healthBars?.fill).toEqual({ lakebase: lakebaseMs / 141_000, competitor: 1 })
+})
+
+it('health bars: human units round the winner up and the loser down, and hold at unit boundaries', () => {
+  expect(humanDuration(13_690, 'up').label).toBe('14 SECONDS')
+  expect(humanDuration(621_260, 'down').label).toBe('10 MINUTES')
+  expect(humanDuration(2_310, 'up').label).toBe('2.4 SECONDS')
+  expect(humanDuration(41_860, 'down').label).toBe('41 SECONDS')
+  expect(humanDuration(165_000, 'down').label).toBe('2M 45S')
+  expect(humanDuration(65_000, 'up').label).toBe('1M 05S')
+  expect(humanDuration(60_000, 'down').label).toBe('1 MINUTE')
+  expect(humanDuration(700, 'up').label).toBe('0.7 SECONDS')
+  // The boundary the audit flagged: sub-millisecond noise must not tip the
+  // decisecond in the wrong direction. 2300.001ms up stays 2.3s (not 2.4s);
+  // 2399.999ms down stays 2.4s (not 2.3s). Winner still reads faster.
+  expect(humanDuration(2_300.001, 'up').label).toBe('2.3 SECONDS')
+  expect(humanDuration(2_399.999, 'down').label).toBe('2.4 SECONDS')
+  expect(humanDuration(2_300.001, 'up').seconds).toBeLessThan(humanDuration(2_399.999, 'down').seconds)
+})
+
+it('health bars: a towel keeps the scorecard card (no bars)', () => {
+  expect(receiptPresentation(screenshotTowelRoundFiveSession(), 'round').healthBars).toBeUndefined()
+})
+
+it('health bars: equal clocks fall back to the scorecard (no zero-margin bar)', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 3_112.673
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 3_112.673
+  session.lanes.competitor.elapsed_ms = 3_112.673
+  session.comparison!.margin!.value = 0
+  // Equal clocks cannot honestly credit a winner: the presentation must never
+  // draw a zero-margin bar, whether the classifier reports a tie or the
+  // health-bars strict guard rejects it.
+  expect(receiptPresentation(session, 'round').healthBars).toBeUndefined()
+})
+
+it('health bars: a non-finite, negative, or zero challenger clock falls back to the scorecard', () => {
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0]) {
+    const session = verifiedBellRoundFiveSession()
+    session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = bad
+    session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = Number.isFinite(bad) ? bad : 0
+    expect(receiptPresentation(session, 'round').healthBars).toBeUndefined()
+  }
+})
+
+it('health bars: a huge but finite challenger clock renders safely with the true (unfloored) ratio', () => {
+  const session = verifiedBellRoundFiveSession()
+  const lakebaseMs = session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms!
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 1_000_000_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 1_000_000_000
+  session.lanes.competitor.elapsed_ms = 1_000_000_000
+  session.comparison!.margin!.value = 1_000_000_000 - lakebaseMs
+  const receipt = receiptPresentation(session, 'round')
+  expect(receipt.healthBars).toBeDefined()
+  expect(receipt.healthBars!.fill.lakebase).toBeCloseTo(lakebaseMs / 1_000_000_000, 12)
+  expect(receipt.healthBars!.fill.competitor).toBe(1)
+  expect(receipt.healthBars!.verdict.length).toBeGreaterThan(0)
+})
+
+it('health bars: a human margin that disagrees with the ledger drops the aside and keeps the ledger verdict', () => {
+  const session = verifiedBellRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms = 141_000
+  session.round5_runtime!.lanes.competitor.elapsed_at_snapshot_ms = 141_000
+  session.lanes.competitor.elapsed_ms = 141_000
+  // The ledger margin (100 ms) contradicts the drawn clocks (≈137.9 s). The
+  // bars keep their true shape, but the misleading human aside is withheld and
+  // the verdict falls back to the authoritative ledger headline.
+  session.comparison!.margin!.value = 100
+  const receipt = receiptPresentation(session, 'round')
+  expect(classifyOutcome(session).marginMs).toBe(100)
+  expect(receipt.healthBars).toBeDefined()
+  expect(receipt.healthBars!.aside).toBeNull()
+  expect(receipt.healthBars!.verdict).toBe(receipt.verdict)
+  expect(receipt.healthBars!.fill.lakebase).toBeCloseTo(
+    session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms! / 141_000,
+    6,
+  )
+})
+
+it('health bars: Round 5 measures the bell runtime, never the setup clock (no V4 poison)', () => {
+  const session = verifiedBellRoundFiveSession()
+  // Corrupt the legacy setup clocks; the health bars must ignore them entirely.
+  if (session.round5_setup?.lanes?.lakebase) session.round5_setup.lanes.lakebase.setup_elapsed_ms = 0.01
+  if (session.round5_setup?.lanes?.competitor) session.round5_setup.lanes.competitor.setup_elapsed_ms = 999_999
+  const receipt = receiptPresentation(session, 'round')
+  expect(receipt.healthBars?.fill.lakebase).toBeCloseTo(
+    session.round5_runtime!.lanes.lakebase.bell_to_10000_observed_ms!
+      / session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms!,
+    6,
+  )
 })

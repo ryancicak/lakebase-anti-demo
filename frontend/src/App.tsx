@@ -49,6 +49,7 @@ import {
   ledgerDay,
   summariseRounds,
   verdictFor,
+  summaryDuration,
 } from './recap'
 import { offerNativeShare, shareDismissalPrefix } from './share'
 import {
@@ -94,6 +95,7 @@ import {
   roundFiveLaneVerification,
   roundFiveSetupElapsedDisplay,
   roundFiveSetupLaneResult,
+  roundFiveStoppedVerdict,
   roundFiveFanInMarginDisplay,
   roundFiveUsesFanIn,
   type RoundFiveLanePresentation,
@@ -1202,8 +1204,17 @@ function towelCleanupAllowsExit(session: DemoSession): boolean {
 }
 
 function cleanupAllowsTerminalActions(session: DemoSession): boolean {
+  // Round 5 is the only round that creates a per-bout billable Proxy and whose
+  // backstage ring cleanup could stall (a warm-slot CAS race). Its sealed
+  // receipt/score is the end user's outcome, so Share, See Details / Instant
+  // Replay, What it cost, and Next Round must be immediately available
+  // regardless of ring cleanup — which now converges automatically backstage
+  // and is an operator concern only. (Next Round is safe on an unclean ring: it
+  // navigates to a different round or the recap, and starting a NEW Round 5
+  // bout independently requires the ring to be READY, which the fight card /
+  // arm path still gates on.) Other rounds keep their existing towel-exit gate.
+  if (isRoundFive(session)) return true
   return towelCleanupAllowsExit(session)
-    && session.round5_setup?.cleanup_retryable !== true
 }
 
 function proofNavigationAllowsExit(session: DemoSession): boolean {
@@ -1279,6 +1290,18 @@ function receiptId(session: DemoSession): string {
 type ReceiptWinner = FormalWinner
 type ReceiptKind = 'round' | 'idle'
 
+/**
+ * Which of the two Fable share layouts the operator has chosen for the PNG.
+ * `health-bars` (Fable 5.1 / "1b") is the default; `knockout` (1a) stays
+ * available behind the modal selector. Both are drawn from the same verified
+ * receipt -- the choice only picks the layout, never the facts. Towel, tie and
+ * incomplete receipts ignore this and always draw the scorecard fallback.
+ */
+export type ReceiptCardStyle = 'health-bars' | 'knockout'
+
+/** The default layout for a fresh Share modal: always the health-bars card. */
+export const DEFAULT_RECEIPT_CARD_STYLE: ReceiptCardStyle = 'health-bars'
+
 export interface ReceiptPresentation {
   kind: ReceiptKind
   title: string
@@ -1299,6 +1322,29 @@ export interface ReceiptPresentation {
   receiptLabel: string
   integrityDetail?: string
   knockout?: ReceiptKnockout
+  healthBars?: ReceiptHealthBars
+}
+
+/**
+ * The health-bar treatment of a receipt: both lanes' clocks drawn to scale,
+ * the verdict in human units, and the exact margin beside it. Present only on
+ * a complete, untowelled receipt with a named winner -- see
+ * `receiptHealthBars`. Absent, the card is the scorecard (or the knockout
+ * layout when the operator selects it).
+ */
+export interface ReceiptHealthBars {
+  /** What the bars measure, printed as the card's title. */
+  title: string
+  /** Each lane's fill as a share of the full track: the slower lane is 1, an untimed lane 0. */
+  fill: Record<LaneId, number>
+  /** '14 SECONDS VS 10 MINUTES' when honest rounding keeps the order; else the ledger headline. */
+  verdict: string
+  /** Winner and exact margin ('LAKEBASE · 607.57s SOONER'); null when the verdict is the ledger headline. */
+  aside: string | null
+  /** The lane the verdict credits. */
+  winner: LaneId
+  /** The challenger has no clock: its track stays empty and prints why. */
+  capabilityGap: boolean
 }
 
 /**
@@ -1341,6 +1387,20 @@ function receiptStartSkewDisplay(session: DemoSession): string {
       ? session.round5_setup?.workflow_launch_skew_ms
       : null
     : session.fairness.launch_skew_ms
+  return typeof skew === 'number' && Number.isFinite(skew) && skew >= 0
+    ? `${skew.toFixed(3)}ms`
+    : 'N/A'
+}
+
+/**
+ * The launch skew that belongs beside the health-bars clocks. Those bars are
+ * the fan-in race (bell to 10,000 held clients), whose fairness is the shared
+ * post-readiness T0 -- `session.fairness.launch_skew_ms`. The Round 5 *setup*
+ * workflow skew (`round5_setup.workflow_launch_skew_ms`) measures a different
+ * thing and must not be relabelled as the race's start gap.
+ */
+function fanInStartSkewDisplay(session: DemoSession): string {
+  const skew = session.fairness.launch_skew_ms
   return typeof skew === 'number' && Number.isFinite(skew) && skew >= 0
     ? `${skew.toFixed(3)}ms`
     : 'N/A'
@@ -1785,33 +1845,45 @@ export function knockoutRatioLabel(winnerMs: number, loserMs: number): string | 
 }
 
 /**
+ * A lane clock is usable for a drawn comparison only when it is a finite,
+ * non-negative number. Anything else -- null, NaN, Infinity, a negative
+ * placeholder -- is not a clock a bar or a ratio can honestly stand on, so it
+ * collapses to null and the caller falls back.
+ */
+function validLaneClock(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+/**
  * The two exact clocks a receipt compares, read from the surface that owns
  * them: the cooldown for the idle receipt, the V4 bell runtime for Round 5
- * (never the legacy setup clock), the lanes otherwise.
+ * (never the legacy setup clock), the lanes otherwise. Each is validated to a
+ * finite, non-negative number (or null). Shared by both share layouts
+ * (`receiptKnockout` and `receiptHealthBars`).
  */
-function knockoutClocks(
+function receiptLaneClocks(
   session: DemoSession,
   kind: ReceiptKind,
 ): { lakebaseMs: number | null; competitorMs: number | null } {
   if (kind === 'idle') {
     const lanes = session.cooldown?.lanes
     return {
-      lakebaseMs: lanes?.lakebase.elapsed_ms ?? null,
-      competitorMs: lanes?.competitor.elapsed_ms ?? null,
+      lakebaseMs: validLaneClock(lanes?.lakebase.elapsed_ms),
+      competitorMs: validLaneClock(lanes?.competitor.elapsed_ms),
     }
   }
   if (isRoundFive(session)) {
     const runtime = roundFiveBellRuntime(session)
     if (runtime) {
       return {
-        lakebaseMs: runtime.lanes.lakebase.bell_to_10000_observed_ms ?? null,
-        competitorMs: runtime.lanes.competitor.bell_to_10000_observed_ms ?? null,
+        lakebaseMs: validLaneClock(runtime.lanes.lakebase.bell_to_10000_observed_ms),
+        competitorMs: validLaneClock(runtime.lanes.competitor.bell_to_10000_observed_ms),
       }
     }
   }
   return {
-    lakebaseMs: session.lanes.lakebase.elapsed_ms,
-    competitorMs: session.lanes.competitor.elapsed_ms,
+    lakebaseMs: validLaneClock(session.lanes.lakebase.elapsed_ms),
+    competitorMs: validLaneClock(session.lanes.competitor.elapsed_ms),
   }
 }
 
@@ -1855,7 +1927,7 @@ function receiptKnockout(
     }
   }
 
-  const { lakebaseMs, competitorMs } = knockoutClocks(session, kind)
+  const { lakebaseMs, competitorMs } = receiptLaneClocks(session, kind)
   if (lakebaseMs === null || competitorMs === null) return undefined
   const winnerMs = winner === 'lakebase' ? lakebaseMs : competitorMs
   const loserMs = winner === 'lakebase' ? competitorMs : lakebaseMs
@@ -1868,6 +1940,123 @@ function receiptKnockout(
   }
 }
 
+/**
+ * A clock in the units a reader says aloud -- '14 SECONDS', '10 MINUTES',
+ * '2M 45S', '2.4 SECONDS' -- rounded in the direction the caller names, and
+ * only into a unit that stays within 15% of the clock. The verdict rounds the
+ * winner up and the loser down, so the human line never flatters the claim;
+ * `seconds` is what the label stands for, so a caller can refuse a pair that
+ * rounding would put in the wrong order.
+ */
+// Exported for the receipt contract test; it remains a pure function.
+// eslint-disable-next-line react-refresh/only-export-components
+export function humanDuration(milliseconds: number, mode: 'up' | 'down'): { label: string; seconds: number } {
+  const clock = Math.max(0, milliseconds) / 1000
+  const round = mode === 'up' ? Math.ceil : Math.floor
+  const near = (seconds: number) => Math.abs(seconds - clock) <= clock * 0.15
+  const minutes = round(clock / 60)
+  if (minutes > 0 && near(minutes * 60)) {
+    return { label: `${minutes} ${minutes === 1 ? 'MINUTE' : 'MINUTES'}`, seconds: minutes * 60 }
+  }
+  if (clock >= 60) {
+    let wholeMinutes = Math.floor(clock / 60)
+    let rest = round(clock - wholeMinutes * 60)
+    if (rest === 60) {
+      wholeMinutes += 1
+      rest = 0
+    }
+    return { label: `${wholeMinutes}M ${String(rest).padStart(2, '0')}S`, seconds: wholeMinutes * 60 + rest }
+  }
+  const whole = round(clock)
+  if (whole > 0 && near(whole)) {
+    return { label: `${whole} ${whole === 1 ? 'SECOND' : 'SECONDS'}`, seconds: whole }
+  }
+  const tenths = round(Math.round(clock * 1000) / 100) / 10
+  return { label: `${tenths.toFixed(1)} SECONDS`, seconds: tenths }
+}
+
+/**
+ * Whether a receipt may be drawn as two bars, and what they say.
+ *
+ * Undefined -- keep the scorecard -- for a towel, a tie, an incomplete
+ * contract, a legacy Round 5 scorecard, a race with a clock missing, or clocks
+ * that disagree with the declared winner: a bar drawn from any of those would
+ * be a shape without a fact behind it. A capability gap (Rounds 4 and 6, or a
+ * challenger that cannot enter) has no second clock, so the home lane fills
+ * its track and the challenger's stays empty and says why.
+ */
+function receiptHealthBars(
+  session: DemoSession,
+  kind: ReceiptKind,
+  receipt: ReceiptPresentation,
+): ReceiptHealthBars | undefined {
+  if (session.towel) return undefined
+  const winner = receipt.winner
+  if (winner !== 'lakebase' && winner !== 'competitor') return undefined
+  if (kind === 'round') {
+    if (!classifyOutcome(session).contractComplete) return undefined
+    if (isRoundFive(session) && !roundFiveUsesFanIn(session)) return undefined
+  }
+  const title = kind === 'round' && isRoundFive(session)
+    ? 'BELL TO 10,000 HELD CLIENTS'
+    : receipt.title.toUpperCase()
+
+  const { lakebaseMs, competitorMs } = receiptLaneClocks(session, kind)
+
+  // Capability gap (Rounds 4, 6, or a challenger that cannot enter): the win is
+  // structural, not a race. The home lane fills its track only when it has a
+  // finite, positive clock of its own; the challenger's track stays empty and
+  // says why. Detected from `competitorCapabilityGap` (structured) and a
+  // validated home clock -- never from the display string.
+  if (receipt.competitorCapabilityGap) {
+    if (winner !== 'lakebase' || !(lakebaseMs !== null && lakebaseMs > 0)) return undefined
+    return {
+      title,
+      fill: { lakebase: 1, competitor: 0 },
+      verdict: receipt.verdict,
+      aside: null,
+      winner,
+      capabilityGap: true,
+    }
+  }
+
+  // A two-lane race needs two finite, positive clocks with the winner strictly
+  // faster. Equal clocks with a named winner, a zero/negative/absent clock, or
+  // an inverted pair are all shapes without a fact behind them -- fall back.
+  if (lakebaseMs === null || competitorMs === null) return undefined
+  const winnerMs = winner === 'lakebase' ? lakebaseMs : competitorMs
+  const loserMs = winner === 'lakebase' ? competitorMs : lakebaseMs
+  if (!(winnerMs > 0) || !(loserMs > 0) || !(winnerMs < loserMs)) return undefined
+
+  const share = winnerMs / loserMs
+  const marginMs = loserMs - winnerMs
+  const winnerName = winner === 'lakebase' ? 'LAKEBASE' : session.competitor.short_name.toUpperCase()
+
+  // The human verdict/aside are only honest when (a) rounding the winner up and
+  // the loser down keeps the order and (b) the margin the aside would print
+  // agrees with the authoritative classified/ledger margin. Otherwise the card
+  // keeps its bars but prints the ledger's own headline with no margin aside.
+  const sooner = humanDuration(winnerMs, 'up')
+  const later = humanDuration(loserMs, 'down')
+  const roundingKeepsOrder = sooner.seconds < later.seconds
+  const authoritativeMarginMs = kind === 'round' ? classifyOutcome(session).marginMs : null
+  const marginAgrees = authoritativeMarginMs === null
+    || (Number.isFinite(authoritativeMarginMs) && Math.abs(authoritativeMarginMs - marginMs) <= 1)
+  const human = roundingKeepsOrder && marginAgrees
+  const marginLabel = kind === 'idle' ? compactDuration(marginMs) : preciseDuration(marginMs)
+  return {
+    title,
+    fill: {
+      lakebase: winner === 'lakebase' ? share : 1,
+      competitor: winner === 'competitor' ? share : 1,
+    },
+    verdict: human ? `${sooner.label} VS ${later.label}` : receipt.verdict,
+    aside: human ? `${winnerName} · ${marginLabel} SOONER` : null,
+    winner,
+    capabilityGap: false,
+  }
+}
+
 // Exported for the all-surface contract matrix; it remains a pure renderer.
 // eslint-disable-next-line react-refresh/only-export-components
 export function receiptPresentation(
@@ -1875,7 +2064,14 @@ export function receiptPresentation(
   kind: ReceiptKind,
 ): ReceiptPresentation {
   const receipt = receiptPresentationBase(session, kind)
-  return { ...receipt, knockout: receiptKnockout(session, kind, receipt) }
+  // Both share layouts are computed from the same verified receipt so the modal
+  // selector can switch between them without recomputing the ledger. Health-bars
+  // (1b) is the default the card renders; knockout (1a) stays available.
+  return {
+    ...receipt,
+    knockout: receiptKnockout(session, kind, receipt),
+    healthBars: receiptHealthBars(session, kind, receipt),
+  }
 }
 
 function receiptPresentationBase(
@@ -2102,87 +2298,6 @@ function drawFittedCanvasText(
   return options.y + lines.length * lineHeight
 }
 
-/**
- * The ledger's winner field, painted into one cell of the share card.
- *
- * Same composition as the screen -- corner chip, name, figure, qualifier, and
- * the lane fact underneath -- because this is the same scorecard and the two
- * must not disagree. The split matters more here than on the screen: the image
- * travels without an operator, so the qualifier has to sit beside the figure
- * where nobody can read the number without it, and the lane fact has to be
- * present in full rather than paraphrased down to something that fits.
- *
- * Returns nothing: the caller owns the cell's geometry.
- */
-function drawCardWinner(
-  context: CanvasRenderingContext2D,
-  verdict: LedgerVerdict,
-  day: string | null,
-  box: { x: number; y: number; width: number },
-) {
-  const right = box.x + box.width
-
-  if (verdict.winner) {
-    // The chip, then the name. Coloured by corner rather than hardcoded red, so
-    // a blue-corner win would not be printed in the home corner's colour.
-    const chipWidth = 30
-    context.fillStyle = verdict.winner.badge === 'LB' ? '#e8482e' : '#4a83e8'
-    context.fillRect(box.x, box.y, chipWidth, 15)
-    context.fillStyle = '#fff4c2'
-    context.font = '400 8px "Press Start 2P", monospace'
-    context.textAlign = 'center'
-    context.fillText(verdict.winner.badge, box.x + chipWidth / 2, box.y + 4)
-    context.textAlign = 'left'
-    context.font = '400 11px "Press Start 2P", monospace'
-    context.fillStyle = '#fff4c2'
-    context.fillText(verdict.winner.name, box.x + chipWidth + 9, box.y + 3)
-  } else {
-    // No winner: the outcome takes the whole field rather than leaving a blank
-    // where a name would go, which would read as a result withheld.
-    drawFittedCanvasText(context, verdict.outcome ?? 'NO RESULT DECLARED', {
-      x: box.x, y: box.y + 3, maxWidth: box.width, maxLines: 1,
-      startSize: 11, minSize: 8, color: '#8f9dcb',
-    })
-  }
-
-  // The figure sits hard right, the one number on the row, so the eye finds it
-  // without reading the name first.
-  if (verdict.figure) {
-    context.font = '400 13px "Press Start 2P", monospace'
-    context.fillStyle = '#6bf39a'
-    context.textAlign = 'right'
-    context.fillText(verdict.figure, right, box.y + 1)
-    context.textAlign = 'left'
-  }
-
-  /**
-   * Qualifier and date on one line: both are conditions on the figure above.
-   *
-   * Set at the name's size, NOT at the lane note's. This image is read at about
-   * 46% in a feed, where 8px stops being words -- and a figure that reads at
-   * feed scale with a qualifier that does not is the same defect as printing the
-   * figure bare. Tying the two sizes together means nobody can take the number
-   * off this card without also taking the condition on it.
-   */
-  const tokens = [verdict.qualifier, day].filter((token): token is string => !!token)
-  if (tokens.length > 0) {
-    drawFittedCanvasText(context, tokens.join(' · '), {
-      x: box.x, y: box.y + 19, maxWidth: box.width, maxLines: 1,
-      startSize: 11, minSize: 9, color: '#f8d83b',
-    })
-  }
-
-  // The lane fact, in full, at the same size as the round's own proof note. Two
-  // lines is the budget and nothing is abbreviated to fit it: the wording IS
-  // the disclosure. It reads at full size, not in a feed -- see the report.
-  if (verdict.laneNote) {
-    drawFittedCanvasText(context, verdict.laneNote, {
-      x: box.x, y: box.y + 34, maxWidth: box.width, maxLines: 2,
-      startSize: 8, minSize: 7, color: '#aeb9df', lineHeight: 9,
-    })
-  }
-}
-
 function drawPixelFighter(
   context: CanvasRenderingContext2D,
   x: number,
@@ -2216,6 +2331,7 @@ async function renderReceiptCard(
   session: DemoSession,
   roundNumber: number,
   kind: ReceiptKind,
+  style: ReceiptCardStyle = DEFAULT_RECEIPT_CARD_STYLE,
 ): Promise<Blob> {
   const receipt = receiptPresentation(session, kind)
   if (document.fonts) await document.fonts.ready
@@ -2248,7 +2364,14 @@ async function renderReceiptCard(
   context.font = '400 16px "Press Start 2P", monospace'
   context.fillText('THE ANTI-DEMO', 55, 78)
 
-  if (receipt.knockout) {
+  // The operator's chosen layout, when this receipt supports it. Health-bars
+  // (1b) is the default; knockout (1a) is the alternate. Towel/tie/incomplete
+  // receipts have neither presentation and always fall through to the scorecard.
+  if (style === 'health-bars' && receipt.healthBars) {
+    drawHealthBarReceipt(context, session, roundNumber, kind, receipt, receipt.healthBars)
+    return encodeReceiptCard(canvas)
+  }
+  if (style === 'knockout' && receipt.knockout) {
     drawKnockoutReceipt(context, session, roundNumber, kind, receipt, receipt.knockout)
     return encodeReceiptCard(canvas)
   }
@@ -2562,25 +2685,191 @@ function drawKnockoutReceipt(
   context.textAlign = 'left'
 }
 
+/**
+ * The health-bar card (Fable 5.1 / "1b", the default): both lanes' clocks drawn
+ * to scale, the verdict in human units, and the exact margin beside it.
+ *
+ * Why this layout. The scorecard card carries every gate at 7-10px; LinkedIn
+ * shows the image at 552px (desktop) or ~360px (phone), where that type is
+ * texture, not words. A bar is understood before a word is read: the slower
+ * lane always fills the track and the faster lane fills its share of it, so
+ * the gap is a shape rather than a subtraction the reader has to do. The
+ * caption already carries the integrity ledger verbatim, so the image stops
+ * duplicating it.
+ *
+ * The house rules hold. Both exact clocks are printed on the bars; the human
+ * verdict rounds the winner up and the loser down and is used only when that
+ * still preserves the order (otherwise the ledger's own headline is printed);
+ * an untimed challenger gets an empty track that says why, never an invented
+ * length; "ONE LIVE RUN · NOT A BENCHMARK" and the verified stamp keep their
+ * places. Only a complete, untowelled receipt with a named winner gets here
+ * -- see `receiptHealthBars`.
+ */
+function drawHealthBarReceipt(
+  context: CanvasRenderingContext2D,
+  session: DemoSession,
+  roundNumber: number,
+  kind: ReceiptKind,
+  receipt: ReceiptPresentation,
+  bars: ReceiptHealthBars,
+) {
+  const font = (size: number) => `400 ${size}px "Press Start 2P", monospace`
+  const trackX = 160
+  const trackWidth = 980
+  const fillX = trackX + 3
+  const fillWidth = trackWidth - 6
+
+  // Round chip top right, where the scorecard keeps its verified stamp; the
+  // stamp moves to the receipt block, bottom right.
+  context.fillStyle = '#e8482e'
+  context.fillRect(1007, 40, 146, 38)
+  context.fillStyle = '#fff4c2'
+  context.font = font(13)
+  context.textAlign = 'center'
+  context.fillText(kind === 'idle' ? 'IDLE' : `ROUND ${String(roundNumber).padStart(2, '0')}`, 1080, 52)
+  context.textAlign = 'left'
+
+  // What the bars measure, and the round's focus line under it.
+  drawFittedCanvasText(context, bars.title, {
+    x: 54, y: 128, maxWidth: 1090, maxLines: 1, startSize: 26, minSize: 16, color: '#fff4c2',
+  })
+  drawFittedCanvasText(context, receipt.focus.toUpperCase(), {
+    x: 54, y: 164, maxWidth: 1090, maxLines: 1, startSize: 11, minSize: 8, color: '#f8d83b',
+  })
+
+  const drawLane = (lane: LaneId, trackY: number) => {
+    const home = lane === 'lakebase'
+    const color = home ? '#e8482e' : '#4a83e8'
+    const value = home ? receipt.lakebaseValue : receipt.competitorValue
+    const status = (home ? receipt.lakebaseStatus : receipt.competitorStatus).toUpperCase()
+    drawPixelFighter(
+      context, 58, trackY - 20, color,
+      home ? 'LB' : session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS',
+    )
+    drawFittedCanvasText(context, home ? 'LAKEBASE' : session.competitor.short_name.toUpperCase(), {
+      x: trackX, y: trackY - 20, maxWidth: trackWidth, maxLines: 1, startSize: 13, minSize: 9, color,
+    })
+    context.fillStyle = '#111e48'
+    context.fillRect(trackX, trackY, trackWidth, 60)
+    context.strokeStyle = '#46527c'
+    context.lineWidth = 3
+    context.strokeRect(trackX + 1.5, trackY + 1.5, trackWidth - 3, 57)
+
+    const share = bars.fill[lane]
+    if (share <= 0) {
+      // No clock: the track stays empty and carries the lane fact in full.
+      drawFittedCanvasText(context, value.toUpperCase(), {
+        x: fillX + 18, y: trackY + 11, maxWidth: fillWidth - 36, maxLines: 1, startSize: 16, minSize: 10, color: '#fff4c2',
+      })
+      drawFittedCanvasText(context, status, {
+        x: fillX + 18, y: trackY + 37, maxWidth: fillWidth - 36, maxLines: 1, startSize: 8, minSize: 6, color: '#aeb9df',
+      })
+      return
+    }
+    // Never thinner than a visible stub, never past the track.
+    const width = Math.max(12, Math.round(fillWidth * Math.min(1, share)))
+    context.fillStyle = color
+    context.fillRect(fillX, trackY + 3, width, 54)
+    context.font = font(36)
+    const valueWidth = context.measureText(value).width
+    context.fillStyle = '#fff4c2'
+    if (fillX + width + 18 + valueWidth + 24 + 200 <= fillX + fillWidth) {
+      // A short bar: the clock and its status follow the fill along the track.
+      const valueX = fillX + width + 18
+      context.fillText(value, valueX, trackY + 12)
+      drawFittedCanvasText(context, status, {
+        x: valueX + valueWidth + 24, y: trackY + 26, maxWidth: fillX + fillWidth - 18 - (valueX + valueWidth + 24),
+        maxLines: 1, startSize: 9, minSize: 7, color: '#aeb9df',
+      })
+    } else {
+      // A long bar: the clock sits at its end, the status inside it.
+      context.textAlign = 'right'
+      context.fillText(value, fillX + width - 18, trackY + 12)
+      context.textAlign = 'left'
+      drawFittedCanvasText(context, status, {
+        x: fillX + 18, y: trackY + 26, maxWidth: width - valueWidth - 60, maxLines: 1, startSize: 9, minSize: 7, color: '#070b22',
+      })
+    }
+  }
+  drawLane('lakebase', 216)
+  drawLane('competitor', 332)
+
+  // The verdict banner: the precondition and the winner's exact margin on one
+  // line, then the verdict as large as one line allows.
+  context.fillStyle = '#e8482e'
+  context.fillRect(47, 437, 1115, 78)
+  context.fillStyle = '#f8d83b'
+  context.fillRect(38, 428, 1115, 78)
+  let asideWidth = 0
+  if (bars.aside) {
+    drawFittedCanvasText(context, bars.aside, {
+      x: 1130, y: 441, maxWidth: 420, maxLines: 1, startSize: 11, minSize: 8, color: '#070b22', align: 'right',
+    })
+    asideWidth = context.measureText(bars.aside).width + 24
+  }
+  drawFittedCanvasText(context, receipt.verdictLabel, {
+    x: 59, y: 441, maxWidth: 1071 - asideWidth, maxLines: 1, startSize: 9, minSize: 7, color: '#070b22',
+  })
+  drawFittedCanvasText(context, bars.verdict, {
+    x: 59, y: 461, maxWidth: 1071, maxLines: 1, startSize: 32, minSize: 16, color: '#070b22',
+  })
+
+  // The stub: the disclaimer, the invitation, the audit line, and the stamp.
+  context.fillStyle = '#f1ebd7'
+  context.fillRect(38, 520, 1115, 78)
+  context.fillStyle = '#070b22'
+  for (let x = 52; x < 1136; x += 24) context.fillRect(x, 520, 12, 5)
+  context.font = font(13)
+  context.fillStyle = '#e8482e'
+  context.fillText('ONE LIVE RUN · NOT A BENCHMARK', 58, 536)
+  context.font = font(11)
+  context.fillStyle = '#070b22'
+  context.fillText("DON'T TRUST THIS POST. RING THE BELL YOURSELF.", 58, 558)
+  const auditStart = kind === 'idle'
+    ? `RESET ${session.cooldown!.started_at}`
+    : `START GAP ${fanInStartSkewDisplay(session)}`
+  drawFittedCanvasText(context, `${auditStart} · ${receipt.measuredAt}`, {
+    x: 58, y: 580, maxWidth: 790, maxLines: 1, startSize: 7, minSize: 6, color: '#070b22',
+  })
+  context.fillStyle = '#0a2c22'
+  context.fillRect(878, 530, 255, 58)
+  context.strokeStyle = '#6bf39a'
+  context.lineWidth = 4
+  context.strokeRect(880, 532, 251, 54)
+  drawFittedCanvasText(context, receipt.verifiedStamp, {
+    x: 1005, y: 543, maxWidth: 235, maxLines: 1, startSize: 12, minSize: 8, color: '#6bf39a', align: 'center',
+  })
+  drawFittedCanvasText(context, `${receipt.receiptLabel} ${receiptId(session)}`, {
+    x: 1005, y: 566, maxWidth: 235, maxLines: 1, startSize: 8, minSize: 6, color: '#fff4c2', align: 'center',
+  })
+}
+
 async function downloadReceiptCard(
   session: DemoSession,
   roundNumber: number,
   kind: ReceiptKind,
+  style: ReceiptCardStyle = DEFAULT_RECEIPT_CARD_STYLE,
   rendered?: Blob,
 ): Promise<void> {
-  const blob = rendered ?? await renderReceiptCard(session, roundNumber, kind)
+  const blob = rendered ?? await renderReceiptCard(session, roundNumber, kind, style)
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = receiptCardFilename(session, roundNumber, kind)
+  link.download = receiptCardFilename(session, roundNumber, kind, style)
   link.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
-function receiptCardFilename(session: DemoSession, roundNumber: number, kind: ReceiptKind): string {
-  return kind === 'idle'
-    ? `lakebase-anti-demo-idle-receipt-${receiptId(session)}.png`
-    : `lakebase-anti-demo-round-${roundNumber}-receipt-${receiptId(session)}.png`
+function receiptCardFilename(
+  session: DemoSession,
+  roundNumber: number,
+  kind: ReceiptKind,
+  style: ReceiptCardStyle = DEFAULT_RECEIPT_CARD_STYLE,
+): string {
+  const base = kind === 'idle'
+    ? `lakebase-anti-demo-idle-receipt-${receiptId(session)}`
+    : `lakebase-anti-demo-round-${roundNumber}-receipt-${receiptId(session)}`
+  return `${base}-${style}.png`
 }
 
 function finaleElapsed(session: DemoSession): string {
@@ -2614,8 +2903,109 @@ function finaleCardFilename(session: DemoSession): string {
 }
 
 /**
- * The shareable card: the same six rounds the ledger scores, and now the same
- * winners.
+ * The two lanes of one round as bar fills: the slower lane fills the track and
+ * the faster lane fills its share of it, so the gap is a shape rather than a
+ * subtraction. A lane with no clock gets `share: null` and a short lane fact
+ * instead -- never an invented length. A stopped opponent's figure is a floor,
+ * so its fill is labelled LOWER BOUND, the ledger's own word for it.
+ */
+interface FinaleLane {
+  share: number | null
+  label: string
+  lowerBound?: boolean
+}
+interface FinaleLaneBars { lakebase: FinaleLane; opponent: FinaleLane }
+
+function finaleLaneBars(result: RoundResult | null, verdict: LedgerVerdict): FinaleLaneBars {
+  const empty = (label: string): FinaleLane => ({ share: null, label })
+  if (!result) return { lakebase: empty(verdict.outcome ?? 'NOT RUN YET'), opponent: empty('') }
+  const lb = result.lakebaseMs
+  const op = result.opponentMs
+  switch (result.status) {
+    case 'uncontested':
+      return {
+        lakebase: lb === null ? empty('UNCONTESTED') : { share: 1, label: summaryDuration(lb) },
+        opponent: empty('NO NATIVE PATH'),
+      }
+    case 'lakebase_faster':
+    case 'competitor_faster':
+    case 'tie': {
+      const slower = Math.max(lb ?? 0, op ?? 0)
+      return {
+        lakebase: lb === null ? empty('UNVERIFIED') : { share: slower > 0 ? lb / slower : 1, label: summaryDuration(lb) },
+        opponent: op === null
+          ? empty('—')
+          : { share: slower > 0 ? op / slower : 1, label: summaryDuration(op) },
+      }
+    }
+    case 'lakebase_finished':
+      // The opponent's clock is censored: it says only that the lane had not
+      // finished by this point. With no exact denominator there is no honest
+      // proportional bar for either lane, so retain the two figures as labelled
+      // text and leave both tracks indeterminate.
+      return {
+        lakebase: empty(lb === null ? 'UNVERIFIED' : summaryDuration(lb)),
+        opponent: {
+          share: null,
+          label: op === null ? 'UNVERIFIED' : `LOWER BOUND ${summaryDuration(op)}`,
+          lowerBound: true,
+        },
+      }
+    default:
+      return { lakebase: empty(verdict.outcome ?? 'NOT RUN YET'), opponent: empty('') }
+  }
+}
+
+/** Which corner a tile belongs to, or null for a round nobody took. */
+type FinaleCorner = 'red' | 'blue' | 'tie' | null
+function finaleCorner(verdict: LedgerVerdict): FinaleCorner {
+  if (verdict.winner) return verdict.winner.badge === 'LB' ? 'red' : 'blue'
+  return verdict.outcome === 'TIE' ? 'tie' : null
+}
+
+/**
+ * The tally, in words that never print a zero for a corner that never raced:
+ * "3 OF 6 SCORED · 3 TO THE RED CORNER". A round the blue corner was not in is
+ * not a round it lost, so it gets no line unless it took one.
+ */
+function finaleTallyLine(results: Map<RoundId, RoundResult>, recordRead: boolean): string {
+  if (!recordRead) return 'RECORD UNREAD · NOTHING IS ASSERTED'
+  let red = 0
+  let blue = 0
+  let ties = 0
+  for (const result of results.values()) {
+    const corner = finaleCorner(verdictFor(result, 'read'))
+    if (corner === 'red') red += 1
+    else if (corner === 'blue') blue += 1
+    else if (corner === 'tie') ties += 1
+  }
+  const parts = [`${red + blue + ties} OF 6 SCORED`]
+  if (red > 0) parts.push(`${red} TO THE RED CORNER`)
+  if (blue > 0) parts.push(`${blue} TO THE BLUE CORNER`)
+  if (ties > 0) parts.push(`${ties} ${ties === 1 ? 'TIE' : 'TIES'}`)
+  return parts.join(' · ')
+}
+
+/** Whole seconds or minutes, rounded UP -- the conservative direction for our own clock. */
+function finaleHumanDuration(milliseconds: number): string {
+  if (milliseconds < 60_000) {
+    const seconds = Math.max(1, Math.ceil(milliseconds / 1000))
+    return `${seconds} ${seconds === 1 ? 'SECOND' : 'SECONDS'}`
+  }
+  const minutes = Math.ceil(milliseconds / 60_000)
+  return `${minutes} ${minutes === 1 ? 'MINUTE' : 'MINUTES'}`
+}
+
+/**
+ * The shareable card: a fight poster. The two corners face off in the header,
+ * the six rounds sit across the middle as a judge's scorecard -- a tile takes
+ * the colour of the corner that took it, so the record is read by counting
+ * red blocks before a single word is read -- and the latest live proof is the
+ * verdict banner in human units with the exact figure beside it.
+ *
+ * Every tile still carries the receipt card's two bars and the exact clocks;
+ * a round nobody took stays dark and says why. The stub keeps NOT A BENCHMARK
+ * because this image travels without the operator to say it.
  *
  * `results` is the record off disk, keyed by round. `recordRead` distinguishes
  * a record that says nothing from one that could not be read -- printing "not
@@ -2633,104 +3023,226 @@ async function renderFinaleCard(
   canvas.height = 627
   const context = canvas.getContext('2d')
   if (!context) throw new Error('This browser cannot create the final card.')
+  const font = (size: number) => `400 ${size}px "Press Start 2P", monospace`
+  const RED = '#e8482e'
+  const BLUE = '#4a83e8'
+  const YELLOW = '#f8d83b'
+  const NAVY = '#070b22'
+  const CREAM = '#fff4c2'
+  const accents = { red: RED, blue: BLUE, yellow: YELLOW }
+  const opponent = { badge: opponentBadge(session.competitor.id), name: session.competitor.short_name.toUpperCase() }
+
   context.imageSmoothingEnabled = false
   context.textBaseline = 'top'
-  context.fillStyle = '#070b22'
+  context.fillStyle = NAVY
   context.fillRect(0, 0, canvas.width, canvas.height)
   context.fillStyle = '#10183e'
   for (let x = 0; x < canvas.width; x += 32) {
     if ((x / 32) % 2 === 0) context.fillRect(x, 0, 16, canvas.height)
   }
-  context.strokeStyle = '#f8d83b'
+  context.strokeStyle = YELLOW
   context.lineWidth = 12
   context.strokeRect(12, 12, 1176, 603)
-  context.strokeStyle = '#e8482e'
+  context.strokeStyle = RED
   context.lineWidth = 5
   context.strokeRect(29, 29, 1142, 569)
 
-  context.fillStyle = '#f8d83b'
-  context.font = '400 11px "Press Start 2P", monospace'
-  context.fillText('FINAL BELL · THE SIX-ROUND STORY', 52, 47)
-  // The same heading the screen carries. "ONE DATA LOOP." was cut from the
-  // screen and this is the same artefact, so it is cut here too; the claims
-  // strip lower down is NOT, because this image travels without the operator
-  // and without the fight card beside it to supply the caveat.
-  drawFittedCanvasText(context, 'SIX ROUNDS.', {
-    x: 52, y: 78, maxWidth: 1090, maxLines: 1, startSize: 34, minSize: 25, color: '#fff4c2',
+  // Header: the title with its red shadow, and the two corners facing off.
+  drawFittedCanvasText(context, `FINAL BELL · LAKEBASE VS ${opponent.name}`, {
+    x: 54, y: 46, maxWidth: 720, maxLines: 1, startSize: 9, minSize: 7, color: YELLOW,
   })
-  context.fillStyle = '#6bf39a'
-  context.font = '400 12px "Press Start 2P", monospace'
-  context.fillText(`LIVE APP → EXACT DELTA ANSWER · ${finaleElapsed(session)}`, 54, 122)
+  context.font = font(44)
+  context.fillStyle = RED
+  context.fillText('SIX ROUNDS.', 58, 66)
+  context.fillStyle = CREAM
+  context.fillText('SIX ROUNDS.', 54, 62)
+  drawFittedCanvasText(context, 'FROM LIVE APPLICATIONS TO THE LAKEHOUSE — AND BACK AGAIN.', {
+    x: 54, y: 120, maxWidth: 720, maxLines: 1, startSize: 8, minSize: 6, color: '#b7c2e7',
+  })
+  drawPixelFighter(context, 816, 40, RED, 'LB', 0.9)
+  drawPixelFighter(context, 1054, 40, BLUE, opponent.badge, 0.9)
+  context.font = font(18)
+  context.fillStyle = YELLOW
+  context.textAlign = 'center'
+  context.fillText('VS', 973, 84)
+  context.textAlign = 'left'
+  drawFittedCanvasText(context, 'LAKEBASE', {
+    x: 852, y: 141, maxWidth: 120, maxLines: 1, startSize: 6, minSize: 6, color: '#b7c2e7', align: 'center',
+  })
+  drawFittedCanvasText(context, opponent.name, {
+    x: 1090, y: 141, maxWidth: 130, maxLines: 1, startSize: 6, minSize: 6, color: '#b7c2e7', align: 'center',
+  })
 
-  const colors = { red: '#e8482e', blue: '#4a83e8', yellow: '#f8d83b' }
-  /**
-   * The grid keeps its shape -- three across, two down, same width, same gutter
-   * -- and grows downwards to carry the winner field. The 36 units that costs
-   * are taken from slack: the gap under the header, the gap between the rows,
-   * and the band of empty frame under the claims strip. Nothing legible was
-   * given up for it, and the heading kept its size because it is the one thing
-   * on this card that still reads at feed scale.
-   */
-  const cardWidth = 350
-  const cardHeight = 194
-  const cardGap = 22
-  const rowGap = 8
-  const startX = 52
-  const startY = 144
-  FINALE_BEATS.forEach((beat, index) => {
-    const column = index % 3
-    const row = Math.floor(index / 3)
-    const x = startX + column * (cardWidth + cardGap)
-    const y = startY + row * (cardHeight + rowGap)
-    const accent = colors[beat.accent]
-    context.fillStyle = '#0b1230'
-    context.fillRect(x, y, cardWidth, cardHeight)
-    context.fillStyle = accent
-    context.fillRect(x, y, cardWidth, 8)
+  // The scorecard: six tiles across, coloured by the corner that took the round.
+  const tileWidth = 172
+  const tileGap = 12
+  const tileTop = 160
+  const tileHeight = 290
+  const plateHeight = 108
+  const drawTrack = (
+    lane: FinaleLane, laneColor: string, badge: string, x: number, y: number, width: number,
+  ) => {
+    context.fillStyle = laneColor
+    context.fillRect(x, y, 22, 16)
+    context.fillStyle = CREAM
+    context.font = font(6)
+    context.textAlign = 'center'
+    context.fillText(badge, x + 11, y + 5)
+    context.textAlign = 'left'
+    const trackX = x + 26
+    const trackWidth = width - 26
+    context.fillStyle = '#111e48'
+    context.fillRect(trackX, y, trackWidth, 16)
     context.strokeStyle = '#46527c'
-    context.lineWidth = 2
-    context.strokeRect(x, y, cardWidth, cardHeight)
-    context.fillStyle = '#070b22'
-    context.fillRect(x + 16, y + 18, 43, 32)
-    context.fillStyle = accent
-    context.font = '400 12px "Press Start 2P", monospace'
-    context.fillText(beat.number, x + 23, y + 28)
-    drawFittedCanvasText(context, beat.title.toUpperCase(), {
-      x: x + 73, y: y + 20, maxWidth: 255, maxLines: 2, startSize: 13, minSize: 9, color: '#fff4c2', lineHeight: 17,
-    })
-    drawFittedCanvasText(context, beat.flow.toUpperCase(), {
-      x: x + 17, y: y + 62, maxWidth: 316, maxLines: 2, startSize: 12, minSize: 9, color: accent, lineHeight: 16,
-    })
-    drawFittedCanvasText(context, beat.proof.toUpperCase(), {
-      x: x + 17, y: y + 100, maxWidth: 316, maxLines: 2, startSize: 8, minSize: 6, color: '#aeb9df', lineHeight: 11,
-    })
+    context.lineWidth = 1
+    context.strokeRect(trackX + 0.5, y + 0.5, trackWidth - 1, 15)
+    if (lane.share === null) {
+      if (lane.label) {
+        drawFittedCanvasText(context, lane.label, {
+          x: trackX + 6, y: y + 5, maxWidth: trackWidth - 12, maxLines: 1, startSize: 6, minSize: 6, color: '#8f9dcb',
+        })
+      }
+      return
+    }
+    const fill = Math.max(6, Math.round((trackWidth - 4) * Math.min(1, lane.share)))
+    context.fillStyle = laneColor
+    context.fillRect(trackX + 2, y + 2, fill, 12)
+    context.font = font(6)
+    const labelWidth = context.measureText(lane.label).width
+    if (trackX + 2 + fill + 6 + labelWidth <= trackX + trackWidth - 4) {
+      context.fillStyle = CREAM
+      context.fillText(lane.label, trackX + 2 + fill + 6, y + 5)
+    } else {
+      context.fillStyle = NAVY
+      context.textAlign = 'right'
+      context.fillText(lane.label, trackX + 2 + fill - 5, y + 5)
+      context.textAlign = 'left'
+    }
+  }
 
-    // The rule separates what the round was from who took it, the same job the
-    // ledger's winner column does with a border.
-    context.fillStyle = '#2b376c'
-    context.fillRect(x + 17, y + 128, 316, 2)
+  FINALE_BEATS.forEach((beat, index) => {
+    const x = 54 + index * (tileWidth + tileGap)
+    const y = tileTop
+    const inner = tileWidth - 24
     const result = results.get(beat.roundId) ?? null
     const verdict = verdictFor(result, recordRead ? 'read' : 'unread')
-    drawCardWinner(context, verdict, recordRead && result ? ledgerDay(result) : null, {
-      x: x + 17, y: y + 136, width: 316,
+    const corner = finaleCorner(verdict)
+    const cornerColor = corner === 'red' ? RED : corner === 'blue' ? BLUE : corner === 'tie' ? YELLOW : null
+    const bars = finaleLaneBars(result, verdict)
+    const day = recordRead && result ? ledgerDay(result) : null
+
+    // Plate + panel. A taken round wears its corner's colour; an untaken one stays dark.
+    context.fillStyle = cornerColor ?? '#151e48'
+    context.fillRect(x, y, tileWidth, plateHeight)
+    context.fillStyle = cornerColor ? NAVY : '#0b1230'
+    context.fillRect(x, y + plateHeight, tileWidth, tileHeight - plateHeight)
+    if (!cornerColor) {
+      context.fillStyle = accents[beat.accent]
+      context.fillRect(x, y, tileWidth, 6)
+    }
+    context.strokeStyle = cornerColor ?? '#46527c'
+    context.lineWidth = 2
+    context.strokeRect(x + 1, y + 1, tileWidth - 2, tileHeight - 2)
+
+    const ink = cornerColor ? NAVY : accents[beat.accent]
+    context.fillStyle = ink
+    context.font = font(14)
+    context.fillText(beat.number, x + 12, y + 16)
+    drawFittedCanvasText(context, beat.title.toUpperCase(), {
+      x: x + 12, y: y + 42, maxWidth: inner, maxLines: 2, startSize: 8, minSize: 7, lineHeight: 11,
+      color: cornerColor ? NAVY : '#b7c2e7',
     })
+    drawFittedCanvasText(context, beat.flow.toUpperCase(), {
+      x: x + 12, y: y + 76, maxWidth: inner, maxLines: 2, startSize: 6, minSize: 6, lineHeight: 9,
+      color: cornerColor ? '#3b1410' : '#8f9dcb',
+    })
+
+    if (cornerColor) {
+      // The winner's figure, large; the qualifier that conditions it right under.
+      drawFittedCanvasText(context, verdict.figure ?? '—', {
+        x: x + 12, y: y + 122, maxWidth: inner, maxLines: 1, startSize: 26, minSize: 16, color: YELLOW,
+      })
+      if (verdict.qualifier) {
+        drawFittedCanvasText(context, verdict.qualifier, {
+          x: x + 12, y: y + 154, maxWidth: inner, maxLines: 1, startSize: 7, minSize: 6, color: CREAM,
+        })
+      }
+    } else {
+      drawFittedCanvasText(context, verdict.outcome ?? 'NOT RUN YET', {
+        x: x + 12, y: y + 124, maxWidth: inner, maxLines: 2, startSize: 10, minSize: 7, lineHeight: 14, color: '#8f9dcb',
+      })
+      if (verdict.qualifier) {
+        drawFittedCanvasText(context, verdict.qualifier, {
+          x: x + 12, y: y + 154, maxWidth: inner, maxLines: 1, startSize: 7, minSize: 6, color: '#8f9dcb',
+        })
+      }
+    }
+
+    // The receipt card's two bars, red over blue, one track each.
+    drawTrack(bars.lakebase, RED, 'LB', x + 12, y + 236, inner)
+    drawTrack(bars.opponent, BLUE, opponent.badge, x + 12, y + 258, inner)
+
+    // The lane fact in full, under the bars. The wording IS the disclosure.
+    if (verdict.laneNote) {
+      drawFittedCanvasText(context, verdict.laneNote, {
+        x: x + 12, y: y + 170, maxWidth: inner, maxLines: 4, startSize: 6, minSize: 6, lineHeight: 9, color: '#8f9dcb',
+      })
+    }
+    if (beat.roundId === session.round.id && result) {
+      context.fillStyle = '#6bf39a'
+      context.font = font(6)
+      context.fillText('LIVE PROOF · THIS RUN', x + 12, y + 216)
+    }
+    if (day) {
+      context.fillStyle = '#8f9dcb'
+      context.font = font(6)
+      context.textAlign = 'right'
+      context.fillText(day, x + tileWidth - 12, y + 216)
+      context.textAlign = 'left'
+    }
   })
 
-  // Tightened from 58 to 46 and moved down into the band of empty frame it used
-  // to sit above. The wording is untouched: with winners now on the image the
-  // case for this strip is stronger than it was, so it gave up padding rather
-  // than words. Bottom edge stays inside the inner rule at 598.
+  // The verdict banner: the latest live proof in human units, exact beside it.
+  const metric = metricValue(session, 'analytics_available_ms')?.value
+  const liveMs = typeof metric === 'number' ? metric : session.lanes.lakebase.elapsed_ms
+  context.fillStyle = RED
+  context.fillRect(46, 470, 1108, 54)
+  context.fillStyle = YELLOW
+  context.fillRect(38, 462, 1108, 54)
+  drawFittedCanvasText(context, 'LATEST LIVE PROOF · ROUND 06 · ONE OBSERVED RUN', {
+    x: 58, y: 471, maxWidth: 520, maxLines: 1, startSize: 8, minSize: 7, color: NAVY,
+  })
+  drawFittedCanvasText(context, finaleTallyLine(results, recordRead), {
+    x: 1126, y: 471, maxWidth: 540, maxLines: 1, startSize: 8, minSize: 7, color: NAVY, align: 'right',
+  })
+  drawFittedCanvasText(context, liveMs === null
+    ? 'SIX PROOF CONTRACTS. ONE DATA LOOP.'
+    : `LIVE APP → DELTA IN ${finaleHumanDuration(liveMs)} · EXACT ${finaleElapsed(session)}`, {
+    x: 58, y: 487, maxWidth: 1068, maxLines: 1, startSize: 20, minSize: 12, color: NAVY,
+  })
+
+  // The stub: the disclaimer, the invitation, and the stamp.
   context.fillStyle = '#f1ebd7'
-  context.fillRect(52, 546, 1094, 46)
-  context.fillStyle = '#070b22'
-  context.font = '400 9px "Press Start 2P", monospace'
-  context.fillText('PROOF CONTRACTS NAME EXACT STOP GATES', 72, 556)
-  context.fillStyle = '#e8482e'
-  context.fillText('CAPABILITY GAPS SAY NOT TIMED · NOT A BENCHMARK', 72, 573)
-  context.fillStyle = '#070b22'
-  context.textAlign = 'right'
-  context.fillText('LAKEBASE · THE ANTI-DEMO', 1126, 564)
-  context.textAlign = 'left'
+  context.fillRect(38, 528, 1108, 70)
+  context.fillStyle = NAVY
+  for (let x = 52; x < 1130; x += 24) context.fillRect(x, 528, 12, 4)
+  context.font = font(11)
+  context.fillStyle = RED
+  context.fillText('ONE LIVE RUN PER ROUND · NOT A BENCHMARK', 58, 546)
+  context.font = font(8)
+  context.fillStyle = NAVY
+  context.fillText('CAPABILITY GAPS SAY NOT TIMED · RING THE BELL YOURSELF.', 58, 570)
+  context.fillStyle = '#0a2c22'
+  context.fillRect(872, 540, 260, 46)
+  context.strokeStyle = '#6bf39a'
+  context.lineWidth = 3
+  context.strokeRect(873.5, 541.5, 257, 43)
+  drawFittedCanvasText(context, 'LAKEBASE · THE ANTI-DEMO', {
+    x: 1002, y: 550, maxWidth: 240, maxLines: 1, startSize: 10, minSize: 7, color: '#6bf39a', align: 'center',
+  })
+  drawFittedCanvasText(context, `FINALE ${receiptId(session)}`, {
+    x: 1002, y: 569, maxWidth: 240, maxLines: 1, startSize: 7, minSize: 6, color: CREAM, align: 'center',
+  })
 
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((value) => value ? resolve(value) : reject(new Error('The final card could not be encoded.')), 'image/png')
@@ -5384,13 +5896,13 @@ export function RoundFiveProof({
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
   const [showCostRoom, setShowCostRoom] = useState(false)
-  const cleanupRetryable = session.round5_setup?.cleanup_retryable === true
-  /* The one fact `cleanup_retryable` cannot carry. It is true while cleanup is
-     still retrying and true again once the server has given up, so a screen
-     reading it alone cannot tell a tidy-up in flight from an abandoned one --
-     and the second is the one where a run-owned proxy may still exist. Set
-     only on abandonment, so its presence is the distinction. */
-  const cleanupAbandoned = session.round5_setup?.cleanup_failure || null
+  /* Backstage ring cleanup is fully decoupled from the end user. It now
+     converges automatically (the server keeps reconciling the per-bout Proxy to
+     confirmed-absent and rewarms without a human "Retry Cleanup"), so the
+     end-user proof view never surfaces a cleanup/billing banner and never gates
+     an action on it. The operator surface (`/readyz` `round5_cleanup_owed`)
+     still carries the backstage state for ops. */
+  const cleanupAbandoned: string | null = null
   const cleanupAllowsActions = cleanupAllowsTerminalActions(session)
   const v3Runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
   const runtimeLanes = v3Runtime
@@ -5417,10 +5929,8 @@ export function RoundFiveProof({
   const oneSidedSetupLead = oneSidedExactLane && oneSidedUnverifiedLane
     ? `${session.round5_setup?.lanes?.[oneSidedExactLane]?.name ?? session.lanes[oneSidedExactLane].name} verified first · ${session.round5_setup?.lanes?.[oneSidedUnverifiedLane]?.name ?? session.lanes[oneSidedUnverifiedLane].name} unverified${oneSidedLowerBound === null ? '' : ` beyond ${laneReceiptTime(oneSidedLowerBound)}`}`
     : 'Bout stopped · Setup clocks frozen'
-  const showCleanupFallback = cleanupRetryable
-    && !session.towel
-    && !uiReview
-    && Boolean(onRetryCleanup)
+  // No end-user "Retry cleanup" button: cleanup is automatic and never blocks.
+  const showCleanupFallback = false
   if (uiReview || session.state !== 'failed' || v3Runtime) {
     const lakebaseSetupLane = runtimeLanes?.lakebase
       ?? roundFiveArenaLane(session, 'lakebase')
@@ -5549,27 +6059,10 @@ export function RoundFiveProof({
                   : explicitLegacy
                     ? 'Legacy scorecard decoded · current 10,000-client fan-in contract not recorded'
                     : 'Protocol evidence unavailable · no timing or fan-in claim inferred'}</p>
-                {/* A verified Round 5 keeps its win and can still fail to tidy
-                    up, which is the case this screen used to render as a bare
-                    "settling backstage" line whether cleanup was still trying
-                    or had been given up on hours ago. */}
-                {cleanupAbandoned ? (
-                  <div className="cleanup-abandoned" data-state="failed" role="alert" aria-live="polite">
-                    <strong>{CLEANUP_ABANDONED_TITLE}</strong>
-                    <span>{cleanupAbandoned}</span>
-                  </div>
-                ) : cleanupRetryable ? (
-                  <p className="proof-error" role="status">Automatic cleanup is settling backstage · Ring protected</p>
-                ) : null}
-                {showCleanupFallback && (
-                  <button
-                    className="round5-retry-cleanup"
-                    disabled={cleanupPending}
-                    onClick={onRetryCleanup}
-                  >
-                    B · {cleanupPending ? 'Retrying cleanup…' : 'Retry cleanup'}
-                  </button>
-                )}
+                {/* A verified Round 5 keeps its win. Backstage ring cleanup is
+                    decoupled from the end user: it converges automatically and
+                    is never surfaced here as a billing/attention banner, and it
+                    never gates Share / Instant Replay / What it cost / Next. */}
                 {!uiReview && !cleanupAllowsActions && (
                   <button className="proof-ringside" onClick={() => setShowRingsideTake(true)}>Select · Explain to the room</button>
                 )}
@@ -6673,7 +7166,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           : 'Automatic warming measured one sealed c7i.2xlarge per physical 10,000-client lane before the bell.',
         shared: [
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
-          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Both launches must occur within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of the shared T0 or the setup race is void.` },
+          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Evidence validity (Proxy absent before the bell, CreateDBProxy the first timed post-bell AWS mutation, shared T0, exact 10,000 client connections) is what verifies a bout. Scheduling quality — launches within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other, CreateDBProxy within 100 ms of the bell — is advisory only; a miss is charged to that lane's own clock and never voids an exact result.` },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
           { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge, resident registry, lock, and cancellation owner per lane.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
         ],
@@ -7329,7 +7822,22 @@ function ShareReceipt({
   const post = kind === 'idle' ? linkedInIdleReceipt(session) : linkedInReceipt(session, roundNumber)
   const [status, setStatus] = useState<string | null>(null)
   const dialogRef = useAccessibleDialog<HTMLElement>(true, onClose)
-  const cardKey = `${session.id}:${session.updated_at}:${roundNumber}:${kind}`
+
+  // Which layouts this receipt can actually draw. Both health-bars (1b) and
+  // knockout (1a) are present on any complete, untowelled, named-winner receipt;
+  // a towel/tie/incomplete receipt has neither and only ever shows the
+  // scorecard, so the selector is hidden. The preference is modal-local state,
+  // so every fresh Share modal starts on the default (health-bars).
+  const presentation = receiptPresentation(session, kind)
+  const availableStyles: ReceiptCardStyle[] = []
+  if (presentation.healthBars) availableStyles.push('health-bars')
+  if (presentation.knockout) availableStyles.push('knockout')
+  const [preferredStyle, setPreferredStyle] = useState<ReceiptCardStyle>(DEFAULT_RECEIPT_CARD_STYLE)
+  const cardStyle = availableStyles.includes(preferredStyle)
+    ? preferredStyle
+    : availableStyles[0] ?? DEFAULT_RECEIPT_CARD_STYLE
+
+  const cardKey = `${session.id}:${session.updated_at}:${roundNumber}:${kind}:${cardStyle}`
   const [renderedCard, setRenderedCard] = useState<{ key: string; blob: Blob } | null>(null)
   const [failedCardKey, setFailedCardKey] = useState<string | null>(null)
   const cardBlob = renderedCard?.key === cardKey ? renderedCard.blob : null
@@ -7337,11 +7845,11 @@ function ShareReceipt({
 
   useEffect(() => {
     let current = true
-    void renderReceiptCard(session, roundNumber, kind)
+    void renderReceiptCard(session, roundNumber, kind, cardStyle)
       .then((blob) => { if (current) setRenderedCard({ key: cardKey, blob }) })
       .catch(() => { if (current) setFailedCardKey(cardKey) })
     return () => { current = false }
-  }, [cardKey, kind, roundNumber, session])
+  }, [cardKey, cardStyle, kind, roundNumber, session])
 
   async function copyPost(updateStatus = true): Promise<boolean> {
     try {
@@ -7369,7 +7877,7 @@ function ShareReceipt({
   async function prepareLinkedInPost() {
     if (!cardBlob) return
     const linkedinUrl = 'https://www.linkedin.com/feed/?shareActive=true'
-    const filename = receiptCardFilename(session, roundNumber, kind)
+    const filename = receiptCardFilename(session, roundNumber, kind, cardStyle)
     const file = new File([cardBlob], filename, { type: 'image/png' })
     const shareData: ShareData = {
       files: [file],
@@ -7386,7 +7894,7 @@ function ShareReceipt({
     // wants the post, so they still get the tab, the PNG and the caption.
     const dismissed = shareDismissalPrefix(outcome)
     window.open(linkedinUrl, '_blank', 'noopener,noreferrer')
-    const download = downloadReceiptCard(session, roundNumber, kind, cardBlob)
+    const download = downloadReceiptCard(session, roundNumber, kind, cardStyle, cardBlob)
     const caption = copyPost(false)
     const [downloadResult, captionCopied] = await Promise.all([download.then(() => true).catch(() => false), caption])
     if (downloadResult && captionCopied) {
@@ -7422,6 +7930,27 @@ function ShareReceipt({
             fallbackOnly={!cardRenderFailed}
           />
         </div>
+        {availableStyles.length > 1 && (
+          <div className="receipt-style-toggle" role="group" aria-label="Share card style">
+            <span className="receipt-style-label">Card style</span>
+            {availableStyles.map((styleOption) => {
+              const optionLabel = styleOption === 'health-bars' ? 'Health Bars' : 'Knockout'
+              const selected = cardStyle === styleOption
+              return (
+                <button
+                  key={styleOption}
+                  type="button"
+                  className="receipt-style-option"
+                  aria-pressed={selected}
+                  data-selected={selected}
+                  onClick={() => { setPreferredStyle(styleOption); setStatus(null) }}
+                >
+                  {optionLabel}
+                </button>
+              )
+            })}
+          </div>
+        )}
         <p className="receipt-share-note">LinkedIn desktop needs the PNG added as media; browser image paste is not reliable.</p>
         {status && <p className="receipt-status" role="status">{status}</p>}
         <div className="receipt-actions">
@@ -7700,7 +8229,7 @@ function BetweenRounds({
  * complaint that produced this screen was a scorecard you could read top to
  * bottom without ever learning who won.
  */
-function FinaleRow({ beat, result, reading, latest }: {
+function FinaleRow({ beat, result, reading, latest, opponent }: {
   beat: FinaleBeat
   /** Null when the record has been read and holds nothing for this round. */
   result: RoundResult | null
@@ -7712,10 +8241,32 @@ function FinaleRow({ beat, result, reading, latest }: {
    * measured and not a claim that it is worth more than the other five.
    */
   latest: boolean
+  /** The blue corner's chip, the fight card's own, for the lane badge. */
+  opponent: { badge: string; name: string }
 }) {
   const verdict: LedgerVerdict = verdictFor(result, reading ? 'reading' : 'read')
   // A result from an earlier day says so, or the ledger reads as one sitting.
   const day = reading || !result ? null : ledgerDay(result)
+  // The same two bars the share card draws, so the screen and the image agree.
+  const bars = finaleLaneBars(result, verdict)
+  // Keep the finale scorecard concise; hold/check details remain on the Round 5 receipt.
+  const proof = beat.roundId === 'survive_connection_spike'
+    ? '10,000 clients held / lane · multiplexing proved'
+    : beat.proof
+  const lane = (side: FinaleLane, corner: 'red' | 'blue', badge: string) => (
+    <div className="finale-lane" data-corner={corner} aria-hidden="true">
+      <b>{badge}</b>
+      <span
+        className="finale-track"
+        data-empty={side.share === null ? 'true' : undefined}
+        data-lower-bound={side.lowerBound ? 'true' : undefined}
+        data-inside={side.share !== null && side.share > 0.72 ? 'true' : undefined}
+      >
+        {side.share !== null && <i style={{ width: `${Math.max(1.5, Math.min(100, side.share * 100))}%` }} />}
+        {side.label && <em>{side.label}</em>}
+      </span>
+    </div>
+  )
 
   return (
     <article
@@ -7727,12 +8278,23 @@ function FinaleRow({ beat, result, reading, latest }: {
       <header><span>{beat.number}</span><strong>{beat.title}</strong></header>
       <h2>{beat.flow}</h2>
       <p>
-        {beat.proof}
+        {proof}
         {/* The lane fact that qualifies the verdict, next to the evidence rather
             than next to our own number: the reason a corner has no figure is a
             statement about that corner. */}
         {verdict.laneNote && <em>{verdict.laneNote}</em>}
       </p>
+      {/* One concise accessible summary owns both lane facts. The painted bars
+          stay hidden below it so a screen reader hears each clock/state once,
+          while still getting the losing lane a compact verdict can omit. */}
+      <div
+        className="finale-bars"
+        role="group"
+        aria-label={`Lane facts · Lakebase: ${bars.lakebase.label || 'no result'} · ${opponent.name}: ${bars.opponent.label || 'no result'}`}
+      >
+        {lane(bars.lakebase, 'red', 'LB')}
+        {lane(bars.opponent, 'blue', opponent.badge)}
+      </div>
       <div className="finale-win">
         {verdict.winner
           ? <b><span aria-hidden="true">{verdict.winner.badge}</span>{verdict.winner.name}</b>
@@ -7903,6 +8465,10 @@ function Finale({ session, onBack, onSummary }: {
             result={results.get(beat.roundId) ?? null}
             reading={receipts === null}
             latest={beat.roundId === session.round.id}
+            opponent={{
+              badge: opponentBadge(session.competitor.id),
+              name: session.competitor.short_name,
+            }}
           />
         ))}
       </section>
@@ -8409,7 +8975,7 @@ function proofCommentary(
           ? roundFiveVerifiedVerdict(session)
           : runtime.state === 'running'
             ? 'V4 resident fan-in live · no winner until both canonical runtime lanes verify'
-            : 'V4 runtime stopped · cleanup must settle before the receipt is final',
+            : roundFiveStoppedVerdict(session),
       }
     }
     const fanInActive = (['lakebase', 'competitor'] as LaneId[]).some(

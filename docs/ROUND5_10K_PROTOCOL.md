@@ -55,6 +55,60 @@ stops at `bell_to_10000_observed_ms`; its sibling continues from the same bell. 
 uses `performance.now()` seeded from the server floor, accepts only non-regressing revisions, and
 never changes the clock to setup time or runner-local ramp time.
 
+## Setup launch contract
+
+The setup phase (`round5-fanin-v4`) scores each lane's setup from one shared monotonic `T0`. The
+contract draws one hard line: **evidence/anti-cheat validity (FATAL) is separate from scheduling
+conformance (ADVISORY).** A scheduling-SLO miss must never erase an exact, honestly-obtained
+10,000-client proof; a slow Aurora is the *result* of the round, and every operational delay is
+already charged to that lane's own bell→10,000 clock, so it cannot advantage the slow lane.
+
+### Fatal evidence / anti-cheat invariants (void the bout)
+
+- The per-bout RDS Proxy is absent before the bell; a warm generation proves absence.
+- `CreateDBProxy` is the **first timed post-bell AWS mutation**, and its request boundary is
+  genuinely observed: `create_db_proxy_requested_ns` must be **present** (a missing stamp on the AWS
+  competitor is fatal — `create_db_proxy_missing` — because the one timed mutation the round measures
+  was never observed; a skipped or pre-adopted Proxy presents exactly this way) and **not before
+  `T0`** (a pre-bell stamp is fatal — `create_db_proxy_pre_bell` — a pre-bell request or wrong clock
+  domain).
+- `workflow_launched_ns` is stamped `≥ T0`; a pre-`T0` stamp is fatal (`workflow_launch_ordering`),
+  because it would corrupt the shared-`T0` elapsed and skew maths.
+- The exact stop gate verifies (`stop_gate_evidence`), inside the 30-minute deadline
+  (`setup_deadline`), after the workflow launch (`stop_gate_before_workflow_launch`), with public
+  evidence that survives redaction (`public_fact_key_rejected`).
+- Downstream: exactly 10,000 initiated/authenticated/held/peak-retained per lane, the full 30-second
+  hold, 64/64 sampled queries, empty `telemetry_failures`, and valid pooled-binding/proof seals.
+
+### Advisory scheduling-conformance quality bars (never void the bout)
+
+Both stamps below are lower bounds taken right after the shared gate releases; a miss is
+host-scheduling jitter, not a cheat, and is recorded as a non-fatal advisory (surfaced in the
+detailed play-by-play, never as a FAILED header or share card):
+
+1. **Inter-lane workflow-start skew ≤ 10 ms** (`workflow_launch_skew`). A larger skew is advisory on
+   both lanes; the comparison is still declared for an exact pair.
+2. **`CreateDBProxy` requested ≤ 100 ms after the bell** (`create_db_proxy_window`, reference =
+   bell/`T0`, stamped at the request boundary `create_db_proxy_requested_ns`). A present, `≥ T0`, but
+   slower request is advisory. The observed latency is published as
+   `create_db_proxy_request_delta_ms` so "12 ms vs an advisory 163 ms" is directly visible.
+
+Implementation note: the journal-before-AWS durability write (fence + duplicate-ordinal read +
+durable `CREATE_INTENT` commit) is **pre-committed before `T0`** inside `setup()`, so the mandatory
+coordination hop is not charged against the 100 ms advisory and the post-gate path issues the direct
+`CreateDBProxy` call with no awaited coordination I/O in front of it. This keeps `CreateDBProxy` the
+first post-`T0` AWS mutation while removing the cold-connection latency that used to breach the
+advisory.
+
+Two design SLOs remain observed-only (never scored gates): the Lakebase `run_lane_v3` dispatch
+≤ 100 ms after the bell, and the competitor `run_lane_v3` dispatch ≤ 100 ms after the Proxy
+control-plane gate. They are visible in the `round5_runtime` snapshot; a missing or late dispatch
+cannot produce an exact 10,000-client runtime lane, which is itself a fatal downstream gate.
+
+Changing either advisory threshold, `deadline_seconds`, or the evidence-vs-scheduling semantics tag
+reseals `SetupPhaseContract` (`advisory_request_launch_delay_ms`,
+`advisory_workflow_launch_skew_ms`, `deadline_seconds`) via its `sha256`.
+
 ## Lakebase lane
 
 The first post-bell external operation is the deterministic `run_lane_v3` dispatch to the dedicated
@@ -122,8 +176,12 @@ Event-loop lag, host scheduling delay, CPU utilization, calibration time, and se
 timing are advisory pacing signals. They may reduce future admission concurrency and remain visible
 in the evidence, but they never cancel admitted connections, block the hold, shorten the 30-second
 hold, suppress the 64 samples, or invalidate an otherwise exact result. The 50 ms event-loop and
-0.85 CPU thresholds remain adaptation thresholds, not pass/fail gates. Unknown safety codes fail
-closed as protocol errors; they are never classified by string prefix.
+0.85 CPU thresholds remain adaptation thresholds, not pass/fail gates. First-launch skew is the same
+class of signal: missing or non-finite `launch_skew_ms` fails closed as incomplete evidence, but
+exceeding the 10 ms advisory target (`advisory_launch_skew_ms`, sealed with
+`launch_skew_semantics: advisory_scheduling_not_fatal`) does not. The public contract still emits
+`max_launch_skew_ms` as a compatibility alias of that advisory target; it is not a fatal validity
+max. Unknown safety codes fail closed as protocol errors; they are never classified by string prefix.
 
 9,999 fails. A one-sided exact result may remain visible but never declares a winner.
 

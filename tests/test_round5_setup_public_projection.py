@@ -53,6 +53,12 @@ def _production_observation(lane_id: str, *, launch_delay_ns: int, elapsed_ns: i
         credential_sha256="a" * 64,
         endpoint_host="pooled.internal" if lane_id == "lakebase" else "proxy.internal",
         secret_arn="" if lane_id == "lakebase" else "arn:aws:secretsmanager:x:y:secret:z",
+        # The competitor fails closed without its CreateDBProxy stamp; supply a
+        # within-budget one (~10 ms after T0) so this projection test exercises
+        # the fact-key contract, not the missing-stamp gate.
+        create_db_proxy_requested_ns=(
+            T0_NS + 10_000_000 if lane_id == "competitor" else None
+        ),
     )
     return LiveConnectionSpikeSetupOrchestrator._setup_observation(None, stop)
 

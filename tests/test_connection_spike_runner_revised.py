@@ -2340,7 +2340,10 @@ async def test_sharded_worker_ready_timeout_is_not_capacity_failure(
 ) -> None:
     context = _FakeProcessContext()
     monkeypatch.setattr(runner.mp, "get_context", lambda unused: context)
-    monkeypatch.setattr(runner, "FANIN_WORKER_RUN_TIMEOUT_SECONDS", 0.01)
+    # This path is still waiting for workers to report ready, before T0 rebases
+    # the scored run deadline. Patch the readiness budget it actually consumes
+    # so the test proves the error classification without sleeping five minutes.
+    monkeypatch.setattr(runner, "FANIN_WORKER_READY_BUDGET_SECONDS", 0.01)
 
     with pytest.raises(runner.RunnerContractError, match="fanin_worker_ready_timeout"):
         await runner._execute_sharded_fanin({}, asyncio.Event())

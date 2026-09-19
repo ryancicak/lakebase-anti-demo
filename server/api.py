@@ -253,12 +253,19 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
     warm_ring_ready = getattr(run_manager, "round5_ring_ready", None)
     warm_status = getattr(run_manager, "round5_warm_status", None)
     coordinator_present = isinstance(warm_status, dict)
+    blocked_terminal = bool(
+        coordinator_present and warm_status.get("round5_warm_blocked_terminal")
+    )
     warm_detail = None
     if coordinator_present and not warm_ring_ready:
         warm_detail = " · ".join(
             part
             for part in (
-                "Preparing backstage",
+                # A permanent block will not self-recover; do not imply it is
+                # merely "preparing" and will unlock on its own.
+                "Needs operator attention"
+                if blocked_terminal
+                else "Preparing backstage",
                 str(warm_status.get("round5_warm_state") or "warming").upper(),
                 (
                     f"attempt {warm_status['round5_warm_attempt_count']}"
@@ -319,7 +326,11 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
             )
             if warm_state == "cleaning"
             else warm_detail
-            or "Preparing backstage · Round 5 will unlock automatically"
+            or (
+                "Round 5 needs operator attention and will not unlock automatically"
+                if blocked_terminal
+                else "Preparing backstage · Round 5 will unlock automatically"
+            )
             if coordinator_present
             else getattr(round5_status, "maintenance_detail", None)
         ),

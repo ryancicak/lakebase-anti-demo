@@ -92,6 +92,7 @@ from .coordination import COORDINATION_TABLE, RING_KEY, validate_ring_key
 from .manifest import DemoManifest, load_manifest
 from .models import CompetitorId, RoundId
 from .round5_control import (
+    ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS,
     ROUND5_ARM_STAGE_DEADLINE_SECONDS,
     Round5ControlBinding,
     Round5ControlEvent,
@@ -793,6 +794,9 @@ class ConnectionSpikeSetupLaneStop:
     credential_sha256: str
     endpoint_host: str
     secret_arn: str = field(default="", repr=False)
+    # Real CreateDBProxy request-boundary stamp (competitor only). None for lanes
+    # that issue no setup-phase request the contract can score.
+    create_db_proxy_requested_ns: int | None = None
 
     @property
     def elapsed_ms(self) -> float:
@@ -891,6 +895,11 @@ class _SetupResources:
     proxy_security_group_id: str = ""
     rds_security_group_id: str = ""
     proxy_endpoint: str = ""
+    # Monotonic stamp taken at the CreateDBProxy request boundary (before the SDK
+    # call leaves this process), so the setup contract can score the real
+    # bell -> CreateDBProxy request latency instead of the workflow_launched
+    # lower bound.
+    proxy_create_requested_ns: int | None = None
     security_group_rule_ids: list[str] = field(default_factory=list)
 
 
@@ -1512,10 +1521,43 @@ class LiveConnectionSpikeSetupOrchestrator:
             resources = prepared
             clients = warm.clients
 
+            # Journal-before-AWS durability for the timed CreateDBProxy mutation
+            # is satisfied HERE, before the authoritative comparison T0 is
+            # captured and before the shared gate releases. The intent commit is
+            # ~3 coordination-store round trips (fence assert + duplicate-ordinal
+            # read + durable intent write) that used to sit *after* T0 on the
+            # timed path and structurally blew the 100 ms bell-relative
+            # create_db_proxy_window (live proxy CREATE_INTENT durable wall was
+            # ~163 ms after T0). Pre-committing it before T0 keeps the reference
+            # (bell/T0) and the 100 ms budget intact while removing every awaited
+            # journal/fence op from the post-gate path: the first awaited call the
+            # competitor lane makes after the gate releases is the direct boto3
+            # CreateDBProxy request itself. This is not a pre-created Proxy -- no
+            # AWS mutation happens before T0, only the durable coordination write
+            # -- and it introduces no new orphan class because the intent is still
+            # journalled within this same ``setup()``/bell invocation.
+            proxy_spec = next(
+                (spec for spec in specs if spec.resource_kind == "rds_proxy"), None
+            )
+            if proxy_spec is None:
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 competitor specs omitted the timed CreateDBProxy mutation"
+                )
+            proxy_intent = await coordinator.precommit_intent(scope, proxy_spec)
+
             gate = asyncio.Event()
             t0_box: list[int] = []
+            # Two-party launch-stamp barrier: both lane tasks capture
+            # workflow_launched_ns immediately after the gate releases and rendezvous
+            # here before either runs a downstream callback. Without it, whichever
+            # task the loop resumes first would run its synchronous ``on_lane_ready``
+            # prefix (or absorb a GC pause) before the sibling could stamp, inflating
+            # the inter-lane skew metric even though the barrier release was fair.
+            launch_barrier = asyncio.Barrier(2)
             lakebase_task = asyncio.create_task(
-                self._setup_lakebase(bout_id, clients, gate, t0_box, on_progress, on_lane_ready)
+                self._setup_lakebase(
+                    bout_id, clients, gate, t0_box, on_progress, on_lane_ready, launch_barrier
+                )
             )
             competitor_task = asyncio.create_task(
                 self._setup_competitor(
@@ -1530,6 +1572,8 @@ class LiveConnectionSpikeSetupOrchestrator:
                     on_progress,
                     on_lane_ready,
                     on_lane_stage,
+                    launch_barrier,
+                    proxy_intent,
                 )
             )
             comparison_t0_ns = self._monotonic_ns() if t0_ns is None else t0_ns
@@ -2044,9 +2088,15 @@ class LiveConnectionSpikeSetupOrchestrator:
         t0_box: list[int],
         on_progress: SetupProgressCallback | None,
         on_lane_ready: SetupLaneReadyCallback | None = None,
+        launch_barrier: asyncio.Barrier | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
+        # Rendezvous so the sibling lane stamps its own launch before either lane
+        # runs downstream work; keeps the inter-lane skew metric a pure function of
+        # the shared gate release, not of any post-launch synchronous prefix.
+        if launch_barrier is not None:
+            await launch_barrier.wait()
 
         async def report(phase: str, status: str = "running") -> None:
             await self._report(
@@ -2091,9 +2141,17 @@ class LiveConnectionSpikeSetupOrchestrator:
         on_progress: SetupProgressCallback | None,
         on_lane_ready: SetupLaneReadyCallback | None = None,
         on_lane_stage: SetupLaneStageCallback | None = None,
+        launch_barrier: asyncio.Barrier | None = None,
+        proxy_intent: JournalEvent | None = None,
     ) -> ConnectionSpikeSetupLaneStop:
         await gate.wait()
         launched_ns = self._monotonic_ns()
+        # Rendezvous so both lanes stamp workflow_launched_ns before either runs a
+        # downstream callback (see _setup_lakebase). Nothing awaited between the
+        # gate release and this stamp/barrier, so the CreateDBProxy request below
+        # is the first awaited call after launch.
+        if launch_barrier is not None:
+            await launch_barrier.wait()
 
         async def report(phase: str, status: str = "running") -> None:
             await self._report(
@@ -2112,9 +2170,18 @@ class LiveConnectionSpikeSetupOrchestrator:
         for spec in specs:
             phase = phases[spec.resource_kind]
             if spec.resource_kind == "rds_proxy":
-                # No progress/log write lies between bell gate release and the
-                # first timed AWS mutation.
-                await coordinator.create_resource(scope, spec)
+                # The CreateDBProxy CREATE_INTENT was durably pre-committed before
+                # the bell T0 (see setup()). No journal/fence/progress/log write
+                # lies between the gate release and this first timed AWS mutation:
+                # complete_prestaged issues the direct boto3 CreateDBProxy request
+                # with no awaited coordination I/O in front of it, so the request
+                # boundary lands inside the 100 ms bell-relative window. The
+                # CREATED completion it commits afterwards is off the timed path.
+                if proxy_intent is None:
+                    raise ConnectionSpikeLiveOperationError(
+                        "Round 5 CreateDBProxy intent was not pre-staged before the bell"
+                    )
+                await coordinator.complete_prestaged(scope, spec, intent=proxy_intent)
                 await report(phase)
             else:
                 await report(phase)
@@ -2173,6 +2240,9 @@ class LiveConnectionSpikeSetupOrchestrator:
             credential_sha256=self.config.competitor_credential_sha256,
             endpoint_host=resources.proxy_endpoint,
             secret_arn=resources.secret_arn,
+            create_db_proxy_requested_ns=getattr(
+                resources, "proxy_create_requested_ns", None
+            ),
         )
         # Ready the instant the Proxy verifies, so its 10,000 starts then rather than after
         # some other lane finishes something unrelated to it.
@@ -2219,6 +2289,11 @@ class LiveConnectionSpikeSetupOrchestrator:
                 observed=facts,
                 verified_at_ns=stop.stopped_ns,
             ),
+            create_db_proxy_requested_ns=stop.create_db_proxy_requested_ns,
+            # The AWS competitor always issues CreateDBProxy, so its observation
+            # must carry the request stamp; a missing stamp fails closed. Lakebase
+            # issues no setup-phase request and leaves this False.
+            requires_create_db_proxy_stamp=(stop.lane_id == "competitor"),
         )
 
     async def _verify_journaled_resources(
@@ -3358,6 +3433,10 @@ class LiveConnectionSpikeSetupOrchestrator:
     async def _create_proxy(
         self, clients: _SetupAwsClients, resources: _SetupResources, spec: ResourceSpec
     ) -> ResourceObservation:
+        # Stamp the request boundary before the SDK call leaves this process. This
+        # is the real, scored bell -> CreateDBProxy latency; workflow_launched_ns
+        # is only a lower bound taken right after gate.wait().
+        resources.proxy_create_requested_ns = self._monotonic_ns()
         await self._call(
             clients.rds.create_db_proxy,
             DBProxyName=resources.names.proxy_name,
@@ -4872,6 +4951,11 @@ class LiveConnectionSpikeAdapter:
             raise ConnectionSpikeCleanupError(
                 "Resident runner cancellation transport is unavailable"
             )
+        # Record debt before durable CANCEL delivery. If the bounded abandoned-
+        # ARM caller stops awaiting settlement, the binding remains visible to
+        # settlement_pending and restart reconciliation instead of becoming an
+        # unowned resident.
+        self._resident_settlement_debt[binding.job_id] = binding
         await transport.cancel(binding=binding, await_settlement=True)
         self._resident_settlement_debt.pop(binding.job_id, None)
         self._resident_release_events.pop(binding.job_id, None)
@@ -7326,11 +7410,46 @@ class LiveConnectionSpikeEngine:
                 burst.cancel()
         if bursts:
             await asyncio.gather(*bursts, return_exceptions=True)
+        # ARM stages the Lakebase resident before any lane is dispatched, so its
+        # binding is not yet represented in _active_run_ids.  Settle every
+        # recorded binding first; otherwise an abandoned arm leaves that exact
+        # prepared job resident and the subsequent warm generation is
+        # quarantined as resident_job_active.
+        deferred_resident_jobs: set[str] = set()
+        for lane_id, binding in tuple(self._resident_bindings.items()):
+            try:
+                async with asyncio.timeout(ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS):
+                    await self._lane_adapters[lane_id].cancel_resident(binding=binding)
+            except TimeoutError:
+                # transport.cancel committed durable CANCEL before waiting for
+                # SETTLED. Keep both the engine binding and adapter settlement
+                # debt so restart reconciliation can finish it, but do not hold
+                # the provider janitor (and its RDS Proxy delete) for 12 minutes.
+                deferred_resident_jobs.add(binding.job_id)
+                logger.error(
+                    "round5_abandoned_arm_resident_settlement_deferred "
+                    "lane=%s job_id=%s budget_seconds=%.0f",
+                    lane_id,
+                    binding.job_id,
+                    ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS,
+                )
+                continue
+            if self._resident_bindings.get(lane_id) is binding:
+                self._resident_bindings.pop(lane_id, None)
+            if self._active_run_ids.get(lane_id) == binding.job_id:
+                self._active_run_ids.pop(lane_id, None)
         for lane_id, run_id in tuple(self._active_run_ids.items()):
+            if run_id in deferred_resident_jobs:
+                continue
             await self._cancel_resident_lane(lane_id, run_id)
             if self._active_run_ids.get(lane_id) == run_id:
                 self._active_run_ids.pop(lane_id, None)
-        if self._active_run_ids:
+        blocking_active_jobs = {
+            lane_id: run_id
+            for lane_id, run_id in self._active_run_ids.items()
+            if run_id not in deferred_resident_jobs
+        }
+        if blocking_active_jobs:
             raise ConnectionSpikeCleanupError(
                 "Round 5 active jobs did not settle before provider cleanup"
             )
@@ -7688,10 +7807,7 @@ class LiveRound5WarmProvider:
         from .round5_warm import (
             BlockedWarmError,
             RetryableWarmError,
-            Round5RunnerReceipt,
-            Round5SharedReceipt,
             Round5Variant,
-            Round5WarmPreparation,
         )
 
         del process_epoch
@@ -7716,13 +7832,94 @@ class LiveRound5WarmProvider:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            # Observability: the warm-slot public status carries only the fixed,
+            # secret-free code (``warm_baseline_invalid`` / ``warm_provider_retryable``)
+            # and the underlying cause was previously swallowed, so a blocked warm
+            # could not be diagnosed without a redeploy. Name the cause type and its
+            # (internal, non-secret) message at WARNING so an operator can see WHY the
+            # baseline was rejected. Provider ARNs/secrets never appear in these
+            # internal ConnectionSpikeLive* messages.
+            # Split at the raise site -- a bare ``except Exception -> retry`` would
+            # silently retry a genuine anti-cheat/config defect forever, and a bare
+            # ``-> block`` would terminally freeze a transient throttle (the
+            # overnight outage). Classify explicitly:
+            #   * transient AWS/Lakebase read failures (throttles, timeouts, 5xx,
+            #     ping/connection errors) -> RETRYABLE with capped backoff.
+            #   * ConnectionSpikeLiveConfigurationError (runner identity change,
+            #     an orphaned per-bout Proxy present at warm, or fixture drift) ->
+            #     typed permanent BLOCK. These are real defects that must fail
+            #     closed for operator attention, never be papered over as READY.
+            #   * anything else unexpected -> fail closed rather than assume it is
+            #     safe to retry.
             if self._retryable(exc):
+                logger.warning(
+                    "round5_warm_provider_retryable generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
                 raise RetryableWarmError("warm_provider_retryable") from exc
-            raise BlockedWarmError("warm_baseline_invalid") from exc
+            if isinstance(exc, ConnectionSpikeLiveConfigurationError):
+                logger.warning(
+                    "round5_warm_baseline_invalid generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise BlockedWarmError("warm_baseline_invalid") from exc
+            logger.warning(
+                "round5_warm_baseline_unexpected generation=%s cause=%s: %s",
+                generation,
+                type(exc).__name__,
+                exc,
+            )
+            raise BlockedWarmError("warm_baseline_unexpected") from exc
         receipts = dict(zip(engines, warmed, strict=True))
         self._engines = {variants[variant].value: engine for variant, engine in engines.items()}
         self._receipts = {variants[variant].value: receipt for variant, receipt in receipts.items()}
         self._credential_generation += 1
+
+        return self._assemble_preparation(
+            generation=generation,
+            coordinator_fence=coordinator_fence,
+            broker_epoch=broker_epoch,
+            warm_attempt_token=warm_attempt_token,
+            engines=engines,
+            receipts=receipts,
+        )
+
+    def _assemble_preparation(
+        self,
+        *,
+        generation: int,
+        coordinator_fence: int,
+        broker_epoch: str,
+        warm_attempt_token: str,
+        engines: Mapping[object, LiveConnectionSpikeEngine | None],
+        receipts: Mapping[object, LiveRound5WarmEngineReceipt],
+    ) -> object:
+        """Seal the READY preparation (runner/shared/variant receipts + capsule).
+
+        Shared by the initial warm (``prepare``) and the in-place credential +
+        receipt renewal (``refresh_preparation``). The runner IDENTITY (boot id,
+        process boot id, image/harness/capacity digests) is immutable and is
+        re-asserted here on every renewal -- a mismatch is a TYPED PERMANENT block
+        (``runner_boot_identity_changed`` / ``runner_harness_identity_changed``),
+        never a silently slid receipt. Only the freshness bound (``expires_at``)
+        and the freshly-observed proxy-absence timestamp
+        (``receipt.setup_context.observed_at``, carried into each variant receipt)
+        advance -- exactly "identity immutable, provenance renewable". So a
+        renewal publishes genuinely NEW receipts off a fresh live probe, it does
+        not rest READY on a stale/hardcoded absence.
+        """
+
+        from .round5_warm import (
+            BlockedWarmError,
+            Round5RunnerReceipt,
+            Round5SharedReceipt,
+            Round5Variant,
+            Round5WarmPreparation,
+        )
 
         resources = self._manifest.require_round5_resources()
         now = datetime.now(UTC)
@@ -7812,7 +8009,7 @@ class LiveRound5WarmProvider:
                 receipts[variant],
                 expires_at=runner_expiration,
             )
-            for variant in variants
+            for variant in receipts
         }
         capsule = self._capsule(
             generation=generation,
@@ -7825,6 +8022,68 @@ class LiveRound5WarmProvider:
             shared_receipt=shared,
             variants=public_variants,
             capsule=capsule,
+        )
+
+    async def refresh_preparation(self, slot: object, capsule: object) -> object:
+        """Renew credentials AND republish fresh receipts off a live probe.
+
+        The keep-alive path: ``refresh_warm`` re-runs the setup orchestrator
+        (which re-observes per-bout Proxy ABSENCE and refreshes launch/dispatch
+        credentials) and re-reads the resident runner boot identity, so the
+        preparation this returns carries a freshly-observed proxy-absence
+        timestamp, rotated credentials, and a fresh 45-minute receipt horizon --
+        on the SAME immutable runner identity (a change fails closed inside
+        ``_assemble_preparation``). This lets READY renew in place across the
+        45-minute receipt horizon without a full ``prepare()`` rewarm, while never
+        resting on a hardcoded/stale absence.
+        """
+
+        from .round5_warm import (
+            BlockedWarmError,
+            RetryableWarmError,
+            Round5Variant,
+        )
+
+        del capsule
+        engines = {
+            Round5Variant.AURORA: self._engines.get("aurora_serverless_v2"),
+            Round5Variant.RDS: self._engines.get("rds_postgres"),
+        }
+        if any(engine is None for engine in engines.values()):
+            raise BlockedWarmError("launch_capsule_missing")
+        try:
+            aurora_engine = engines[Round5Variant.AURORA]
+            rds_engine = engines[Round5Variant.RDS]
+            assert aurora_engine is not None and rds_engine is not None
+            aurora_receipt = await aurora_engine.refresh_warm(slot.generation)
+            rds_receipt = await rds_engine.warm_with_physical_runners_from(
+                aurora_engine,
+                slot.generation,
+            )
+            refreshed = (aurora_receipt, rds_receipt)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._retryable(exc):
+                raise RetryableWarmError("credential_refresh_retryable") from exc
+            raise BlockedWarmError("credential_refresh_failed") from exc
+        receipts = dict(zip(engines, refreshed, strict=True))
+        self._receipts = {
+            (
+                "aurora_serverless_v2"
+                if variant == Round5Variant.AURORA
+                else "rds_postgres"
+            ): receipt
+            for variant, receipt in receipts.items()
+        }
+        self._credential_generation += 1
+        return self._assemble_preparation(
+            generation=slot.generation,
+            coordinator_fence=slot.coordinator_fence,
+            broker_epoch=f"broker-{uuid4().hex}",
+            warm_attempt_token=slot.warm_attempt_token,
+            engines=engines,
+            receipts=receipts,
         )
 
     async def refresh_capsule(

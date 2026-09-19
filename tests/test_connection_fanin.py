@@ -14,8 +14,10 @@ import pytest
 
 from runner import round5_fanin as runner
 from server.connection_fanin import (
+    ADVISORY_LAUNCH_SKEW_MS,
     FANIN_PROTOCOL,
     FANIN_SCHEMA_VERSION,
+    LAUNCH_SKEW_SEMANTICS,
     MAX_PREEXISTING_CLIENT_SESSIONS,
     OWNED_STALL_READY_BATCH,
     CapacityPreflight,
@@ -176,6 +178,36 @@ def finalize(raw: dict[str, object]):
     )
 
 
+def test_exact_10k_launch_skew_over_advisory_still_verifies() -> None:
+    # Over the 10 ms advisory target still verifies. Do not re-attach a
+    # launch-skew comparison to fairness or any other fatal gate.
+    raw = raw_lane("lakebase")
+    raw["launch_skew_ms"] = 10.53
+
+    lane = finalize(raw)
+
+    assert lane.initiated_clients == 10_000
+    assert lane.authenticated_clients == 10_000
+    assert lane.held_clients_at_gate == 10_000
+    assert lane.launch_skew_ms == pytest.approx(10.53)
+    assert lane.gates.fairness is True
+    assert lane.verified is True
+
+
+@pytest.mark.parametrize("skew", [None, float("nan")])
+def test_missing_or_nonfinite_launch_skew_evidence_fails_closed(
+    skew: float | None,
+) -> None:
+    raw = raw_lane("lakebase")
+    if skew is None:
+        raw.pop("launch_skew_ms")
+    else:
+        raw["launch_skew_ms"] = skew
+
+    with pytest.raises(FanInError, match="launch_skew_ms_invalid"):
+        finalize(raw)
+
+
 def worker_result(index: int, *, release_ns: int = 123) -> dict[str, object]:
     lanes = []
     for lane_id in ("lakebase", "competitor"):
@@ -254,6 +286,32 @@ def test_contract_and_runner_digests_are_exactly_the_same() -> None:
         replace(contract, target_clients_per_lane=9_999)
     with pytest.raises(ValueError, match="frozen"):
         replace(contract, initial_wave_size=251)
+
+
+def test_public_contract_marks_launch_skew_advisory_not_fatal() -> None:
+    """max_launch_skew_ms is a compatibility alias, not a validity max.
+
+    Verification already records skew over 10 ms without failing an exact
+    10k proof. Re-hardening that number, dropping launch_skew_semantics, or
+    treating the old key as a fatal gate is a contract regression.
+    """
+
+    contract = ConnectionSpikeContract()
+    public = contract.public_dict
+    runner_public = runner.contract_values()
+    assert public["advisory_launch_skew_ms"] == ADVISORY_LAUNCH_SKEW_MS
+    assert public["max_launch_skew_ms"] == public["advisory_launch_skew_ms"]
+    assert public["launch_skew_semantics"] == LAUNCH_SKEW_SEMANTICS
+    assert "not_fatal" in str(public["launch_skew_semantics"])
+    assert runner_public["advisory_launch_skew_ms"] == public["advisory_launch_skew_ms"]
+    assert runner_public["max_launch_skew_ms"] == public["max_launch_skew_ms"]
+    assert runner_public["launch_skew_semantics"] == public["launch_skew_semantics"]
+    with pytest.raises(ValueError, match="frozen"):
+        replace(contract, advisory_launch_skew_ms=0.0)
+    with pytest.raises(ValueError, match="frozen"):
+        replace(contract, launch_skew_semantics="fatal_validity_max")
+    with pytest.raises(ValueError, match="frozen"):
+        replace(contract, max_launch_skew_ms=0.0)
 
 
 def test_capacity_model_uses_measured_limits_and_fails_the_known_tight_runner() -> None:
@@ -1294,6 +1352,19 @@ def test_worker_aggregation_uses_one_shared_start_and_exact_partitions() -> None
         assert lane["telemetry_peak_cpu_capacity_fraction"] == pytest.approx(
             0.99
         )
+
+
+def test_worker_aggregation_keeps_launch_skew_advisory() -> None:
+    workers = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    for lane in workers[-1]["lanes"]:
+        lane["first_launch_ns"] = 10_530_123
+
+    aggregated = runner.aggregate_worker_results(workers)
+
+    for raw in aggregated["lanes"]:
+        assert raw["launch_skew_ms"] == pytest.approx(10.53)
+        assert raw["fairness_verified"] is True
+        assert raw["identity_verified"] is True
 
 
 def test_partition_sampling_indices_cover_all_groups_without_global_indexing() -> None:

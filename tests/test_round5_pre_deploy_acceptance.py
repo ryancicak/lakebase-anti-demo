@@ -791,6 +791,12 @@ async def test_create_proxy_is_first_aws_mutation_and_competitor_waits_for_gate(
             del scope
             order.append(f"mutate:{spec.resource_kind}")
 
+        async def complete_prestaged(self, scope, spec, *, intent) -> None:
+            # Proxy CREATE_INTENT pre-committed before T0; the timed path issues
+            # the mutation with no coordination I/O in front of it.
+            del scope, intent
+            order.append(f"mutate:{spec.resource_kind}")
+
     async def report(callback, lane_id, phase, status, **kwargs) -> None:
         del callback, lane_id, status, kwargs
         order.append(f"progress:{phase}")
@@ -837,6 +843,9 @@ async def test_create_proxy_is_first_aws_mutation_and_competitor_waits_for_gate(
         [1_000_000_000],
         None,
         lane_ready,
+        None,
+        None,
+        SimpleNamespace(ordinal=1, resource_kind="rds_proxy"),
     )
 
     assert order[0] == "mutate:rds_proxy"

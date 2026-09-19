@@ -7,6 +7,9 @@ local transition (startup stage/active recovery, incoming PRELOAD/STAGE, worker
 spawn/stop, heartbeat, file replacement) is gated on an exact, lane-bound
 disposition -- current / superseded / terminal / unknown -- computed against the
 same authoritative slot/outbox/event relations the write-side RLS gate consults.
+Cancelled RELEASE is a separate disposition: it is ACKed without opening the
+gate or destructively discarding the active job, so the following FIFO CANCEL
+can settle normally.
 
 These tests drive the real ``_resident_agent`` loop against an in-memory control
 plane that emulates the disposition classifier and the RLS ``WITH CHECK`` insert
@@ -27,6 +30,7 @@ Scenario map (from the review):
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from pathlib import Path
@@ -112,21 +116,25 @@ class _FakeControlPlane:
         self.current_token: dict[tuple[str, int], str] = {}
         # dispatched control events: keyed identity -> stripped binding
         self.outbox: dict[tuple, dict] = {}
+        self.outbox_kinds: dict[tuple, Round5ControlKind] = {}
+        self.cancelled_jobs: set[tuple[str, str, int, str, str]] = set()
         self.events: list[dict] = []
 
     def dispatch(self, event: Round5ControlEvent) -> None:
         b = event.binding
         stripped = {k: v for k, v in b.wire_value().items() if k != "runner_process_boot_id"}
-        self.outbox[
-            (
-                b.installation_id,
-                b.lane_id,
-                b.generation,
-                b.warm_attempt_token,
-                b.job_id,
-                event.event_id,
-            )
-        ] = stripped
+        key = (
+            b.installation_id,
+            b.lane_id,
+            b.generation,
+            b.warm_attempt_token,
+            b.job_id,
+            event.event_id,
+        )
+        self.outbox[key] = stripped
+        self.outbox_kinds[key] = event.kind
+        if event.kind == Round5ControlKind.CANCEL:
+            self.cancelled_jobs.add(key[:5])
 
     def make_current(self, token: str) -> None:
         self.current_token[(INSTALLATION, GENERATION)] = token
@@ -139,6 +147,11 @@ class _FakeControlPlane:
         outbox = self.outbox.get(key)
         if outbox is None or outbox != stripped:
             return "unknown"
+        if (
+            self.outbox_kinds[key] == Round5ControlKind.RELEASE
+            and key[:5] in self.cancelled_jobs
+        ):
+            return "cancelled"
         if any(
             ev["installation"] == installation
             and ev["lane"] == lane
@@ -302,8 +315,10 @@ class _FakeSecrets:
 def _install_fakes(monkeypatch, tmp_path: Path, plane: _FakeControlPlane, sqs: _FakeSqs) -> None:
     monkeypatch.setattr(runner, "JOB_ROOT", tmp_path / "jobs")
     monkeypatch.setattr(runner, "RESIDENT_ATTESTATION_DIR", tmp_path / "run")
+    monkeypatch.setattr(runner, "RESIDENT_LOCK_PATH", tmp_path / "resident.lock")
     (tmp_path / "run").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(runner, "ResidentShardPool", _FakePool)
+    monkeypatch.setattr(runner.secrets, "token_hex", lambda _size: "0" * 32)
 
     def fake_boto_client(name: str):
         if name == "sqs":
@@ -430,6 +445,106 @@ async def test_delayed_preload_after_supersession_is_acked_without_touching_curr
 
 
 # --------------------------------------------------------------------------- #
+# Cancellation fence: RELEASE was already being sent when CANCEL committed.
+# --------------------------------------------------------------------------- #
+async def test_cancelled_inflight_release_never_opens_gate_and_fifo_cancel_settles(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    plane = _FakeControlPlane()
+    job_id = "a" * 64
+    preload, request = _preload_event(
+        lane_id="lakebase",
+        token="attempt-A",
+        job_id=job_id,
+    )
+    claimed = Round5ControlBinding(
+        **{
+            **preload.binding.wire_value(),
+            "claim_id": "claim-one",
+            "bout_id": "bout-one",
+            "bell_id": "bell-one",
+            "fence": 1,
+            "runner_process_boot_id": "process-" + "0" * 32,
+        }
+    )
+    stage = Round5ControlEvent.create(
+        binding=claimed,
+        sequence=1,
+        kind=Round5ControlKind.STAGE,
+        payload={"request": request},
+    )
+    release = Round5ControlEvent.create(
+        binding=claimed,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    cancel = Round5ControlEvent.create(
+        binding=claimed,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+    )
+    for event in (preload, stage, release, cancel):
+        plane.dispatch(event)
+    plane.make_current("attempt-A")
+
+    launched: list[bool] = []
+
+    async def execute(
+        _request,
+        _targets,
+        cancelled,
+        *,
+        resident_pool=None,
+        resident_release_gate=None,
+        on_resident_prepared=None,
+    ):
+        del resident_pool
+        assert resident_release_gate is not None
+        assert on_resident_prepared is not None
+        await on_resident_prepared()
+        cancel_wait = asyncio.create_task(cancelled.wait())
+        release_wait = asyncio.create_task(resident_release_gate.wait())
+        done, pending = await asyncio.wait(
+            {cancel_wait, release_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        launched.append(release_wait in done)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        raise runner.RunnerContractError("resident_cancelled")
+
+    monkeypatch.setattr(runner, "_execute_fanin_request", execute)
+    monkeypatch.setattr(
+        runner,
+        "_decode_fanin_request",
+        lambda _encoded: (job_id, (), "", request),
+    )
+    sqs = await _drive(
+        monkeypatch,
+        tmp_path,
+        plane,
+        batches=[
+            [{"Body": preload.encoded_body(), "ReceiptHandle": "preload"}],
+            [{"Body": stage.encoded_body(), "ReceiptHandle": "stage"}],
+            [{"Body": release.encoded_body(), "ReceiptHandle": "release"}],
+            [{"Body": cancel.encoded_body(), "ReceiptHandle": "cancel"}],
+            [],
+            [],
+        ],
+    )
+
+    assert launched == [False], (
+        [(event["kind"], event["payload"]) for event in plane.events],
+        sqs.deleted,
+    )
+    assert {"release", "cancel"}.issubset(sqs.deleted)
+    assert not any(event["kind"] == "quarantined" for event in plane.events)
+    assert any(event["kind"] == "settled" for event in plane.events)
+
+
+# --------------------------------------------------------------------------- #
 # Scenario 4: token rotates between the precheck and the readiness insert.
 # --------------------------------------------------------------------------- #
 async def test_rotation_between_precheck_and_insert_is_superseded_not_crash(
@@ -531,6 +646,63 @@ async def test_stale_heartbeat_clears_only_matching_identity_and_survives(
 # --------------------------------------------------------------------------- #
 # Scenario 6: a terminal (already-settled) job recovered from active.json.
 # --------------------------------------------------------------------------- #
+async def test_startup_cancelled_release_settles_before_fifo_cancel(monkeypatch, tmp_path) -> None:
+    plane = _FakeControlPlane()
+    preload, request = _preload_event(
+        lane_id="lakebase",
+        token="attempt-A",
+        job_id="a" * 64,
+    )
+    claimed = Round5ControlBinding(
+        **{
+            **preload.binding.wire_value(),
+            "claim_id": "claim-one",
+            "bout_id": "bout-one",
+            "bell_id": "bell-one",
+            "fence": 1,
+            "runner_process_boot_id": "process-" + "0" * 32,
+        }
+    )
+    release = Round5ControlEvent.create(
+        binding=claimed,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    cancel = Round5ControlEvent.create(
+        binding=claimed,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+    )
+    plane.dispatch(release)
+    plane.dispatch(cancel)
+    plane.make_current("attempt-A")
+    jobs = tmp_path / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    (jobs / "resident-lakebase-active.json").write_text(
+        json.dumps(
+            {
+                "event": release.wire_value(),
+                "request": request,
+                "state": "released",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sqs = await _drive(
+        monkeypatch,
+        tmp_path,
+        plane,
+        batches=[[{"Body": cancel.encoded_body(), "ReceiptHandle": "cancel"}]],
+    )
+
+    settled = [event for event in plane.events if event["kind"] == "settled"]
+    assert [event["payload"] for event in settled] == [{"state": "cancelled"}]
+    assert not any(event["kind"] == "quarantined" for event in plane.events)
+    assert "cancel" in sqs.deleted
+    assert not (jobs / "resident-lakebase-active.json").exists()
+
+
 async def test_startup_terminal_active_emits_no_duplicate_settlement(monkeypatch, tmp_path) -> None:
     plane = _FakeControlPlane()
     event_a, request_a = _preload_event(lane_id="lakebase", token="attempt-A", job_id="a" * 64)
@@ -636,6 +808,40 @@ def test_resident_event_disposition_maps_each_classification(monkeypatch) -> Non
     plane.dispatch(event_a)
     plane.make_current("attempt-A")
     assert classify() == "current"
+    claimed_binding = Round5ControlBinding(
+        **{
+            **event_a.binding.wire_value(),
+            "claim_id": "claim-one",
+            "bout_id": "bout-one",
+            "bell_id": "bell-one",
+            "fence": 1,
+        }
+    )
+    cancel = Round5ControlEvent.create(
+        binding=claimed_binding,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+    )
+    release = Round5ControlEvent.create(
+        binding=claimed_binding,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    plane.dispatch(release)
+    plane.dispatch(cancel)
+    assert (
+        runner._resident_event_disposition(
+            "postgresql://x",
+            installation_id=INSTALLATION,
+            lane_id="lakebase",
+            generation=GENERATION,
+            warm_attempt_token="attempt-A",
+            job_id="a" * 64,
+            event_id=release.event_id,
+            binding=claimed_binding.wire_value(),
+        )
+        == "cancelled"
+    )
     plane.make_current("attempt-B")
     assert classify() == "superseded"
     plane.make_current("attempt-A")
@@ -708,12 +914,15 @@ def test_disposition_function_binds_exact_identity_and_is_locked_down() -> None:
     assert "control.warm_attempt_token = p_warm_attempt_token" in source
     assert "control.job_id = p_job_id" in source
     assert "(control.payload -> 'binding') - 'runner_process_boot_id'::text" in source
-    # Classification order: unknown -> terminal -> current -> superseded.
+    # Classification order: unknown -> cancelled RELEASE -> terminal -> current
+    # -> stale-attempt superseded.
     unknown = source.index("THEN 'unknown'")
+    cancelled_release = source.index("release.event_id = p_event_id", unknown)
+    cancelled = source.index("THEN 'cancelled'", cancelled_release)
     terminal = source.index("THEN 'terminal'")
     current = source.index("THEN 'current'")
     superseded = source.index("ELSE 'superseded'")
-    assert unknown < terminal < current < superseded
+    assert unknown < cancelled_release < cancelled < terminal < current < superseded
     # Locked down like the write-side authorizer.
     assert "SECURITY DEFINER" in source
     assert "SET search_path = pg_catalog" in source

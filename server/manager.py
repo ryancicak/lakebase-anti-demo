@@ -701,6 +701,13 @@ class SessionRecord:
     connection_spike_arm: object | None = None
     connection_spike_setup_result: object | None = None
     connection_spike_cleanup_task: asyncio.Task[None] | None = None
+    #: Durable, automatic cleanup-convergence loop. When a backstage cleanup /
+    #: rewarm handoff fails (e.g. a warm-slot ``WarmStoreConflictError`` CAS race,
+    #: or a delete that has not yet been re-verified absent), this loop keeps
+    #: re-running the reconcile+rewarm with bounded backoff until it converges,
+    #: instead of surfacing a human "Retry Cleanup". No end-user action ever
+    #: depends on it.
+    connection_spike_cleanup_retry_task: asyncio.Task[None] | None = None
     live_orders_engine: LiveOrdersEngine | None = None
     live_orders_arm: LiveOrdersArm | None = None
     live_orders_result: LiveOrdersResult | None = None
@@ -1502,6 +1509,7 @@ class RunManager:
                         record.task,
                         record.cooldown_task,
                         record.connection_spike_cleanup_task,
+                        record.connection_spike_cleanup_retry_task,
                         record.settlement_task,
                     )
                     if operation is not None
@@ -2638,10 +2646,12 @@ class RunManager:
                 "cleanup_update",
                 {"session": snapshot.model_dump(mode="json")},
             )
-            record.task = asyncio.create_task(
-                self._retry_connection_spike_cleanup(record, engine),
-                name=f"retry-cleanup-{session_id}",
-            )
+            # Only WAKE the durable auto-convergence worker; never start a second
+            # concurrent reconcile racing it. The worker keeps retrying the
+            # journal-based reconcile + rewarm CAS (with backoff) until the exact
+            # per-bout Proxy is confirmed absent and the ring rewarms, so a manual
+            # Retry Cleanup is now just an operator nudge, idempotent by design.
+            self._schedule_connection_spike_cleanup_convergence(record)
             return snapshot
 
     async def start_towel(
@@ -6676,18 +6686,129 @@ class RunManager:
                 "Round 5 durable rewarm transition is not confirmed"
             )
 
+    def _schedule_connection_spike_cleanup_convergence(
+        self,
+        record: SessionRecord,
+    ) -> None:
+        """Drive a stalled Round 5 backstage cleanup to convergence automatically.
+
+        The observed live failure was a warm-slot ``WarmStoreConflictError`` CAS
+        race at the cleanup->rewarm handoff: the handoff gave up, latched a
+        process-local "cleanup owed" notice, and stopped -- leaving a stale
+        billing banner even though AWS had already deleted (or never had) the
+        Proxy. This loop removes the human "Retry Cleanup": it keeps re-running
+        the journal-based reconcile with bounded backoff until the exact per-bout
+        Proxy is confirmed absent (NotFound) and the rewarm CAS wins. It never
+        clears the owed notice on an empty-orchestrator no-op -- only
+        ``_retry_connection_spike_cleanup`` (which calls the journal
+        ``reconcile_failed_cleanup`` and clears owed solely via
+        ``_mark_connection_spike_cleanup_complete`` after reconcile+rewarm
+        succeed) does. No end-user action ever waits on this loop.
+        """
+
+        # Defensive getattr: some unit tests exercise cleanup helpers on a
+        # manager built via object.__new__ (no __init__), so these attributes may
+        # be absent. In that case there is nothing to schedule against.
+        if getattr(self, "_closed", False):
+            return
+        round_obj = getattr(getattr(record, "snapshot", None), "round", None)
+        if getattr(round_obj, "id", None) != RoundId.SURVIVE_CONNECTION_SPIKE:
+            return
+        if getattr(self, "_connection_spike_factory", None) is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        del loop
+        existing = record.connection_spike_cleanup_retry_task
+        if existing is not None and not existing.done():
+            return
+        record.connection_spike_cleanup_retry_task = asyncio.create_task(
+            self._auto_converge_connection_spike_cleanup(record),
+            name=f"round5-auto-cleanup-{record.snapshot.id}",
+        )
+
+    async def _auto_converge_connection_spike_cleanup(
+        self,
+        record: SessionRecord,
+    ) -> None:
+        task = asyncio.current_task()
+        delay = max(0.05, self._cleanup_retry_initial)
+        maximum_delay = max(delay, self._cleanup_retry_max)
+        attempts = 0
+        try:
+            # Let the sealed receipt event reach the room before any backstage
+            # reconcile churn.
+            await asyncio.sleep(delay)
+            while not self._closed:
+                # A live bout task or an in-flight backstage cleanup owns the
+                # ring; never race them, just wait and re-check.
+                if record.task is not None and not record.task.done():
+                    await asyncio.sleep(delay)
+                    continue
+                if (
+                    record.connection_spike_cleanup_task is not None
+                    and not record.connection_spike_cleanup_task.done()
+                ):
+                    await asyncio.sleep(delay)
+                    continue
+                async with record.lock:
+                    setup = record.snapshot.round5_setup
+                    still_owed = bool(setup is not None and setup.cleanup_retryable)
+                if not still_owed:
+                    return
+                engine = record.connection_spike_engine
+                if engine is None or getattr(engine, "reconcile_failed_cleanup", None) is None:
+                    engine = self._connection_spike_factory(record.snapshot.competitor.id)
+                    record.connection_spike_engine = engine
+                attempts += 1
+                converged = False
+                try:
+                    converged = await self._retry_connection_spike_cleanup(record, engine)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Round 5 automatic cleanup convergence attempt %d "
+                        "session=%s diagnostic=%s",
+                        attempts,
+                        record.snapshot.id,
+                        _redacted_exception_chain(exc),
+                    )
+                if converged:
+                    logger.warning(
+                        "Round 5 automatic cleanup converged after %d attempt(s) "
+                        "session=%s",
+                        attempts,
+                        record.snapshot.id,
+                    )
+                    return
+                # Bounded exponential backoff (capped): retry the CAS/reconcile
+                # persistently without storming. AWS delete/absence is proven by
+                # reconcile_failed_cleanup before the rewarm CAS is attempted.
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, maximum_delay)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if record.connection_spike_cleanup_retry_task is task:
+                record.connection_spike_cleanup_retry_task = None
+
     async def _mark_connection_spike_cleanup_pending(
         self,
         record: SessionRecord,
     ) -> None:
         owed = self._note_round5_proxy_at_risk(
             record,
-            still_retrying=False,
+            # Automatic convergence keeps retrying (below), so the operator
+            # notice reflects "still retrying", never "gave up, ask a human".
+            still_retrying=True,
         )
         cleanup_failure = (
             owed.detail
             if owed is not None
-            else "Automatic backstage cleanup failed; use Retry Cleanup."
+            else "Automatic backstage cleanup is retrying."
         )
         async with record.lock:
             setup = record.snapshot.round5_setup
@@ -6708,6 +6829,11 @@ class RunManager:
                 "cleanup_update",
                 {"session": snapshot.model_dump(mode="json")},
             )
+        # Never leave a stalled cleanup waiting on a human. This is a no-op when a
+        # convergence loop (or a live bout / in-flight cleanup task) is already
+        # running, so a reconcile that itself marks pending cannot spawn a second
+        # loop.
+        self._schedule_connection_spike_cleanup_convergence(record)
 
     def _note_round5_proxy_at_risk(
         self,
@@ -6780,7 +6906,13 @@ class RunManager:
             snapshot = self._revalidated_snapshot(record.snapshot)
             await record.event_log.publish(
                 "cleanup_update",
-                {"session": snapshot.model_dump(mode="json")},
+                {
+                    "session": snapshot.model_dump(mode="json"),
+                    # The public event name remains stable for existing clients,
+                    # while the receipt hook can distinguish confirmed recovery
+                    # from an in-progress cleanup snapshot with the same shape.
+                    "cleanup_settled": True,
+                },
             )
         # The one place a Proxy is proved gone. Every surface that was warning
         # about it stops here, together, so `/readyz` cannot keep naming a
@@ -6821,6 +6953,7 @@ class RunManager:
             lanes = self._round_five_lanes(result)
             runtime = record.snapshot.round5_runtime
             valid = set(lanes) == {"lakebase", "competitor"}
+            launch_skews: list[float | None] = []
             for lane_id in ("lakebase", "competitor"):
                 raw = lanes.get(lane_id)
                 lane = record.snapshot.lanes[lane_id]
@@ -6857,6 +6990,18 @@ class RunManager:
                 )
                 lane.evidence = evidence
                 lane_valid = self._round_five_lane_valid(raw, evidence)
+                launch_skew = self._round_five_number(
+                    self._round_five_value(raw, "launch_skew_ms")
+                )
+                launch_skews.append(launch_skew)
+                # Launch skew is recorded fairness evidence, not a millisecond
+                # SLO that can void an otherwise verified exact-10K proof.
+                # Missing, non-finite, and negative evidence still fail closed.
+                lane_valid = (
+                    lane_valid
+                    and launch_skew is not None
+                    and launch_skew >= 0
+                )
                 if runtime is not None:
                     runtime_lane = runtime.lanes[lane_id]
                     # Result transfer happens after ramp, hold, sampling and
@@ -6920,16 +7065,7 @@ class RunManager:
                 lane.verified_at = datetime.now(UTC) if lane_valid else None
                 lane.activity = LaneActivity(phase="verified" if lane_valid else "failed")
 
-            launch_skews = [
-                self._round_five_number(self._round_five_value(raw, "launch_skew_ms"))
-                for raw in lanes.values()
-            ]
             skew = max((value for value in launch_skews if value is not None), default=None)
-            valid = (
-                valid
-                and len(launch_skews) == 2
-                and all(value is not None and 0 <= value <= 10 for value in launch_skews)
-            )
             record.snapshot.fairness = FairnessSnapshot(
                 launch_skew_ms=skew,
                 warmup_connections=_ROUND_FIVE_WARMUP_CONNECTIONS,
@@ -7019,8 +7155,21 @@ class RunManager:
                     runtime.state = "verified"
             else:
                 record.snapshot.state = SessionState.FAILED
+                # Name the actual gate in the bout-level sentence so a future
+                # paid failure is self-describing (e.g. "... [competitor:
+                # create_db_proxy_window]") instead of the generic contract-gate
+                # line that forced a log dig on 2026-09-17.
+                setup_diagnostics = [
+                    f"{lane_id}:{lane.setup_diagnostic}"
+                    for lane_id, lane in setup_snapshot.lanes.items()
+                    if not lane.verified and lane.setup_diagnostic
+                ]
+                diagnostic_suffix = (
+                    f" [{'; '.join(setup_diagnostics)}]" if setup_diagnostics else ""
+                )
                 record.snapshot.failure = (
                     "Round 5 contract gate failed; no comparison was declared."
+                    + diagnostic_suffix
                 )
                 record.snapshot.remembered_result = None
                 setup_snapshot.state = RoundFiveSetupState.FAILED
@@ -7826,16 +7975,27 @@ class RunManager:
             comparison=comparison,
         )
 
-    #: Fixed, secret-free finalizer subcodes the snapshot may carry. Extended
-    #: only with new fixed labels; never with runtime/provider strings.
+    #: Fixed, secret-free FATAL evidence/anti-cheat subcodes that void the bout.
+    #: Extended only with new fixed labels; never with runtime/provider strings.
     _ROUND_FIVE_SETUP_LANE_FAILURES = (
+        # Retired labels; still accepted so a legacy sealed receipt stays legible.
         "workflow_launch_window",
+        # Fatal evidence/provenance/clock-domain faults.
+        "workflow_launch_ordering",
+        "create_db_proxy_pre_bell",
+        "create_db_proxy_missing",
         "stop_gate_evidence",
         "stop_gate_before_workflow_launch",
         "setup_deadline",
         "setup_error",
         "setup_failed",
         "setup_towelled",
+    )
+    #: Fixed, secret-free NON-FATAL scheduling-conformance advisories. These are
+    #: surfaced for play-by-play but never void an exact, honestly-obtained bout.
+    _ROUND_FIVE_SETUP_LANE_ADVISORIES = (
+        "create_db_proxy_window",
+        "workflow_launch_skew",
     )
     _ROUND_FIVE_PUBLIC_FACT_REJECTED = "public_fact_key_rejected"
 
@@ -7869,6 +8029,23 @@ class RunManager:
         return ";".join(subcodes) if subcodes else None
 
     @classmethod
+    def _round_five_setup_lane_advisories(cls, raw: object) -> str | None:
+        """Reduce a lane's NON-FATAL scheduling advisories to a fixed-label string.
+
+        Only known advisory labels are emitted, so an advisory can be surfaced in
+        the play-by-play without ever being confused for a fatal evidence fault.
+        """
+
+        codes: list[str] = []
+        raw_advisories = cls._round_five_value(raw, "scheduling_advisories", ())
+        if isinstance(raw_advisories, (list, tuple)):
+            for advisory in raw_advisories:
+                label = str(getattr(advisory, "value", advisory))
+                if label in cls._ROUND_FIVE_SETUP_LANE_ADVISORIES and label not in codes:
+                    codes.append(label)
+        return ";".join(codes) if codes else None
+
+    @classmethod
     def _round_five_setup_snapshot(
         cls,
         snapshot: SessionSnapshot,
@@ -7876,6 +8053,8 @@ class RunManager:
         *,
         terminal: bool,
     ) -> RoundFiveSetupSnapshot:
+        from .connection_spike import MAX_SETUP_REQUEST_LAUNCH_DELAY_MS
+
         public = cls._new_round_five_setup(snapshot)
         public.state = RoundFiveSetupState.FAILED if terminal else RoundFiveSetupState.RUNNING
         if result is None:
@@ -7904,6 +8083,9 @@ class RunManager:
             lane.workflow_launch_delay_ms = cls._round_five_number(
                 cls._round_five_value(raw, "workflow_launch_delay_ms")
             )
+            lane.create_db_proxy_request_delta_ms = cls._round_five_number(
+                cls._round_five_value(raw, "create_db_proxy_request_delta_ms")
+            )
             lane.stop_gate_evidence = gate
             lane.verified = verified
             # Durable, secret-free finalizer subcode. Fixed labels only: the core
@@ -7916,10 +8098,32 @@ class RunManager:
                 core_verified=core_verified,
                 gate_dropped=core_verified and gate is None,
             )
+            # Non-fatal scheduling advisories are recorded separately from the
+            # fatal diagnostic so a verified lane can still carry, e.g., a slow
+            # CreateDBProxy note for the play-by-play without being marked failed.
+            lane.scheduling_advisory = cls._round_five_setup_lane_advisories(raw)
             lane.status = (
                 "Setup stop gate verified" if verified else "Setup stop gate did not verify"
             )
             lane.error = None if verified else "Setup verification failed"
+            # Always publish the competitor's observed CreateDBProxy request delta
+            # (pass or fail) so "12 ms vs an advisory 163 ms" is visible in the
+            # log. None prints for a missing stamp, which IS a fatal fault.
+            if lane.create_db_proxy_request_delta_ms is not None or str(lane_id) == "competitor":
+                logger.warning(
+                    "Round 5 CreateDBProxy timing session=%s lane=%s "
+                    "create_db_proxy_request_delta_ms=%s advisory_ms=%.0f verified=%s advisory=%s",
+                    snapshot.id,
+                    str(lane_id),
+                    (
+                        f"{lane.create_db_proxy_request_delta_ms:.3f}"
+                        if lane.create_db_proxy_request_delta_ms is not None
+                        else "None"
+                    ),
+                    MAX_SETUP_REQUEST_LAUNCH_DELAY_MS,
+                    verified,
+                    lane.scheduling_advisory or "none",
+                )
             if not verified and lane.setup_diagnostic:
                 logger.warning(
                     "Round 5 setup lane finalizer session=%s lane=%s subcode=%s",

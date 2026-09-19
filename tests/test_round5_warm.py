@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -9,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from server.round5_warm import (
+    MAX_PROVENANCE_PROBE_FAILURES,
+    SELF_VERIFIABLE_BLOCK_RETRY_SECONDS,
     BlockedWarmError,
     InMemoryRound5WarmStore,
     LakebaseRound5WarmStore,
@@ -171,6 +174,10 @@ class Provider:
         self.validate_calls = 0
         self.prepare_error: Exception | None = None
         self.refresh_error: Exception | None = None
+        self.validate_error: Exception | None = None
+        self.refresh_preparation_override: (
+            Callable[[object, Round5LaunchCapsule], Round5WarmPreparation] | None
+        ) = None
         self.attempt_tokens: list[str] = []
 
     async def reconcile(self, slot) -> bool:
@@ -181,6 +188,8 @@ class Provider:
     async def validate_ready(self, slot, launch_capsule) -> bool:
         del slot, launch_capsule
         self.validate_calls += 1
+        if self.validate_error is not None:
+            raise self.validate_error
         return self.provenance_current
 
     async def prepare(
@@ -215,6 +224,28 @@ class Provider:
         if self.refresh_error is not None:
             raise self.refresh_error
         return capsule(
+            self.clock,
+            generation=slot.generation,
+            fence=slot.coordinator_fence,
+            credential_generation=previous.credential_generation + 1,
+            warm_attempt_token=previous.warm_attempt_token,
+        )
+
+    async def refresh_preparation(
+        self,
+        slot,
+        previous: Round5LaunchCapsule,
+    ) -> Round5WarmPreparation:
+        # The keep-alive republishes a FRESH preparation off a live probe:
+        # the runner identity (boot ids / digests) is deterministic here, so it
+        # is byte-identical to the warm's receipts (immutable identity), while
+        # expires_at advances to clock.now + horizon (renewable provenance).
+        self.refresh_calls += 1
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        if self.refresh_preparation_override is not None:
+            return self.refresh_preparation_override(slot, previous)
+        return preparation(
             self.clock,
             generation=slot.generation,
             fence=slot.coordinator_fence,
@@ -456,19 +487,34 @@ async def test_credential_rotation_swaps_capsule_without_losing_readiness() -> N
     assert (await manager.public_status())["round5_ring_ready"] is True
 
 
-async def test_refresh_failure_removes_readiness_before_margin_is_lost() -> None:
+async def test_retryable_refresh_stays_ready_then_escalates_when_margin_lost() -> None:
+    # A transient (throttled/timed-out) credential+receipt refresh is an in-place
+    # retry, NOT a teardown: the still-held capsule is valid, so READY persists and
+    # the beat retries shortly. Only once the held credential can no longer meet
+    # the launch margin does it escalate to a full rewarm (freshness_lost).
     clock = Clock()
     provider = Provider(clock)
     manager = coordinator(clock, provider)
     await warm_ready(manager, provider)
     provider.refresh_error = RetryableWarmError("credential_refresh_timeout")
-    clock.advance(2_001)
 
+    clock.advance(2_001)  # past renew_by, launch margin still held
+    delay = await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    # Stays READY and keeps the capsule (in-place retry), NOT torn down to WARMING.
+    # It is briefly un-claimable because renew_by has passed and the refresh has
+    # not yet succeeded -- a short retry, not a full rewarm.
+    assert slot.state == Round5WarmState.READY
+    assert manager.capsule is not None
+    assert delay > 0
+
+    clock.advance(200)  # now the held credential can no longer meet the margin
     await manager.run_one_cycle()
-
     slot = await manager.store.read("install-one")
     assert slot is not None
     assert slot.state == Round5WarmState.WARMING
+    assert slot.last_error_code == "credential_refresh_retryable"
     assert manager.capsule is None
     assert (await manager.public_status())["round5_ring_ready"] is False
 
@@ -514,6 +560,24 @@ async def test_each_warm_retry_uses_a_new_durable_attempt_token() -> None:
     assert provider.attempt_tokens == [first, slot.warm_attempt_token]
 
 
+def _refreshed_preparation(
+    clock: Clock,
+    slot,
+    previous: Round5LaunchCapsule,
+    **capsule_overrides: object,
+) -> Round5WarmPreparation:
+    prep = preparation(
+        clock,
+        generation=slot.generation,
+        fence=slot.coordinator_fence,
+        credential_generation=previous.credential_generation + 1,
+        warm_attempt_token=previous.warm_attempt_token,
+    )
+    if capsule_overrides:
+        return replace(prep, capsule=replace(prep.capsule, **capsule_overrides))
+    return prep
+
+
 async def test_expired_renew_by_refresh_fails_closed_without_refresh_loop() -> None:
     clock = Clock()
     provider = Provider(clock)
@@ -521,26 +585,296 @@ async def test_expired_renew_by_refresh_fails_closed_without_refresh_loop() -> N
     await warm_ready(manager, provider)
     clock.advance(2_001)
 
-    async def expired(slot, previous):
-        provider.refresh_calls += 1
-        return replace(
-            capsule(
-                clock,
-                generation=slot.generation,
-                fence=slot.coordinator_fence,
-                credential_generation=2,
-                warm_attempt_token=previous.warm_attempt_token,
-            ),
-            renew_by=clock.now - timedelta(seconds=1),
-        )
-
-    provider.refresh_capsule = expired
+    provider.refresh_preparation_override = lambda slot, previous: _refreshed_preparation(
+        clock, slot, previous, renew_by=clock.now - timedelta(seconds=1)
+    )
     assert await manager.run_one_cycle() == 0.0
     slot = await manager.store.read("install-one")
     assert slot is not None
     assert slot.state == Round5WarmState.WARMING
     assert slot.last_error_code == "credential_refresh_expired"
     assert provider.refresh_calls == 1
+
+
+async def test_refresh_returning_under_margined_capsule_fails_closed() -> None:
+    # A refresh that returns a capsule whose control credentials are too short to
+    # cover the launch margin must fail closed (WARMING, capsule dropped), never
+    # publish a READY that cannot actually launch a bout in time.
+    clock = Clock()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider)
+    await warm_ready(manager, provider)
+    clock.advance(2_001)
+
+    provider.refresh_preparation_override = lambda slot, previous: _refreshed_preparation(
+        clock,
+        slot,
+        previous,
+        control_expires_at=clock.now + timedelta(seconds=10),
+        dispatch_expires_at={
+            "lakebase": clock.now + timedelta(seconds=10),
+            "competitor": clock.now + timedelta(seconds=10),
+        },
+        expires_at=clock.now + timedelta(seconds=10),
+        renew_by=clock.now + timedelta(seconds=5),
+    )
+    assert await manager.run_one_cycle() == 0.0
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.WARMING
+    assert slot.last_error_code == "credential_margin_insufficient"
+    assert manager.capsule is None
+
+
+async def test_retryable_prepare_backs_off_then_self_heals_to_ready() -> None:
+    # A retryable warm failure records a future next_retry_at and does NOT block;
+    # a cycle before that instant does zero extra prepare work; once the backoff
+    # elapses and the transient clears, the slot reaches READY with no sticky error.
+    clock = Clock()
+    provider = Provider(clock)
+    provider.prepare_error = RetryableWarmError("baseline_probe_throttled")
+    manager = coordinator(clock, provider)
+    provider.release_prepare.set()
+
+    await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.WARMING
+    assert slot.next_retry_at is not None and slot.next_retry_at > clock.now
+    assert slot.last_error_code == "baseline_probe_throttled"
+    first_attempts = slot.attempt_count
+    prepare_after_first = provider.prepare_calls
+
+    # A cycle before next_retry_at must not re-run prepare.
+    await manager.run_one_cycle()
+    assert provider.prepare_calls == prepare_after_first
+
+    # A second failure escalates the backoff window (attempt_count grows).
+    clock.advance(120)
+    await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.attempt_count > first_attempts
+
+    # Clear the transient; the next attempt self-heals to READY.
+    clock.advance(120)
+    provider.prepare_error = None
+    await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.READY
+    assert slot.last_error_code is None
+
+
+async def test_ready_keep_alive_refreshes_once_per_renew_by_window() -> None:
+    # Keep-alive is per-renew_by-window, not per-cycle: crossing renew_by triggers
+    # exactly one refresh; a cycle within the same window does none; and across
+    # three windows (which also crosses the runner-receipt horizon, since each
+    # refresh republishes fresh receipts) there is never a full prepare() rewarm.
+    clock = Clock()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider)
+    await warm_ready(manager, provider)
+    assert provider.prepare_calls == 1 and provider.refresh_calls == 0
+
+    clock.advance(2_001)
+    await manager.run_one_cycle()
+    assert provider.refresh_calls == 1
+    slot = await manager.store.read("install-one")
+    assert slot is not None and slot.renew_by is not None and slot.renew_by > clock.now
+
+    # Same window, no clock movement -> no additional refresh.
+    await manager.run_one_cycle()
+    assert provider.refresh_calls == 1
+
+    clock.advance(2_001)
+    await manager.run_one_cycle()
+    assert provider.refresh_calls == 2
+
+    clock.advance(2_001)
+    await manager.run_one_cycle()
+    assert provider.refresh_calls == 3
+
+    assert provider.prepare_calls == 1  # never a full rewarm across the horizon
+    slot = await manager.store.read("install-one")
+    assert slot is not None and slot.state == Round5WarmState.READY
+    assert (await manager.public_status())["round5_ring_ready"] is True
+
+
+async def test_retryable_validate_ready_probe_stays_ready_in_place() -> None:
+    # A throttled/timed-out provenance PROBE (validate_ready RetryableWarmError) is
+    # a transient read failure, not a runner identity change: keep the capsule,
+    # stay READY, retry in place. It must NOT fold into freshness_lost -> full
+    # prepare() (the overnight churn), and it must NOT be swallowed into a fake
+    # "still current" success.
+    clock = Clock()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider)
+    await warm_ready(manager, provider)
+
+    provider.validate_error = RetryableWarmError("runner_provenance_probe_retryable")
+    for _ in range(MAX_PROVENANCE_PROBE_FAILURES - 1):
+        clock.advance(1)
+        delay = await manager.run_one_cycle()
+        slot = await manager.store.read("install-one")
+        assert slot is not None
+        assert slot.state == Round5WarmState.READY  # stays READY in place
+        assert manager.capsule is not None
+        assert provider.prepare_calls == 1  # no full rewarm
+        assert delay > 0
+
+    # Once the probe keeps failing past the bounded budget, escalate to a rewarm.
+    clock.advance(1)
+    await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.WARMING
+    assert slot.last_error_code == "runner_provenance_probe_retryable"
+    assert manager.capsule is None
+
+    # A recovered probe then warms cleanly back to READY (self-heal).
+    provider.validate_error = None
+    await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.READY
+
+
+async def test_self_verifiable_block_retries_but_permanent_block_latches() -> None:
+    # A SELF-VERIFIABLE block (insufficient credential margin) must re-attempt on a
+    # bounded interval and recover in-process -- never a latch a human must clear --
+    # and must not be reported as terminal. A TRUE permanent block (config/identity)
+    # latches, is reported terminal, and is never silently re-attempted.
+    clock = Clock()
+    provider = Provider(clock)
+    provider.release_prepare.set()
+    provider.prepare_error = BlockedWarmError("credential_margin_insufficient")
+    manager = coordinator(clock, provider)
+
+    await manager.run_one_cycle()
+    slot = await manager.store.read("install-one")
+    assert slot is not None and slot.state == Round5WarmState.BLOCKED
+    assert slot.last_error_code == "credential_margin_insufficient"
+    assert manager.public_status_cached()["round5_warm_blocked_terminal"] is False
+
+    blocked_prepare_calls = provider.prepare_calls
+    await manager.run_one_cycle()  # before the interval -> no re-attempt
+    assert provider.prepare_calls == blocked_prepare_calls
+
+    clock.advance(SELF_VERIFIABLE_BLOCK_RETRY_SECONDS + 1)
+    provider.prepare_error = None
+    await manager.run_one_cycle()  # recheck -> re-warm; may need one more cycle
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    if slot.state != Round5WarmState.READY:
+        await manager.run_one_cycle()
+        slot = await manager.store.read("install-one")
+    assert slot.state == Round5WarmState.READY
+
+    clock2 = Clock()
+    provider2 = Provider(clock2)
+    provider2.release_prepare.set()
+    provider2.prepare_error = BlockedWarmError("warm_baseline_invalid")
+    manager2 = coordinator(clock2, provider2)
+    await manager2.run_one_cycle()
+    slot2 = await manager2.store.read("install-one")
+    assert slot2 is not None and slot2.state == Round5WarmState.BLOCKED
+    assert manager2.public_status_cached()["round5_warm_blocked_terminal"] is True
+
+    permanent_calls = provider2.prepare_calls
+    clock2.advance(SELF_VERIFIABLE_BLOCK_RETRY_SECONDS + 100)
+    await manager2.run_one_cycle()
+    assert provider2.prepare_calls == permanent_calls  # permanent block never churns
+    slot2 = await manager2.store.read("install-one")
+    assert slot2 is not None and slot2.state == Round5WarmState.BLOCKED
+
+
+async def test_ready_capsule_past_launch_margin_refreshes_instead_of_full_rewarm() -> None:
+    # Regression for the overnight rewarm storm. Once a READY capsule reaches its
+    # renew_by it no longer meets the launch margin (dispatch/control creds are
+    # minted at margin+epsilon), and the keep-alive used to gate on launch margin
+    # BEFORE the renew_by refresh -- so it declared freshness_lost and full
+    # prepare()-rewarmed every ~3 minutes (151 cycles overnight). The keep-alive
+    # now gates on capsule IDENTITY only, so the capsule is refreshed in place and
+    # the slot stays READY.
+    clock = Clock()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider)
+    await warm_ready(manager, provider)
+    assert provider.prepare_calls == 1
+    before = manager.capsule
+    assert before is not None and before.meets_launch_margin(clock.now)
+    # Past renew_by (2000s) AND past the launch margin (control creds now within
+    # PROXY_SETUP_DEADLINE+margin = 1860s of the +4000s expiry) but not past any
+    # receipt/capsule expiry -- exactly the boundary that triggered the storm.
+    clock.advance(2_200)
+    assert not before.meets_launch_margin(clock.now)
+
+    delay = await manager.run_one_cycle()
+
+    slot = await manager.store.read("install-one")
+    assert slot is not None
+    assert slot.state == Round5WarmState.READY  # NOT torn down to WARMING
+    assert provider.prepare_calls == 1  # NO full prepare() rewarm storm
+    assert provider.refresh_calls == 1  # refreshed in place instead
+    assert manager.capsule is not None
+    assert manager.capsule.credential_generation == 2
+    assert manager.capsule.meets_launch_margin(clock.now)
+    assert delay > 0
+    assert (await manager.public_status())["round5_ring_ready"] is True
+
+
+async def test_warm_baseline_classification_splits_at_the_raise_site() -> None:
+    # The overnight class of failure must be split at the raise site, not lumped
+    # under a bare ``except Exception``:
+    #   * a typed config/identity/orphan-Proxy/fixture defect
+    #     (ConnectionSpikeLiveConfigurationError) is PERMANENT -> BlockedWarmError.
+    #   * a transient throttle/timeout is RETRYABLE -> RetryableWarmError, never a
+    #     terminal block (a BLOCKED slot is never re-attempted by the same process).
+    from server import connection_spike_live as live
+
+    class _Engine:
+        def __init__(self, exc: Exception) -> None:
+            self._exc = exc
+
+        async def warm(self, generation, warm_attempt_token):
+            del generation, warm_attempt_token
+            raise self._exc
+
+        async def warm_with_physical_runners_from(self, other, generation):
+            del other, generation
+            return object()
+
+    prov_config = object.__new__(live.LiveRound5WarmProvider)
+    prov_config._engine_factory = lambda competitor_id: _Engine(
+        live.ConnectionSpikeLiveConfigurationError(
+            "Round 5 warm source or physical runner identity changed"
+        )
+    )
+    with pytest.raises(BlockedWarmError) as blocked:
+        await prov_config.prepare(
+            generation=1,
+            coordinator_fence=1,
+            process_epoch="p",
+            broker_epoch="b",
+            warm_attempt_token="t",
+        )
+    assert blocked.value.code == "warm_baseline_invalid"
+
+    prov_throttle = object.__new__(live.LiveRound5WarmProvider)
+    prov_throttle._engine_factory = lambda competitor_id: _Engine(
+        TimeoutError("SSM control-plane throttled")
+    )
+    with pytest.raises(RetryableWarmError) as retry:
+        await prov_throttle.prepare(
+            generation=1,
+            coordinator_fence=1,
+            process_epoch="p",
+            broker_epoch="b",
+            warm_attempt_token="t",
+        )
+    assert retry.value.code == "warm_provider_retryable"
+    assert not isinstance(retry.value, BlockedWarmError)
 
 
 async def test_duplicate_bell_returns_one_server_context() -> None:

@@ -263,10 +263,12 @@ class SuccessfulTwoPhaseConnectionSpikeEngine:
         self,
         *,
         burst_valid: bool,
+        burst_launch_skew_ms: float | None = 2.0,
         cleanup_failure: bool = False,
         cleanup_abandoned: bool = False,
     ) -> None:
         self.burst_valid = burst_valid
+        self.burst_launch_skew_ms = burst_launch_skew_ms
         self.cleanup_failure = cleanup_failure
         # Cleanup that fails and keeps failing, without touching the run. The
         # separate knob is the point: `cleanup_failure` fails the run too, so it
@@ -339,7 +341,7 @@ class SuccessfulTwoPhaseConnectionSpikeEngine:
                 witness_verified_clients=64,
                 unique_backend_pids=8,
                 peak_backend_sessions=12,
-                launch_skew_ms=2.0,
+                launch_skew_ms=self.burst_launch_skew_ms,
                 gates=gates,
             )
 
@@ -511,15 +513,21 @@ class SequencedCooldownTarget(FakeLiveTarget):
         cooldown_states: list[bool],
         *,
         verification_delay: float = 0.001,
+        cooldown_gate: asyncio.Event | None = None,
     ) -> None:
         super().__init__(id, name, verification_delay)
         self.cooldown_states = list(cooldown_states)
         self.cooldown_cutoffs: list[datetime | None] = []
+        self.cooldown_gate = cooldown_gate
+        self.cooldown_entered = asyncio.Event()
 
     async def assert_armed(self, *, not_before=None) -> dict[str, object]:
         self.arm_calls += 1
         if self.arm_calls <= 2:
             return {"state": "ZERO"}
+        self.cooldown_entered.set()
+        if self.cooldown_gate is not None:
+            await self.cooldown_gate.wait()
         self.cooldown_cutoffs.append(not_before)
         state = self.cooldown_states.pop(0) if self.cooldown_states else True
         if not state:
@@ -533,6 +541,7 @@ class SequencedCooldownResolver:
         *,
         lakebase_verification_delay: float = 0.001,
         competitor_verification_delay: float = 0.001,
+        competitor_cooldown_gate: asyncio.Event | None = None,
     ) -> None:
         self.lakebase = SequencedCooldownTarget(
             "lakebase",
@@ -545,6 +554,7 @@ class SequencedCooldownResolver:
             "Aurora Serverless v2",
             [False, False, True],
             verification_delay=competitor_verification_delay,
+            cooldown_gate=competitor_cooldown_gate,
         )
 
     def resolve(self, competitor: CompetitorId):
@@ -2968,22 +2978,21 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         assert terminal.metrics == []
 
     if cleanup_failure:
-        for _ in range(100):
+        # Automatic convergence, no human Retry Cleanup: the durable loop re-runs
+        # the journal-based reconcile (which converges for this engine) and
+        # settles the bout to a clean 'failed' with the ring released on its own.
+        retried = await manager.get(created.id)
+        for _ in range(400):
             retried = await manager.get(created.id)
+            status = await manager.bout_status()
             if (
-                retried.round5_setup
-                and retried.round5_setup.cleanup_retryable
+                retried.round5_setup is not None
+                and retried.round5_setup.state.value == "failed"
+                and retried.round5_setup.cleanup_retryable is False
+                and status.active is False
             ):
                 break
-            await asyncio.sleep(0.005)
-        else:
-            raise AssertionError("Cleanup failure did not become operator-retryable")
-        assert engine.reconcile_calls == []
-        await manager.retry_connection_spike_cleanup(created.id, operator)
-        record = manager._records[created.id]
-        assert record.task is not None
-        await record.task
-        retried = await manager.get(created.id)
+            await asyncio.sleep(0.02)
         assert retried.round5_setup is not None
         assert retried.round5_setup.state.value == "failed"
         assert retried.round5_setup.cleanup_retryable is False
@@ -2996,8 +3005,11 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         )
         assert retried.comparison is None
         assert (await manager.bout_status()).active is False
+        # The automatic loop ran the reconcile itself; no manual retry was needed.
         assert len(engine.reconcile_calls) == 1
         assert engine.reconcile_calls[0][1] == 1
+        # A manual Retry Cleanup now only wakes the (idle) worker; cleanup has
+        # already converged, so it starts no second reconcile.
         repeated = await manager.retry_connection_spike_cleanup(created.id, operator)
         assert repeated.round5_setup is not None
         assert repeated.round5_setup.cleanup_retryable is False
@@ -3031,7 +3043,16 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
         # legible: the artifacts were never proved gone.
         assert abandoned.round5_setup.cleanup_retryable is True
         assert (await manager.bout_status()).active is True
-        assert engine.reconcile_calls == []
+        # The durable convergence loop keeps automatically re-running the
+        # journal-based reconcile even for a genuinely abandoned cleanup (only the
+        # artifacts actually going away can end it), so a human is never required.
+        # It never clears owed here, because reconcile keeps raising -- an empty
+        # in-memory no-op never masquerades as a confirmed deletion.
+        for _ in range(400):
+            if engine.reconcile_calls:
+                break
+            await asyncio.sleep(0.02)
+        assert engine.reconcile_calls, "abandoned cleanup did not auto-retry reconcile"
         assert manager._releasable(manager._records[created.id]) is False
 
     public = str(terminal.model_dump(mode="json")).lower()
@@ -3069,6 +3090,210 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
 
     assert selected_opponents
     assert set(selected_opponents) == {selected_competitor}
+
+    # Stop any durable cleanup-convergence loop still retrying an abandoned
+    # cleanup so it does not outlive the test.
+    await manager.close()
+
+
+@pytest.mark.parametrize(
+    ("launch_skew_ms", "expected_state"),
+    (
+        (10.53, SessionState.VERIFIED),
+        (None, SessionState.FAILED),
+        (float("nan"), SessionState.FAILED),
+    ),
+)
+async def test_round_five_burst_skew_is_advisory_but_evidence_is_required(
+    launch_skew_ms: float | None,
+    expected_state: SessionState,
+) -> None:
+    engine = SuccessfulTwoPhaseConnectionSpikeEngine(
+        burst_valid=True,
+        burst_launch_skew_ms=launch_skew_ms,
+    )
+    manager = RunManager(connection_spike_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    terminal = await wait_for_state(manager, created.id, expected_state)
+
+    assert terminal.state == expected_state
+    if expected_state == SessionState.VERIFIED:
+        assert terminal.failure is None
+        assert terminal.fairness.launch_skew_ms == pytest.approx(10.53)
+        assert all(lane.state == LaneState.VERIFIED for lane in terminal.lanes.values())
+    else:
+        assert terminal.comparison is None
+        assert terminal.fairness.launch_skew_ms is None
+
+    await manager.close()
+
+
+class LaunchJitterTwoPhaseConnectionSpikeEngine(SuccessfulTwoPhaseConnectionSpikeEngine):
+    """Replays the live 2026-09-17 bout where the competitor setup workflow
+    launched 10.53 ms after the shared T0 -- 0.53 ms past the old 10.00 ms
+    ceiling -- while every exact gate (10,000 held clients, 30 s hold, 64
+    held-connection checks, exact stop gates) passed. The bout must verify."""
+
+    async def setup(self, bout_id, fencing_token, on_progress):
+        assert bout_id and fencing_token > 0
+        await on_progress(SimpleNamespace(lane_id="lakebase", phase="setup"))
+        t0_ns = 1_000_000_000
+        arm = arm_setup_phase(("lakebase", "competitor"), t0_ns=t0_ns)
+
+        def observation(
+            lane_id: str,
+            launched_ns: int,
+            stopped_ns: int,
+            create_db_proxy_requested_ns: int | None = None,
+        ):
+            facts = (
+                PublicSetupEvidence("transaction_verified", True),
+                PublicSetupEvidence("tls_verified", True),
+            )
+            return SetupLaneObservation(
+                lane_id=lane_id,
+                workflow_launched_ns=launched_ns,
+                status=SetupLaneStatus.SUCCEEDED,
+                stop_gate_evidence=SetupStopGateEvidence(
+                    gate_id="application_transaction",
+                    expected=facts,
+                    observed=facts,
+                    verified_at_ns=stopped_ns,
+                ),
+                create_db_proxy_requested_ns=create_db_proxy_requested_ns,
+            )
+
+        return SimpleNamespace(
+            bout_id=bout_id,
+            arm=arm,
+            observations=(
+                observation("lakebase", t0_ns + 7_873_272, t0_ns + 7_874_849),
+                # 10.53 ms workflow launch (over the retired 10 ms absolute gate),
+                # with CreateDBProxy requested ~2 ms later -- inside the 100 ms
+                # real-request budget. Inter-lane skew is 2.657684 ms.
+                observation(
+                    "competitor",
+                    t0_ns + 10_530_956,
+                    t0_ns + 607_808_521_774,
+                    create_db_proxy_requested_ns=t0_ns + 12_500_000,
+                ),
+            ),
+            credential_sha256="must-not-reach-browser",
+            secret_arn="arn:must-not-reach-browser",
+            fencing_token=fencing_token,
+        )
+
+
+async def test_round_five_setup_launch_jitter_still_verifies() -> None:
+    engine = LaunchJitterTwoPhaseConnectionSpikeEngine(burst_valid=True)
+
+    def factory(competitor: CompetitorId):
+        return engine
+
+    manager = RunManager(connection_spike_factory=factory)
+    operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    terminal = await wait_for_state(manager, created.id, SessionState.VERIFIED)
+
+    assert terminal.state == SessionState.VERIFIED
+    assert terminal.failure is None
+    assert terminal.round5_setup is not None
+    assert terminal.round5_setup.setup_validated
+    assert terminal.round5_setup.lanes["competitor"].verified
+    assert terminal.round5_setup.lanes["competitor"].state.value == "verified"
+    assert terminal.comparison is not None
+
+
+class LateCreateDbProxyTwoPhaseConnectionSpikeEngine(
+    LaunchJitterTwoPhaseConnectionSpikeEngine
+):
+    """Both runtime lanes reach exactly 10,000 held clients and the competitor's
+    real CreateDBProxy request lands 163.51 ms after the bell (the 2026-09-17
+    old-path latency). Per the product override, a slow-but-present CreateDBProxy
+    is a NON-FATAL scheduling advisory: the bout must DECLARE a winner, carry the
+    advisory for the play-by-play, and never show FAILED."""
+
+    async def setup(self, bout_id, fencing_token, on_progress):
+        base = await super().setup(bout_id, fencing_token, on_progress)
+        t0_ns = 1_000_000_000
+        lakebase, competitor = base.observations
+        competitor = replace(
+            competitor,
+            create_db_proxy_requested_ns=t0_ns + 163_510_000,  # 163.51 ms after T0
+            requires_create_db_proxy_stamp=True,
+        )
+        base.observations = (lakebase, competitor)
+        return base
+
+
+async def test_round_five_late_create_db_proxy_declares_with_advisory() -> None:
+    engine = LateCreateDbProxyTwoPhaseConnectionSpikeEngine(burst_valid=True)
+
+    def factory(competitor: CompetitorId):
+        return engine
+
+    manager = RunManager(connection_spike_factory=factory)
+    operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    terminal = await wait_for_state(manager, created.id, SessionState.VERIFIED)
+
+    # A scheduling advisory does not void an exact, honestly-obtained proof: the
+    # bout DECLARES a winner end-to-end through the manager.
+    assert terminal.state == SessionState.VERIFIED
+    assert terminal.comparison is not None
+    assert terminal.failure is None
+    assert terminal.round5_setup is not None
+    assert terminal.round5_setup.setup_validated
+    competitor_setup = terminal.round5_setup.lanes["competitor"]
+    assert competitor_setup.verified
+    assert competitor_setup.setup_diagnostic is None
+    # The advisory is recorded (for play-by-play) with the observed delta.
+    assert competitor_setup.scheduling_advisory == "create_db_proxy_window"
+    assert competitor_setup.create_db_proxy_request_delta_ms == pytest.approx(163.51)
+
+
+# NOTE on the FATAL manager-level path (missing stamp / pre-T0 / stop-gate):
+# ``test_competitor_missing_create_db_proxy_stamp_is_fatal`` and
+# ``test_competitor_pre_bell_create_db_proxy_is_fatal`` in test_connection_spike.py
+# prove the fatal finalize behavior deterministically, and
+# ``test_global_failure_after_two_verified_lanes_is_terminal_once`` (v3 acceptance)
+# proves the coherent V4 terminal state where both runtime lanes verified exact
+# 10,000 yet the session is FAILED with no comparison and evidence preserved. The
+# setup-only harness in this module has no ``round5_runtime`` and so exercises the
+# legacy scoring branch, which is not the V4 production path for a fatal setup
+# fault; the V4 coverage above is authoritative.
 
 
 async def wait_for_cooldown(
@@ -3130,7 +3355,11 @@ async def wait_for_redo(manager: RunManager, session_id: str, state: RedoState):
 
 
 async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> None:
-    resolver = SequencedCooldownResolver(competitor_verification_delay=60)
+    settle_zero = asyncio.Event()
+    resolver = SequencedCooldownResolver(
+        competitor_verification_delay=60,
+        competitor_cooldown_gate=settle_zero,
+    )
     manager = RunManager(resolver=resolver, verifier=make_verifier())
     manager._arm_poll = 0.001
     created = await manager.create(
@@ -3160,11 +3389,13 @@ async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> 
     assert frozen.lanes["lakebase"].connection_closed_at is not None
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.state == SessionState.TOWELLED
+    await asyncio.wait_for(resolver.competitor.cooldown_entered.wait(), timeout=1)
     active = await manager.bout_status(round_id=RoundId.WAKE_IDLE_APP)
     assert active.active is True
     assert active.phase == "cooldown"
     assert active.can_start is False
 
+    settle_zero.set()
     cooldown = await wait_for_cooldown(
         manager,
         created.id,
@@ -6536,8 +6767,12 @@ async def test_readiness_gate_refuses_the_arm_but_never_the_towel() -> None:
         await manager.start_arm(challenger.id)
 
 
-# T2 · Round 5 cleanup that will not converge must stop retrying and say so.
-async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() -> None:
+# T2 · Round 5 cleanup that cannot yet converge MUST keep retrying automatically
+# (never "stop and ask a human") and converge on its own the moment it can.
+async def test_round_five_towel_cleanup_auto_converges_without_manual_retry(monkeypatch) -> None:
+    # Fast automatic retries so the durable convergence loop settles quickly.
+    monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "0.02")
+    monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "0.05")
     engine = UnconvergingTowelConnectionSpikeEngine()
     main_store = InMemoryBoutLeaseStore()
     round5_store = InMemoryBoutLeaseStore(ring_key="round5")
@@ -6562,49 +6797,44 @@ async def test_round_five_towel_cleanup_that_never_converges_ends_at_failed() ->
     await manager.start_towel(created.id)
     failed = await wait_for_towel(manager, created.id, "failed")
 
-    assert engine.reconcile_attempts == 0
     assert failed.towel is not None
-    assert "Retry cleanup" in failed.towel.cleanup_failure
-    record = manager._records[created.id]
-    retry_task = record.connection_spike_cleanup_task
-    assert retry_task is None or retry_task.done()
-    # Keeping the ring is deliberate; being unable to leave `cleaning` was not.
-    assert await main_store.current() is not None
-    assert await round5_store.current() is not None
-
-    # The worst bout to lose is this one. A towel whose cleanup failed is the
-    # exact failure a verification campaign exists to hunt, and it used to seal
-    # nothing -- the abandonment published `towel_update`, which was not a
-    # sealing event, so the only trace was a log line and a held ring.
+    # The interim operator notice names the proxy and keeps the affordance, but
+    # it says cleanup is retrying -- never that a human must intervene -- and the
+    # end-user UI decouples from it entirely.
+    assert failed.towel.cleanup_failure is not None
+    # A towel whose cleanup has not converged still seals a stopped_short receipt
+    # that does not read clean.
     abandoned = await sealed_receipt(created.id)
     assert abandoned is not None, "a towel with failed cleanup sealed no receipt"
     assert abandoned.outcome == "stopped_short"
-    # And it must not read clean. This project has a recorded defect class where
-    # a round reported success while its cleanup silently failed four times; a
-    # receipt that omits the tidy-up is how a reader repeats that mistake.
     assert abandoned.cleanup_failure is not None
-    assert "Retry cleanup" in abandoned.cleanup_failure
 
-    # Terminal state is absorbing. Cleanup retries only through Retry Cleanup.
-    await manager.start_towel(created.id)
-    assert engine.reconcile_attempts == 0
-    await manager.retry_connection_spike_cleanup(created.id)
-    record = manager._records[created.id]
-    assert record.task is not None
-    await record.task
-    assert engine.reconcile_attempts == 1
+    # No human touched Retry Cleanup, yet the automatic convergence loop is
+    # already re-running the journal-based reconcile with backoff.
+    for _ in range(300):
+        if engine.reconcile_attempts > 0:
+            break
+        await asyncio.sleep(0.02)
+    assert engine.reconcile_attempts > 0
+    # Keeping the ring held until cleanup actually converges is deliberate.
+    assert await main_store.current() is not None
+    assert await round5_store.current() is not None
 
+    # Let cleanup succeed. The AUTOMATIC loop converges with no manual retry:
+    # reconcile now proves the Proxy absent, the rewarm CAS wins, the ring is
+    # released, and the owed notice clears.
     engine.relent()
-    await manager.retry_connection_spike_cleanup(created.id)
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.towel is not None and settled.towel.cleanup_failure is None
     assert await main_store.current() is None
     assert await round5_store.current() is None
 
-    # The successful retry supersedes the record: cleanup did complete in the
-    # end, so the receipt stops claiming otherwise.
+    # The automatic convergence supersedes the record: cleanup did complete in
+    # the end, so the receipt stops claiming otherwise.
     cleared = await sealed_receipt(created.id, until=lambda item: item.cleanup_failure is None)
     assert cleared is not None and cleared.cleanup_failure is None
+
+    await manager.close()
 
 
 # T6 · a refused lease transition must not have already killed the bout.

@@ -3764,18 +3764,20 @@ ROUND5_RUNNER_EVENT_DISPOSITION_FUNCTION = (
 # redirect it to a temporary directory.
 RESIDENT_ATTESTATION_DIR = Path("/run")
 
-# The four exact, lane-bound dispositions the resident precomputes before every
+# The exact, lane-bound dispositions the resident precomputes before every
 # local transition. They mirror the authoritative slot/outbox/event relations
 # the write-side RLS gate consults, so the resident never trusts a persisted
 # stage, spawns workers, and only then learns from a rejected insert that a
 # newer attempt superseded it.
 RESIDENT_DISPOSITION_CURRENT = "current"
+RESIDENT_DISPOSITION_CANCELLED = "cancelled"
 RESIDENT_DISPOSITION_SUPERSEDED = "superseded"
 RESIDENT_DISPOSITION_TERMINAL = "terminal"
 RESIDENT_DISPOSITION_UNKNOWN = "unknown"
 _RESIDENT_DISPOSITIONS = frozenset(
     {
         RESIDENT_DISPOSITION_CURRENT,
+        RESIDENT_DISPOSITION_CANCELLED,
         RESIDENT_DISPOSITION_SUPERSEDED,
         RESIDENT_DISPOSITION_TERMINAL,
         RESIDENT_DISPOSITION_UNKNOWN,
@@ -4250,17 +4252,31 @@ async def _resident_agent(
         if active_event is not None:
             active_binding = binding_of(active_event)
             active_disposition = await disposition_of(active_event)
-            if active_disposition == RESIDENT_DISPOSITION_CURRENT:
+            if active_disposition in {
+                RESIDENT_DISPOSITION_CURRENT,
+                RESIDENT_DISPOSITION_CANCELLED,
+            }:
+                restarted_after_cancel = (
+                    active_disposition == RESIDENT_DISPOSITION_CANCELLED
+                )
                 try:
-                    await publish(
-                        active_binding,
-                        "failed",
-                        {"code": "resident_process_restarted"},
-                    )
+                    if not restarted_after_cancel:
+                        await publish(
+                            active_binding,
+                            "failed",
+                            {"code": "resident_process_restarted"},
+                        )
                     await publish(
                         active_binding,
                         "settled",
-                        {"state": "failed", "code": "resident_process_restarted"},
+                        (
+                            {"state": "cancelled"}
+                            if restarted_after_cancel
+                            else {
+                                "state": "failed",
+                                "code": "resident_process_restarted",
+                            }
+                        ),
                     )
                 except RunnerAttemptSupersededError:
                     # Authority rotated between the precheck and the settle: this
@@ -4521,6 +4537,15 @@ async def _resident_agent(
                             "RESIDENT_CONTROL_QUARANTINED:resident_control_disposition_unknown",
                             flush=True,
                         )
+                        consumed_control_events.add(event_id)
+                        acknowledge = True
+                        continue
+                    if disposition == RESIDENT_DISPOSITION_CANCELLED:
+                        # The RELEASE crossed the network after its durable
+                        # CANCEL committed. ACK only the revoked message: keep
+                        # the staged/active job intact so the following FIFO
+                        # CANCEL can set its cancellation event and publish the
+                        # normal settlement. This is not a stale-attempt cleanup.
                         consumed_control_events.add(event_id)
                         acknowledge = True
                         continue

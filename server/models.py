@@ -431,12 +431,23 @@ class RoundFiveSetupLaneSnapshot(BaseModel):
     # persisted per lane.  Inter-lane skew alone (``workflow_launch_skew_ms``)
     # cannot prove each lane launched within the bounded window; this can.
     workflow_launch_delay_ms: float | None = None
+    # Observed bell-relative latency of the competitor's real CreateDBProxy
+    # request (``create_db_proxy_requested_ns - t0_ns``), in ms. Published so the
+    # actual timing (e.g. 12 ms vs a failing 163 ms) is directly observable in the
+    # snapshot rather than only inferable from the pass/fail ``create_db_proxy_window``
+    # subcode. None for Lakebase and for a missing (fail-closed) competitor stamp.
+    create_db_proxy_request_delta_ms: float | None = None
     # Secret-free finalizer subcode that survives auto-cleanup and the terminal
     # receipt.  Distinguishes a genuine stop-gate failure (e.g.
-    # ``stop_gate_evidence``/``workflow_launch_window``/``setup_deadline``) from
-    # a public-projection rejection (``public_fact_key_rejected``), instead of
-    # collapsing every case into the generic "Setup verification failed".
+    # ``stop_gate_evidence``/``workflow_launch_skew``/``create_db_proxy_window``/
+    # ``setup_deadline``) from a public-projection rejection
+    # (``public_fact_key_rejected``), instead of collapsing every case into the
+    # generic "Setup verification failed".
     setup_diagnostic: str | None = None
+    # Non-fatal scheduling-conformance advisory subcode(s) (``create_db_proxy_window``,
+    # ``workflow_launch_skew``). Surfaced for detailed play-by-play only; a lane can
+    # be fully ``verified`` and still carry an advisory. Never a FAILED reason.
+    scheduling_advisory: str | None = None
 
 
 class RoundFiveSetupSnapshot(BaseModel):

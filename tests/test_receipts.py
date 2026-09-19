@@ -89,10 +89,10 @@ def deployed_shaped_runtime(monkeypatch) -> None:
 class FakeCoordinationCursor:
     """Enough of the coordination database to hold receipts, and nothing more.
 
-    Deliberately keyed and ranked the same way the real SQL is -- primary key
-    (session_id, round_id, sealing_event), `ON CONFLICT DO NOTHING`, and a
-    declared row outranking a later terminal event -- so a test that passes here
-    is testing the store's rules rather than the fake's.
+    Deliberately keyed the same way the real SQL is -- primary key
+    (session_id, round_id, sealing_event), with a latest-state upsert for the
+    cleanup overlay -- so a test that passes here is testing the store's rules
+    rather than the fake's.
     """
 
     def __init__(self, *, table_present: bool = True, may_create: bool = True) -> None:
@@ -121,18 +121,40 @@ class FakeCoordinationCursor:
             self.schema_present = True
             self.table_present = True
         elif statement.startswith(f"INSERT INTO {BOUT_RECEIPT_TABLE}"):
-            self.rows.setdefault((params[0], params[1], params[2]), params)
-        elif "SELECT DISTINCT ON" in statement:
-            floor = params[0]
-            best: dict[tuple[str, str], tuple] = {}
-            for (session_id, round_id, _event), row in self.rows.items():
-                if floor is not None and row[6] < floor:
-                    continue
-                rank = (row[5] == "declared", row[6])
-                current = best.get((session_id, round_id))
-                if current is None or rank > current[0]:
-                    best[(session_id, round_id)] = (rank, row)
-            self._pending = [(json.loads(row[7]),) for _key, (_rank, row) in sorted(best.items())]
+            key = (params[0], params[1], params[2])
+            current = self.rows.get(key)
+            if current is None:
+                self.rows[key] = params
+            elif params[2] == "cleanup_update":
+                current_failure = json.loads(current[7])["receipt"].get(
+                    "cleanup_failure"
+                )
+                new_failure = json.loads(params[7])["receipt"].get("cleanup_failure")
+                if current[6] <= params[6] and current_failure != new_failure:
+                    self.rows[key] = params
+        elif statement.startswith("WITH ranked_receipts AS"):
+            best: dict[tuple[str, str, bool], tuple] = {}
+            for row in self.rows.values():
+                is_cleanup = str(row[2]).startswith("cleanup_update")
+                key = (row[0], row[1], is_cleanup)
+                rank = (
+                    row[6] if is_cleanup else row[5] == "declared",
+                    row[6],
+                )
+                current = best.get(key)
+                current_rank = (
+                    (
+                        current[6]
+                        if is_cleanup
+                        else current[5] == "declared"
+                    ),
+                    current[6],
+                ) if current is not None else None
+                if current_rank is None or rank > current_rank:
+                    best[key] = row
+            selected = list(best.values())
+            selected.sort(key=lambda row: (row[0], row[1], row[6]))
+            self._pending = [(json.loads(row[7]),) for row in selected]
         else:  # pragma: no cover - the store issues nothing else
             raise AssertionError(f"unexpected statement: {statement}")
 
@@ -383,6 +405,74 @@ async def test_v4_bell_towel_receipt_reads_the_runtime_not_the_setup_stop() -> N
     from server.receipts import BoutReceipt
 
     assert BoutReceipt.model_validate(receipt.model_dump(mode="json")) == receipt
+
+
+async def test_stopped_short_bout_with_both_lanes_verified_records_no_margin() -> None:
+    """Replays the live 2026-09-17 bout eb2b79b7173544fc92ff3a0da2ecec9f: both
+    runtime lanes reached the exact 10,000-client gate and both session lanes are
+    ``VERIFIED``, yet the orchestrator declared no comparison (a setup-phase gate
+    failed) so the session is ``FAILED``/stopped_short. The receipt must not
+    subtract the two verified lane times into a margin the bout never declared."""
+    from server.models import (
+        RoundFiveRuntimeLaneSnapshot,
+        RoundFiveRuntimeSnapshot,
+    )
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.round = snapshot.round.model_copy(
+        update={
+            "id": RoundId.SURVIVE_CONNECTION_SPIKE,
+            "title": "Ready a pooled application path",
+        }
+    )
+    snapshot.state = SessionState.FAILED
+    snapshot.failure = "Round 5 contract gate failed; no comparison was declared."
+    snapshot.comparison = None
+    snapshot.remembered_result = None
+    # Both lanes verified their own load/witness/cleanup gates.
+    snapshot.lanes["lakebase"].state = LaneState.VERIFIED
+    snapshot.lanes["competitor"].state = LaneState.VERIFIED
+    snapshot.round5_runtime = RoundFiveRuntimeSnapshot(
+        protocol="round5-bell-to-10k-v4",
+        warm_generation=1,
+        bell_id="bell-4ad57f21842b425aa58eff5be9220f66",
+        revision=31,
+        state="failed",
+        bell_at_utc=snapshot.updated_at,
+        lanes={
+            "lakebase": RoundFiveRuntimeLaneSnapshot(
+                id="lakebase",
+                phase="verified",
+                elapsed_at_snapshot_ms=13_740.241493,
+                bell_to_10000_observed_ms=13_740.241493,
+                clients_initiated=10_000,
+                clients_authenticated=10_000,
+                held_clients=10_000,
+                peak_clients_authenticated=10_000,
+                peak_held_clients=10_000,
+                sampled_queries_succeeded=64,
+                status="Exact 10,000-client retained gate verified",
+            ),
+            "competitor": RoundFiveRuntimeLaneSnapshot(
+                id="competitor",
+                phase="verified",
+                elapsed_at_snapshot_ms=642_472.948717,
+                bell_to_10000_observed_ms=642_472.948717,
+                clients_initiated=10_000,
+                clients_authenticated=10_000,
+                held_clients=10_000,
+                peak_clients_authenticated=10_000,
+                peak_held_clients=10_000,
+                sampled_queries_succeeded=64,
+                status="Exact 10,000-client retained gate verified",
+            ),
+        },
+    )
+
+    receipt = derive_receipt(snapshot, "session_failed")
+
+    assert receipt.outcome == "stopped_short"
+    assert receipt.margin_ms is None
 
 
 async def test_a_verified_lane_is_never_flagged_as_a_lower_bound() -> None:
@@ -836,6 +926,81 @@ async def test_recording_the_same_terminal_event_twice_is_one_row() -> None:
 
     assert len(cursor.rows) == 1
     assert [item.session_id for item in await store.load()] == [snapshot.id]
+
+
+async def test_durable_auto_cleanup_failure_then_recovery_folds_clean() -> None:
+    snapshot = await verified_round_one_snapshot()
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    declared = derive_receipt(snapshot, "run_finished")
+    await store.append(declared, snapshot)
+
+    failed = declared.model_copy(
+        update={
+            "outcome": "stopped_short",
+            "sealing_event": "cleanup_update",
+            "sealed_at": declared.sealed_at + timedelta(seconds=1),
+            "cleanup_failure": "RDS Proxy deletion is still retrying.",
+        }
+    )
+    recovered = failed.model_copy(
+        update={
+            "sealed_at": declared.sealed_at + timedelta(seconds=12),
+            "cleanup_failure": None,
+        }
+    )
+    for offset in range(1, 12):
+        await store.append(
+            failed.model_copy(
+                update={"sealed_at": declared.sealed_at + timedelta(seconds=offset)}
+            ),
+            snapshot,
+        )
+    assert (await store.load())[0].cleanup_failure == failed.cleanup_failure
+
+    await store.append(recovered, snapshot)
+
+    # One immutable declaration plus one bounded latest-cleanup overlay, even
+    # after repeated pending retries.
+    assert len(cursor.rows) == 2
+    found = await store.load()
+    assert len(found) == 1
+    assert found[0].outcome == "declared"
+    assert found[0].remembered_result == declared.remembered_result
+    assert found[0].cleanup_failure is None
+    assert found[0].sealed_at == declared.sealed_at
+
+
+async def test_cleanup_recovery_does_not_make_an_older_bout_latest() -> None:
+    first_snapshot = await verified_round_one_snapshot()
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    first = derive_receipt(first_snapshot, "run_finished")
+    await store.append(first, first_snapshot)
+
+    second_snapshot = first_snapshot.model_copy(deep=True)
+    second_snapshot.id = "b" * 32
+    second_snapshot.updated_at = first.sealed_at + timedelta(seconds=2)
+    second = derive_receipt(second_snapshot, "run_finished")
+    await store.append(second, second_snapshot)
+
+    recovered = first.model_copy(
+        update={
+            "sealing_event": "cleanup_update",
+            "sealed_at": first.sealed_at + timedelta(seconds=3),
+            "cleanup_failure": None,
+        }
+    )
+    await store.append(recovered, first_snapshot)
+
+    found = await store.load()
+
+    assert [item.session_id for item in found] == [
+        first.session_id,
+        second.session_id,
+    ]
+    assert found[0].sealed_at == first.sealed_at
+    assert found[-1].session_id == second.session_id
 
 
 async def test_the_receipt_table_is_confirmed_rather_than_created_when_present() -> None:

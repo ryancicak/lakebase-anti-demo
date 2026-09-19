@@ -9,9 +9,9 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -40,6 +40,16 @@ ROUND5_RESIDENT_DEADLINE_SECONDS = 720.0
 # 720s" into a fast, bounded failure that says the ring was not actually warm,
 # instead of blocking the operator on the full bout-execution deadline.
 ROUND5_ARM_STAGE_DEADLINE_SECONDS = 45.0
+# An abandoned ARM must not spend the normal 12-minute running-bout settlement
+# deadline ahead of provider cleanup. CANCEL is durable before settlement is
+# awaited, so this budget may defer observation without losing cleanup intent.
+ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS = ROUND5_ARM_STAGE_DEADLINE_SECONDS
+# A RELEASE is process-local permission layered over a durable intent. If the
+# process that held that permission dies, no replacement process may infer the
+# bell from the row alone. Tombstone such rows after the bout deadline so the
+# 10 Hz publisher does not scan crashed-bell debt forever.
+ROUND5_ORPHANED_RELEASE_TTL_SECONDS = ROUND5_RESIDENT_DEADLINE_SECONDS
+ROUND5_ORPHAN_REAP_INTERVAL_SECONDS = 30.0
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
@@ -441,7 +451,22 @@ class Round5ControlStore(Protocol):
 
     async def enqueue(self, event: Round5ControlEvent) -> None: ...
 
-    async def pending(self, limit: int = 32) -> tuple[Round5ControlEvent, ...]: ...
+    async def pending(
+        self,
+        limit: int = 32,
+        *,
+        allowed_release_ids: Collection[str] = (),
+    ) -> tuple[Round5ControlEvent, ...]: ...
+
+    async def release_dispatchable(self, event_id: str) -> bool: ...
+
+    async def expire_orphaned_releases(
+        self,
+        *,
+        created_before: datetime,
+        expired_at: datetime,
+        protected_release_ids: Collection[str] = (),
+    ) -> tuple[str, ...]: ...
 
     async def mark_published(
         self,
@@ -507,10 +532,29 @@ class InMemoryRound5ControlStore:
             if existing is not None and existing[0] != event:
                 raise ValueError("resident outbox event identity conflict")
             self.outbox.setdefault(event.event_id, (event, None))
+            if event.kind == Round5ControlKind.CANCEL:
+                for event_id, (current, published_at) in tuple(self.outbox.items()):
+                    if (
+                        current.job_id == event.job_id
+                        and current.kind == Round5ControlKind.RELEASE
+                        and published_at is None
+                    ):
+                        self.outbox[event_id] = (current, event.created_at)
 
-    async def pending(self, limit: int = 32) -> tuple[Round5ControlEvent, ...]:
+    async def pending(
+        self,
+        limit: int = 32,
+        *,
+        allowed_release_ids: Collection[str] = (),
+    ) -> tuple[Round5ControlEvent, ...]:
         async with self._lock:
-            values = [event for event, published_at in self.outbox.values() if published_at is None]
+            allowed = frozenset(allowed_release_ids)
+            values = [
+                event
+                for event, published_at in self.outbox.values()
+                if published_at is None
+                and (event.kind != Round5ControlKind.RELEASE or event.event_id in allowed)
+            ]
             values.sort(
                 key=lambda event: (
                     event.installation_id,
@@ -534,6 +578,41 @@ class InMemoryRound5ControlStore:
         async with self._lock:
             event, current = self.outbox[event_id]
             self.outbox[event_id] = (event, current or published_at)
+
+    async def release_dispatchable(self, event_id: str) -> bool:
+        async with self._lock:
+            row = self.outbox.get(event_id)
+            if row is None:
+                return False
+            event, published_at = row
+            if event.kind != Round5ControlKind.RELEASE or published_at is not None:
+                return False
+            return not any(
+                current.kind == Round5ControlKind.CANCEL
+                and current.job_id == event.job_id
+                for current, _current_published_at in self.outbox.values()
+            )
+
+    async def expire_orphaned_releases(
+        self,
+        *,
+        created_before: datetime,
+        expired_at: datetime,
+        protected_release_ids: Collection[str] = (),
+    ) -> tuple[str, ...]:
+        async with self._lock:
+            protected = frozenset(protected_release_ids)
+            expired: list[str] = []
+            for event_id, (event, published_at) in tuple(self.outbox.items()):
+                if (
+                    event.kind == Round5ControlKind.RELEASE
+                    and published_at is None
+                    and event.created_at <= created_before
+                    and event_id not in protected
+                ):
+                    self.outbox[event_id] = (event, expired_at)
+                    expired.append(event_id)
+            return tuple(expired)
 
     async def append_runner_event(self, event: Round5RunnerEvent) -> None:
         async with self._lock:
@@ -669,6 +748,28 @@ class LakebaseRound5ControlStore:
                 raise CoordinationObjectsMissingError(
                     "Round 5 resident control schema version is incomplete"
                 )
+            # Repair debt written by versions that committed CANCEL without
+            # suppressing the gated RELEASE. The matching cancel is durable
+            # proof that the release must never cross its gate.
+            await cursor.execute(
+                f"""
+                UPDATE {ROUND5_CONTROL_OUTBOX_TABLE} AS release
+                SET published_at = COALESCE(release.published_at, cancel.created_at)
+                FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS cancel
+                WHERE release.published_at IS NULL
+                  AND release.kind = %s
+                  AND cancel.kind = %s
+                  AND cancel.installation_id = release.installation_id
+                  AND cancel.lane_id = release.lane_id
+                  AND cancel.generation = release.generation
+                  AND cancel.warm_attempt_token = release.warm_attempt_token
+                  AND cancel.job_id = release.job_id
+                """,
+                (
+                    Round5ControlKind.RELEASE.value,
+                    Round5ControlKind.CANCEL.value,
+                ),
+            )
 
         await self._run(verify)
 
@@ -711,21 +812,52 @@ class LakebaseRound5ControlStore:
             row = await cursor.fetchone()
             if row is None or str(row[0]) != event.event_id:
                 raise ValueError("resident outbox logical identity conflict")
+            if event.kind == Round5ControlKind.CANCEL:
+                # CANCEL and suppression commit in the same transaction. A
+                # process death after this callback therefore cannot strand the
+                # gated RELEASE at the head of the ordered pending window.
+                await cursor.execute(
+                    f"""
+                    UPDATE {ROUND5_CONTROL_OUTBOX_TABLE}
+                    SET published_at = COALESCE(published_at, %s)
+                    WHERE job_id = %s
+                      AND kind = %s
+                      AND published_at IS NULL
+                    """,
+                    (
+                        event.created_at,
+                        event.job_id,
+                        Round5ControlKind.RELEASE.value,
+                    ),
+                )
 
         await self._run(insert)
 
-    async def pending(self, limit: int = 32) -> tuple[Round5ControlEvent, ...]:
+    async def pending(
+        self,
+        limit: int = 32,
+        *,
+        allowed_release_ids: Collection[str] = (),
+    ) -> tuple[Round5ControlEvent, ...]:
         async def select(cursor: Any) -> tuple[Round5ControlEvent, ...]:
             await cursor.execute(
                 f"""
                 SELECT payload
                 FROM {ROUND5_CONTROL_OUTBOX_TABLE}
                 WHERE published_at IS NULL
+                  AND (
+                    kind <> %s
+                    OR event_id = ANY(%s)
+                  )
                 ORDER BY installation_id, lane_id, generation,
                          warm_attempt_token, job_id, sequence, created_at, event_id
                 LIMIT %s
                 """,
-                (limit,),
+                (
+                    Round5ControlKind.RELEASE.value,
+                    list(allowed_release_ids),
+                    limit,
+                ),
             )
             return tuple(
                 Round5ControlEvent.from_wire(
@@ -753,6 +885,72 @@ class LakebaseRound5ControlStore:
             )
 
         await self._run(update)
+
+    async def release_dispatchable(self, event_id: str) -> bool:
+        """Revalidate one RELEASE against its durable cancellation fence."""
+
+        async def select(cursor: Any) -> bool:
+            await cursor.execute(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS release
+                    WHERE release.event_id = %s
+                      AND release.kind = %s
+                      AND release.published_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS cancel
+                          WHERE cancel.kind = %s
+                            AND cancel.installation_id = release.installation_id
+                            AND cancel.lane_id = release.lane_id
+                            AND cancel.generation = release.generation
+                            AND cancel.warm_attempt_token = release.warm_attempt_token
+                            AND cancel.job_id = release.job_id
+                      )
+                )
+                """,
+                (
+                    event_id,
+                    Round5ControlKind.RELEASE.value,
+                    Round5ControlKind.CANCEL.value,
+                ),
+            )
+            row = await cursor.fetchone()
+            return bool(row and row[0])
+
+        return await self._run(select)
+
+    async def expire_orphaned_releases(
+        self,
+        *,
+        created_before: datetime,
+        expired_at: datetime,
+        protected_release_ids: Collection[str] = (),
+    ) -> tuple[str, ...]:
+        """Tombstone crashed-bell RELEASE intents after their execution budget."""
+
+        async def update(cursor: Any) -> tuple[str, ...]:
+            await cursor.execute(
+                f"""
+                UPDATE {ROUND5_CONTROL_OUTBOX_TABLE}
+                SET published_at = %s
+                WHERE kind = %s
+                  AND published_at IS NULL
+                  AND created_at <= %s
+                  AND NOT (event_id = ANY(%s))
+                RETURNING event_id
+                """,
+                (
+                    expired_at,
+                    Round5ControlKind.RELEASE.value,
+                    created_before,
+                    list(protected_release_ids),
+                ),
+            )
+            return tuple(str(row[0]) for row in await cursor.fetchall())
+
+        return await self._run(update)
 
     async def runner_events(
         self,
@@ -870,6 +1068,7 @@ class Round5ControlDispatcher:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         on_persistent_failure: Callable[[str], Awaitable[None]] | None = None,
         persistent_failure_threshold: int = 3,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if persistent_failure_threshold <= 0:
             raise ValueError("persistent failure threshold must be positive")
@@ -878,18 +1077,30 @@ class Round5ControlDispatcher:
         self._sleep = sleep
         self._on_persistent_failure = on_persistent_failure
         self._persistent_failure_threshold = persistent_failure_threshold
+        self._now = now
         self._wake = asyncio.Event()
         self._closed = False
         self._task: asyncio.Task[None] | None = None
+        self._start_lock = asyncio.Lock()
+        self._initialized = False
         self._allowed_releases: set[str] = set()
+        self._held_releases: set[str] = set()
+        self._next_orphan_reap_at: datetime | None = None
         self._consecutive_failures = 0
         self._persistent_failure_reported = False
 
     async def start(self) -> asyncio.Task[None]:
-        await self.store.initialize()
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self.run(), name="round5-control-outbox")
-        return self._task
+        # Every enqueue calls start(), and concurrent lanes may call it at the
+        # same time. Schema verification and the legacy CANCEL/RELEASE repair
+        # are process-start work, not per-event work; serialize them once for
+        # this dispatcher before exposing its publishing task.
+        async with self._start_lock:
+            if not self._initialized:
+                await self.store.initialize()
+                self._initialized = True
+            if self._task is None or self._task.done():
+                self._task = asyncio.create_task(self.run(), name="round5-control-outbox")
+            return self._task
 
     def wake(self) -> None:
         self._wake.set()
@@ -898,8 +1109,22 @@ class Round5ControlDispatcher:
         """Open one exact RELEASE only after its eligibility edge."""
 
         _digest(event_id, "event_id")
+        self._held_releases.add(event_id)
         self._allowed_releases.add(event_id)
         self._wake.set()
+
+    def hold_release(self, event_id: str) -> None:
+        """Protect a live gated RELEASE while its topology gate is still closed."""
+
+        _digest(event_id, "event_id")
+        self._held_releases.add(event_id)
+
+    def discard_release(self, event_id: str) -> None:
+        """Forget a process-local gate after its durable RELEASE is suppressed."""
+
+        _digest(event_id, "event_id")
+        self._held_releases.discard(event_id)
+        self._allowed_releases.discard(event_id)
 
     async def close(self) -> None:
         self._closed = True
@@ -912,23 +1137,59 @@ class Round5ControlDispatcher:
     async def publish_once(self) -> int:
         published = 0
         try:
-            for event in await self.store.pending():
+            now = self._now()
+            if self._next_orphan_reap_at is None or now >= self._next_orphan_reap_at:
+                self._next_orphan_reap_at = now + timedelta(
+                    seconds=ROUND5_ORPHAN_REAP_INTERVAL_SECONDS
+                )
+                try:
+                    expired = await self.store.expire_orphaned_releases(
+                        created_before=now
+                        - timedelta(seconds=ROUND5_ORPHANED_RELEASE_TTL_SECONDS),
+                        expired_at=now,
+                        protected_release_ids=self._held_releases,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Reaping is maintenance, never a delivery dependency. A
+                    # coordination blip must not block STAGE/CANCEL or turn this
+                    # 30-second task into a 10 Hz retry loop.
+                    logger.warning("round5_control_orphan_reap_failed")
+                else:
+                    if expired:
+                        logger.warning(
+                            "round5_control_orphan_releases_expired count=%d",
+                            len(expired),
+                        )
+                    self._held_releases.difference_update(expired)
+                    self._allowed_releases.difference_update(expired)
+            for event in await self.store.pending(
+                allowed_release_ids=self._allowed_releases,
+            ):
                 # RELEASE is a durable intent, not permission to cross the
                 # measured edge.  Lakebase's row is committed with the bell and
                 # opened only after the process captures T0; the competitor row
                 # is staged while the Proxy is provisioning and opened only
-                # after the exact control-plane gate.
+                # after the exact control-plane gate.  Gated rows stay
+                # unpublished so allow_release can still open the current bout,
+                # but they are excluded from pending() so crashed bells cannot
+                # fill the ordered LIMIT 32 window.
                 if (
                     event.kind == Round5ControlKind.RELEASE
-                    and event.event_id not in self._allowed_releases
+                    and (
+                        event.event_id not in self._allowed_releases
+                        or not await self.store.release_dispatchable(event.event_id)
+                    )
                 ):
+                    self.discard_release(event.event_id)
                     continue
                 await self._send(event)
                 await self.store.mark_published(
                     event.event_id,
-                    published_at=datetime.now(UTC),
+                    published_at=self._now(),
                 )
-                self._allowed_releases.discard(event.event_id)
+                self.discard_release(event.event_id)
                 published += 1
         except asyncio.CancelledError:
             raise
@@ -1084,11 +1345,17 @@ class Round5ResidentTransport:
         """Prepare the resident and durably hold RELEASE behind its exact gate."""
 
         await self.stage(binding=binding, request=request)
-        return await self._enqueue(
+        event = await self._enqueue(
             binding=binding,
             sequence=2,
             kind=Round5ControlKind.RELEASE,
         )
+        # The competitor can remain staged while RDS Proxy becomes available
+        # for longer than the bout execution deadline. This process still owns
+        # that exact gate, so the crashed-bell janitor must not infer orphanhood
+        # merely from age.
+        self.dispatcher.hold_release(event.event_id)
+        return event
 
     async def release(self, *, binding: Round5ControlBinding) -> None:
         event = await self._enqueue(
@@ -1109,6 +1376,13 @@ class Round5ResidentTransport:
             sequence=3,
             kind=Round5ControlKind.CANCEL,
         )
+        release = await self.store.control_event(binding.job_id, 2)
+        if release is not None and release.kind == Round5ControlKind.RELEASE:
+            # The CANCEL transaction has now tombstoned the durable RELEASE.
+            # Drop its process-local permission too: a prior send failure leaves
+            # that permission live because publish_once never reached its normal
+            # post-publish discard.
+            self.dispatcher.discard_release(release.event_id)
         if await_settlement:
             await self.wait_settled(binding)
 

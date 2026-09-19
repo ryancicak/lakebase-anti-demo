@@ -6,6 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { ApiError, api } from './api/client'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
+import {
+  getCanvasRecordings,
+  resetCanvasRecordings,
+  type CanvasOperation,
+  type CanvasRecording,
+} from './test/setup'
 
 /**
  * Round selection goes through the six tiles on the fight card. The redundant
@@ -135,14 +141,25 @@ function deferred<T>() {
 }
 
 function stubReceiptCanvas() {
-  const context = {
-    fillRect: vi.fn(), strokeRect: vi.fn(), fillText: vi.fn(),
-    save: vi.fn(), translate: vi.fn(), rotate: vi.fn(), restore: vi.fn(),
-    measureText: vi.fn((value: string) => ({ width: value.length * 8 })),
-  }
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context as unknown as CanvasRenderingContext2D)
-  vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation((callback) => callback(new Blob(['pixel-card'], { type: 'image/png' })))
-  return context
+  resetCanvasRecordings()
+}
+
+function canvasTexts(recording: CanvasRecording): string[] {
+  return recording.operations
+    .filter((operation) => operation.kind === 'fillText')
+    .map((operation) => operation.text)
+}
+
+function canvasRecordingWithText(pattern: RegExp): CanvasRecording | undefined {
+  return [...getCanvasRecordings()]
+    .reverse()
+    .find((recording) => canvasTexts(recording).some((text) => pattern.test(text)))
+}
+
+function isFillRect(
+  operation: CanvasOperation,
+): operation is Extract<CanvasOperation, { kind: 'fillRect' }> {
+  return operation.kind === 'fillRect'
 }
 
 /**
@@ -199,8 +216,8 @@ function ledgerReceipts(): BoutReceipt[] {
       round_title: 'MAKE A SCHEMA CHANGE SAFELY',
       outcome: 'stopped_short',
       has_measurements: true,
-      lakebase: lane(14_240, 'verified'),
-      opponent_lane: lane(93_997, 'incomplete', true),
+      lakebase: lane(10_000, 'verified'),
+      opponent_lane: lane(90_000, 'incomplete', true),
       margin_ms: null,
       sealed_at: new Date(now - 3 * day).toISOString(),
     },
@@ -1374,6 +1391,10 @@ describe('backstage setup', () => {
     rejected.round5_runtime!.state = 'failed'
     rejected.round5_runtime!.lanes.lakebase.phase = 'failed'
 
+    // The live SSE stream is opened by a subscription effect that can settle a
+    // tick after the towel button paints; wait for it before emitting so the
+    // rejected snapshot lands on an established stream (not a race with connect()).
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0))
     FakeEventSource.instances.at(-1)!.emit({
       sequence: 1,
       event: 'session_failed',
@@ -2913,6 +2934,139 @@ describe('backstage setup', () => {
     expect(screen.getByRole('heading', { name: /make this schema change safely/i })).toBeInTheDocument()
   })
 
+  it('share modal: health-bars is the default, and the selector switches to knockout with no stale card', async () => {
+    const running = session('running')
+    const verified: DemoSession = {
+      ...session('verified'),
+      lanes: {
+        lakebase: { ...running.lanes.lakebase, state: 'verified', elapsed_ms: 842.6, attempts: 1, status: 'Transaction verified' },
+        competitor: { ...running.lanes.competitor, state: 'verified', elapsed_ms: 1288.3, attempts: 1, status: 'Transaction verified' },
+      },
+      remembered_result: 'LAKEBASE WINS BY 0.45s',
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(running))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+
+    // Distinct, ordered object URLs so a stale preview would be observable, and
+    // the download/clipboard plumbing the Prepare button needs.
+    let urlSeq = 0
+    const createObjectURL = vi.fn(() => `blob:card-${++urlSeq}`)
+    const revokeObjectURL = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL })
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    vi.spyOn(window, 'open').mockReturnValue(null)
+    stubReceiptCanvas()
+
+    render(<App />)
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    const source = FakeEventSource.instances.at(-1)!
+    source.open()
+    source.emit({
+      sequence: 9,
+      event: 'run_finished',
+      occurred_at: '2026-08-17T00:00:01Z',
+      payload: { state: 'verified', session: verified },
+    })
+    expect(await screen.findByText('LAKEBASE WINS BY 0.45s')).toBeInTheDocument()
+
+    const openShare = () => user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    await openShare()
+    let receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+
+    // Default is Health Bars, with the PNG preview already rendered.
+    const group = within(receipt).getByRole('group', { name: /share card style/i })
+    const healthBtn = within(group).getByRole('button', { name: /health bars/i })
+    const knockoutBtn = within(group).getByRole('button', { name: /knockout/i })
+    expect(healthBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(knockoutBtn).toHaveAttribute('aria-pressed', 'false')
+    await within(receipt).findByRole('img', { name: /result card exactly as it will post/i })
+    const healthCanvas = canvasRecordingWithText(/^ONE LIVE RUN · NOT A BENCHMARK$/)
+    expect(healthCanvas, 'health-bars canvas was not drawn').toBeDefined()
+    expect(canvasTexts(healthCanvas!)).toEqual(expect.arrayContaining([
+      'LAKEBASE',
+      'ONE LIVE RUN · NOT A BENCHMARK',
+      "DON'T TRUST THIS POST. RING THE BELL YOURSELF.",
+    ]))
+    const healthBarFills = healthCanvas!.operations
+      .filter(isFillRect)
+      .filter((operation) => operation.x === 163 && operation.height === 54)
+      .map((operation) => ({
+        corner: operation.fillStyle,
+        y: operation.y,
+        width: operation.width,
+      }))
+    // 842.6ms / 1288.3ms fills 637px of the 974px track. The slower
+    // competitor fills the whole track; swapping these widths reverses the card.
+    expect(healthBarFills).toEqual([
+      { corner: '#e8482e', y: 219, width: 637 },
+      { corner: '#4a83e8', y: 335, width: 974 },
+    ])
+
+    // A status set, then a style switch clears it and swaps the layout.
+    await user.click(within(receipt).getByRole('button', { name: /copy caption/i }))
+    expect(receipt).toHaveTextContent(/caption copied/i)
+    const urlsBeforeSwitch = createObjectURL.mock.calls.length
+    await user.click(knockoutBtn)
+    expect(knockoutBtn).toHaveAttribute('aria-pressed', 'true')
+    expect(healthBtn).toHaveAttribute('aria-pressed', 'false')
+    expect(receipt).not.toHaveTextContent(/caption copied/i)
+    // A fresh object URL is minted for the knockout PNG and the previous one is
+    // revoked, so the preview never shows a stale image.
+    await waitFor(() => expect(createObjectURL.mock.calls.length).toBeGreaterThan(urlsBeforeSwitch))
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalled())
+    const knockoutCanvas = getCanvasRecordings().at(-1)
+    expect(knockoutCanvas).not.toBe(healthCanvas)
+    expect(canvasTexts(knockoutCanvas!)).toEqual(expect.arrayContaining([
+      'ONE LIVE RUN',
+      'NOT A BENCHMARK',
+      "DON'T TRUST THIS POST.",
+      'RING THE BELL YOURSELF.',
+    ]))
+    expect(knockoutCanvas!.operations.some(
+      (operation) => operation.kind === 'fillText' && /1[0-9]{2}px/.test(operation.font),
+    )).toBe(true)
+
+    // The prepared download filename reflects the chosen style.
+    const prepare = within(receipt).getByRole('button', { name: /prepare linkedin post/i })
+    await waitFor(() => expect(prepare).toBeEnabled())
+    await user.click(prepare)
+    const knockoutAnchor = downloadClick.mock.instances.at(-1) as unknown as HTMLAnchorElement
+    expect(knockoutAnchor.download).toMatch(/-knockout\.png$/)
+
+    // Keyboard activation switches back to Health Bars (rapid re-switch is safe).
+    healthBtn.focus()
+    await user.keyboard('{Enter}')
+    expect(healthBtn).toHaveAttribute('aria-pressed', 'true')
+    await waitFor(() => expect(within(receipt).getByRole('button', { name: /prepare linkedin post/i })).toBeEnabled())
+    await user.click(within(receipt).getByRole('button', { name: /prepare linkedin post/i }))
+    const healthAnchor = downloadClick.mock.instances.at(-1) as unknown as HTMLAnchorElement
+    expect(healthAnchor.download).toMatch(/-health-bars\.png$/)
+
+    // Reopening the modal resets the default back to Health Bars.
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /share the proof/i })).not.toBeInTheDocument())
+    await openShare()
+    receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    expect(within(receipt).getByRole('button', { name: /health bars/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(receipt).getByRole('button', { name: /knockout/i })).toHaveAttribute('aria-pressed', 'false')
+  })
+
   // The deployed app's own words for Round 1, copied from
   // `server/round_availability.py` so the test is exercising the real thing.
   // Every clause of it is true and every clause of it is written for the person
@@ -4100,14 +4254,29 @@ describe('backstage setup', () => {
       await waitFor(() => expect(rows.children[0]).toHaveTextContent(/LB.*LAKEBASE.*2\.32s/))
       const [clean, stopped, abandoned, uncontested, unrun, live] = Array.from(rows.children)
       expect(clean).toHaveAttribute('data-status', 'lakebase_faster')
+      // The visual verdict repeats only the winner's figure. Assistive tech gets
+      // one compact lane summary that includes the losing clock as well, while
+      // the painted bars themselves stay out of the accessibility tree.
+      const cleanLaneFacts = within(clean as HTMLElement).getByRole('group', {
+        name: /lane facts.*lakebase: 2\.32s.*aurora serverless v2: 13\.42s/i,
+      })
+      expect(cleanLaneFacts).not.toHaveAttribute('aria-hidden')
+      expect(cleanLaneFacts.querySelectorAll('.finale-lane[aria-hidden="true"]')).toHaveLength(2)
 
       // A stopped round keeps both figures, dates itself, and refuses a margin.
       expect(stopped).toHaveAttribute('data-status', 'lakebase_finished')
-      expect(stopped).toHaveTextContent(/LAKEBASE.*14\.24s.*STOPPED SHORT/)
+      expect(stopped).toHaveTextContent(/LAKEBASE.*10\.00s.*STOPPED SHORT/)
       // Their figure is a floor, printed m:ss because a minute-and-a-half lane
-      // is unreadable as 93.99s.
+      // is clearer as 1:30 than 90.00s.
       expect(stopped).toHaveTextContent(
-        /AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1:33 · MARGIN N\/A/,
+        /AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1:30 · MARGIN N\/A/,
+      )
+      // 10s versus >90s is censored evidence, not an exact 1:9 ratio. Neither
+      // track gets a proportional fill, and the opponent track carries explicit
+      // lower-bound semantics instead.
+      expect(stopped.querySelectorAll('.finale-track > i')).toHaveLength(0)
+      expect(stopped.querySelector('.finale-track[data-lower-bound="true"]')).toHaveTextContent(
+        'LOWER BOUND 1:30',
       )
       // A result sealed on an earlier day says so, or the ledger reads as one
       // sitting.
@@ -4138,6 +4307,36 @@ describe('backstage setup', () => {
       expect(finale).not.toHaveTextContent(/proof contracts name exact stop gates/i)
       expect(finale).not.toHaveTextContent(/not a benchmark/i)
       const shareFullCard = await within(finale).findByRole('button', { name: /share the full card/i })
+      const finaleCanvas = canvasRecordingWithText(/^SIX ROUNDS\.$/)
+      expect(finaleCanvas, 'finale canvas was not drawn').toBeDefined()
+      expect(canvasTexts(finaleCanvas!)).toEqual(expect.arrayContaining([
+        'SIX ROUNDS.',
+        '01',
+        '02',
+        '03',
+        '04',
+        '05',
+        '06',
+        'ONE LIVE RUN PER ROUND · NOT A BENCHMARK',
+      ]))
+      const firstRoundBars = finaleCanvas!.operations
+        .filter(isFillRect)
+        .filter((operation) => (
+          operation.x === 94
+          && operation.height === 12
+          && (operation.y === 398 || operation.y === 420)
+        ))
+        .map((operation) => ({
+          corner: operation.fillStyle,
+          y: operation.y,
+          width: operation.width,
+        }))
+      // Round 1 is 2.324s vs 13.417s: red is the shorter 20px fill and blue
+      // is the full 118px track. This catches blank and visually reversed cards.
+      expect(firstRoundBars).toEqual([
+        { corner: '#e8482e', y: 398, width: 20 },
+        { corner: '#4a83e8', y: 420, width: 118 },
+      ])
       const writeText = vi.fn().mockResolvedValue(undefined)
       Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
       Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:finale') })
@@ -5352,6 +5551,9 @@ describe('backstage setup', () => {
     expect(within(receipt).getByLabelText(/lakebase receipt result/i)).toHaveTextContent('14.38s')
     expect(within(receipt).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent('>90.00s')
     expect(within(receipt).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/unverified when stopped.*lower bound/i)
+    // A towel draws the scorecard for both layouts, so the style selector is
+    // withheld -- there is nothing to switch between.
+    expect(within(receipt).queryByRole('group', { name: /share card style/i })).not.toBeInTheDocument()
 
     await waitFor(() => {
       const entries = JSON.parse(
