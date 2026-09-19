@@ -888,6 +888,7 @@ def test_round5_outputs_require_static_proxy_role_and_secret_bindings() -> None:
     ]
     outputs["round5_competitor_runner_egress_rule_ids"] = [
         "sgr-2123456789abcdef0",
+        "sgr-3123456789abcdef0",
     ]
     outputs["round5_bout_base_tags"] = {"managed-by": "round5-lifecycle"}
 
@@ -977,6 +978,10 @@ async def test_clean_install_resident_acl_secret_and_state_inventory() -> None:
     terraform = "\n".join(path.read_text() for path in terraform_root.glob("*.tf"))
     assert 'variable "round5_control_dsn"' not in terraform
     assert 'resource "aws_secretsmanager_secret_version" "round5_runner_control"' not in terraform
+    assert (
+        "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres.id"
+        in terraform
+    )
 
 
 def test_round5_provisioning_tags_use_installation_scope_before_v7_commit() -> None:

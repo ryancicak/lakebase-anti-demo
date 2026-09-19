@@ -4210,11 +4210,17 @@ def _round5_topology_check(
                         "Round 5 Lakebase runner public egress is not limited "
                         "to HTTPS and PostgreSQL"
                     )
-            elif any(
-                rule.get("FromPort") == 5432 and rule.get("CidrIpv4") == "0.0.0.0/0"
-                for rule in rules
-            ):
-                raise RuntimeError("Round 5 competitor runner has public PostgreSQL egress")
+            else:
+                public_ports = {
+                    rule.get("FromPort")
+                    for rule in rules
+                    if rule.get("CidrIpv4") == "0.0.0.0/0"
+                }
+                if public_ports != {443, 5432}:
+                    raise RuntimeError(
+                        "Round 5 competitor runner public egress is not limited "
+                        "to HTTPS and coordination PostgreSQL"
+                    )
 
         iam = session.client("iam")
         runner_role_name = sealed.runner_role_arn.rsplit("/", 1)[-1]

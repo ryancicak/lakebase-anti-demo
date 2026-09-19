@@ -398,9 +398,12 @@ output "round5_lakebase_runner_egress_rule_ids" {
 }
 
 output "round5_competitor_runner_egress_rule_ids" {
-  description = "Exact Terraform-owned HTTPS and SG-targeted PostgreSQL egress rules for the competitor runner."
+  description = "Exact Terraform-owned HTTPS, coordination PostgreSQL, and SG-targeted PostgreSQL egress rules for the competitor runner."
   value = concat(
-    [aws_vpc_security_group_egress_rule.round5_competitor_runner_https.id],
+    [
+      aws_vpc_security_group_egress_rule.round5_competitor_runner_https.id,
+      aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres.id,
+    ],
     [for rule in aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy : rule.id],
     [for rule in aws_vpc_security_group_egress_rule.round5_competitor_runner_to_database : rule.id],
   )
