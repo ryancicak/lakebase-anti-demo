@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -404,7 +405,15 @@ def test_a_failed_provision_says_what_is_already_billing(tmp_path):
         assert instruction in result.stderr, f"{instruction!r} missing from:\n{result.stderr}"
 
 
-def _run_ready_gate(tmp_path, source: str, *, reset_ready: int, status: str = "ready"):
+def _run_ready_gate(
+    tmp_path,
+    source: str,
+    *,
+    reset_ready: int,
+    status: str = "ready",
+    manifest_version: int = 7,
+    has_round6: bool = True,
+):
     """Run bootstrap.sh's own ready-install gate with nothing else around it.
 
     The gate is two functions -- the condition and the refusal -- called from two
@@ -417,7 +426,16 @@ def _run_ready_gate(tmp_path, source: str, *, reset_ready: int, status: str = "r
 
     manifest = tmp_path / f"manifest-{reset_ready}-{status}.json"
     manifest.write_text(
-        f'{{"run_id": "ad-test-ready", "status": "{status}"}}\n', encoding="utf-8"
+        json.dumps(
+            {
+                "run_id": "ad-test-ready",
+                "status": status,
+                "manifest_version": manifest_version,
+                "round6": {"sealed": True} if has_round6 else None,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
     )
     script = tmp_path / f"gate-{reset_ready}-{status}.sh"
     script.write_text(
@@ -487,6 +505,18 @@ def test_apply_against_a_ready_install_refuses_and_names_the_redeploy_path(tmp_p
     resumable = _run_ready_gate(tmp_path, source, reset_ready=0, status="provisioning")
     assert resumable.returncode == 0, resumable.stderr
     assert "REACHED THE PROVISION" in resumable.stdout, resumable.stdout
+
+    # Round 4's progressive v2 seal says ready so it can be verified in
+    # isolation, but a missing Round 5/6 seal is still an interrupted install.
+    partial = _run_ready_gate(
+        tmp_path,
+        source,
+        reset_ready=0,
+        manifest_version=2,
+        has_round6=False,
+    )
+    assert partial.returncode == 0, partial.stderr
+    assert "REACHED THE PROVISION" in partial.stdout, partial.stdout
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")

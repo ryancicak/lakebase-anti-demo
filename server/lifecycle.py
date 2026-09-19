@@ -5163,6 +5163,13 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
 
     if manifest.round4 is None or manifest.manifest_version not in (2, 3, 4, 5, 6, 7):
         raise RuntimeError("Round 5 provisioning requires a complete sealed Round 4")
+    if not manifest.round5_ready:
+        # Round 4's progressive v2 seal is valid and historically carries
+        # status=ready, but setup is not finished until Round 5 and Round 6 are
+        # sealed. Persist the truthful resumable state before the first runner
+        # mutation so any later failure is not mistaken for a completed install.
+        manifest.status = "seeding"
+        save_manifest(manifest)
     outputs = _required_round5_outputs(_terraform_outputs(manifest))
     session = _aws_session(manifest)
     _round5_aurora_cluster_resource_id(

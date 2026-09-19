@@ -546,14 +546,19 @@ manifest_this_run_would_adopt() {
   printf '%s' "$ROOT/$LATEST_GENERATION/manifest.json"
 }
 
-# True when this run is an --apply, without --reset-ready, against a manifest
-# that already reads `ready`. Any other status still falls through: that is the
-# interrupted provision --apply genuinely does resume.
+# True when this run is an --apply, without --reset-ready, against a complete
+# ready manifest. Setup uses `ready` for its progressive v2 Round 4 seal before
+# Round 5 and Round 6 exist; that state is still an interrupted provision and
+# must fall through to the documented resume path.
 apply_would_reset_a_ready_install() { # <manifest path, possibly empty>
   [[ "$MODE" == "apply" ]] || return 1
   ((RESET_READY == 0)) || return 1
   [[ -n "$1" && -f "$1" ]] || return 1
-  [[ "$(jq -r '.status // empty' "$1" 2>/dev/null || true)" == "ready" ]]
+  jq -e '
+    .status == "ready"
+    and ((.manifest_version // 0) >= 6)
+    and (.round6 != null)
+  ' "$1" >/dev/null 2>&1
 }
 
 # --apply is not a resume of a finished install.
