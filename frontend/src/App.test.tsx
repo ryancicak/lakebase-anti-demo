@@ -6,6 +6,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { ApiError, api } from './api/client'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
+import {
+  getCanvasRecordings,
+  resetCanvasRecordings,
+  type CanvasOperation,
+  type CanvasRecording,
+} from './test/setup'
 
 /**
  * Round selection goes through the six tiles on the fight card. The redundant
@@ -135,14 +141,25 @@ function deferred<T>() {
 }
 
 function stubReceiptCanvas() {
-  const context = {
-    fillRect: vi.fn(), strokeRect: vi.fn(), fillText: vi.fn(),
-    save: vi.fn(), translate: vi.fn(), rotate: vi.fn(), restore: vi.fn(),
-    measureText: vi.fn((value: string) => ({ width: value.length * 8 })),
-  }
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context as unknown as CanvasRenderingContext2D)
-  vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation((callback) => callback(new Blob(['pixel-card'], { type: 'image/png' })))
-  return context
+  resetCanvasRecordings()
+}
+
+function canvasTexts(recording: CanvasRecording): string[] {
+  return recording.operations
+    .filter((operation) => operation.kind === 'fillText')
+    .map((operation) => operation.text)
+}
+
+function canvasRecordingWithText(pattern: RegExp): CanvasRecording | undefined {
+  return [...getCanvasRecordings()]
+    .reverse()
+    .find((recording) => canvasTexts(recording).some((text) => pattern.test(text)))
+}
+
+function isFillRect(
+  operation: CanvasOperation,
+): operation is Extract<CanvasOperation, { kind: 'fillRect' }> {
+  return operation.kind === 'fillRect'
 }
 
 /**
@@ -199,8 +216,8 @@ function ledgerReceipts(): BoutReceipt[] {
       round_title: 'MAKE A SCHEMA CHANGE SAFELY',
       outcome: 'stopped_short',
       has_measurements: true,
-      lakebase: lane(14_240, 'verified'),
-      opponent_lane: lane(93_997, 'incomplete', true),
+      lakebase: lane(10_000, 'verified'),
+      opponent_lane: lane(90_000, 'incomplete', true),
       margin_ms: null,
       sealed_at: new Date(now - 3 * day).toISOString(),
     },
@@ -2979,6 +2996,27 @@ describe('backstage setup', () => {
     expect(healthBtn).toHaveAttribute('aria-pressed', 'true')
     expect(knockoutBtn).toHaveAttribute('aria-pressed', 'false')
     await within(receipt).findByRole('img', { name: /result card exactly as it will post/i })
+    const healthCanvas = canvasRecordingWithText(/^ONE LIVE RUN · NOT A BENCHMARK$/)
+    expect(healthCanvas, 'health-bars canvas was not drawn').toBeDefined()
+    expect(canvasTexts(healthCanvas!)).toEqual(expect.arrayContaining([
+      'LAKEBASE',
+      'ONE LIVE RUN · NOT A BENCHMARK',
+      "DON'T TRUST THIS POST. RING THE BELL YOURSELF.",
+    ]))
+    const healthBarFills = healthCanvas!.operations
+      .filter(isFillRect)
+      .filter((operation) => operation.x === 163 && operation.height === 54)
+      .map((operation) => ({
+        corner: operation.fillStyle,
+        y: operation.y,
+        width: operation.width,
+      }))
+    // 842.6ms / 1288.3ms fills 637px of the 974px track. The slower
+    // competitor fills the whole track; swapping these widths reverses the card.
+    expect(healthBarFills).toEqual([
+      { corner: '#e8482e', y: 219, width: 637 },
+      { corner: '#4a83e8', y: 335, width: 974 },
+    ])
 
     // A status set, then a style switch clears it and swaps the layout.
     await user.click(within(receipt).getByRole('button', { name: /copy caption/i }))
@@ -2992,6 +3030,17 @@ describe('backstage setup', () => {
     // revoked, so the preview never shows a stale image.
     await waitFor(() => expect(createObjectURL.mock.calls.length).toBeGreaterThan(urlsBeforeSwitch))
     await waitFor(() => expect(revokeObjectURL).toHaveBeenCalled())
+    const knockoutCanvas = getCanvasRecordings().at(-1)
+    expect(knockoutCanvas).not.toBe(healthCanvas)
+    expect(canvasTexts(knockoutCanvas!)).toEqual(expect.arrayContaining([
+      'ONE LIVE RUN',
+      'NOT A BENCHMARK',
+      "DON'T TRUST THIS POST.",
+      'RING THE BELL YOURSELF.',
+    ]))
+    expect(knockoutCanvas!.operations.some(
+      (operation) => operation.kind === 'fillText' && /1[0-9]{2}px/.test(operation.font),
+    )).toBe(true)
 
     // The prepared download filename reflects the chosen style.
     const prepare = within(receipt).getByRole('button', { name: /prepare linkedin post/i })
@@ -4205,14 +4254,29 @@ describe('backstage setup', () => {
       await waitFor(() => expect(rows.children[0]).toHaveTextContent(/LB.*LAKEBASE.*2\.32s/))
       const [clean, stopped, abandoned, uncontested, unrun, live] = Array.from(rows.children)
       expect(clean).toHaveAttribute('data-status', 'lakebase_faster')
+      // The visual verdict repeats only the winner's figure. Assistive tech gets
+      // one compact lane summary that includes the losing clock as well, while
+      // the painted bars themselves stay out of the accessibility tree.
+      const cleanLaneFacts = within(clean as HTMLElement).getByRole('group', {
+        name: /lane facts.*lakebase: 2\.32s.*aurora serverless v2: 13\.42s/i,
+      })
+      expect(cleanLaneFacts).not.toHaveAttribute('aria-hidden')
+      expect(cleanLaneFacts.querySelectorAll('.finale-lane[aria-hidden="true"]')).toHaveLength(2)
 
       // A stopped round keeps both figures, dates itself, and refuses a margin.
       expect(stopped).toHaveAttribute('data-status', 'lakebase_finished')
-      expect(stopped).toHaveTextContent(/LAKEBASE.*14\.24s.*STOPPED SHORT/)
+      expect(stopped).toHaveTextContent(/LAKEBASE.*10\.00s.*STOPPED SHORT/)
       // Their figure is a floor, printed m:ss because a minute-and-a-half lane
-      // is unreadable as 93.99s.
+      // is clearer as 1:30 than 90.00s.
       expect(stopped).toHaveTextContent(
-        /AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1:33 · MARGIN N\/A/,
+        /AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1:30 · MARGIN N\/A/,
+      )
+      // 10s versus >90s is censored evidence, not an exact 1:9 ratio. Neither
+      // track gets a proportional fill, and the opponent track carries explicit
+      // lower-bound semantics instead.
+      expect(stopped.querySelectorAll('.finale-track > i')).toHaveLength(0)
+      expect(stopped.querySelector('.finale-track[data-lower-bound="true"]')).toHaveTextContent(
+        'LOWER BOUND 1:30',
       )
       // A result sealed on an earlier day says so, or the ledger reads as one
       // sitting.
@@ -4243,6 +4307,36 @@ describe('backstage setup', () => {
       expect(finale).not.toHaveTextContent(/proof contracts name exact stop gates/i)
       expect(finale).not.toHaveTextContent(/not a benchmark/i)
       const shareFullCard = await within(finale).findByRole('button', { name: /share the full card/i })
+      const finaleCanvas = canvasRecordingWithText(/^SIX ROUNDS\.$/)
+      expect(finaleCanvas, 'finale canvas was not drawn').toBeDefined()
+      expect(canvasTexts(finaleCanvas!)).toEqual(expect.arrayContaining([
+        'SIX ROUNDS.',
+        '01',
+        '02',
+        '03',
+        '04',
+        '05',
+        '06',
+        'ONE LIVE RUN PER ROUND · NOT A BENCHMARK',
+      ]))
+      const firstRoundBars = finaleCanvas!.operations
+        .filter(isFillRect)
+        .filter((operation) => (
+          operation.x === 94
+          && operation.height === 12
+          && (operation.y === 398 || operation.y === 420)
+        ))
+        .map((operation) => ({
+          corner: operation.fillStyle,
+          y: operation.y,
+          width: operation.width,
+        }))
+      // Round 1 is 2.324s vs 13.417s: red is the shorter 20px fill and blue
+      // is the full 118px track. This catches blank and visually reversed cards.
+      expect(firstRoundBars).toEqual([
+        { corner: '#e8482e', y: 398, width: 20 },
+        { corner: '#4a83e8', y: 420, width: 118 },
+      ])
       const writeText = vi.fn().mockResolvedValue(undefined)
       Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
       Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:finale') })

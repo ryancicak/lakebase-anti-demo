@@ -263,10 +263,12 @@ class SuccessfulTwoPhaseConnectionSpikeEngine:
         self,
         *,
         burst_valid: bool,
+        burst_launch_skew_ms: float | None = 2.0,
         cleanup_failure: bool = False,
         cleanup_abandoned: bool = False,
     ) -> None:
         self.burst_valid = burst_valid
+        self.burst_launch_skew_ms = burst_launch_skew_ms
         self.cleanup_failure = cleanup_failure
         # Cleanup that fails and keeps failing, without touching the run. The
         # separate knob is the point: `cleanup_failure` fails the run too, so it
@@ -339,7 +341,7 @@ class SuccessfulTwoPhaseConnectionSpikeEngine:
                 witness_verified_clients=64,
                 unique_backend_pids=8,
                 peak_backend_sessions=12,
-                launch_skew_ms=2.0,
+                launch_skew_ms=self.burst_launch_skew_ms,
                 gates=gates,
             )
 
@@ -3083,6 +3085,50 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
 
     # Stop any durable cleanup-convergence loop still retrying an abandoned
     # cleanup so it does not outlive the test.
+    await manager.close()
+
+
+@pytest.mark.parametrize(
+    ("launch_skew_ms", "expected_state"),
+    (
+        (10.53, SessionState.VERIFIED),
+        (None, SessionState.FAILED),
+        (float("nan"), SessionState.FAILED),
+    ),
+)
+async def test_round_five_burst_skew_is_advisory_but_evidence_is_required(
+    launch_skew_ms: float | None,
+    expected_state: SessionState,
+) -> None:
+    engine = SuccessfulTwoPhaseConnectionSpikeEngine(
+        burst_valid=True,
+        burst_launch_skew_ms=launch_skew_ms,
+    )
+    manager = RunManager(connection_spike_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Five Owner", subject="round-five-owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    terminal = await wait_for_state(manager, created.id, expected_state)
+
+    assert terminal.state == expected_state
+    if expected_state == SessionState.VERIFIED:
+        assert terminal.failure is None
+        assert terminal.fairness.launch_skew_ms == pytest.approx(10.53)
+        assert all(lane.state == LaneState.VERIFIED for lane in terminal.lanes.values())
+    else:
+        assert terminal.comparison is None
+        assert terminal.fairness.launch_skew_ms is None
+
     await manager.close()
 
 

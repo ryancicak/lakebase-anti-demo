@@ -6906,7 +6906,13 @@ class RunManager:
             snapshot = self._revalidated_snapshot(record.snapshot)
             await record.event_log.publish(
                 "cleanup_update",
-                {"session": snapshot.model_dump(mode="json")},
+                {
+                    "session": snapshot.model_dump(mode="json"),
+                    # The public event name remains stable for existing clients,
+                    # while the receipt hook can distinguish confirmed recovery
+                    # from an in-progress cleanup snapshot with the same shape.
+                    "cleanup_settled": True,
+                },
             )
         # The one place a Proxy is proved gone. Every surface that was warning
         # about it stops here, together, so `/readyz` cannot keep naming a
@@ -6947,6 +6953,7 @@ class RunManager:
             lanes = self._round_five_lanes(result)
             runtime = record.snapshot.round5_runtime
             valid = set(lanes) == {"lakebase", "competitor"}
+            launch_skews: list[float | None] = []
             for lane_id in ("lakebase", "competitor"):
                 raw = lanes.get(lane_id)
                 lane = record.snapshot.lanes[lane_id]
@@ -6983,6 +6990,18 @@ class RunManager:
                 )
                 lane.evidence = evidence
                 lane_valid = self._round_five_lane_valid(raw, evidence)
+                launch_skew = self._round_five_number(
+                    self._round_five_value(raw, "launch_skew_ms")
+                )
+                launch_skews.append(launch_skew)
+                # Launch skew is recorded fairness evidence, not a millisecond
+                # SLO that can void an otherwise verified exact-10K proof.
+                # Missing, non-finite, and negative evidence still fail closed.
+                lane_valid = (
+                    lane_valid
+                    and launch_skew is not None
+                    and launch_skew >= 0
+                )
                 if runtime is not None:
                     runtime_lane = runtime.lanes[lane_id]
                     # Result transfer happens after ramp, hold, sampling and
@@ -7046,16 +7065,7 @@ class RunManager:
                 lane.verified_at = datetime.now(UTC) if lane_valid else None
                 lane.activity = LaneActivity(phase="verified" if lane_valid else "failed")
 
-            launch_skews = [
-                self._round_five_number(self._round_five_value(raw, "launch_skew_ms"))
-                for raw in lanes.values()
-            ]
             skew = max((value for value in launch_skews if value is not None), default=None)
-            valid = (
-                valid
-                and len(launch_skews) == 2
-                and all(value is not None and 0 <= value <= 10 for value in launch_skews)
-            )
             record.snapshot.fairness = FairnessSnapshot(
                 launch_skew_ms=skew,
                 warmup_connections=_ROUND_FIVE_WARMUP_CONNECTIONS,

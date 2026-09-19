@@ -49,6 +49,7 @@ import {
   ledgerDay,
   summariseRounds,
   verdictFor,
+  summaryDuration,
 } from './recap'
 import { offerNativeShare, shareDismissalPrefix } from './share'
 import {
@@ -2297,87 +2298,6 @@ function drawFittedCanvasText(
   return options.y + lines.length * lineHeight
 }
 
-/**
- * The ledger's winner field, painted into one cell of the share card.
- *
- * Same composition as the screen -- corner chip, name, figure, qualifier, and
- * the lane fact underneath -- because this is the same scorecard and the two
- * must not disagree. The split matters more here than on the screen: the image
- * travels without an operator, so the qualifier has to sit beside the figure
- * where nobody can read the number without it, and the lane fact has to be
- * present in full rather than paraphrased down to something that fits.
- *
- * Returns nothing: the caller owns the cell's geometry.
- */
-function drawCardWinner(
-  context: CanvasRenderingContext2D,
-  verdict: LedgerVerdict,
-  day: string | null,
-  box: { x: number; y: number; width: number },
-) {
-  const right = box.x + box.width
-
-  if (verdict.winner) {
-    // The chip, then the name. Coloured by corner rather than hardcoded red, so
-    // a blue-corner win would not be printed in the home corner's colour.
-    const chipWidth = 30
-    context.fillStyle = verdict.winner.badge === 'LB' ? '#e8482e' : '#4a83e8'
-    context.fillRect(box.x, box.y, chipWidth, 15)
-    context.fillStyle = '#fff4c2'
-    context.font = '400 8px "Press Start 2P", monospace'
-    context.textAlign = 'center'
-    context.fillText(verdict.winner.badge, box.x + chipWidth / 2, box.y + 4)
-    context.textAlign = 'left'
-    context.font = '400 11px "Press Start 2P", monospace'
-    context.fillStyle = '#fff4c2'
-    context.fillText(verdict.winner.name, box.x + chipWidth + 9, box.y + 3)
-  } else {
-    // No winner: the outcome takes the whole field rather than leaving a blank
-    // where a name would go, which would read as a result withheld.
-    drawFittedCanvasText(context, verdict.outcome ?? 'NO RESULT DECLARED', {
-      x: box.x, y: box.y + 3, maxWidth: box.width, maxLines: 1,
-      startSize: 11, minSize: 8, color: '#8f9dcb',
-    })
-  }
-
-  // The figure sits hard right, the one number on the row, so the eye finds it
-  // without reading the name first.
-  if (verdict.figure) {
-    context.font = '400 13px "Press Start 2P", monospace'
-    context.fillStyle = '#6bf39a'
-    context.textAlign = 'right'
-    context.fillText(verdict.figure, right, box.y + 1)
-    context.textAlign = 'left'
-  }
-
-  /**
-   * Qualifier and date on one line: both are conditions on the figure above.
-   *
-   * Set at the name's size, NOT at the lane note's. This image is read at about
-   * 46% in a feed, where 8px stops being words -- and a figure that reads at
-   * feed scale with a qualifier that does not is the same defect as printing the
-   * figure bare. Tying the two sizes together means nobody can take the number
-   * off this card without also taking the condition on it.
-   */
-  const tokens = [verdict.qualifier, day].filter((token): token is string => !!token)
-  if (tokens.length > 0) {
-    drawFittedCanvasText(context, tokens.join(' · '), {
-      x: box.x, y: box.y + 19, maxWidth: box.width, maxLines: 1,
-      startSize: 11, minSize: 9, color: '#f8d83b',
-    })
-  }
-
-  // The lane fact, in full, at the same size as the round's own proof note. Two
-  // lines is the budget and nothing is abbreviated to fit it: the wording IS
-  // the disclosure. It reads at full size, not in a feed -- see the report.
-  if (verdict.laneNote) {
-    drawFittedCanvasText(context, verdict.laneNote, {
-      x: box.x, y: box.y + 34, maxWidth: box.width, maxLines: 2,
-      startSize: 8, minSize: 7, color: '#aeb9df', lineHeight: 9,
-    })
-  }
-}
-
 function drawPixelFighter(
   context: CanvasRenderingContext2D,
   x: number,
@@ -2983,8 +2903,109 @@ function finaleCardFilename(session: DemoSession): string {
 }
 
 /**
- * The shareable card: the same six rounds the ledger scores, and now the same
- * winners.
+ * The two lanes of one round as bar fills: the slower lane fills the track and
+ * the faster lane fills its share of it, so the gap is a shape rather than a
+ * subtraction. A lane with no clock gets `share: null` and a short lane fact
+ * instead -- never an invented length. A stopped opponent's figure is a floor,
+ * so its fill is labelled LOWER BOUND, the ledger's own word for it.
+ */
+interface FinaleLane {
+  share: number | null
+  label: string
+  lowerBound?: boolean
+}
+interface FinaleLaneBars { lakebase: FinaleLane; opponent: FinaleLane }
+
+function finaleLaneBars(result: RoundResult | null, verdict: LedgerVerdict): FinaleLaneBars {
+  const empty = (label: string): FinaleLane => ({ share: null, label })
+  if (!result) return { lakebase: empty(verdict.outcome ?? 'NOT RUN YET'), opponent: empty('') }
+  const lb = result.lakebaseMs
+  const op = result.opponentMs
+  switch (result.status) {
+    case 'uncontested':
+      return {
+        lakebase: lb === null ? empty('UNCONTESTED') : { share: 1, label: summaryDuration(lb) },
+        opponent: empty('NO NATIVE PATH'),
+      }
+    case 'lakebase_faster':
+    case 'competitor_faster':
+    case 'tie': {
+      const slower = Math.max(lb ?? 0, op ?? 0)
+      return {
+        lakebase: lb === null ? empty('UNVERIFIED') : { share: slower > 0 ? lb / slower : 1, label: summaryDuration(lb) },
+        opponent: op === null
+          ? empty('—')
+          : { share: slower > 0 ? op / slower : 1, label: summaryDuration(op) },
+      }
+    }
+    case 'lakebase_finished':
+      // The opponent's clock is censored: it says only that the lane had not
+      // finished by this point. With no exact denominator there is no honest
+      // proportional bar for either lane, so retain the two figures as labelled
+      // text and leave both tracks indeterminate.
+      return {
+        lakebase: empty(lb === null ? 'UNVERIFIED' : summaryDuration(lb)),
+        opponent: {
+          share: null,
+          label: op === null ? 'UNVERIFIED' : `LOWER BOUND ${summaryDuration(op)}`,
+          lowerBound: true,
+        },
+      }
+    default:
+      return { lakebase: empty(verdict.outcome ?? 'NOT RUN YET'), opponent: empty('') }
+  }
+}
+
+/** Which corner a tile belongs to, or null for a round nobody took. */
+type FinaleCorner = 'red' | 'blue' | 'tie' | null
+function finaleCorner(verdict: LedgerVerdict): FinaleCorner {
+  if (verdict.winner) return verdict.winner.badge === 'LB' ? 'red' : 'blue'
+  return verdict.outcome === 'TIE' ? 'tie' : null
+}
+
+/**
+ * The tally, in words that never print a zero for a corner that never raced:
+ * "3 OF 6 SCORED · 3 TO THE RED CORNER". A round the blue corner was not in is
+ * not a round it lost, so it gets no line unless it took one.
+ */
+function finaleTallyLine(results: Map<RoundId, RoundResult>, recordRead: boolean): string {
+  if (!recordRead) return 'RECORD UNREAD · NOTHING IS ASSERTED'
+  let red = 0
+  let blue = 0
+  let ties = 0
+  for (const result of results.values()) {
+    const corner = finaleCorner(verdictFor(result, 'read'))
+    if (corner === 'red') red += 1
+    else if (corner === 'blue') blue += 1
+    else if (corner === 'tie') ties += 1
+  }
+  const parts = [`${red + blue + ties} OF 6 SCORED`]
+  if (red > 0) parts.push(`${red} TO THE RED CORNER`)
+  if (blue > 0) parts.push(`${blue} TO THE BLUE CORNER`)
+  if (ties > 0) parts.push(`${ties} ${ties === 1 ? 'TIE' : 'TIES'}`)
+  return parts.join(' · ')
+}
+
+/** Whole seconds or minutes, rounded UP -- the conservative direction for our own clock. */
+function finaleHumanDuration(milliseconds: number): string {
+  if (milliseconds < 60_000) {
+    const seconds = Math.max(1, Math.ceil(milliseconds / 1000))
+    return `${seconds} ${seconds === 1 ? 'SECOND' : 'SECONDS'}`
+  }
+  const minutes = Math.ceil(milliseconds / 60_000)
+  return `${minutes} ${minutes === 1 ? 'MINUTE' : 'MINUTES'}`
+}
+
+/**
+ * The shareable card: a fight poster. The two corners face off in the header,
+ * the six rounds sit across the middle as a judge's scorecard -- a tile takes
+ * the colour of the corner that took it, so the record is read by counting
+ * red blocks before a single word is read -- and the latest live proof is the
+ * verdict banner in human units with the exact figure beside it.
+ *
+ * Every tile still carries the receipt card's two bars and the exact clocks;
+ * a round nobody took stays dark and says why. The stub keeps NOT A BENCHMARK
+ * because this image travels without the operator to say it.
  *
  * `results` is the record off disk, keyed by round. `recordRead` distinguishes
  * a record that says nothing from one that could not be read -- printing "not
@@ -3002,104 +3023,226 @@ async function renderFinaleCard(
   canvas.height = 627
   const context = canvas.getContext('2d')
   if (!context) throw new Error('This browser cannot create the final card.')
+  const font = (size: number) => `400 ${size}px "Press Start 2P", monospace`
+  const RED = '#e8482e'
+  const BLUE = '#4a83e8'
+  const YELLOW = '#f8d83b'
+  const NAVY = '#070b22'
+  const CREAM = '#fff4c2'
+  const accents = { red: RED, blue: BLUE, yellow: YELLOW }
+  const opponent = { badge: opponentBadge(session.competitor.id), name: session.competitor.short_name.toUpperCase() }
+
   context.imageSmoothingEnabled = false
   context.textBaseline = 'top'
-  context.fillStyle = '#070b22'
+  context.fillStyle = NAVY
   context.fillRect(0, 0, canvas.width, canvas.height)
   context.fillStyle = '#10183e'
   for (let x = 0; x < canvas.width; x += 32) {
     if ((x / 32) % 2 === 0) context.fillRect(x, 0, 16, canvas.height)
   }
-  context.strokeStyle = '#f8d83b'
+  context.strokeStyle = YELLOW
   context.lineWidth = 12
   context.strokeRect(12, 12, 1176, 603)
-  context.strokeStyle = '#e8482e'
+  context.strokeStyle = RED
   context.lineWidth = 5
   context.strokeRect(29, 29, 1142, 569)
 
-  context.fillStyle = '#f8d83b'
-  context.font = '400 11px "Press Start 2P", monospace'
-  context.fillText('FINAL BELL · THE SIX-ROUND STORY', 52, 47)
-  // The same heading the screen carries. "ONE DATA LOOP." was cut from the
-  // screen and this is the same artefact, so it is cut here too; the claims
-  // strip lower down is NOT, because this image travels without the operator
-  // and without the fight card beside it to supply the caveat.
-  drawFittedCanvasText(context, 'SIX ROUNDS.', {
-    x: 52, y: 78, maxWidth: 1090, maxLines: 1, startSize: 34, minSize: 25, color: '#fff4c2',
+  // Header: the title with its red shadow, and the two corners facing off.
+  drawFittedCanvasText(context, `FINAL BELL · LAKEBASE VS ${opponent.name}`, {
+    x: 54, y: 46, maxWidth: 720, maxLines: 1, startSize: 9, minSize: 7, color: YELLOW,
   })
-  context.fillStyle = '#6bf39a'
-  context.font = '400 12px "Press Start 2P", monospace'
-  context.fillText(`LIVE APP → EXACT DELTA ANSWER · ${finaleElapsed(session)}`, 54, 122)
+  context.font = font(44)
+  context.fillStyle = RED
+  context.fillText('SIX ROUNDS.', 58, 66)
+  context.fillStyle = CREAM
+  context.fillText('SIX ROUNDS.', 54, 62)
+  drawFittedCanvasText(context, 'FROM LIVE APPLICATIONS TO THE LAKEHOUSE — AND BACK AGAIN.', {
+    x: 54, y: 120, maxWidth: 720, maxLines: 1, startSize: 8, minSize: 6, color: '#b7c2e7',
+  })
+  drawPixelFighter(context, 816, 40, RED, 'LB', 0.9)
+  drawPixelFighter(context, 1054, 40, BLUE, opponent.badge, 0.9)
+  context.font = font(18)
+  context.fillStyle = YELLOW
+  context.textAlign = 'center'
+  context.fillText('VS', 973, 84)
+  context.textAlign = 'left'
+  drawFittedCanvasText(context, 'LAKEBASE', {
+    x: 852, y: 141, maxWidth: 120, maxLines: 1, startSize: 6, minSize: 6, color: '#b7c2e7', align: 'center',
+  })
+  drawFittedCanvasText(context, opponent.name, {
+    x: 1090, y: 141, maxWidth: 130, maxLines: 1, startSize: 6, minSize: 6, color: '#b7c2e7', align: 'center',
+  })
 
-  const colors = { red: '#e8482e', blue: '#4a83e8', yellow: '#f8d83b' }
-  /**
-   * The grid keeps its shape -- three across, two down, same width, same gutter
-   * -- and grows downwards to carry the winner field. The 36 units that costs
-   * are taken from slack: the gap under the header, the gap between the rows,
-   * and the band of empty frame under the claims strip. Nothing legible was
-   * given up for it, and the heading kept its size because it is the one thing
-   * on this card that still reads at feed scale.
-   */
-  const cardWidth = 350
-  const cardHeight = 194
-  const cardGap = 22
-  const rowGap = 8
-  const startX = 52
-  const startY = 144
-  FINALE_BEATS.forEach((beat, index) => {
-    const column = index % 3
-    const row = Math.floor(index / 3)
-    const x = startX + column * (cardWidth + cardGap)
-    const y = startY + row * (cardHeight + rowGap)
-    const accent = colors[beat.accent]
-    context.fillStyle = '#0b1230'
-    context.fillRect(x, y, cardWidth, cardHeight)
-    context.fillStyle = accent
-    context.fillRect(x, y, cardWidth, 8)
+  // The scorecard: six tiles across, coloured by the corner that took the round.
+  const tileWidth = 172
+  const tileGap = 12
+  const tileTop = 160
+  const tileHeight = 290
+  const plateHeight = 108
+  const drawTrack = (
+    lane: FinaleLane, laneColor: string, badge: string, x: number, y: number, width: number,
+  ) => {
+    context.fillStyle = laneColor
+    context.fillRect(x, y, 22, 16)
+    context.fillStyle = CREAM
+    context.font = font(6)
+    context.textAlign = 'center'
+    context.fillText(badge, x + 11, y + 5)
+    context.textAlign = 'left'
+    const trackX = x + 26
+    const trackWidth = width - 26
+    context.fillStyle = '#111e48'
+    context.fillRect(trackX, y, trackWidth, 16)
     context.strokeStyle = '#46527c'
-    context.lineWidth = 2
-    context.strokeRect(x, y, cardWidth, cardHeight)
-    context.fillStyle = '#070b22'
-    context.fillRect(x + 16, y + 18, 43, 32)
-    context.fillStyle = accent
-    context.font = '400 12px "Press Start 2P", monospace'
-    context.fillText(beat.number, x + 23, y + 28)
-    drawFittedCanvasText(context, beat.title.toUpperCase(), {
-      x: x + 73, y: y + 20, maxWidth: 255, maxLines: 2, startSize: 13, minSize: 9, color: '#fff4c2', lineHeight: 17,
-    })
-    drawFittedCanvasText(context, beat.flow.toUpperCase(), {
-      x: x + 17, y: y + 62, maxWidth: 316, maxLines: 2, startSize: 12, minSize: 9, color: accent, lineHeight: 16,
-    })
-    drawFittedCanvasText(context, beat.proof.toUpperCase(), {
-      x: x + 17, y: y + 100, maxWidth: 316, maxLines: 2, startSize: 8, minSize: 6, color: '#aeb9df', lineHeight: 11,
-    })
+    context.lineWidth = 1
+    context.strokeRect(trackX + 0.5, y + 0.5, trackWidth - 1, 15)
+    if (lane.share === null) {
+      if (lane.label) {
+        drawFittedCanvasText(context, lane.label, {
+          x: trackX + 6, y: y + 5, maxWidth: trackWidth - 12, maxLines: 1, startSize: 6, minSize: 6, color: '#8f9dcb',
+        })
+      }
+      return
+    }
+    const fill = Math.max(6, Math.round((trackWidth - 4) * Math.min(1, lane.share)))
+    context.fillStyle = laneColor
+    context.fillRect(trackX + 2, y + 2, fill, 12)
+    context.font = font(6)
+    const labelWidth = context.measureText(lane.label).width
+    if (trackX + 2 + fill + 6 + labelWidth <= trackX + trackWidth - 4) {
+      context.fillStyle = CREAM
+      context.fillText(lane.label, trackX + 2 + fill + 6, y + 5)
+    } else {
+      context.fillStyle = NAVY
+      context.textAlign = 'right'
+      context.fillText(lane.label, trackX + 2 + fill - 5, y + 5)
+      context.textAlign = 'left'
+    }
+  }
 
-    // The rule separates what the round was from who took it, the same job the
-    // ledger's winner column does with a border.
-    context.fillStyle = '#2b376c'
-    context.fillRect(x + 17, y + 128, 316, 2)
+  FINALE_BEATS.forEach((beat, index) => {
+    const x = 54 + index * (tileWidth + tileGap)
+    const y = tileTop
+    const inner = tileWidth - 24
     const result = results.get(beat.roundId) ?? null
     const verdict = verdictFor(result, recordRead ? 'read' : 'unread')
-    drawCardWinner(context, verdict, recordRead && result ? ledgerDay(result) : null, {
-      x: x + 17, y: y + 136, width: 316,
+    const corner = finaleCorner(verdict)
+    const cornerColor = corner === 'red' ? RED : corner === 'blue' ? BLUE : corner === 'tie' ? YELLOW : null
+    const bars = finaleLaneBars(result, verdict)
+    const day = recordRead && result ? ledgerDay(result) : null
+
+    // Plate + panel. A taken round wears its corner's colour; an untaken one stays dark.
+    context.fillStyle = cornerColor ?? '#151e48'
+    context.fillRect(x, y, tileWidth, plateHeight)
+    context.fillStyle = cornerColor ? NAVY : '#0b1230'
+    context.fillRect(x, y + plateHeight, tileWidth, tileHeight - plateHeight)
+    if (!cornerColor) {
+      context.fillStyle = accents[beat.accent]
+      context.fillRect(x, y, tileWidth, 6)
+    }
+    context.strokeStyle = cornerColor ?? '#46527c'
+    context.lineWidth = 2
+    context.strokeRect(x + 1, y + 1, tileWidth - 2, tileHeight - 2)
+
+    const ink = cornerColor ? NAVY : accents[beat.accent]
+    context.fillStyle = ink
+    context.font = font(14)
+    context.fillText(beat.number, x + 12, y + 16)
+    drawFittedCanvasText(context, beat.title.toUpperCase(), {
+      x: x + 12, y: y + 42, maxWidth: inner, maxLines: 2, startSize: 8, minSize: 7, lineHeight: 11,
+      color: cornerColor ? NAVY : '#b7c2e7',
     })
+    drawFittedCanvasText(context, beat.flow.toUpperCase(), {
+      x: x + 12, y: y + 76, maxWidth: inner, maxLines: 2, startSize: 6, minSize: 6, lineHeight: 9,
+      color: cornerColor ? '#3b1410' : '#8f9dcb',
+    })
+
+    if (cornerColor) {
+      // The winner's figure, large; the qualifier that conditions it right under.
+      drawFittedCanvasText(context, verdict.figure ?? '—', {
+        x: x + 12, y: y + 122, maxWidth: inner, maxLines: 1, startSize: 26, minSize: 16, color: YELLOW,
+      })
+      if (verdict.qualifier) {
+        drawFittedCanvasText(context, verdict.qualifier, {
+          x: x + 12, y: y + 154, maxWidth: inner, maxLines: 1, startSize: 7, minSize: 6, color: CREAM,
+        })
+      }
+    } else {
+      drawFittedCanvasText(context, verdict.outcome ?? 'NOT RUN YET', {
+        x: x + 12, y: y + 124, maxWidth: inner, maxLines: 2, startSize: 10, minSize: 7, lineHeight: 14, color: '#8f9dcb',
+      })
+      if (verdict.qualifier) {
+        drawFittedCanvasText(context, verdict.qualifier, {
+          x: x + 12, y: y + 154, maxWidth: inner, maxLines: 1, startSize: 7, minSize: 6, color: '#8f9dcb',
+        })
+      }
+    }
+
+    // The receipt card's two bars, red over blue, one track each.
+    drawTrack(bars.lakebase, RED, 'LB', x + 12, y + 236, inner)
+    drawTrack(bars.opponent, BLUE, opponent.badge, x + 12, y + 258, inner)
+
+    // The lane fact in full, under the bars. The wording IS the disclosure.
+    if (verdict.laneNote) {
+      drawFittedCanvasText(context, verdict.laneNote, {
+        x: x + 12, y: y + 170, maxWidth: inner, maxLines: 4, startSize: 6, minSize: 6, lineHeight: 9, color: '#8f9dcb',
+      })
+    }
+    if (beat.roundId === session.round.id && result) {
+      context.fillStyle = '#6bf39a'
+      context.font = font(6)
+      context.fillText('LIVE PROOF · THIS RUN', x + 12, y + 216)
+    }
+    if (day) {
+      context.fillStyle = '#8f9dcb'
+      context.font = font(6)
+      context.textAlign = 'right'
+      context.fillText(day, x + tileWidth - 12, y + 216)
+      context.textAlign = 'left'
+    }
   })
 
-  // Tightened from 58 to 46 and moved down into the band of empty frame it used
-  // to sit above. The wording is untouched: with winners now on the image the
-  // case for this strip is stronger than it was, so it gave up padding rather
-  // than words. Bottom edge stays inside the inner rule at 598.
+  // The verdict banner: the latest live proof in human units, exact beside it.
+  const metric = metricValue(session, 'analytics_available_ms')?.value
+  const liveMs = typeof metric === 'number' ? metric : session.lanes.lakebase.elapsed_ms
+  context.fillStyle = RED
+  context.fillRect(46, 470, 1108, 54)
+  context.fillStyle = YELLOW
+  context.fillRect(38, 462, 1108, 54)
+  drawFittedCanvasText(context, 'LATEST LIVE PROOF · ROUND 06 · ONE OBSERVED RUN', {
+    x: 58, y: 471, maxWidth: 520, maxLines: 1, startSize: 8, minSize: 7, color: NAVY,
+  })
+  drawFittedCanvasText(context, finaleTallyLine(results, recordRead), {
+    x: 1126, y: 471, maxWidth: 540, maxLines: 1, startSize: 8, minSize: 7, color: NAVY, align: 'right',
+  })
+  drawFittedCanvasText(context, liveMs === null
+    ? 'SIX PROOF CONTRACTS. ONE DATA LOOP.'
+    : `LIVE APP → DELTA IN ${finaleHumanDuration(liveMs)} · EXACT ${finaleElapsed(session)}`, {
+    x: 58, y: 487, maxWidth: 1068, maxLines: 1, startSize: 20, minSize: 12, color: NAVY,
+  })
+
+  // The stub: the disclaimer, the invitation, and the stamp.
   context.fillStyle = '#f1ebd7'
-  context.fillRect(52, 546, 1094, 46)
-  context.fillStyle = '#070b22'
-  context.font = '400 9px "Press Start 2P", monospace'
-  context.fillText('PROOF CONTRACTS NAME EXACT STOP GATES', 72, 556)
-  context.fillStyle = '#e8482e'
-  context.fillText('CAPABILITY GAPS SAY NOT TIMED · NOT A BENCHMARK', 72, 573)
-  context.fillStyle = '#070b22'
-  context.textAlign = 'right'
-  context.fillText('LAKEBASE · THE ANTI-DEMO', 1126, 564)
-  context.textAlign = 'left'
+  context.fillRect(38, 528, 1108, 70)
+  context.fillStyle = NAVY
+  for (let x = 52; x < 1130; x += 24) context.fillRect(x, 528, 12, 4)
+  context.font = font(11)
+  context.fillStyle = RED
+  context.fillText('ONE LIVE RUN PER ROUND · NOT A BENCHMARK', 58, 546)
+  context.font = font(8)
+  context.fillStyle = NAVY
+  context.fillText('CAPABILITY GAPS SAY NOT TIMED · RING THE BELL YOURSELF.', 58, 570)
+  context.fillStyle = '#0a2c22'
+  context.fillRect(872, 540, 260, 46)
+  context.strokeStyle = '#6bf39a'
+  context.lineWidth = 3
+  context.strokeRect(873.5, 541.5, 257, 43)
+  drawFittedCanvasText(context, 'LAKEBASE · THE ANTI-DEMO', {
+    x: 1002, y: 550, maxWidth: 240, maxLines: 1, startSize: 10, minSize: 7, color: '#6bf39a', align: 'center',
+  })
+  drawFittedCanvasText(context, `FINALE ${receiptId(session)}`, {
+    x: 1002, y: 569, maxWidth: 240, maxLines: 1, startSize: 7, minSize: 6, color: CREAM, align: 'center',
+  })
 
   return new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((value) => value ? resolve(value) : reject(new Error('The final card could not be encoded.')), 'image/png')
@@ -8086,7 +8229,7 @@ function BetweenRounds({
  * complaint that produced this screen was a scorecard you could read top to
  * bottom without ever learning who won.
  */
-function FinaleRow({ beat, result, reading, latest }: {
+function FinaleRow({ beat, result, reading, latest, opponent }: {
   beat: FinaleBeat
   /** Null when the record has been read and holds nothing for this round. */
   result: RoundResult | null
@@ -8098,10 +8241,32 @@ function FinaleRow({ beat, result, reading, latest }: {
    * measured and not a claim that it is worth more than the other five.
    */
   latest: boolean
+  /** The blue corner's chip, the fight card's own, for the lane badge. */
+  opponent: { badge: string; name: string }
 }) {
   const verdict: LedgerVerdict = verdictFor(result, reading ? 'reading' : 'read')
   // A result from an earlier day says so, or the ledger reads as one sitting.
   const day = reading || !result ? null : ledgerDay(result)
+  // The same two bars the share card draws, so the screen and the image agree.
+  const bars = finaleLaneBars(result, verdict)
+  // Keep the finale scorecard concise; hold/check details remain on the Round 5 receipt.
+  const proof = beat.roundId === 'survive_connection_spike'
+    ? '10,000 clients held / lane · multiplexing proved'
+    : beat.proof
+  const lane = (side: FinaleLane, corner: 'red' | 'blue', badge: string) => (
+    <div className="finale-lane" data-corner={corner} aria-hidden="true">
+      <b>{badge}</b>
+      <span
+        className="finale-track"
+        data-empty={side.share === null ? 'true' : undefined}
+        data-lower-bound={side.lowerBound ? 'true' : undefined}
+        data-inside={side.share !== null && side.share > 0.72 ? 'true' : undefined}
+      >
+        {side.share !== null && <i style={{ width: `${Math.max(1.5, Math.min(100, side.share * 100))}%` }} />}
+        {side.label && <em>{side.label}</em>}
+      </span>
+    </div>
+  )
 
   return (
     <article
@@ -8113,12 +8278,23 @@ function FinaleRow({ beat, result, reading, latest }: {
       <header><span>{beat.number}</span><strong>{beat.title}</strong></header>
       <h2>{beat.flow}</h2>
       <p>
-        {beat.proof}
+        {proof}
         {/* The lane fact that qualifies the verdict, next to the evidence rather
             than next to our own number: the reason a corner has no figure is a
             statement about that corner. */}
         {verdict.laneNote && <em>{verdict.laneNote}</em>}
       </p>
+      {/* One concise accessible summary owns both lane facts. The painted bars
+          stay hidden below it so a screen reader hears each clock/state once,
+          while still getting the losing lane a compact verdict can omit. */}
+      <div
+        className="finale-bars"
+        role="group"
+        aria-label={`Lane facts · Lakebase: ${bars.lakebase.label || 'no result'} · ${opponent.name}: ${bars.opponent.label || 'no result'}`}
+      >
+        {lane(bars.lakebase, 'red', 'LB')}
+        {lane(bars.opponent, 'blue', opponent.badge)}
+      </div>
       <div className="finale-win">
         {verdict.winner
           ? <b><span aria-hidden="true">{verdict.winner.badge}</span>{verdict.winner.name}</b>
@@ -8289,6 +8465,10 @@ function Finale({ session, onBack, onSummary }: {
             result={results.get(beat.roundId) ?? null}
             reading={receipts === null}
             latest={beat.roundId === session.round.id}
+            opponent={{
+              badge: opponentBadge(session.competitor.id),
+              name: session.competitor.short_name,
+            }}
           />
         ))}
       </section>

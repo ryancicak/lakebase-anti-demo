@@ -752,6 +752,26 @@ describe('one generic evidence classifier with six round contracts', () => {
     }).shape).toBe('cleanup_failure')
   })
 
+  it.each([
+    ['Round 4', 'put_model_score_in_app'],
+    ['Round 6', 'analyze_live_orders_without_slowing_checkout'],
+  ] as const)(
+    '%s complete capability gap unconditionally produces Lakebase health bars',
+    (_label, roundId) => {
+      const session = verifiedSession(roundId)
+      const classified = classifyOutcome(session)
+      const receipt = receiptPresentation(session, 'round')
+
+      expect(classified.status).toBe('declared_capability')
+      expect(classified.contractComplete).toBe(true)
+      expect(receipt.healthBars).toMatchObject({
+        fill: { lakebase: 1, competitor: 0 },
+        winner: 'lakebase',
+        capabilityGap: true,
+      })
+    },
+  )
+
   it.each(ROUND_IDS)(
     '%s treats failed cooldown cleanup as one non-shareable fenced outcome',
     (roundId) => {
@@ -834,17 +854,21 @@ describe('one generic evidence classifier with six round contracts', () => {
       // card: never without a named winner on a complete, untowelled contract;
       // the slower lane always fills the track; the verdict is never empty; and
       // the capability flag matches the structured classification, not a string.
-      if (receipt.healthBars) {
+      const shouldHaveHealthBars = !session.towel
+        && (classified.status === 'declared_comparison' || classified.status === 'declared_capability')
+        && (receipt.winner === 'lakebase' || receipt.winner === 'competitor')
+      if (shouldHaveHealthBars) {
+        expect(receipt.healthBars).toBeDefined()
+        const healthBars = receipt.healthBars!
         expect(receipt.winner === 'lakebase' || receipt.winner === 'competitor').toBe(true)
         expect(classified.contractComplete).toBe(true)
         expect(session.towel).toBeFalsy()
-        expect(receipt.healthBars.winner).toBe(receipt.winner)
-        expect(receipt.healthBars.capabilityGap).toBe(receipt.competitorCapabilityGap)
-        expect(Math.max(receipt.healthBars.fill.lakebase, receipt.healthBars.fill.competitor)).toBe(1)
-        expect(receipt.healthBars.fill[receipt.healthBars.winner]).toBeGreaterThanOrEqual(0)
-        expect(receipt.healthBars.verdict.length).toBeGreaterThan(0)
-      }
-      if (session.towel || !classified.contractComplete || (receipt.winner !== 'lakebase' && receipt.winner !== 'competitor')) {
+        expect(healthBars.winner).toBe(receipt.winner)
+        expect(healthBars.capabilityGap).toBe(receipt.competitorCapabilityGap)
+        expect(Math.max(healthBars.fill.lakebase, healthBars.fill.competitor)).toBe(1)
+        expect(healthBars.fill[healthBars.winner]).toBeGreaterThanOrEqual(0)
+        expect(healthBars.verdict.length).toBeGreaterThan(0)
+      } else {
         expect(receipt.healthBars).toBeUndefined()
       }
 

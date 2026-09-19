@@ -777,6 +777,7 @@ async def test_setup_cleanup_waits_for_lane_settlement_before_provider_cleanup()
     engine._cleanup_start_lock = asyncio.Lock()
     engine._cleanup_bout_id = None
     engine._setup_result = None
+    engine._resident_bindings = {}
     engine._active_run_ids = {"lakebase": "job-one"}
     order: list[str] = []
 
@@ -804,6 +805,90 @@ async def test_setup_cleanup_waits_for_lane_settlement_before_provider_cleanup()
 
     assert order == ["job_settled", "provider_cleanup"]
     assert engine._cleanup_bout_id == "bout-one"
+
+
+async def test_abandoned_arm_settles_prepared_resident_before_rewarm() -> None:
+    engine = object.__new__(LiveConnectionSpikeEngine)
+    engine._setup_task = None
+    engine._cleanup_start_lock = asyncio.Lock()
+    engine._cleanup_bout_id = None
+    engine._setup_result = None
+    engine._lane_bursts = {}
+    engine._active_run_ids = {}
+    binding = SimpleNamespace(job_id="prepared-job")
+    engine._resident_bindings = {"lakebase": binding}
+    order: list[str] = []
+
+    class LaneAdapter:
+        async def cancel_resident(self, *, binding: object) -> None:
+            assert binding is engine._resident_bindings["lakebase"]
+            order.append("prepared_resident_settled")
+
+    class Setup:
+        async def begin_cleanup(self, bout_id: str) -> None:
+            assert bout_id == "bout-one"
+            order.append("provider_cleanup")
+
+    engine._lane_adapters = {"lakebase": LaneAdapter()}
+    engine._setup_orchestrator = Setup()
+
+    await engine._stop_setup_and_begin_cleanup_once("bout-one")
+
+    assert order == ["prepared_resident_settled", "provider_cleanup"]
+    assert engine._resident_bindings == {}
+    assert engine._cleanup_bout_id == "bout-one"
+
+
+async def test_abandoned_arm_timeout_defers_resident_but_starts_provider_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(live, "ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS", 0.01)
+    caplog.set_level("ERROR", logger="server.connection_spike_live")
+    engine = object.__new__(LiveConnectionSpikeEngine)
+    engine._setup_task = None
+    engine._cleanup_start_lock = asyncio.Lock()
+    engine._cleanup_bout_id = None
+    engine._setup_result = None
+    engine._lane_bursts = {}
+    binding = SimpleNamespace(job_id="prepared-job")
+    engine._resident_bindings = {"lakebase": binding}
+    engine._active_run_ids = {"lakebase": binding.job_id}
+    order: list[str] = []
+
+    class Transport:
+        async def cancel(
+            self,
+            *,
+            binding: object,
+            await_settlement: bool,
+        ) -> None:
+            assert await_settlement is True
+            await asyncio.Event().wait()
+
+    class Setup:
+        async def begin_cleanup(self, bout_id: str) -> None:
+            assert bout_id == "bout-one"
+            order.append("provider_cleanup")
+
+    adapter = object.__new__(LiveConnectionSpikeAdapter)
+    adapter._resident_transport = Transport()
+    adapter._resident_settlement_debt = {}
+    adapter._resident_release_events = {}
+    engine._lane_adapters = {"lakebase": adapter}
+    engine._setup_orchestrator = Setup()
+
+    await asyncio.wait_for(
+        engine._stop_setup_and_begin_cleanup_once("bout-one"),
+        timeout=0.2,
+    )
+
+    assert order == ["provider_cleanup"]
+    assert engine._resident_bindings == {"lakebase": binding}
+    assert engine._active_run_ids == {"lakebase": binding.job_id}
+    assert adapter._resident_settlement_debt == {"prepared-job": binding}
+    assert engine._cleanup_bout_id == "bout-one"
+    assert "round5_abandoned_arm_resident_settlement_deferred" in caplog.text
 
 
 async def test_duplicate_lane_callback_is_refused_before_a_second_dispatch() -> None:

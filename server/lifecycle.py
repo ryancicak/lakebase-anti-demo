@@ -6843,6 +6843,7 @@ async def _rotate_round5_resident_login(
     # -- and additionally binds the outbox event_id so a forged or never-
     # dispatched event is classified 'unknown' rather than acted on. It returns:
     #   'unknown'    -- no matching dispatched outbox event (tamper/forgery),
+    #   'cancelled'  -- this RELEASE was durably revoked by its later CANCEL,
     #   'terminal'   -- this job already settled/quarantined under this token,
     #   'current'    -- the durable warm slot still names this attempt's token,
     #   'superseded' -- a valid old event whose token the warm slot has rotated.
@@ -6882,6 +6883,19 @@ async def _rotate_round5_resident_login(
                           p_binding - 'runner_process_boot_id'::text
                       )
                 ) THEN 'unknown'
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM {ROUND5_CONTROL_OUTBOX_TABLE} AS release
+                    JOIN {ROUND5_CONTROL_OUTBOX_TABLE} AS cancel
+                      ON cancel.installation_id = release.installation_id
+                     AND cancel.lane_id = release.lane_id
+                     AND cancel.generation = release.generation
+                     AND cancel.warm_attempt_token = release.warm_attempt_token
+                     AND cancel.job_id = release.job_id
+                     AND cancel.kind = 'cancel'
+                    WHERE release.event_id = p_event_id
+                      AND release.kind = 'release'
+                ) THEN 'cancelled'
                 WHEN EXISTS (
                     SELECT 1
                     FROM {ROUND5_RUNNER_EVENT_TABLE} AS ev

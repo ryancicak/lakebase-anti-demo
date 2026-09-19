@@ -6,6 +6,7 @@ import { FALLBACK_CATALOG } from './catalog'
 import { replayStory } from './instant-replay'
 import { buildRingsideCue, classifyOutcome } from './ringside-cues'
 import { applyRunEventSnapshot, reconcileRunEventSession, selectRound4Session } from './round4'
+import { resetCanvasRecordings } from './test/setup'
 import {
   isRoundFiveSetupEvidence,
   roundFiveFightCardOpening,
@@ -1036,17 +1037,7 @@ it('uses V4 runtime over contradictory setup and lane evidence everywhere', () =
 })
 
 function stubReceiptCanvas() {
-  const context = {
-    fillRect: vi.fn(), strokeRect: vi.fn(), fillText: vi.fn(),
-    save: vi.fn(), translate: vi.fn(), rotate: vi.fn(), restore: vi.fn(),
-    measureText: vi.fn((value: string) => ({ width: value.length * 8 })),
-  }
-  vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(
-    context as unknown as CanvasRenderingContext2D,
-  )
-  vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation(
-    (callback) => callback(new Blob(['pixel-card'], { type: 'image/png' })),
-  )
+  resetCanvasRecordings()
 }
 
 it('renders the running Round 5 race in the canonical two-clock arena', async () => {

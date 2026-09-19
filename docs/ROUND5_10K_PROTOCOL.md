@@ -176,8 +176,12 @@ Event-loop lag, host scheduling delay, CPU utilization, calibration time, and se
 timing are advisory pacing signals. They may reduce future admission concurrency and remain visible
 in the evidence, but they never cancel admitted connections, block the hold, shorten the 30-second
 hold, suppress the 64 samples, or invalidate an otherwise exact result. The 50 ms event-loop and
-0.85 CPU thresholds remain adaptation thresholds, not pass/fail gates. Unknown safety codes fail
-closed as protocol errors; they are never classified by string prefix.
+0.85 CPU thresholds remain adaptation thresholds, not pass/fail gates. First-launch skew is the same
+class of signal: missing or non-finite `launch_skew_ms` fails closed as incomplete evidence, but
+exceeding the 10 ms advisory target (`advisory_launch_skew_ms`, sealed with
+`launch_skew_semantics: advisory_scheduling_not_fatal`) does not. The public contract still emits
+`max_launch_skew_ms` as a compatibility alias of that advisory target; it is not a fatal validity
+max. Unknown safety codes fail closed as protocol errors; they are never classified by string prefix.
 
 9,999 fails. A one-sided exact result may remain visible but never declares a winner.
 

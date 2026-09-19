@@ -129,26 +129,32 @@ TOWEL_SETTLING_EVENTS = frozenset({"towel_update", "cleanup_update"})
 SETTLED_TOWEL_STATES = frozenset({TowelState.READY, TowelState.FAILED})
 
 
-def seals_bout(event: str, snapshot: SessionSnapshot) -> bool:
+def seals_bout(
+    event: str,
+    snapshot: SessionSnapshot,
+    *,
+    cleanup_settled: bool = False,
+) -> bool:
     """Whether this published event is the one that ends the bout's record.
 
-    The non-towel branch is Round 5's, and it seals a *second* time for a bout
-    that already has a receipt. That is deliberate and it is what the store was
-    built for: cleanup is abandoned long after the verdict was published, so the
-    only alternative would be amending a sealed row, and this app holds no UPDATE
-    anywhere near its own history. The later seal supersedes rather than
-    accompanies -- ``load`` is ``DISTINCT ON (session_id, round_id)`` and the
-    filesystem keeps one file per bout -- which is safe only because the later
-    snapshot is a strict superset: abandonment touches the setup and towel
-    sub-objects and never a lane, so every measurement survives and the tidy-up
-    failure is added. A bout that verified therefore keeps ``outcome ==
-    "declared"`` and gains the admission that its proxy may still be billing.
+    Round 5 cleanup may seal again after the immutable declared receipt. The
+    durable store upserts one bounded ``cleanup_update`` overlay per bout, and
+    ``load`` folds only its cleanup state onto the declared base. The filesystem
+    likewise keeps one folded file per bout. Measurements, outcome, and the
+    declaration's ordering timestamp therefore survive while cleanup failure
+    can be recorded and later cleared without an unbounded revision stream.
     """
 
     if event in SEALING_EVENTS:
         return True
     if event not in TOWEL_SETTLING_EVENTS:
         return False
+    if (
+        event == "cleanup_update"
+        and cleanup_settled
+        and (snapshot.round5_setup is not None or snapshot.towel is not None)
+    ):
+        return True
     towel = snapshot.towel
     if towel is not None:
         return towel.state in SETTLED_TOWEL_STATES
@@ -595,17 +601,15 @@ def _since_floor(since: date | None) -> datetime | None:
 
 
 class DurableReceiptStore:
-    """Sealed bouts on the coordination database, one row per terminal event.
+    """Sealed bouts plus one bounded latest-cleanup overlay per bout.
 
-    Append-only, and that is a design choice rather than a simplification. The
-    filesystem writer has a rule it needs mutable state to enforce: a bout that
-    publishes a second terminal event after it has already been declared -- a
-    cleanup that will not verify, a lost lease -- must not overwrite the proven
-    result. On disk that means reading the file back and refusing the write. Here
-    every terminal event simply gets its own row, and :meth:`load` picks the
-    declared one when there is one. The later failure is then *kept* rather than
-    merely not-winning, which is strictly more evidence, and the app needs no
-    UPDATE and no DELETE anywhere near its own history.
+    Bout declarations and terminal failures are append-only. Cleanup is the one
+    mutable fact: retries may later recover, so one ``cleanup_update`` row is
+    updated only when its cleanup state changes. :meth:`load` ranks legacy
+    timestamp-keyed cleanup rows together with that bounded row, then overlays
+    only the latest cleanup state on the immutable base receipt. This preserves
+    the original result and ordering while preventing retries from appending
+    thousands of full snapshots.
 
     The runner is handed in for the same reason ``StartupReadinessStore`` takes
     one: this module has no business resolving a Lakebase host, a user and an
@@ -671,6 +675,48 @@ class DurableReceiptStore:
         """Record one sealed bout. Idempotent per (bout, round, terminal event)."""
 
         document = json.dumps(_receipt_document(receipt, snapshot), sort_keys=True)
+        sealing_event = receipt.sealing_event
+        if sealing_event == "cleanup_update":
+            # Cleanup is mutable state over an immutable bout result. Keep one
+            # bounded overlay row per bout: repeated "still retrying" notices
+            # neither append full snapshots nor move the original receipt, while
+            # a later changed diagnostic (including recovery to None) supersedes
+            # the prior overlay.
+            async def upsert_cleanup(cursor: Any) -> None:
+                await cursor.execute(
+                    f"""
+                    INSERT INTO {BOUT_RECEIPT_TABLE} (
+                        session_id, round_id, sealing_event, receipt, run_id,
+                        outcome, sealed_at, document
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                    ON CONFLICT (session_id, round_id, sealing_event) DO UPDATE
+                    SET receipt = EXCLUDED.receipt,
+                        run_id = EXCLUDED.run_id,
+                        outcome = EXCLUDED.outcome,
+                        sealed_at = EXCLUDED.sealed_at,
+                        document = EXCLUDED.document
+                    WHERE {BOUT_RECEIPT_TABLE}.sealed_at <= EXCLUDED.sealed_at
+                      AND (
+                        {BOUT_RECEIPT_TABLE}.document
+                            -> 'receipt' -> 'cleanup_failure'
+                        IS DISTINCT FROM
+                        EXCLUDED.document -> 'receipt' -> 'cleanup_failure'
+                      )
+                    """,
+                    (
+                        receipt.session_id,
+                        receipt.round_id.value,
+                        sealing_event,
+                        receipt.receipt,
+                        receipt.run_id,
+                        receipt.outcome,
+                        _as_utc(receipt.sealed_at),
+                        document,
+                    ),
+                )
+
+            await self._run(upsert_cleanup)
+            return
 
         async def insert(cursor: Any) -> None:
             await cursor.execute(
@@ -684,7 +730,7 @@ class DurableReceiptStore:
                 (
                     receipt.session_id,
                     receipt.round_id.value,
-                    receipt.sealing_event,
+                    sealing_event,
                     receipt.receipt,
                     receipt.run_id,
                     receipt.outcome,
@@ -702,10 +748,11 @@ class DurableReceiptStore:
     ) -> list[BoutReceipt]:
         """Every stored bout on or after ``since``, one per bout, newest last.
 
-        The ``DISTINCT ON`` is what replaces the filesystem's read-modify-write:
-        a declared row wins its bout outright, and otherwise the latest terminal
-        event does. Unreadable documents are skipped rather than failing the
-        read, exactly as one corrupt file must not hide the rest of the record.
+        A declared row supplies the measured result. Any later cleanup revision
+        supplies only the latest cleanup state, so recovery can clear an earlier
+        warning without rewriting or erasing either historical row. Unreadable
+        documents are skipped rather than failing the read, exactly as one
+        corrupt file must not hide the rest of the record.
         """
 
         floor = _since_floor(since)
@@ -713,17 +760,41 @@ class DurableReceiptStore:
         async def select(cursor: Any) -> list[Any]:
             await cursor.execute(
                 f"""
-                SELECT DISTINCT ON (session_id, round_id) document
-                FROM {BOUT_RECEIPT_TABLE}
-                WHERE %s::timestamptz IS NULL OR sealed_at >= %s
-                ORDER BY session_id, round_id,
-                         (outcome = 'declared') DESC, sealed_at DESC
-                """,
-                (floor, floor),
+                WITH ranked_receipts AS (
+                    SELECT
+                        document,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                session_id,
+                                round_id,
+                                (
+                                    sealing_event = 'cleanup_update'
+                                    OR sealing_event LIKE 'cleanup_update:%'
+                                )
+                            ORDER BY
+                                CASE
+                                    WHEN sealing_event = 'cleanup_update'
+                                      OR sealing_event LIKE 'cleanup_update:%'
+                                    THEN sealed_at
+                                END DESC,
+                                CASE
+                                    WHEN sealing_event <> 'cleanup_update'
+                                     AND sealing_event NOT LIKE 'cleanup_update:%'
+                                     AND outcome = 'declared'
+                                    THEN 1 ELSE 0
+                                END DESC,
+                                sealed_at DESC
+                        ) AS revision_rank
+                    FROM {BOUT_RECEIPT_TABLE}
+                )
+                SELECT document
+                FROM ranked_receipts
+                WHERE revision_rank = 1
+                """
             )
             return list(await cursor.fetchall())
 
-        found: list[BoutReceipt] = []
+        revisions: dict[tuple[str, RoundId], list[BoutReceipt]] = {}
         for row in await self._run(select):
             try:
                 receipt = _parse_document(row[0])
@@ -732,7 +803,33 @@ class DurableReceiptStore:
                 continue
             if installation is not None and not belongs_to_installation(receipt, installation):
                 continue
-            found.append(receipt)
+            revisions.setdefault((receipt.session_id, receipt.round_id), []).append(
+                receipt
+            )
+
+        found: list[BoutReceipt] = []
+        for values in revisions.values():
+            original = [
+                item for item in values if item.sealing_event != "cleanup_update"
+            ]
+            declared = [item for item in original if item.outcome == "declared"]
+            base = max(declared or original or values, key=lambda item: item.sealed_at)
+            cleanup = [
+                item
+                for item in values
+                if item.sealing_event == "cleanup_update"
+                and item.sealed_at >= base.sealed_at
+            ]
+            if cleanup:
+                latest_cleanup = max(cleanup, key=lambda item: item.sealed_at)
+                base = base.model_copy(
+                    update={"cleanup_failure": latest_cleanup.cleanup_failure}
+                )
+            # Cleanup revisions amend only cleanup state. They cannot move an
+            # old measurement into a later recap window or make it outrank a
+            # newer rerun of the same round.
+            if floor is None or base.sealed_at >= floor:
+                found.append(base)
         found.sort(key=lambda item: item.sealed_at)
         return found
 
@@ -872,7 +969,11 @@ def record_sealed_bout(
         if not isinstance(session, dict):
             return None
         snapshot = SessionSnapshot.model_validate(session)
-        if not seals_bout(event, snapshot):
+        if not seals_bout(
+            event,
+            snapshot,
+            cleanup_settled=payload.get("cleanup_settled") is True,
+        ):
             return None
         installation = current_installation()
         receipt = derive_receipt(

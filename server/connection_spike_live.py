@@ -92,6 +92,7 @@ from .coordination import COORDINATION_TABLE, RING_KEY, validate_ring_key
 from .manifest import DemoManifest, load_manifest
 from .models import CompetitorId, RoundId
 from .round5_control import (
+    ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS,
     ROUND5_ARM_STAGE_DEADLINE_SECONDS,
     Round5ControlBinding,
     Round5ControlEvent,
@@ -4950,6 +4951,11 @@ class LiveConnectionSpikeAdapter:
             raise ConnectionSpikeCleanupError(
                 "Resident runner cancellation transport is unavailable"
             )
+        # Record debt before durable CANCEL delivery. If the bounded abandoned-
+        # ARM caller stops awaiting settlement, the binding remains visible to
+        # settlement_pending and restart reconciliation instead of becoming an
+        # unowned resident.
+        self._resident_settlement_debt[binding.job_id] = binding
         await transport.cancel(binding=binding, await_settlement=True)
         self._resident_settlement_debt.pop(binding.job_id, None)
         self._resident_release_events.pop(binding.job_id, None)
@@ -7404,11 +7410,46 @@ class LiveConnectionSpikeEngine:
                 burst.cancel()
         if bursts:
             await asyncio.gather(*bursts, return_exceptions=True)
+        # ARM stages the Lakebase resident before any lane is dispatched, so its
+        # binding is not yet represented in _active_run_ids.  Settle every
+        # recorded binding first; otherwise an abandoned arm leaves that exact
+        # prepared job resident and the subsequent warm generation is
+        # quarantined as resident_job_active.
+        deferred_resident_jobs: set[str] = set()
+        for lane_id, binding in tuple(self._resident_bindings.items()):
+            try:
+                async with asyncio.timeout(ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS):
+                    await self._lane_adapters[lane_id].cancel_resident(binding=binding)
+            except TimeoutError:
+                # transport.cancel committed durable CANCEL before waiting for
+                # SETTLED. Keep both the engine binding and adapter settlement
+                # debt so restart reconciliation can finish it, but do not hold
+                # the provider janitor (and its RDS Proxy delete) for 12 minutes.
+                deferred_resident_jobs.add(binding.job_id)
+                logger.error(
+                    "round5_abandoned_arm_resident_settlement_deferred "
+                    "lane=%s job_id=%s budget_seconds=%.0f",
+                    lane_id,
+                    binding.job_id,
+                    ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS,
+                )
+                continue
+            if self._resident_bindings.get(lane_id) is binding:
+                self._resident_bindings.pop(lane_id, None)
+            if self._active_run_ids.get(lane_id) == binding.job_id:
+                self._active_run_ids.pop(lane_id, None)
         for lane_id, run_id in tuple(self._active_run_ids.items()):
+            if run_id in deferred_resident_jobs:
+                continue
             await self._cancel_resident_lane(lane_id, run_id)
             if self._active_run_ids.get(lane_id) == run_id:
                 self._active_run_ids.pop(lane_id, None)
-        if self._active_run_ids:
+        blocking_active_jobs = {
+            lane_id: run_id
+            for lane_id, run_id in self._active_run_ids.items()
+            if run_id not in deferred_resident_jobs
+        }
+        if blocking_active_jobs:
             raise ConnectionSpikeCleanupError(
                 "Round 5 active jobs did not settle before provider cleanup"
             )

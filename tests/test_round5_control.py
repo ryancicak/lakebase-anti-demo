@@ -22,6 +22,7 @@ from server.connection_spike_live import (
     LiveConnectionSpikeEngine,
 )
 from server.round5_control import (
+    ROUND5_ORPHANED_RELEASE_TTL_SECONDS,
     InMemoryRound5ControlStore,
     LakebaseRound5ControlStore,
     Round5ControlBinding,
@@ -68,6 +69,236 @@ def binding(
         runner_harness_sha256="b" * 64,
         request_sha256=str(request["prepared_request_digest"]),
     )
+
+
+class DurableControlDb:
+    """Stateful cursor fake for the durable outbox's PostgreSQL statements."""
+
+    CONTROL_COLUMNS = {
+        "round5_control_outbox_v3": {
+            "event_id",
+            "installation_id",
+            "lane_id",
+            "generation",
+            "warm_attempt_token",
+            "job_id",
+            "sequence",
+            "kind",
+            "payload",
+            "created_at",
+            "published_at",
+        },
+        "round5_runner_event_v3": {
+            "event_id",
+            "installation_id",
+            "lane_id",
+            "generation",
+            "warm_attempt_token",
+            "job_id",
+            "sequence",
+            "kind",
+            "binding",
+            "payload",
+            "occurred_at",
+        },
+    }
+
+    def __init__(self) -> None:
+        self.outbox: dict[str, dict[str, object]] = {}
+        self.transactions: list[list[tuple[str, object]]] = []
+        self.revalidation_started: asyncio.Event | None = None
+        self.finish_revalidation: asyncio.Event | None = None
+        self.fail_expiry = False
+
+    def seed(
+        self,
+        event: Round5ControlEvent,
+        *,
+        published_at: datetime | None = None,
+    ) -> None:
+        self.outbox[event.event_id] = {
+            "event": event,
+            "published_at": published_at,
+        }
+
+    async def run(self, operation):
+        transaction: list[tuple[str, object]] = []
+        self.transactions.append(transaction)
+        return await operation(self.Cursor(self, transaction))
+
+    class Cursor:
+        def __init__(
+            self,
+            database: DurableControlDb,
+            transaction: list[tuple[str, object]],
+        ) -> None:
+            self.database = database
+            self.transaction = transaction
+            self.rows: list[tuple[object, ...]] = []
+
+        async def execute(self, statement, parameters=None):
+            text = str(statement)
+            normalized = " ".join(text.split())
+            self.transaction.append((normalized, parameters))
+            self.rows = []
+
+            if "SELECT 1 FROM pg_catalog.pg_namespace" in text:
+                self.rows = [(1,)]
+                return
+            if "FROM pg_catalog.pg_class" in text:
+                self.rows = [(str(name),) for name in parameters[1]]
+                return
+            if "FROM information_schema.columns" in text:
+                self.rows = [
+                    (table, column)
+                    for table, columns in DurableControlDb.CONTROL_COLUMNS.items()
+                    for column in columns
+                ]
+                return
+            if "UPDATE" in text and " AS release" in text and " AS cancel" in text:
+                release_kind, cancel_kind = parameters
+                for release_row in self.database.outbox.values():
+                    release = release_row["event"]
+                    if (
+                        release.kind != release_kind
+                        or release_row["published_at"] is not None
+                    ):
+                        continue
+                    matching = next(
+                        (
+                            candidate["event"]
+                            for candidate in self.database.outbox.values()
+                            if candidate["event"].kind == cancel_kind
+                            and candidate["event"].binding == release.binding
+                        ),
+                        None,
+                    )
+                    if matching is not None:
+                        release_row["published_at"] = matching.created_at
+                return
+            if normalized.startswith("INSERT INTO") and "round5_control_outbox_v3" in text:
+                (
+                    event_id,
+                    _installation_id,
+                    _lane_id,
+                    _generation,
+                    _warm_attempt_token,
+                    _job_id,
+                    _sequence,
+                    _kind,
+                    payload,
+                    _created_at,
+                ) = parameters
+                event = Round5ControlEvent.from_wire(json.loads(payload))
+                existing = self.database.outbox.get(event_id)
+                if existing is None:
+                    self.database.seed(event)
+                elif existing["event"] != event:
+                    self.rows = []
+                    return
+                self.rows = [(event_id,)]
+                return
+            if (
+                normalized.startswith("UPDATE")
+                and "SET published_at = COALESCE(published_at, %s)" in text
+                and "WHERE job_id = %s" in text
+            ):
+                published_at, job_id, release_kind = parameters
+                for row in self.database.outbox.values():
+                    event = row["event"]
+                    if (
+                        event.job_id == job_id
+                        and event.kind == release_kind
+                        and row["published_at"] is None
+                    ):
+                        row["published_at"] = published_at
+                return
+            if normalized.startswith("SELECT payload") and "published_at IS NULL" in text:
+                release_kind, allowed_release_ids, limit = parameters
+                allowed = frozenset(allowed_release_ids)
+                events = [
+                    row["event"]
+                    for row in self.database.outbox.values()
+                    if row["published_at"] is None
+                    and (
+                        row["event"].kind != release_kind
+                        or row["event"].event_id in allowed
+                    )
+                ]
+                events.sort(
+                    key=lambda event: (
+                        event.installation_id,
+                        event.lane_id,
+                        event.generation,
+                        event.binding.warm_attempt_token,
+                        event.job_id,
+                        event.sequence,
+                        event.created_at,
+                        event.event_id,
+                    )
+                )
+                self.rows = [(event.wire_value(),) for event in events[:limit]]
+                return
+            if "SELECT EXISTS" in text and "release.event_id = %s" in text:
+                if self.database.revalidation_started is not None:
+                    self.database.revalidation_started.set()
+                if self.database.finish_revalidation is not None:
+                    await self.database.finish_revalidation.wait()
+                event_id, release_kind, cancel_kind = parameters
+                row = self.database.outbox.get(event_id)
+                dispatchable = False
+                if row is not None:
+                    release = row["event"]
+                    dispatchable = (
+                        release.kind == release_kind
+                        and row["published_at"] is None
+                        and not any(
+                            candidate["event"].kind == cancel_kind
+                            and candidate["event"].binding == release.binding
+                            for candidate in self.database.outbox.values()
+                        )
+                    )
+                self.rows = [(dispatchable,)]
+                return
+            if (
+                normalized.startswith("UPDATE")
+                and "created_at <= %s" in text
+                and "RETURNING event_id" in text
+            ):
+                if self.database.fail_expiry:
+                    raise RuntimeError("coordination unavailable")
+                expired_at, release_kind, created_before, protected_ids = parameters
+                protected = frozenset(protected_ids)
+                expired: list[str] = []
+                for event_id, row in self.database.outbox.items():
+                    event = row["event"]
+                    if (
+                        event.kind == release_kind
+                        and row["published_at"] is None
+                        and event.created_at <= created_before
+                        and event_id not in protected
+                    ):
+                        row["published_at"] = expired_at
+                        expired.append(event_id)
+                self.rows = [(event_id,) for event_id in expired]
+                return
+            if (
+                normalized.startswith("UPDATE")
+                and "SET published_at = COALESCE(published_at, %s)" in text
+                and "WHERE event_id = %s" in text
+            ):
+                published_at, event_id = parameters
+                row = self.database.outbox.get(event_id)
+                if row is not None and row["published_at"] is None:
+                    row["published_at"] = published_at
+                return
+            raise AssertionError(f"unexpected durable control SQL: {normalized}")
+
+        async def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        async def fetchall(self):
+            return self.rows
 
 
 async def test_transactional_outbox_preserves_stage_release_fifo_order() -> None:
@@ -140,6 +371,318 @@ async def test_durable_release_cannot_publish_before_its_process_gate_opens() ->
     assert await dispatcher.publish_once() == 1
     assert sent == [event]
     assert store.outbox[event.event_id][1] is not None
+
+
+async def test_multiple_enqueues_initialize_legacy_repair_once() -> None:
+    class CountingStore(InMemoryRound5ControlStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.initialize_calls = 0
+
+        async def initialize(self) -> None:
+            self.initialize_calls += 1
+
+    store = CountingStore()
+    dispatcher = Round5ControlDispatcher(store, lambda _event: asyncio.sleep(0))
+    transport = Round5ResidentTransport(store, dispatcher)
+    request = canonical_request()
+
+    await asyncio.gather(
+        *(
+            transport.preload(
+                binding=binding(
+                    job_id=f"{index:064x}",
+                    claim_bound=False,
+                    request=request,
+                ),
+                request=request,
+            )
+            for index in range(8)
+        )
+    )
+
+    assert store.initialize_calls == 1
+    await dispatcher.close()
+
+
+async def test_cancel_discards_an_allowed_release_after_send_failure() -> None:
+    class RecordingStore(InMemoryRound5ControlStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allowed_scans: list[frozenset[str]] = []
+
+        async def pending(
+            self,
+            limit: int = 32,
+            *,
+            allowed_release_ids=(),
+        ) -> tuple[Round5ControlEvent, ...]:
+            self.allowed_scans.append(frozenset(allowed_release_ids))
+            return await super().pending(
+                limit,
+                allowed_release_ids=allowed_release_ids,
+            )
+
+    store = RecordingStore()
+
+    async def send(event: Round5ControlEvent) -> None:
+        if event.kind == Round5ControlKind.RELEASE:
+            raise RuntimeError("injected release delivery failure")
+
+    dispatcher = Round5ControlDispatcher(store, send)
+    transport = Round5ResidentTransport(store, dispatcher)
+    event_binding = binding()
+    release = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    await store.enqueue(release)
+    dispatcher.allow_release(release.event_id)
+
+    with pytest.raises(RuntimeError, match="injected release delivery failure"):
+        await dispatcher.publish_once()
+    assert release.event_id in dispatcher._allowed_releases
+
+    await transport.cancel(binding=event_binding, await_settlement=False)
+
+    assert release.event_id not in dispatcher._allowed_releases
+    await dispatcher.publish_once()
+    assert release.event_id not in store.allowed_scans[-1]
+    await dispatcher.close()
+
+
+async def test_cancel_during_release_send_is_durably_rejected_before_runner_launch() -> None:
+    store = InMemoryRound5ControlStore()
+    send_started = asyncio.Event()
+    unblock_send = asyncio.Event()
+    launched: list[Round5ControlEvent] = []
+    rejected: list[Round5ControlEvent] = []
+
+    async def send(event: Round5ControlEvent) -> None:
+        if event.kind != Round5ControlKind.RELEASE:
+            return
+        send_started.set()
+        await unblock_send.wait()
+        # SQS send cannot be revoked after it starts. The resident's durable
+        # disposition fence applies this same test when the body arrives.
+        if await store.release_dispatchable(event.event_id):
+            launched.append(event)
+        else:
+            rejected.append(event)
+
+    dispatcher = Round5ControlDispatcher(store, send)
+    event_binding = binding()
+    release = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    await store.enqueue(release)
+    dispatcher.allow_release(release.event_id)
+
+    publishing = asyncio.create_task(dispatcher.publish_once())
+    await asyncio.wait_for(send_started.wait(), timeout=1)
+    cancel = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+    )
+    await store.enqueue(cancel)
+    dispatcher.discard_release(release.event_id)
+    unblock_send.set()
+
+    assert await asyncio.wait_for(publishing, timeout=1) == 1
+    assert launched == []
+    assert rejected == [release]
+    assert not await store.release_dispatchable(release.event_id)
+
+
+async def test_cancel_supersedes_gated_release_without_outbox_debt() -> None:
+    store = InMemoryRound5ControlStore()
+    sent: list[Round5ControlEvent] = []
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda event: asyncio.sleep(0, result=sent.append(event)),
+    )
+
+    for index in range(33):
+        event_binding = binding(job_id=f"{index:064x}")
+        await store.enqueue(
+            Round5ControlEvent.create(
+                binding=event_binding,
+                sequence=2,
+                kind=Round5ControlKind.RELEASE,
+            )
+        )
+        await store.enqueue(
+            Round5ControlEvent.create(
+                binding=event_binding,
+                sequence=3,
+                kind=Round5ControlKind.CANCEL,
+            )
+        )
+
+    deliverable = Round5ControlEvent.create(
+        binding=binding(job_id="f" * 64),
+        sequence=1,
+        kind=Round5ControlKind.STAGE,
+        payload={"request": canonical_request()},
+    )
+    await store.enqueue(deliverable)
+
+    assert all(event.kind != Round5ControlKind.RELEASE for event in await store.pending())
+    assert await dispatcher.publish_once() == 32
+    assert await dispatcher.publish_once() == 2
+    assert deliverable in sent
+    assert not await store.pending()
+
+
+async def test_unpublished_releases_from_crashed_bells_do_not_starve_current_generation() -> None:
+    store = InMemoryRound5ControlStore()
+    sent: list[Round5ControlEvent] = []
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda event: asyncio.sleep(0, result=sent.append(event)),
+    )
+
+    leftover: list[Round5ControlEvent] = []
+    for bell in range(16):
+        for lane_id, lane_nibble in (("lakebase", "0"), ("competitor", "1")):
+            event_binding = binding(
+                lane_id=lane_id,
+                job_id=f"{bell:02x}{lane_nibble}{'a' * 61}",
+            )
+            event = Round5ControlEvent.create(
+                binding=event_binding,
+                sequence=2,
+                kind=Round5ControlKind.RELEASE,
+            )
+            leftover.append(event)
+            await store.enqueue(event)
+
+    assert len(leftover) == 32
+    request = canonical_request()
+    preload = Round5ControlEvent.create(
+        binding=binding(job_id="f" * 64, claim_bound=False, request=request),
+        sequence=1,
+        kind=Round5ControlKind.PRELOAD,
+        payload={"request": request},
+    )
+    release = Round5ControlEvent.create(
+        binding=binding(job_id="f" * 64, request=request),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    await store.enqueue(preload)
+    await store.enqueue(release)
+
+    assert await dispatcher.publish_once() == 1
+    assert sent == [preload]
+    assert all(store.outbox[event.event_id][1] is None for event in leftover)
+    assert store.outbox[release.event_id][1] is None
+
+    dispatcher.allow_release(release.event_id)
+    assert await dispatcher.publish_once() == 1
+    assert sent == [preload, release]
+    assert store.outbox[release.event_id][1] is not None
+    assert all(store.outbox[event.event_id][1] is None for event in leftover)
+
+
+async def test_orphaned_release_is_tombstoned_after_bout_deadline() -> None:
+    created_at = datetime(2026, 9, 18, tzinfo=UTC)
+    now = created_at + timedelta(seconds=ROUND5_ORPHANED_RELEASE_TTL_SECONDS + 1)
+    store = InMemoryRound5ControlStore()
+    sent: list[Round5ControlEvent] = []
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda event: asyncio.sleep(0, result=sent.append(event)),
+        now=lambda: now,
+    )
+    release = Round5ControlEvent.create(
+        binding=binding(),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=created_at,
+    )
+    await store.enqueue(release)
+
+    assert await dispatcher.publish_once() == 0
+    assert store.outbox[release.event_id][1] == now
+    assert not await store.pending(allowed_release_ids={release.event_id})
+
+    # A late process-local bell cannot resurrect a durable crashed-bell tombstone.
+    dispatcher.allow_release(release.event_id)
+    assert await dispatcher.publish_once() == 0
+    assert sent == []
+
+
+async def test_live_held_release_survives_janitor_until_owner_is_lost() -> None:
+    created_at = datetime(2026, 9, 18, tzinfo=UTC)
+    clock = {
+        "now": created_at + timedelta(seconds=ROUND5_ORPHANED_RELEASE_TTL_SECONDS + 1)
+    }
+    store = InMemoryRound5ControlStore()
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda _event: asyncio.sleep(0),
+        now=lambda: clock["now"],
+    )
+    release = Round5ControlEvent.create(
+        binding=binding(),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=created_at,
+    )
+    await store.enqueue(release)
+    dispatcher.hold_release(release.event_id)
+
+    assert await dispatcher.publish_once() == 0
+    assert store.outbox[release.event_id][1] is None
+
+    # Losing the process-local owner converts the same old row into crash debt;
+    # the next bounded janitor pass tombstones it.
+    dispatcher.discard_release(release.event_id)
+    clock["now"] += timedelta(seconds=31)
+    assert await dispatcher.publish_once() == 0
+    assert store.outbox[release.event_id][1] == clock["now"]
+
+
+async def test_orphan_reap_failure_does_not_block_delivery_or_retry_at_10hz(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ReapFailingStore(InMemoryRound5ControlStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reap_calls = 0
+
+        async def expire_orphaned_releases(self, **unused) -> tuple[str, ...]:
+            self.reap_calls += 1
+            raise RuntimeError("coordination unavailable")
+
+    now = datetime(2026, 9, 18, tzinfo=UTC)
+    store = ReapFailingStore()
+    sent: list[Round5ControlEvent] = []
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda event: asyncio.sleep(0, result=sent.append(event)),
+        now=lambda: now,
+    )
+    request = canonical_request()
+    stage = Round5ControlEvent.create(
+        binding=binding(request=request),
+        sequence=1,
+        kind=Round5ControlKind.STAGE,
+        payload={"request": request},
+    )
+    await store.enqueue(stage)
+    caplog.set_level(logging.WARNING, logger="server.round5_control")
+
+    assert await dispatcher.publish_once() == 1
+    assert await dispatcher.publish_once() == 0
+    assert sent == [stage]
+    assert store.reap_calls == 1
+    assert "round5_control_orphan_reap_failed" in caplog.text
 
 
 async def test_release_wake_during_outbox_scan_is_not_lost() -> None:
@@ -242,7 +785,12 @@ async def test_outbox_dispatch_failure_is_visible_without_leaking_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class FailingStore(InMemoryRound5ControlStore):
-        async def pending(self, limit: int = 32) -> tuple[Round5ControlEvent, ...]:
+        async def pending(
+            self,
+            limit: int = 32,
+            *,
+            allowed_release_ids=(),
+        ) -> tuple[Round5ControlEvent, ...]:
             raise RuntimeError("secret-provider-detail")
 
     dispatcher = Round5ControlDispatcher(FailingStore(), lambda _event: asyncio.sleep(0))
@@ -292,9 +840,11 @@ async def test_injected_fifteen_second_preparation_finishes_before_stage_returns
 async def test_competitor_can_prepare_exact_request_while_release_stays_closed() -> None:
     store = InMemoryRound5ControlStore()
     sent: list[Round5ControlEvent] = []
+    clock = {"now": datetime.now(UTC)}
     dispatcher = Round5ControlDispatcher(
         store,
         lambda event: asyncio.sleep(0, result=sent.append(event)),
+        now=lambda: clock["now"],
     )
     transport = Round5ResidentTransport(
         store,
@@ -346,6 +896,15 @@ async def test_competitor_can_prepare_exact_request_while_release_stays_closed()
     assert release.kind == Round5ControlKind.RELEASE
     assert store.outbox[release.event_id][1] is None
     await dispatcher.close()
+
+    # A live competitor gate can remain closed beyond the ordinary bout
+    # deadline while RDS Proxy becomes available. stage_for_release wires the
+    # row into dispatcher ownership, so age alone cannot tombstone it.
+    clock["now"] = release.created_at + timedelta(
+        seconds=ROUND5_ORPHANED_RELEASE_TTL_SECONDS + 1
+    )
+    assert await dispatcher.publish_once() == 0
+    assert store.outbox[release.event_id][1] is None
 
 
 async def test_conflicting_logical_event_reuse_is_rejected() -> None:
@@ -492,6 +1051,325 @@ def test_resident_never_recomputes_and_blesses_mutated_request_digest() -> None:
         runner._decode_resident_control(encoded)
 
 
+async def test_durable_dispatcher_initializes_once_and_repairs_only_matching_legacy_debt() -> None:
+    database = DurableControlDb()
+    created_at = datetime(2026, 9, 18, 12, tzinfo=UTC)
+    eligible_binding = binding(job_id="1" * 64)
+    eligible_release = Round5ControlEvent.create(
+        binding=eligible_binding,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=created_at,
+    )
+    eligible_cancel = Round5ControlEvent.create(
+        binding=eligible_binding,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+        created_at=created_at + timedelta(seconds=1),
+    )
+    unmatched_release = Round5ControlEvent.create(
+        binding=binding(job_id="2" * 64),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=created_at,
+    )
+    database.seed(eligible_release)
+    database.seed(eligible_cancel)
+    database.seed(unmatched_release)
+
+    store = LakebaseRound5ControlStore(database.run)
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda _event: asyncio.sleep(0),
+        now=lambda: created_at,
+    )
+    first, second = await asyncio.gather(dispatcher.start(), dispatcher.start())
+    assert first is second
+    await dispatcher.close()
+
+    repair_statements = [
+        (sql, params)
+        for transaction in database.transactions
+        for sql, params in transaction
+        if "round5_control_outbox_v3 AS release" in sql
+    ]
+    assert len(repair_statements) == 1
+    repair_sql, repair_params = repair_statements[0]
+    assert repair_params == (
+        Round5ControlKind.RELEASE.value,
+        Round5ControlKind.CANCEL.value,
+    )
+    for identity_column in (
+        "installation_id",
+        "lane_id",
+        "generation",
+        "warm_attempt_token",
+        "job_id",
+    ):
+        assert f"cancel.{identity_column} = release.{identity_column}" in repair_sql
+    assert database.outbox[eligible_release.event_id]["published_at"] == (
+        eligible_cancel.created_at
+    )
+    assert database.outbox[unmatched_release.event_id]["published_at"] is None
+
+
+async def test_durable_cancel_insert_and_release_tombstone_share_one_transaction() -> None:
+    database = DurableControlDb()
+    store = LakebaseRound5ControlStore(database.run)
+    event_binding = binding(job_id="3" * 64)
+    release = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    cancel = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+        created_at=release.created_at + timedelta(seconds=1),
+    )
+
+    await store.enqueue(release)
+    await store.enqueue(cancel)
+
+    assert database.outbox[release.event_id]["published_at"] == cancel.created_at
+    assert database.outbox[cancel.event_id]["published_at"] is None
+    cancel_transaction = database.transactions[-1]
+    assert len(cancel_transaction) == 2
+    insert_sql, insert_params = cancel_transaction[0]
+    suppress_sql, suppress_params = cancel_transaction[1]
+    assert "INSERT INTO anti_demo_coordination.round5_control_outbox_v3" in insert_sql
+    assert insert_params[0] == cancel.event_id
+    assert insert_params[7] == Round5ControlKind.CANCEL.value
+    assert "SET published_at = COALESCE(published_at, %s)" in suppress_sql
+    assert "WHERE job_id = %s" in suppress_sql
+    assert suppress_params == (
+        cancel.created_at,
+        event_binding.job_id,
+        Round5ControlKind.RELEASE.value,
+    )
+
+
+async def test_durable_pending_adapts_empty_and_allowed_release_arrays() -> None:
+    database = DurableControlDb()
+    store = LakebaseRound5ControlStore(database.run)
+    request = canonical_request()
+    stage = Round5ControlEvent.create(
+        binding=binding(job_id="4" * 64, request=request),
+        sequence=1,
+        kind=Round5ControlKind.STAGE,
+        payload={"request": request},
+    )
+    release = Round5ControlEvent.create(
+        binding=binding(job_id="5" * 64),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    database.seed(stage)
+    database.seed(release)
+
+    assert await store.pending() == (stage,)
+    empty_sql, empty_params = database.transactions[-1][0]
+    assert "event_id = ANY(%s)" in empty_sql
+    assert empty_params == (Round5ControlKind.RELEASE.value, [], 32)
+
+    allowed = await store.pending(allowed_release_ids={release.event_id})
+    assert {event.event_id for event in allowed} == {
+        stage.event_id,
+        release.event_id,
+    }
+    allowed_sql, allowed_params = database.transactions[-1][0]
+    assert "event_id = ANY(%s)" in allowed_sql
+    assert allowed_params == (
+        Round5ControlKind.RELEASE.value,
+        [release.event_id],
+        32,
+    )
+
+
+async def test_durable_pending_filters_32_crashed_bells_before_limit() -> None:
+    database = DurableControlDb()
+    store = LakebaseRound5ControlStore(database.run)
+    for bell in range(16):
+        for lane_id, nibble in (("lakebase", "0"), ("competitor", "1")):
+            database.seed(
+                Round5ControlEvent.create(
+                    binding=binding(
+                        lane_id=lane_id,
+                        job_id=f"{bell:02x}{nibble}{'a' * 61}",
+                    ),
+                    sequence=2,
+                    kind=Round5ControlKind.RELEASE,
+                )
+            )
+    request = canonical_request()
+    current = Round5ControlEvent.create(
+        binding=binding(
+            job_id="e" * 64,
+            claim_bound=False,
+            request=request,
+        ),
+        sequence=1,
+        kind=Round5ControlKind.PRELOAD,
+        payload={"request": request},
+    )
+    current_release = Round5ControlEvent.create(
+        binding=binding(job_id="f" * 64),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    database.seed(current)
+    database.seed(current_release)
+
+    assert await store.pending(limit=32) == (current,)
+    pending_sql, pending_params = database.transactions[-1][0]
+    assert pending_sql.index("kind <> %s") < pending_sql.index("LIMIT %s")
+    assert pending_params == (Round5ControlKind.RELEASE.value, [], 32)
+
+    opened = await store.pending(
+        limit=32,
+        allowed_release_ids={current_release.event_id},
+    )
+    assert {event.event_id for event in opened} == {
+        current.event_id,
+        current_release.event_id,
+    }
+
+
+async def test_durable_pre_send_revalidation_observes_interleaved_cancel() -> None:
+    database = DurableControlDb()
+    database.revalidation_started = asyncio.Event()
+    database.finish_revalidation = asyncio.Event()
+    store = LakebaseRound5ControlStore(database.run)
+    sent: list[Round5ControlEvent] = []
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda event: asyncio.sleep(0, result=sent.append(event)),
+    )
+    event_binding = binding(job_id="6" * 64)
+    release = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+    )
+    await store.enqueue(release)
+    dispatcher.allow_release(release.event_id)
+
+    publishing = asyncio.create_task(dispatcher.publish_once())
+    await asyncio.wait_for(database.revalidation_started.wait(), timeout=1)
+    cancel = Round5ControlEvent.create(
+        binding=event_binding,
+        sequence=3,
+        kind=Round5ControlKind.CANCEL,
+        created_at=release.created_at + timedelta(seconds=1),
+    )
+    await store.enqueue(cancel)
+    database.finish_revalidation.set()
+
+    assert await asyncio.wait_for(publishing, timeout=1) == 0
+    assert sent == []
+    assert release.event_id not in dispatcher._allowed_releases
+    assert database.outbox[release.event_id]["published_at"] == cancel.created_at
+    revalidation_sql = next(
+        sql
+        for transaction in database.transactions
+        for sql, _params in transaction
+        if "SELECT EXISTS" in sql
+    )
+    assert "release.published_at IS NULL" in revalidation_sql
+    assert "NOT EXISTS" in revalidation_sql
+
+
+async def test_durable_orphan_janitor_expires_old_debt_but_protects_live_gate() -> None:
+    database = DurableControlDb()
+    store = LakebaseRound5ControlStore(database.run)
+    created_at = datetime(2026, 9, 18, 12, tzinfo=UTC)
+    expired_at = created_at + timedelta(seconds=ROUND5_ORPHANED_RELEASE_TTL_SECONDS + 1)
+    orphan = Round5ControlEvent.create(
+        binding=binding(job_id="7" * 64),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=created_at,
+    )
+    protected = Round5ControlEvent.create(
+        binding=binding(job_id="8" * 64),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=created_at,
+    )
+    fresh = Round5ControlEvent.create(
+        binding=binding(job_id="9" * 64),
+        sequence=2,
+        kind=Round5ControlKind.RELEASE,
+        created_at=expired_at,
+    )
+    for event in (orphan, protected, fresh):
+        database.seed(event)
+
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda _event: asyncio.sleep(0),
+        now=lambda: expired_at,
+    )
+    dispatcher.hold_release(protected.event_id)
+
+    assert await dispatcher.publish_once() == 0
+    assert database.outbox[orphan.event_id]["published_at"] == expired_at
+    assert database.outbox[protected.event_id]["published_at"] is None
+    assert database.outbox[fresh.event_id]["published_at"] is None
+    expiry_sql, expiry_params = next(
+        (sql, params)
+        for transaction in database.transactions
+        for sql, params in transaction
+        if "created_at <= %s" in sql
+    )
+    assert "created_at <= %s" in expiry_sql
+    assert "NOT (event_id = ANY(%s))" in expiry_sql
+    assert expiry_params == (
+        expired_at,
+        Round5ControlKind.RELEASE.value,
+        expired_at - timedelta(seconds=ROUND5_ORPHANED_RELEASE_TTL_SECONDS),
+        [protected.event_id],
+    )
+
+
+async def test_durable_orphan_reap_failure_backs_off_without_blocking_delivery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = DurableControlDb()
+    database.fail_expiry = True
+    store = LakebaseRound5ControlStore(database.run)
+    now = datetime(2026, 9, 18, 12, tzinfo=UTC)
+    request = canonical_request()
+    stage = Round5ControlEvent.create(
+        binding=binding(job_id="b" * 64, request=request),
+        sequence=1,
+        kind=Round5ControlKind.STAGE,
+        payload={"request": request},
+    )
+    database.seed(stage)
+    sent: list[Round5ControlEvent] = []
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda event: asyncio.sleep(0, result=sent.append(event)),
+        now=lambda: now,
+    )
+    caplog.set_level(logging.WARNING, logger="server.round5_control")
+
+    assert await dispatcher.publish_once() == 1
+    assert await dispatcher.publish_once() == 0
+
+    expiry_statements = [
+        sql
+        for transaction in database.transactions
+        for sql, _params in transaction
+        if "created_at <= %s" in sql
+    ]
+    assert len(expiry_statements) == 1
+    assert sent == [stage]
+    assert "round5_control_orphan_reap_failed" in caplog.text
+
+
 async def test_runtime_control_initialization_executes_zero_ddl() -> None:
     statements: list[str] = []
 
@@ -556,6 +1434,55 @@ async def test_runtime_control_initialization_executes_zero_ddl() -> None:
         for statement in statements
         for token in ("CREATE ", "ALTER ", "DROP ", "TRUNCATE ")
     )
+
+
+async def test_lakebase_store_revalidates_and_expires_releases_durably() -> None:
+    statements: list[tuple[str, object]] = []
+
+    class Cursor:
+        rows: list[tuple[object, ...]] = []
+
+        async def execute(self, statement, parameters=None):
+            text = str(statement)
+            statements.append((text, parameters))
+            if "SELECT EXISTS" in text:
+                self.rows = [(False,)]
+            elif "RETURNING event_id" in text:
+                self.rows = [("a" * 64,), ("b" * 64,)]
+            else:
+                self.rows = []
+
+        async def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        async def fetchall(self):
+            return self.rows
+
+    async def run(callback):
+        return await callback(Cursor())
+
+    store = LakebaseRound5ControlStore(run)
+    assert not await store.release_dispatchable("c" * 64)
+    now = datetime(2026, 9, 18, 12, tzinfo=UTC)
+    expired = await store.expire_orphaned_releases(
+        created_before=now - timedelta(minutes=12),
+        expired_at=now,
+        protected_release_ids={"d" * 64},
+    )
+
+    assert expired == ("a" * 64, "b" * 64)
+    revalidation_sql, revalidation_params = statements[0]
+    assert "release.published_at IS NULL" in revalidation_sql
+    assert "NOT EXISTS" in revalidation_sql
+    assert revalidation_params == (
+        "c" * 64,
+        Round5ControlKind.RELEASE.value,
+        Round5ControlKind.CANCEL.value,
+    )
+    expiry_sql, expiry_params = statements[1]
+    assert "created_at <= %s" in expiry_sql
+    assert "NOT (event_id = ANY(%s))" in expiry_sql
+    assert expiry_params[-1] == ["d" * 64]
 
 
 async def test_runtime_warm_initialization_also_executes_zero_ddl() -> None:

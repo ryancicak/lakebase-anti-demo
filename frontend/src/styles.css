@@ -1365,20 +1365,9 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    with whatever the row sits on: var(--yellow) on #10152f measures 12.3:1. */
 .scorecard-gap { margin: .6em 0 0; padding: .7em .85em; border-left: clamp(3px, .3vw, 6px) solid var(--yellow); color: var(--yellow); background: #10152f; font-size: clamp(6px, .58vw, 11px); line-height: 1.5; text-transform: none; }
 
-/* The final card is a ledger: six rows in one column, four aligned fields each,
-   with the verdict last. Ported from the approved `B-the-ledger.html`.
-   
-   The layout it replaced was six cards in a 3x2 grid, which had room for the
-   round and its proof and nowhere to put a result -- so the screen described the
-   product six times and never said who won any of it.
-
-   Two rules the mockup settled and this keeps. Chroma comes off the large type
-   and stays on the accent rail and the round chip: six statements in six
-   different hues at one weight spreads them across a luminance range and makes
-   the set harder to read than any single line in it. And the accent moves from
-   each card's top edge to the row's left edge, so the six rules stack into one
-   rail reading red, blue, yellow, red, blue, yellow down the screen. The
-   accent-to-round mapping is unchanged from FINALE_BEATS. */
+/* Shared finale chrome. The six-tile scorecard layout itself has one canonical
+   block at the end of this sheet; keeping the header and actions here avoids a
+   second, competing set of grid/card declarations in the cascade. */
 .finale-screen { justify-content: center; gap: clamp(10px, 1.5vh, 18px); padding: clamp(24px, 3.2vh, 38px) 4vw clamp(18px, 2.4vh, 28px); background: radial-gradient(circle at 50% 8%, #17214c 0, var(--navy) 44%, #040713 100%); }
 .finale-header { position: relative; z-index: 6; display: flex; align-items: center; justify-content: space-between; gap: 3vw; width: min(1520px, 92vw); text-align: left; text-transform: uppercase; }
 .finale-header > div { min-width: 0; }
@@ -1401,37 +1390,6 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .finale-corners li[data-corner="red"] > b { background: var(--red); }
 .finale-corners li[data-corner="blue"] > b { background: var(--blue); }
 .finale-corners li > span { color: var(--cream); }
-.finale-grid { position: relative; z-index: 6; display: grid; flex: 0 1 auto; grid-template-columns: minmax(0, 1fr); grid-template-rows: repeat(6, minmax(0, auto)); gap: clamp(5px, .55vh, 9px); width: min(1520px, 92vw); min-height: 0; }
-.finale-beat { --finale-accent: var(--yellow); display: grid; grid-template-columns: minmax(0, 15em) minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 11em); grid-template-rows: auto; align-items: center; column-gap: clamp(13px, 1.7vw, 32px); min-width: 0; min-height: 0; padding: clamp(9px, 1.05vh, 17px) clamp(13px, 1.4vw, 24px); border: 2px solid #46527c; color: var(--cream); background: #0b1230; box-shadow: inset clamp(7px, .7vw, 13px) 0 var(--finale-accent), .3em .3em #000; text-align: left; }
-.finale-beat[data-accent="red"] { --finale-accent: var(--red); }
-.finale-beat[data-accent="blue"] { --finale-accent: var(--blue-light); }
-.finale-beat header { display: flex; align-items: center; gap: 1em; padding-left: clamp(5px, .55vw, 10px); text-transform: uppercase; }
-.finale-beat header span { display: grid; flex: none; place-items: center; width: 3.6em; height: 3.6em; color: var(--navy); background: var(--finale-accent); font-size: clamp(7px, .6vw, 11px); }
-.finale-beat header strong { color: var(--cream); font-size: clamp(8px, .74vw, 13px); line-height: 1.35; }
-.finale-beat h2 { align-self: center; margin: 0; color: var(--cream); font-size: clamp(11px, 1vw, 18px); line-height: 1.35; text-transform: none; text-shadow: .09em .09em #000; }
-.finale-beat p { align-self: center; min-height: 0; margin: 0; padding: .1em 0 .1em clamp(13px, 1.5vw, 26px); border-left: 2px solid #46527c; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(9px, .74vw, 13px); font-weight: 900; line-height: 1.45; }
-/* The lane fact that qualifies a verdict. Its own line and its own colour so it
-   never reads as another clause of the proof above it. */
-.finale-beat p em { display: block; margin-top: .5em; color: var(--yellow); font-size: .88em; font-style: normal; letter-spacing: .04em; text-transform: uppercase; }
-/* The fourth field: who took the round, and the one figure behind it. Same rule
-   and spacing as the third, so it reads as another aligned column rather than a
-   panel bolted on. Nothing in here is a sentence. */
-.finale-win { align-self: center; display: grid; gap: .32em; justify-items: end; padding: .1em 0 .1em clamp(13px, 1.5vw, 26px); border-left: 2px solid #46527c; text-align: right; }
-.finale-win b { display: flex; align-items: center; gap: .6em; color: var(--cream); font-weight: 400; font-size: clamp(11px, .86vw, 15px); line-height: 1.3; text-shadow: .09em .09em #000; }
-/* The winner's own chip, the fight card's again. Red because the only corner
-   that takes a round on this card is the red one. */
-.finale-win b span { flex: none; padding: .25em .45em; color: var(--cream); background: var(--red); text-shadow: none; }
-/* One constant colour for all six figures, deliberately NOT the row accent: the
-   rail swings red/blue/yellow down the screen, and putting that on the numbers
-   would spread them across a luminance range at identical weight -- the exact
-   fault that was taken off the six statements. The rail keeps the chroma. */
-.finale-win i { color: var(--yellow); font-size: clamp(11px, .86vw, 15px); font-style: normal; line-height: 1.3; }
-/* One token, never a clause: what qualifies the win, and the day a standing
-   result was sealed when it was not sealed today. */
-.finale-win u { color: #9aa6d0; font-size: clamp(9px, .74vw, 13px); line-height: 1.35; letter-spacing: .04em; text-decoration: none; }
-/* The round just run, lit. One row, and only ever the row whose figure this
-   room watched being produced. */
-.finale-beat[data-latest="true"] { background: #121c48; border-color: #7b8bc4; }
 /* A round with no winner states that and stops. Dimmed rather than struck
    through or blanked: an empty cell reads as a number somebody lost. */
 .finale-beat[data-status="unrun"], .finale-beat[data-status="reading"] { background: #080d24; }
@@ -1450,15 +1408,6 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .finale-share:disabled { cursor: wait; filter: saturate(.45); opacity: .72; }
 .finale-summary { border: 3px solid #46527c; color: var(--cream); background: var(--navy); box-shadow: .4em .4em #000; }
 .finale-summary:hover, .finale-summary:focus-visible { background: #151e48; }
-@media (max-height: 920px) {
-  .finale-screen { gap: 9px; padding-top: 20px; padding-bottom: 14px; }
-  .finale-header p { margin-bottom: .55em; }
-  .finale-header > div > span { margin-top: .65em; }
-  .finale-beat { padding-top: 8px; padding-bottom: 8px; }
-  .finale-beat h2 { margin: 0; }
-  .finale-beat p { padding-top: .1em; }
-  .finale-actions button { min-height: 46px; }
-}
 
 .cooldown-proof-rules { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1vw; margin: 0; padding: 0; list-style: none; }
 .cooldown-proof-rules li { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 1em; min-width: 0; padding: .85em 1em; border: 2px solid #46527c; background: #050817; }
@@ -2492,3 +2441,66 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .receipt-card-loading { align-self: center; margin: 0; color: var(--yellow); font-size: clamp(9px, .8vw, 14px); text-transform: uppercase; text-align: center; }
 /* Mirror poster: present in the DOM, removed from the visual layout. */
 .receipt-poster--mirror { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+
+/* ── Finale · scorecard restyle ───────────────────────────────────────────
+   The six rounds become six tiles across, the same scorecard the share card
+   draws: a tile's plate takes the colour of the corner that took the round,
+   a round nobody took stays dark, and every tile carries the receipt card's
+   two bars. This is the sole owner of the finale grid and tile geometry. */
+.finale-screen { gap: clamp(10px, 1.6vh, 20px); padding: clamp(22px, 3vh, 34px) 4vw clamp(16px, 2.2vh, 26px); }
+.finale-header h1 { text-shadow: .09em .09em var(--red), .18em .18em #000; }
+.finale-grid { position: relative; z-index: 6; display: grid; flex: 0 0 auto; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-template-rows: minmax(0, 1fr); gap: clamp(8px, .8vw, 14px); width: min(1520px, 92vw); height: clamp(320px, 54dvh, 520px); min-height: 0; }
+.finale-beat {
+  --finale-accent: var(--yellow); --finale-corner: #151e48; --finale-ink: #b7c2e7; --finale-rule: var(--finale-accent);
+  --finale-num-bg: var(--finale-accent); --finale-num-ink: var(--navy);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  row-gap: clamp(6px, .9vh, 12px); column-gap: 0; align-items: start; align-content: start;
+  min-height: 0; padding: 0 clamp(10px, .9vw, 16px) clamp(10px, 1.1vh, 16px);
+  border: 2px solid var(--finale-corner); color: var(--cream); background: #0b1230; box-shadow: .3em .3em #000; text-align: left;
+}
+.finale-beat[data-accent="red"] { --finale-accent: var(--red); }
+.finale-beat[data-accent="blue"] { --finale-accent: var(--blue-light); }
+.finale-beat[data-status="lakebase_faster"], .finale-beat[data-status="lakebase_finished"], .finale-beat[data-status="uncontested"] { --finale-corner: var(--red); }
+.finale-beat[data-status="competitor_faster"] { --finale-corner: var(--blue); }
+.finale-beat[data-status="tie"] { --finale-corner: var(--yellow); }
+.finale-beat[data-status="lakebase_faster"], .finale-beat[data-status="lakebase_finished"], .finale-beat[data-status="uncontested"], .finale-beat[data-status="competitor_faster"], .finale-beat[data-status="tie"] {
+  --finale-ink: var(--navy); --finale-rule: transparent; --finale-num-bg: var(--navy); --finale-num-ink: var(--cream); background: var(--navy);
+}
+.finale-beat header {
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: .8em; align-items: center;
+  margin: 0 calc(-1 * clamp(10px, .9vw, 16px)); padding: clamp(9px, 1.1vh, 15px) clamp(10px, .9vw, 16px) clamp(8px, 1vh, 13px);
+  background: var(--finale-corner); box-shadow: inset 0 clamp(4px, .5vh, 7px) var(--finale-rule);
+}
+.finale-beat header span { width: 3.2em; height: 3.2em; color: var(--finale-num-ink); background: var(--finale-num-bg); font-size: clamp(8px, .72vw, 12px); }
+.finale-beat header strong { color: var(--finale-ink); font-size: clamp(8px, .68vw, 12px); line-height: 1.3; }
+.finale-beat h2 { align-self: start; margin: 0; color: var(--cream); font-size: clamp(9px, .8vw, 14px); line-height: 1.4; text-transform: none; text-shadow: none; }
+.finale-beat p { align-self: start; min-height: 0; margin: 0; padding: 0; border-left: 0; color: #9aa6d0; font-family: ui-monospace, monospace; font-size: clamp(8px, .6vw, 11px); font-weight: 900; line-height: 1.5; }
+.finale-beat p em { display: block; margin-top: .5em; color: var(--yellow); font-size: .88em; font-style: normal; letter-spacing: .04em; text-transform: uppercase; }
+.finale-bars { display: grid; align-self: end; gap: clamp(5px, .6vh, 8px); min-width: 0; }
+.finale-lane { --lane-color: var(--red); display: grid; grid-template-columns: 3.2em minmax(0, 1fr); height: clamp(18px, 2.4vh, 28px); font-size: clamp(7px, .6vw, 10px); }
+.finale-lane[data-corner="blue"] { --lane-color: var(--blue); }
+.finale-lane > b { display: grid; place-items: center; color: var(--cream); background: var(--lane-color); font-weight: 400; letter-spacing: .05em; }
+.finale-track { position: relative; display: flex; align-items: center; gap: .8em; min-width: 0; overflow: hidden; background: #111e48; box-shadow: inset 0 0 0 2px #46527c; }
+.finale-track > i { display: block; flex: none; height: calc(100% - 6px); margin-left: 3px; background: var(--lane-color); }
+.finale-track > em { min-width: 0; overflow: hidden; color: var(--cream); font-style: normal; letter-spacing: .02em; white-space: nowrap; text-overflow: ellipsis; }
+.finale-track[data-empty="true"] > em { padding-left: .9em; color: #9aa6d0; letter-spacing: .05em; }
+.finale-track[data-inside="true"] > em { position: absolute; right: .9em; color: var(--navy); }
+/* The verdict, now the tile's foot: chip and name, then the figure large. */
+.finale-win { align-self: end; display: grid; gap: .32em; justify-items: start; padding: clamp(8px, 1vh, 12px) 0 0; border-left: 0; border-top: 2px solid #46527c; text-align: left; }
+.finale-win b { display: flex; align-items: center; gap: .6em; color: var(--cream); font-weight: 400; font-size: clamp(8px, .7vw, 12px); line-height: 1.3; text-shadow: .09em .09em #000; }
+.finale-win b span { flex: none; padding: .25em .45em; color: var(--cream); background: var(--finale-corner); text-shadow: none; }
+.finale-win i { color: var(--yellow); font-size: clamp(18px, 1.9vw, 34px); font-style: normal; line-height: 1.1; }
+.finale-win u { color: #9aa6d0; font-size: clamp(7px, .62vw, 11px); line-height: 1.35; letter-spacing: .04em; text-decoration: none; }
+/* The round just run, ringed in the share-ready green: the one figure this room watched. */
+.finale-beat[data-latest="true"] { border-color: #6bf39a; box-shadow: 0 0 0 clamp(2px, .25vw, 4px) #6bf39a, .3em .3em #000; }
+@media (max-width: 1180px) {
+  .finale-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr)); height: auto; }
+}
+@media (min-width: 1181px) and (max-height: 760px) {
+  .finale-screen { gap: 8px; padding-top: 14px; padding-bottom: 12px; }
+  .finale-header p { margin-bottom: .45em; }
+  .finale-header > div > span { margin-top: .55em; }
+  .finale-grid { height: clamp(300px, 52dvh, 395px); }
+  .finale-actions button { min-height: 42px; }
+}
