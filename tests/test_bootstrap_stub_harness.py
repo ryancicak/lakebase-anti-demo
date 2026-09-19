@@ -559,7 +559,16 @@ def test_apply_against_a_ready_install_refuses_before_writing_anything(tmp_path)
         directory = tree / f".anti-demo-v{generation}"
         directory.mkdir()
         (directory / "manifest.json").write_text(
-            f'{{"run_id": "{run_id}", "status": "ready"}}\n', encoding="utf-8"
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": "ready",
+                    "manifest_version": 7,
+                    "round6": {"sealed": True},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
     def run(*args, extra_env: dict[str, str] | None = None):
