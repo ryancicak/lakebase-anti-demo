@@ -434,6 +434,11 @@ else
   unset AWS_PROFILE AWS_DEFAULT_PROFILE
 fi
 if [[ -f "$ENV_FILE" ]]; then
+  # A persistent AKIA pair in the five-value file has no session token. Do not
+  # let an unrelated SSO/STS token inherited from the launching shell turn that
+  # pair into a mismatched temporary credential. If the file intentionally
+  # supplies a token, sourcing it below restores the value.
+  unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
   # Sourced rather than parsed so an operator can use shell quoting, but read
   # with `set -a` off so only explicit exports leak; every value is re-read
   # from the shell below.
