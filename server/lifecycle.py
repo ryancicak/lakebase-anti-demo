@@ -1277,6 +1277,7 @@ EXPECTED_AWS_STATE_ADDRESSES = {
     "aws_vpc_security_group_egress_rule.round5_lakebase_runner_https",
     "aws_vpc_security_group_egress_rule.round5_lakebase_runner_postgres",
     "aws_vpc_security_group_egress_rule.round5_competitor_runner_https",
+    "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres",
     'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy["aurora"]',
     'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy["rds"]',
     'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_database["aurora"]',

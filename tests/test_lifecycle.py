@@ -917,6 +917,7 @@ async def test_clean_install_resident_acl_secret_and_state_inventory() -> None:
         "aws_secretsmanager_secret.round5_runner_control",
         "aws_secretsmanager_secret.round5_competitor_runner_control",
         "aws_security_group.round5_competitor_runner",
+        "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres",
     }
     assert required_addresses <= lifecycle.EXPECTED_AWS_STATE_ADDRESSES
 
