@@ -1006,27 +1006,10 @@ def _terraform_environment(manifest: DemoManifest) -> dict[str, str]:
         selection,
         manifest.aws.region,
     )
-    if manifest.aws.runtime_role_arn is None:
-        return environment
-
-    # A fresh install starts with the supplied principal so Terraform can create
-    # the shared runtime role. After that role is sealed, the supplied app/operator
-    # user is deliberately narrowed to sts:AssumeRole. Every later Terraform
-    # refresh, apply and destroy therefore has to use the same sealed role as the
-    # Python AWS clients; continuing with the source user makes healthy resources
-    # unreadable and strands cleanup.
-    credentials = _aws_session(manifest).get_credentials()
-    if credentials is None:
-        raise RuntimeError("The sealed AWS runtime role returned no credentials for Terraform")
-    frozen = credentials.get_frozen_credentials()
-    environment["AWS_ACCESS_KEY_ID"] = frozen.access_key
-    environment["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
-    if frozen.token:
-        environment["AWS_SESSION_TOKEN"] = frozen.token
-    else:
-        environment.pop("AWS_SESSION_TOKEN", None)
-    environment.pop("AWS_PROFILE", None)
-    environment.pop("AWS_DEFAULT_PROFILE", None)
+    # Terraform assumes the sealed runtime role in the provider configuration,
+    # using this source environment as its credential chain. The AWS provider
+    # refreshes assumed-role sessions during long RDS/Aurora destroys; injecting
+    # one frozen STS snapshot here imposed a hard one-hour teardown deadline.
     return environment
 
 
@@ -1135,6 +1118,10 @@ def _terraform_variables(
     values = {
         "aws_region": manifest.aws.region,
         "aws_account_id": manifest.aws.account_id,
+        # Null on first provision because the role does not exist yet. Once the
+        # role is sealed, the provider assumes it and refreshes the session for
+        # every subsequent plan/apply/destroy.
+        "terraform_assume_role_arn": _terraform_assume_role_arn(manifest),
         "run_id": manifest.run_id,
         "owner": manifest.owner,
         "expires_at": _utc_tag(expires_at_override or manifest.expires_at),
@@ -1386,6 +1373,9 @@ _ANTI_DEMO_RUNTIME_STATE_ADDRESSES = {
         for key in _ANTI_DEMO_RUNTIME_POLICY_KEYS
     ),
 }
+_ROUND5_COMPETITOR_COORDINATION_EGRESS_ADDRESS = (
+    "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres"
+)
 
 
 def _expected_aws_state_addresses(manifest: DemoManifest) -> set[str]:
@@ -1403,9 +1393,23 @@ def _expected_aws_state_addresses(manifest: DemoManifest) -> set[str]:
     return base | _ANTI_DEMO_RUNTIME_STATE_ADDRESSES
 
 
-def _aws_state_is_complete(manifest: DemoManifest, addresses: set[str]) -> bool:
+def _aws_state_is_complete(
+    manifest: DemoManifest,
+    addresses: set[str],
+    *,
+    allow_legacy_missing_coordination_egress: bool = False,
+) -> bool:
     expected = _expected_aws_state_addresses(manifest)
     if addresses == expected:
+        return True
+    # This one egress rule was added after existing Round 5 installations had
+    # already sealed. Its absence is a known migration state, not evidence of a
+    # partial apply, and destroy mode must remain able to tear that fleet down
+    # without first running a reconcile that creates a resource only to delete it.
+    if (
+        allow_legacy_missing_coordination_egress
+        and addresses == expected - {_ROUND5_COMPETITOR_COORDINATION_EGRESS_ADDRESS}
+    ):
         return True
     if manifest.aws.runtime_role_arn is not None:
         return False
@@ -2039,6 +2043,20 @@ def _aws_source_session(manifest: DemoManifest) -> boto3.Session:
     return boto3.Session(
         **session_arguments(selection.mode, selection.profile, manifest.aws.region)
     )
+
+
+def _terraform_assume_role_arn(manifest: DemoManifest) -> str:
+    """Return the provider role, avoiding an impossible self-assume hop."""
+
+    runtime_role = manifest.aws.runtime_role_arn
+    if runtime_role is None:
+        return "null"
+    identity = _aws_source_session(manifest).client(
+        "sts", region_name=manifest.aws.region
+    ).get_caller_identity()
+    current = str(identity.get("Arn") or "")
+    expected_marker = f":assumed-role/{runtime_role.rsplit('/', 1)[-1]}/"
+    return "null" if expected_marker in current else runtime_role
 
 
 def _aws_session(manifest: DemoManifest) -> boto3.Session:
@@ -3677,7 +3695,7 @@ def _install_round5_runner_assets(
             (
                 "for attempt in 1 2 3; do "
                 f"{stage_root}/venv/bin/pip install --disable-pip-version-check "
-                f"--no-cache-dir --retries 10 --timeout 60 "
+                f"--no-cache-dir --retries 2 --timeout 15 "
                 f"-r {stage_root}/requirements-round5.txt && break; "
                 'test "$attempt" -lt 3; sleep $((attempt * 5)); '
                 "done"
@@ -3695,7 +3713,9 @@ def _install_round5_runner_assets(
             f"rm -rf {stage_root} {install_root}/venv.old",
             f"chmod 0755 {RUNNER_PATH} {install_root}/connection_spike_runner.py",
         ],
-        timeout=ROUND5_SSM_COMMAND_TIMEOUT_SECONDS,
+        # Dependency download retries need a larger envelope than ordinary
+        # runner control commands; the individual sockets remain bounded above.
+        timeout=300,
     )
 
 
@@ -9167,6 +9187,11 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         and manifest.manifest_version == 2
         and manifest.round4 is not None
     )
+    round5_seal_in_progress = (
+        manifest.status == "seeding"
+        and manifest.manifest_version == 2
+        and manifest.round4 is not None
+    )
     round6_seal_retry = (
         manifest.status == "seeding"
         and manifest.manifest_version == 5
@@ -9179,7 +9204,11 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
             flush=True,
         )
         return _prepare_and_reseal_round6(manifest, timeout=zero_timeout_seconds)
-    if manifest.status != "ready" and not round4_waiting_for_final_seal:
+    if (
+        manifest.status != "ready"
+        and not round4_waiting_for_final_seal
+        and not round5_seal_in_progress
+    ):
         manifest = _complete_provision(manifest, zero_timeout_seconds)
     manifest = _prepare_and_reseal_round4(manifest, timeout=zero_timeout_seconds)
     if not manifest.round5_ready:
@@ -10841,7 +10870,7 @@ def setup(
                 "re-seals the Round 5 ownership tags."
             )
         existing = load_manifest()
-        if existing.status == "ready":
+        if existing.status == "ready" and existing.round6_ready:
             if existing.round5_ready:
                 _require_round5_clean_baseline(existing)
             reconcile_infrastructure(existing)
@@ -11187,11 +11216,53 @@ def _delete_databricks_app(manifest: DemoManifest) -> None:
         )
     if not app.present or not app.owned:
         return
+    owned_client_id = str(app.payload.get("service_principal_client_id") or "").strip()
+    path = f"/api/2.0/apps/{quote(app.name, safe='')}"
+    # The delete API accepts only the shared app name; it has no client-ID or
+    # ETag precondition. Re-read at the last possible moment so a replacement
+    # observed between inventory and deletion is refused rather than deleted.
+    current = _databricks_api_optional(manifest.databricks.profile, path)
+    if current is None:
+        return
+    current_client_id = str(current.get("service_principal_client_id") or "").strip()
+    if current_client_id != owned_client_id:
+        raise RuntimeError(
+            f"Cleanup refused to delete Databricks app {app.name}: its service principal "
+            "changed after ownership verification. The shared app name now belongs to "
+            "a different app."
+        )
     print(f"DELETE Databricks app {app.name} ({app.compute_state or 'UNKNOWN'})", flush=True)
-    _databricks_api_delete_no_response(
-        manifest.databricks.profile,
-        f"/api/2.0/apps/{quote(app.name, safe='')}",
-    )
+    _databricks_api_delete_no_response(manifest.databricks.profile, path)
+    deadline = time.monotonic() + 600
+    while True:
+        remaining = max(0, int(deadline - time.monotonic()))
+        current = _databricks_api_optional(
+            manifest.databricks.profile,
+            path,
+        )
+        if current is None:
+            break
+        current_client_id = str(current.get("service_principal_client_id") or "").strip()
+        if current_client_id != owned_client_id:
+            print(
+                f"DONE  owned Databricks app {app.name} is gone; that shared name now "
+                "belongs to a different service principal",
+                flush=True,
+            )
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Cleanup asked Databricks to delete app {app.name}, but it still exists "
+                f"after 10 minutes. Remove it with: databricks apps delete {app.name} "
+                f"-p {manifest.databricks.profile}"
+            )
+        state = str((current.get("compute_status") or {}).get("state") or "UNKNOWN")
+        print(
+            f"WAIT  Databricks app {app.name} still exists ({state}); "
+            f"up to {remaining}s remaining",
+            flush=True,
+        )
+        time.sleep(5)
 
 
 def _detach_runtime_role_from_destroy_state(
@@ -11208,9 +11279,12 @@ def _detach_runtime_role_from_destroy_state(
         # live, tag-verified role and must remove it after every billed resource.
         return True
     if present != _ANTI_DEMO_RUNTIME_STATE_ADDRESSES:
+        missing = _ANTI_DEMO_RUNTIME_STATE_ADDRESSES - present
         raise RuntimeError(
             "Cleanup refused: the sealed runtime role is only partially represented "
-            "in Terraform state"
+            f"in Terraform state. Present: {sorted(present)}. Missing: {sorted(missing)}. "
+            "Do not remove more state by hand; restore the missing addresses or remove "
+            "the detached IAM objects, then rerun './antidemo cleanup --dry-run'."
         )
     _run(
         _terraform_base()
@@ -11415,6 +11489,14 @@ def _owned_app(manifest: DemoManifest) -> _OwnedApp:
     """
 
     name, source, recorded_client_id = _deployed_app_name(manifest)
+    bootstrap = _read_json_object(manifest_path().parent / BOOTSTRAP_RECORD_NAME) or {}
+    if bootstrap.get("databricks_app_creation_pending") is True:
+        pending_name = str(bootstrap.get("databricks_app_name") or name).strip() or name
+        return _OwnedApp(
+            pending_name,
+            BOOTSTRAP_RECORD_NAME,
+            unreadable="app creation ownership is pending explicit adjudication",
+        )
     try:
         payload = _databricks_api_optional(
             manifest.databricks.profile,
@@ -11425,7 +11507,19 @@ def _owned_app(manifest: DemoManifest) -> _OwnedApp:
     if payload is None:
         return _OwnedApp(name, source)
     live_client_id = str(payload.get("service_principal_client_id") or "").strip()
-    owned = bool(recorded_client_id) and recorded_client_id == live_client_id
+    created_client_id = str(
+        bootstrap.get("databricks_app_created_client_id") or ""
+    ).strip()
+    # A matching client ID proves that this is the app the installation used,
+    # but not that this installation created it. Bootstrap can adopt a shared
+    # pre-existing app; deleting that app would break its actual owner. Older
+    # records without explicit provenance therefore take the safe path and
+    # report the survivor instead of deleting it.
+    owned = (
+        bool(created_client_id)
+        and created_client_id == recorded_client_id
+        and created_client_id == live_client_id
+    )
     return _OwnedApp(name, source, payload=payload, owned=owned)
 
 
@@ -11601,7 +11695,11 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
     # This read used to happen below, after the all-clear, where its verdict
     # gated nothing and could contradict the line printed just above it.
     reconciliation = reconcile_live(manifest, _aws_session)
-    complete_baseline = _aws_state_is_complete(manifest, managed_addresses)
+    complete_baseline = _aws_state_is_complete(
+        manifest,
+        managed_addresses,
+        allow_legacy_missing_coordination_egress=True,
+    )
     destroy_plan: Path | None = None
     if aws_resources_exist:
         if complete_baseline:
@@ -11845,7 +11943,7 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
             )
         if delete_detached_runtime_role:
             _delete_detached_runtime_role(manifest)
-    except Exception:
+    except BaseException:
         # Not on a dry run. `cleanup_failed` means "a teardown ran partway and a
         # human must adjudicate what survived" -- `require_ready_manifest`
         # refuses all six rounds on it, and no automatic recovery accepts it. A
@@ -11868,6 +11966,10 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         raise
 
     receipt = manifest_path().parent / "cleanup-receipt.json"
+    deleted_project_ids = [project_id for _, project_id, _ in lakebase_projects]
+    deleted_project_profiles = list(
+        dict.fromkeys(profile for profile, _, _ in lakebase_projects)
+    )
     receipt.write_text(
         json.dumps(
             {
@@ -11876,8 +11978,11 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
                 "cleaned_at": datetime.now(UTC).isoformat(),
                 "aws_account_id": manifest.aws.account_id,
                 "aws_region": manifest.aws.region,
-                "lakebase_project": expected_project,
-                "lakebase_profiles": [binding.profile for binding in databricks_bindings],
+                "lakebase_project": (
+                    deleted_project_ids[0] if len(deleted_project_ids) == 1 else None
+                ),
+                "lakebase_projects": deleted_project_ids,
+                "lakebase_profiles": deleted_project_profiles,
             },
             indent=2,
         )

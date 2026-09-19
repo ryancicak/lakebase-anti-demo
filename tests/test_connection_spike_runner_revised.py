@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 
 from runner import connection_spike_runner as runner
+from runner.external_io import secrets_manager_for_runner_operation
 from server.connection_spike_live import SETUP_SSM_TIMEOUT_SECONDS
 from tests.test_connection_fanin import worker_result as exact_worker_result
 
@@ -25,6 +26,32 @@ def test_affinity_probe_runs_only_during_explicit_preflight() -> None:
     assert source.count("shard_process_preflight()") == 1
     assert 'fanin_request["action"] == "preflight"' in source
     assert "shard_preflight = shard_process_preflight()" in source
+
+
+def test_runner_secrets_calls_fit_inside_the_setup_settlement_margin(monkeypatch) -> None:
+    import boto3
+
+    captured: dict[str, object] = {}
+
+    class Session:
+        def __init__(self, **kwargs):
+            captured["session"] = kwargs
+
+        def client(self, service, **kwargs):
+            captured["service"] = service
+            captured["client"] = kwargs
+            return object()
+
+    monkeypatch.setattr(boto3, "Session", Session)
+
+    secrets_manager_for_runner_operation(
+        ("arn:aws:secretsmanager:us-west-2:123456789012:secret:owned",)
+    )
+
+    config = captured["client"]["config"]
+    assert config.connect_timeout == 3
+    assert config.read_timeout == 5
+    assert config.retries["total_max_attempts"] == 2
 
 
 class _FakeValue:
@@ -945,10 +972,9 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
             assert prepare is False
             if self.fail:
                 self.fail = False
-                # Aurora has surfaced post-resume failures outside psycopg's
-                # OperationalError branch. The bounded Aurora setup retry must
-                # cover those database errors as well.
-                raise runner.psycopg.errors.InternalError("endpoint still settling")
+                # Aurora has surfaced this exact post-resume anomaly after the
+                # role was created but before the following GRANT could see it.
+                raise runner.psycopg.errors.UndefinedObject("endpoint still settling")
 
         async def fetchone(self):
             return self.rows.pop(0)
@@ -993,6 +1019,50 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
         ["rollback", "close"],
         ["commit", "close"],
     ]
+
+
+    class DeterministicCursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *unused):
+            return None
+
+        async def execute(self, *args, **kwargs):
+            raise runner.psycopg.errors.InternalError("deterministic SQL defect")
+
+    class DeterministicConnection:
+        def cursor(self):
+            return DeterministicCursor()
+
+        async def rollback(self):
+            return None
+
+        async def close(self):
+            return None
+
+    deterministic_attempts = 0
+
+    async def deterministic_connect(*unused):
+        nonlocal deterministic_attempts
+        deterministic_attempts += 1
+        return DeterministicConnection()
+
+    async def no_retry_sleep(delay):
+        pytest.fail(f"deterministic database errors must not retry after {delay}s")
+
+    with monkeypatch.context() as deterministic_patch:
+        deterministic_patch.setattr(runner, "_connect", deterministic_connect)
+        deterministic_patch.setattr(runner.asyncio, "sleep", no_retry_sleep)
+        with pytest.raises(runner.RunnerContractError, match="^baseline_role_setup_failed$"):
+            await runner._configure_ordinary_role(
+                {"user": "admin"},
+                {"dbname": "anti_demo", "password": "ordinary-secret"},
+                create_if_missing=True,
+                retry_transient_restart=True,
+            )
+
+    assert deterministic_attempts == 1
 
     timing_ticks = iter((100, 300))
 
@@ -1042,6 +1112,11 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
     await setup_started.wait()
     cancelled.set()
     assert await bounded == (None, True)
+    assert setup_stopped.is_set()
+
+    setup_stopped.clear()
+    with pytest.raises(runner.RunnerContractError, match="^setup_deadline$"):
+        await runner._run_setup_bounded(decoded, asyncio.Event(), _timeout=0)
     assert setup_stopped.is_set()
 
     async def failed_setup(unused):

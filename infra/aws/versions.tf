@@ -32,4 +32,12 @@ terraform {
 provider "aws" {
   region              = var.aws_region
   allowed_account_ids = [var.aws_account_id]
+
+  dynamic "assume_role" {
+    for_each = var.terraform_assume_role_arn == null ? [] : [var.terraform_assume_role_arn]
+    content {
+      role_arn     = assume_role.value
+      session_name = "lakebase-anti-demo-terraform"
+    }
+  }
 }

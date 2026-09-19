@@ -311,6 +311,9 @@ def test_clean_install_has_every_frontend_build_tool_without_dev_dependencies() 
         "@types/react",
         "@types/react-dom",
         "@vitejs/plugin-react",
+        "@fontsource/press-start-2p",
+        "react",
+        "react-dom",
         "typescript",
         "vite",
     } <= dependencies
@@ -335,6 +338,25 @@ def test_bootstrap_never_replaces_the_source_pair_with_runtime_role_credentials(
     assert 'export AWS_ACCESS_KEY_ID="$RUNTIME_ACCESS_KEY_ID"' not in bootstrap
     assert 'export AWS_SECRET_ACCESS_KEY="$RUNTIME_SECRET_ACCESS_KEY"' not in bootstrap
     assert 'export AWS_SESSION_TOKEN="$RUNTIME_SESSION_TOKEN"' not in bootstrap
+
+
+def test_bootstrap_creates_and_records_the_app_only_after_provision_confirmation() -> None:
+    bootstrap = (PROJECT_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+
+    confirmation = bootstrap.index('[[ "$CONFIRM" == "PROVISION" ]]')
+    pending_record = bootstrap.index('record["databricks_app_creation_pending"] = True')
+    creation = bootstrap.index('databricks apps create "$APP_NAME"')
+    immutable_record = bootstrap.index('record["databricks_app_created_client_id"] = client_id')
+
+    assert confirmation < pending_record < creation < immutable_record
+
+
+def test_terraform_provider_refreshes_the_sealed_runtime_role() -> None:
+    provider = (PROJECT_ROOT / "infra" / "aws" / "versions.tf").read_text(encoding="utf-8")
+
+    assert 'dynamic "assume_role"' in provider
+    assert "var.terraform_assume_role_arn == null ? []" in provider
+    assert "role_arn     = assume_role.value" in provider
 
 
 def test_the_npm_lockfile_guard_catches_the_proxy_that_was_actually_shipped() -> None:

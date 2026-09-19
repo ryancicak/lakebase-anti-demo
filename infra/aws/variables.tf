@@ -18,6 +18,21 @@ variable "aws_account_id" {
   }
 }
 
+variable "terraform_assume_role_arn" {
+  description = "Sealed runtime role Terraform assumes after initial creation. Null keeps first provision on the source principal."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.terraform_assume_role_arn == null || can(regex(
+      "^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$",
+      var.terraform_assume_role_arn,
+    ))
+    error_message = "terraform_assume_role_arn must be null or an exact IAM role ARN."
+  }
+}
+
 variable "run_id" {
   description = "Unique lowercase identifier for this owned demo run. Used in names and ownership tags."
   type        = string

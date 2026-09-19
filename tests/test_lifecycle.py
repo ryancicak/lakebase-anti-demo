@@ -119,6 +119,7 @@ def test_round5_runner_dependency_install_retries_transient_download_failures(
     from server import connection_spike_live
 
     calls: list[list[str]] = []
+    timeouts: list[float] = []
     monkeypatch.setattr(lifecycle, "_round5_runner_archive", lambda: "YWJj")
     monkeypatch.setattr(
         connection_spike_live,
@@ -128,7 +129,11 @@ def test_round5_runner_dependency_install_retries_transient_download_failures(
     monkeypatch.setattr(
         lifecycle,
         "_run_round5_ssm_command",
-        lambda _ssm, *, commands, **_kwargs: calls.append(commands) or "",
+        lambda _ssm, *, commands, timeout, **_kwargs: (
+            calls.append(commands),
+            timeouts.append(timeout),
+        )
+        and "",
     )
 
     lifecycle._install_round5_runner_assets(
@@ -142,7 +147,8 @@ def test_round5_runner_dependency_install_retries_transient_download_failures(
         if "requirements-round5.txt" in command and "pip install" in command
     )
     assert "for attempt in 1 2 3" in dependency_command
-    assert "--retries 10 --timeout 60" in dependency_command
+    assert "--retries 2 --timeout 15" in dependency_command
+    assert timeouts[-1] == 300
 
 
 def test_fresh_v7_install_derives_seven_unique_workspace_projects() -> None:
@@ -736,10 +742,13 @@ def test_rds_network_check_requires_public_instance_with_exact_operator_ingress(
 
     manifest = make_manifest()
     attach_round4(manifest)
-    manifest.round5 = ready_round5_stub(runner_security_group_id="sg-runner")
+    manifest.round5 = ready_round5_stub(
+        runner_security_group_id="sg-lakebase-runner",
+        competitor_runner_security_group_id="sg-competitor-runner",
+    )
     manifest.manifest_version = 5
     ingress[0]["UserIdGroupPairs"] = [
-        {"GroupId": "sg-runner"},
+        {"GroupId": "sg-competitor-runner"},
         {"GroupId": "sg-proxy-rds"},
     ]
     check = _rds_ingress(manifest)
@@ -1422,6 +1431,10 @@ def test_terraform_uses_only_manifest_selected_environment_credentials(monkeypat
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test-access")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test-secret")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "test-token")
+    monkeypatch.setenv(
+        "ROUND5_APP_PRINCIPAL_ARN",
+        "arn:aws:iam::123456789012:user/operator",
+    )
     monkeypatch.setenv("AWS_ROLE_ARN", "arn:aws:iam::999999999999:role/wrong")
     monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "/tmp/wrong")
 
@@ -1433,37 +1446,68 @@ def test_terraform_uses_only_manifest_selected_environment_credentials(monkeypat
     assert "AWS_PROFILE" not in environment
     assert "AWS_ROLE_ARN" not in environment
     assert "AWS_WEB_IDENTITY_TOKEN_FILE" not in environment
+    assert "terraform_assume_role_arn=null" in lifecycle._terraform_variables(manifest)
 
 
-def test_terraform_uses_the_sealed_runtime_role_after_first_provision(monkeypatch) -> None:
+def test_terraform_provider_assumes_the_sealed_runtime_role_after_first_provision(
+    monkeypatch,
+) -> None:
     manifest = make_manifest()
     manifest.aws.auth_mode = "environment"
     manifest.aws.profile = ""
     manifest.aws.runtime_role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    manifest.aws.runtime_role_trusted_principal_arns = (
+        "arn:aws:iam::123456789012:user/operator",
+    )
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "source-access")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "source-secret")
     monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
     monkeypatch.setattr(
-        lifecycle,
-        "_aws_session",
+        "server.lifecycle._aws_source_session",
         lambda candidate: SimpleNamespace(
-            get_credentials=lambda: SimpleNamespace(
-                get_frozen_credentials=lambda: SimpleNamespace(
-                    access_key="runtime-access",
-                    secret_key="runtime-secret",
-                    token="runtime-token",
-                )
+            client=lambda service, region_name: SimpleNamespace(
+                get_caller_identity=lambda: {
+                    "Arn": "arn:aws:iam::123456789012:user/operator"
+                }
             )
         ),
     )
 
     environment = _terraform_environment(manifest)
+    variables = lifecycle._terraform_variables(manifest)
 
-    assert environment["AWS_ACCESS_KEY_ID"] == "runtime-access"
-    assert environment["AWS_SECRET_ACCESS_KEY"] == "runtime-secret"
-    assert environment["AWS_SESSION_TOKEN"] == "runtime-token"
+    assert environment["AWS_ACCESS_KEY_ID"] == "source-access"
+    assert environment["AWS_SECRET_ACCESS_KEY"] == "source-secret"
+    assert "AWS_SESSION_TOKEN" not in environment
     assert "AWS_PROFILE" not in environment
     assert "AWS_DEFAULT_PROFILE" not in environment
+    assert (
+        "terraform_assume_role_arn="
+        "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    ) in variables
+
+
+def test_terraform_does_not_self_assume_the_sealed_runtime_role(monkeypatch) -> None:
+    manifest = make_manifest()
+    manifest.aws.runtime_role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    manifest.aws.runtime_role_trusted_principal_arns = (
+        "arn:aws:iam::123456789012:user/operator",
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._aws_source_session",
+        lambda candidate: SimpleNamespace(
+            client=lambda service, region_name: SimpleNamespace(
+                get_caller_identity=lambda: {
+                    "Arn": (
+                        "arn:aws:sts::123456789012:"
+                        "assumed-role/anti-demo-runtime/operator-session"
+                    )
+                }
+            )
+        ),
+    )
+
+    assert "terraform_assume_role_arn=null" in lifecycle._terraform_variables(manifest)
 
 
 def test_cleanup_detaches_the_runtime_role_from_the_destroy_graph(monkeypatch) -> None:
@@ -2085,18 +2129,29 @@ def test_a_first_provision_seals_the_app_egress_before_its_first_apply(
     assert "operator_cidr=203.0.113.10/32" in rendered
 
 
+@pytest.mark.parametrize(
+    ("caller_arn", "expected_principal"),
+    [
+        (
+            "arn:aws:iam::123456789012:user/lakebase-anti-demo-operator",
+            "arn:aws:iam::123456789012:user/lakebase-anti-demo-operator",
+        ),
+        (
+            "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_abc/operator",
+            "arn:aws:iam::123456789012:role/AWSReservedSSO_Admin_abc",
+        ),
+    ],
+)
 def test_destroy_plan_recovers_the_source_principal_for_a_partial_install(
     monkeypatch,
+    caller_arn: str,
+    expected_principal: str,
 ) -> None:
     manifest = make_manifest()
     monkeypatch.delenv("ROUND5_APP_PRINCIPAL_ARN", raising=False)
     monkeypatch.delenv("TF_VAR_round5_app_principal_arn", raising=False)
     monkeypatch.delenv("ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS", raising=False)
-    sts = SimpleNamespace(
-        get_caller_identity=lambda: {
-            "Arn": "arn:aws:iam::123456789012:user/lakebase-anti-demo-operator"
-        }
-    )
+    sts = SimpleNamespace(get_caller_identity=lambda: {"Arn": caller_arn})
     monkeypatch.setattr(
         "server.lifecycle._aws_source_session",
         lambda candidate: SimpleNamespace(client=lambda service, region_name: sts),
@@ -2104,10 +2159,7 @@ def test_destroy_plan_recovers_the_source_principal_for_a_partial_install(
 
     rendered = " ".join(lifecycle._terraform_variables(manifest, destroy=True))
 
-    assert (
-        "round5_app_principal_arn="
-        "arn:aws:iam::123456789012:user/lakebase-anti-demo-operator"
-    ) in rendered
+    assert f"round5_app_principal_arn={expected_principal}" in rendered
 
 
 def test_a_first_provision_survives_a_feed_it_cannot_read(
@@ -2405,12 +2457,17 @@ def test_round5_cleanup_ring_key_tracks_manifest_generation() -> None:
 
 def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_path) -> None:
     manifest = make_manifest(status="ready")
+    attach_round4(manifest)
+    manifest.round5 = ready_round5_stub()
+    manifest.round6 = SimpleNamespace()
+    manifest.manifest_version = 6
     owned_manifest = tmp_path / "manifest.json"
     owned_manifest.touch()
     calls: list[str] = []
 
     monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
     monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr("server.lifecycle._require_round5_clean_baseline", lambda candidate: None)
     monkeypatch.setattr(
         "server.lifecycle.reconcile_infrastructure",
         lambda candidate: calls.append("reconcile") or candidate,
@@ -2460,6 +2517,63 @@ def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_pat
         "reconcile",
         "round5:321",
         "reset:321",
+        "doctor:aurora:321",
+        "doctor:rds:321",
+    ]
+
+
+def test_setup_resumes_an_incomplete_ready_seal_without_reset(monkeypatch, tmp_path) -> None:
+    manifest = make_manifest(status="ready")
+    attach_round4(manifest)
+    owned_manifest = tmp_path / "manifest.json"
+    owned_manifest.touch()
+    calls: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle.resume_provision",
+        lambda timeout: calls.append(f"resume:{timeout}") or manifest,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle.reconcile_infrastructure",
+        lambda candidate: pytest.fail("an incomplete ready seal must not reconcile/reset"),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle.reset",
+        lambda timeout: pytest.fail("an incomplete ready seal must not reset"),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round5",
+        lambda candidate, *, timeout: calls.append(f"round5:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round6",
+        lambda candidate, *, timeout: calls.append(f"round6:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle.doctor",
+        lambda competitor, *, timeout_seconds: (
+            calls.append(f"doctor:{competitor}:{timeout_seconds}")
+            or [Check("ready", True, "ready")]
+        ),
+    )
+
+    assert (
+        setup(
+            databricks_profile="",
+            aws_profile="",
+            aws_region="",
+            expected_account="",
+            owner="",
+            operator_cidr=None,
+            ttl_hours=None,
+            timeout_seconds=321,
+        )
+        is manifest
+    )
+    assert calls == [
+        "resume:321",
         "round6:321",
         "doctor:aurora:321",
         "doctor:rds:321",
@@ -2492,6 +2606,105 @@ def test_resume_reseals_round5_when_existing_manifest_needs_upgrade(monkeypatch)
 
     assert resume_provision(321) is manifest
     assert calls == ["round4:321", "round5:321", "round6:321"]
+
+
+@pytest.mark.parametrize("candidate_saved", [False, True])
+def test_resume_interrupted_round5_does_not_repeat_base_provision(
+    monkeypatch, candidate_saved: bool
+) -> None:
+    manifest = make_manifest(status="seeding")
+    attach_round4(manifest)
+    if candidate_saved:
+        manifest.round5 = ready_round5_stub()
+        manifest.manifest_version = 2
+    calls: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle._verify_databricks_identity",
+        lambda profile: manifest.databricks.user,
+    )
+    monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
+    monkeypatch.setattr(
+        "server.lifecycle._complete_provision",
+        lambda *args: pytest.fail("Round 5 retry must not repeat base seeding"),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round4",
+        lambda candidate, *, timeout: calls.append(f"round4:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round5",
+        lambda candidate, *, timeout: calls.append(f"round5:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round6",
+        lambda candidate, *, timeout: calls.append(f"round6:{timeout}") or candidate,
+    )
+
+    assert resume_provision(321) is manifest
+    assert calls == ["round4:321", "round5:321", "round6:321"]
+
+
+def test_resume_without_a_round4_seal_completes_base_provision(monkeypatch) -> None:
+    manifest = make_manifest(status="seeding")
+    calls: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle._verify_databricks_identity",
+        lambda profile: manifest.databricks.user,
+    )
+    monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
+    monkeypatch.setattr(
+        "server.lifecycle._complete_provision",
+        lambda candidate, timeout: calls.append(f"base:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round4",
+        lambda candidate, *, timeout: calls.append(f"round4:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round5",
+        lambda candidate, *, timeout: calls.append(f"round5:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round6",
+        lambda candidate, *, timeout: calls.append(f"round6:{timeout}") or candidate,
+    )
+
+    assert resume_provision(321) is manifest
+    assert calls == ["base:321", "round4:321", "round5:321", "round6:321"]
+
+
+def test_resume_interrupted_reset_repeats_base_seeding(monkeypatch) -> None:
+    manifest = make_manifest(status="seeding")
+    attach_round4(manifest)
+    manifest.round5 = ready_round5_stub()
+    manifest.round6 = SimpleNamespace()
+    manifest.manifest_version = 6
+    calls: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle._verify_databricks_identity",
+        lambda profile: manifest.databricks.user,
+    )
+    monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
+    monkeypatch.setattr(
+        "server.lifecycle._complete_provision",
+        lambda candidate, timeout: calls.append(f"base:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round4",
+        lambda candidate, *, timeout: calls.append(f"round4:{timeout}") or candidate,
+    )
+
+    assert resume_provision(321) is manifest
+    assert calls == ["base:321", "round4:321"]
 
 
 def test_resume_retries_interrupted_round6_without_reseeding_base(monkeypatch) -> None:
@@ -4099,6 +4312,18 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(
             "project",
         ]
     )
+    receipt = json.loads((tmp_path / "cleanup-receipt.json").read_text())
+    assert receipt["lakebase_projects"] == (
+        [
+            *(
+                f"anti-demo-{manifest.installation_id.replace('-', '')}-r{number}"
+                for number in range(1, 7)
+            ),
+            f"anti-demo-{manifest.installation_id.replace('-', '')}-coord",
+        ]
+        if isolated_round1_project and manifest.installation_id is not None
+        else [manifest.databricks.project_id]
+    )
 
 
 def _stub_round6_drifted_cleanup(monkeypatch, tmp_path):
@@ -4227,6 +4452,8 @@ def test_a_billing_app_is_named_even_with_no_successful_deploy_recorded(
             {
                 "databricks_app_name": "lakebase-anti-demo",
                 "databricks_app_client_id": "spn-owned",
+                "databricks_app_created": True,
+                "databricks_app_created_client_id": "spn-owned",
             }
         )
         + "\n",
@@ -4300,6 +4527,209 @@ def test_an_app_this_installation_cannot_prove_it_owns_is_reported_never_deleted
     _delete_databricks_app(manifest)
 
     assert deleted == []
+
+
+def test_an_adopted_app_is_never_deleted_even_when_its_client_id_matches(
+    monkeypatch, tmp_path, isolated_lifecycle_manifest
+) -> None:
+    manifest = _stub_round6_drifted_cleanup(monkeypatch, tmp_path)
+    (isolated_lifecycle_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_name": "lakebase-anti-demo",
+                "databricks_app_client_id": "spn-adopted",
+                "databricks_app_created": False,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda profile, path: {
+            "compute_status": {"state": "ACTIVE"},
+            "service_principal_client_id": "spn-adopted",
+        },
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_delete_no_response",
+        lambda profile, path: deleted.append(path),
+    )
+
+    lines = _round4_survivor_lines(manifest)
+    _delete_databricks_app(manifest)
+
+    assert any("SURVIVES THIS CLEANUP" in line for line in lines)
+    assert deleted == []
+
+
+def test_created_app_provenance_never_transfers_to_a_replacement(
+    monkeypatch, tmp_path, isolated_lifecycle_manifest
+) -> None:
+    manifest = _stub_round6_drifted_cleanup(monkeypatch, tmp_path)
+    (isolated_lifecycle_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_name": "lakebase-anti-demo",
+                "databricks_app_client_id": "spn-replacement",
+                "databricks_app_created": True,
+                "databricks_app_created_client_id": "spn-original",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda profile, path: {
+            "compute_status": {"state": "ACTIVE"},
+            "service_principal_client_id": "spn-replacement",
+        },
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_delete_no_response",
+        lambda profile, path: deleted.append(path),
+    )
+
+    _delete_databricks_app(manifest)
+
+    assert deleted == []
+
+
+def test_owned_app_delete_waits_until_the_app_is_absent(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    manifest = make_manifest()
+    (isolated_lifecycle_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_name": "lakebase-anti-demo",
+                "databricks_app_client_id": "spn-owned",
+                "databricks_app_created": True,
+                "databricks_app_created_client_id": "spn-owned",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    responses = iter(
+        [
+            {"service_principal_client_id": "spn-owned"},
+            {"service_principal_client_id": "spn-owned"},
+            {
+                "service_principal_client_id": "spn-owned",
+                "compute_status": {"state": "DELETING"},
+            },
+            None,
+        ]
+    )
+    sleeps: list[float] = []
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda profile, path: next(responses),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_delete_no_response",
+        lambda profile, path: deleted.append(path),
+    )
+    monkeypatch.setattr("server.lifecycle.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    _delete_databricks_app(manifest)
+
+    assert deleted == ["/api/2.0/apps/lakebase-anti-demo"]
+    assert sleeps == [5]
+
+
+def test_owned_app_delete_refuses_a_replacement_seen_before_delete(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    manifest = make_manifest()
+    (isolated_lifecycle_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_name": "lakebase-anti-demo",
+                "databricks_app_client_id": "spn-owned",
+                "databricks_app_created": True,
+                "databricks_app_created_client_id": "spn-owned",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    responses = iter(
+        [
+            {"service_principal_client_id": "spn-owned"},
+            {"service_principal_client_id": "spn-replacement"},
+        ]
+    )
+    deleted: list[str] = []
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda profile, path: next(responses),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_delete_no_response",
+        lambda profile, path: deleted.append(path),
+    )
+
+    with pytest.raises(RuntimeError, match="service principal changed"):
+        _delete_databricks_app(manifest)
+
+    assert deleted == []
+
+
+def test_pending_app_creation_requires_cleanup_adjudication(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    manifest = make_manifest()
+    (isolated_lifecycle_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_name": "first-app",
+                "databricks_app_creation_pending": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda *args: pytest.fail("pending ownership must be adjudicated before lookup"),
+    )
+
+    with pytest.raises(RuntimeError, match="pending explicit adjudication"):
+        _delete_databricks_app(manifest)
+
+
+def test_owned_app_delete_refuses_when_the_app_never_disappears(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    manifest = make_manifest()
+    (isolated_lifecycle_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_name": "lakebase-anti-demo",
+                "databricks_app_client_id": "spn-owned",
+                "databricks_app_created": True,
+                "databricks_app_created_client_id": "spn-owned",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._databricks_api_optional",
+        lambda profile, path: {"service_principal_client_id": "spn-owned"},
+    )
+    monkeypatch.setattr("server.lifecycle._databricks_api_delete_no_response", lambda *args: None)
+    ticks = iter((0.0, 0.0, 600.0))
+    monkeypatch.setattr("server.lifecycle.time.monotonic", lambda: next(ticks))
+
+    with pytest.raises(RuntimeError, match="still exists after 10 minutes"):
+        _delete_databricks_app(manifest)
 
 
 def test_a_pipeline_that_outlived_its_synced_table_is_deleted_not_assumed_gone(
@@ -5006,7 +5436,37 @@ def test_hydration_reseals_the_single_missing_competitor_coordination_rule(
     assert manifest.round5 is migrated
 
 
-def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, tmp_path) -> None:
+def test_pre_coordination_egress_state_remains_destroyable() -> None:
+    manifest = make_manifest()
+    expected = lifecycle._expected_aws_state_addresses(manifest)
+
+    legacy_addresses = expected - {
+        "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres"
+    }
+    assert not lifecycle._aws_state_is_complete(manifest, legacy_addresses)
+    assert lifecycle._aws_state_is_complete(
+        manifest,
+        legacy_addresses,
+        allow_legacy_missing_coordination_egress=True,
+    )
+    assert not lifecycle._aws_state_is_complete(
+        manifest,
+        expected - {"aws_security_group.aurora"},
+    )
+    assert not lifecycle._aws_state_is_complete(
+        manifest,
+        expected
+        - {
+            "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres",
+            "aws_security_group.aurora",
+        },
+    )
+
+
+@pytest.mark.parametrize("interrupted", (False, True))
+def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(
+    monkeypatch, tmp_path, interrupted: bool
+) -> None:
     manifest = make_manifest(status="cleanup_failed")
     owned_manifest = tmp_path / "manifest.json"
     owned_manifest.write_text("{}")
@@ -5110,10 +5570,13 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, t
         "server.lifecycle.reset_safe_change_artifacts",
         lambda candidate: pytest.fail("partial retry must not open deleted sources"),
     )
-    monkeypatch.setattr(
-        "server.lifecycle._terraform_apply",
-        lambda candidate, plan: calls.append("terraform_apply"),
-    )
+    def terraform_apply(candidate, plan):
+        del candidate, plan
+        calls.append("terraform_apply")
+        if interrupted:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr("server.lifecycle._terraform_apply", terraform_apply)
     # The Databricks app. It is not a Terraform resource and never has been, so
     # nothing above this line can see it -- and cleanup used to print "SURVIVES
     # THIS CLEANUP" over compute that stays ACTIVE and billing for as long as
@@ -5124,23 +5587,48 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, t
         "server.lifecycle._round4_app_record",
         lambda candidate: {"app_name": "lakebase-anti-demo", "app_client_id": "spn-owned"},
     )
-    monkeypatch.setattr(
-        "server.lifecycle._databricks_api_optional",
-        lambda profile, path: {
+    (owned_manifest.parent / "bootstrap.json").write_text(
+        json.dumps(
+            {
+                "databricks_app_created": True,
+                "databricks_app_created_client_id": "spn-owned",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    app_present = True
+
+    def app_state(profile, path):
+        del profile, path
+        if not app_present:
+            return None
+        return {
             "compute_status": {"state": "ACTIVE"},
             "service_principal_client_id": "spn-owned",
-        },
-    )
-    monkeypatch.setattr(
-        "server.lifecycle._databricks_api_delete_no_response",
-        lambda profile, path: calls.append(f"delete {path}"),
-    )
+        }
+
+    def delete_app(profile, path):
+        nonlocal app_present
+        del profile
+        calls.append(f"delete {path}")
+        app_present = False
+
+    monkeypatch.setattr("server.lifecycle._databricks_api_optional", app_state)
+    monkeypatch.setattr("server.lifecycle._databricks_api_delete_no_response", delete_app)
     monkeypatch.setattr(
         "server.lifecycle._run",
         lambda arguments, **kwargs: calls.append("remove_destroy_guard"),
     )
 
-    assert cleanup(dry_run=False) is manifest
+    if interrupted:
+        with pytest.raises(KeyboardInterrupt):
+            cleanup(dry_run=False)
+        assert manifest.status == "cleanup_failed"
+        assert json.loads(owned_manifest.read_text())["status"] == "cleanup_failed"
+        assert not (tmp_path / "cleanup-receipt.json").exists()
+    else:
+        assert cleanup(dry_run=False) is manifest
     # Ordering is the assertion, not just membership. The app assumes the
     # runtime IAM role the destroy removes, so deleting it after
     # `terraform_apply` would leave an app that is broken *and* still billing,

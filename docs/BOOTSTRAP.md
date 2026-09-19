@@ -208,10 +208,11 @@ run. The script says so rather than implying it proved them.
 - **It never runs Terraform on its own.** The only mutating step is
   `./antidemo setup`, under `--apply`, after an itemised cost summary and a typed
   `PROVISION` confirmation.
-- **It tells you when `antidemo setup` will be destructive.** On an existing
-  installation `setup` runs `terraform plan` and `terraform apply` through
-  `reconcile_infrastructure` (`server/lifecycle.py:5176`), so any pending diff
-  in `infra/aws` is applied. The confirmation prompt says this explicitly.
+- **It tells you when `antidemo setup` will be destructive.** On a complete,
+  ready installation `setup` runs `terraform plan` and `terraform apply`
+  through `reconcile_infrastructure`, so any pending diff in `infra/aws` is
+  applied. An incomplete seal resumes instead. The confirmation prompt says
+  which path will run.
 - **It is resumable.** `antidemo setup` decides from the manifest whether to
   provision, resume an interrupted provision, or reconcile and reset a ready
   one, so re-running `bootstrap.sh --apply` after a failure continues instead of
@@ -229,32 +230,33 @@ run. The script says so rather than implying it proved them.
 `ANTI_DEMO_MANIFEST` set, bootstrap picks the highest-numbered existing
 `.anti-demo-v<N>/manifest.json` and operates on it, so on a workspace that
 already carries a live generation `./bootstrap.sh --apply` is not "install it
-again" — it is `antidemo setup` against the running installation, which runs
-`terraform plan` and `terraform apply` through `reconcile_infrastructure`,
-applies any pending diff in `infra/aws`, resets both database lanes and clears
-Round 3 anchors. Check mode now says that in a `warn` line at the point it adopts
-the generation, and `--apply` repeats it in the confirmation prompt.
+again" — it is `antidemo setup` against that installation. An incomplete
+progressive seal resumes from its checkpoint. A complete ready seal requires
+`--reset-ready`; that path reconciles Terraform, resets both database lanes and
+clears Round 3 anchors. The confirmation prompt distinguishes the two.
 
 That is usually what you want — it is what makes a failed provision resumable —
 but it is not what "run the installer again" sounds like.
 
-**And on an installation whose manifest already reads `ready`, `--apply` refuses.**
-There the reset is not a no-op: both database lanes are reseeded and the Round 3
-anchors are cleared, so a bout in progress dies and every Round 3 recovery point
-taken since the last reset is gone. The refusal names the two ways forward:
+**On a complete installation whose manifest reads `ready`, `--apply` refuses.**
+A complete seal is manifest v6 or newer with Round 6 present. There the reset is
+not a no-op: both database lanes are reseeded and the Round 3 anchors are cleared,
+so a bout in progress dies and every Round 3 recovery point taken since the last
+reset is gone. The refusal names the two ways forward:
 
 - `./bootstrap.sh --deploy-only` — republish the seal and redeploy the app. No
-  database is touched and no Terraform runs. **This is the resume path for a
-  ready install**, and it is what an operator reaching for `--apply` after a
-  code change almost always meant.
+  database is touched and no Terraform runs. This is the redeploy path for a
+  complete ready install.
 - `./bootstrap.sh --apply --reset-ready` — the explicit opt-in, for an `infra/aws`
   diff to apply or lanes to return to a known state.
 
 `--yes` does **not** authorise this. It suppresses the spend confirmation, and it
 used to suppress the only sentence that mentioned the reset as well, so
-`--apply --yes` against a ready install reset it silently. Any status other than
-`ready` still falls straight through: that is the interrupted provision `--apply`
-genuinely does resume.
+`--apply --yes` against a ready install reset it silently. An older progressive
+seal can also read `ready` before Round 5 and Round 6 have been sealed. `--apply`
+treats that as an interrupted provision and resumes it; `--deploy-only` cannot
+finish those missing rounds. Any non-`ready` status also falls through to the
+interrupted-provision resume path.
 
 `--new-generation` is the other behaviour: it provisions a fresh
 `.anti-demo-v<N+1>` and leaves the existing generation, its Terraform state and
