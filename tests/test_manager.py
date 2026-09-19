@@ -513,15 +513,21 @@ class SequencedCooldownTarget(FakeLiveTarget):
         cooldown_states: list[bool],
         *,
         verification_delay: float = 0.001,
+        cooldown_gate: asyncio.Event | None = None,
     ) -> None:
         super().__init__(id, name, verification_delay)
         self.cooldown_states = list(cooldown_states)
         self.cooldown_cutoffs: list[datetime | None] = []
+        self.cooldown_gate = cooldown_gate
+        self.cooldown_entered = asyncio.Event()
 
     async def assert_armed(self, *, not_before=None) -> dict[str, object]:
         self.arm_calls += 1
         if self.arm_calls <= 2:
             return {"state": "ZERO"}
+        self.cooldown_entered.set()
+        if self.cooldown_gate is not None:
+            await self.cooldown_gate.wait()
         self.cooldown_cutoffs.append(not_before)
         state = self.cooldown_states.pop(0) if self.cooldown_states else True
         if not state:
@@ -535,6 +541,7 @@ class SequencedCooldownResolver:
         *,
         lakebase_verification_delay: float = 0.001,
         competitor_verification_delay: float = 0.001,
+        competitor_cooldown_gate: asyncio.Event | None = None,
     ) -> None:
         self.lakebase = SequencedCooldownTarget(
             "lakebase",
@@ -547,6 +554,7 @@ class SequencedCooldownResolver:
             "Aurora Serverless v2",
             [False, False, True],
             verification_delay=competitor_verification_delay,
+            cooldown_gate=competitor_cooldown_gate,
         )
 
     def resolve(self, competitor: CompetitorId):
@@ -3347,7 +3355,11 @@ async def wait_for_redo(manager: RunManager, session_id: str, state: RedoState):
 
 
 async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> None:
-    resolver = SequencedCooldownResolver(competitor_verification_delay=60)
+    settle_zero = asyncio.Event()
+    resolver = SequencedCooldownResolver(
+        competitor_verification_delay=60,
+        competitor_cooldown_gate=settle_zero,
+    )
     manager = RunManager(resolver=resolver, verifier=make_verifier())
     manager._arm_poll = 0.001
     created = await manager.create(
@@ -3377,11 +3389,13 @@ async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> 
     assert frozen.lanes["lakebase"].connection_closed_at is not None
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.state == SessionState.TOWELLED
+    await asyncio.wait_for(resolver.competitor.cooldown_entered.wait(), timeout=1)
     active = await manager.bout_status(round_id=RoundId.WAKE_IDLE_APP)
     assert active.active is True
     assert active.phase == "cooldown"
     assert active.can_start is False
 
+    settle_zero.set()
     cooldown = await wait_for_cooldown(
         manager,
         created.id,
