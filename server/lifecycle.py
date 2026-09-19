@@ -3649,8 +3649,14 @@ def _install_round5_runner_assets(
             "stage=venv",
             f"python3.12 -m venv {stage_root}/venv",
             "stage=dependencies",
-            f"{stage_root}/venv/bin/pip install --disable-pip-version-check "
-            f"--no-cache-dir -r {stage_root}/requirements-round5.txt",
+            (
+                "for attempt in 1 2 3; do "
+                f"{stage_root}/venv/bin/pip install --disable-pip-version-check "
+                f"--no-cache-dir --retries 10 --timeout 60 "
+                f"-r {stage_root}/requirements-round5.txt && break; "
+                'test "$attempt" -lt 3; sleep $((attempt * 5)); '
+                "done"
+            ),
             "stage=permissions",
             *(
                 f"install -m {'0755' if name.endswith('.sh') or name.endswith('.py') else '0644'} "
