@@ -945,7 +945,10 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
             assert prepare is False
             if self.fail:
                 self.fail = False
-                raise runner.psycopg.errors.AdminShutdown("endpoint restarting")
+                # Aurora has surfaced post-resume failures outside psycopg's
+                # OperationalError branch. The bounded Aurora setup retry must
+                # cover those database errors as well.
+                raise runner.psycopg.errors.InternalError("endpoint still settling")
 
         async def fetchone(self):
             return self.rows.pop(0)
