@@ -324,6 +324,19 @@ def test_clean_install_has_every_frontend_build_tool_without_dev_dependencies() 
     assert (frontend / "vitest.config.ts").exists()
 
 
+def test_bootstrap_never_replaces_the_source_pair_with_runtime_role_credentials() -> None:
+    """Role assumption belongs at AWS call sites, not in bootstrap's global env.
+
+    A global handoff makes target providers assume the runtime role from itself
+    and accidentally selects temporary STS values for app-secret publication.
+    """
+    bootstrap = (PROJECT_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+    assert "--role-session-name anti-demo-bootstrap" not in bootstrap
+    assert 'export AWS_ACCESS_KEY_ID="$RUNTIME_ACCESS_KEY_ID"' not in bootstrap
+    assert 'export AWS_SECRET_ACCESS_KEY="$RUNTIME_SECRET_ACCESS_KEY"' not in bootstrap
+    assert 'export AWS_SESSION_TOKEN="$RUNTIME_SESSION_TOKEN"' not in bootstrap
+
+
 def test_the_npm_lockfile_guard_catches_the_proxy_that_was_actually_shipped() -> None:
     """The npm guard, run against the lockfile shape that was committed.
 

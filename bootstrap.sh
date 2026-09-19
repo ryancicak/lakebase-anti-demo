@@ -1069,29 +1069,11 @@ else
   ok "derived persistent app principal $ROUND5_APP_PRINCIPAL_ARN"
   ok "runtime trust resolved automatically for account $AWS_ACCOUNT_ID"
 
-  # The five-input path uses one permanent source pair. On the first install it
-  # carries the documented bootstrap policies and Terraform creates this role.
-  # On later runs the same source may be an assume-only dedicated app user; if
-  # the sealed fixed-name role already exists and admits it, use that role for
-  # all provisioning reads and writes without asking for a sixth input.
-  if [[ -z "$AWS_OPERATOR_PROFILE" ]]; then
-    RUNTIME_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/anti-demo-runtime"
-    RUNTIME_SESSION_JSON="$(aws sts assume-role \
-      --role-arn "$RUNTIME_ROLE_ARN" \
-      --role-session-name anti-demo-bootstrap \
-      --duration-seconds 3600 \
-      --output json 2>/dev/null || true)"
-    RUNTIME_ACCESS_KEY_ID="$(printf '%s' "$RUNTIME_SESSION_JSON" | jq -r '.Credentials.AccessKeyId // empty' 2>/dev/null || true)"
-    RUNTIME_SECRET_ACCESS_KEY="$(printf '%s' "$RUNTIME_SESSION_JSON" | jq -r '.Credentials.SecretAccessKey // empty' 2>/dev/null || true)"
-    RUNTIME_SESSION_TOKEN="$(printf '%s' "$RUNTIME_SESSION_JSON" | jq -r '.Credentials.SessionToken // empty' 2>/dev/null || true)"
-    if [[ -n "$RUNTIME_ACCESS_KEY_ID" && -n "$RUNTIME_SECRET_ACCESS_KEY" && -n "$RUNTIME_SESSION_TOKEN" ]]; then
-      export AWS_ACCESS_KEY_ID="$RUNTIME_ACCESS_KEY_ID"
-      export AWS_SECRET_ACCESS_KEY="$RUNTIME_SECRET_ACCESS_KEY"
-      export AWS_SESSION_TOKEN="$RUNTIME_SESSION_TOKEN"
-      ok "using the existing sealed runtime role for provisioning (temporary values withheld)"
-    fi
-    unset RUNTIME_SESSION_JSON RUNTIME_ACCESS_KEY_ID RUNTIME_SECRET_ACCESS_KEY RUNTIME_SESSION_TOKEN
-  fi
+  # Keep the permanent source pair in the process environment. Lifecycle code
+  # assumes the sealed runtime role only at the AWS call sites that need it.
+  # Replacing these variables globally would make target providers try to assume
+  # the runtime role from itself, and would also select temporary STS credentials
+  # for Databricks secret publication instead of the saved APP_AWS_* pair.
 
   OPERATOR_IP="$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]' || true)"
   if [[ "$OPERATOR_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
