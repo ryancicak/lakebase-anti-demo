@@ -521,7 +521,8 @@ cp "$source" "\$ANTI_DEMO_MANIFEST"
 STUB
   chmod +x "$gen/antidemo-apply-stub"
 
-  AWS_SESSION_TOKEN="" STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
+  AWS_SESSION_TOKEN="stale-operator-session-token" \
+    STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
     run "$sb" --apply --yes
   status=$?
   check "creates the app after confirmation" \
@@ -553,7 +554,8 @@ STUB
       materialized) materializes=1; expected_pending=true ;;
       indeterminate) indeterminate=1; expected_pending=true ;;
     esac
-    AWS_SESSION_TOKEN="" STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
+    AWS_SESSION_TOKEN="stale-operator-session-token" \
+      STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
       STUB_APP_CREATE_FAILS=1 \
       STUB_APP_CREATE_MATERIALIZES="$materializes" \
       STUB_APP_VERIFY_INDETERMINATE="$indeterminate" \
@@ -574,7 +576,8 @@ STUB
     fi
     if [[ "$outcome" == "materialized" ]]; then
       printf 'DATABRICKS_APP_NAME=renamed-anti-demo\n' >>"$sb/env"
-      AWS_SESSION_TOKEN="" STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
+      AWS_SESSION_TOKEN="stale-operator-session-token" \
+        STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
         run "$sb" --apply --yes
       status=$?
       if ((status != 0)) &&
