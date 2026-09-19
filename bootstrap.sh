@@ -834,8 +834,10 @@ fi
 if [[ ! -f frontend/package.json ]]; then
   warn "no frontend/package.json here, so there is nothing to build"
 else
-  # `npm ci` is the expensive half and is only needed when the lockfile has
-  # moved under node_modules. `npm run build` is re-run whenever any source is
+  # The installer needs only the production app and its build toolchain. Lint,
+  # jsdom and test-runner dependencies stay in devDependencies for contributors
+  # and CI; omitting them here keeps a deploy from depending on packages that
+  # cannot affect frontend/dist. `npm run build` is re-run whenever any source is
   # newer than the built index.html, which is what makes a second bootstrap run
   # cost a second rather than a minute.
   NEED_NPM_CI=0
@@ -843,11 +845,11 @@ else
   [[ -f frontend/package-lock.json && frontend/package-lock.json -nt frontend/node_modules ]] &&
     NEED_NPM_CI=1
   if ((NEED_NPM_CI == 1)); then
-    info "installing frontend dependencies (npm ci); this takes a minute or two"
-    if (cd frontend && npm ci); then
-      ok "npm ci"
+    info "installing frontend build dependencies (npm ci --omit=dev); this takes a minute or two"
+    if (cd frontend && npm ci --omit=dev); then
+      ok "npm ci --omit=dev"
     else
-      fail "'npm ci' failed in frontend/, so frontend/dist cannot be built and the
+      fail "'npm ci --omit=dev' failed in frontend/, so frontend/dist cannot be built and the
       deployed UI would answer 503. package-lock.json is committed, so this is not a
       resolution problem: it is the network, the Node version, or the registry this
       machine is pointed at. Check 'npm config get registry' -- a laptop configured
@@ -2501,7 +2503,7 @@ ok "seal is servable: status ready, manifest v$MANIFEST_VERSION (sha256:${SEAL_S
 
 if [[ ! -d frontend/dist ]]; then
   die "frontend/dist is missing, and the app answers 503 on every page without it.
-       Build it first: cd frontend && npm ci && npm run build
+       Build it first: cd frontend && npm ci --omit=dev && npm run build
        This script will not build for you, because 'npm run build' overwrites the
        directory a locally running server is serving from."
 fi

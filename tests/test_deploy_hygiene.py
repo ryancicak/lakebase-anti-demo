@@ -62,6 +62,7 @@ on so far; the point is that it was the precise trap the step exists to set.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import shutil
@@ -292,6 +293,35 @@ def test_package_lock_names_only_hosts_a_build_container_can_reach() -> None:
         "than regenerating the lockfile, because regenerating it re-resolves "
         "versions as well."
     )
+
+
+def test_clean_install_has_every_frontend_build_tool_without_dev_dependencies() -> None:
+    """Bootstrap's production-only install must still be able to build the bundle.
+
+    Internal npm mirrors do not necessarily carry the deep, old dependency graph
+    used only by lint and test tooling.  Bootstrap intentionally omits that graph,
+    so every package imported by the production build must be a runtime dependency
+    and the production TypeScript config must not include the test config.
+    """
+    frontend = PROJECT_ROOT / "frontend"
+    package = json.loads((frontend / "package.json").read_text(encoding="utf-8"))
+    dependencies = set(package["dependencies"])
+    assert {
+        "@types/node",
+        "@types/react",
+        "@types/react-dom",
+        "@vitejs/plugin-react",
+        "typescript",
+        "vite",
+    } <= dependencies
+
+    bootstrap = (PROJECT_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+    assert "npm ci --omit=dev" in bootstrap
+
+    vite_config = (frontend / "vite.config.ts").read_text(encoding="utf-8")
+    assert "from 'vitest/config'" not in vite_config
+    assert "test:" not in vite_config
+    assert (frontend / "vitest.config.ts").exists()
 
 
 def test_the_npm_lockfile_guard_catches_the_proxy_that_was_actually_shipped() -> None:
