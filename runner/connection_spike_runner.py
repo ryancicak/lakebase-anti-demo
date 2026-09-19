@@ -2478,15 +2478,14 @@ async def _configure_ordinary_role(
                     await connection.rollback()
                 except psycopg.Error:
                     pass
-            sqlstate = exc.sqlstate if isinstance(exc, psycopg.OperationalError) else None
-            transient_restart = isinstance(exc, (OSError, TimeoutError)) or (
-                isinstance(exc, psycopg.OperationalError)
-                and (
-                    sqlstate is None
-                    or sqlstate.startswith("08")
-                    or sqlstate in {"57P01", "57P02", "57P03"}
-                )
-            )
+            # Aurora can accept the first post-pause socket and then reject a
+            # statement while its PostgreSQL process is still settling. Those
+            # resume failures have appeared under more than one psycopg
+            # subclass/SQLSTATE, so the bounded Aurora-only retry must cover
+            # every database error. RDS and ordinary reassertions remain
+            # single-attempt, and deterministic Aurora failures still stop
+            # after the short fixed retry budget.
+            transient_restart = isinstance(exc, (OSError, TimeoutError, psycopg.Error))
             if (
                 retry_transient_restart
                 and transient_restart

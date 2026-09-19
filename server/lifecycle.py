@@ -10167,16 +10167,35 @@ def _sealed_ingress_summary(manifest: DemoManifest) -> str:
     )
 
 
+def _round5_source_ingress_groups(
+    manifest: DemoManifest,
+    proxy_security_group_id: str | None,
+) -> tuple[str, ...]:
+    """Return the exact groups that reach a Round 5 competitor source.
+
+    Progressive v3 split the original physical runner into dedicated Lakebase
+    and competitor instances.  Older seals have no competitor group and remain
+    loadable, while current seals must validate the competitor runner that
+    Terraform actually authorizes on Aurora and RDS.
+    """
+
+    if not manifest.round5_ready:
+        return ()
+    sealed = manifest.require_round5_resources()
+    runner_group = sealed.competitor_runner_security_group_id or sealed.runner_security_group_id
+    return (runner_group, str(proxy_security_group_id))
+
+
 def _aws_ingress(manifest: DemoManifest) -> Check:
     try:
         session = _aws_session(manifest)
-        round5_groups = (
+        round5_groups = _round5_source_ingress_groups(
+            manifest,
             (
-                manifest.require_round5_resources().runner_security_group_id,
-                str(manifest.require_round5_resources().aurora_proxy_security_group_id),
-            )
-            if manifest.round5_ready
-            else ()
+                manifest.require_round5_resources().aurora_proxy_security_group_id
+                if manifest.round5_ready
+                else None
+            ),
         )
         if manifest.manifest_version == 7:
             groups = [
@@ -10273,13 +10292,13 @@ def _postgres_ingress_is_exact(
 def _rds_ingress(manifest: DemoManifest) -> Check:
     try:
         session = _aws_session(manifest)
-        round5_groups = (
+        round5_groups = _round5_source_ingress_groups(
+            manifest,
             (
-                manifest.require_round5_resources().runner_security_group_id,
-                str(manifest.require_round5_resources().rds_proxy_security_group_id),
-            )
-            if manifest.round5_ready
-            else ()
+                manifest.require_round5_resources().rds_proxy_security_group_id
+                if manifest.round5_ready
+                else None
+            ),
         )
         if manifest.manifest_version == 7:
             databases = [

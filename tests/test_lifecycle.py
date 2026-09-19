@@ -58,6 +58,7 @@ from server.lifecycle import (
     _round5_aurora_cluster_resource_id,
     _round5_cleanup_ring_key,
     _round5_runtime_tag_inventory,
+    _round5_source_ingress_groups,
     _round_lakebase_binding,
     _terraform_environment,
     _validate_partial_aws_destroy_retry,
@@ -687,6 +688,28 @@ class FakeAwsSession:
 
     def client(self, service: str):
         return {"rds": self.rds, "ec2": self.ec2}[service]
+
+
+def test_round5_source_ingress_uses_the_competitor_runner_group() -> None:
+    sealed = SimpleNamespace(
+        runner_security_group_id="sg-lakebase-runner",
+        competitor_runner_security_group_id="sg-competitor-runner",
+    )
+    manifest = SimpleNamespace(
+        round5_ready=True,
+        require_round5_resources=lambda: sealed,
+    )
+
+    assert _round5_source_ingress_groups(manifest, "sg-proxy") == (
+        "sg-competitor-runner",
+        "sg-proxy",
+    )
+
+    sealed.competitor_runner_security_group_id = None
+    assert _round5_source_ingress_groups(manifest, "sg-proxy") == (
+        "sg-lakebase-runner",
+        "sg-proxy",
+    )
 
 
 def test_rds_network_check_requires_public_instance_with_exact_operator_ingress(
