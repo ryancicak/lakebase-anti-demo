@@ -113,6 +113,7 @@ def _stub_reseal_preconditions(monkeypatch: pytest.MonkeyPatch, manifest) -> lis
     monkeypatch.setattr(
         lifecycle, "_round5_aurora_cluster_resource_id", lambda *args, **kwargs: None
     )
+    monkeypatch.setattr(lifecycle, "ensure_coordination", lambda candidate: candidate)
     monkeypatch.setattr(lifecycle, "_wait_round5_runner_ready", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         lifecycle,
@@ -187,6 +188,12 @@ def test_a_refused_gate_preserves_the_existing_credential_seal(
         sealed.rds_credential_sha256,
     )
     saved = _stub_reseal_preconditions(monkeypatch, manifest)
+    coordinated = []
+    monkeypatch.setattr(
+        lifecycle,
+        "ensure_coordination",
+        lambda candidate: coordinated.append(candidate) or candidate,
+    )
     monkeypatch.setattr(
         lifecycle,
         "_round5_topology_check",
@@ -201,6 +208,7 @@ def test_a_refused_gate_preserves_the_existing_credential_seal(
     # As loud as it was before: the same exception type, naming the same check.
     assert "Round 5 secret-free doctor failed" in str(refusal.value)
     assert "runner is not online in SSM" in str(refusal.value)
+    assert coordinated == [manifest]
 
     # ... and the unchanged digests reached the candidate written before it.
     assert saved, "a failed gate must still record the re-sealed candidate"
