@@ -4396,6 +4396,20 @@ def test_round4_cleanup_retry_accepts_an_already_removed_workspace_folder(monkey
     assert not any(arguments[:3] == ["databricks", "workspace", "delete"] for arguments in calls)
 
 
+def test_optional_databricks_lookup_accepts_cli_doesnt_exist_wording(monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Error: Path (/already/gone) doesn't exist.",
+        ),
+    )
+
+    assert lifecycle._databricks_api_optional("profile", "/api/2.0/workspace/get-status") is None
+
+
 def test_a_pipeline_that_survives_its_own_deletion_refuses_the_teardown(monkeypatch) -> None:
     """ "Delete returned" is not "gone", and the difference is the whole bill."""
 

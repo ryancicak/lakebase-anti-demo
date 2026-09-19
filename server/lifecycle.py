@@ -2077,7 +2077,13 @@ def _databricks_api_optional(profile: str, path: str) -> dict[str, Any] | None:
         detail = f"{result.stderr}\n{result.stdout}".lower()
         if any(
             marker in detail
-            for marker in ("not found", "does not exist", "resource_does_not_exist", "404")
+            for marker in (
+                "not found",
+                "does not exist",
+                "doesn't exist",
+                "resource_does_not_exist",
+                "404",
+            )
         ):
             return None
         raise _safe_failure(result)
