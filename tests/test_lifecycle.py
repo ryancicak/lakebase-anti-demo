@@ -112,6 +112,38 @@ def test_lifecycle_tests_resolve_only_the_isolated_manifest(
     assert manifest_path() == isolated_lifecycle_manifest.resolve()
 
 
+def test_round5_runner_dependency_install_retries_transient_download_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server import connection_spike_live
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(lifecycle, "_round5_runner_archive", lambda: "YWJj")
+    monkeypatch.setattr(
+        connection_spike_live,
+        "RUNNER_ASSETS",
+        ("connection_spike_runner.py", "requirements-round5.txt"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_run_round5_ssm_command",
+        lambda _ssm, *, commands, **_kwargs: calls.append(commands) or "",
+    )
+
+    lifecycle._install_round5_runner_assets(
+        SimpleNamespace(client=lambda _service: object()),
+        runner_instance_id="i-0123456789abcdef0",
+    )
+
+    dependency_command = next(
+        command
+        for command in calls[-1]
+        if "requirements-round5.txt" in command and "pip install" in command
+    )
+    assert "for attempt in 1 2 3" in dependency_command
+    assert "--retries 10 --timeout 60" in dependency_command
+
+
 def test_fresh_v7_install_derives_seven_unique_workspace_projects() -> None:
     def staged(installation_id: str) -> SimpleNamespace:
         return SimpleNamespace(
