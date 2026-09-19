@@ -2085,6 +2085,31 @@ def test_a_first_provision_seals_the_app_egress_before_its_first_apply(
     assert "operator_cidr=203.0.113.10/32" in rendered
 
 
+def test_destroy_plan_recovers_the_source_principal_for_a_partial_install(
+    monkeypatch,
+) -> None:
+    manifest = make_manifest()
+    monkeypatch.delenv("ROUND5_APP_PRINCIPAL_ARN", raising=False)
+    monkeypatch.delenv("TF_VAR_round5_app_principal_arn", raising=False)
+    monkeypatch.delenv("ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS", raising=False)
+    sts = SimpleNamespace(
+        get_caller_identity=lambda: {
+            "Arn": "arn:aws:iam::123456789012:user/lakebase-anti-demo-operator"
+        }
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._aws_source_session",
+        lambda candidate: SimpleNamespace(client=lambda service, region_name: sts),
+    )
+
+    rendered = " ".join(lifecycle._terraform_variables(manifest, destroy=True))
+
+    assert (
+        "round5_app_principal_arn="
+        "arn:aws:iam::123456789012:user/lakebase-anti-demo-operator"
+    ) in rendered
+
+
 def test_a_first_provision_survives_a_feed_it_cannot_read(
     monkeypatch, isolated_lifecycle_manifest, capsys
 ) -> None:
@@ -3936,8 +3961,25 @@ def test_every_lakebase_branch_role_comes_with_its_project_permission(monkeypatc
     assert permission_calls == []
 
 
-def test_cleanup_deletes_synced_table_then_schemas_before_project(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("isolated_round1_project", (False, True))
+def test_cleanup_deletes_synced_table_then_schemas_before_project(
+    monkeypatch,
+    tmp_path,
+    isolated_round1_project: bool,
+) -> None:
     manifest = make_manifest()
+    if isolated_round1_project:
+        manifest = manifest.model_copy(
+            update={"installation_id": "11111111-2222-4333-8444-555555555555"}
+        )
+        assert manifest.installation_id is not None
+        project_id = f"anti-demo-{manifest.installation_id.replace('-', '')}-r1"
+        manifest.databricks = manifest.databricks.model_copy(
+            update={
+                "project_id": project_id,
+                "endpoint_name": f"projects/{project_id}/branches/production/endpoints/primary",
+            }
+        )
     names = attach_round4(manifest)
     payload = round4_payload(manifest, names)
     database_payload = database_round4_payload(manifest, names)
@@ -3966,15 +4008,18 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(monkeypatch, t
     monkeypatch.setattr(
         "server.lifecycle.reconcile_live", lambda candidate, factory: reconcile(candidate, ())
     )
-    monkeypatch.setattr(
-        "server.lifecycle._get_lakebase_project_or_none",
-        lambda candidate: {
-            "project_id": manifest.run_id,
-            "name": f"projects/{manifest.run_id}",
+    def get_project(candidate, project_id=None):
+        requested = project_id or candidate.databricks.project_id
+        if requested != manifest.databricks.project_id:
+            return None
+        return {
+            "project_id": manifest.databricks.project_id,
+            "name": f"projects/{manifest.databricks.project_id}",
             "uid": "project-uid-001",
             "status": {"pg_version": 17},
-        },
-    )
+        }
+
+    monkeypatch.setattr("server.lifecycle._get_lakebase_project_or_none", get_project)
     monkeypatch.setattr(
         "server.lifecycle._round4_get_branch",
         lambda candidate, expected: {
@@ -3986,11 +4031,11 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(monkeypatch, t
     )
     monkeypatch.setattr(
         "server.lifecycle._round4_get_synced_table",
-        lambda candidate, expected: payload,
+        lambda candidate, expected: None if isolated_round1_project else payload,
     )
     monkeypatch.setattr(
         "server.lifecycle._round4_get_database_synced_table",
-        lambda candidate, expected: database_payload,
+        lambda candidate, expected: None if isolated_round1_project else database_payload,
     )
     monkeypatch.setattr(
         "server.lifecycle._round4_get_pipeline",
@@ -4038,13 +4083,22 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(monkeypatch, t
     cleaned = cleanup(dry_run=False)
 
     assert cleaned is manifest
-    assert calls == [
-        "synced_table",
-        f"schema:{names['online_schema']}",
-        f"schema:{names['storage_schema']}",
-        f"schema:{names['source_schema']}",
-        "project",
-    ]
+    assert calls == (
+        [
+            f"schema:{names['online_schema']}",
+            f"schema:{names['storage_schema']}",
+            f"schema:{names['source_schema']}",
+            "project",
+        ]
+        if isolated_round1_project
+        else [
+            "synced_table",
+            f"schema:{names['online_schema']}",
+            f"schema:{names['storage_schema']}",
+            f"schema:{names['source_schema']}",
+            "project",
+        ]
+    )
 
 
 def _stub_round6_drifted_cleanup(monkeypatch, tmp_path):
@@ -4956,7 +5010,14 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, t
     manifest = make_manifest(status="cleanup_failed")
     owned_manifest = tmp_path / "manifest.json"
     owned_manifest.write_text("{}")
-    addresses = {"aws_db_subnet_group.round1", "aws_security_group.aurora"}
+    addresses = {
+        "aws_db_subnet_group.round1",
+        "aws_security_group.aurora",
+        'aws_iam_role_policy_attachment.anti_demo_runtime["1-network"]',
+        'aws_iam_role_policy_attachment.anti_demo_runtime["2-databases"]',
+        'aws_iam_role_policy_attachment.anti_demo_runtime["3-identity"]',
+        "terraform_data.round5_destroy_guard",
+    }
     expected_tags = {
         "anti-demo-run-id": manifest.run_id,
         "Owner": manifest.owner,
@@ -5012,6 +5073,10 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, t
         lambda candidate, expected: {
             "aws_db_subnet_group.round1": {"name": manifest.aws.resources.db_subnet_group_name},
             "aws_security_group.aurora": {"id": manifest.aws.resources.security_group_id},
+                'aws_iam_role_policy_attachment.anti_demo_runtime["1-network"]': {},
+                'aws_iam_role_policy_attachment.anti_demo_runtime["2-databases"]': {},
+                'aws_iam_role_policy_attachment.anti_demo_runtime["3-identity"]': {},
+                "terraform_data.round5_destroy_guard": {},
         },
     )
     monkeypatch.setattr("server.lifecycle._aws_session", lambda candidate: FakeSession())
@@ -5070,6 +5135,10 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, t
         "server.lifecycle._databricks_api_delete_no_response",
         lambda profile, path: calls.append(f"delete {path}"),
     )
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda arguments, **kwargs: calls.append("remove_destroy_guard"),
+    )
 
     assert cleanup(dry_run=False) is manifest
     # Ordering is the assertion, not just membership. The app assumes the
@@ -5077,6 +5146,7 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, t
     # `terraform_apply` would leave an app that is broken *and* still billing,
     # with a successful destroy scrolling past to say otherwise.
     assert calls == [
+        "remove_destroy_guard",
         "destroy_plan",
         "delete /api/2.0/apps/lakebase-anti-demo",
         "safe_change_cleanup",

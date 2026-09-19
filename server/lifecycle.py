@@ -1082,6 +1082,7 @@ def _terraform_variables(
     manifest: DemoManifest,
     *,
     expires_at_override: datetime | None = None,
+    destroy: bool = False,
 ) -> list[str]:
     """Build the Terraform variables for this manifest.
 
@@ -1109,6 +1110,20 @@ def _terraform_variables(
             os.environ.get("ROUND5_APP_PRINCIPAL_ARN", "").strip()
             or os.environ.get("TF_VAR_round5_app_principal_arn", "").strip()
         )
+        if not round5_app_principal and destroy:
+            identity = _aws_source_session(manifest).client(
+                "sts", region_name=manifest.aws.region
+            ).get_caller_identity()
+            caller_arn = str(identity.get("Arn") or "")
+            assumed = re.fullmatch(
+                r"arn:([^:]+):sts::(\d{12}):assumed-role/([^/]+)/[^/]+",
+                caller_arn,
+            )
+            round5_app_principal = (
+                f"arn:{assumed.group(1)}:iam::{assumed.group(2)}:role/{assumed.group(3)}"
+                if assumed is not None
+                else caller_arn
+            )
     expected_arn_prefix = f"arn:aws:iam::{manifest.aws.account_id}:"
     if not round5_app_principal.startswith(expected_arn_prefix) or not re.fullmatch(
         r"arn:aws:iam::\d{12}:(?:role|user)/[A-Za-z0-9+=,.@_/-]+",
@@ -1236,7 +1251,11 @@ def _terraform_plan(
     arguments.extend(
         [
             f"-out={plan_path}",
-            *_terraform_variables(manifest, expires_at_override=expires_at_override),
+            *_terraform_variables(
+                manifest,
+                expires_at_override=expires_at_override,
+                destroy=destroy,
+            ),
         ]
     )
     _run(arguments, env=_terraform_environment(manifest))
@@ -1894,9 +1913,15 @@ def _validate_partial_aws_destroy_retry(
         # proven by the tagged managed policy and the tagged control role it binds.
         "aws_iam_role_policy_attachment.round5_execution_proxy",
         "aws_iam_role_policy_attachment.round5_runner_ssm",
+        "aws_iam_role_policy_attachment.anti_demo_runtime[\"1-network\"]",
+        "aws_iam_role_policy_attachment.anti_demo_runtime[\"2-databases\"]",
+        "aws_iam_role_policy_attachment.anti_demo_runtime[\"3-identity\"]",
         "aws_vpc_security_group_egress_rule.round5_proxy_to_rds",
         "aws_vpc_security_group_egress_rule.round5_runner_outbound",
         "aws_vpc_security_group_ingress_rule.round5_runner_to_proxy",
+        # Local destroy ordering only; this is Terraform state, not an AWS
+        # resource, so it cannot carry ownership tags.
+        "terraform_data.round5_destroy_guard",
     }
     for address in round5_addresses:
         values = state_values[address]
@@ -7554,7 +7579,7 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
             manifest,
             project_id=names["project"].removeprefix("projects/"),
         )
-        if manifest.round_environments is not None
+        if manifest.round_environments is not None or manifest.installation_id is not None
         else _get_lakebase_project_or_none(manifest)
     )
     branch = _round4_get_branch(manifest, names)
@@ -10919,7 +10944,7 @@ def _inspect_round4_for_cleanup(
             manifest,
             project_id=names["project"].removeprefix("projects/"),
         )
-        if manifest.round_environments is not None
+        if manifest.round_environments is not None or manifest.installation_id is not None
         else _get_lakebase_project_or_none(manifest)
     )
     branch = _round4_get_branch(manifest, names) if project is not None else None
@@ -11520,7 +11545,6 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
     """
 
     manifest = load_manifest()
-    expected_project = f"projects/{manifest.run_id}"
     databricks_bindings: list[DatabricksManifest] = []
     if manifest.round_environments is not None:
         actual_user = _verify_databricks_identity(manifest.databricks.profile)
@@ -11536,11 +11560,24 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
             if binding_key in seen_bindings:
                 continue
             seen_bindings.add(binding_key)
+            # A v7 provision writes its isolated Round 1 project into the
+            # initial v1 manifest before Terraform runs. If that first apply
+            # fails, round_environments is still absent, but cleanup must accept
+            # the exact installation-derived project rather than misclassifying
+            # it as a legacy run-id project and stranding the partial fleet.
+            expected_project_ids = {manifest.run_id}
+            if manifest.installation_id is not None:
+                expected_project_ids.add(
+                    f"anti-demo-{manifest.installation_id.replace('-', '')}-r1"
+                )
+            expected_project = f"projects/{binding.project_id}"
             if (
-                binding.project_id != manifest.run_id
+                binding.project_id not in expected_project_ids
                 or binding.endpoint_name.split("/branches/", 1)[0] != expected_project
             ):
-                raise RuntimeError("Manifest Lakebase project does not match its run ID")
+                raise RuntimeError(
+                    "Manifest Lakebase project does not match its sealed installation"
+                )
             actual_user = _verify_databricks_identity(binding.profile)
             if actual_user != binding.user:
                 raise RuntimeError(
@@ -11599,6 +11636,22 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
                 f"OWNED Lakebase project: projects/{sealed.project_id} via "
                 f"{manifest.databricks.profile} ({state})"
             )
+    elif manifest.installation_id is not None:
+        compact_installation_id = manifest.installation_id.replace("-", "")
+        project_ids = [
+            *(f"anti-demo-{compact_installation_id}-r{number}" for number in range(1, 7)),
+            f"anti-demo-{compact_installation_id}-coord",
+        ]
+        for project_id in project_ids:
+            project = _get_lakebase_project_or_none(manifest, project_id=project_id)
+            if project is not None:
+                _validate_lakebase_project(manifest, project, project_id=project_id)
+            lakebase_projects.append((manifest.databricks.profile, project_id, project))
+            state = "exists" if project is not None else "already removed"
+            print(
+                f"OWNED Lakebase project: projects/{project_id} via "
+                f"{manifest.databricks.profile} ({state})"
+            )
     else:
         for binding in databricks_bindings:
             candidate = manifest.model_copy(update={"databricks": binding})
@@ -11607,7 +11660,10 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
                 _validate_lakebase_project(candidate, project)
             lakebase_projects.append((binding.profile, binding.project_id, project))
             state = "exists" if project is not None else "already removed"
-            print(f"OWNED Lakebase project: {expected_project} via {binding.profile} ({state})")
+            print(
+                f"OWNED Lakebase project: projects/{binding.project_id} via "
+                f"{binding.profile} ({state})"
+            )
     round4_inventory = _inspect_round4_for_cleanup(manifest)
     round4_state = "exists" if round4_inventory[1] is not None else "already removed"
     print(f"OWNED Round 4 synced table: {round4_inventory[0]['resource_name']} ({round4_state})")
@@ -11737,15 +11793,16 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         if complete_baseline:
             clean_receipt = _write_round5_clean_receipt(manifest)
             print(f"CLEAN {clean_receipt}", flush=True)
+        if "terraform_data.round5_destroy_guard" in managed_addresses:
             _run(
                 _terraform_base() + ["state", "rm", "terraform_data.round5_destroy_guard"],
                 env=_terraform_environment(manifest),
             )
-        if not dry_run:
-            delete_detached_runtime_role = _detach_runtime_role_from_destroy_state(
-                manifest,
-                managed_addresses,
-            )
+            managed_addresses.remove("terraform_data.round5_destroy_guard")
+        delete_detached_runtime_role = _detach_runtime_role_from_destroy_state(
+            manifest,
+            managed_addresses,
+        )
         if aws_resources_exist:
             destroy_plan = _terraform_plan(manifest, destroy=True)
             print(f"PLAN  {destroy_plan}", flush=True)
@@ -11758,7 +11815,12 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         if destroy_plan is not None:
             if complete_baseline:
                 asyncio.run(reset_safe_change_artifacts(manifest))
-            else:
+            elif manifest.aws.resources.aurora_cluster_id:
+                # A legacy partial seal can have per-bout artifacts even when
+                # its Terraform baseline is incomplete. The initial v7
+                # provisioning manifest has no sealed source identity yet, and
+                # attempting legacy cleanup against its blank fields strands
+                # the destroy plan before Terraform can remove the fleet.
                 asyncio.run(reset_safe_change_only_artifacts(manifest))
             _terraform_apply(manifest, destroy_plan)
         for profile, project_id, project in lakebase_projects:
