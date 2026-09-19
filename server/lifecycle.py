@@ -11002,18 +11002,24 @@ def _delete_round4_resources(
                 capture=True,
             )
         owner_key = str(manifest.installation_id or manifest.run_id)
-        _run(
-            [
-                "databricks",
-                "workspace",
-                "delete",
-                f"/Shared/lakebase-anti-demo/{owner_key}",
-                "--recursive",
-                "-p",
-                manifest.databricks.profile,
-            ],
-            capture=True,
+        workspace_path = f"/Shared/lakebase-anti-demo/{owner_key}"
+        workspace_object = _databricks_api_optional(
+            manifest.databricks.profile,
+            f"/api/2.0/workspace/get-status?path={quote(workspace_path, safe='')}",
         )
+        if workspace_object is not None:
+            _run(
+                [
+                    "databricks",
+                    "workspace",
+                    "delete",
+                    workspace_path,
+                    "--recursive",
+                    "-p",
+                    manifest.databricks.profile,
+                ],
+                capture=True,
+            )
     for key, schema_name in (
         ("online_schema", names["online_schema"]),
         ("storage_schema", names["storage_schema"]),

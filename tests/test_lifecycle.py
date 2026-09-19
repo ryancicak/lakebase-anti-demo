@@ -4365,6 +4365,37 @@ def test_round4_cleanup_removes_the_installation_workspace_folder(monkeypatch) -
     ] in calls
 
 
+def test_round4_cleanup_retry_accepts_an_already_removed_workspace_folder(monkeypatch) -> None:
+    manifest = make_manifest()
+    attach_round4(manifest)
+    manifest.round4.source_repair_job_id = "123"
+    calls: list[list[str]] = []
+    monkeypatch.setattr("server.lifecycle._delete_round4_pipeline", lambda candidate: None)
+
+    def optional(profile, path):
+        if path.startswith("/api/2.1/jobs/get"):
+            return {
+                "job_id": 123,
+                "creator_user_name": manifest.round4.setup_principal,
+                "settings": {
+                    "name": (
+                        f"lakebase-anti-demo-{manifest.run_id[:8]}-round4-source-repair"
+                    )
+                },
+            }
+        return None
+
+    monkeypatch.setattr("server.lifecycle._databricks_api_optional", optional)
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda arguments, **kwargs: calls.append(arguments) or SimpleNamespace(stdout="{}"),
+    )
+
+    _delete_round4_resources(manifest, (_round4_names(manifest), None, {}))
+
+    assert not any(arguments[:3] == ["databricks", "workspace", "delete"] for arguments in calls)
+
+
 def test_a_pipeline_that_survives_its_own_deletion_refuses_the_teardown(monkeypatch) -> None:
     """ "Delete returned" is not "gone", and the difference is the whole bill."""
 
