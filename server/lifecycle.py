@@ -1001,7 +1001,33 @@ def _terraform_environment(manifest: DemoManifest) -> dict[str, str]:
         manifest.aws.profile,
         os.environ,
     )
-    return selected_subprocess_environment(os.environ, selection, manifest.aws.region)
+    environment = selected_subprocess_environment(
+        os.environ,
+        selection,
+        manifest.aws.region,
+    )
+    if manifest.aws.runtime_role_arn is None:
+        return environment
+
+    # A fresh install starts with the supplied principal so Terraform can create
+    # the shared runtime role. After that role is sealed, the supplied app/operator
+    # user is deliberately narrowed to sts:AssumeRole. Every later Terraform
+    # refresh, apply and destroy therefore has to use the same sealed role as the
+    # Python AWS clients; continuing with the source user makes healthy resources
+    # unreadable and strands cleanup.
+    credentials = _aws_session(manifest).get_credentials()
+    if credentials is None:
+        raise RuntimeError("The sealed AWS runtime role returned no credentials for Terraform")
+    frozen = credentials.get_frozen_credentials()
+    environment["AWS_ACCESS_KEY_ID"] = frozen.access_key
+    environment["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+    if frozen.token:
+        environment["AWS_SESSION_TOKEN"] = frozen.token
+    else:
+        environment.pop("AWS_SESSION_TOKEN", None)
+    environment.pop("AWS_PROFILE", None)
+    environment.pop("AWS_DEFAULT_PROFILE", None)
+    return environment
 
 
 def anti_demo_runtime_principals(manifest: DemoManifest) -> tuple[str, ...]:

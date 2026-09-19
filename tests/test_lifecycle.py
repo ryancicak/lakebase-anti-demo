@@ -1380,6 +1380,37 @@ def test_terraform_uses_only_manifest_selected_environment_credentials(monkeypat
     assert "AWS_WEB_IDENTITY_TOKEN_FILE" not in environment
 
 
+def test_terraform_uses_the_sealed_runtime_role_after_first_provision(monkeypatch) -> None:
+    manifest = make_manifest()
+    manifest.aws.auth_mode = "environment"
+    manifest.aws.profile = ""
+    manifest.aws.runtime_role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "source-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "source-secret")
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(
+        lifecycle,
+        "_aws_session",
+        lambda candidate: SimpleNamespace(
+            get_credentials=lambda: SimpleNamespace(
+                get_frozen_credentials=lambda: SimpleNamespace(
+                    access_key="runtime-access",
+                    secret_key="runtime-secret",
+                    token="runtime-token",
+                )
+            )
+        ),
+    )
+
+    environment = _terraform_environment(manifest)
+
+    assert environment["AWS_ACCESS_KEY_ID"] == "runtime-access"
+    assert environment["AWS_SECRET_ACCESS_KEY"] == "runtime-secret"
+    assert environment["AWS_SESSION_TOKEN"] == "runtime-token"
+    assert "AWS_PROFILE" not in environment
+    assert "AWS_DEFAULT_PROFILE" not in environment
+
+
 def test_an_iam_policy_proves_ownership_with_the_tag_iam_can_actually_hold(monkeypatch) -> None:
     """A destroy must not be gated on a tag AWS refuses to store.
 
