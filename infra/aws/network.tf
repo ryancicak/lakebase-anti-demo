@@ -256,8 +256,8 @@ resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_https" {
 }
 
 # Lakebase is publicly reachable and does not publish a stable customer-specific
-# CIDR that a security-group rule can seal. Limit the exception to PostgreSQL;
-# the competitor runner receives no corresponding public destination rule.
+# CIDR that a security-group rule can seal. Limit this lane's exception to
+# PostgreSQL; the competitor lane has its own coordination-only rule below.
 resource "aws_vpc_security_group_egress_rule" "round5_lakebase_runner_postgres" {
   security_group_id = aws_security_group.round5_runner.id
   description       = "PostgreSQL to the public Lakebase direct, pooled, and coordination endpoints"

@@ -1001,7 +1001,33 @@ def _terraform_environment(manifest: DemoManifest) -> dict[str, str]:
         manifest.aws.profile,
         os.environ,
     )
-    return selected_subprocess_environment(os.environ, selection, manifest.aws.region)
+    environment = selected_subprocess_environment(
+        os.environ,
+        selection,
+        manifest.aws.region,
+    )
+    if manifest.aws.runtime_role_arn is None:
+        return environment
+
+    # A fresh install starts with the supplied principal so Terraform can create
+    # the shared runtime role. After that role is sealed, the supplied app/operator
+    # user is deliberately narrowed to sts:AssumeRole. Every later Terraform
+    # refresh, apply and destroy therefore has to use the same sealed role as the
+    # Python AWS clients; continuing with the source user makes healthy resources
+    # unreadable and strands cleanup.
+    credentials = _aws_session(manifest).get_credentials()
+    if credentials is None:
+        raise RuntimeError("The sealed AWS runtime role returned no credentials for Terraform")
+    frozen = credentials.get_frozen_credentials()
+    environment["AWS_ACCESS_KEY_ID"] = frozen.access_key
+    environment["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+    if frozen.token:
+        environment["AWS_SESSION_TOKEN"] = frozen.token
+    else:
+        environment.pop("AWS_SESSION_TOKEN", None)
+    environment.pop("AWS_PROFILE", None)
+    environment.pop("AWS_DEFAULT_PROFILE", None)
+    return environment
 
 
 def anti_demo_runtime_principals(manifest: DemoManifest) -> tuple[str, ...]:
@@ -1277,6 +1303,7 @@ EXPECTED_AWS_STATE_ADDRESSES = {
     "aws_vpc_security_group_egress_rule.round5_lakebase_runner_https",
     "aws_vpc_security_group_egress_rule.round5_lakebase_runner_postgres",
     "aws_vpc_security_group_egress_rule.round5_competitor_runner_https",
+    "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres",
     'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy["aurora"]',
     'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_proxy["rds"]',
     'aws_vpc_security_group_egress_rule.round5_competitor_runner_to_database["aurora"]',
@@ -1721,8 +1748,42 @@ def _hydrate_aws_resources(
     resolved = outputs if outputs is not None else _terraform_outputs(manifest)
     manifest.aws.resources = _aws_resources_from_outputs(resolved)
     _seal_anti_demo_runtime(manifest, resolved)
+    _migrate_round5_competitor_coordination_egress(manifest, resolved)
     if persist:
         save_manifest(manifest)
+
+
+def _migrate_round5_competitor_coordination_egress(
+    manifest: DemoManifest,
+    outputs: dict[str, Any],
+) -> None:
+    """Add the v4 resident coordination rule to a pre-rule Round 5 seal.
+
+    The rule was added to Terraform before its output and exact-state contract
+    were updated. Those installations own the rule in state, but their manifest
+    seals only the older competitor egress set. Accept exactly that one-member
+    expansion from Terraform's resource-derived output and canonicalize both
+    hashes; every other difference remains drift.
+    """
+
+    sealed = manifest.round5
+    if not isinstance(sealed, Round5Resources):
+        return
+    current = tuple(sealed.competitor_runner_egress_rule_ids)
+    reported = tuple(
+        str(item) for item in (outputs.get("round5_competitor_runner_egress_rule_ids") or ())
+    )
+    if reported == current:
+        return
+    if (
+        len(reported) == len(current) + 1
+        and set(current) < set(reported)
+        and len(set(reported)) == len(reported)
+    ):
+        manifest.round5 = _reseal_round5(
+            sealed,
+            competitor_runner_egress_rule_ids=reported,
+        )
 
 
 def _seal_anti_demo_runtime(manifest: DemoManifest, outputs: dict[str, Any]) -> None:
@@ -2016,7 +2077,13 @@ def _databricks_api_optional(profile: str, path: str) -> dict[str, Any] | None:
         detail = f"{result.stderr}\n{result.stdout}".lower()
         if any(
             marker in detail
-            for marker in ("not found", "does not exist", "resource_does_not_exist", "404")
+            for marker in (
+                "not found",
+                "does not exist",
+                "doesn't exist",
+                "resource_does_not_exist",
+                "404",
+            )
         ):
             return None
         raise _safe_failure(result)
@@ -4209,11 +4276,17 @@ def _round5_topology_check(
                         "Round 5 Lakebase runner public egress is not limited "
                         "to HTTPS and PostgreSQL"
                     )
-            elif any(
-                rule.get("FromPort") == 5432 and rule.get("CidrIpv4") == "0.0.0.0/0"
-                for rule in rules
-            ):
-                raise RuntimeError("Round 5 competitor runner has public PostgreSQL egress")
+            else:
+                public_ports = {
+                    rule.get("FromPort")
+                    for rule in rules
+                    if rule.get("CidrIpv4") == "0.0.0.0/0"
+                }
+                if public_ports != {443, 5432}:
+                    raise RuntimeError(
+                        "Round 5 competitor runner public egress is not limited "
+                        "to HTTPS and coordination PostgreSQL"
+                    )
 
         iam = session.client("iam")
         runner_role_name = sealed.runner_role_arn.rsplit("/", 1)[-1]
@@ -10935,18 +11008,24 @@ def _delete_round4_resources(
                 capture=True,
             )
         owner_key = str(manifest.installation_id or manifest.run_id)
-        _run(
-            [
-                "databricks",
-                "workspace",
-                "delete",
-                f"/Shared/lakebase-anti-demo/{owner_key}",
-                "--recursive",
-                "-p",
-                manifest.databricks.profile,
-            ],
-            capture=True,
+        workspace_path = f"/Shared/lakebase-anti-demo/{owner_key}"
+        workspace_object = _databricks_api_optional(
+            manifest.databricks.profile,
+            f"/api/2.0/workspace/get-status?path={quote(workspace_path, safe='')}",
         )
+        if workspace_object is not None:
+            _run(
+                [
+                    "databricks",
+                    "workspace",
+                    "delete",
+                    workspace_path,
+                    "--recursive",
+                    "-p",
+                    manifest.databricks.profile,
+                ],
+                capture=True,
+            )
     for key, schema_name in (
         ("online_schema", names["online_schema"]),
         ("storage_schema", names["storage_schema"]),
@@ -11042,6 +11121,101 @@ def _delete_databricks_app(manifest: DemoManifest) -> None:
         manifest.databricks.profile,
         f"/api/2.0/apps/{quote(app.name, safe='')}",
     )
+
+
+def _detach_runtime_role_from_destroy_state(
+    manifest: DemoManifest,
+    managed_addresses: set[str],
+) -> bool:
+    """Keep the credential-bearing runtime role alive until teardown is complete."""
+
+    if manifest.aws.runtime_role_arn is None:
+        return False
+    present = managed_addresses & _ANTI_DEMO_RUNTIME_STATE_ADDRESSES
+    if not present:
+        # A retry after the role was already detached from state still owns the
+        # live, tag-verified role and must remove it after every billed resource.
+        return True
+    if present != _ANTI_DEMO_RUNTIME_STATE_ADDRESSES:
+        raise RuntimeError(
+            "Cleanup refused: the sealed runtime role is only partially represented "
+            "in Terraform state"
+        )
+    _run(
+        _terraform_base()
+        + ["state", "rm", *sorted(_ANTI_DEMO_RUNTIME_STATE_ADDRESSES)],
+        env=_terraform_environment(manifest),
+    )
+    return True
+
+
+def _delete_detached_runtime_role(manifest: DemoManifest) -> None:
+    """Delete the exact sealed runtime role last, using the source principal.
+
+    Terraform itself cannot do this safely: deleting the role invalidates the
+    temporary credentials its provider is using while slower EC2/RDS deletions
+    are still being polled. The source principal is intentionally authorized to
+    manage only this fixed-name role and its fixed-prefix policies, so it can
+    perform the final zero-cost IAM cleanup after every billed resource and
+    Lakebase project is gone.
+    """
+
+    role_arn = manifest.aws.runtime_role_arn
+    if role_arn is None:
+        return
+    role_name = role_arn.rsplit("/", 1)[-1]
+    iam = _aws_source_session(manifest).client("iam")
+    try:
+        role = iam.get_role(RoleName=role_name).get("Role") or {}
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") == "NoSuchEntity":
+            return
+        raise
+    if str(role.get("Arn") or "") != role_arn:
+        raise RuntimeError("Cleanup refused: the runtime role ARN differs from its seal")
+    required = _required_tags_for_address(manifest, "aws_iam_role.anti_demo_runtime[0]")
+    tags = {
+        str(item.get("Key") or ""): str(item.get("Value") or "")
+        for item in role.get("Tags", [])
+    }
+    if any(tags.get(key) != value for key, value in required.items()):
+        raise RuntimeError("Cleanup refused: the runtime role ownership tags differ")
+    if iam.list_role_policies(RoleName=role_name).get("PolicyNames"):
+        raise RuntimeError("Cleanup refused: the runtime role has an unexpected inline policy")
+    if iam.list_instance_profiles_for_role(RoleName=role_name).get("InstanceProfiles"):
+        raise RuntimeError("Cleanup refused: the runtime role belongs to an instance profile")
+
+    expected_prefix = (
+        f"arn:{role_arn.split(':', 2)[1]}:iam::{manifest.aws.account_id}:"
+        f"policy/{ANTI_DEMO_RUNTIME_ROLE_NAME}-"
+    )
+    attached = iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies") or []
+    if len(attached) > len(_ANTI_DEMO_RUNTIME_POLICY_KEYS) or any(
+        not str(item.get("PolicyArn") or "").startswith(expected_prefix) for item in attached
+    ):
+        raise RuntimeError("Cleanup refused: the runtime role has an unexpected managed policy")
+    for item in attached:
+        policy_arn = str(item.get("PolicyArn") or "")
+        policy = iam.get_policy(PolicyArn=policy_arn).get("Policy") or {}
+        policy_tags = {
+            str(tag.get("Key") or ""): str(tag.get("Value") or "")
+            for tag in (iam.list_policy_tags(PolicyArn=policy_arn).get("Tags") or [])
+        }
+        if (
+            str(policy.get("Arn") or "") != policy_arn
+            or any(policy_tags.get(key) != value for key, value in required.items())
+        ):
+            raise RuntimeError("Cleanup refused: a runtime policy differs from its ownership seal")
+        iam.detach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+        versions = iam.list_policy_versions(PolicyArn=policy_arn).get("Versions") or []
+        for version in versions:
+            if not version.get("IsDefaultVersion"):
+                iam.delete_policy_version(
+                    PolicyArn=policy_arn,
+                    VersionId=str(version.get("VersionId") or ""),
+                )
+        iam.delete_policy(PolicyArn=policy_arn)
+    iam.delete_role(RoleName=role_name)
 
 
 def _round4_app_record(manifest: DemoManifest) -> dict[str, Any] | None:
@@ -11513,12 +11687,18 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
                 )
         if complete_baseline:
             _require_round5_runner_idle(manifest)
+        delete_detached_runtime_role = False
         if complete_baseline:
             clean_receipt = _write_round5_clean_receipt(manifest)
             print(f"CLEAN {clean_receipt}", flush=True)
             _run(
                 _terraform_base() + ["state", "rm", "terraform_data.round5_destroy_guard"],
                 env=_terraform_environment(manifest),
+            )
+        if not dry_run:
+            delete_detached_runtime_role = _detach_runtime_role_from_destroy_state(
+                manifest,
+                managed_addresses,
             )
         if aws_resources_exist:
             destroy_plan = _terraform_plan(manifest, destroy=True)
@@ -11555,6 +11735,8 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
                 capture=True,
                 timeout=700,
             )
+        if delete_detached_runtime_role:
+            _delete_detached_runtime_role(manifest)
     except Exception:
         # Not on a dry run. `cleanup_failed` means "a teardown ran partway and a
         # human must adjudicate what survived" -- `require_ready_manifest`

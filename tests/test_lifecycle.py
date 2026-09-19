@@ -888,6 +888,7 @@ def test_round5_outputs_require_static_proxy_role_and_secret_bindings() -> None:
     ]
     outputs["round5_competitor_runner_egress_rule_ids"] = [
         "sgr-2123456789abcdef0",
+        "sgr-3123456789abcdef0",
     ]
     outputs["round5_bout_base_tags"] = {"managed-by": "round5-lifecycle"}
 
@@ -917,6 +918,7 @@ async def test_clean_install_resident_acl_secret_and_state_inventory() -> None:
         "aws_secretsmanager_secret.round5_runner_control",
         "aws_secretsmanager_secret.round5_competitor_runner_control",
         "aws_security_group.round5_competitor_runner",
+        "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres",
     }
     assert required_addresses <= lifecycle.EXPECTED_AWS_STATE_ADDRESSES
 
@@ -976,6 +978,10 @@ async def test_clean_install_resident_acl_secret_and_state_inventory() -> None:
     terraform = "\n".join(path.read_text() for path in terraform_root.glob("*.tf"))
     assert 'variable "round5_control_dsn"' not in terraform
     assert 'resource "aws_secretsmanager_secret_version" "round5_runner_control"' not in terraform
+    assert (
+        "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres.id"
+        in terraform
+    )
 
 
 def test_round5_provisioning_tags_use_installation_scope_before_v7_commit() -> None:
@@ -1372,6 +1378,126 @@ def test_terraform_uses_only_manifest_selected_environment_credentials(monkeypat
     assert "AWS_PROFILE" not in environment
     assert "AWS_ROLE_ARN" not in environment
     assert "AWS_WEB_IDENTITY_TOKEN_FILE" not in environment
+
+
+def test_terraform_uses_the_sealed_runtime_role_after_first_provision(monkeypatch) -> None:
+    manifest = make_manifest()
+    manifest.aws.auth_mode = "environment"
+    manifest.aws.profile = ""
+    manifest.aws.runtime_role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "source-access")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "source-secret")
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+    monkeypatch.setattr(
+        lifecycle,
+        "_aws_session",
+        lambda candidate: SimpleNamespace(
+            get_credentials=lambda: SimpleNamespace(
+                get_frozen_credentials=lambda: SimpleNamespace(
+                    access_key="runtime-access",
+                    secret_key="runtime-secret",
+                    token="runtime-token",
+                )
+            )
+        ),
+    )
+
+    environment = _terraform_environment(manifest)
+
+    assert environment["AWS_ACCESS_KEY_ID"] == "runtime-access"
+    assert environment["AWS_SECRET_ACCESS_KEY"] == "runtime-secret"
+    assert environment["AWS_SESSION_TOKEN"] == "runtime-token"
+    assert "AWS_PROFILE" not in environment
+    assert "AWS_DEFAULT_PROFILE" not in environment
+
+
+def test_cleanup_detaches_the_runtime_role_from_the_destroy_graph(monkeypatch) -> None:
+    manifest = make_manifest()
+    manifest.aws.runtime_role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    commands: list[list[str]] = []
+    monkeypatch.setattr(lifecycle, "_terraform_environment", lambda candidate: {})
+    monkeypatch.setattr(
+        lifecycle,
+        "_run",
+        lambda command, **kwargs: commands.append(list(command)) or SimpleNamespace(stdout=""),
+    )
+
+    assert lifecycle._detach_runtime_role_from_destroy_state(
+        manifest,
+        set(lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES),
+    )
+
+    assert commands
+    assert commands[0][-len(lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES) :] == sorted(
+        lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES
+    )
+
+
+def test_cleanup_deletes_the_tag_verified_runtime_role_last(monkeypatch) -> None:
+    manifest = make_manifest()
+    role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    policy_arn = "arn:aws:iam::123456789012:policy/anti-demo-runtime-1-network-test"
+    manifest.aws.runtime_role_arn = role_arn
+    required = lifecycle._required_tags_for_address(
+        manifest,
+        "aws_iam_role.anti_demo_runtime[0]",
+    )
+    tag_list = [{"Key": key, "Value": value} for key, value in required.items()]
+    calls: list[tuple[str, str]] = []
+
+    class Iam:
+        def get_role(self, **kwargs):
+            return {"Role": {"Arn": role_arn, "Tags": tag_list}}
+
+        def list_role_policies(self, **kwargs):
+            return {"PolicyNames": []}
+
+        def list_instance_profiles_for_role(self, **kwargs):
+            return {"InstanceProfiles": []}
+
+        def list_attached_role_policies(self, **kwargs):
+            return {"AttachedPolicies": [{"PolicyArn": policy_arn}]}
+
+        def get_policy(self, **kwargs):
+            return {"Policy": {"Arn": policy_arn}}
+
+        def list_policy_tags(self, **kwargs):
+            return {"Tags": tag_list}
+
+        def detach_role_policy(self, **kwargs):
+            calls.append(("detach", kwargs["PolicyArn"]))
+
+        def list_policy_versions(self, **kwargs):
+            return {
+                "Versions": [
+                    {"VersionId": "v1", "IsDefaultVersion": True},
+                    {"VersionId": "v2", "IsDefaultVersion": False},
+                ]
+            }
+
+        def delete_policy_version(self, **kwargs):
+            calls.append(("delete-version", kwargs["VersionId"]))
+
+        def delete_policy(self, **kwargs):
+            calls.append(("delete-policy", kwargs["PolicyArn"]))
+
+        def delete_role(self, **kwargs):
+            calls.append(("delete-role", kwargs["RoleName"]))
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_aws_source_session",
+        lambda candidate: SimpleNamespace(client=lambda name: Iam()),
+    )
+
+    lifecycle._delete_detached_runtime_role(manifest)
+
+    assert calls == [
+        ("detach", policy_arn),
+        ("delete-version", "v2"),
+        ("delete-policy", policy_arn),
+        ("delete-role", "anti-demo-runtime"),
+    ]
 
 
 def test_an_iam_policy_proves_ownership_with_the_tag_iam_can_actually_hold(monkeypatch) -> None:
@@ -4328,6 +4454,51 @@ def test_round4_cleanup_removes_the_installation_workspace_folder(monkeypatch) -
     ] in calls
 
 
+def test_round4_cleanup_retry_accepts_an_already_removed_workspace_folder(monkeypatch) -> None:
+    manifest = make_manifest()
+    attach_round4(manifest)
+    manifest.round4.source_repair_job_id = "123"
+    calls: list[list[str]] = []
+    monkeypatch.setattr("server.lifecycle._delete_round4_pipeline", lambda candidate: None)
+
+    def optional(profile, path):
+        if path.startswith("/api/2.1/jobs/get"):
+            return {
+                "job_id": 123,
+                "creator_user_name": manifest.round4.setup_principal,
+                "settings": {
+                    "name": (
+                        f"lakebase-anti-demo-{manifest.run_id[:8]}-round4-source-repair"
+                    )
+                },
+            }
+        return None
+
+    monkeypatch.setattr("server.lifecycle._databricks_api_optional", optional)
+    monkeypatch.setattr(
+        "server.lifecycle._run",
+        lambda arguments, **kwargs: calls.append(arguments) or SimpleNamespace(stdout="{}"),
+    )
+
+    _delete_round4_resources(manifest, (_round4_names(manifest), None, {}))
+
+    assert not any(arguments[:3] == ["databricks", "workspace", "delete"] for arguments in calls)
+
+
+def test_optional_databricks_lookup_accepts_cli_doesnt_exist_wording(monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Error: Path (/already/gone) doesn't exist.",
+        ),
+    )
+
+    assert lifecycle._databricks_api_optional("profile", "/api/2.0/workspace/get-status") is None
+
+
 def test_a_pipeline_that_survives_its_own_deletion_refuses_the_teardown(monkeypatch) -> None:
     """ "Delete returned" is not "gone", and the difference is the whole bill."""
 
@@ -4680,6 +4851,50 @@ def test_aws_hydration_can_inventory_without_writing_the_manifest(monkeypatch) -
     _hydrate_aws_resources(manifest, {}, persist=True)
 
     assert saved == [manifest.run_id]
+
+
+def test_hydration_reseals_the_single_missing_competitor_coordination_rule(
+    monkeypatch,
+) -> None:
+    manifest = make_manifest()
+    sealed = Round5Resources.model_construct(
+        competitor_runner_egress_rule_ids=("sgr-https", "sgr-proxy")
+    )
+    migrated = Round5Resources.model_construct(
+        competitor_runner_egress_rule_ids=("sgr-https", "sgr-coordination", "sgr-proxy")
+    )
+    manifest.round5 = sealed
+    calls: list[tuple[Round5Resources, dict[str, object]]] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "_reseal_round5",
+        lambda candidate, **updates: calls.append((candidate, updates)) or migrated,
+    )
+
+    lifecycle._migrate_round5_competitor_coordination_egress(
+        manifest,
+        {
+            "round5_competitor_runner_egress_rule_ids": [
+                "sgr-https",
+                "sgr-coordination",
+                "sgr-proxy",
+            ]
+        },
+    )
+
+    assert calls == [
+        (
+            sealed,
+            {
+                "competitor_runner_egress_rule_ids": (
+                    "sgr-https",
+                    "sgr-coordination",
+                    "sgr-proxy",
+                )
+            },
+        )
+    ]
+    assert manifest.round5 is migrated
 
 
 def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, tmp_path) -> None:
