@@ -1411,6 +1411,95 @@ def test_terraform_uses_the_sealed_runtime_role_after_first_provision(monkeypatc
     assert "AWS_DEFAULT_PROFILE" not in environment
 
 
+def test_cleanup_detaches_the_runtime_role_from_the_destroy_graph(monkeypatch) -> None:
+    manifest = make_manifest()
+    manifest.aws.runtime_role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    commands: list[list[str]] = []
+    monkeypatch.setattr(lifecycle, "_terraform_environment", lambda candidate: {})
+    monkeypatch.setattr(
+        lifecycle,
+        "_run",
+        lambda command, **kwargs: commands.append(list(command)) or SimpleNamespace(stdout=""),
+    )
+
+    assert lifecycle._detach_runtime_role_from_destroy_state(
+        manifest,
+        set(lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES),
+    )
+
+    assert commands
+    assert commands[0][-len(lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES) :] == sorted(
+        lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES
+    )
+
+
+def test_cleanup_deletes_the_tag_verified_runtime_role_last(monkeypatch) -> None:
+    manifest = make_manifest()
+    role_arn = "arn:aws:iam::123456789012:role/anti-demo-runtime"
+    policy_arn = "arn:aws:iam::123456789012:policy/anti-demo-runtime-1-network-test"
+    manifest.aws.runtime_role_arn = role_arn
+    required = lifecycle._required_tags_for_address(
+        manifest,
+        "aws_iam_role.anti_demo_runtime[0]",
+    )
+    tag_list = [{"Key": key, "Value": value} for key, value in required.items()]
+    calls: list[tuple[str, str]] = []
+
+    class Iam:
+        def get_role(self, **kwargs):
+            return {"Role": {"Arn": role_arn, "Tags": tag_list}}
+
+        def list_role_policies(self, **kwargs):
+            return {"PolicyNames": []}
+
+        def list_instance_profiles_for_role(self, **kwargs):
+            return {"InstanceProfiles": []}
+
+        def list_attached_role_policies(self, **kwargs):
+            return {"AttachedPolicies": [{"PolicyArn": policy_arn}]}
+
+        def get_policy(self, **kwargs):
+            return {"Policy": {"Arn": policy_arn}}
+
+        def list_policy_tags(self, **kwargs):
+            return {"Tags": tag_list}
+
+        def detach_role_policy(self, **kwargs):
+            calls.append(("detach", kwargs["PolicyArn"]))
+
+        def list_policy_versions(self, **kwargs):
+            return {
+                "Versions": [
+                    {"VersionId": "v1", "IsDefaultVersion": True},
+                    {"VersionId": "v2", "IsDefaultVersion": False},
+                ]
+            }
+
+        def delete_policy_version(self, **kwargs):
+            calls.append(("delete-version", kwargs["VersionId"]))
+
+        def delete_policy(self, **kwargs):
+            calls.append(("delete-policy", kwargs["PolicyArn"]))
+
+        def delete_role(self, **kwargs):
+            calls.append(("delete-role", kwargs["RoleName"]))
+
+    monkeypatch.setattr(
+        lifecycle,
+        "_aws_source_session",
+        lambda candidate: SimpleNamespace(client=lambda name: Iam()),
+    )
+
+    lifecycle._delete_detached_runtime_role(manifest)
+
+    assert calls == [
+        ("detach", policy_arn),
+        ("delete-version", "v2"),
+        ("delete-policy", policy_arn),
+        ("delete-role", "anti-demo-runtime"),
+    ]
+
+
 def test_an_iam_policy_proves_ownership_with_the_tag_iam_can_actually_hold(monkeypatch) -> None:
     """A destroy must not be gated on a tag AWS refuses to store.
 
