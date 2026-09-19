@@ -5570,6 +5570,10 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
     manifest.round5 = candidate
     manifest.status = "seeding"
     save_manifest(manifest)
+    # The pre-Round-5 coordination pass deliberately skipped resident
+    # credentials because their secret ARNs and trust bundle were not sealed.
+    # Re-enter now that the candidate records those exact bindings.
+    ensure_coordination(manifest)
 
     topology = _round5_topology_check(manifest, candidate)
     if not topology.ok:
@@ -8056,54 +8060,64 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
         ).initialize()
         await LakebaseRound5ControlStore(store._run).initialize()
 
-        installation_digest = hashlib.sha256(
-            (manifest.installation_id or manifest.run_id).encode()
-        ).hexdigest()[:16]
-        resident_roles = {
-            "lakebase": f"anti_demo_r5_lakebase_{installation_digest}",
-            "competitor": f"anti_demo_r5_competitor_{installation_digest}",
-        }
-        resident_passwords = {lane_id: secrets.token_urlsafe(48) for lane_id in resident_roles}
+        # The first coordination pass happens before Round 5 is sealed. Core
+        # tables must exist for the remaining setup, but the lane-scoped resident
+        # secrets do not have a trustworthy manifest binding yet. The Round 5
+        # sealer calls ensure_coordination again immediately after recording its
+        # candidate, which is when these credentials become safe to publish.
+        resources = (
+            manifest.round5 if isinstance(manifest.round5, Round5Resources) else None
+        )
+        if resources is not None:
+            installation_digest = hashlib.sha256(
+                (manifest.installation_id or manifest.run_id).encode()
+            ).hexdigest()[:16]
+            resident_roles = {
+                "lakebase": f"anti_demo_r5_lakebase_{installation_digest}",
+                "competitor": f"anti_demo_r5_competitor_{installation_digest}",
+            }
+            resident_passwords = {
+                lane_id: secrets.token_urlsafe(48) for lane_id in resident_roles
+            }
 
-        async def rotate_resident_login(cursor: Any) -> None:
-            for lane_id, role in resident_roles.items():
-                await _rotate_round5_resident_login(
+            async def rotate_resident_login(cursor: Any) -> None:
+                for lane_id, role in resident_roles.items():
+                    await _rotate_round5_resident_login(
+                        cursor,
+                        database=manifest.databricks.database,
+                        role=role,
+                        password=resident_passwords[lane_id],
+                        lane_id=lane_id,
+                    )
+                await _retire_round5_shared_resident_login(
                     cursor,
+                    database=manifest.databricks.database,
+                    role=f"anti_demo_r5_{installation_digest}",
+                )
+
+            await store._run(rotate_resident_login)
+            secret_arns = {
+                "lakebase": resources.runner_control_secret_arn,
+                "competitor": resources.competitor_runner_control_secret_arn,
+            }
+            if any(not value for value in secret_arns.values()):
+                raise RuntimeError("Round 5 lane-scoped resident event DSN secrets are not sealed")
+            secrets_manager = _aws_session(manifest).client("secretsmanager")
+            for lane_id, role in resident_roles.items():
+                resident_dsn = _round5_resident_dsn(
+                    host=host,
                     database=manifest.databricks.database,
                     role=role,
                     password=resident_passwords[lane_id],
-                    lane_id=lane_id,
+                    trust_bundle_path=resources.trust_bundle_path,
                 )
-            await _retire_round5_shared_resident_login(
-                cursor,
-                database=manifest.databricks.database,
-                role=f"anti_demo_r5_{installation_digest}",
-            )
-
-        await store._run(rotate_resident_login)
-        resources = manifest.require_round5_resources()
-        secret_arns = {
-            "lakebase": resources.runner_control_secret_arn,
-            "competitor": resources.competitor_runner_control_secret_arn,
-        }
-        if any(not value for value in secret_arns.values()):
-            raise RuntimeError("Round 5 lane-scoped resident event DSN secrets are not sealed")
-        secrets_manager = _aws_session(manifest).client("secretsmanager")
-        for lane_id, role in resident_roles.items():
-            resident_dsn = _round5_resident_dsn(
-                host=host,
-                database=manifest.databricks.database,
-                role=role,
-                password=resident_passwords[lane_id],
-                trust_bundle_path=resources.trust_bundle_path,
-            )
-            await asyncio.to_thread(
-                secrets_manager.put_secret_value,
-                SecretId=secret_arns[lane_id],
-                ClientRequestToken=str(uuid4()),
-                SecretString=resident_dsn,
-                VersionStages=["AWSCURRENT"],
-            )
+                await asyncio.to_thread(
+                    secrets_manager.put_secret_value,
+                    SecretId=secret_arns[lane_id],
+                    ClientRequestToken=str(uuid4()),
+                    SecretString=resident_dsn,
+                    VersionStages=["AWSCURRENT"],
+                )
         await store.close()
 
         ledger = LakebaseCostLedgerStore(
