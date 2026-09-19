@@ -1153,6 +1153,11 @@ def _terraform_variables(
         values["installation_id"] = manifest.installation_id
     arguments: list[str] = []
     for name, value in values.items():
+        # Terraform's CLI parses `-var name=null` as the literal string "null"
+        # for a string variable. Omit an absent optional value so the provider
+        # receives the variable's native null default instead.
+        if value is None:
+            continue
         arguments.extend(["-var", f"{name}={value}"])
     return arguments
 
@@ -2045,18 +2050,18 @@ def _aws_source_session(manifest: DemoManifest) -> boto3.Session:
     )
 
 
-def _terraform_assume_role_arn(manifest: DemoManifest) -> str:
+def _terraform_assume_role_arn(manifest: DemoManifest) -> str | None:
     """Return the provider role, avoiding an impossible self-assume hop."""
 
     runtime_role = manifest.aws.runtime_role_arn
     if runtime_role is None:
-        return "null"
+        return None
     identity = _aws_source_session(manifest).client(
         "sts", region_name=manifest.aws.region
     ).get_caller_identity()
     current = str(identity.get("Arn") or "")
     expected_marker = f":assumed-role/{runtime_role.rsplit('/', 1)[-1]}/"
-    return "null" if expected_marker in current else runtime_role
+    return None if expected_marker in current else runtime_role
 
 
 def _aws_session(manifest: DemoManifest) -> boto3.Session:

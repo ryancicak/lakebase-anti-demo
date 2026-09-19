@@ -1446,7 +1446,11 @@ def test_terraform_uses_only_manifest_selected_environment_credentials(monkeypat
     assert "AWS_PROFILE" not in environment
     assert "AWS_ROLE_ARN" not in environment
     assert "AWS_WEB_IDENTITY_TOKEN_FILE" not in environment
-    assert "terraform_assume_role_arn=null" in lifecycle._terraform_variables(manifest)
+    variables = lifecycle._terraform_variables(manifest)
+    assert not any(
+        argument.startswith("terraform_assume_role_arn=") for argument in variables
+    )
+    assert lifecycle._terraform_assume_role_arn(manifest) is None
 
 
 def test_terraform_provider_assumes_the_sealed_runtime_role_after_first_provision(
@@ -1507,7 +1511,11 @@ def test_terraform_does_not_self_assume_the_sealed_runtime_role(monkeypatch) -> 
         ),
     )
 
-    assert "terraform_assume_role_arn=null" in lifecycle._terraform_variables(manifest)
+    variables = lifecycle._terraform_variables(manifest)
+    assert not any(
+        argument.startswith("terraform_assume_role_arn=") for argument in variables
+    )
+    assert lifecycle._terraform_assume_role_arn(manifest) is None
 
 
 def test_cleanup_detaches_the_runtime_role_from_the_destroy_graph(monkeypatch) -> None:
