@@ -4719,6 +4719,50 @@ def test_aws_hydration_can_inventory_without_writing_the_manifest(monkeypatch) -
     assert saved == [manifest.run_id]
 
 
+def test_hydration_reseals_the_single_missing_competitor_coordination_rule(
+    monkeypatch,
+) -> None:
+    manifest = make_manifest()
+    sealed = Round5Resources.model_construct(
+        competitor_runner_egress_rule_ids=("sgr-https", "sgr-proxy")
+    )
+    migrated = Round5Resources.model_construct(
+        competitor_runner_egress_rule_ids=("sgr-https", "sgr-coordination", "sgr-proxy")
+    )
+    manifest.round5 = sealed
+    calls: list[tuple[Round5Resources, dict[str, object]]] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "_reseal_round5",
+        lambda candidate, **updates: calls.append((candidate, updates)) or migrated,
+    )
+
+    lifecycle._migrate_round5_competitor_coordination_egress(
+        manifest,
+        {
+            "round5_competitor_runner_egress_rule_ids": [
+                "sgr-https",
+                "sgr-coordination",
+                "sgr-proxy",
+            ]
+        },
+    )
+
+    assert calls == [
+        (
+            sealed,
+            {
+                "competitor_runner_egress_rule_ids": (
+                    "sgr-https",
+                    "sgr-coordination",
+                    "sgr-proxy",
+                )
+            },
+        )
+    ]
+    assert manifest.round5 is migrated
+
+
 def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(monkeypatch, tmp_path) -> None:
     manifest = make_manifest(status="cleanup_failed")
     owned_manifest = tmp_path / "manifest.json"

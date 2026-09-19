@@ -1748,8 +1748,42 @@ def _hydrate_aws_resources(
     resolved = outputs if outputs is not None else _terraform_outputs(manifest)
     manifest.aws.resources = _aws_resources_from_outputs(resolved)
     _seal_anti_demo_runtime(manifest, resolved)
+    _migrate_round5_competitor_coordination_egress(manifest, resolved)
     if persist:
         save_manifest(manifest)
+
+
+def _migrate_round5_competitor_coordination_egress(
+    manifest: DemoManifest,
+    outputs: dict[str, Any],
+) -> None:
+    """Add the v4 resident coordination rule to a pre-rule Round 5 seal.
+
+    The rule was added to Terraform before its output and exact-state contract
+    were updated. Those installations own the rule in state, but their manifest
+    seals only the older competitor egress set. Accept exactly that one-member
+    expansion from Terraform's resource-derived output and canonicalize both
+    hashes; every other difference remains drift.
+    """
+
+    sealed = manifest.round5
+    if not isinstance(sealed, Round5Resources):
+        return
+    current = tuple(sealed.competitor_runner_egress_rule_ids)
+    reported = tuple(
+        str(item) for item in (outputs.get("round5_competitor_runner_egress_rule_ids") or ())
+    )
+    if reported == current:
+        return
+    if (
+        len(reported) == len(current) + 1
+        and set(current) < set(reported)
+        and len(set(reported)) == len(reported)
+    ):
+        manifest.round5 = _reseal_round5(
+            sealed,
+            competitor_runner_egress_rule_ids=reported,
+        )
 
 
 def _seal_anti_demo_runtime(manifest: DemoManifest, outputs: dict[str, Any]) -> None:
