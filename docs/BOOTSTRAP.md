@@ -70,10 +70,12 @@ cp docs/bootstrap.env.example .env.bootstrap   # fill in, never commit
 ```
 
 **It installs and builds what it needs.** `uv sync --locked` provisions `.venv`
-— which `./antidemo` refuses to run without — and `npm ci && npm run build`
-provisions `frontend/dist`, which the UI answers 503 without. Both run before
-anything is provisioned in the cloud, both are idempotent, and both are skipped
-by the parts that have not changed: a second run reports
+— which `./antidemo` refuses to run without — and
+`npm ci --omit=dev && npm run build` provisions `frontend/dist`, which the UI
+answers 503 without. The omitted development-only tree contains lint and test
+tools; TypeScript, Vite and the type declarations required by the production
+build are regular dependencies. Both steps run before anything is provisioned
+in the cloud, both are idempotent, and both are skipped by the parts that have not changed: a second run reports
 `frontend/node_modules is current` and `frontend/dist is newer than every source`
 and moves on in about a second.
 
