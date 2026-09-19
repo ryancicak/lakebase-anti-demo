@@ -16,6 +16,7 @@ drift apart silently.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError
@@ -234,6 +235,15 @@ def test_terraform_variables_carry_the_principals_as_hcl(monkeypatch):
     # Set to the caller's own ARN, which is what bootstrap derives, to prove the
     # derivation below is not just reading this back.
     monkeypatch.setenv("ROUND5_APP_PRINCIPAL_ARN", APP_USER_ARN)
+    monkeypatch.setattr(
+        lifecycle,
+        "_aws_source_session",
+        lambda candidate: SimpleNamespace(
+            client=lambda service, region_name: SimpleNamespace(
+                get_caller_identity=lambda: {"Arn": APP_USER_ARN}
+            )
+        ),
+    )
     arguments = lifecycle._terraform_variables(sealed_manifest())
     pairs = dict(
         argument.split("=", 1) for argument in arguments[1::2]

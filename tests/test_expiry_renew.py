@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from test_lifecycle import make_manifest, ready_round5_stub
+from test_lifecycle import attach_round4, make_manifest, ready_round5_stub
 
 import app as app_module
 from server import cli as cli_module
@@ -216,6 +216,10 @@ def test_expiry_warning_starts_before_external_reaping_and_uses_injected_utc() -
 def test_setup_does_not_fail_on_an_advisory_doctor_finding(monkeypatch, tmp_path) -> None:
     """`antidemo setup` proceeds: the expiry line reports, other failures still stop it."""
     manifest = expired_manifest()
+    attach_round4(manifest)
+    manifest.round5 = ready_round5_stub()
+    manifest.round6 = SimpleNamespace()
+    manifest.manifest_version = 6
     owned = tmp_path / "manifest.json"
     owned.touch()
     monkeypatch.setattr(lifecycle, "manifest_path", lambda: owned)

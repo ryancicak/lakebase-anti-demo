@@ -31,6 +31,7 @@ EXPECTED_CASES = {
     "case_exact_five_inputs_required",
     "case_runtime_identity_refusals",
     "case_five_input_full_acceptance",
+    "case_fresh_app_creation_provenance",
     "case_deploy_seal_only",
     "case_deploy_record_merge",
     "case_deploy_seal_snapshot",
@@ -444,10 +445,13 @@ def _run_ready_gate(
         'MODE="apply"\n'
         f"RESET_READY={reset_ready}\n"
         + _extract(source, "die() {\n", "\n}\n")
-        + _extract(source, "apply_would_reset_a_ready_install() {", "\n}\n")
+        + _extract(source, "apply_targets_complete_ready_install() {", "\n}\n")
         + _extract(source, "refuse_ready_install() {", "\n}\n")
-        + f'\nif apply_would_reset_a_ready_install "{manifest}"; then\n'
-        '  refuse_ready_install "$(jq -r .run_id ' + f'"{manifest}")"\n'
+        + f'\nif apply_targets_complete_ready_install "{manifest}"; then\n'
+        '  printf "TARGETS A COMPLETE INSTALL\\n"\n'
+        "  if ((RESET_READY == 0)); then\n"
+        f'    refuse_ready_install "$(jq -r .run_id "{manifest}")"\n'
+        "  fi\n"
         "fi\n"
         'printf "REACHED THE PROVISION\\n"\n',
         encoding="utf-8",
@@ -498,6 +502,7 @@ def test_apply_against_a_ready_install_refuses_and_names_the_redeploy_path(tmp_p
     # a guard: an infra diff to apply has to remain reachable.
     allowed = _run_ready_gate(tmp_path, source, reset_ready=1)
     assert allowed.returncode == 0, allowed.stderr
+    assert "TARGETS A COMPLETE INSTALL" in allowed.stdout, allowed.stdout
     assert "REACHED THE PROVISION" in allowed.stdout, allowed.stdout
 
     # Any status other than `ready` is the interrupted provision --apply

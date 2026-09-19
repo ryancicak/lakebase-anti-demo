@@ -34,10 +34,16 @@ def secrets_manager_for_runner_operation(secret_arns: Sequence[str]) -> Any:
         raise ValueError("runner secret descriptors must share one account and region")
 
     import boto3
+    from botocore.config import Config
 
     return boto3.Session(region_name=next(iter(regions))).client(
         "secretsmanager",
         region_name=next(iter(regions)),
+        config=Config(
+            connect_timeout=3,
+            read_timeout=5,
+            retries={"mode": "standard", "total_max_attempts": 2},
+        ),
     )
 
 

@@ -323,7 +323,16 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install from the lockfile
+      # This is the install bootstrap.sh performs on a pristine checkout.
+      # Keep it separate from the developer install below: a full node_modules
+      # can hide a build tool or type package that was accidentally left in
+      # devDependencies even though --omit=dev will not ship it.
+      - name: Build from production dependencies only
+        run: |
+          npm ci --omit=dev
+          npm run build
+
+      - name: Install developer dependencies from the lockfile
         run: npm ci
 
       - name: Typecheck

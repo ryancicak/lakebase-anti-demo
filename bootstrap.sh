@@ -14,15 +14,16 @@
 #   - creates the generation directory and takes a lock file inside it, in
 #     every mode including the default check;
 #   - writes bootstrap.json into that directory in every mode except check;
-#   - under --apply, may create the Databricks App, because Round 4 seals its
-#     service principal client ID and the app has to exist to have one.
+#   - under --apply, checks whether the Databricks App exists. Creation is
+#     deferred until after the operator confirms PROVISION.
 #
 # The single billed step is `./antidemo setup`, which runs Terraform and
 # provisions real infrastructure; it happens only under --apply, only after an
 # itemised cost summary, and only after the operator types the confirmation.
 #
-# `--apply` against an installation that already reads `ready` is refused at
-# step 1a, before any of the above -- see the comment there.
+# `--apply` against a complete v6+ installation that reads `ready` is refused at
+# step 1a. An older progressive `ready` seal is an interrupted provision and is
+# allowed through to the resume path.
 #
 # Run `./bootstrap.sh --help` for the input contract.
 
@@ -546,13 +547,13 @@ manifest_this_run_would_adopt() {
   printf '%s' "$ROOT/$LATEST_GENERATION/manifest.json"
 }
 
-# True when this run is an --apply, without --reset-ready, against a complete
-# ready manifest. Setup uses `ready` for its progressive v2 Round 4 seal before
-# Round 5 and Round 6 exist; that state is still an interrupted provision and
-# must fall through to the documented resume path.
-apply_would_reset_a_ready_install() { # <manifest path, possibly empty>
+# True when this run is an --apply against a complete ready manifest. Whether
+# --reset-ready permits that reset is a separate decision: the confirmation
+# prompt still has to describe the destructive action after permission is given.
+# Setup uses `ready` for its progressive v2 Round 4 seal before Round 5 and
+# Round 6 exist; that state is still an interrupted provision.
+apply_targets_complete_ready_install() { # <manifest path, possibly empty>
   [[ "$MODE" == "apply" ]] || return 1
-  ((RESET_READY == 0)) || return 1
   [[ -n "$1" && -f "$1" ]] || return 1
   jq -e '
     .status == "ready"
@@ -598,7 +599,7 @@ refuse_ready_install() { # <run id, possibly empty>
 }
 
 EARLY_MANIFEST="$(manifest_this_run_would_adopt)"
-if apply_would_reset_a_ready_install "$EARLY_MANIFEST"; then
+if ((RESET_READY == 0)) && apply_targets_complete_ready_install "$EARLY_MANIFEST"; then
   refuse_ready_install "$(jq -r '.run_id // empty' "$EARLY_MANIFEST" 2>/dev/null || true)"
 fi
 unset EARLY_MANIFEST
@@ -1548,36 +1549,6 @@ else
       visible and writable by this service principal (server/round6_lifecycle.py:723)."
 fi
 
-# The app's own service principal client ID is sealed into the Round 4 contract,
-# so the app has to exist before setup runs. Creating it is cheap, reversible,
-# and the only way this stays a derived value rather than a sixth input.
-if ((DATABRICKS_OK == 0)); then
-  DATABRICKS_APP_CLIENT_ID="${DATABRICKS_APP_CLIENT_ID:-}"
-  skipped "the Databricks App and its service principal"
-elif [[ -z "${DATABRICKS_APP_CLIENT_ID:-}" ]]; then
-  if APP_JSON="$(databricks apps get "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>/dev/null)"; then
-    DATABRICKS_APP_CLIENT_ID="$(printf '%s' "$APP_JSON" | jq -r '.service_principal_client_id // empty')"
-    [[ -n "$DATABRICKS_APP_CLIENT_ID" ]] ||
-      die "App '$APP_NAME' exists but exposes no service_principal_client_id, so its
-           runtime identity cannot be derived from the five-input contract."
-    ok "adopted the existing app '$APP_NAME'"
-  elif [[ "$MODE" == "apply" ]]; then
-    info "creating Databricks App '$APP_NAME' to obtain its service principal"
-    APP_JSON="$(databricks apps create "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>&1)" ||
-      die "Could not create the Databricks App '$APP_NAME': $(printf '%s' "$APP_JSON" | tail -2)"
-    DATABRICKS_APP_CLIENT_ID="$(printf '%s' "$APP_JSON" | jq -r '.service_principal_client_id // empty')"
-    [[ -n "$DATABRICKS_APP_CLIENT_ID" ]] ||
-      die "The created app returned no service_principal_client_id"
-    ok "created '$APP_NAME'"
-  else
-    warn "app '$APP_NAME' does not exist yet. --apply would create it and read its
-        service principal; check mode cannot, so DATABRICKS_APP_CLIENT_ID stays unresolved."
-    DATABRICKS_APP_CLIENT_ID=""
-  fi
-else
-  ok "using the supplied DATABRICKS_APP_CLIENT_ID"
-fi
-
 # ---------------------------------------------------------------------------
 # 6. Manifest generation
 # ---------------------------------------------------------------------------
@@ -1747,6 +1718,49 @@ fi
 # cannot start is how an operator learns to skim the bill.
 preflight_gate
 ok "preflight passed: every input resolved and every read probe answered"
+
+# The app's own service principal client ID is sealed into the Round 4 contract,
+# so the app has to exist before setup runs. Creation deliberately sits after
+# the aggregate preflight gate: a known-bad AWS or Databricks prerequisite must
+# not leave an unrecorded app behind.
+DATABRICKS_APP_CREATED_THIS_RUN=0
+DATABRICKS_APP_NEEDS_CREATE=0
+if [[ -f "$MANIFEST_DIR/bootstrap.json" ]] &&
+  jq -e '.databricks_app_creation_pending == true' \
+    "$MANIFEST_DIR/bootstrap.json" >/dev/null 2>&1; then
+  PENDING_APP_NAME="$(
+    jq -r '.databricks_app_name // "lakebase-anti-demo"' \
+      "$MANIFEST_DIR/bootstrap.json"
+  )"
+  die "A previous confirmed run was interrupted while creating app '$PENDING_APP_NAME'.
+       Its ownership is unresolved, so this run will not adopt it, replace it, or create
+       a differently named app. Verify it, then either delete it with
+       'databricks apps delete $PENDING_APP_NAME -p $DATABRICKS_PROFILE' and set
+       databricks_app_creation_pending to false in $MANIFEST_DIR/bootstrap.json, or
+       clear that flag to adopt it without granting cleanup ownership."
+fi
+if ((DATABRICKS_OK == 0)); then
+  DATABRICKS_APP_CLIENT_ID="${DATABRICKS_APP_CLIENT_ID:-}"
+  skipped "the Databricks App and its service principal"
+elif [[ -z "${DATABRICKS_APP_CLIENT_ID:-}" ]]; then
+  if APP_JSON="$(databricks apps get "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>/dev/null)"; then
+    DATABRICKS_APP_CLIENT_ID="$(printf '%s' "$APP_JSON" | jq -r '.service_principal_client_id // empty')"
+    [[ -n "$DATABRICKS_APP_CLIENT_ID" ]] ||
+      die "App '$APP_NAME' exists but exposes no service_principal_client_id, so its
+           runtime identity cannot be derived from the five-input contract."
+    ok "adopted the existing app '$APP_NAME'"
+  elif [[ "$MODE" == "apply" ]]; then
+    DATABRICKS_APP_NEEDS_CREATE=1
+    DATABRICKS_APP_CLIENT_ID=""
+    info "Databricks App '$APP_NAME' will be created only after PROVISION is confirmed"
+  else
+    warn "app '$APP_NAME' does not exist yet. --apply would create it and read its
+        service principal; check mode cannot, so DATABRICKS_APP_CLIENT_ID stays unresolved."
+    DATABRICKS_APP_CLIENT_ID=""
+  fi
+else
+  ok "using the supplied DATABRICKS_APP_CLIENT_ID"
+fi
 
 # ---------------------------------------------------------------------------
 # 6b. Databricks App: publish state and drift
@@ -2122,6 +2136,7 @@ if ((GENERATION_LOCK_HELD == 1)) && [[ "$MODE" != "check" ]]; then
     DATABRICKS_WAREHOUSE_ID="$DATABRICKS_WAREHOUSE_ID" \
     DATABRICKS_APP_NAME="$APP_NAME" \
     DATABRICKS_APP_CLIENT_ID="${DATABRICKS_APP_CLIENT_ID:-}" \
+    DATABRICKS_APP_CREATED_THIS_RUN="$DATABRICKS_APP_CREATED_THIS_RUN" \
     ROUND4_CATALOG="$ROUND4_CATALOG" \
     CDF_CATALOG="$CDF_CATALOG" \
     MANIFEST_PATH="$ANTI_DEMO_MANIFEST" \
@@ -2187,6 +2202,13 @@ for key, variable in FIELDS.items():
         # First write, and this mode has no answer. Recorded empty so the shape
         # of the file does not depend on which mode wrote it first.
         record[key] = ""
+if os.environ.get("DATABRICKS_APP_CREATED_THIS_RUN") == "1":
+    record["databricks_app_created"] = True
+    record["databricks_app_created_client_id"] = os.environ["DATABRICKS_APP_CLIENT_ID"]
+    record["databricks_app_creation_pending"] = False
+elif "databricks_app_created" not in record:
+    # Adoption and caller-supplied app identities are usage, not ownership.
+    record["databricks_app_created"] = False
 record["recorded_by"] = f"bootstrap.sh --{os.environ['RUN_MODE']}"
 
 path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -2216,16 +2238,14 @@ fi
 if [[ "$MODE" == "apply" ]]; then
 step "Provision"
 
-[[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] ||
-  die "DATABRICKS_APP_CLIENT_ID is still unresolved; Round 4 cannot be sealed without it"
-
 # The same refusal as step 1a, from the same two functions, on the manifest this
 # run actually resolved rather than the one it predicted it would. Normally
 # unreachable, because 1a already refused -- it stays because 1a predicts the
 # generation from flags and the filesystem, and this is the only place that knows
 # for certain. If the two ever disagree, the last word should be the one that
 # read the real manifest, not the one that guessed.
-if ((EXISTING_INSTALL == 1)) && apply_would_reset_a_ready_install "$ANTI_DEMO_MANIFEST"; then
+if ((EXISTING_INSTALL == 1 && RESET_READY == 0)) &&
+  apply_targets_complete_ready_install "$ANTI_DEMO_MANIFEST"; then
   refuse_ready_install "${MANIFEST_RUN:-}"
 fi
 
@@ -2233,16 +2253,18 @@ if ((ASSUME_YES == 0)); then
   [[ -t 0 ]] || die "--apply needs a terminal to confirm on, or pass --yes"
   if ((EXISTING_INSTALL == 1)); then
     say ""
-    say "  ${BOLD}This installation already exists.${RESET} 'antidemo setup' will run"
-    say "  'terraform plan' and 'terraform apply' against it through"
-    say "  reconcile_infrastructure (server/lifecycle.py:5176), so any pending"
-    say "  diff in infra/aws will be applied now. It will also reset both"
-    say "  database lanes and clear Round 3 anchors."
-    if [[ "${MANIFEST_STATUS:-}" == "ready" ]]; then
+    if apply_targets_complete_ready_install "$ANTI_DEMO_MANIFEST"; then
+      say "  ${BOLD}This installation is complete.${RESET} 'antidemo setup' will run"
+      say "  'terraform plan' and 'terraform apply' through reconcile_infrastructure,"
+      say "  apply any pending infra/aws diff, reset both database lanes, and clear"
+      say "  Round 3 anchors."
       say ""
       say "  ${BOLD}This install is 'ready', so that reset is not a no-op.${RESET} You passed"
       say "  --reset-ready, which is what got you here. A bout running now will die."
       say "  ${BOLD}--deploy-only${RESET} is the path that redeploys without touching a database."
+    else
+      say "  ${BOLD}This installation is incomplete.${RESET} 'antidemo setup' will resume"
+      say "  from its sealed checkpoint without resetting completed rounds."
     fi
   fi
   if [[ "$STATE_BACKEND" == "s3" ]] && ((BUCKET_EXISTS == 0)); then
@@ -2264,8 +2286,71 @@ if ((ASSUME_YES == 0)); then
   say ""
   printf '  Type %sPROVISION%s to continue: ' "$BOLD" "$RESET"
   read -r CONFIRM </dev/tty
-  [[ "$CONFIRM" == "PROVISION" ]] || die "not confirmed; nothing was changed"
+  [[ "$CONFIRM" == "PROVISION" ]] ||
+    die "not confirmed; no app or infrastructure was created"
 fi
+
+if ((DATABRICKS_APP_NEEDS_CREATE == 1)); then
+  if ! STATE_FILE="$STATE_FILE" python3 - <<'PY'
+import json, os, pathlib
+
+path = pathlib.Path(os.environ["STATE_FILE"])
+record = json.loads(path.read_text(encoding="utf-8"))
+record["databricks_app_creation_pending"] = True
+path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+  then
+    die "could not record app creation intent before creating it"
+  fi
+  info "creating Databricks App '$APP_NAME' to obtain its service principal"
+  if ! APP_JSON="$(databricks apps create "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>&1)"; then
+    if APP_VERIFY="$(databricks apps get "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>&1)"; then
+      warn "app creation returned an error, but '$APP_NAME' now exists. Its pending
+        ownership record is preserved; the next run will require explicit adjudication."
+    elif printf '%s' "$APP_VERIFY" |
+      grep -Eiq "resource[_ ]does[_ ]not[_ ]exist|doesn't exist|does not exist|not found"; then
+      if ! STATE_FILE="$STATE_FILE" python3 - <<'PY'
+import json, os, pathlib
+
+path = pathlib.Path(os.environ["STATE_FILE"])
+record = json.loads(path.read_text(encoding="utf-8"))
+record["databricks_app_creation_pending"] = False
+path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+      then
+        die "app creation failed and its proven-absent pending record could not be cleared"
+      fi
+    else
+      warn "app creation returned an error and app absence could not be proven. The
+        pending ownership record is preserved so a retry cannot silently adopt it."
+    fi
+    die "Could not create the Databricks App '$APP_NAME': $(printf '%s' "$APP_JSON" | tail -2)"
+  fi
+  DATABRICKS_APP_CLIENT_ID="$(printf '%s' "$APP_JSON" | jq -r '.service_principal_client_id // empty')"
+  [[ -n "$DATABRICKS_APP_CLIENT_ID" ]] ||
+    die "The created app returned no service_principal_client_id"
+  DATABRICKS_APP_CREATED_THIS_RUN=1
+  STATE_FILE="$STATE_FILE" DATABRICKS_APP_CLIENT_ID="$DATABRICKS_APP_CLIENT_ID" \
+    python3 - <<'PY' || die "the app was created but its ownership record could not be written"
+import json, os, pathlib
+
+path = pathlib.Path(os.environ["STATE_FILE"])
+record = json.loads(path.read_text(encoding="utf-8"))
+client_id = os.environ["DATABRICKS_APP_CLIENT_ID"]
+record["databricks_app_client_id"] = client_id
+record["databricks_app_created"] = True
+record["databricks_app_created_client_id"] = client_id
+record["databricks_app_creation_pending"] = False
+path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+  ok "created '$APP_NAME' and recorded its immutable client ID"
+fi
+
+[[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] ||
+  die "DATABRICKS_APP_CLIENT_ID is still unresolved; Round 4 cannot be sealed without it"
 
 # The bucket has to exist before `terraform init`, and init happens inside
 # `antidemo setup`, so this is the last moment to create it.

@@ -2479,13 +2479,19 @@ async def _configure_ordinary_role(
                 except psycopg.Error:
                     pass
             # Aurora can accept the first post-pause socket and then reject a
-            # statement while its PostgreSQL process is still settling. Those
-            # resume failures have appeared under more than one psycopg
-            # subclass/SQLSTATE, so the bounded Aurora-only retry must cover
-            # every database error. RDS and ordinary reassertions remain
-            # single-attempt, and deterministic Aurora failures still stop
-            # after the short fixed retry budget.
-            transient_restart = isinstance(exc, (OSError, TimeoutError, psycopg.Error))
+            # statement while PostgreSQL is still settling. Connection-class
+            # failures are retryable. The observed wake-up anomaly can also
+            # surface as UndefinedObject while CREATE ROLE and its following
+            # GRANT briefly disagree; retry that exact create path without
+            # masking unrelated schema, SQL, or authorization defects.
+            transient_restart = isinstance(
+                exc,
+                (OSError, TimeoutError, psycopg.OperationalError, psycopg.InterfaceError),
+            ) or (
+                create_if_missing
+                and isinstance(exc, psycopg.Error)
+                and getattr(exc, "sqlstate", None) == "42704"
+            )
             if (
                 retry_transient_restart
                 and transient_restart
@@ -2868,12 +2874,23 @@ async def _execute_setup(request: Mapping[str, object]) -> dict[str, object]:
 
 
 async def _run_setup_bounded(
-    request: Mapping[str, object], cancelled: asyncio.Event
+    request: Mapping[str, object],
+    cancelled: asyncio.Event,
+    *,
+    _timeout: float = SETUP_VERIFY_DEADLINE_SECONDS,
 ) -> tuple[dict[str, object] | None, bool]:
     setup = asyncio.create_task(_execute_setup(request))
     cancellation = asyncio.create_task(cancelled.wait())
     try:
-        done, _ = await asyncio.wait((setup, cancellation), return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            (setup, cancellation),
+            timeout=_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            setup.cancel()
+            await asyncio.gather(setup, return_exceptions=True)
+            raise RunnerContractError("setup_deadline")
         if cancellation in done and cancelled.is_set():
             setup.cancel()
             await asyncio.gather(setup, return_exceptions=True)

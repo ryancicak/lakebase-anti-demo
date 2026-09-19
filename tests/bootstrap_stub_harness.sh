@@ -150,7 +150,16 @@ case "$args" in
     [[ "${STUB_CATALOG_MISSING:-0}" == "1" ]] && { echo "does not exist" >&2; exit 1; }
     echo '{"name":"stubcat"}' ;;
   *"apps get"*)
-    [[ "${STUB_APP_MISSING:-0}" == "1" ]] && { echo "RESOURCE_DOES_NOT_EXIST" >&2; exit 1; }
+    app_marker="${STUB_STATE_DIR:-/tmp}/app-created"
+    attempt_marker="${STUB_STATE_DIR:-/tmp}/app-create-attempted"
+    if [[ "${STUB_APP_VERIFY_INDETERMINATE:-0}" == "1" && -f "$attempt_marker" ]]; then
+      echo "PERMISSION_DENIED: cannot verify app after create" >&2
+      exit 1
+    fi
+    if [[ "${STUB_APP_MISSING:-0}" == "1" && ! -f "$app_marker" ]]; then
+      echo "RESOURCE_DOES_NOT_EXIST" >&2
+      exit 1
+    fi
     cat <<JSON
 {"name":"lakebase-anti-demo",
  "service_principal_client_id":"app-client-stub",
@@ -160,6 +169,19 @@ case "$args" in
  "resources":[{"name":"anti-demo-manifest-json","secret":{"scope":"${STUB_BOUND_SCOPE:-lakebase-anti-demo-.anti-demo-v7}","key":"manifest-json","permission":"READ"}}]}
 JSON
     ;;
+  *"apps create"*)
+    app_marker="${STUB_STATE_DIR:-/tmp}/app-created"
+    attempt_marker="${STUB_STATE_DIR:-/tmp}/app-create-attempted"
+    attempt_count="${STUB_STATE_DIR:-/tmp}/app-create-attempts"
+    : >"$attempt_marker"
+    echo "$(( $(cat "$attempt_count" 2>/dev/null || echo 0) + 1 ))" >"$attempt_count"
+    if [[ "${STUB_APP_CREATE_FAILS:-0}" == "1" ]]; then
+      [[ "${STUB_APP_CREATE_MATERIALIZES:-0}" == "1" ]] && : >"$app_marker"
+      echo "INTERNAL_ERROR: create result was lost" >&2
+      exit 1
+    fi
+    : >"$app_marker"
+    echo '{"name":"lakebase-anti-demo","service_principal_client_id":"app-client-stub"}' ;;
   *"secrets list-scopes"*)
     [[ "${STUB_SCOPE_EXISTS:-1}" == "1" ]] && echo '[{"name":"lakebase-anti-demo-.anti-demo-v7"}]' || echo '[]' ;;
   *"secrets create-scope"*)
@@ -483,6 +505,92 @@ STUB
     printf '  %sFAIL%s full five-input acceptance exited %s\n' "$RED" "$RESET" "$status"
     FAIL=$((FAIL + 1))
   fi
+}
+
+case_fresh_app_creation_provenance() {
+  printf '\n%s== fresh app creation records immutable provenance ==%s\n' "$BOLD" "$RESET"
+  local sb gen source status
+  gen="$(mktemp -d)/gen"
+  source="$gen/ready-source.json"
+  write_manifest "$source"
+  sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$gen"$'/antidemo-apply-stub' sandbox)"
+  cat >"$gen/antidemo-apply-stub" <<STUB
+#!/usr/bin/env bash
+set -eu
+cp "$source" "\$ANTI_DEMO_MANIFEST"
+STUB
+  chmod +x "$gen/antidemo-apply-stub"
+
+  AWS_SESSION_TOKEN="" STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
+    run "$sb" --apply --yes
+  status=$?
+  check "creates the app after confirmation" \
+    "created 'lakebase-anti-demo' and recorded its immutable client ID"
+  if ((status == 0)) &&
+    jq -e '
+      .databricks_app_created == true and
+      .databricks_app_client_id == "app-client-stub" and
+      .databricks_app_created_client_id == "app-client-stub" and
+      .databricks_app_creation_pending == false
+    ' "$gen/bootstrap.json" >/dev/null; then
+    printf '  %sok%s   successful creation seals immutable app ownership\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s successful creation did not seal immutable app ownership\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  printf '\n%s== failed app creation is adjudicated from live state ==%s\n' "$BOLD" "$RESET"
+  local outcome materializes indeterminate expected_pending
+  for outcome in absent materialized indeterminate; do
+    gen="$(mktemp -d)/gen"
+    sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$gen"$'/never-runs' sandbox)"
+    materializes=0
+    indeterminate=0
+    expected_pending=false
+    case "$outcome" in
+      absent) ;;
+      materialized) materializes=1; expected_pending=true ;;
+      indeterminate) indeterminate=1; expected_pending=true ;;
+    esac
+    AWS_SESSION_TOKEN="" STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
+      STUB_APP_CREATE_FAILS=1 \
+      STUB_APP_CREATE_MATERIALIZES="$materializes" \
+      STUB_APP_VERIFY_INDETERMINATE="$indeterminate" \
+      run "$sb" --apply --yes
+    status=$?
+    if ((status != 0)) &&
+      jq -e --argjson expected "$expected_pending" \
+        '.databricks_app_creation_pending == $expected' \
+        "$gen/bootstrap.json" >/dev/null; then
+      printf '  %sok%s   %-13s create failure leaves pending=%s\n' \
+        "$GREEN" "$RESET" "$outcome" "$expected_pending"
+      PASS=$((PASS + 1))
+    else
+      printf '  %sFAIL%s %-13s create failure did not leave pending=%s\n' \
+        "$RED" "$RESET" "$outcome" "$expected_pending"
+      printf '%s\n' "$OUT" | tail -12 | sed 's/^/       | /'
+      FAIL=$((FAIL + 1))
+    fi
+    if [[ "$outcome" == "materialized" ]]; then
+      printf 'DATABRICKS_APP_NAME=renamed-anti-demo\n' >>"$sb/env"
+      AWS_SESSION_TOKEN="" STUB_STATE_DIR="$sb" STUB_APP_MISSING=1 \
+        run "$sb" --apply --yes
+      status=$?
+      if ((status != 0)) &&
+        [[ "$(cat "$sb/app-create-attempts")" == "1" ]] &&
+        printf '%s' "$OUT" | grep -qF "interrupted while creating app 'lakebase-anti-demo'" &&
+        printf '%s' "$OUT" | grep -qF "will not adopt it, replace it, or create"; then
+        printf '  %sok%s   rename cannot orphan the pending app or create another\n' \
+          "$GREEN" "$RESET"
+        PASS=$((PASS + 1))
+      else
+        printf '  %sFAIL%s rename bypassed pending app adjudication\n' "$RED" "$RESET"
+        printf '%s\n' "$OUT" | tail -12 | sed 's/^/       | /'
+        FAIL=$((FAIL + 1))
+      fi
+    fi
+  done
 }
 
 # The two files whose mere presence breaks a deploy. Neither exists in this tree,
@@ -1435,6 +1543,7 @@ CASES=(
   case_check_clean
   case_multiple_warehouses_are_derived
   case_five_input_full_acceptance
+  case_fresh_app_creation_provenance
   case_banned_files
   case_print_env
   case_s3_refuses_existing
