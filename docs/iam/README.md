@@ -39,14 +39,15 @@ a cloud team can review and approve each one independently:
 
 | File | Covers | Packed size | Required |
 |---|---|---|---|
-| `anti-demo-operator-1-network.json` | EC2 discovery, security groups, the Round 5 runner instance, SSM | 2162 | yes |
-| `anti-demo-operator-2-databases.json` | RDS: Aurora Serverless v2, RDS PostgreSQL, subnet groups, RDS Proxy | 2356 | yes |
-| `anti-demo-operator-3-identity.json` | IAM, Secrets Manager, KMS grants, STS, CloudWatch reads | 4228 | yes |
+| `anti-demo-operator-1-network.json` | EC2 discovery, security groups, the Round 5 runner instance, SSM | 2359 | yes |
+| `anti-demo-operator-2-databases.json` | RDS: Aurora Serverless v2, RDS PostgreSQL, subnet groups, RDS Proxy | 2385 | yes |
+| `anti-demo-operator-3-identity.json` | IAM, Secrets Manager, KMS grants, STS, SQS, `iam:SimulatePrincipalPolicy`, CloudWatch reads | 5574 | yes |
 | `anti-demo-operator-4-state.json` | S3: the Terraform state bucket, the state object and its lock | 1059 | only with `--state-backend s3` |
 
-Every one of the four is comfortably inside the limit; the largest, file 3, has
-1916 characters of headroom. Attach 1, 2 and 3 — any one alone is not
-sufficient.
+Every one of the four is inside the limit; the largest, file 3, has 570
+characters of headroom. Attach 1, 2 and 3 — any one alone is not sufficient.
+File 3 is the one to watch: it is closest to the 6144 cap, so a new IAM or
+Secrets Manager grant there may force the split the other files already model.
 
 File 4 is a separate file rather than merged into one of the other three because
 the default install needs none of it: keeping it separate means a local-backend
@@ -87,8 +88,15 @@ aws iam create-policy --policy-name AntiDemoOperatorState \
 ```
 
 `bootstrap.sh` verifies the resulting permissions before spending anything: it
-runs every read that Terraform and the app need, plus real EC2 authorisation
-dry runs for `CreateSecurityGroup` and `RunInstances`.
+runs every read that Terraform and the app need, real EC2 authorisation dry runs
+for `CreateSecurityGroup` and `RunInstances`, and — for the create actions that
+have no dry run (`rds:CreateDB*`, `iam:CreateRole`/`CreatePolicy`/`CreateInstanceProfile`/`PutRolePolicy`,
+`secretsmanager:CreateSecret`, `sqs:CreateQueue`) — an `iam:SimulatePrincipalPolicy`
+evaluation of the exact caller against each one, so a missing or mis-scoped grant
+is refused before PROVISION rather than discovered mid-apply. That simulation is
+opportunistic: a caller that is not a plain IAM user/role, or one without
+`iam:SimulatePrincipalPolicy`, is told the actions are unverified rather than
+blocked.
 
 ## The deployed app's own principal
 
@@ -421,9 +429,24 @@ Give these to whoever approves the policy.
 5. **`kms:CreateGrant`.** Required for RDS to encrypt storage and for Secrets
    Manager to wrap master passwords. Gated on `kms:ViaService` for the three
    services involved, which is the tightest form AWS supports here.
-6. **No `iam:SimulatePrincipalPolicy`.** Deliberately omitted:
-   `bootstrap.sh` proves permissions with real read calls and EC2 dry runs
-   instead, so the policy does not need to grant a policy-introspection API.
+6. **`iam:SimulatePrincipalPolicy`, scoped to this account's own users and
+   roles.** This was previously omitted; it is now granted (statement
+   `ProveCreatePermissionsBeforeSpend` in file 3) because it is what lets
+   `bootstrap.sh` prove the no-dry-run create actions before the fleet is built,
+   rather than discovering a missing grant thirty minutes into a real apply. It
+   is a read-only introspection API — it reveals what a principal in this account
+   *could* do, not any data — and it is scoped to `user/*` and `role/*` in this
+   account rather than `*`. The trade is small and one-directional: a principal
+   with it can ask IAM whether any principal in the account is allowed an action.
+   In a dedicated sandbox account (the recommended posture) that is unremarkable;
+   in a shared account, drop the statement and the preflight degrades to reporting
+   those actions as unverified, exactly as it does for a caller that lacks it. The
+   simulation never widens what Terraform can do — it only reads a decision. One
+   caveat for a shared account: because `bootstrap.sh` publishes the operator pair
+   to the app by default (the operator principal *is* the app principal today),
+   the deployed app's sealed credential also gains this account-wide enumeration —
+   another reason to provision from a distinct profile, or drop the statement, in
+   a shared account.
 
 ## What is *not* in these policies
 

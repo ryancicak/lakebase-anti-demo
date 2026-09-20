@@ -3,10 +3,13 @@
 # One entry point from five credentials to a stage-ready installation.
 #
 # Nothing before the confirmation prompt costs money and nothing before it
-# touches AWS: every AWS call up to that point is a describe, a list or an
-# explicit --dry-run. It is not, however, read-only, and the whole list is here
-# because a stranger reading this line is deciding whether it is safe to run
-# this script merely to *look* at something. Before the prompt it:
+# touches AWS: every AWS call up to that point is a describe, a list, an explicit
+# --dry-run or an iam:SimulatePrincipalPolicy evaluation (all read-only), and
+# every Databricks call is a read (identity, Lakebase list, catalog get, and a
+# `warehouses get` that reads the SQL warehouse's state without running it). It
+# is not, however, read-only, and the whole list is here because a stranger
+# reading this line is deciding whether it is safe to run this script merely to
+# *look* at something. Before the prompt it:
 #
 #   - writes an OAuth M2M profile into ~/.databrickscfg (step "Databricks
 #     service principal profile"; mode 600, and it refuses to overwrite a
@@ -492,6 +495,19 @@ if ((DEPLOY_ONLY == 1)); then
 else
   unset AWS_PROFILE AWS_DEFAULT_PROFILE
 fi
+# The absolute path of the file this run actually reads, printed rather than the
+# relative `$ENV_FILE`, because the ambiguity it removes has a real cost: an
+# operator with both a `.env.bootstrap` and, say, a `.env.bootstrap.prod` beside
+# it can spend an install window editing the one this run never opens. The path
+# is safe to print -- it names a file, not a secret; the values inside are never
+# echoed, here or anywhere.
+if [[ "$ENV_FILE" = /* ]]; then
+  ENV_FILE_ABS="$ENV_FILE"
+else
+  ENV_FILE_ABS="$ROOT/$ENV_FILE"
+fi
+ENV_FILE_DIR="$(dirname "$ENV_FILE_ABS")"
+ENV_FILE_BASE="$(basename "$ENV_FILE_ABS")"
 if [[ -f "$ENV_FILE" ]]; then
   # A persistent AKIA pair in the five-value file has no session token. Do not
   # let an unrelated SSO/STS token inherited from the launching shell turn that
@@ -505,9 +521,30 @@ if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set -u
-  say "Read inputs from $ENV_FILE"
+  say "Read inputs from $ENV_FILE_ABS"
+  say "  Only five values are required: DATABRICKS_HOST, DATABRICKS_CLIENT_ID,"
+  say "  DATABRICKS_CLIENT_SECRET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Everything"
+  say "  else in the file is optional -- bootstrap derives it and asks only if it must."
 else
-  say "No $ENV_FILE (start from docs/bootstrap.env.example); missing inputs will be prompted for."
+  say "No env file at $ENV_FILE_ABS (start from docs/bootstrap.env.example); missing inputs will be prompted for."
+  say "  Only five values are required: the Databricks host, client id and secret, and the"
+  say "  AWS access-key/secret pair. Everything else is optional and derived."
+fi
+
+# Name any sibling `.env.bootstrap*` this run is NOT reading, so a change to the
+# wrong one is caught here rather than discovered as "my edit did nothing". The
+# glob is guarded because bash leaves it literal when nothing matches.
+UNUSED_ENV_FILES=""
+for _candidate in "$ENV_FILE_DIR"/.env.bootstrap*; do
+  [[ -e "$_candidate" ]] || continue
+  [[ "$(basename "$_candidate")" == "$ENV_FILE_BASE" ]] && continue
+  UNUSED_ENV_FILES="$UNUSED_ENV_FILES $(basename "$_candidate")"
+done
+if [[ -n "${UNUSED_ENV_FILES// /}" ]]; then
+  warn "other bootstrap env files exist beside it and are NOT read by this run:${UNUSED_ENV_FILES}.
+        This run reads only $ENV_FILE_ABS -- editing any of the others has no effect unless you
+        pass it with --env-file. Region is derived, not a sixth input: pin it by setting
+        AWS_REGION or AWS_DEFAULT_REGION inside the file this run reads, or via 'aws configure'."
 fi
 AWS_OPERATOR_PROFILE="${AWS_PROFILE:-${AWS_DEFAULT_PROFILE:-}}"
 unset AWS_PROFILE AWS_DEFAULT_PROFILE
@@ -1293,8 +1330,112 @@ if ((${#PERMISSION_FAILURES[@]} > 0)); then
 else
   ok "all read probes and every available dry run passed"
 fi
-warn "rds:Create*, iam:CreateRole and secretsmanager:CreateSecret have no dry run.
-        They are covered by docs/iam/ but are first exercised by the real apply."
+
+# The create half that has no dry run. EC2 create-security-group and run-instances
+# were proven above with real authorisation dry runs; RDS, IAM, Secrets Manager
+# and SQS have no equivalent, so historically they were first exercised by the
+# real apply -- thirty minutes and a fleet too late to learn that policy 3 was
+# never attached. iam:SimulatePrincipalPolicy proves them without creating
+# anything: it asks IAM to evaluate the *exact* caller against each action on a
+# representative resource that matches the documented grant patterns
+# (docs/iam/anti-demo-operator-2/3), so a correctly-attached operator set answers
+# `allowed` for every one and a missing or mis-scoped grant answers
+# `implicitDeny`/`explicitDeny` here rather than mid-apply. Permissions boundaries
+# ARE evaluated by the simulation; SCPs are NOT (SimulatePrincipalPolicy does not
+# evaluate organization policies), so an SCP block would still surface at apply --
+# this narrows that window, it does not close it.
+#
+# Opportunistic on purpose, because policy simulation itself needs a permission
+# and this must not break an admin or a role that lacks it. If the caller is not
+# a plain IAM user/role (an assumed-role/SSO session cannot be a policy source
+# here), or if SimulatePrincipalPolicy is itself denied, the actions are reported
+# as unverified with the fix rather than failing the run. docs/iam/README.md now
+# grants iam:SimulatePrincipalPolicy on the operator principal so the documented
+# key pair gets the proof.
+#
+# Condition-scoped creates are deliberately excluded: iam:PassRole
+# (iam:PassedToService), kms:CreateGrant (kms:ViaService) and rds:CreateDBProxy
+# (aws:RequestedRegion, resource "*") need context keys to simulate truthfully,
+# and a simulation that omits them would deny a grant that is in fact present.
+#
+# The partition is read off the caller so GovCloud/China (arn:aws-us-gov, arn:aws-cn)
+# evaluate against their own ARNs rather than falsely denying against arn:aws.
+CREATE_ACTIONS_SUMMARY="rds:CreateDB{Cluster,Instance,SubnetGroup}, iam:Create{Role,Policy,InstanceProfile}, iam:PutRolePolicy, secretsmanager:CreateSecret and sqs:CreateQueue"
+if printf '%s' "$CALLER_ARN" | grep -qE '^arn:aws[a-z-]*:iam::[0-9]+:(user|role)/'; then
+  SIM_PARTITION="$(printf '%s' "$CALLER_ARN" | cut -d: -f2)"
+  # action|representative-resource, one per line. Every resource matches a pattern
+  # the docs/iam operator policies grant, and none of the statements granting
+  # these actions carries a Condition, so a correct policy simulates `allowed`.
+  SIMULATE_PAIRS="iam:CreateRole|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:role/r5-preflight-exec-x
+iam:PutRolePolicy|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:role/r5-preflight-exec-x
+iam:CreatePolicy|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:policy/anti-demo-runtime-1-preflight
+iam:CreateInstanceProfile|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:instance-profile/r5-preflight-runner-x
+secretsmanager:CreateSecret|arn:$SIM_PARTITION:secretsmanager:$AWS_REGION:$AWS_ACCOUNT_ID:secret:lakebase-ant-preflight
+sqs:CreateQueue|arn:$SIM_PARTITION:sqs:$AWS_REGION:$AWS_ACCOUNT_ID:r5-preflight
+rds:CreateDBCluster|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:cluster:lakebase-ant-preflight
+rds:CreateDBInstance|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:db:lakebase-ant-preflight
+rds:CreateDBSubnetGroup|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:subgrp:lakebase-ant-preflight"
+  SIMULATE_DENIED=""
+  SIMULATE_UNAVAILABLE=0
+  SIMULATE_UNAVAILABLE_DETAIL=""
+  while IFS='|' read -r sim_action sim_resource; do
+    [[ -z "$sim_action" ]] && continue
+    # stdout only (stderr discarded), so a CLI deprecation/warning line cannot be
+    # mixed into the JSON and misread as a non-`allowed` decision. A failed call
+    # or an exit-0 body with no parseable decision both DEGRADE (unverified),
+    # never deny: this must not block a valid operator on a call it could not
+    # make or parse -- only a real `implicitDeny`/`explicitDeny` denies.
+    if ! SIM_OUT="$(aws iam simulate-principal-policy \
+      --policy-source-arn "$CALLER_ARN" \
+      --action-names "$sim_action" \
+      --resource-arns "$sim_resource" \
+      --output json 2>/dev/null)"; then
+      SIMULATE_UNAVAILABLE=1
+      SIMULATE_UNAVAILABLE_DETAIL="the iam:SimulatePrincipalPolicy call failed (permission, throttling, or unreachable)"
+      break
+    fi
+    SIM_DECISION="$(printf '%s' "$SIM_OUT" \
+      | jq -r '.EvaluationResults[0].EvalDecision // "unknown"' 2>/dev/null || echo unknown)"
+    if [[ "$SIM_DECISION" == "allowed" ]]; then
+      :
+    elif [[ "$SIM_DECISION" == "unknown" ]]; then
+      SIMULATE_UNAVAILABLE=1
+      SIMULATE_UNAVAILABLE_DETAIL="iam:SimulatePrincipalPolicy returned no parseable decision for $sim_action"
+      break
+    else
+      SIMULATE_DENIED="${SIMULATE_DENIED}
+        - ${sim_action} (${SIM_DECISION})"
+    fi
+  done <<SIMEOF
+$SIMULATE_PAIRS
+SIMEOF
+  if ((SIMULATE_UNAVAILABLE == 1)); then
+    warn "could not prove the no-dry-run create permissions with iam:SimulatePrincipalPolicy
+        ($SIMULATE_UNAVAILABLE_DETAIL). $CREATE_ACTIONS_SUMMARY are therefore unverified and
+        first exercised by the real apply. Grant iam:SimulatePrincipalPolicy on this principal
+        -- docs/iam/anti-demo-operator-3-identity.json now includes it -- to have this run prove
+        them before any spend."
+  elif [[ -n "$SIMULATE_DENIED" ]]; then
+    PREFLIGHT_FAILURES+=("iam:SimulatePrincipalPolicy shows this principal cannot perform create
+      actions that Terraform runs with no dry run to fall back on:${SIMULATE_DENIED}
+      A denied/implicitDeny means the attached policy does not grant the action on the resource
+      Terraform will create, or a permissions boundary blocks it. Attach the three docs/iam/
+      operator policies (rendered with your account and region) and re-run; docs/iam/README.md
+      has the loop. If you JUST attached them, IAM is eventually consistent -- wait ~1 minute and
+      re-run before changing anything. Proven before PROVISION precisely so it is not discovered
+      thirty minutes into a real apply, after the fleet is already billing.")
+    printf '  %sFAIL%s  iam:SimulatePrincipalPolicy denied one or more create actions (listed above)\n' \
+      "$RED" "$RESET" >&2
+  else
+    ok "iam:SimulatePrincipalPolicy confirms the no-dry-run create actions ($CREATE_ACTIONS_SUMMARY)"
+    info "iam:PassRole, kms:CreateGrant and rds:CreateDBProxy are condition-scoped, so they stay first exercised by the apply"
+  fi
+else
+  warn "the caller $CALLER_ARN is not a plain IAM user or role, so iam:SimulatePrincipalPolicy
+        cannot evaluate it here. $CREATE_ACTIONS_SUMMARY are unverified and first exercised by the
+        real apply. The documented setup uses a permanent IAM user pair, for which this run proves
+        them; see docs/iam/README.md."
+fi
 fi # AWS_IDENTITY_OK
 fi # RUN_AWS_SECTIONS
 
@@ -1797,6 +1938,57 @@ fi
 # bucket. installation_id is stable across resets; run_id is not.
 if [[ "$STATE_BACKEND" == "s3" && -z "$STATE_KEY" ]]; then
   STATE_KEY="anti-demo/$(basename "$MANIFEST_DIR")/terraform.tfstate"
+fi
+
+# Warehouse presence, read-only and free. `warehouses list` above derived a
+# warehouse; this reads the exact one setup will use and refuses the case that is
+# both common and cheap to catch here: the warehouse an existing installation
+# sealed has been deleted or reaped since. It probes the sealed warehouse for an
+# existing installation (what `_ensure_round4` reads) and the derived one for a
+# first provision. It deliberately does NOT run a statement -- a `SELECT 1` would
+# auto-resume a serverless warehouse and cost money before the confirmation
+# prompt, which this script promises it never does, and a cold non-serverless
+# warehouse would look "unusable" while it was merely starting. CAN_USE itself is
+# proven where a cost is already sanctioned: `server/lifecycle.py:_probe_sql_warehouse`
+# runs a read-only `SELECT 1` from `./antidemo setup`, after PROVISION is
+# confirmed and still before Terraform. --deploy-only skips this: no Round 4.
+if ((DATABRICKS_OK == 1)) && [[ "$MODE" == "check" || "$MODE" == "apply" ]]; then
+  PROBE_WAREHOUSE_ID="$DATABRICKS_WAREHOUSE_ID"
+  PROBE_WAREHOUSE_SOURCE="the warehouse this run selected"
+  if ((EXISTING_INSTALL == 1)); then
+    SEALED_WAREHOUSE_ID="$(jq -r '.round4.warehouse_id // empty' "$ANTI_DEMO_MANIFEST" \
+      2>/dev/null || true)"
+    if [[ -n "$SEALED_WAREHOUSE_ID" ]]; then
+      PROBE_WAREHOUSE_ID="$SEALED_WAREHOUSE_ID"
+      PROBE_WAREHOUSE_SOURCE="the warehouse this installation sealed"
+    fi
+  fi
+  if [[ -z "$PROBE_WAREHOUSE_ID" ]]; then
+    skipped "the SQL warehouse presence check, because no warehouse was resolved above"
+  elif WAREHOUSE_GET_JSON="$(databricks warehouses get "$PROBE_WAREHOUSE_ID" \
+    "${DATABRICKS_ARGS[@]}" 2>&1)"; then
+    WAREHOUSE_STATE="$(printf '%s' "$WAREHOUSE_GET_JSON" \
+      | jq -r '.state // .warehouse.state // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)"
+    case "$WAREHOUSE_STATE" in
+      DELETED | DELETING)
+        fail "The SQL warehouse $PROBE_WAREHOUSE_ID ($PROBE_WAREHOUSE_SOURCE) is $WAREHOUSE_STATE.
+      Round 4 runs every one of its statements on this warehouse, so this would fail after the
+      AWS fleet is built. Choose or create a live warehouse and grant this service principal
+      CAN_USE, then re-run." ;;
+      *)
+        ok "SQL warehouse $PROBE_WAREHOUSE_ID is present ($PROBE_WAREHOUSE_SOURCE, state $WAREHOUSE_STATE)"
+        info "'antidemo setup' proves CAN_USE with a read-only SELECT 1 on it, after PROVISION and before any AWS spend (server/lifecycle.py:_probe_sql_warehouse)" ;;
+    esac
+  else
+    fail "The SQL warehouse $PROBE_WAREHOUSE_ID ($PROBE_WAREHOUSE_SOURCE) could not be read and is
+      not visible to this service principal: $(sanitize_databricks_output "$WAREHOUSE_GET_JSON" | tail -2)
+      Usually this means it was deleted or reaped, or this principal cannot see it -- but a transient
+      control-plane error looks the same, so if you just created it, or this may be transient, re-run.
+      Otherwise choose or create a warehouse and grant this service principal CAN_USE.
+      server/lifecycle.py:_probe_sql_warehouse proves CAN_USE with a SELECT 1 at './antidemo setup'."
+  fi
+elif ((DATABRICKS_OK == 0)); then
+  skipped "the SQL warehouse presence check, because nothing authenticated to Databricks"
 fi
 
 # ---------------------------------------------------------------------------

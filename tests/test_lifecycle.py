@@ -2616,6 +2616,56 @@ def test_resume_reseals_round5_when_existing_manifest_needs_upgrade(monkeypatch)
     assert calls == ["round4:321", "round5:321", "round6:321"]
 
 
+def test_resume_probes_the_sealed_warehouse_before_completing_provision(monkeypatch) -> None:
+    """A resume proves the warehouse it is bound to, before any billable step.
+
+    The warehouse it must prove is the sealed one in the manifest, not whatever
+    ``DATABRICKS_WAREHOUSE_ID`` the resuming shell happens to carry -- the sealed
+    shell value is set here to a different id precisely so a probe that read the
+    environment would fail this. And it must run before `_complete_provision`,
+    which is where Terraform re-applies: a warehouse that lost CAN_USE since the
+    last run stops the resume rather than failing it mid-Round-4.
+    """
+
+    manifest = make_manifest(status="seeding")
+    names = attach_round4(manifest)
+    del names
+    monkeypatch.setenv("DATABRICKS_WAREHOUSE_ID", "wh-from-the-resuming-shell")
+    order: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle._verify_databricks_identity",
+        lambda profile: manifest.databricks.user,
+    )
+    monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
+    monkeypatch.setattr(
+        "server.lifecycle._probe_sql_warehouse",
+        lambda profile, warehouse_id: order.append(f"probe:{warehouse_id}"),
+    )
+    # Every billable/reseal step a resume can take from here, so the assertion is
+    # "the probe is first" regardless of which checkpoint this manifest resumes
+    # from rather than a bet on one branch.
+    for step in (
+        "_complete_provision",
+        "_prepare_and_reseal_round4",
+        "_prepare_and_reseal_round5",
+        "_prepare_and_reseal_round6",
+    ):
+        monkeypatch.setattr(
+            f"server.lifecycle.{step}",
+            lambda candidate, *_a, _step=step, **_k: order.append(_step) or candidate,
+        )
+
+    resume_provision(321)
+
+    assert order[0] == "probe:0123456789abcdef", (
+        "the sealed warehouse (not the shell's) must be proven before any billable "
+        f"or reseal step; order was {order}"
+    )
+
+
 @pytest.mark.parametrize("candidate_saved", [False, True])
 def test_resume_interrupted_round5_does_not_repeat_base_provision(
     monkeypatch, candidate_saved: bool
@@ -2633,6 +2683,9 @@ def test_resume_interrupted_round5_does_not_repeat_base_provision(
         lambda profile: manifest.databricks.user,
     )
     monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    # The sealed Round 4 warehouse is probed before any reseal; a resume unit run
+    # must not reach a live warehouse to prove it.
+    monkeypatch.setattr("server.lifecycle._probe_sql_warehouse", lambda *args, **kwargs: None)
     monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
     monkeypatch.setattr(
         "server.lifecycle._complete_provision",
@@ -2701,6 +2754,7 @@ def test_resume_interrupted_reset_repeats_base_seeding(monkeypatch) -> None:
         lambda profile: manifest.databricks.user,
     )
     monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle._probe_sql_warehouse", lambda *args, **kwargs: None)
     monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
     monkeypatch.setattr(
         "server.lifecycle._complete_provision",
@@ -2728,6 +2782,7 @@ def test_resume_retries_interrupted_round6_without_reseeding_base(monkeypatch) -
         lambda profile: manifest.databricks.user,
     )
     monkeypatch.setattr("server.lifecycle._verify_aws_identity", lambda *args: None)
+    monkeypatch.setattr("server.lifecycle._probe_sql_warehouse", lambda *args, **kwargs: None)
     monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: manifest.aws.operator_cidr)
     monkeypatch.setattr(
         "server.lifecycle._complete_provision",
