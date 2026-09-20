@@ -86,13 +86,89 @@ when that process started it. A stop that fires costs cents: one bout costs abou
 window before its posted usage has settled and it reads low, sometimes by a
 factor of several, so let a window complete before quoting it. The
 pipeline bills for as long as it is up, though, and it does not stop itself if
-the server process dies. Check it after a session and stop it if it is still
-running:
+the server process dies. If the serving process died, or the pipeline remains
+running after the cost-control observation budget below, capture its events and
+stop it:
 
 ```bash
 ./antidemo pipeline status
 ./antidemo pipeline stop
 ```
+
+The stop command reports that the request was accepted; it does not prove the
+control plane reached the deliberate-stop shape. Treat its immediate `STOPPED`
+or `$0.00/day` summary as an acknowledgement, not a live control-plane reading.
+Always finish with the bounded post-stop poll, retry, and escalation protocol
+below.
+
+Preserve the control-plane pipeline event log in a secure location outside the
+repository before that manual cleanup when it is available. Missing or
+incomplete events mean the automatic release is **unobserved**; they must not
+delay stopping a billable pipeline after the process is dead or the test-owned
+observation budget expires. Never use the cleanup command during an active bout
+or its redo window. Confirmed death of the process that owned the bout overrides
+both restrictions: no process remains that can finish the bout or serve its
+redo, so stop immediately.
+
+For automated post-bout checks, a terminal session or a `ready` Round 4 ring is
+not evidence that the pipeline should already be `IDLE`. The terminal path
+releases the ring before background settlement schedules the stop, then
+deliberately keeps the pipeline running for the 20-minute redo window. Likewise,
+`/readyz`'s `round4_stop_recovery_state` describes startup reconciliation of
+debt inherited from an older process and defaults to `settled` when no recovery
+is active; it never reports the current bout's delayed stop. Internally, the
+exact end of the redo window is the current bout's durable
+`stop_owed.owed_at`, written after settlement, but the deployed current-bout
+health surface does not expose that timestamp. A timeout measured from terminal
+publication is therefore only a cost-control observation budget, not proof that
+a stop request failed.
+
+Poll the Databricks control plane until it shows the full deliberate-stop shape:
+pipeline `IDLE`, newest update `CANCELED`, no continuous update, and synced table
+`SYNCED_TABLE_ONLINE_PIPELINE_FAILED`. That proves a deliberate stop, not who
+stopped it.
+To verify automatic release, capture events before any cleanup mutation and
+identify an app-principal stop for the current update; this proves only
+**app-issued stop observed**, because delayed release, shutdown, and inherited
+recovery use the same principal. Use timing and app lifecycle logs to distinguish
+those mechanisms. An operator's manual stop produces the same state pair and
+never counts.
+
+In an automated test that owns the bout and will issue no redo, use a
+conservative observation budget that allows for settlement plus the 20-minute
+window. At expiry, branch on the live state:
+
+- the full deliberate-stop shape above: stopped; use pre-cleanup events, not the
+  state shape, for actor attribution.
+- cloud state or newest update `STOPPING`: report **stop still settling** and
+  poll every 10 seconds for up to 5 minutes for the deliberate-stop shape. If
+  that bound expires, preserve diagnostics, retry the cost-control stop once,
+  poll for another 5 minutes, and then escalate the stuck transition.
+- any continuous update, or newest update `RUNNING`, `QUEUED`, `CREATED`,
+  `WAITING_FOR_RESOURCES`, `INITIALIZING`, `RESETTING`, or
+  `SETTING_UP_TABLES`: treat it as active even when cloud state is `IDLE`;
+  report **automatic release unobserved** and use the cost-control stop protocol.
+- `RUNNING`, `DEPLOYING`, `STARTING`, `RECOVERING`, or `RESETTING`: report
+  **automatic release unobserved**, preserve whatever events are available, and
+  stop the pipeline for cost control.
+- `IDLE` with no active/starting update and no continuous update, but without
+  the full deliberate-stop shape: inactive but **cleanup state unverified**;
+  preserve diagnostics rather than claiming deliberate release.
+- unreadable: report **cleanup state unverified**, preserve diagnostics, and
+  attempt the cost-control stop because billing cannot be ruled out.
+- cloud state `FAILED`: preserve diagnostics, attempt the cost-control stop if
+  billing cannot be ruled out, and verify the deliberate-stop shape.
+- `DELETED`: terminal provider state; preserve the deletion diagnostics.
+
+Branch on the pipeline's cloud state, not only the newest update state. A
+`FAILED` update can coexist with a billable `RUNNING` pipeline and must follow
+the `RUNNING` cost-control branch. After every cleanup stop, poll every 10
+seconds for up to 5 minutes for the deliberate-stop shape. Retry the stop once,
+poll for another 5 minutes, then escalate if the pipeline remains billable,
+unreadable, or stuck in `STOPPING`.
+
+Do not report **stop API returned success while still running** unless
+pre-cleanup events first prove the app actually issued that stop.
 
 Clone it Friday and forget it until Monday: three days of a local install with
 the pipeline released is about **$25**, or about **$58** with the App deployed

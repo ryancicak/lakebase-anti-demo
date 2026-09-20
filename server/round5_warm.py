@@ -179,24 +179,28 @@ def _assert_immutable_receipt_identity(
         (slot.shared_receipt.lakebase_runner, shared_receipt.lakebase_runner),
         (slot.shared_receipt.competitor_runner, shared_receipt.competitor_runner),
     ):
-        if (
-            lane_old.boot_id != lane_new.boot_id
-            or lane_old.process_boot_id != lane_new.process_boot_id
-            or lane_old.instance_id != lane_new.instance_id
-            or lane_old.image_sha256 != lane_new.image_sha256
-            or lane_old.loaded_harness_sha256 != lane_new.loaded_harness_sha256
-            or lane_old.capacity_model_sha256 != lane_new.capacity_model_sha256
-        ):
+        if replace(lane_old, expires_at=lane_new.expires_at) != lane_new:
             raise WarmFenceLostError("renewed receipt runner identity changed")
+    if (
+        replace(
+            slot.shared_receipt,
+            lakebase_runner=shared_receipt.lakebase_runner,
+            competitor_runner=shared_receipt.competitor_runner,
+        )
+        != shared_receipt
+    ):
+        raise WarmFenceLostError("renewed receipt shared identity changed")
     if set(slot.variants) != set(variants):
         raise WarmFenceLostError("renewed receipt variant set changed")
     for key, old_variant in slot.variants.items():
         new_variant = variants[key]
         if (
-            old_variant.target_sha256 != new_variant.target_sha256
-            or old_variant.source_sha256 != new_variant.source_sha256
-            or old_variant.security_group_sha256 != new_variant.security_group_sha256
-            or old_variant.vpc_sha256 != new_variant.vpc_sha256
+            replace(
+                old_variant,
+                proxy_absence_observed_at=new_variant.proxy_absence_observed_at,
+                expires_at=new_variant.expires_at,
+            )
+            != new_variant
         ):
             raise WarmFenceLostError("renewed receipt variant identity changed")
 
@@ -929,7 +933,7 @@ class InMemoryRound5WarmStore:
                 revision=current.revision + 1,
                 coordinator_fence=current.coordinator_fence + (1 if replacement else 0),
                 process_epoch=process_epoch,
-                broker_epoch=broker_epoch,
+                broker_epoch=broker_epoch if replacement else current.broker_epoch,
                 coordinator_owner=process_epoch,
                 coordinator_lease_expires_at=now + ttl,
                 ready_at=None if state == Round5WarmState.WARMING else current.ready_at,
@@ -1860,7 +1864,9 @@ class LakebaseRound5WarmStore:
             state=state,
             coordinator_fence=current.coordinator_fence + (1 if replacement else 0),
             process_epoch=process_epoch,
-            broker_epoch=str(kwargs["broker_epoch"]),
+            broker_epoch=(
+                str(kwargs["broker_epoch"]) if replacement else current.broker_epoch
+            ),
             coordinator_owner=process_epoch,
             coordinator_lease_expires_at=now + kwargs["ttl"],
             ready_at=None if state == Round5WarmState.WARMING else current.ready_at,
@@ -2067,6 +2073,8 @@ class LakebaseRound5WarmStore:
         bout_id: str,
         selected_variant: Round5Variant,
         capsule_generation: int,
+        capsule_broker_epoch: str,
+        capsule_warm_attempt_token: str,
         main_ring_key: str,
         cleanup_ring_key: str,
         operator: object,
@@ -2089,6 +2097,17 @@ class LakebaseRound5WarmStore:
 
         async def commit(cursor: Any) -> tuple[Round5WarmSlot, BoutLease, BoutLease]:
             async with cursor.connection.transaction():
+                # Ordinary claims create scoped ring rows lazily. Round 5 claims
+                # both rows in one transaction, including on the first bout of a
+                # pristine installation, so materialize both before locking them.
+                await cursor.execute(
+                    f"""
+                    INSERT INTO {COORDINATION_TABLE} (ring_key, fencing_token)
+                    VALUES (%s, 0), (%s, 0)
+                    ON CONFLICT (ring_key) DO NOTHING
+                    """,
+                    (main_ring_key, cleanup_ring_key),
+                )
                 await cursor.execute(
                     f"""
                     SELECT ring_key, fencing_token, lease_id, expires_at
@@ -2141,21 +2160,78 @@ class LakebaseRound5WarmStore:
                     for row in by_key.values()
                 ):
                     raise WarmClaimUnavailableError("Round 5 ring is already held")
-                if (
-                    current.revision != slot.revision
-                    or current.coordinator_fence != slot.coordinator_fence
-                    or current.state != Round5WarmState.READY
-                    or current.ready_expires_at is None
-                    or current.ready_expires_at <= locked_now
-                    or current.renew_by is None
-                    or current.renew_by <= locked_now
-                    or current.provenance_expires_at is None
-                    or current.provenance_expires_at <= locked_now
-                    or _receipt_expiry_bound(current) <= locked_now
-                    or capsule_generation != current.generation
-                ):
+                try:
+                    if current.shared_receipt is None or not current.variants:
+                        raise WarmFenceLostError(
+                            "locked READY receipt identity is unavailable"
+                        )
+                    _assert_immutable_receipt_identity(
+                        slot,
+                        current.shared_receipt,
+                        current.variants,
+                    )
+                    receipt_identity_changed = False
+                except WarmFenceLostError:
+                    receipt_identity_changed = True
+                # Coordinator heartbeats and provenance renewal advance revision
+                # while leaving this generation, fence, and capsule valid. Requiring
+                # the caller's pre-transaction revision made a claim impossible when
+                # database latency exceeded the renewal interval. The locked row's
+                # semantic identity and freshness checks below are the actual fence.
+                failed_checks = [
+                    name
+                    for name, failed in (
+                        (
+                            "coordinator_fence",
+                            current.coordinator_fence != slot.coordinator_fence,
+                        ),
+                        ("state", current.state != Round5WarmState.READY),
+                        (
+                            "ready_expiry",
+                            current.ready_expires_at is None
+                            or current.ready_expires_at <= locked_now,
+                        ),
+                        (
+                            "renew_by",
+                            current.renew_by is None or current.renew_by <= locked_now,
+                        ),
+                        (
+                            "provenance",
+                            current.provenance_expires_at is None
+                            or current.provenance_expires_at <= locked_now,
+                        ),
+                        ("receipt_expiry", _receipt_expiry_bound(current) <= locked_now),
+                        ("receipt_identity", receipt_identity_changed),
+                        ("generation", capsule_generation != current.generation),
+                        ("broker_epoch", capsule_broker_epoch != current.broker_epoch),
+                        (
+                            "warm_attempt",
+                            capsule_warm_attempt_token != current.warm_attempt_token,
+                        ),
+                    )
+                    if failed
+                ]
+                if failed_checks:
+                    logger.warning(
+                        "Round 5 locked claim refused checks=%s "
+                        "slot_revision=%d current_revision=%d "
+                        "slot_generation=%d current_generation=%d",
+                        ",".join(failed_checks),
+                        slot.revision,
+                        current.revision,
+                        slot.generation,
+                        current.generation,
+                    )
                     raise WarmClaimUnavailableError(
                         "Round 5 READY generation changed while claiming"
+                    )
+                if current.revision != slot.revision:
+                    logger.info(
+                        "Round 5 locked claim accepted safe revision skew "
+                        "slot_revision=%d current_revision=%d generation=%d",
+                        slot.revision,
+                        current.revision,
+                        current.generation,
                     )
                 fences = {
                     key: int(row[1]) + 1 for key, row in by_key.items()
@@ -3464,6 +3540,8 @@ class Round5WarmCoordinator:
             bout_id=bout_id,
             selected_variant=selected_variant,
             capsule_generation=capsule.generation,
+            capsule_broker_epoch=capsule.broker_epoch,
+            capsule_warm_attempt_token=capsule.warm_attempt_token,
             main_ring_key=main_store.ring_key,
             cleanup_ring_key=cleanup_store.ring_key,
             operator=operator,

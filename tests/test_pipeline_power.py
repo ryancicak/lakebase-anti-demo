@@ -901,6 +901,7 @@ def test_an_owed_stop_is_silent_until_it_is_due_and_then_names_the_money(
 
         payload = _readyz_on_a_healthy_box(monkeypatch, app_module)
         assert payload["round4_stop_owed"] is True
+        assert payload["round4_stop_recovery_state"] == "settled"
         # Unchanged by the origin now riding along on the same record, and
         # pinned here deliberately: `/readyz` is rendered in `app.py`, which
         # this change may not edit, and these three fields read out of this
@@ -940,6 +941,7 @@ def test_an_owed_stop_is_silent_until_it_is_due_and_then_names_the_money(
         assert asyncio.run(pipeline_power.load_owed_stop_snapshot(manifest)) is not None
         quiet_payload = _readyz_on_a_healthy_box(monkeypatch, app_module)
         assert quiet_payload["round4_stop_owed"] is False
+        assert quiet_payload["round4_stop_recovery_state"] == "settled"
         assert quiet_payload["round4_stop_owed_since"] is None
         assert quiet_payload["round4_stop_owed_detail"] is None
 
