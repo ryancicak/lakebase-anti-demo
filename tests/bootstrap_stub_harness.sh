@@ -57,6 +57,11 @@ CFG
 #!/usr/bin/env bash
 # Ordered most-specific first: --query forms must win over their bare commands.
 args="$*"
+# Every invocation is journaled when a case asks (STUB_STATE_DIR set), so a
+# fail-closed case can assert that no *mutating* AWS call was made before it
+# exited. Reads and --dry-run authorisation probes are expected; creates,
+# run-instances, deletes and modifies are not.
+[[ -n "${STUB_STATE_DIR:-}" ]] && printf '%s\n' "$args" >>"$STUB_STATE_DIR/aws-calls.log"
 case "$args" in
   *"--dry-run"*)
     if [[ "${STUB_EC2_DRYRUN_DENIED:-0}" == "1" ]]; then
@@ -98,6 +103,28 @@ case "$args" in
     [[ "${STUB_S3_LIST_DENIED:-0}" == "1" ]] && { echo "AccessDenied" >&2; exit 255; }
     echo '{"Buckets":[]}' ;;
   *"iam get-role"*) echo "arn:aws:iam::${STUB_ACCOUNT:-111122223333}:role/stub-role" ;;
+  *"iam simulate-principal-policy"*)
+    # The create-permission preflight (bootstrap.sh). STUB_SIMULATE_UNAVAILABLE=1
+    # reproduces a caller that lacks iam:SimulatePrincipalPolicy itself (the
+    # degrade path); STUB_SIMULATE_DENY is a space-separated list of action names
+    # to return implicitDeny for (a missing/mis-scoped grant or an SCP). Every
+    # other action answers `allowed`, which is what a correctly-attached operator
+    # policy set produces.
+    if [[ "${STUB_SIMULATE_UNAVAILABLE:-0}" == "1" ]]; then
+      echo "An error occurred (AccessDenied) when calling the SimulatePrincipalPolicy operation" >&2
+      exit 254
+    fi
+    sim_action=""; prev=""
+    for w in "$@"; do
+      [[ "$prev" == "--action-names" ]] && { sim_action="$w"; break; }
+      prev="$w"
+    done
+    decision="allowed"
+    for denied in ${STUB_SIMULATE_DENY:-}; do
+      [[ "$denied" == "$sim_action" ]] && decision="implicitDeny"
+    done
+    printf '{"EvaluationResults":[{"EvalActionName":"%s","EvalDecision":"%s"}]}\n' \
+      "$sim_action" "$decision" ;;
   *) echo '{}' ;;
 esac
 STUB
@@ -137,6 +164,9 @@ STUB
   cat >"$dir/bin/databricks" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
+# Journaled like `aws` above, so a fail-closed case can assert no app create,
+# deploy, or secret write happened before the run refused.
+[[ -n "${STUB_STATE_DIR:-}" ]] && printf '%s\n' "$args" >>"$STUB_STATE_DIR/databricks-calls.log"
 case "$args" in
   *"current-user me"*)
     # STUB_DB_IDENTITY_ERROR reproduces a failed identity probe: a reaped
@@ -166,6 +196,15 @@ case "$args" in
     else
       echo '[{"id":"whstub","name":"Stub WH","warehouse_type":"PRO"}]'
     fi ;;
+  *"warehouses get"*)
+    # The read-only warehouse presence check (bootstrap.sh, before the gate). The
+    # warehouse id is the third positional and is recorded so a case can assert the
+    # SEALED warehouse (not the derived one) was the one probed. Default: present
+    # and RUNNING. STUB_WAREHOUSE_STATE injects DELETED/DELETING (a reaped
+    # warehouse); STUB_WAREHOUSE_GET_FAILS reproduces one no longer visible.
+    printf '%s\n' "$3" >>"${STUB_STATE_DIR:-/tmp}/warehouse-get-ids"
+    [[ "${STUB_WAREHOUSE_GET_FAILS:-0}" == "1" ]] && { echo "RESOURCE_DOES_NOT_EXIST" >&2; exit 1; }
+    printf '{"id":"%s","state":"%s"}\n' "$3" "${STUB_WAREHOUSE_STATE:-RUNNING}" ;;
   *"catalogs get"*)
     [[ "${STUB_CATALOG_MISSING:-0}" == "1" ]] && { echo "does not exist" >&2; exit 1; }
     echo '{"name":"stubcat"}' ;;
@@ -311,6 +350,10 @@ STUB
 
   cat >"$dir/bin/terraform" <<'STUB'
 #!/usr/bin/env bash
+# Journaled so a fail-closed case can assert no `apply`/`plan`/`init`/`destroy`
+# ran before the refusal. Before the gate, bootstrap.sh only ever asks for the
+# version; anything else here would mean the refusal came too late.
+[[ -n "${STUB_STATE_DIR:-}" ]] && printf '%s\n' "$*" >>"$STUB_STATE_DIR/terraform-calls.log"
 echo "{\"terraform_version\":\"${STUB_TF_VERSION:-1.11.4}\"}"
 STUB
 
@@ -1652,6 +1695,252 @@ print('size', size)
   fi
 }
 
+case_fail_closed_no_mutation_before_databricks_preflight() {
+  printf '\n%s== a failed Databricks preflight mutates nothing before it refuses ==%s\n' \
+    "$BOLD" "$RESET"
+  # The claim "Nothing was provisioned and nothing was written" has to be a fact,
+  # not a slogan. So this drives --apply --yes (the mode that would otherwise
+  # provision) into an invalid Databricks identity and then proves, from the stub
+  # call journals and the filesystem, that before the refusal there was: no
+  # mutating AWS call, no Terraform apply, no Databricks App create/deploy/secret
+  # write, and no write into the generation directory at all. Non-vacuous by
+  # construction -- the journals DO contain the reads and dry runs the preflight
+  # legitimately makes, so an empty-file check would prove nothing; the assertion
+  # is specifically about the mutating subset.
+  local sb gen genparent status host
+  host="dbc-stub-0000.cloud.databricks.com"
+  gen="$(mktemp -d)/gen"
+  genparent="$(dirname "$gen")"
+  # The real provisioning (Terraform, boto3) lives in `./antidemo setup`, which is
+  # path-relative and so reached through $ANTI_DEMO_EXECUTABLE rather than a PATH
+  # stub. Point it at a recorder that touches a marker if it is ever invoked, so
+  # "no Terraform / no spend" is proven by the delegate never running -- not by a
+  # grep that could never match because bootstrap.sh delegates all mutation. Both
+  # the recorder and its marker live OUTSIDE $gen so the generation-directory
+  # assertion below stays a true "bootstrap wrote nothing here".
+  cat >"$genparent/antidemo-must-not-run" <<RECORDER
+#!/usr/bin/env bash
+: >"$genparent/antidemo-invoked"
+exit 0
+RECORDER
+  chmod +x "$genparent/antidemo-must-not-run"
+  sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$genparent"$'/antidemo-must-not-run' sandbox)"
+  STUB_STATE_DIR="$sb" \
+    STUB_DB_IDENTITY_ERROR="Error: default auth: oauth-m2m: token request failed at $host: 401 Unauthorized invalid_client" \
+    run "$sb" --apply --yes
+  status=$?
+
+  check "refuses at the preflight gate" "Nothing was provisioned and nothing was written"
+  check_absent "never reaches the cost estimate or provision" "What this will cost"
+  if ((status != 0)); then
+    printf '  %sok%s   the run exits non-zero\n' "$GREEN" "$RESET"; PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the run exited zero\n' "$RED" "$RESET"; FAIL=$((FAIL + 1))
+  fi
+
+  # The non-vacuous core: `./antidemo setup` (Terraform + boto3 provisioning) was
+  # never invoked, so nothing downstream of the gate could have spent.
+  if [[ ! -e "$genparent/antidemo-invoked" ]]; then
+    printf '  %sok%s   the provisioning delegate (antidemo setup) never ran\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the provisioning delegate ran despite a failed preflight\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # 1. No generation directory was written -- the gate is before the mkdir.
+  if [[ ! -e "$gen" ]]; then
+    printf '  %sok%s   no generation directory was created\n' "$GREEN" "$RESET"; PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the generation directory was written: %s\n' "$RED" "$RESET" \
+      "$(ls -A "$gen" 2>/dev/null | tr '\n' ' ')"; FAIL=$((FAIL + 1))
+  fi
+
+  # 2. No mutating AWS call. Reads and --dry-run probes are expected and ignored;
+  #    a real create/run/delete/modify/attach/put is the thing that must not appear.
+  local aws_mutations
+  aws_mutations="$(grep -E 'create-|run-instances|delete-|modify-|attach-|detach-|put-' \
+    "$sb/aws-calls.log" 2>/dev/null | grep -v -- '--dry-run' || true)"
+  if [[ -z "$aws_mutations" ]]; then
+    printf '  %sok%s   no mutating AWS call was made before the refusal\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a mutating AWS call was made before the refusal:\n%s\n' \
+      "$RED" "$RESET" "$aws_mutations"; FAIL=$((FAIL + 1))
+  fi
+
+  # 3. No Terraform apply/plan/init/destroy -- only the version read is allowed.
+  local tf_mutations
+  tf_mutations="$(grep -E '(^| )(apply|plan|init|destroy)( |$)' \
+    "$sb/terraform-calls.log" 2>/dev/null || true)"
+  if [[ -z "$tf_mutations" ]]; then
+    printf '  %sok%s   no Terraform apply/plan/init/destroy ran\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s Terraform mutated before the refusal:\n%s\n' \
+      "$RED" "$RESET" "$tf_mutations"; FAIL=$((FAIL + 1))
+  fi
+
+  # 4. No Databricks App create/deploy/update and no secret write.
+  local db_mutations
+  db_mutations="$(grep -E 'apps create|apps deploy|apps update|secrets put-secret|api post /api/2.0/secrets/put' \
+    "$sb/databricks-calls.log" 2>/dev/null || true)"
+  if [[ -z "$db_mutations" ]]; then
+    printf '  %sok%s   no Databricks App create/deploy or secret write happened\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a Databricks App/secret mutation happened before the refusal:\n%s\n' \
+      "$RED" "$RESET" "$db_mutations"; FAIL=$((FAIL + 1))
+  fi
+}
+
+case_iam_create_permission_simulation() {
+  printf '\n%s== the no-dry-run create permissions are proven with iam:SimulatePrincipalPolicy ==%s\n' \
+    "$BOLD" "$RESET"
+  local sb gen status
+
+  # The documented path: a plain IAM user (AKIA pair) whose policy grants every
+  # create action. Simulation confirms them all before spend.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" run "$sb"
+  check "confirms the no-dry-run creates" \
+    "iam:SimulatePrincipalPolicy confirms the no-dry-run create actions"
+  check "leaves the conditioned ones to the apply" \
+    "iam:PassRole, kms:CreateGrant and rds:CreateDBProxy are condition-scoped"
+
+  # A missing/mis-scoped grant (or an SCP) shows up as a denied action. It must
+  # fail closed at the gate, name the exact action, and never reach the bill.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" \
+    STUB_SIMULATE_DENY="secretsmanager:CreateSecret sqs:CreateQueue" \
+    run "$sb" --apply --yes
+  status=$?
+  check "names the denied create action" "secretsmanager:CreateSecret (implicitDeny)"
+  check "names the second denied action" "sqs:CreateQueue (implicitDeny)"
+  check "points at the operator policies" "Attach the three docs/iam/"
+  check "fails closed at the gate" "Nothing was provisioned and nothing was written"
+  check_absent "never reaches the cost estimate or provision" "What this will cost"
+  if ((status != 0)); then
+    printf '  %sok%s   a denied create action exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a denied create action exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # A caller without iam:SimulatePrincipalPolicy must NOT be blocked: the check
+  # degrades to naming the unverified actions and the fix, and the run continues.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" STUB_SIMULATE_UNAVAILABLE=1 run "$sb"
+  status=$?
+  check "degrades rather than blocks" "could not prove the no-dry-run create permissions"
+  check "names how to enable the proof" "Grant iam:SimulatePrincipalPolicy on this principal"
+  check_absent "does not fail closed on a missing introspection permission" \
+    "Nothing was provisioned and nothing was written"
+  if ((status == 0)); then
+    printf '  %sok%s   a caller lacking the introspection permission still validates\n' \
+      "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a caller lacking iam:SimulatePrincipalPolicy was blocked (exit %s)\n' \
+      "$RED" "$RESET" "$status"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+case_warehouse_presence_preflight() {
+  printf '\n%s== the SQL warehouse presence is proven (read-only, free) before the gate ==%s\n' \
+    "$BOLD" "$RESET"
+  local sb gen status
+
+  # A fresh install with a present warehouse: the derived warehouse is read (no
+  # statement, no spend) and the run points at the SELECT 1 CAN_USE proof that
+  # happens post-confirm at 'antidemo setup'. The recorded id proves the read hit
+  # the warehouse, not merely that a line was printed.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" run "$sb"
+  check "a present warehouse passes the read-only check" "SQL warehouse whstub is present"
+  check "defers CAN_USE to the post-confirm SELECT 1" \
+    "proves CAN_USE with a read-only SELECT 1 on it, after PROVISION"
+  if grep -qx "whstub" "$sb/warehouse-get-ids" 2>/dev/null; then
+    printf '  %sok%s   the presence read targeted the derived warehouse\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the presence read did not target the derived warehouse\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # A warehouse that was deleted/reaped since it was sealed must fail closed at
+  # the gate, naming the warehouse -- caught here for free rather than after the
+  # AWS fleet is built.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" STUB_WAREHOUSE_STATE=DELETED run "$sb" --apply --yes
+  status=$?
+  check "a deleted warehouse is named" "is DELETED"
+  check "fails closed at the gate" "Nothing was provisioned and nothing was written"
+  check_absent "never reaches the cost estimate or provision" "What this will cost"
+  if ((status != 0)); then
+    printf '  %sok%s   a deleted warehouse exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a deleted warehouse exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # A warehouse this principal cannot see (reaped, or no access) also fails closed.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" STUB_WAREHOUSE_GET_FAILS=1 run "$sb" --apply --yes
+  status=$?
+  check "an invisible warehouse is named" "not visible to this service principal"
+  check "fails closed at the gate" "Nothing was provisioned and nothing was written"
+  if ((status != 0)); then
+    printf '  %sok%s   an invisible warehouse exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s an invisible warehouse exited zero\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # An existing installation reads the warehouse it SEALED, not whatever the run
+  # would derive now -- that is the one `_ensure_round4` will use on resume.
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  jq '.round4.warehouse_id = "wh-sealed-42"' "$gen/manifest.json" >"$gen/manifest.next"
+  mv "$gen/manifest.next" "$gen/manifest.json"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" run "$sb"
+  check "an existing install reads the sealed warehouse" "SQL warehouse wh-sealed-42 is present"
+  check "names it as the sealed one" "the warehouse this installation sealed"
+  if grep -qx "wh-sealed-42" "$sb/warehouse-get-ids" 2>/dev/null; then
+    printf '  %sok%s   the presence read targeted the sealed warehouse, not the derived one\n' \
+      "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the presence read did not target the sealed warehouse\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # --deploy-only never provisions Round 4, so it must not read the warehouse.
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STATE_DIR="$sb" run "$sb" --deploy-only --yes
+  check_absent "deploy-only does not run the presence check" "is present ("
+  if [[ ! -e "$sb/warehouse-get-ids" ]]; then
+    printf '  %sok%s   deploy-only issued no warehouse read\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s deploy-only read a warehouse it did not need\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 case_no_regression() {
   printf '\n%s== the live installation is untouched ==%s\n' "$BOLD" "$RESET"
   if [[ ! -f .anti-demo-v7/terraform.tfstate ]]; then
@@ -1709,6 +1998,9 @@ CASES=(
   case_deploy_failures
   case_deploy_retry
   case_deploy_reads_app_yaml
+  case_fail_closed_no_mutation_before_databricks_preflight
+  case_iam_create_permission_simulation
+  case_warehouse_presence_preflight
   case_generated_artefacts
   case_no_regression
 )

@@ -2212,6 +2212,19 @@ def _sql_statement_error_is_transient(text: str) -> bool:
     return any(token in lowered for token in _SQL_TRANSIENT_ERROR_SUBSTRINGS)
 
 
+class _SqlStatementTimeout(RuntimeError):
+    """`_sql_statement` reached its per-attempt deadline without a terminal state.
+
+    A distinct type rather than a message a caller has to string-match. It is the
+    difference `_probe_sql_warehouse` turns on: a statement that is still running
+    when the budget runs out (a cold warehouse resuming) is not the same as one
+    that came back ``FAILED`` -- and a terminal ``FAILED`` whose control-plane
+    text merely contains the words "timed out" (a lock wait, a downstream
+    timeout) must not be mistaken for the former. Subclasses ``RuntimeError`` so
+    every existing ``except RuntimeError`` around a statement is unaffected.
+    """
+
+
 def _sql_statement(
     profile: str,
     warehouse_id: str,
@@ -2286,7 +2299,7 @@ def _sql_statement(
             if not statement_id:
                 raise RuntimeError("Databricks SQL statement did not return an ID")
             if time.monotonic() >= deadline:
-                raise RuntimeError("Databricks SQL statement timed out")
+                raise _SqlStatementTimeout("Databricks SQL statement timed out")
             time.sleep(min(2, max(0, deadline - time.monotonic())))
             payload = _databricks_api(
                 profile,
@@ -2295,6 +2308,92 @@ def _sql_statement(
                 timeout=120,
             )
     raise RuntimeError("Databricks SQL statement exhausted all retry attempts")
+
+
+def _resolve_setup_warehouse_id(manifest: DemoManifest) -> str | None:
+    """The SQL warehouse this installation's Round 4 will actually run on.
+
+    Fresh and resume answer this differently, and a preflight probe has to ask
+    the same question `_ensure_round4` will. A sealed installation is bound to the
+    warehouse in its manifest -- `_ensure_round4` reads ``sealed.warehouse_id``
+    and refuses to move off it -- so a resume must probe *that* one, not whatever
+    ``DATABRICKS_WAREHOUSE_ID`` happens to name in the resuming shell. A first
+    provision has no seal yet and takes the warehouse from the environment,
+    exactly as `_ensure_round4`'s create branch does.
+
+    ``None`` means there is nothing to prove yet: a first provision that has not
+    been given ``DATABRICKS_WAREHOUSE_ID``. Round 4 refuses that later with the
+    message that names the variable, so this does not have to.
+    """
+
+    sealed = manifest.round4
+    if sealed is not None and getattr(sealed, "warehouse_id", ""):
+        return sealed.warehouse_id
+    return os.environ.get("DATABRICKS_WAREHOUSE_ID", "").strip() or None
+
+
+def _probe_sql_warehouse(profile: str, warehouse_id: str) -> None:
+    """Prove the selected SQL warehouse is usable *before* the first billable step.
+
+    Selecting a warehouse -- which both `bootstrap.sh` and `_ensure_round4` do --
+    proves only that one is *visible* to this principal, not that the principal
+    may *run* on it. A warehouse the service principal can list but lacks
+    ``CAN_USE`` on, or one wedged in a non-runnable state, is indistinguishable
+    from a healthy one until the first statement is issued against it. Round 4
+    issues that statement roughly twenty minutes and a whole AWS fleet
+    downstream of here (`_prepare_round4_source_artifacts`), and the deployed app
+    is granted ``CAN_USE`` on this exact warehouse
+    (`_grant_round4_uc_and_warehouse`), so the fault this catches is otherwise
+    discovered after the spend it should have stopped.
+
+    A read-only ``SELECT 1`` is the cheapest thing that exercises the exact path
+    Round 4 will -- the same `_sql_statement` retry and transient classification,
+    the same warehouse, the same profile -- and it mutates nothing: no schema, no
+    table, no grant, so running it in preflight can leave nothing behind. This
+    only reframes `_sql_statement`'s already-redacted, already-retried error
+    around the thing an operator can act on, which is the warehouse and its
+    ``CAN_USE`` grant.
+
+    **A denial fails; a slow resume does not.** ``CAN_USE`` is checked when the
+    statement is submitted, so a principal that lacks it comes back as a terminal
+    ``FAILED`` almost at once and this refuses. A warehouse the principal *can*
+    use but that is cold -- a stopped non-serverless warehouse can take minutes to
+    start -- stays non-terminal until the deadline and raises
+    :class:`_SqlStatementTimeout`, which is not evidence of unusability: Round 4's
+    own statements will wait for the same resume. Blocking a valid install on a
+    slow start would be the exact "never break a valid operator" failure this
+    preflight exists to avoid, so that one type degrades to a warning and
+    proceeds. Discriminating on the *type* rather than on the word "timed out" is
+    deliberate: a terminal ``FAILED`` whose control-plane message merely contains
+    "timed out" (a lock wait, a downstream timeout) is a real failure and must
+    still refuse. Broad ``except`` otherwise, for the same reason
+    `_verify_databricks_identity` uses one; the redacted last line carries the
+    cause.
+    """
+
+    try:
+        _sql_statement(profile, warehouse_id, "SELECT 1", timeout=120, max_attempts=4)
+    except _SqlStatementTimeout as exc:
+        scrubbed = _redact_databricks_secrets(str(exc)).strip().splitlines()
+        detail = scrubbed[-1].strip() if scrubbed else "no error detail"
+        print(
+            f"WARN  The selected Databricks SQL warehouse {warehouse_id} did not finish a "
+            "read-only SELECT 1 within the probe budget; it is most likely still resuming, "
+            "which is not a CAN_USE failure. Proceeding -- Round 4 waits for the same resume, "
+            f"and reports a clear error if the warehouse is genuinely unusable. Databricks "
+            f"said: {detail}",
+            flush=True,
+        )
+        return
+    except Exception as exc:
+        scrubbed = _redact_databricks_secrets(str(exc)).strip().splitlines()
+        detail = scrubbed[-1].strip() if scrubbed else "no error detail"
+        raise RuntimeError(
+            f"The selected Databricks SQL warehouse {warehouse_id} is not usable by this "
+            "principal, so Round 4 would fail after the AWS fleet is already provisioned and "
+            "billing. Confirm the warehouse exists and is not deleted, and that this service "
+            f"principal has CAN_USE on it, then retry. Databricks said: {detail}"
+        ) from exc
 
 
 def _round4_catalog(manifest: DemoManifest) -> str:
@@ -9457,6 +9556,16 @@ def provision(
         schema_sha256=_schema_sha256(),
     )
     save_manifest(manifest)
+    # Last, just before the first billable step: every free check above (both
+    # identities, the operator CIDR, the egress seal) has already had its chance
+    # to abort, so a warehouse is resumed only for a run that is actually about to
+    # spend. `_resolve_setup_warehouse_id` returns the environment's warehouse
+    # here -- a first provision has sealed no Round 4 yet -- the same one
+    # `_ensure_round4`'s create branch reads.
+    setup_warehouse_id = _resolve_setup_warehouse_id(manifest)
+    if setup_warehouse_id:
+        print("CHECK selected SQL warehouse is usable (read-only SELECT 1)", flush=True)
+        _probe_sql_warehouse(databricks_profile, setup_warehouse_id)
     return _complete_provision(manifest, zero_timeout_seconds)
 
 
@@ -9488,6 +9597,17 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
             f"Operator public IP changed to {current_cidr}; provisioned ingress is "
             f"{manifest.aws.operator_cidr}"
         )
+    # After every free check above (both identities and the operator CIDR), so a
+    # resume that a changed IP would abort does not resume a warehouse first. The
+    # same read-only proof as a fresh provision, on the warehouse this
+    # installation is bound to: a resume probes the sealed `round4.warehouse_id`,
+    # not whatever the resuming shell exports, and does so before any
+    # `_complete_provision`/reseal so a warehouse that lost CAN_USE since the last
+    # run stops the resume rather than failing it mid-Round-4.
+    setup_warehouse_id = _resolve_setup_warehouse_id(manifest)
+    if setup_warehouse_id:
+        print("CHECK sealed SQL warehouse is usable (read-only SELECT 1)", flush=True)
+        _probe_sql_warehouse(manifest.databricks.profile, setup_warehouse_id)
     round4_waiting_for_final_seal = (
         manifest.status == "waiting_for_zero"
         and manifest.manifest_version == 2

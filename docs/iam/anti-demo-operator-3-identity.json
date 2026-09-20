@@ -12,6 +12,15 @@
       "Resource": "*"
     },
     {
+      "Sid": "ProveCreatePermissionsBeforeSpend",
+      "Effect": "Allow",
+      "Action": "iam:SimulatePrincipalPolicy",
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:user/*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/*"
+      ]
+    },
+    {
       "Sid": "AssumeTheRound5ControlRole",
       "Effect": "Allow",
       "Action": "sts:AssumeRole",

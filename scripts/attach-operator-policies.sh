@@ -16,7 +16,9 @@
 #   scripts/attach-operator-policies.sh --user <iam-user> [--account ID] [--region R] [--profile P]
 #   scripts/attach-operator-policies.sh --role <iam-role> [...]
 #
-# Idempotent: existing policies are reused, existing attachments are left alone.
+# Idempotent, and now correct when re-run after docs/iam changes: an existing
+# policy is updated in place -- a new default version -- only when its live
+# document has drifted from the rendered one; existing attachments are left alone.
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -47,6 +49,11 @@ done
 [[ -n "$PRINCIPAL_KIND" ]] || die "one of --user or --role is required"
 
 command -v aws >/dev/null 2>&1 || die "the AWS CLI is not on PATH"
+# Required to compare a live policy document against the rendered one. Without it
+# `reconcile_policy` cannot tell a drifted policy from a current one and would
+# fall back to reusing the stale document -- the exact bug this script now fixes.
+# jq is already a project prerequisite (server/lifecycle.py:doctor checks it).
+command -v jq >/dev/null 2>&1 || die "jq is not on PATH (required to compare policy documents)"
 
 # Derive rather than ask: the account must be the one these credentials belong
 # to, and guessing it wrong would render policies that grant nothing.
@@ -78,6 +85,90 @@ render() {
   printf '%s' "$rendered"
 }
 
+# IAM caps a customer-managed policy at five versions, so a policy that is updated
+# in place will eventually refuse a sixth with LimitExceeded. Delete the oldest
+# NON-default versions to make room -- never the default, which is the one in
+# force. Called only just before a new version is created, and only when the limit
+# is actually in the way.
+prune_policy_versions() {
+  local arn="$1" total oldest
+  total="$(aws iam list-policy-versions --policy-arn "$arn" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+    --query 'length(Versions)' --output text 2>/dev/null || echo 0)"
+  case "$total" in '' | *[!0-9]*) total=0 ;; esac
+  while ((total >= 5)); do
+    # Versions come back newest-first, so the last non-default is the oldest.
+    oldest="$(aws iam list-policy-versions --policy-arn "$arn" \
+      "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+      --query 'Versions[?IsDefaultVersion==`false`]|[-1].VersionId' --output text 2>/dev/null \
+      || echo None)"
+    [[ -n "$oldest" && "$oldest" != None ]] || break
+    aws iam delete-policy-version --policy-arn "$arn" --version-id "$oldest" \
+      "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}"
+    note "pruned old version $oldest to stay within IAM's five-version limit"
+    total=$((total - 1))
+  done
+}
+
+# Create the policy if it is absent; otherwise reuse it ONLY if its live default
+# version already matches the rendered document. Reusing a named policy whose
+# document is stale is the trap this closes: the previous version of this script
+# reused it unconditionally, so an operator who re-ran after docs/iam grew a grant
+# (SQS, iam:SimulatePrincipalPolicy) kept the old document and then failed the very
+# apply the new grant was for. On drift, a new version is created and set as
+# default; the old versions are pruned only if the five-version limit is in the way.
+#
+# AWS CLI v2 URL-decodes the stored policy document into a JSON object, and `jq -cS`
+# canonicalises both sides so that key order or whitespace cannot masquerade as
+# drift and churn a new version on every run.
+reconcile_policy() {
+  local name="$1" arn="$2" file="$3" default_version live_doc live_norm rendered_doc
+  if ! aws iam get-policy --policy-arn "$arn" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" >/dev/null 2>&1; then
+    aws iam create-policy --policy-name "$name" --policy-document "file://$file" \
+      "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --query 'Policy.Arn' --output text >/dev/null
+    note "created $name"
+    return 0
+  fi
+  default_version="$(aws iam get-policy --policy-arn "$arn" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+    --query 'Policy.DefaultVersionId' --output text 2>/dev/null || echo '')"
+  live_doc="$(aws iam get-policy-version --policy-arn "$arn" --version-id "$default_version" \
+    "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+    --query 'PolicyVersion.Document' --output json 2>/dev/null || echo '{}')"
+  live_norm="$(printf '%s' "$live_doc" | jq -cS . 2>/dev/null || echo 'unparseable-live')"
+  # Two ways the comparison cannot be trusted, and both must fall back to reuse
+  # rather than re-version -- re-versioning on a comparison we cannot make is the
+  # churn (a new default version and a prune on every run) this guards against:
+  #   * AWS CLI v1 returns Document URL-encoded, so `jq -cS` yields a JSON *string*
+  #     literal (starts with a quote), never the rendered object.
+  #   * jq missing or the response unparseable -> the sentinel below.
+  case "$live_norm" in
+    '"'*)
+      note "policy $name exists; this AWS CLI returns its document URL-encoded (v1), so drift"
+      note "cannot be checked -- leaving it as-is. Upgrade to AWS CLI v2 to enable drift detection."
+      return 0
+      ;;
+    unparseable-live)
+      note "policy $name exists but its live document could not be parsed (is jq present, AWS"
+      note "CLI v2?) -- leaving it as-is rather than risk churning versions."
+      return 0
+      ;;
+  esac
+  rendered_doc="$(jq -cS . "$file" 2>/dev/null || echo 'unreadable-rendered')"
+  [[ "$rendered_doc" == "unreadable-rendered" ]] && die "could not read rendered policy $file"
+  if [[ "$live_norm" == "$rendered_doc" ]]; then
+    note "policy $name already matches the rendered document, leaving it"
+    return 0
+  fi
+  note "policy $name has drifted from docs/iam; creating a new default version"
+  prune_policy_versions "$arn"
+  aws iam create-policy-version --policy-arn "$arn" --policy-document "file://$file" \
+    --set-as-default "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \
+    --query 'PolicyVersion.VersionId' --output text >/dev/null
+  note "updated $name to the current document"
+}
+
 POLICY_NAMES+=("AntiDemoOperatorNetwork")
 POLICY_FILES+=("$(render "$REPO_ROOT/docs/iam/anti-demo-operator-1-network.json")")
 POLICY_NAMES+=("AntiDemoOperatorDatabases")
@@ -99,13 +190,7 @@ for index in "${!POLICY_NAMES[@]}"; do
   name="${POLICY_NAMES[$index]}"
   file="${POLICY_FILES[$index]}"
   arn="arn:aws:iam::$ACCOUNT:policy/$name"
-  if aws iam get-policy --policy-arn "$arn" "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" >/dev/null 2>&1; then
-    note "policy $name already exists, reusing it"
-  else
-    aws iam create-policy --policy-name "$name" --policy-document "file://$file" \
-      "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" --query 'Policy.Arn' --output text >/dev/null
-    note "created $name"
-  fi
+  reconcile_policy "$name" "$arn" "$file"
   if [[ "$PRINCIPAL_KIND" == user ]]; then
     already="$(aws iam list-attached-user-policies --user-name "$PRINCIPAL_NAME" \
       "${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"}" \

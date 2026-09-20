@@ -62,6 +62,7 @@ on so far; the point is that it was the precise trap the step exists to set.
 from __future__ import annotations
 
 import ast
+import fnmatch
 import json
 import os
 import re
@@ -648,3 +649,190 @@ def test_a_serve_with_no_credentials_anywhere_says_so_unmissably() -> None:
         )
     assert quiet.returncode == 0, quiet.stderr
     assert "AWS_ACCESS_KEY_ID" not in quiet.stderr
+
+
+# ---------------------------------------------------------------------------
+# The env template's required-vs-optional shape
+# ---------------------------------------------------------------------------
+#
+# The template exists so a first-time operator sees five inputs and nothing else
+# they have to reason about. That property is easy to lose one well-meaning
+# "just document this knob too" at a time until required and optional are tangled
+# again -- which is the exact confusion this file's shape was rebuilt to remove.
+# So the shape is asserted: exactly the five required keys are active, they are
+# all above a loud STOP-HERE line, and everything below it is commented out.
+
+#: The five, and only these, a first install must fill.
+_REQUIRED_ENV_KEYS = (
+    "DATABRICKS_HOST",
+    "DATABRICKS_CLIENT_ID",
+    "DATABRICKS_CLIENT_SECRET",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+)
+
+BOOTSTRAP_ENV_EXAMPLE = PROJECT_ROOT / "docs" / "bootstrap.env.example"
+
+
+def _active_assignments(lines: list[str]) -> list[str]:
+    """The keys of every uncommented ``KEY=VALUE`` line, in order."""
+
+    keys: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" in stripped:
+            keys.append(stripped.split("=", 1)[0].strip())
+    return keys
+
+
+def test_the_env_template_leads_with_exactly_the_five_required_inputs() -> None:
+    """Five active inputs, all above the STOP-HERE break, nothing active below it.
+
+    This is the whole promise of the template as a first-run artifact, made a
+    fact rather than a hope: an active assignment that is not one of the five, or
+    any active assignment below the break, means required and optional have
+    started to intertwine again, and this fails naming which line did it.
+    """
+
+    text = BOOTSTRAP_ENV_EXAMPLE.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    marker_indices = [i for i, line in enumerate(lines) if "YOU CAN STOP HERE" in line]
+    assert len(marker_indices) == 1, (
+        "the template must carry exactly one 'YOU CAN STOP HERE' break separating the "
+        f"five required inputs from the optional config; found {len(marker_indices)}"
+    )
+    marker = marker_indices[0]
+
+    above = _active_assignments(lines[:marker])
+    below = _active_assignments(lines[marker:])
+
+    assert above == list(_REQUIRED_ENV_KEYS), (
+        "the only active assignments above the STOP-HERE break must be exactly the five "
+        f"required inputs, in order; found {above}"
+    )
+    assert below == [], (
+        "everything below the STOP-HERE break must be optional and therefore commented "
+        f"out; these active assignments leaked below it: {below}"
+    )
+    # The break must actually say the word so an operator reading the file, not
+    # just this test, is told they can stop.
+    assert "OPTIONAL" in text, "the break must name what is below it as optional"
+
+
+def test_the_env_template_names_the_optional_families_and_points_to_the_docs() -> None:
+    """Optional config is named as optional and deferred to the docs, not inlined.
+
+    A first-time reader who was found to be drowning must not have to scroll a
+    per-knob stanza for each optional value. The template instead names the
+    families once, in the STOP block, marks them optional, and points at the docs
+    for anyone who genuinely needs to pin one -- present enough to reassure, quiet
+    enough to ignore. Listing each knob as its own line is what this guards
+    against: it re-grows the file one well-meaning knob at a time.
+    """
+
+    text = BOOTSTRAP_ENV_EXAMPLE.read_text(encoding="utf-8").casefold()
+    # The families are named as optional, so a reader knows they exist without a
+    # stanza each.
+    for family in ("warehouse", "region", "catalog", "env-file"):
+        assert family in text, f"the optional block should name {family!r} as optional"
+    assert "optional" in text
+    # Optional detail is deferred to the docs rather than restated per knob.
+    assert "docs/bootstrap.md" in text, "the template must point to the docs for optional config"
+    # And it must say there is no sixth required value, which was the whole worry.
+    assert "no sixth required value" in text
+
+
+# ---------------------------------------------------------------------------
+# The IAM create-permission simulation's representative ARNs
+# ---------------------------------------------------------------------------
+#
+# bootstrap.sh proves the no-dry-run create actions with iam:SimulatePrincipalPolicy
+# against a hand-written representative resource ARN per action. If any of those
+# ARNs falls outside the pattern the operator policy actually grants -- a typo, a
+# renamed prefix, or an action whose only grant carries a Condition the simulation
+# cannot supply -- then a *correctly* permissioned operator gets `implicitDeny` and
+# is blocked at the gate, with zero runtime coverage (the stub answers `allowed`
+# regardless of resource). So the contract is asserted from the committed files:
+# every simulated (action, resource) must be covered by a condition-free Allow in
+# the docs/iam operator set.
+
+_OPERATOR_POLICY_FILES = (
+    PROJECT_ROOT / "docs" / "iam" / "anti-demo-operator-2-databases.json",
+    PROJECT_ROOT / "docs" / "iam" / "anti-demo-operator-3-identity.json",
+)
+
+
+def _bootstrap_simulate_pairs() -> list[tuple[str, str]]:
+    """The (action, rendered-resource-ARN) pairs bootstrap.sh simulates."""
+
+    text = (PROJECT_ROOT / "bootstrap.sh").read_text(encoding="utf-8")
+    match = re.search(r'SIMULATE_PAIRS="(.*?)"', text, re.DOTALL)
+    assert match, "could not find SIMULATE_PAIRS in bootstrap.sh"
+    block = (
+        match.group(1)
+        .replace("$SIM_PARTITION", "aws")
+        .replace("$AWS_ACCOUNT_ID", "123456789012")
+        .replace("$AWS_REGION", "us-west-2")
+    )
+    pairs: list[tuple[str, str]] = []
+    for line in block.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        action, resource = line.split("|", 1)
+        pairs.append((action, resource))
+    return pairs
+
+
+def _condition_free_grant_patterns(action: str) -> list[str]:
+    """Resource patterns of every condition-free Allow granting ``action``.
+
+    Conditioned statements are excluded on purpose: the simulation supplies no
+    context keys, so a grant gated on one would evaluate to a deny and the pair
+    would be a false block. A pair that only matches a conditioned grant is
+    therefore treated as "not covered" here, which is exactly the guidance
+    bootstrap.sh follows by excluding PassRole/CreateGrant/CreateDBProxy.
+    """
+
+    patterns: list[str] = []
+    for path in _OPERATOR_POLICY_FILES:
+        rendered = (
+            path.read_text(encoding="utf-8")
+            .replace("<AWS_ACCOUNT_ID>", "123456789012")
+            .replace("<AWS_REGION>", "us-west-2")
+        )
+        for statement in json.loads(rendered)["Statement"]:
+            if statement.get("Effect") != "Allow" or "Condition" in statement:
+                continue
+            actions = statement["Action"]
+            actions = [actions] if isinstance(actions, str) else actions
+            if action not in actions:
+                continue
+            resources = statement["Resource"]
+            patterns.extend([resources] if isinstance(resources, str) else resources)
+    return patterns
+
+
+def test_every_iam_simulate_pair_matches_a_condition_free_operator_grant() -> None:
+    """A correct operator must simulate `allowed` for every pair -- not a false deny.
+
+    IAM wildcards match with `fnmatch` semantics (`*` spans any characters,
+    `/` included). If this fails, bootstrap.sh would refuse a properly-permissioned
+    first install at the create-permission gate.
+    """
+
+    pairs = _bootstrap_simulate_pairs()
+    assert pairs, "no SIMULATE_PAIRS parsed; the extraction has stopped working"
+    for action, resource in pairs:
+        patterns = _condition_free_grant_patterns(action)
+        assert patterns, (
+            f"{action} is simulated but no condition-free operator grant covers it; "
+            "a conditioned-only grant would false-deny a correct operator"
+        )
+        assert any(fnmatch.fnmatch(resource, pattern) for pattern in patterns), (
+            f"the simulated resource {resource!r} for {action} matches none of the granted "
+            f"patterns {patterns}; a correct operator would be false-denied at the gate"
+        )

@@ -40,6 +40,9 @@ EXPECTED_CASES = {
     "case_deploy_failures",
     "case_deploy_retry",
     "case_deploy_reads_app_yaml",
+    "case_fail_closed_no_mutation_before_databricks_preflight",
+    "case_iam_create_permission_simulation",
+    "case_warehouse_presence_preflight",
     "case_generated_artefacts",
     "case_no_regression",
 }

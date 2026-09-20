@@ -77,6 +77,15 @@ cp docs/bootstrap.env.example .env.bootstrap   # fill in, never commit
 ./bootstrap.sh --apply                         # validate, show the bill, confirm, provision
 ```
 
+**You fill in five values and nothing else.** The template puts those five at the
+top — `DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`,
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` — then a loud `YOU CAN STOP HERE`
+line. Everything below it is optional and commented out: bootstrap derives it and
+tells you, before spending anything, if it ever needs your help. Do not worry
+about the optional block, and do not add a sixth required value — there isn't
+one. The region in particular is derived, not an input; pin it only if you want
+to (see the region note further down).
+
 **It installs and builds what it needs.** `uv sync --locked` provisions `.venv`
 — which `./antidemo` refuses to run without — and
 `npm ci --omit=dev && npm run build` provisions `frontend/dist`, which the UI
@@ -108,9 +117,26 @@ The template lives at `docs/bootstrap.env.example` rather than
 `.env.bootstrap.example` for the same reason: that name would have been ignored
 too, and an uncommittable template is a template nobody finds.
 
+**Exactly one env file is read, and the run prints which.** The default is
+`.env.bootstrap`; `--env-file PATH` chooses another. The run echoes the absolute
+path it read (`Read inputs from /…/.env.bootstrap`) and, if any sibling
+`.env.bootstrap*` exists that it did *not* read — a `.env.bootstrap.prod`, a
+`.env.bootstrap.bak` — it names them and says they have no effect. Nothing else
+consults them. So if you keep more than one, edit the file the run names, or pass
+the one you mean with `--env-file`; a change to an unused sibling is silently
+inert, which is exactly the mistake this warning exists to stop. The path is the
+only thing printed; the values inside are never echoed.
+
 With no `.env.bootstrap`, every missing value is prompted for instead; secrets
 are read with `read -s` and never echoed. Every one of them is also read from the
 environment, so `DATABRICKS_HOST=... ./bootstrap.sh --apply` works without a file.
+
+**The AWS region is derived, not a sixth input.** Bootstrap takes the configured
+CLI region (`aws configure get region`) or falls back to the safe `us-west-2`
+default, and seals it. To pin it deliberately without expanding the five-input
+contract, set `AWS_REGION` or `AWS_DEFAULT_REGION` inside the env file the run
+reads (the launcher and `./antidemo` carry both forward), or set a region with
+`aws configure`. It is not one of the five credentials and is never prompted for.
 
 A prompt with nobody to answer it is a **refusal, not a wait**. A `read` from
 `/dev/tty` does not fail when the run is automated or supervised — it blocks for
@@ -487,7 +513,12 @@ is the manifest's business at run time; a launcher that also exported
 `ANTI_DEMO_MANIFEST` could silently point a serve at another generation.
 
 Set `ANTI_DEMO_ENV_FILE` to read from somewhere other than `.env.bootstrap` in
-the repository root.
+the repository root. Like `bootstrap.sh --env-file`, `./antidemo` reads exactly
+one file: whichever `ANTI_DEMO_ENV_FILE` names, or `.env.bootstrap` by default.
+A `.env.bootstrap.prod` or any other sibling is not read unless you point one of
+these at it, so keep the credentials you actually serve with in the file the run
+reads — `bootstrap.sh` prints that path and flags unused siblings; `./antidemo`
+carries the same file forward but, holding secrets, prints nothing.
 
 A serve that ends up with no AWS credentials prints a block naming the file and
 the two variables, and says which four rounds it just lost. It is not fatal —
