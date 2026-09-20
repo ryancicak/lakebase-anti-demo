@@ -138,8 +138,28 @@ STUB
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
-  *"current-user me"*) echo "{\"userName\":\"${STUB_DB_USER:-stub@example.com}\",\"id\":\"42\"}" ;;
-  *"postgres list-projects"*) echo '{"projects":[]}' ;;
+  *"current-user me"*)
+    # STUB_DB_IDENTITY_ERROR reproduces a failed identity probe: a reaped
+    # workspace (DNS/404), a forbidden principal (403), or a rejected credential
+    # (401). Whatever it holds is written to stderr and the call exits non-zero,
+    # exactly as the real CLI does, so the classifier branch is exercised end to
+    # end rather than in a re-implementation.
+    if [[ -n "${STUB_DB_IDENTITY_ERROR:-}" ]]; then
+      printf '%s\n' "$STUB_DB_IDENTITY_ERROR" >&2
+      exit "${STUB_DB_IDENTITY_EXIT:-1}"
+    fi
+    # STUB_DB_NO_USERNAME reproduces a 200 that is not an identity: the wrong URL
+    # (account console, a proxy login page) can answer without a userName.
+    if [[ "${STUB_DB_NO_USERNAME:-0}" == "1" ]]; then
+      echo '{"id":"42"}'
+      exit 0
+    fi
+    echo "{\"userName\":\"${STUB_DB_USER:-stub@example.com}\",\"id\":\"42\"}" ;;
+  *"postgres list-projects"*)
+    # STUB_LAKEBASE_FAILS reproduces an authenticated principal that still cannot
+    # use Lakebase (not enabled, or not granted).
+    [[ "${STUB_LAKEBASE_FAILS:-0}" == "1" ]] && { echo "PERMISSION_DENIED: Lakebase is not enabled on this workspace" >&2; exit 1; }
+    echo '{"projects":[]}' ;;
   *"warehouses list"*)
     if [[ -n "${STUB_WAREHOUSES:-}" ]]; then
       printf '%s\n' "$STUB_WAREHOUSES"
@@ -1073,6 +1093,125 @@ case_exact_five_inputs_required() {
   done
 }
 
+# The reaper case. A workspace that no longer exists, a principal that cannot see
+# it, and a rejected credential are three different failures with three different
+# fixes, and the installer used to report all three as "check your client secret"
+# -- so an operator whose workspace had been deleted re-issued credentials for an
+# hour. Each subcase asserts the cause is named, the host is named, no secret
+# leaks, and the run stops AT the preflight gate. --apply --yes is used so the
+# fail-closed claim is about the mode that would otherwise provision.
+#
+# Fail-closed is asserted two ways that are NOT vacuous: the gate's own line
+# ("Nothing was provisioned and nothing was written") must be PRESENT, and the
+# first post-gate step ("What this will cost") must be ABSENT. A build that let a
+# failure fall through to provisioning fails both -- unlike a check_absent on a
+# string the product never prints, which passes no matter what.
+case_databricks_identity_failures() {
+  printf '\n%s== a gone workspace / bad token / forbidden principal each fail closed and are told apart ==%s\n' "$BOLD" "$RESET"
+  local host
+  host="dbc-stub-0000.cloud.databricks.com"
+
+  # <label> <status> -- pass iff the run exited non-zero (it must never proceed).
+  _id_nonzero() {
+    if (( $2 != 0 )); then
+      printf '  %sok%s   %s exits non-zero\n' "$GREEN" "$RESET" "$1"; PASS=$((PASS + 1))
+    else
+      printf '  %sFAIL%s %s exited zero (proceeded past the failure)\n' "$RED" "$RESET" "$1"; FAIL=$((FAIL + 1))
+    fi
+  }
+  # <label-prefix> -- the two non-vacuous fail-closed assertions.
+  _id_failclosed() {
+    check "$1 stops at the preflight gate" "Nothing was provisioned and nothing was written"
+    check_absent "$1 never reaches the cost estimate or provision" "What this will cost"
+  }
+
+  local sb gen status
+
+  # Workspace deleted by the reaper: DNS no longer resolves. Credentials are fine.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="Error: oauth-m2m for client_secret=stub-secret: dial tcp: lookup $host: no such host" \
+    run "$sb" --apply --yes
+  status=$?
+  check "workspace-gone names the cause" "could not be reached or no longer exists"
+  check "workspace-gone names the host" "$host"
+  check_absent "workspace-gone does not misblame the credentials" "rejected these credentials"
+  check "workspace-gone redacts the echoed secret" "[redacted]"
+  check_absent "workspace-gone leaks no secret" "stub-secret"
+  _id_failclosed "workspace-gone"
+  _id_nonzero "workspace-gone" "$status"
+
+  # Authenticated but forbidden: 403. Rotating the secret would not help.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="Error: 403 Forbidden (client_secret=stub-secret): this service principal is not authorized to access workspace $host" \
+    run "$sb" --apply --yes
+  status=$?
+  check "no-access classified" "is not authorized to use the workspace"
+  check "no-access names the host" "$host"
+  check_absent "no-access does not misblame the credentials" "rejected these credentials"
+  check "no-access redacts the echoed secret" "[redacted]"
+  check_absent "no-access leaks no secret" "stub-secret"
+  _id_failclosed "no-access"
+  _id_nonzero "no-access" "$status"
+
+  # Rejected credential: 401, and the control plane echoes the secret back. This
+  # is the leak test: a naive `tail -2` of the CLI error would publish it.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="Error: default auth: oauth-m2m: token request failed for client_secret=stub-secret at $host: 401 Unauthorized (error code: invalid_client)" \
+    run "$sb" --apply --yes
+  status=$?
+  check "bad-token classified" "rejected these credentials"
+  check "bad-token names the host" "$host"
+  check "bad-token echoes the control plane with the secret redacted" "[redacted]"
+  check_absent "bad-token never leaks the OAuth secret" "stub-secret"
+  _id_failclosed "bad-token"
+  _id_nonzero "bad-token" "$status"
+
+  # A 401 whose text carries a hex request id containing "404" must NOT be
+  # reclassified as workspace-gone -- that would reintroduce the exact
+  # credential-vs-deleted misdirection this change removes.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="Error: oauth-m2m: token request failed: 401 Unauthorized invalid_client (request-id: a7f404e2-1c3d)" \
+    run "$sb" --apply --yes
+  status=$?
+  check "401-with-hex-404 stays bad-token" "rejected these credentials"
+  check_absent "401-with-hex-404 is not called workspace-gone" "could not be reached or no longer exists"
+  _id_nonzero "401-with-hex-404" "$status"
+
+  # Unclassifiable error: honest three-way message, still fails closed.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="Error: kaboom, an unmapped control-plane condition" \
+    run "$sb" --apply --yes
+  status=$?
+  check "unknown gives the honest three-way message" "This is one of:"
+  check "unknown names the host" "$host"
+  _id_failclosed "unknown"
+  _id_nonzero "unknown" "$status"
+
+  # HTTP 200 with no userName (wrong URL / account console / proxy login page).
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_NO_USERNAME=1 run "$sb" --apply --yes
+  status=$?
+  check "no-userName is named, not swallowed" "returned no workspace userName"
+  check "no-userName names the host" "$host"
+  _id_failclosed "no-userName"
+  _id_nonzero "no-userName" "$status"
+
+  # Authenticated, but Lakebase not usable by this principal.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_LAKEBASE_FAILS=1 run "$sb" --apply --yes
+  status=$?
+  check "lakebase-unusable is named" "The Lakebase (Databricks Postgres) API is not usable"
+  _id_failclosed "lakebase-unusable"
+  _id_nonzero "lakebase-unusable" "$status"
+}
+
 case_runtime_identity_refusals() {
   printf '\n%s== runtime identity is derived and refused safely when ineligible ==%s\n' "$BOLD" "$RESET"
   local sb gen status
@@ -1561,6 +1700,7 @@ CASES=(
   case_deploy_credential_isolation
   case_incomplete_aws_pair_refused
   case_exact_five_inputs_required
+  case_databricks_identity_failures
   case_runtime_identity_refusals
   case_deploy_seal_only
   case_deploy_record_merge
