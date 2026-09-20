@@ -3464,6 +3464,11 @@ class RunManager:
                     competitor_name=record.snapshot.competitor.short_name,
                 )
             except Exception as exc:
+                logger.warning(
+                    "Round 5 atomic claim refused diagnosis=%s detail=%s",
+                    type(exc).__name__,
+                    str(exc),
+                )
                 raise InvalidStateError(
                     "ROUND 5 IS PREPARING BACKSTAGE · OTHER ROUNDS ARE READY"
                 ) from exc

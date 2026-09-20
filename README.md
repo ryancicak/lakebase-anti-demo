@@ -209,13 +209,23 @@ databases. Read
 before provisioning.
 
 The Round 4 pipeline bills for as long as it is up, and it does not stop itself
-if the server process dies. Check it after a session and stop it if it is still
-running:
+if the server process dies. A terminal session or `ready` ring does not mean it
+should already be `IDLE`: `RUNNING` is expected during the 20-minute redo
+window, which begins after settlement. A terminal-timed wait is an observation
+budget, not proof that a stop request failed. After confirmed process death, or
+after a no-redo test's conservative budget allowing for settlement plus the
+window, preserve available events and stop it:
 
 ```bash
 ./antidemo pipeline status
 ./antidemo pipeline stop
 ```
+
+The command's immediate `STOPPED` or `$0.00/day` summary only acknowledges the
+request. Poll every 10 seconds for up to 5 minutes for the deliberate-stop shape
+(`IDLE`, newest update `CANCELED`, no continuous update, synced table
+`SYNCED_TABLE_ONLINE_PIPELINE_FAILED`); retry once, poll for another 5 minutes,
+then escalate.
 
 A deployed App has no idle timeout and does not scale to zero, so stop it when
 you are done presenting:

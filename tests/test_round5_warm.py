@@ -342,13 +342,19 @@ async def test_claim_is_o1_and_performs_no_provider_work() -> None:
     assert provider.validate_calls == counts[3]
 
 
-async def test_atomic_claim_uses_one_post_lock_database_timestamp() -> None:
+async def test_atomic_claim_allows_concurrent_same_generation_renewal() -> None:
     clock = Clock()
     provider = Provider(clock)
     manager = coordinator(clock, provider)
     await warm_ready(manager, provider)
     ready = await manager.store.read("install-one")
     assert ready is not None
+    locked_slot = replace(
+        ready,
+        revision=ready.revision + 2,
+        provenance_expires_at=ready.provenance_expires_at + timedelta(seconds=30),
+    )
+    locked_slot_holder = [locked_slot]
     supplied_now = clock.now - timedelta(minutes=5)
     locked_now = clock.now + timedelta(seconds=3)
     statements: list[str] = []
@@ -377,7 +383,7 @@ async def test_atomic_claim_uses_one_post_lock_database_timestamp() -> None:
                     ("cleanup-ring", 8, None, supplied_now),
                 ]
             elif "SELECT payload" in text and "round5_warm_slot" in text:
-                self.rows = [(json.dumps(_to_json(ready)),)]
+                self.rows = [(json.dumps(_to_json(locked_slot_holder[0])),)]
             elif "SELECT clock_timestamp()" in text:
                 self.rows = [(locked_now,)]
             elif "UPDATE anti_demo_coordination.ring_lease" in text:
@@ -397,31 +403,48 @@ async def test_atomic_claim_uses_one_post_lock_database_timestamp() -> None:
         return await callback(cursor)
 
     store = LakebaseRound5WarmStore(run)
-    claimed, main, cleanup = await store.claim_ready_with_leases(
-        ready,
-        session_id="session-one",
-        bout_id="bout-one",
-        selected_variant=Round5Variant.AURORA,
-        capsule_generation=ready.generation,
-        main_ring_key="main-ring",
-        cleanup_ring_key="cleanup-ring",
-        operator=SimpleNamespace(
-            subject="operator-one",
-            display_name="Operator",
-            email="operator@example.com",
-        ),
-        round_id="survive_connection_spike",
-        round_title="Connection Spike",
-        competitor_id="aurora_serverless_v2",
-        competitor_name="Aurora",
-        now=supplied_now,
-        ttl=timedelta(seconds=90),
-        claim_ttl=timedelta(seconds=60),
-    )
+
+    async def claim():
+        return await store.claim_ready_with_leases(
+            ready,
+            session_id="session-one",
+            bout_id="bout-one",
+            selected_variant=Round5Variant.AURORA,
+            capsule_generation=ready.generation,
+            capsule_broker_epoch=ready.broker_epoch,
+            capsule_warm_attempt_token=ready.warm_attempt_token,
+            main_ring_key="main-ring",
+            cleanup_ring_key="cleanup-ring",
+            operator=SimpleNamespace(
+                subject="operator-one",
+                display_name="Operator",
+                email="operator@example.com",
+            ),
+            round_id="survive_connection_spike",
+            round_title="Connection Spike",
+            competitor_id="aurora_serverless_v2",
+            competitor_name="Aurora",
+            now=supplied_now,
+            ttl=timedelta(seconds=90),
+            claim_ttl=timedelta(seconds=60),
+        )
+
+    claimed, main, cleanup = await claim()
     assert claimed.claim is not None
+    assert claimed.revision == locked_slot.revision + 1
+    assert claimed.generation == ready.generation
+    assert claimed.coordinator_fence == ready.coordinator_fence
+    assert claimed.state == Round5WarmState.CLAIMED
+    assert claimed.claim.capsule_generation == ready.generation
+    assert claimed.claim.warm_attempt_token == ready.warm_attempt_token
     assert claimed.claim.claimed_at == locked_now
     assert claimed.claim.claim_expires_at == locked_now + timedelta(seconds=60)
     assert main.started_at == cleanup.started_at == locked_now
+    materialize_index = next(
+        index
+        for index, value in enumerate(statements)
+        if "INSERT INTO anti_demo_coordination.ring_lease" in value
+    )
     lock_indexes = [
         index for index, value in enumerate(statements) if "FOR UPDATE" in value
     ]
@@ -430,9 +453,87 @@ async def test_atomic_claim_uses_one_post_lock_database_timestamp() -> None:
         for index, value in enumerate(statements)
         if "SELECT clock_timestamp()" in value
     )
-    assert lock_indexes and clock_index > max(lock_indexes)
+    assert lock_indexes and materialize_index < min(lock_indexes) < clock_index
     assert claimed.claim is not None
     assert claimed.claim.lakebase_job_id != claimed.claim.competitor_job_id
+
+    assert ready.shared_receipt is not None
+    mutated_shared_identity = replace(
+        ready.shared_receipt,
+        config_sha256="1" * 64,
+    )
+    mutated_variant_identity = dict(ready.variants)
+    mutated_variant_identity[Round5Variant.AURORA] = replace(
+        ready.variants[Round5Variant.AURORA],
+        auth_sha256="2" * 64,
+    )
+    expired_shared_receipt = replace(
+        ready.shared_receipt,
+        lakebase_runner=replace(
+            ready.shared_receipt.lakebase_runner,
+            expires_at=locked_now - timedelta(seconds=1),
+        ),
+    )
+    unsafe_locked_slots = (
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            broker_epoch="broker-refreshed",
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            warm_attempt_token="attempt-rewarmed",
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            coordinator_fence=ready.coordinator_fence + 1,
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            generation=ready.generation + 1,
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            provenance_expires_at=locked_now - timedelta(seconds=1),
+        ),
+        replace(claimed, revision=ready.revision + 3),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            ready_expires_at=locked_now - timedelta(seconds=1),
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            renew_by=locked_now - timedelta(seconds=1),
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            shared_receipt=expired_shared_receipt,
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            shared_receipt=mutated_shared_identity,
+        ),
+        replace(
+            ready,
+            revision=ready.revision + 3,
+            variants=mutated_variant_identity,
+        ),
+    )
+    for unsafe_locked_slot in unsafe_locked_slots:
+        locked_slot_holder[0] = unsafe_locked_slot
+        with pytest.raises(
+            WarmClaimUnavailableError,
+            match="READY generation changed while claiming",
+        ):
+            await claim()
 
 
 async def test_runner_reboot_invalidates_ready_before_claim_or_bell() -> None:
@@ -485,6 +586,55 @@ async def test_credential_rotation_swaps_capsule_without_losing_readiness() -> N
         manager.capsule.expires_at,
     )
     assert (await manager.public_status())["round5_ring_ready"] is True
+
+
+@pytest.mark.parametrize("identity_part", ("shared", "runner", "variant"))
+async def test_receipt_renewal_rejects_every_nonrenewable_identity_class(
+    identity_part: str,
+) -> None:
+    clock = Clock()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider)
+    await warm_ready(manager, provider)
+    slot = await manager.store.read("install-one")
+    previous = manager.capsule
+    assert slot is not None and slot.shared_receipt is not None
+    assert previous is not None
+
+    clock.advance(60)
+    refreshed = preparation(
+        clock,
+        generation=slot.generation,
+        fence=slot.coordinator_fence,
+        credential_generation=previous.credential_generation + 1,
+        warm_attempt_token=previous.warm_attempt_token,
+    )
+    shared_receipt = refreshed.shared_receipt
+    variants = dict(refreshed.variants)
+    if identity_part == "shared":
+        shared_receipt = replace(shared_receipt, config_sha256="1" * 64)
+    elif identity_part == "runner":
+        shared_receipt = replace(
+            shared_receipt,
+            lakebase_runner=replace(
+                shared_receipt.lakebase_runner,
+                process_pid=shared_receipt.lakebase_runner.process_pid + 1,
+            ),
+        )
+    else:
+        variants[Round5Variant.RDS] = replace(
+            variants[Round5Variant.RDS],
+            request_template_sha256="2" * 64,
+        )
+
+    with pytest.raises(WarmFenceLostError, match="renewed receipt .* identity changed"):
+        await manager.store.update_capsule_receipt(
+            slot,
+            capsule=refreshed.capsule,
+            shared_receipt=shared_receipt,
+            variants=variants,
+            now=clock.now,
+        )
 
 
 async def test_retryable_refresh_stays_ready_then_escalates_when_margin_lost() -> None:
@@ -820,8 +970,17 @@ async def test_ready_capsule_past_launch_margin_refreshes_instead_of_full_rewarm
     assert manager.capsule is not None
     assert manager.capsule.credential_generation == 2
     assert manager.capsule.meets_launch_margin(clock.now)
+    refreshed_broker_epoch = manager.capsule.broker_epoch
+    assert slot.broker_epoch == refreshed_broker_epoch
     assert delay > 0
     assert (await manager.public_status())["round5_ring_ready"] is True
+
+    await manager.run_one_cycle()
+    after_heartbeat = await manager.store.read("install-one")
+    assert after_heartbeat is not None
+    assert after_heartbeat.broker_epoch == refreshed_broker_epoch
+    assert manager.capsule.broker_epoch == refreshed_broker_epoch
+    assert manager.ring_ready
 
 
 async def test_warm_baseline_classification_splits_at_the_raise_site() -> None:

@@ -1729,6 +1729,29 @@ def _stated_cost_figures(name: str) -> dict[str, Decimal]:
 class TestThePublishedCostBoxAgrees:
     """Three documents, one bill. They drifted apart once; not silently again."""
 
+    def test_round4_stop_contract_agrees(self):
+        for name in _COST_DOCUMENTS:
+            prose = _normalised_cost_prose(name)
+            assert "20-minute redo window" in prose
+            assert "settlement" in prose
+            assert "observation budget" in prose
+            assert "not proof that a stop request failed" in prose
+            assert "IDLE" in prose
+            assert "CANCELED" in prose
+            assert "no continuous update" in prose
+            assert "SYNCED_TABLE_ONLINE_PIPELINE_FAILED" in prose
+            assert re.search(r"(?<!SYNCED_TABLE_)ONLINE_PIPELINE_FAILED", prose) is None
+            assert "10 seconds" in prose
+            assert "5 minutes" in prose
+            assert re.search(r"retry(?: the stop)? once", prose, re.IGNORECASE)
+            assert "poll for another 5 minutes" in prose
+
+        contributing = _normalised_cost_prose("CONTRIBUTING.md")
+        assert "even when cloud state is IDLE" in contributing
+        assert "RUNNING, QUEUED, CREATED" in contributing
+        assert "WAITING_FOR_RESOURCES, INITIALIZING, RESETTING" in contributing
+        assert "with no active/starting update and no continuous update" in contributing
+
     def test_every_document_states_the_whole_headline(self):
         # Not a completeness nicety. `CONTRIBUTING.md` and `docs/BOOTSTRAP.md`
         # both quoted the subtotal and the all-in while saying nothing about

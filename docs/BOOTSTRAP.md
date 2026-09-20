@@ -51,8 +51,16 @@ before spending anything, prints what the spend will be, and then runs
 > its posted usage had settled. Posted usage lags by hours, so a window read
 > early is a watermark rather than the finished line and reads low. That line bills for as
 > long as it is up, and it does not stop itself if the server process dies, so
-> check it after a session and stop it if it is still running:
-> `./antidemo pipeline status`, then `./antidemo pipeline stop`.
+> do not mistake a terminal session or `ready` ring for a completed stop:
+> `RUNNING` is expected during the 20-minute redo window. If the owner process
+> dies, or a conservative no-redo test budget allowing for settlement plus that
+> window expires, preserve available events outside the repository, run
+> `./antidemo pipeline stop`, and ignore its immediate `STOPPED` / `$0.00/day`
+> acknowledgement. Poll every 10 seconds for up to 5 minutes for pipeline
+> `IDLE`, newest update `CANCELED`, no continuous update, and synced table
+> `SYNCED_TABLE_ONLINE_PIPELINE_FAILED`; retry once, poll for another 5 minutes,
+> then escalate. A terminal-timed wait is an observation budget, not proof that
+> a stop request failed.
 >
 > **Clone it Friday, forget it until Monday.** Three days of a local install with
 > the pipeline released is about **$25**. With the App deployed as well it is
