@@ -156,6 +156,65 @@ fail() {
 # the summary never mixes real findings with consequences of earlier ones.
 skipped() { printf '  %s----%s  %s\n' "$DIM" "$RESET" "not checked: $*"; }
 
+# ---------------------------------------------------------------------------
+# Databricks control-plane failure classification
+# ---------------------------------------------------------------------------
+#
+# A failed `databricks current-user me` has three operator-actionable causes,
+# and conflating them is what turned a deleted workspace into a wild-goose chase:
+# the old message said "could not authenticate ... check DATABRICKS_CLIENT_ID and
+# DATABRICKS_CLIENT_SECRET" for every failure, so an operator whose workspace the
+# reaper had wiped spent the next hour re-issuing credentials that were correct
+# all along. These two helpers let the failure branch say which of the three it
+# is, always naming the host and never the secret. server/lifecycle.py carries
+# the same taxonomy for the `./antidemo setup` path; keep them in step.
+databricks_failure_category() {
+  # $1: combined stdout+stderr of the failed `databricks` call. Ordered so the
+  # reaper's signal (DNS/404/"does not exist") wins over the 401 a dead
+  # workspace's OAuth endpoint can also emit; 403 (authenticated but forbidden)
+  # is distinguished from 401 (credentials rejected).
+  # Textual signals decide FIRST (they are unambiguous), then \b-anchored HTTP
+  # codes as a backstop for a case the words did not name -- so a request/trace id
+  # like a7f404e2 that merely contains "404" is never mistaken for one, and a code
+  # that co-occurs with a text signal (invalid_client ... 404) is decided by the
+  # text. Precedence AND markers are kept identical to
+  # server/lifecycle.py:_classify_databricks_identity_error; the behavioral corpus
+  # in tests/test_databricks_identity_preflight.py fails if the two ever drift.
+  local out="$1"
+  local ws='no such host|could not resolve|name or service not known|nodename nor servname|dial tcp|no route to host|network is unreachable|connection refused|server misbehaving|proxy authenticat|x509|certificate|not found|does not exist|resource_does_not_exist|no longer exists'
+  local na='forbidden|permission denied|permission_denied|is not authorized|not authorized|access denied'
+  local bt='unauthorized|invalid_client|invalid client|authenticat|oauth|invalid access token|token request failed|expired|credential'
+  if   printf '%s' "$out" | grep -qiE "$ws"; then echo "workspace-gone"
+  elif printf '%s' "$out" | grep -qiE "$na"; then echo "no-access"
+  elif printf '%s' "$out" | grep -qiE "$bt"; then echo "bad-token"
+  elif printf '%s' "$out" | grep -qiE '\b404\b|\b407\b'; then echo "workspace-gone"
+  elif printf '%s' "$out" | grep -qiE '\b403\b'; then echo "no-access"
+  elif printf '%s' "$out" | grep -qiE '\b401\b'; then echo "bad-token"
+  else echo "unknown"
+  fi
+}
+
+sanitize_databricks_output() {
+  # Redact the OAuth secret this script holds so an echoed CLI error can never
+  # carry it, even if a future CLI prints the config it was handed. Quoted
+  # pattern substitution is literal (bash 3.2-safe), so a secret containing glob
+  # or regex metacharacters is still removed whole.
+  local text="$1"
+  if [[ -n "${DATABRICKS_CLIENT_SECRET:-}" ]]; then
+    text="${text//"$DATABRICKS_CLIENT_SECRET"/[redacted]}"
+  fi
+  # Defense in depth, and parity with server/lifecycle.py:_redact_databricks_secrets:
+  # scrub credential-shaped values even when they are not our literal secret (a
+  # rotated/intermediate token, an encoded form, a base64 Basic header). All three
+  # expressions are BSD- and GNU-sed compatible ERE; case is spelled out because
+  # BSD sed has no case-insensitive flag.
+  local keys='[Cc]lient[_-]?[Ss]ecret|[Rr]efresh[_-]?[Tt]oken|[Aa]ccess[_-]?[Tt]oken|[Ss]ecret|[Pp]assword|[Tt]oken'
+  printf '%s' "$text" \
+    | sed -E "s/\"(${keys})\"([[:space:]]*:[[:space:]]*)\"[^\"]*\"/\"\1\"\2\"[redacted]\"/g" \
+    | sed -E "s/(${keys})([[:space:]]*[:=][[:space:]]*)(\"[^\"]*\"|'[^']*'|[^[:space:]\"']+)/\1\2[redacted]/g" \
+    | sed -E 's/([Bb]earer|[Bb]asic)[[:space:]]+[A-Za-z0-9._~+/=-]{16,}/\1 [redacted]/g'
+}
+
 preflight_gate() {
   ((${#PREFLIGHT_FAILURES[@]} > 0)) || return 0
   printf '\n%sFAIL%s  %d preflight %s. Nothing was provisioned and nothing was written\n' \
@@ -1454,16 +1513,48 @@ if ME_JSON="$(databricks current-user me "${DATABRICKS_ARGS[@]}" 2>&1)"; then
     DATABRICKS_OK=1
     ok "authenticated as $DATABRICKS_PRINCIPAL"
   else
-    fail "'databricks current-user me' returned no userName.
-      server/lifecycle.py:_verify_databricks_identity requires one and refuses to provision
-      without it."
+    # A 200 with no userName is not an identity. Naming the host keeps this from
+    # reading as a credential problem when the reply came from the wrong place
+    # (an account-console URL, a proxy login page).
+    fail "Databricks answered at $DATABRICKS_HOST but returned no workspace userName, so no
+      identity could be established. Confirm DATABRICKS_HOST is a workspace URL, not an
+      account console. server/lifecycle.py:_verify_databricks_identity requires a userName
+      and refuses to provision without one."
   fi
 else
-  fail "The service principal could not authenticate to $DATABRICKS_HOST.
+  # One failure, three causes. Say which, name the host in every branch, and echo
+  # a secret-redacted tail of the control plane's own words.
+  DB_ERR="$(sanitize_databricks_output "$ME_JSON" | tail -4)"
+  case "$(databricks_failure_category "$ME_JSON")" in
+    workspace-gone)
+      fail "The Databricks workspace could not be reached or no longer exists: $DATABRICKS_HOST
+      If a reaper or an admin deleted it, DATABRICKS_HOST now points at nothing and the
+      service principal credentials may be perfectly valid. Confirm the workspace exists
+      and DATABRICKS_HOST is its current URL. If the host is right, also confirm you are
+      online and not behind a TLS-intercepting proxy, then re-run.
       'databricks current-user me -p $DATABRICKS_PROFILE' said:
-        $(printf '%s' "$ME_JSON" | tail -2)
-      Check DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET. A personal access token is
-      not accepted here: the mechanism is a workspace service principal's OAuth (M2M) secret."
+        $DB_ERR" ;;
+    no-access)
+      fail "The service principal authenticated, but is not authorized to use the workspace
+      at $DATABRICKS_HOST. Grant this principal workspace access (and the Lakebase / Unity
+      Catalog entitlements Round 4 and Round 6 need), then re-run.
+      'databricks current-user me -p $DATABRICKS_PROFILE' said:
+        $DB_ERR" ;;
+    bad-token)
+      fail "The Databricks workspace at $DATABRICKS_HOST rejected these credentials. Check
+      DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET: this path needs a workspace service
+      principal's OAuth (M2M) secret, not a personal access token. If the workspace was
+      recently deleted or recreated, DATABRICKS_HOST may also be stale.
+      'databricks current-user me -p $DATABRICKS_PROFILE' said:
+        $DB_ERR" ;;
+    *)
+      fail "Could not establish a Databricks identity at $DATABRICKS_HOST. This is one of:
+      the workspace no longer exists, this service principal cannot access it, or
+      DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET are wrong. Verify the host is a live
+      workspace and the OAuth (M2M) credentials belong to it, then re-run.
+      'databricks current-user me -p $DATABRICKS_PROFILE' said:
+        $DB_ERR" ;;
+  esac
 fi
 
 # _verify_databricks_identity treats this as a capability check as well as an
@@ -1476,7 +1567,7 @@ elif LAKEBASE_PROBE="$(databricks postgres list-projects "${DATABRICKS_ARGS[@]}"
 else
   fail "The Lakebase (Databricks Postgres) API is not usable by this principal.
       'databricks postgres list-projects' said:
-        $(printf '%s' "$LAKEBASE_PROBE" | tail -2)
+        $(sanitize_databricks_output "$LAKEBASE_PROBE" | tail -2)
       server/lifecycle.py:_verify_databricks_identity runs the same call and fails the
       provision on it. Either Lakebase is not enabled on this workspace, or this principal
       cannot see it."

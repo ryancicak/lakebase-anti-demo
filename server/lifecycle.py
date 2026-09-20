@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import configparser
 import gzip
 import hashlib
 import io
@@ -280,8 +281,11 @@ def _round_rds_provider(manifest: DemoManifest, round_id: RoundId | int) -> RdsC
 
 
 def _safe_failure(result: subprocess.CompletedProcess[str]) -> RuntimeError:
+    # Redact at this chokepoint so no raw control-plane secret can ride the
+    # RuntimeError -- or its __cause__ via `raise ... from exc` -- into any log or
+    # message, for every subprocess this module runs, not just the identity path.
     lines = (result.stderr or result.stdout or "command failed").strip().splitlines()
-    return RuntimeError(lines[-1] if lines else "command failed")
+    return RuntimeError(_redact_databricks_secrets(lines[-1] if lines else "command failed"))
 
 
 def _run(
@@ -2161,45 +2165,136 @@ def _sql_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(zip(columns, row, strict=False)) for row in data]
 
 
+# Databricks serverless SQL occasionally returns a terminal FAILED for a
+# transient infrastructure reason rather than a fault in the statement. The one
+# observed on an otherwise-clean install was a warehouse node mis-signing an S3
+# request to the workspace's own root bucket ("the authorization header is
+# malformed; the region '...' is wrong"), which failed a Round 4 Delta statement
+# and aborted a ~20-minute provision that had already created every cloud
+# resource. Every statement this module runs is idempotent -- CREATE ... IF NOT
+# EXISTS, a declarative ALTER ... SET TBLPROPERTIES, an entity-keyed MERGE,
+# GRANT, and read-only SELECT/DESCRIBE -- so re-issuing one cannot double-apply.
+# A bounded retry turns that flake into a short delay; a genuine error (missing
+# catalog, denied grant, malformed SQL) is not transient, so it is raised at
+# once and now carries the control plane's own message instead of a bare state.
+_SQL_TRANSIENT_ERROR_SUBSTRINGS: tuple[str, ...] = (
+    "the authorization header is malformed",
+    "awsbadrequestexception",
+    "doesbucketexist",
+    "amazons3exception",
+    "slowdown",
+    "please try again",
+    "try again later",
+    "temporarily",
+    "service unavailable",
+    "timed out",
+    "timeout",
+    "throttl",
+    "rate limit",
+    "connection reset",
+    "connection refused",
+    "internal error",
+    "internalerror",
+    "internal_error",
+    "unavailable",
+    "maintenance",
+)
+
+
+def _sql_statement_error_is_transient(text: str) -> bool:
+    """Whether a control-plane error (code and/or message) looks retryable.
+
+    Callers pass ``error_code`` and ``message`` together, because Databricks
+    sometimes carries the transient signal in the structured code with a terse
+    or empty message.
+    """
+    lowered = text.casefold()
+    return any(token in lowered for token in _SQL_TRANSIENT_ERROR_SUBSTRINGS)
+
+
 def _sql_statement(
     profile: str,
     warehouse_id: str,
     statement: str,
     *,
     timeout: float = 600,
+    max_attempts: int = 4,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout
-    payload = _databricks_api(
-        profile,
-        "post",
-        "/api/2.0/sql/statements",
-        body={
-            "warehouse_id": warehouse_id,
-            "statement": statement,
-            "wait_timeout": "50s",
-            "on_wait_timeout": "CONTINUE",
-            "disposition": "INLINE",
-        },
-        timeout=min(timeout, 120),
-    )
-    while True:
-        state = str(((payload.get("status") or {}).get("state")) or "")
-        if state == "SUCCEEDED":
-            return payload
-        if state in {"FAILED", "CANCELED", "CLOSED"}:
-            raise RuntimeError(f"Databricks SQL statement failed with state {state}")
-        statement_id = str(payload.get("statement_id") or "")
-        if not statement_id:
-            raise RuntimeError("Databricks SQL statement did not return an ID")
-        if time.monotonic() >= deadline:
-            raise RuntimeError("Databricks SQL statement timed out")
-        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    """Run one Databricks SQL statement on ``warehouse_id`` and return its payload.
+
+    CALLERS MUST PASS AN IDEMPOTENT STATEMENT. On a terminal ``FAILED`` whose
+    error code/message looks transient (``_SQL_TRANSIENT_ERROR_SUBSTRINGS``) this
+    re-issues the *entire* statement up to ``max_attempts`` times with
+    exponential backoff, so a non-idempotent statement (a bare ``INSERT``, an
+    append-only ``COPY INTO``) could double-apply. Every current caller uses
+    ``CREATE ... IF NOT EXISTS``, a declarative ``ALTER ... SET TBLPROPERTIES``,
+    an entity-keyed ``MERGE``, ``GRANT``, or a read-only ``SELECT``/``DESCRIBE``.
+    ``CANCELED``/``CLOSED`` and non-transient ``FAILED`` are raised at once, now
+    carrying the control plane's own error code and message. ``timeout`` is a
+    per-attempt budget (each re-issue gets a fresh deadline), so the worst-case
+    wall clock is ``max_attempts * timeout`` plus backoff; a transient ``FAILED``
+    normally returns within ``wait_timeout`` so that ceiling is rarely neared.
+    """
+    for attempt in range(1, max_attempts + 1):
+        deadline = time.monotonic() + timeout
         payload = _databricks_api(
             profile,
-            "get",
-            f"/api/2.0/sql/statements/{quote(statement_id, safe='')}",
-            timeout=120,
+            "post",
+            "/api/2.0/sql/statements",
+            body={
+                "warehouse_id": warehouse_id,
+                "statement": statement,
+                "wait_timeout": "50s",
+                "on_wait_timeout": "CONTINUE",
+                "disposition": "INLINE",
+            },
+            timeout=min(timeout, 120),
         )
+        while True:
+            status = payload.get("status") or {}
+            state = str(status.get("state") or "")
+            if state == "SUCCEEDED":
+                return payload
+            statement_id = str(payload.get("statement_id") or "")
+            if state in {"FAILED", "CANCELED", "CLOSED"}:
+                error = status.get("error") or {}
+                message = str(error.get("message") or "").strip()
+                error_code = str(error.get("error_code") or "").strip()
+                shown = message if len(message) <= 500 else message[:497] + "..."
+                described = f" [{error_code}]" if error_code else ""
+                where = (
+                    f" (warehouse={warehouse_id}, statement={statement_id or 'none'}, "
+                    f"attempt {attempt}/{max_attempts})"
+                )
+                because = f": {shown}" if shown else ""
+                if (
+                    attempt < max_attempts
+                    and state == "FAILED"
+                    and _sql_statement_error_is_transient(f"{error_code} {message}")
+                ):
+                    backoff = min(30.0, 3.0 * 2 ** (attempt - 1))
+                    print(
+                        f"RETRY Databricks SQL hit a transient control-plane error"
+                        f"{described}{where}; retrying in {backoff:.0f}s{because}",
+                        flush=True,
+                    )
+                    time.sleep(backoff)
+                    break
+                raise RuntimeError(
+                    f"Databricks SQL statement failed with state {state}{described}{where}{because}"
+                )
+            if not statement_id:
+                raise RuntimeError("Databricks SQL statement did not return an ID")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("Databricks SQL statement timed out")
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+            payload = _databricks_api(
+                profile,
+                "get",
+                f"/api/2.0/sql/statements/{quote(statement_id, safe='')}",
+                timeout=120,
+            )
+    raise RuntimeError("Databricks SQL statement exhausted all retry attempts")
 
 
 def _round4_catalog(manifest: DemoManifest) -> str:
@@ -2735,16 +2830,222 @@ def _wait_round4_operation(profile: str, operation: dict[str, Any], *, timeout: 
         raise RuntimeError("Round 4 control-plane operation failed")
 
 
+# A failed Databricks identity probe has three operator-actionable causes -- the
+# workspace no longer exists, the principal cannot access it, or the credentials
+# are wrong -- and reporting all three the same way is what sent an operator whose
+# workspace the reaper had deleted to re-issue credentials that were always
+# correct. These markers classify by the control plane's own words. Kept in step
+# with bootstrap.sh:databricks_failure_category; a change here should change both.
+_DATABRICKS_WORKSPACE_GONE_MARKERS: tuple[str, ...] = (
+    "no such host",
+    "could not resolve",
+    "name or service not known",
+    "nodename nor servname",
+    "dial tcp",
+    "no route to host",
+    "network is unreachable",
+    "connection refused",
+    "server misbehaving",
+    "proxy authenticat",
+    "x509",
+    "certificate",
+    "not found",
+    "does not exist",
+    "resource_does_not_exist",
+    "no longer exists",
+)
+_DATABRICKS_NO_ACCESS_MARKERS: tuple[str, ...] = (
+    "forbidden",
+    "permission denied",
+    "permission_denied",
+    "is not authorized",
+    "not authorized",
+    "access denied",
+)
+_DATABRICKS_BAD_TOKEN_MARKERS: tuple[str, ...] = (
+    "unauthorized",
+    "invalid_client",
+    "invalid client",
+    "authenticat",
+    "oauth",
+    "invalid access token",
+    "token request failed",
+    "expired",
+    "credential",
+)
+
+# HTTP status codes are matched \b-anchored, as a backstop after the textual
+# signals above. A bare-substring "404"/"403"/"401" also matches a request/trace
+# id (a7f404e2) or a byte offset (55404123), which would send a bad-token error
+# to the workspace-gone message -- the exact misdirection this classifier exists
+# to prevent. Mirrors bootstrap.sh's \b40x\b anchoring so the two agree.
+_DATABRICKS_HTTP_CODE_RES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\b404\b"), "workspace-gone"),
+    (re.compile(r"\b407\b"), "workspace-gone"),
+    (re.compile(r"\b403\b"), "no-access"),
+    (re.compile(r"\b401\b"), "bad-token"),
+)
+
+# Redact secret-bearing shapes a control-plane error could echo, so an
+# identity-failure message can carry the raw cause without carrying a secret. The
+# bootstrap path redacts its own OAuth secret literally; here the secret is not
+# in hand, so the shape is scrubbed: JSON ("client_secret":"..."), form/ini/query
+# (client_secret=...), and Authorization headers (Bearer/Basic <cred>). A
+# separator or credential shape is required, so free text such as "token request
+# failed" is left readable while a real secret value is not.
+# Secret-bearing key names, tolerant of snake_case, camelCase, PascalCase and
+# hyphen (client_secret / clientSecret / ClientSecret / client-secret) so a
+# Go-style `%#v` config dump or a JS-cased key is scrubbed too.
+_DB_SECRET_KEY = (
+    r"client[_-]?secret|refresh[_-]?token|access[_-]?token"
+    # aws_secret_access_key / aws_session_token: _safe_failure redacts the errors
+    # of every subprocess (aws, terraform, psql), not just Databricks.
+    r"|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?session[_-]?token|secret|password|token"
+)
+_DATABRICKS_SECRET_SUBS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # JSON / dict-repr, single OR double quoted: "client_secret":"..." or
+    # 'client_secret': '...'. The value's quote char is captured and restored so
+    # the replacement keeps the original quoting.
+    (
+        re.compile(rf"""(?i)(["'](?:{_DB_SECRET_KEY})["']\s*:\s*)(["'])[^"']*\2"""),
+        r"\1\2[redacted]\2",
+    ),
+    # key=value / key: value, with a single-quoted, double-quoted, or bare value.
+    (
+        re.compile(rf"""(?i)\b({_DB_SECRET_KEY})(\s*[=:]\s*)(?:'[^']*'|"[^"]*"|[^\s"']+)"""),
+        r"\1\2[redacted]",
+    ),
+    # Authorization headers with a credential-shaped value.
+    (
+        re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/-]{16,}=*"),
+        r"\1\2[redacted]",
+    ),
+)
+
+
+def _redact_databricks_secrets(text: str) -> str:
+    for pattern, replacement in _DATABRICKS_SECRET_SUBS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _classify_databricks_identity_error(raw: str) -> str:
+    """Which of three operator-actionable causes a failed identity probe is.
+
+    Ordered so a deleted workspace's DNS/404 signal wins over the 401 its OAuth
+    endpoint can also emit, and 403 (authenticated but forbidden) is told apart
+    from 401 (credentials rejected). Textual signals decide first because they
+    are unambiguous; \b-anchored HTTP codes are only a backstop for a case the
+    words did not name. Returns ``"unknown"`` when nothing matches, which the
+    message turns into an honest three-way "one of these" rather than a confident
+    wrong guess.
+    """
+    lowered = raw.casefold()
+    if any(marker in lowered for marker in _DATABRICKS_WORKSPACE_GONE_MARKERS):
+        return "workspace-gone"
+    if any(marker in lowered for marker in _DATABRICKS_NO_ACCESS_MARKERS):
+        return "no-access"
+    if any(marker in lowered for marker in _DATABRICKS_BAD_TOKEN_MARKERS):
+        return "bad-token"
+    for pattern, category in _DATABRICKS_HTTP_CODE_RES:
+        if pattern.search(raw):
+            return category
+    return "unknown"
+
+
+def _databricks_profile_host(profile: str) -> str:
+    """Best-effort workspace host for a profile; ``""`` if it cannot be read.
+
+    Names the workspace in a failure message without letting an unreadable or
+    absent config turn the message itself into a second, more confusing failure.
+    """
+    path = os.environ.get("DATABRICKS_CONFIG_FILE") or os.path.expanduser("~/.databrickscfg")
+    # RawConfigParser: a host value containing '%' must not raise
+    # InterpolationError and become the second, more confusing failure this
+    # helper exists to avoid.
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path)
+        if parser.has_section(profile):
+            return str(parser.get(profile, "host", fallback="") or "")
+    except (OSError, configparser.Error):
+        return ""
+    return ""
+
+
+def _databricks_identity_failure_message(*, host: str, profile: str, raw: str) -> str:
+    """Operator-facing identity-failure text: names the cause and host, not a secret.
+
+    Same taxonomy and lead phrasing as bootstrap.sh so the two preflight surfaces
+    cannot disagree about what a given control-plane error means.
+    """
+    where = host or f"profile {profile!r}"
+    scrubbed = _redact_databricks_secrets(raw).strip().splitlines()
+    detail = scrubbed[-1].strip() if scrubbed else "no error detail"
+    category = _classify_databricks_identity_error(raw)
+    if category == "workspace-gone":
+        lead = (
+            f"The Databricks workspace could not be reached or no longer exists: {where}. "
+            "If it was deleted, the service principal credentials may still be valid; confirm "
+            "the workspace exists and DATABRICKS_HOST is current. If the host is right, also "
+            "confirm you are online and not behind a TLS-intercepting proxy."
+        )
+    elif category == "no-access":
+        lead = (
+            f"The service principal is not authorized to use the workspace at {where}. Grant it "
+            "workspace access and the Lakebase / Unity Catalog entitlements, then retry."
+        )
+    elif category == "bad-token":
+        lead = (
+            f"Databricks rejected these credentials at {where}. Verify the service principal "
+            "OAuth (M2M) client id and secret; a personal access token is not accepted here."
+        )
+    else:
+        lead = (
+            f"Could not establish a Databricks identity at {where}: the workspace may not exist, "
+            "the principal may lack access, or the OAuth credentials may be wrong."
+        )
+    return f"{lead} Databricks said: {detail}"
+
+
 def _verify_databricks_identity(profile: str) -> str:
-    current_user = _databricks_json(profile, "current-user", "me")
+    try:
+        current_user = _databricks_json(profile, "current-user", "me")
+    except Exception as exc:
+        # ``str(exc)`` here is the redacted last line of the CLI's stderr
+        # (``_safe_failure``). The Databricks CLI emits single-line ``Error:``
+        # messages, so this carries the classifying signal in practice; the
+        # bootstrap.sh preflight classifies the full multi-line capture, and the
+        # shared behavioral corpus keeps the two in step on the single-line
+        # errors the CLI actually produces.
+        raise RuntimeError(
+            _databricks_identity_failure_message(
+                host=_databricks_profile_host(profile), profile=profile, raw=str(exc)
+            )
+        ) from exc
     user = str(current_user.get("userName") or "")
     if not user:
-        raise RuntimeError("Databricks profile did not resolve to a workspace user")
+        where = _databricks_profile_host(profile) or f"profile {profile!r}"
+        raise RuntimeError(
+            f"Databricks answered at {where} but returned no workspace userName, so no identity "
+            "could be established. Confirm DATABRICKS_HOST is a workspace URL, not an account "
+            "console."
+        )
     # This is a capability check as well as an authentication check.
-    _run(
-        ["databricks", "postgres", "list-projects", "-p", profile, "-o", "json"],
-        capture=True,
-    )
+    try:
+        _run(
+            ["databricks", "postgres", "list-projects", "-p", profile, "-o", "json"],
+            capture=True,
+        )
+    except Exception as exc:
+        where = _databricks_profile_host(profile) or f"profile {profile!r}"
+        scrubbed = _redact_databricks_secrets(str(exc)).strip().splitlines()
+        detail = scrubbed[-1].strip() if scrubbed else "no error detail"
+        raise RuntimeError(
+            f"Databricks authenticated as {user} at {where}, but the Lakebase (Postgres) API is "
+            "not usable by this principal. Enable Lakebase on the workspace or grant this "
+            f"principal access, then retry. Databricks said: {detail}"
+        ) from exc
     return user
 
 
