@@ -274,8 +274,44 @@ class ConnectionSpikeLiveConfigurationError(ConnectionSpikeLiveError):
     """A runtime value disagrees with the sealed Round 5 contract."""
 
 
+class ConnectionSpikeLiveTransientError(ConnectionSpikeLiveError):
+    """A live dependency is temporarily unable to prove the sealed contract."""
+
+
 class ConnectionSpikeLiveOperationError(ConnectionSpikeLiveError):
     """The remote runner did not produce a complete, sanitized proof."""
+
+
+def _require_warm_runner_online(
+    runners: Sequence[Mapping[str, object]],
+    *,
+    expected_instance_id: str,
+    lane_id: str,
+) -> None:
+    """Distinguish immutable runner drift from temporary SSM availability."""
+
+    if len(runners) > 1 or (
+        len(runners) == 1 and runners[0].get("InstanceId") != expected_instance_id
+    ):
+        raise ConnectionSpikeLiveConfigurationError(
+            f"Round 5 {lane_id} physical runner identity changed"
+        )
+    if not runners:
+        raise ConnectionSpikeLiveTransientError(
+            f"Round 5 {lane_id} runner is temporarily absent from SSM "
+            "(observed_count=0)"
+        )
+    ping_status = runners[0].get("PingStatus")
+    if ping_status == "ConnectionLost":
+        raise ConnectionSpikeLiveTransientError(
+            f"Round 5 {lane_id} runner is temporarily unavailable in SSM "
+            "(ping_status=ConnectionLost)"
+        )
+    if ping_status != "Online":
+        raise ConnectionSpikeLiveConfigurationError(
+            f"Round 5 {lane_id} runner has invalid SSM ping status "
+            f"(ping_status={ping_status!r})"
+        )
 
 
 class ConnectionSpikeCleanupError(ConnectionSpikeLiveOperationError):
@@ -1381,16 +1417,20 @@ class LiveConnectionSpikeSetupOrchestrator:
             or source.status != "available"
             or source.vpc_id != self.config.vpc_id
             or source.security_group_ids != (self.config.competitor_security_group_id,)
-            or len(lakebase_runners) != 1
-            or lakebase_runners[0].get("InstanceId") != self.config.runner_instance_id
-            or lakebase_runners[0].get("PingStatus") != "Online"
-            or len(competitor_runners) != 1
-            or competitor_runners[0].get("InstanceId") != self.config.competitor_runner_instance_id
-            or competitor_runners[0].get("PingStatus") != "Online"
         ):
             raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 warm source or physical runner identity changed"
+                "Round 5 warm source identity changed"
             )
+        _require_warm_runner_online(
+            lakebase_runners,
+            expected_instance_id=self.config.runner_instance_id,
+            lane_id="lakebase",
+        )
+        _require_warm_runner_online(
+            competitor_runners,
+            expected_instance_id=self.config.competitor_runner_instance_id,
+            lane_id="competitor",
+        )
         await self._verify_proxy_service_role(clients)
         await self._verify_static_proxy_network(clients)
         await self._discover_orphaned_addons(
@@ -5083,7 +5123,7 @@ class LiveConnectionSpikeAdapter:
         ]
         managed_instances = managed.get("InstanceInformationList") or []
         security_groups = groups.get("SecurityGroups") or []
-        if len(instances) != 1 or len(managed_instances) != 1 or len(security_groups) != 1:
+        if len(instances) != 1 or len(security_groups) != 1:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 runner topology did not resolve exactly once"
             )
@@ -5091,7 +5131,6 @@ class LiveConnectionSpikeAdapter:
         metadata = instance.get("MetadataOptions") or {}
         profile = instance.get("IamInstanceProfile") or {}
         group_ids = {value.get("GroupId") for value in instance.get("SecurityGroups") or []}
-        managed_instance = managed_instances[0]
         security_group = security_groups[0]
         if (
             instance.get("InstanceId") != self.config.runner_instance_id
@@ -5102,12 +5141,22 @@ class LiveConnectionSpikeAdapter:
             or group_ids != {self.config.runner_security_group_id}
             or not instance.get("PublicIpAddress")
             or metadata.get("HttpTokens") != "required"
-            or managed_instance.get("InstanceId") != self.config.runner_instance_id
-            or managed_instance.get("PingStatus") != "Online"
-            or managed_instance.get("PlatformType") != "Linux"
             or security_group.get("GroupId") != self.config.runner_security_group_id
             or bool(security_group.get("IpPermissions"))
         ):
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 runner topology differs from the sealed contract"
+            )
+        _require_warm_runner_online(
+            managed_instances,
+            expected_instance_id=self.config.runner_instance_id,
+            lane_id=str(
+                getattr(self.config, "runner_lane", "")
+                or (self.config.targets[0].lane_id if self.config.targets else "runner")
+            ),
+        )
+        managed_instance = managed_instances[0]
+        if managed_instance.get("PlatformType") != "Linux":
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 runner topology differs from the sealed contract"
             )
@@ -7769,6 +7818,7 @@ class LiveRound5WarmProvider:
         if isinstance(
             error,
             (
+                ConnectionSpikeLiveTransientError,
                 TimeoutError,
                 ConnectionError,
                 ConnectTimeoutError,

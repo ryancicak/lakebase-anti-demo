@@ -988,8 +988,9 @@ async def test_warm_baseline_classification_splits_at_the_raise_site() -> None:
     # under a bare ``except Exception``:
     #   * a typed config/identity/orphan-Proxy/fixture defect
     #     (ConnectionSpikeLiveConfigurationError) is PERMANENT -> BlockedWarmError.
-    #   * a transient throttle/timeout is RETRYABLE -> RetryableWarmError, never a
-    #     terminal block (a BLOCKED slot is never re-attempted by the same process).
+    #   * transient runner availability, throttle, or timeout is RETRYABLE ->
+    #     RetryableWarmError, never a terminal block (a BLOCKED slot is never
+    #     re-attempted by the same process).
     from server import connection_spike_live as live
 
     class _Engine:
@@ -1026,6 +1027,23 @@ async def test_warm_baseline_classification_splits_at_the_raise_site() -> None:
     )
     with pytest.raises(RetryableWarmError) as retry:
         await prov_throttle.prepare(
+            generation=1,
+            coordinator_fence=1,
+            process_epoch="p",
+            broker_epoch="b",
+            warm_attempt_token="t",
+        )
+    assert retry.value.code == "warm_provider_retryable"
+    assert not isinstance(retry.value, BlockedWarmError)
+
+    prov_ssm_ping = object.__new__(live.LiveRound5WarmProvider)
+    prov_ssm_ping._engine_factory = lambda competitor_id: _Engine(
+        live.ConnectionSpikeLiveTransientError(
+            "Round 5 lakebase runner is temporarily unavailable in SSM"
+        )
+    )
+    with pytest.raises(RetryableWarmError) as retry:
+        await prov_ssm_ping.prepare(
             generation=1,
             coordinator_fence=1,
             process_epoch="p",
