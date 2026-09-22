@@ -16,11 +16,14 @@ from server.connection_spike_journal import CreationScope, JournalEvent, Resourc
 from server.connection_spike_live import (
     ConnectionSpikeLiveConfigurationError,
     ConnectionSpikeLiveOperationError,
+    ConnectionSpikeLiveTransientError,
     ConnectionSpikeSetupConfig,
     ConnectionSpikeSetupLaneStop,
     LakebaseCreationJournalStore,
+    LiveConnectionSpikeAdapter,
     LiveConnectionSpikeEngine,
     LiveConnectionSpikeSetupOrchestrator,
+    _require_warm_runner_online,
     connection_spike_config_sha256,
     connection_spike_live_config_from_manifest,
     connection_spike_setup_config_from_manifest,
@@ -29,6 +32,134 @@ from server.coordination import round_ring_key
 from server.manager import RunManager, operator_diagnosis
 
 ACCOUNT = "123456789012"
+
+
+def test_warm_runner_ssm_outage_is_retryable_without_hiding_identity_drift() -> None:
+    with pytest.raises(ConnectionSpikeLiveTransientError, match="temporarily unavailable"):
+        _require_warm_runner_online(
+            [{"InstanceId": "i-0123456789abcdef0", "PingStatus": "ConnectionLost"}],
+            expected_instance_id="i-0123456789abcdef0",
+            lane_id="lakebase",
+        )
+    with pytest.raises(ConnectionSpikeLiveTransientError, match="temporarily absent"):
+        _require_warm_runner_online(
+            [],
+            expected_instance_id="i-0123456789abcdef0",
+            lane_id="lakebase",
+        )
+    with pytest.raises(ConnectionSpikeLiveConfigurationError, match="identity changed"):
+        _require_warm_runner_online(
+            [{"InstanceId": "i-0fedcba9876543210", "PingStatus": "ConnectionLost"}],
+            expected_instance_id="i-0123456789abcdef0",
+            lane_id="lakebase",
+        )
+    with pytest.raises(ConnectionSpikeLiveConfigurationError, match="invalid SSM ping status"):
+        _require_warm_runner_online(
+            [{"InstanceId": "i-0123456789abcdef0", "PingStatus": "Inactive"}],
+            expected_instance_id="i-0123456789abcdef0",
+            lane_id="lakebase",
+        )
+
+
+async def test_real_warm_and_preflight_paths_retry_connection_lost() -> None:
+    runner_id = "i-0123456789abcdef0"
+    competitor_runner_id = "i-0fedcba9876543210"
+
+    class Ssm:
+        def describe_instance_information(self, **kwargs):
+            instance_id = kwargs["Filters"][0]["Values"][0]
+            return {
+                "InstanceInformationList": [
+                    {
+                        "InstanceId": instance_id,
+                        "PingStatus": "ConnectionLost",
+                        "PlatformType": "Linux",
+                    }
+                ]
+            }
+
+    setup = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    setup.config = SimpleNamespace(
+        runner_instance_id=runner_id,
+        competitor_runner_instance_id=competitor_runner_id,
+        competitor_target_id="rds-source",
+        competitor_resource_id="db-RESOURCE",
+        competitor_direct_host="rds-direct.test",
+        vpc_id="vpc-sealed",
+        competitor_security_group_id="sg-rds",
+    )
+    clients = SimpleNamespace(ssm=Ssm())
+
+    async def assumed_clients(_session_name):
+        return clients
+
+    async def read_source(_clients):
+        return SimpleNamespace(
+            identifier="rds-source",
+            resource_id="db-RESOURCE",
+            direct_host="rds-direct.test",
+            status="available",
+            vpc_id="vpc-sealed",
+            security_group_ids=("sg-rds",),
+        )
+
+    setup._assumed_clients = assumed_clients
+    setup._read_competitor_source = read_source
+    with pytest.raises(ConnectionSpikeLiveTransientError, match="ConnectionLost"):
+        await setup.warm(4)
+
+    adapter = object.__new__(LiveConnectionSpikeAdapter)
+    adapter.config = SimpleNamespace(
+        runner_instance_id=runner_id,
+        runner_security_group_id="sg-runner",
+        runner_lane="lakebase",
+        runner_instance_type="c7i.2xlarge",
+        runner_subnet_id="subnet-runner",
+        runner_instance_profile_arn=(
+            f"arn:aws:iam::{ACCOUNT}:instance-profile/runner"
+        ),
+    )
+    instance_state = "running"
+    preflight_clients = SimpleNamespace(
+        ssm=Ssm(),
+        ec2=SimpleNamespace(
+            describe_instances=lambda **_kwargs: {
+                "Reservations": [
+                    {
+                        "Instances": [
+                            {
+                                "InstanceId": runner_id,
+                                    "State": {"Name": instance_state},
+                                "InstanceType": "c7i.2xlarge",
+                                "SubnetId": "subnet-runner",
+                                "IamInstanceProfile": {
+                                    "Arn": (
+                                        f"arn:aws:iam::{ACCOUNT}:instance-profile/runner"
+                                    )
+                                },
+                                "SecurityGroups": [{"GroupId": "sg-runner"}],
+                                "PublicIpAddress": "203.0.113.10",
+                                "MetadataOptions": {"HttpTokens": "required"},
+                            }
+                        ]
+                    }
+                ]
+            },
+            describe_security_groups=lambda **_kwargs: {
+                "SecurityGroups": [
+                    {
+                        "GroupId": "sg-runner",
+                        "IpPermissions": [],
+                    }
+                ]
+            },
+        ),
+    )
+    with pytest.raises(ConnectionSpikeLiveTransientError, match="ConnectionLost"):
+        await adapter._preflight_runner(preflight_clients)
+    instance_state = "stopped"
+    with pytest.raises(ConnectionSpikeLiveConfigurationError, match="sealed contract"):
+        await adapter._preflight_runner(preflight_clients)
 
 
 async def test_creation_journal_store_uses_parameterized_append_only_boundaries() -> None:
