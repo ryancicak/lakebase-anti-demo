@@ -97,6 +97,13 @@ class CountingJournal:
         self.reads += 1
         return tuple(self.unresolved)
 
+    async def admitted_lifecycle_states(self):
+        # Req #3: the live CHECK admits exactly the code's lifecycle states, so the
+        # readiness journal-contract guard passes.
+        from server.lifecycle import ROUND5_JOURNAL_LIFECYCLE_STATES
+
+        return set(ROUND5_JOURNAL_LIFECYCLE_STATES)
+
     async def scopes(self, bout_id):
         return (SimpleNamespace(bout_id=bout_id),)
 
@@ -123,6 +130,81 @@ def manifest(*, round5_ready: bool = False):
         round4=SimpleNamespace(app_service_principal_client_id="app-client-id"),
         model_dump_json=lambda **_kwargs: '{"run_id":"ad-readiness-001"}',
     )
+
+
+async def test_v4_readiness_observes_debt_without_becoming_second_cleanup_owner() -> None:
+    main_leases = DurableFakeLeaseStore()
+    round5_leases = DurableFakeLeaseStore(ring_key=ROUND5_RING_KEY)
+    gate = ShowtimeReadinessGate(
+        manifest(round5_ready=True),
+        main_leases,
+        round5_lease_store=round5_leases,
+        safe_change_factory=lambda _manifest: CleanupEngine([], "round2"),
+        recovery_factory=lambda _manifest: CleanupEngine([], "round3"),
+        round5_factory=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("startup readiness must not create a second AWS cleanup owner")
+        ),
+        round5_cleanup_delegated=True,
+        state_store=FakeReadinessStore(main_leases),
+        round5_state_store=FakeReadinessStore(round5_leases),
+    )
+    journal = SimpleNamespace(
+        unresolved_bout_ids=lambda: asyncio.sleep(0, result=("bout-owned",))
+    )
+
+    steady = await gate._round5_iteration(
+        gate._round5_store,
+        round5_leases,
+        journal,
+    )
+
+    assert steady is False
+    assert await round5_leases.current() is None
+    assert gate.round5_status.reason_code == "cleanup_in_progress"
+
+
+async def test_round5_nonretryable_reconstruction_failure_never_gives_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main_leases = DurableFakeLeaseStore()
+    round5_leases = DurableFakeLeaseStore(ring_key=ROUND5_RING_KEY)
+    journal = SimpleNamespace(
+        unresolved_bout_ids=lambda: asyncio.sleep(0, result=("bout-owned",))
+    )
+    monkeypatch.setattr(
+        readiness_module,
+        "LakebaseCreationJournalStore",
+        lambda *_args, **_kwargs: journal,
+    )
+    gate = ShowtimeReadinessGate(
+        manifest(round5_ready=True),
+        main_leases,
+        round5_lease_store=round5_leases,
+        safe_change_factory=lambda _manifest: CleanupEngine([], "round2"),
+        recovery_factory=lambda _manifest: CleanupEngine([], "round3"),
+        round5_factory=lambda *_args: object(),
+        state_store=FakeReadinessStore(main_leases),
+        round5_state_store=FakeReadinessStore(round5_leases),
+        poll_seconds=0.001,
+        retry_ceiling_seconds=0.001,
+    )
+
+    async def broken_reconstruction(**_kwargs):
+        raise RuntimeError("empty journal cannot reconstruct engine")
+
+    monkeypatch.setattr(gate, "_lead_round5_cleanup", broken_reconstruction)
+    task = asyncio.create_task(gate._run_round5())
+    try:
+        for _ in range(100):
+            if gate.round5_recovery.attempts:
+                break
+            await asyncio.sleep(0.001)
+        assert gate.round5_recovery.state == "escalated"
+        assert gate.round5_recovery.error == "RuntimeError"
+        assert gate.round5_recovery.state != "given_up"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def test_durable_ready_generation_makes_replica_cleanup_a_singleton() -> None:
@@ -259,6 +341,11 @@ async def test_round5_monitor_reconciles_old_bout_after_active_lease_releases(
         async def unresolved_bout_ids(self):
             return tuple(self.unresolved)
 
+        async def admitted_lifecycle_states(self):
+            from server.lifecycle import ROUND5_JOURNAL_LIFECYCLE_STATES
+
+            return set(ROUND5_JOURNAL_LIFECYCLE_STATES)
+
         async def scopes(self, bout_id):
             return (SimpleNamespace(bout_id=bout_id),)
 
@@ -342,6 +429,11 @@ async def test_round5_prearm_guard_rejects_other_unresolved_bout(
 
         async def unresolved_bout_ids(self):
             return self.unresolved
+
+        async def admitted_lifecycle_states(self):
+            from server.lifecycle import ROUND5_JOURNAL_LIFECYCLE_STATES
+
+            return set(ROUND5_JOURNAL_LIFECYCLE_STATES)
 
     journal = FakeJournal()
     monkeypatch.setattr(

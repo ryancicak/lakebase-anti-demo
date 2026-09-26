@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import gzip
 import hashlib
@@ -10,10 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import _Round5ArtifactCleanupFence
 from runner import round5_fanin as runner_fanin
 from server.connection_spike import arm_setup_phase, finalize_setup_phase
 from server.connection_spike_journal import CreationScope, JournalEvent, ResourceSpec
 from server.connection_spike_live import (
+    PROXY_DELETE_ABSENCE_CONFIRMATIONS,
+    ConnectionSpikeCleanupError,
     ConnectionSpikeLiveConfigurationError,
     ConnectionSpikeLiveOperationError,
     ConnectionSpikeLiveTransientError,
@@ -29,9 +33,1006 @@ from server.connection_spike_live import (
     connection_spike_setup_config_from_manifest,
 )
 from server.coordination import round_ring_key
-from server.manager import RunManager, operator_diagnosis
+from server.manager import InvalidStateError, RunManager, operator_diagnosis
 
 ACCOUNT = "123456789012"
+
+
+async def test_cleanup_fence_accepts_exact_active_bout_lease_for_setup() -> None:
+    active = SimpleNamespace(
+        session_id="bout",
+        fencing_token=43,
+        phase="checking",
+    )
+
+    class Store:
+        async def current(self):
+            return active
+
+    fence = _Round5ArtifactCleanupFence(Store())
+
+    await fence.assert_current(CreationScope("bout", 43, "b" * 64))
+
+
+async def test_cleanup_fence_refuses_to_adopt_an_active_artifact_lease() -> None:
+    active = SimpleNamespace(
+        session_id="another-session",
+        fencing_token=43,
+        phase="run_committed",
+    )
+    reclaim_calls = 0
+
+    class Store:
+        async def current(self):
+            return active
+
+        async def reclaim_expired_cleanup(self, **_kwargs):
+            nonlocal reclaim_calls
+            reclaim_calls += 1
+
+    fence = _Round5ArtifactCleanupFence(Store())
+    scope = CreationScope("bout", 43, "b" * 64)
+
+    with pytest.raises(InvalidStateError, match="still active"):
+        await fence.reclaim_expired_cleanup(scope)
+
+    assert reclaim_calls == 0
+
+
+async def test_cleanup_fence_adopts_recovery_session_cleanup_lease() -> None:
+    """A replacement warm process may continue the one recovery-owned lease."""
+
+    active = SimpleNamespace(
+        session_id="642cc8be414d47f5a8d51dc24dc29d74",
+        fencing_token=44,
+        phase="round5_cleanup",
+        owner_subject="round5-cleanup-recovery",
+    )
+    releases: list[object] = []
+
+    class Store:
+        async def current(self):
+            return active
+
+        async def release(self, lease):
+            releases.append(lease)
+            return True
+
+        async def renew(self, lease, *, ttl):
+            del ttl
+            return lease
+
+    fence = _Round5ArtifactCleanupFence(Store())
+    recovered = await fence.reclaim_expired_cleanup(
+        CreationScope("bout-16258e04b47ab9df", 43, "b" * 64)
+    )
+    await fence.assert_current(recovered)
+    await fence.release_cleanup(recovered)
+
+    assert recovered.fencing_token == 44
+    assert fence._cleanup_leases == {}
+    assert releases == []
+
+
+async def test_cleanup_fence_never_adopts_live_manager_cleanup_lease() -> None:
+    active = SimpleNamespace(
+        session_id="642cc8be414d47f5a8d51dc24dc29d74",
+        fencing_token=44,
+        phase="round5_cleanup",
+        owner_subject="manager@example.com",
+    )
+
+    class Store:
+        async def current(self):
+            return active
+
+    fence = _Round5ArtifactCleanupFence(Store())
+
+    with pytest.raises(InvalidStateError, match="owner is still active"):
+        await fence.reclaim_expired_cleanup(CreationScope("bout", 43, "b" * 64))
+
+
+async def test_cleanup_fence_renews_and_releases_its_reclaimed_lease() -> None:
+    reclaimed = SimpleNamespace(
+        lease_id="lease-reclaimed",
+        session_id="bout",
+        fencing_token=44,
+    )
+    renewals: list[float] = []
+    releases: list[object] = []
+
+    class Store:
+        async def current(self):
+            return None
+
+        async def reclaim_expired_cleanup(self, **kwargs):
+            assert kwargs["session_id"] == "bout"
+            assert kwargs["expected_previous_token"] == 43
+            assert kwargs["ttl"] == timedelta(seconds=90)
+            return reclaimed
+
+        async def renew(self, lease, *, ttl):
+            assert lease is reclaimed
+            renewals.append(ttl.total_seconds())
+            return lease
+
+        async def release(self, lease):
+            releases.append(lease)
+            return True
+
+    fence = _Round5ArtifactCleanupFence(Store())
+    recovered = await fence.reclaim_expired_cleanup(
+        CreationScope("bout", 43, "b" * 64)
+    )
+    await fence.assert_current(recovered)
+    recovered_again = await fence.reclaim_expired_cleanup(recovered)
+    await fence.release_cleanup(recovered_again)
+
+    assert recovered.fencing_token == 44
+    assert renewals == [90.0, 90.0]
+    assert releases == [reclaimed]
+
+
+async def test_missing_process_cleanup_graph_never_claims_delete_acceptance() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._coordinators = {}
+    orchestrator._scopes = {}
+    orchestrator._proxy_delete_accepted = {}
+
+    with pytest.raises(
+        ConnectionSpikeCleanupError,
+        match="durable resource reconstruction",
+    ):
+        await orchestrator._cleanup_exactly("bout-missing-graph")
+
+    assert orchestrator.proxy_delete_accepted("bout-missing-graph") is False
+
+
+async def test_reconstructed_cleanup_accepts_delete_already_in_flight() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator.config = SimpleNamespace(poll_interval_seconds=0)
+    orchestrator._proxy_delete_accepted = {}
+    orchestrator._sleep = lambda _seconds: asyncio.sleep(0)
+
+    class InvalidState(Exception):
+        response = {"Error": {"Code": "InvalidDBProxyStateFault"}}
+
+    class Rds:
+        async def delete_db_proxy(self, **_kwargs):
+            raise InvalidState()
+
+    async def call(operation, **kwargs):
+        return await operation(**kwargs)
+
+    orchestrator._call = call
+    orchestrator._inspect_proxy = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=None
+    )
+    observed = SimpleNamespace(
+        deterministic_name="owned-proxy",
+        metadata={},
+        provider_id="arn:aws:rds:us-west-2:123456789012:db-proxy:owned",
+    )
+
+    await orchestrator._delete_proxy(
+        SimpleNamespace(rds=Rds()),
+        observed,
+        bout_id="bout-delete-in-flight",
+    )
+
+    assert orchestrator.proxy_delete_accepted("bout-delete-in-flight") is True
+
+
+async def test_invalid_state_without_deleting_does_not_claim_delete_acceptance() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator.config = SimpleNamespace(poll_interval_seconds=0)
+    orchestrator._proxy_delete_accepted = {}
+
+    class InvalidState(Exception):
+        response = {"Error": {"Code": "InvalidDBProxyStateFault"}}
+
+    arn = "arn:aws:rds:us-west-2:123456789012:db-proxy:owned"
+
+    class Rds:
+        async def delete_db_proxy(self, **_kwargs):
+            raise InvalidState()
+
+        async def describe_db_proxies(self, **_kwargs):
+            return {"DBProxies": [{"DBProxyArn": arn, "Status": "modifying"}]}
+
+    async def call(operation, **kwargs):
+        return await operation(**kwargs)
+
+    observed = SimpleNamespace(
+        deterministic_name="owned-proxy",
+        metadata={},
+        provider_id=arn,
+    )
+    orchestrator._call = call
+    orchestrator._inspect_proxy = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=observed
+    )
+
+    with pytest.raises(InvalidState):
+        await orchestrator._delete_proxy(
+            SimpleNamespace(rds=Rds()),
+            observed,
+            bout_id="bout-not-deleting",
+        )
+
+    assert orchestrator.proxy_delete_accepted("bout-not-deleting") is False
+
+
+async def test_visible_deleting_proxy_accepts_duplicate_delete_handoff() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator.config = SimpleNamespace(poll_interval_seconds=0)
+    orchestrator._proxy_delete_accepted = {}
+    orchestrator._sleep = lambda _seconds: asyncio.sleep(0)
+
+    class InvalidState(Exception):
+        response = {"Error": {"Code": "InvalidDBProxyStateFault"}}
+
+    arn = "arn:aws:rds:us-west-2:123456789012:db-proxy:owned"
+
+    class Rds:
+        async def delete_db_proxy(self, **_kwargs):
+            raise InvalidState()
+
+        async def describe_db_proxies(self, **_kwargs):
+            return {"DBProxies": [{"DBProxyArn": arn, "Status": "deleting"}]}
+
+    async def call(operation, **kwargs):
+        return await operation(**kwargs)
+
+    observed = SimpleNamespace(
+        deterministic_name="owned-proxy",
+        metadata={},
+        provider_id=arn,
+    )
+    inspections = 0
+
+    async def inspect(*_args, **_kwargs):
+        nonlocal inspections
+        inspections += 1
+        return observed if inspections == 1 else None
+
+    orchestrator._call = call
+    orchestrator._inspect_proxy = inspect
+
+    await orchestrator._delete_proxy(
+        SimpleNamespace(rds=Rds()),
+        observed,
+        bout_id="bout-deleting",
+    )
+
+    assert orchestrator.proxy_delete_accepted("bout-deleting") is True
+
+
+async def test_proxy_delete_poll_renews_cleanup_authority() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator.config = SimpleNamespace(poll_interval_seconds=0)
+    orchestrator._proxy_delete_accepted = {}
+    orchestrator._sleep = lambda _seconds: asyncio.sleep(0)
+    arn = "arn:aws:rds:us-west-2:123456789012:db-proxy:owned"
+
+    class Rds:
+        async def delete_db_proxy(self, **_kwargs):
+            return {}
+
+    async def call(operation, **kwargs):
+        return await operation(**kwargs)
+
+    observed = SimpleNamespace(
+        deterministic_name="owned-proxy",
+        metadata={},
+        provider_id=arn,
+    )
+    inspections = 0
+    authority_calls = 0
+
+    async def inspect(*_args, **_kwargs):
+        nonlocal inspections
+        inspections += 1
+        return observed if inspections <= 2 else None
+
+    async def authority() -> None:
+        nonlocal authority_calls
+        authority_calls += 1
+
+    orchestrator._call = call
+    orchestrator._inspect_proxy = inspect
+
+    await orchestrator._delete_proxy(
+        SimpleNamespace(rds=Rds()),
+        observed,
+        bout_id="bout-poll-renewal",
+        assert_authority=authority,
+    )
+
+    assert authority_calls == 1 + PROXY_DELETE_ABSENCE_CONFIRMATIONS
+    assert orchestrator.proxy_delete_accepted("bout-poll-renewal") is True
+
+
+async def test_stale_cleanup_never_mutates_replacement_proxy_children() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    reset: list[str] = []
+    resources = SimpleNamespace(
+        proxy_arn="arn:aws:rds:us-west-2:123456789012:db-proxy:old",
+        names=SimpleNamespace(proxy_name="deterministic-proxy"),
+    )
+    child = SimpleNamespace(metadata={"tags": {"anti-demo:bout-fence": "43"}})
+    orchestrator._inspect_proxy = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=None
+    )
+    orchestrator._reset_target_group = lambda *_args: asyncio.sleep(
+        0, result=reset.append("reset")
+    )
+    orchestrator._deregister_proxy_target = lambda *_args: asyncio.sleep(
+        0, result=reset.append("deregister")
+    )
+    async def assert_authority() -> None:
+        return None
+
+    await orchestrator._reset_target_group_if_parent_matches(
+        object(), resources, child, assert_authority
+    )
+    await orchestrator._deregister_proxy_target_if_parent_matches(
+        object(), resources, child, assert_authority
+    )
+
+    assert reset == []
+
+
+async def test_matching_parent_cleanup_mutates_owned_children() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    mutations: list[str] = []
+    resources = SimpleNamespace(
+        proxy_arn="arn:aws:rds:us-west-2:123456789012:db-proxy:owned",
+        names=SimpleNamespace(proxy_name="deterministic-proxy"),
+    )
+    child = SimpleNamespace(metadata={"tags": {"anti-demo:bout-fence": "43"}})
+    orchestrator._inspect_proxy = lambda *_args, **_kwargs: asyncio.sleep(
+        0, result=SimpleNamespace()
+    )
+    orchestrator._reset_target_group = lambda *_args: asyncio.sleep(
+        0, result=mutations.append("reset")
+    )
+    orchestrator._deregister_proxy_target = lambda *_args: asyncio.sleep(
+        0, result=mutations.append("deregister")
+    )
+    async def assert_authority() -> None:
+        return None
+
+    await orchestrator._reset_target_group_if_parent_matches(
+        object(), resources, child, assert_authority
+    )
+    await orchestrator._deregister_proxy_target_if_parent_matches(
+        object(), resources, child, assert_authority
+    )
+
+    assert mutations == ["reset", "deregister"]
+
+
+async def test_empty_parent_arn_never_authorizes_child_mutation() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    resources = SimpleNamespace(
+        proxy_arn="",
+        names=SimpleNamespace(proxy_name="deterministic-proxy"),
+    )
+    child = SimpleNamespace(metadata={"tags": {"anti-demo:bout-fence": "43"}})
+    inspected = False
+
+    async def inspect(*_args, **_kwargs):
+        nonlocal inspected
+        inspected = True
+        return SimpleNamespace()
+
+    orchestrator._inspect_proxy = inspect
+
+    assert (
+        await orchestrator._cleanup_parent_matches(object(), resources, child)
+        is False
+    )
+    assert inspected is False
+
+
+async def test_cleanup_rechecks_parent_after_authority_before_name_mutation() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    mutations: list[str] = []
+    parent_present = True
+    resources = SimpleNamespace(
+        proxy_arn="arn:aws:rds:us-west-2:123456789012:db-proxy:old",
+        names=SimpleNamespace(proxy_name="deterministic-proxy"),
+    )
+    child = SimpleNamespace(metadata={"tags": {"anti-demo:bout-fence": "43"}})
+
+    async def inspect(*_args, **_kwargs):
+        return SimpleNamespace() if parent_present else None
+
+    async def authority() -> None:
+        nonlocal parent_present
+        parent_present = False
+
+    orchestrator._inspect_proxy = inspect
+    orchestrator._reset_target_group = lambda *_args: asyncio.sleep(
+        0, result=mutations.append("reset")
+    )
+
+    await orchestrator._reset_target_group_if_parent_matches(
+        object(),
+        resources,
+        child,
+        authority,
+    )
+
+    assert mutations == []
+
+
+async def test_deregister_rechecks_parent_after_authority() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    mutations: list[str] = []
+    parent_present = True
+    resources = SimpleNamespace(
+        proxy_arn="arn:aws:rds:us-west-2:123456789012:db-proxy:old",
+        names=SimpleNamespace(proxy_name="deterministic-proxy"),
+    )
+    child = SimpleNamespace(metadata={"tags": {"anti-demo:bout-fence": "43"}})
+
+    async def inspect(*_args, **_kwargs):
+        return SimpleNamespace() if parent_present else None
+
+    async def authority() -> None:
+        nonlocal parent_present
+        parent_present = False
+
+    orchestrator._inspect_proxy = inspect
+    orchestrator._deregister_proxy_target = lambda *_args: asyncio.sleep(
+        0, result=mutations.append("deregister")
+    )
+
+    await orchestrator._deregister_proxy_target_if_parent_matches(
+        object(),
+        resources,
+        child,
+        authority,
+    )
+
+    assert mutations == []
+
+
+async def test_delete_rechecks_parent_after_authority() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._proxy_delete_accepted = {}
+    parent_present = True
+    delete_calls = 0
+    observed = SimpleNamespace(
+        deterministic_name="deterministic-proxy",
+        metadata={"tags": {"anti-demo:bout-fence": "43"}},
+        provider_id="arn:aws:rds:us-west-2:123456789012:db-proxy:old",
+    )
+
+    async def inspect(*_args, **_kwargs):
+        return observed if parent_present else None
+
+    async def authority() -> None:
+        nonlocal parent_present
+        parent_present = False
+
+    class Rds:
+        async def delete_db_proxy(self, **_kwargs):
+            nonlocal delete_calls
+            delete_calls += 1
+
+    orchestrator._inspect_proxy = inspect
+
+    await orchestrator._delete_proxy(
+        SimpleNamespace(rds=Rds()),
+        observed,
+        bout_id="bout-stale-delete",
+        assert_authority=authority,
+    )
+
+    assert delete_calls == 0
+    assert orchestrator.proxy_delete_accepted("bout-stale-delete") is False
+
+
+@pytest.mark.parametrize("proxy_present", [True, False])
+async def test_restart_with_empty_journal_reconstructs_and_deletes_owned_proxy(
+    proxy_present: bool,
+) -> None:
+    """Journal absence after CreateDBProxy is unknown, not provider absence."""
+
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._lock = asyncio.Lock()
+    orchestrator.config = SimpleNamespace(
+        baseline_sha256="b" * 64,
+        deterministic_name_prefix="anti-demo-r5",
+        secret_name_prefix="",
+        proxy_secret_arn="arn:secret",
+        proxy_service_role_arn="arn:role",
+        competitor_security_group_id="sg-database",
+    )
+    orchestrator._settle_commands = lambda _bout: asyncio.sleep(0)
+    orchestrator._assumed_clients = lambda _bout: asyncio.sleep(0, result=object())
+    orchestrator._baseline_rds_security_group = lambda _clients: asyncio.sleep(
+        0, result="sg-database"
+    )
+    orchestrator._journal = SimpleNamespace(
+        scopes=lambda _bout: asyncio.sleep(0, result=())
+    )
+    orchestrator._discover_orphaned_addons = (
+        lambda *_args, **_kwargs: asyncio.sleep(0)
+    )
+
+    deleted: list[str] = []
+    inspected: list[str] = []
+    present = {"rds_proxy": proxy_present}
+
+    class Adapter:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        async def inspect(self, spec, provider_id=None):
+            del provider_id
+            inspected.append(spec.resource_kind)
+            return (
+                SimpleNamespace(resource_kind=self.kind)
+                if present.get(self.kind)
+                else None
+            )
+
+        async def delete(self, observed):
+            deleted.append(observed.resource_kind)
+            present[observed.resource_kind] = False
+
+    specs = (
+        ResourceSpec(1, "rds_proxy", "owned-proxy"),
+        ResourceSpec(2, "proxy_target_group", "owned-target-group"),
+        ResourceSpec(3, "proxy_target", "owned-target"),
+    )
+    coordinator = SimpleNamespace(
+        _adapters={spec.resource_kind: Adapter(spec.resource_kind) for spec in specs}
+    )
+    coordinator_tokens: list[int] = []
+
+    def build_coordinator(scope, *_args, **_kwargs):
+        coordinator_tokens.append(scope.fencing_token)
+        return coordinator, specs
+
+    orchestrator._coordinator = build_coordinator
+    artifact_fence_calls = 0
+    released_tokens: list[int] = []
+
+    class ReclaimedBoutFence:
+        async def reclaim_expired_cleanup(self, scope):
+            raise AssertionError(
+                f"coordinator-owned cleanup must not reclaim the ring lease: {scope}"
+            )
+
+        async def assert_current(self, scope):
+            nonlocal artifact_fence_calls
+            artifact_fence_calls += 1
+            assert scope.fencing_token == 43
+
+        async def release_cleanup(self, scope):
+            released_tokens.append(scope.fencing_token)
+
+    orchestrator._fence = ReclaimedBoutFence()
+    cleanup_authority_calls = 0
+
+    async def cleanup_authority() -> None:
+        nonlocal cleanup_authority_calls
+        cleanup_authority_calls += 1
+
+    await orchestrator.reconcile_failed_cleanup(
+        "bout-restart",
+        43,
+        cleanup_authority=cleanup_authority,
+    )
+
+    assert inspected == ["rds_proxy", "rds_proxy"]
+    assert deleted == (["rds_proxy"] if proxy_present else [])
+    assert cleanup_authority_calls >= (3 if proxy_present else 2)
+    assert artifact_fence_calls == 1
+    assert coordinator_tokens == [43]
+    assert released_tokens == []
+
+
+async def test_coordinator_cleanup_ignores_live_manager_ring_lease() -> None:
+    """Manager-owned round5_cleanup must not block coordinator provider delete."""
+
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._lock = asyncio.Lock()
+    orchestrator.config = SimpleNamespace(
+        baseline_sha256="b" * 64,
+        deterministic_name_prefix="anti-demo-r5",
+        secret_name_prefix="",
+        proxy_secret_arn="arn:secret",
+        proxy_service_role_arn="arn:role",
+        competitor_security_group_id="sg-database",
+    )
+    orchestrator._settle_commands = lambda _bout: asyncio.sleep(0)
+    orchestrator._assumed_clients = lambda _bout: asyncio.sleep(0, result=object())
+    orchestrator._baseline_rds_security_group = lambda _clients: asyncio.sleep(
+        0, result="sg-database"
+    )
+    orchestrator._journal = SimpleNamespace(
+        scopes=lambda _bout: asyncio.sleep(0, result=())
+    )
+    orchestrator._discover_orphaned_addons = (
+        lambda *_args, **_kwargs: asyncio.sleep(0)
+    )
+    deleted: list[str] = []
+
+    class Adapter:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        async def inspect(self, spec, provider_id=None):
+            del spec, provider_id
+            return (
+                SimpleNamespace(resource_kind=self.kind)
+                if self.kind == "rds_proxy" and not deleted
+                else None
+            )
+
+        async def delete(self, observed):
+            deleted.append(observed.resource_kind)
+
+    specs = (
+        ResourceSpec(1, "rds_proxy", "owned-proxy"),
+        ResourceSpec(2, "proxy_target_group", "owned-target-group"),
+        ResourceSpec(3, "proxy_target", "owned-target"),
+    )
+    coordinator = SimpleNamespace(
+        _adapters={spec.resource_kind: Adapter(spec.resource_kind) for spec in specs}
+    )
+    orchestrator._coordinator = lambda *_args, **_kwargs: (coordinator, specs)
+
+    class ManagerOwnedFence:
+        async def reclaim_expired_cleanup(self, scope):
+            del scope
+            raise InvalidStateError("Round 5 prior cleanup owner is still active")
+
+        async def assert_current(self, scope):
+            del scope
+            raise InvalidStateError("Round 5 ring fence is no longer current")
+
+    orchestrator._fence = ManagerOwnedFence()
+
+    await orchestrator.reconcile_failed_cleanup(
+        "bout-manager-lease",
+        43,
+        cleanup_authority=lambda: asyncio.sleep(0),
+    )
+
+    assert deleted == ["rds_proxy"]
+
+
+async def test_coordinator_restart_reclaims_expired_ring_to_seal_leftover_journal() -> None:
+    """Restart-during-cleanup must reclaim the departed bout ring.
+
+    Coordinator CAS is live, so the gen54 skip-reclaim path would otherwise
+    skip the artifact fence. Journal DELETED commits JOIN that ring, and the
+    write becomes a permanent cleanup_reconcile_blocked after AWS is gone.
+    """
+
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._lock = asyncio.Lock()
+    orchestrator.config = SimpleNamespace(
+        baseline_sha256="b" * 64,
+        deterministic_name_prefix="anti-demo-r5",
+        secret_name_prefix="",
+        proxy_secret_arn="arn:secret",
+        proxy_service_role_arn="arn:role",
+        competitor_security_group_id="sg-database",
+    )
+    orchestrator._settle_commands = lambda _bout: asyncio.sleep(0)
+    orchestrator._assumed_clients = lambda _bout: asyncio.sleep(0, result=object())
+    orchestrator._baseline_rds_security_group = lambda _clients: asyncio.sleep(
+        0, result="sg-database"
+    )
+    scope = CreationScope("bout-restart-journal", 43, "b" * 64)
+    orchestrator._journal = SimpleNamespace(
+        scopes=lambda _bout: asyncio.sleep(0, result=(scope,)),
+        events=lambda _scope: asyncio.sleep(0, result=()),
+    )
+    orchestrator._restore_resource_bindings = lambda *_args, **_kwargs: asyncio.sleep(0)
+    orchestrator._discover_orphaned_addons = (
+        lambda *_args, **_kwargs: asyncio.sleep(0)
+    )
+    coordinator_tokens: list[int] = []
+    released_tokens: list[int] = []
+    reclaimed: list[int] = []
+    deleted: list[str] = []
+
+    class Adapter:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        async def inspect(self, spec, provider_id=None):
+            del spec, provider_id
+            return None
+
+        async def delete(self, observed):
+            deleted.append(observed.resource_kind)
+
+    specs = (
+        ResourceSpec(1, "rds_proxy", "owned-proxy"),
+        ResourceSpec(2, "proxy_target_group", "owned-target-group"),
+        ResourceSpec(3, "proxy_target", "owned-target"),
+    )
+    coordinator = SimpleNamespace(
+        _adapters={spec.resource_kind: Adapter(spec.resource_kind) for spec in specs},
+    )
+
+    async def reconcile_incomplete(*_args, **_kwargs):
+        return SimpleNamespace(complete=True)
+
+    coordinator.reconcile_incomplete = reconcile_incomplete
+
+    def build_coordinator(auth_scope, *_args, **_kwargs):
+        coordinator_tokens.append(auth_scope.fencing_token)
+        return coordinator, specs
+
+    orchestrator._coordinator = build_coordinator
+
+    class ExpiredBoutFence:
+        async def reclaim_expired_cleanup(self, scope):
+            reclaimed.append(scope.fencing_token)
+            return CreationScope(scope.bout_id, 44, scope.runtime_seal_sha256)
+
+        async def assert_current(self, scope):
+            if scope.fencing_token != 44:
+                raise InvalidStateError("Round 5 ring fence is no longer current")
+
+        async def release_cleanup(self, scope):
+            released_tokens.append(scope.fencing_token)
+
+    orchestrator._fence = ExpiredBoutFence()
+
+    await orchestrator.reconcile_failed_cleanup(
+        "bout-restart-journal",
+        43,
+        cleanup_authority=lambda: asyncio.sleep(0),
+    )
+
+    assert reclaimed == [43]
+    assert coordinator_tokens == [44]
+    assert released_tokens == [44]
+    assert deleted == []
+
+
+async def test_departed_process_without_coordinator_still_reclaims_ring_lease() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._lock = asyncio.Lock()
+    orchestrator.config = SimpleNamespace(
+        baseline_sha256="b" * 64,
+        deterministic_name_prefix="anti-demo-r5",
+        secret_name_prefix="",
+        proxy_secret_arn="arn:secret",
+        proxy_service_role_arn="arn:role",
+        competitor_security_group_id="sg-database",
+    )
+    orchestrator._settle_commands = lambda _bout: asyncio.sleep(0)
+    orchestrator._assumed_clients = lambda _bout: asyncio.sleep(0, result=object())
+    orchestrator._baseline_rds_security_group = lambda _clients: asyncio.sleep(
+        0, result="sg-database"
+    )
+    orchestrator._journal = SimpleNamespace(
+        scopes=lambda _bout: asyncio.sleep(0, result=())
+    )
+    orchestrator._discover_orphaned_addons = (
+        lambda *_args, **_kwargs: asyncio.sleep(0)
+    )
+    deleted: list[str] = []
+    coordinator_tokens: list[int] = []
+    released_tokens: list[int] = []
+
+    class Adapter:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        async def inspect(self, spec, provider_id=None):
+            del spec, provider_id
+            return (
+                SimpleNamespace(resource_kind=self.kind)
+                if self.kind == "rds_proxy" and not deleted
+                else None
+            )
+
+        async def delete(self, observed):
+            deleted.append(observed.resource_kind)
+
+    specs = (
+        ResourceSpec(1, "rds_proxy", "owned-proxy"),
+        ResourceSpec(2, "proxy_target_group", "owned-target-group"),
+        ResourceSpec(3, "proxy_target", "owned-target"),
+    )
+    coordinator = SimpleNamespace(
+        _adapters={spec.resource_kind: Adapter(spec.resource_kind) for spec in specs}
+    )
+
+    def build_coordinator(scope, *_args, **_kwargs):
+        coordinator_tokens.append(scope.fencing_token)
+        return coordinator, specs
+
+    orchestrator._coordinator = build_coordinator
+
+    class ReclaimedBoutFence:
+        async def reclaim_expired_cleanup(self, scope):
+            return CreationScope(scope.bout_id, 44, scope.runtime_seal_sha256)
+
+        async def assert_current(self, scope):
+            assert scope.fencing_token == 44
+
+        async def release_cleanup(self, scope):
+            released_tokens.append(scope.fencing_token)
+
+    orchestrator._fence = ReclaimedBoutFence()
+
+    await orchestrator.reconcile_failed_cleanup("bout-departed", 43)
+
+    assert deleted == ["rds_proxy"]
+    assert coordinator_tokens == [44]
+    assert released_tokens == [44]
+
+
+async def test_incomplete_child_journal_still_deletes_parent_proxy() -> None:
+    """Child journal incompleteness must not become cleanup_reconcile_blocked."""
+
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator._lock = asyncio.Lock()
+    orchestrator.config = SimpleNamespace(
+        baseline_sha256="b" * 64,
+        deterministic_name_prefix="anti-demo-r5",
+        secret_name_prefix="",
+        proxy_secret_arn="arn:secret",
+        proxy_service_role_arn="arn:role",
+        competitor_security_group_id="sg-database",
+    )
+    orchestrator._settle_commands = lambda _bout: asyncio.sleep(0)
+    orchestrator._assumed_clients = lambda _bout: asyncio.sleep(0, result=object())
+    orchestrator._baseline_rds_security_group = lambda _clients: asyncio.sleep(
+        0, result="sg-database"
+    )
+    scope = CreationScope("bout-child", 43, "b" * 64)
+    orchestrator._journal = SimpleNamespace(
+        scopes=lambda _bout: asyncio.sleep(0, result=(scope,)),
+        events=lambda _scope: asyncio.sleep(0, result=()),
+    )
+    orchestrator._restore_resource_bindings = lambda *_args, **_kwargs: asyncio.sleep(0)
+    orchestrator._discover_orphaned_addons = (
+        lambda *_args, **_kwargs: asyncio.sleep(0)
+    )
+    present = {"rds_proxy": True}
+    deleted: list[str] = []
+
+    class Adapter:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+
+        async def inspect(self, spec, provider_id=None):
+            del spec, provider_id
+            return (
+                SimpleNamespace(resource_kind=self.kind)
+                if present.get(self.kind)
+                else None
+            )
+
+        async def delete(self, observed):
+            deleted.append(observed.resource_kind)
+            present[observed.resource_kind] = False
+
+    specs = (
+        ResourceSpec(1, "rds_proxy", "owned-proxy"),
+        ResourceSpec(2, "proxy_target_group", "owned-target-group"),
+        ResourceSpec(3, "proxy_target", "owned-target"),
+    )
+    coordinator = SimpleNamespace(
+        _adapters={spec.resource_kind: Adapter(spec.resource_kind) for spec in specs},
+        reconcile_incomplete=lambda *_args, **_kwargs: asyncio.sleep(
+            0, result=SimpleNamespace(complete=False)
+        ),
+    )
+    reconciles = {"n": 0}
+
+    async def reconcile_incomplete(*_args, **_kwargs):
+        reconciles["n"] += 1
+        return SimpleNamespace(complete=reconciles["n"] > 1)
+
+    coordinator.reconcile_incomplete = reconcile_incomplete
+    orchestrator._coordinator = lambda *_args, **_kwargs: (coordinator, specs)
+    orchestrator._fence = SimpleNamespace(
+        assert_current=lambda _scope: asyncio.sleep(0),
+    )
+
+    await orchestrator.reconcile_failed_cleanup("bout-child", 43)
+
+    assert deleted == ["rds_proxy"]
+    assert present["rds_proxy"] is False
+    assert reconciles["n"] >= 2
+
+
+async def test_deleting_proxy_target_group_describe_is_transient() -> None:
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator.config = SimpleNamespace(
+        deterministic_name_prefix="anti-demo-r5",
+        secret_name_prefix="",
+        ownership_tags={"anti-demo": "true"},
+        vpc_id="vpc-1",
+        runner_security_group_id="sg-runner",
+    )
+
+    class Fault(Exception):
+        response = {"Error": {"Code": "InvalidDBProxyStateFault"}}
+
+    class Rds:
+        def describe_db_proxies(self, **_kwargs):
+            return {"DBProxies": []}
+
+        def describe_db_proxy_target_groups(self, **_kwargs):
+            raise Fault()
+
+    class Ec2:
+        def describe_security_groups(self, **_kwargs):
+            return {"SecurityGroups": []}
+
+        def describe_security_group_rules(self, **_kwargs):
+            return {"SecurityGroupRules": []}
+
+    async def call(operation, **kwargs):
+        return operation(**kwargs)
+
+    orchestrator._call = call
+    orchestrator._error_code = lambda exc: str(
+        (getattr(exc, "response", {}) or {}).get("Error", {}).get("Code") or ""
+    )
+
+    with pytest.raises(ConnectionSpikeLiveTransientError, match="still deleting"):
+        await orchestrator._discover_orphaned_addons(
+            SimpleNamespace(
+                rds=Rds(),
+                ec2=Ec2(),
+                iam=SimpleNamespace(),
+                secretsmanager=SimpleNamespace(),
+            ),
+            "sg-database",
+            include_legacy=False,
+            bout_id="bout-deleting-tg",
+        )
+
+
+def test_in_flight_proxy_delete_faults_are_retryable_not_blocked() -> None:
+    from server.connection_spike_live import LiveRound5WarmProvider
+
+    provider = object.__new__(LiveRound5WarmProvider)
+
+    class Fault(Exception):
+        response = {"Error": {"Code": "InvalidDBProxyStateFault"}}
+
+    wrapped = ConnectionSpikeCleanupError(
+        "Round 5 scoped orphan discovery failed",
+        stage="scoped_orphan_discovery",
+        reason_code="scoped_orphan_read_failed",
+    )
+    wrapped.__cause__ = ConnectionSpikeLiveTransientError(
+        "Round 5 bout-owned proxy is still deleting"
+    )
+    assert provider._retryable(ConnectionSpikeLiveTransientError("still deleting"))
+    assert provider._retryable(Fault())
+    assert provider._retryable(wrapped)
+    assert provider._retryable(
+        InvalidStateError("Round 5 prior cleanup owner is still active")
+    )
+    assert provider._retryable(
+        ConnectionSpikeLiveOperationError(
+            "Round 5 journal write lost its active lease fence"
+        )
+    )
+    assert not provider._retryable(
+        ConnectionSpikeLiveConfigurationError("identity changed")
+    )
 
 
 def test_warm_runner_ssm_outage_is_retryable_without_hiding_identity_drift() -> None:
@@ -1472,6 +2473,54 @@ async def test_proxy_child_inspection_only_accepts_parent_not_found(
             await inspection
 
 
+async def test_cleanup_retry_accepts_an_already_reset_target_group_without_tags() -> None:
+    """A completed reset is absence of our mutation, even after AWS drops child tags."""
+
+    orchestrator = object.__new__(LiveConnectionSpikeSetupOrchestrator)
+    orchestrator.config = SimpleNamespace(
+        region="us-west-2",
+        expected_account_id=ACCOUNT,
+    )
+
+    class Rds:
+        def describe_db_proxy_target_groups(self, **kwargs):
+            assert kwargs == {"DBProxyName": "owned-proxy"}
+            return {
+                "TargetGroups": [
+                    {
+                        "TargetGroupName": "default",
+                        "TargetGroupArn": (
+                            f"arn:aws:rds:us-west-2:{ACCOUNT}:target-group:prx-tg-owned"
+                        ),
+                        "ConnectionPoolConfig": {
+                            "MaxConnectionsPercent": 100,
+                            "MaxIdleConnectionsPercent": 50,
+                            "ConnectionBorrowTimeout": 120,
+                        },
+                    }
+                ]
+            }
+
+        def list_tags_for_resource(self, **kwargs):
+            raise AssertionError(
+                f"an already-reset target group must not require stale child tags: {kwargs}"
+            )
+
+    observed = await orchestrator._inspect_target_group(
+        SimpleNamespace(rds=Rds()),
+        SimpleNamespace(names=SimpleNamespace(proxy_name="owned-proxy")),
+        ResourceSpec(
+            2,
+            "proxy_target_group",
+            "owned-proxy-target-group",
+            metadata={"tags": {"anti-demo-bout-id": "owned-bout"}},
+        ),
+        "owned-proxy:default",
+    )
+
+    assert observed is None
+
+
 @pytest.mark.parametrize(
     ("error_code", "expected_absent"),
     (("InvalidSecurityGroupRuleId.NotFound", True), ("AccessDenied", False)),
@@ -1661,6 +2710,7 @@ async def test_proxy_inspection_only_accepts_not_found_tag_lookup_race(
                 nonlocal polls
                 assert kwargs == {"DBProxyName": "owned-proxy"}
                 polls += 1
+                # Present for 241 polls (status "deleting"), then absent forever.
                 if polls > 241:
                     raise ProviderError
                 return {
@@ -1699,7 +2749,10 @@ async def test_proxy_inspection_only_accepts_not_found_tag_lookup_race(
                 proxy_arn,
             ),
         )
-        assert polls == 242
+        # Swarm defect #5: one NotFound is unknown, not clean. The loop returns
+        # only after PROXY_DELETE_ABSENCE_CONFIRMATIONS consecutive absences, so it
+        # keeps polling past the first NotFound (poll 242) until the count is met.
+        assert polls == 241 + PROXY_DELETE_ABSENCE_CONFIRMATIONS
     else:
         with pytest.raises(ProviderError):
             await inspection

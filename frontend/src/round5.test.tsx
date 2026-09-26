@@ -420,6 +420,97 @@ it('uses serialized V3 model evidence for the formal comparison', () => {
   expect(receipt).not.toContain('0.00s')
 })
 
+/** A verified V4 bout, shaped like the live server's `/api/sessions/{id}` payload. */
+function verifiedV4RoundFiveSession(lakebasePreexisting: number): DemoSession {
+  const session = roundFiveSession()
+  session.round5_setup!.protocol = 'round5-fanin-v4'
+  session.round5_setup!.schema_version = 4
+  session.fairness.protocol = 'round5-fanin-v4'
+  for (const laneId of ['lakebase', 'competitor'] as const) {
+    session.lanes[laneId].evidence = {
+      ...session.lanes[laneId].evidence,
+      protocol: 'round5-fanin-v4',
+      schema_version: 4,
+      safety_evidence_version: 5,
+      hard_safety_verified: true,
+      port_accounting_verified: true,
+      preexisting_client_role_sessions: laneId === 'lakebase' ? lakebasePreexisting : 0,
+    }
+  }
+  const runtime = withV3Runtime(runningRoundFiveSession()).round5_runtime!
+  session.round5_runtime = {
+    ...runtime,
+    state: 'verified',
+    lanes: {
+      lakebase: {
+        ...runtime.lanes.lakebase,
+        phase: 'verified',
+        clients_initiated: 10_000,
+        clients_authenticated: 10_000,
+        held_clients: 10_000,
+        bell_to_10000_observed_ms: 13_631.89,
+        elapsed_at_snapshot_ms: 13_631.89,
+      },
+      competitor: {
+        ...runtime.lanes.competitor,
+        phase: 'verified',
+        clients_initiated: 10_000,
+        clients_authenticated: 10_000,
+        held_clients: 10_000,
+        bell_to_10000_observed_ms: 628_903.28,
+        elapsed_at_snapshot_ms: 628_903.28,
+      },
+    },
+  }
+  session.comparison = {
+    kind: 'measured',
+    winner_lane_id: 'lakebase',
+    margin: {
+      spec_id: 'bell_to_10000_observed_ms',
+      lane_id: 'lakebase',
+      value: 615_271.39,
+      display_value: '615271.39 ms',
+    },
+    detail: 'Lakebase reached exactly 10,000 held clients 615271.39 ms sooner.',
+  }
+  return session
+}
+
+it('declares a verified Lakebase win when its pooler starts with a warm baseline', () => {
+  // Live 2026-09-26: back-to-back bouts left 8 pooled backends open on the
+  // Lakebase lane. The server declared LAKEBASE 615.27s SOONER; the browser
+  // demanded a zero baseline and showed NO DECLARED WINNER with sharing blocked.
+  const session = verifiedV4RoundFiveSession(8)
+
+  expect(roundFiveLaneResult(session.lanes.lakebase).contractVerified).toBe(true)
+  expect(roundFiveHasComparison(session)).toBe(true)
+  const outcome = classifyOutcome(session)
+  expect(outcome.status).toBe('declared_comparison')
+  expect(outcome.shareable).toBe(true)
+  expect(outcome.headline).toContain('LAKEBASE REACHED 10,000')
+})
+
+it('accepts exactly the server warm-baseline ceiling and nothing above it', () => {
+  expect(roundFiveLaneResult(verifiedV4RoundFiveSession(0).lanes.lakebase).contractVerified).toBe(true)
+  expect(roundFiveLaneResult(verifiedV4RoundFiveSession(60).lanes.lakebase).contractVerified).toBe(true)
+  expect(roundFiveLaneResult(verifiedV4RoundFiveSession(61).lanes.lakebase).contractVerified).toBe(false)
+  expect(roundFiveHasComparison(verifiedV4RoundFiveSession(61))).toBe(false)
+})
+
+it('keeps a warm-baseline win shareable while the per-bout Proxy is still being deleted', () => {
+  const session = verifiedV4RoundFiveSession(8)
+  session.round5_setup = {
+    ...session.round5_setup!,
+    cleanup_retryable: true,
+    cleanup_failure: 'ROUND 5 BACKSTAGE CLEANUP did not converge since 2026-09-26T01:16:00Z',
+  }
+
+  const outcome = classifyOutcome(session)
+  expect(outcome.status).toBe('declared_comparison')
+  expect(outcome.shareable).toBe(true)
+  expect(outcome.headline).not.toContain('CLEANUP FAILED')
+})
+
 function runningRoundFiveSession(): DemoSession {
   const proof = roundFiveSession()
   return {
@@ -1391,6 +1482,31 @@ it('posts the full towel action row immediately, before cleanup settles', () => 
   expect(towelled.round5_setup.cleanup_retryable).toBe(false)
 })
 
+it('reads a towel cleanup still inside its grace window as in progress, not failed', () => {
+  // Live 2026-09-26: ~30 s into ordinary towel cleanups the server used to attach
+  // its leaked-Proxy sentence and a failed towel, so the result screen read
+  // CLEANUP FAILED · SHARING BLOCKED until the Proxy finished deleting seconds
+  // later. Inside the grace window the server now sends exactly this shape:
+  // retrying, towel still cleaning, no failure sentence.
+  const towelled = towelledRoundFiveSession()
+  towelled.towel = { ...towelled.towel!, state: 'cleaning', cleanup_failure: null }
+  towelled.round5_setup = {
+    ...towelled.round5_setup!,
+    cleanup_retryable: true,
+    cleanup_failure: null,
+  }
+  const retrying = classifyOutcome(towelled)
+  expect(retrying.status).not.toBe('cleanup_failure')
+  expect(retrying.headline).not.toMatch(/CLEANUP FAILED/)
+
+  // Past the grace window the server attaches the sentence; that is a real failure.
+  towelled.round5_setup = {
+    ...towelled.round5_setup!,
+    cleanup_failure: 'ROUND 5 BACKSTAGE CLEANUP did not converge since 2026-09-26T02:04:26Z',
+  }
+  expect(classifyOutcome(towelled).status).toBe('cleanup_failure')
+})
+
 it('opens the instant replay, explanation and share receipt from a still-cleaning towel', () => {
   const towelled = towelledRoundFiveSession()
   towelled.towel = { ...towelled.towel!, state: 'cleaning' }
@@ -1668,7 +1784,7 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   )
   expect(ringsideTake).toHaveTextContent(/question for the room.*when does a missed job window justify keeping a pool ready/i)
   expect(ringsideTake).toHaveTextContent(
-    /what we proved.*Both paths connected and held 10,000 clients from the same start.*20,000 held for at least 30 seconds.*passed 64 held-connection checks.*provider-selected password exchange inside verify-full TLS.*TLS-protected password.*challenge-response password.*inside connection timing.*Setup.*Lakebase 12\.35s.*selected AWS path 24\.00s.*transaction throughput were not measured/i,
+    /what we proved.*Both paths reached and held 10,000 clients, each timed from the same bell.*includes setup.*Lakebase's pooled path was ready in 12\.35s.*AWS path needed 24\.00s to create its RDS Proxy.*at least 30 seconds.*all 64 test queries.*verify-full TLS.*password sent over TLS.*SCRAM challenge-response.*client connections, not database backends.*Not measured:.*transaction throughput/i,
   )
   expect(ringsideTake.querySelector('details')).toBeNull()
   expect(ringsideTake).not.toHaveTextContent(
@@ -2044,7 +2160,7 @@ it('names Aurora in the canonical Round 5 arena and its on-demand explanation', 
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
   const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
   expect(explanation).toHaveTextContent(
-    /what we proved.*Both paths connected and held 10,000 clients from the same start.*20,000 held for at least 30 seconds.*passed 64 held-connection checks.*provider-selected password exchange inside verify-full TLS.*TLS-protected password.*challenge-response password.*inside connection timing.*Setup.*Lakebase 12\.35s.*selected AWS path 24\.00s.*transaction throughput were not measured/i,
+    /what we proved.*Both paths reached and held 10,000 clients, each timed from the same bell.*includes setup.*Lakebase's pooled path was ready in 12\.35s.*AWS path needed 24\.00s to create its RDS Proxy.*at least 30 seconds.*all 64 test queries.*verify-full TLS.*password sent over TLS.*SCRAM challenge-response.*client connections, not database backends.*Not measured:.*transaction throughput/i,
   )
   expect(explanation.querySelector('details')).toBeNull()
   expect(explanation).not.toHaveTextContent(/full verified proof|component disclosure|supporting changes/i)

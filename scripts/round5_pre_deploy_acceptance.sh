@@ -33,8 +33,10 @@ export ANTI_DEMO_ALLOW_INMEMORY_COORDINATION="${ANTI_DEMO_ALLOW_INMEMORY_COORDIN
 # append strings" this gate exists to replace.
 MODULES=(
   tests/test_round5_pre_deploy_acceptance.py
+  tests/test_round5_chaos_stabilization.py
   tests/test_round5_warm.py
   tests/test_round5_v3_acceptance.py
+  tests/test_api.py::test_all_bout_statuses_cover_six_rounds_with_one_bounded_read
 )
 
 # Prefer `uv run` (the repo's canonical runner); fall back to the project venv.

@@ -474,7 +474,7 @@ class ModelScoreEngine:
                 )
         await self._ensure_pipeline_running(on_progress)
         await self._emit(on_progress, ModelScorePhase.PREFLIGHT, "Inspecting Managed Sync")
-        status = await self._inspect_sync()
+        status = await self._inspect_sync_for_arm()
         self._validate_contract_status(status, arming=True)
         self._validate_caught_up_baseline(status)
 
@@ -991,6 +991,29 @@ class ModelScoreEngine:
             raise ModelScoreTimeoutError(
                 "Managed Sync inspection exceeded its wall-clock bound"
             ) from exc
+
+    async def _inspect_sync_for_arm(self) -> ManagedSyncStatus:
+        """Fence transient provider projections before validating the arm.
+
+        Managed Sync's pipeline and synced-table endpoints are eventually
+        consistent, including while an otherwise healthy continuous pipeline
+        is already running. Retrying does not make any state acceptable: the
+        returned projection still passes the unchanged strict validators, and
+        persistent configuration or identity drift still fails closed after
+        the existing finite poll budget.
+        """
+
+        last_error: ModelScoreError | None = None
+        for attempt in range(1, self.max_poll_attempts + 1):
+            try:
+                return await self._inspect_sync()
+            except ModelScoreError as exc:
+                last_error = exc
+                if attempt == self.max_poll_attempts:
+                    raise
+                await self._sleep(self.poll_interval_seconds)
+        assert last_error is not None
+        raise last_error
 
     async def _commit_source_update(self, update: ModelScoreUpdate) -> DeltaCommit:
         try:

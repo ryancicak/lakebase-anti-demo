@@ -63,6 +63,7 @@ from server.models import (
     RoundId,
     SessionCreate,
     SessionState,
+    TowelSnapshot,
     TowelState,
 )
 from server.pricing import build_cost_receipt, calculate_rds_proxy_cost
@@ -75,7 +76,7 @@ from server.recovery import (
     RecoveryRunResult,
     RecoveryStoppedResult,
 )
-from server.round5_warm import Round5WarmState, WarmStoreConflictError
+from server.round5_warm import Round5Variant, Round5WarmState, WarmStoreConflictError
 from server.round_availability import GRANT_REFUSAL_HEADLINE
 from server.safe_change import (
     SafeChangeArm,
@@ -1746,14 +1747,12 @@ async def test_double_rung_bell_opens_exactly_one_run() -> None:
     await manager.start_towel(session_id)
     settled = await wait_for_towel(manager, session_id, "ready")
     assert settled.state == SessionState.TOWELLED
-    cleanup_lease = await manager._lease_store.current()
-    assert cleanup_lease is not None
-    assert cleanup_lease.phase == "cooldown"
-    assert (await manager.bout_status(RoundId.WAKE_IDLE_APP)).can_start is False
-    assert record.cooldown_task is not None
-    record.cooldown_task.cancel()
-    await asyncio.gather(record.cooldown_task, return_exceptions=True)
-    assert await manager._release_bout(record) is True
+    # This is a pre-verify towel. Once both targets report IDLE/zero there is no
+    # verified lane activity left to reconcile, so cleanup releases rather than
+    # pinning an impossible cooldown requirement.
+    assert await manager._lease_store.current() is None
+    assert (await manager.bout_status(RoundId.WAKE_IDLE_APP)).can_start is True
+    assert record.cooldown_task is None
 
 
 async def test_bell_rung_again_after_verification_replays_the_same_result() -> None:
@@ -1930,7 +1929,10 @@ async def test_round_five_lease_loss_verifies_cleanup_and_forbids_comparison() -
     assert failed.failure is not None and "no comparison" in failed.failure.lower()
     assert failed.round5_setup is not None
     assert failed.round5_setup.downstream_validated is False
-    with pytest.raises(InvalidStateError, match="clean baseline and a new bout"):
+    with pytest.raises(
+        InvalidStateError,
+        match="ROUND 5 NOT STARTABLE.*STAGE CLEANING",
+    ):
         await manager.start_arm(created.id, operator)
 
 
@@ -2008,7 +2010,10 @@ async def test_round_five_keeps_both_leases_until_full_backstage_cleanup() -> No
             round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
         )
     )
-    with pytest.raises(InvalidStateError, match="BOUT IN PROGRESS"):
+    with pytest.raises(
+        InvalidStateError,
+        match="ROUND 5 NOT STARTABLE.*STAGE CLEANING",
+    ):
         await manager.start_arm(second_round5.id, operator)
     assert await main_store.current() is not None
 
@@ -2031,8 +2036,16 @@ async def test_round_five_leases_wait_for_durable_rewarm_transition() -> None:
     class WarmCoordinator:
         store = SimpleNamespace()
         ring_ready = True
+        installation_id = "install-test"
 
-        async def finish_cleanup_and_rewarm(self, claim_id):
+        async def begin_cleanup(self, claim_id):
+            assert claim_id == "claim-one"
+            return SimpleNamespace(
+                state=Round5WarmState.CLEANING,
+                claim=SimpleNamespace(claim_id=claim_id),
+            )
+
+        async def converge_cleanup(self, claim_id):
             assert claim_id == "claim-one"
             transition_entered.set()
             await release_transition.wait()
@@ -2111,7 +2124,7 @@ async def test_begin_cleanup_conflict_retries_under_retained_authority() -> None
         store = SimpleNamespace()
         ring_ready = True
         begin_calls = 0
-        finish_calls = 0
+        converge_calls = 0
 
         async def begin_cleanup(self, claim_id):
             assert claim_id == claim.claim_id
@@ -2123,22 +2136,17 @@ async def test_begin_cleanup_conflict_retries_under_retained_authority() -> None
                 claim=claim,
             )
 
-        async def finish_cleanup_and_rewarm(self, claim_id):
+        async def converge_cleanup(self, claim_id):
+            # The SINGLE cleanup owner: reconcile + finish -> N+1, opaque to the
+            # manager (which no longer drives the engine reconcile itself).
             assert claim_id == claim.claim_id
-            self.finish_calls += 1
+            self.converge_calls += 1
             return SimpleNamespace(
                 state=Round5WarmState.WARMING,
                 claim=None,
             )
 
     class CleanEngine:
-        reconcile_calls = 0
-
-        async def reconcile_failed_cleanup(self, bout_id, fencing_token):
-            assert bout_id
-            assert fencing_token > 0
-            self.reconcile_calls += 1
-
         async def stop_setup_and_begin_cleanup(self, bout_id):
             del bout_id
 
@@ -2182,7 +2190,7 @@ async def test_begin_cleanup_conflict_retries_under_retained_authority() -> None
     assert record.round5_lease.phase == "round5_cleanup"
     assert await main_store.current() is not None
     assert await round5_store.current() is not None
-    assert warm.finish_calls == 0
+    assert warm.converge_calls == 0
 
     manager._closed = False
     completed = await manager._retry_connection_spike_cleanup(
@@ -2192,12 +2200,89 @@ async def test_begin_cleanup_conflict_retries_under_retained_authority() -> None
 
     assert completed is True
     assert warm.begin_calls == 2
-    assert engine.reconcile_calls == 1
-    assert warm.finish_calls == 1
+    # The manager delegates the external reconcile+finish to the single cleanup
+    # owner exactly once; it no longer drives the engine reconcile itself.
+    assert warm.converge_calls == 1
     assert await main_store.current() is None
     assert await round5_store.current() is None
     assert record.round5_warm_slot.state == Round5WarmState.WARMING
     await manager.close()
+
+
+async def test_cancelled_round_five_cleanup_handoff_installs_retry_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost same-process CLEANING handoff cannot leave only a heartbeat."""
+
+    monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "0.02")
+    monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "0.05")
+    cleanup_entered = asyncio.Event()
+
+    class LostHandoffEngine:
+        async def wait_for_proxy_delete_accepted(self):
+            cleanup_entered.set()
+            await asyncio.Event().wait()
+
+        async def wait_for_cleanup_complete(self):
+            raise AssertionError("delete acceptance never completed")
+
+        async def reconcile_failed_cleanup(self, _bout_id, _fencing_token):
+            raise RuntimeError("cleanup is still unavailable")
+
+        def proxy_delete_accepted(self):
+            return False
+
+        def proxy_name_for_bout(self, bout_id):
+            return f"anti-demo-r5-{bout_id}-proxy"
+
+    engine = LostHandoffEngine()
+    main_store = InMemoryBoutLeaseStore()
+    round5_store = InMemoryBoutLeaseStore(ring_key="round5")
+    manager = RunManager(
+        connection_spike_factory=lambda _competitor: engine,
+        lease_store=main_store,
+        round5_lease_store=round5_store,
+    )
+    operator = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    record = manager._records[created.id]
+    record.operator = operator
+    record.connection_spike_engine = engine
+    await manager._claim_bout(record, operator)
+    await manager._mark_bout_armed(
+        record,
+        datetime.now(UTC) + timedelta(seconds=90),
+    )
+    record.snapshot.state = SessionState.FAILED
+    await manager._retain_connection_spike_cleanup_lease(record, operator)
+
+    handoff = asyncio.create_task(
+        manager._complete_connection_spike_cleanup_handoff(record, engine)
+    )
+    record.connection_spike_cleanup_task = handoff
+    await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
+    handoff.cancel()
+    await asyncio.gather(handoff, return_exceptions=True)
+
+    assert record.snapshot.round5_setup is not None
+    assert record.snapshot.round5_setup.cleanup_retryable is True
+    assert manager.round5_cleanup_owed is True
+    retry = record.connection_spike_cleanup_retry_task
+    assert retry is not None and not retry.done()
+    lease = await round5_store.current()
+    assert lease is not None and lease.phase == "round5_cleanup"
+
+    await manager.close()
+    from server.round5_cleanup_owed import clear_round5_cleanup_owed
+
+    clear_round5_cleanup_owed(created.id)
 
 
 async def test_round_five_prearm_guard_refuses_before_engine_or_setup_mutation() -> None:
@@ -2233,7 +2318,7 @@ async def test_round_five_prearm_guard_refuses_before_engine_or_setup_mutation()
         )
     )
 
-    with pytest.raises(InvalidStateError, match="BACKSTAGE CLEANUP"):
+    with pytest.raises(InvalidStateError, match="start state could not be verified"):
         await manager.start_arm(created.id, operator)
     unchanged = await manager.get(created.id)
     assert unchanged.state == SessionState.DRAFT
@@ -2293,6 +2378,142 @@ async def test_v7_round_five_prearm_uses_injected_scoped_cleanup_store() -> None
 
     await manager.close()
     assert await scoped.current() is None
+
+
+async def test_consecutive_round5_prepare_fence_failures_roll_back_without_ghost() -> None:
+    main_store = InMemoryBoutLeaseStore()
+    round5_store = InMemoryBoutLeaseStore(ring_key="round5")
+    aws_starts = 0
+    cleanup_starts = 0
+    returns = 0
+
+    class FenceFailEngine:
+        _resident_bindings: dict[str, object] = {}
+
+        def bind_claim(self, claim):
+            self.claim = claim
+
+        async def verify_start_state(self, bout_id, fencing_token):
+            raise InvalidStateError("Round 5 ring fence is no longer current")
+
+        async def prepare(self, bout_id, fencing_token):
+            nonlocal aws_starts
+            aws_starts += 1
+            raise AssertionError("prepare must not start after fence refusal")
+
+    engine = FenceFailEngine()
+    claim_counter = 0
+
+    class WarmCoordinator:
+        store = SimpleNamespace(claim_ready_with_leases=lambda *a, **k: None)
+        ring_ready = True
+        installation_id = "install-test"
+        _capsule = SimpleNamespace(
+            variant_contexts={Round5Variant.AURORA: engine},
+        )
+
+        def __init__(self) -> None:
+            self.slot = SimpleNamespace(
+                state=Round5WarmState.READY,
+                claim=None,
+                generation=49,
+            )
+
+        def public_status_cached(self):
+            return {
+                "round5_ring_ready": True,
+                "round5_warm_state": "ready",
+                "round5_warm_generation": 49,
+            }
+
+        async def claim_with_leases(self, **kwargs):
+            nonlocal claim_counter
+            claim_counter += 1
+            main = await kwargs["main_store"].claim(
+                session_id=kwargs["session_id"],
+                operator=kwargs["operator"],
+                phase="checking",
+                session_state=SessionState.CHECKING,
+                round_id=kwargs["round_id"],
+                round_title=kwargs["round_title"],
+                competitor_id=kwargs["competitor_id"],
+                competitor_name=kwargs["competitor_name"],
+                ttl=timedelta(seconds=30),
+            )
+            cleanup = await kwargs["cleanup_store"].claim(
+                session_id=kwargs["session_id"],
+                operator=kwargs["operator"],
+                phase="checking",
+                session_state=SessionState.CHECKING,
+                round_id=kwargs["round_id"],
+                round_title=kwargs["round_title"],
+                competitor_id=kwargs["competitor_id"],
+                competitor_name=kwargs["competitor_name"],
+                ttl=timedelta(seconds=30),
+            )
+            self.slot = SimpleNamespace(
+                state=Round5WarmState.CLAIMED,
+                generation=49,
+                claim=SimpleNamespace(
+                    claim_id=f"claim-{claim_counter}",
+                    lakebase_job_id="a" * 64,
+                    competitor_job_id="b" * 64,
+                    capsule_generation=49,
+                    warm_attempt_token="warm-token",
+                ),
+            )
+            return self.slot, self._capsule, main, cleanup
+
+        async def return_unstarted_claim(self, claim_id, **_kwargs):
+            nonlocal returns
+            returns += 1
+            assert claim_id.startswith("claim-")
+            self.slot = SimpleNamespace(
+                state=Round5WarmState.READY,
+                generation=49,
+                claim=None,
+            )
+            return self.slot
+
+        async def begin_cleanup(self, claim_id):
+            nonlocal cleanup_starts
+            cleanup_starts += 1
+            raise AssertionError(f"unstarted ARM must not enter CLEANING {claim_id}")
+
+    warm = WarmCoordinator()
+    manager = RunManager(
+        connection_spike_factory=lambda _competitor: engine,
+        lease_store=main_store,
+        round5_lease_store=round5_store,
+        round5_warm_coordinator=warm,
+    )
+    operator = BoutOperator(display_name="Owner", subject="owner")
+
+    for _ in range(2):
+        created = await manager.create(
+            SessionCreate(
+                competitor=CompetitorId.AURORA_SERVERLESS_V2,
+                primary_persona="sre",
+                corners=[Corner.PERFORMANCE],
+                round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+            )
+        )
+        with pytest.raises(InvalidStateError, match="ring fence is no longer current"):
+            await manager.start_arm(created.id, operator)
+        snapshot = await manager.get(created.id)
+        assert snapshot.state == SessionState.DRAFT
+        assert await main_store.current() is None
+        assert await round5_store.current() is None
+        status = await manager.bout_status(RoundId.SURVIVE_CONNECTION_SPIKE)
+        assert status.active is False
+        assert status.can_start is True
+        assert warm.slot.state == Round5WarmState.READY
+        assert warm.slot.claim is None
+
+    assert aws_starts == 0
+    assert cleanup_starts == 0
+    assert returns == 2
+    await manager.close()
 
 
 async def test_manager_shutdown_settles_round_five_before_releasing_ring() -> None:
@@ -2839,7 +3060,11 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
     burst_valid: bool,
     cleanup_failure: bool,
     cleanup_abandoned: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # This asserts what a cleanup failure seals once it is due; the grace window
+    # before it is due is covered in test_round5_towel_cleanup.
+    monkeypatch.setattr("server.round5_cleanup_owed.GRACE_SECONDS", 0.0)
     engine = SuccessfulTwoPhaseConnectionSpikeEngine(
         burst_valid=burst_valid,
         cleanup_failure=cleanup_failure,
@@ -5334,6 +5559,77 @@ async def test_lakebase_idle_cannot_vacuously_pass_without_verified_lane_activit
     assert "no verified lane transaction" in lane.status
 
 
+async def test_preverify_towel_confirms_repeated_lakebase_idle_without_verified_activity() -> None:
+    manager, record = await round_one_cooldown_record(verified_activity=False)
+    manager._lakebase_idle_dwell = 0.001
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+    record.snapshot.state = SessionState.TOWELLED
+    for lane in record.snapshot.lanes.values():
+        lane.state = LaneState.TOWELLED
+        lane.connection_closed_at = None
+    record.snapshot.towel = TowelSnapshot(
+        state=TowelState.READY,
+        requested_at=cooldown.started_at,
+    )
+
+    _, first = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at,
+    )
+    assert first.lanes["lakebase"].state == CooldownLaneState.WATCHING
+
+    await asyncio.sleep(0.002)
+    _, second = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at + timedelta(seconds=2),
+    )
+
+    lane = second.lanes["lakebase"]
+    assert lane.state == CooldownLaneState.CONFIRMED_ZERO
+    assert lane.confirmation_basis == "preverify_towel_observed_idle_dwell"
+    assert lane.confirmed_at == cooldown.started_at + timedelta(seconds=2)
+
+
+async def test_partial_verify_towel_confirms_idle_when_close_timestamp_never_arrived() -> None:
+    manager, record = await round_one_cooldown_record(verified_activity=False)
+    manager._lakebase_idle_dwell = 0.001
+    cooldown = record.snapshot.cooldown
+    assert cooldown is not None
+    record.snapshot.state = SessionState.TOWELLED
+    record.snapshot.lanes["lakebase"].state = LaneState.VERIFIED
+    record.snapshot.lanes["lakebase"].connection_closed_at = None
+    record.snapshot.lanes["competitor"].state = LaneState.TOWELLED
+    record.snapshot.towel = TowelSnapshot(
+        state=TowelState.READY,
+        requested_at=cooldown.started_at,
+    )
+
+    _, first = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at,
+    )
+    assert first.lanes["lakebase"].state == CooldownLaneState.WATCHING
+
+    await asyncio.sleep(0.002)
+    _, second = await manager._apply_cooldown_observation(
+        record,
+        "lakebase",
+        {"state": "IDLE"},
+        cooldown.started_at + timedelta(seconds=2),
+    )
+
+    lane = second.lanes["lakebase"]
+    assert lane.state == CooldownLaneState.CONFIRMED_ZERO
+    assert lane.confirmation_basis == "settled_towel_observed_idle_dwell"
+
+
 async def test_lakebase_active_state_remains_waiting_and_resets_idle_dwell() -> None:
     manager, record = await round_one_cooldown_record()
     cooldown = record.snapshot.cooldown
@@ -6229,6 +6525,46 @@ async def test_v7_round_five_status_includes_its_lingering_cleanup_only() -> Non
     assert await cleanup_store.release(cleanup) is True
 
 
+async def test_round_five_cleanup_overlay_preserves_durable_error() -> None:
+    manager = RunManager(round_isolation=True, installation_id="install-a")
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    cleanup_store = manager._round5_cleanup_store()
+    cleanup = await cleanup_store.claim(
+        session_id="cleanup-session",
+        operator=owner,
+        phase="round5_cleanup",
+        session_state=SessionState.VERIFIED,
+        round_id=RoundId.SURVIVE_CONNECTION_SPIKE.value,
+        round_title="Ready a pooled application path",
+        competitor_id=CompetitorId.AURORA_SERVERLESS_V2.value,
+        competitor_name="Aurora Serverless v2",
+        ttl=timedelta(minutes=1),
+    )
+    slot = SimpleNamespace(
+        claim=SimpleNamespace(session_id="cleanup-session"),
+        bell_id="bell",
+        bell_at_utc=datetime.now(UTC),
+        generation=43,
+        revision=99,
+        last_error_code="cleanup_reconcile_blocked",
+    )
+    manager._round5_warm_coordinator = SimpleNamespace(
+        installation_id="install-a",
+        public_status_cached=lambda: {},
+        ring_ready=False,
+        store=SimpleNamespace(
+            read=lambda _installation_id: asyncio.sleep(0, result=slot)
+        ),
+    )
+
+    status = await manager.bout_status(RoundId.SURVIVE_CONNECTION_SPIKE)
+
+    assert status.round5_start is not None
+    assert status.round5_start.last_error_code == "cleanup_reconcile_blocked"
+    assert "ERROR cleanup_reconcile_blocked" in str(status.maintenance_detail)
+    assert await cleanup_store.release(cleanup) is True
+
+
 async def test_separate_app_replicas_share_one_visible_ring_lease() -> None:
     lease_store = InMemoryBoutLeaseStore()
     first_replica = RunManager(
@@ -6773,6 +7109,9 @@ async def test_round_five_towel_cleanup_auto_converges_without_manual_retry(monk
     # Fast automatic retries so the durable convergence loop settles quickly.
     monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "0.02")
     monkeypatch.setenv("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "0.05")
+    # The towel is expected to surface its failure before converging, which it now
+    # does only once the owed notice is due; make it due at once.
+    monkeypatch.setattr("server.round5_cleanup_owed.GRACE_SECONDS", 0.0)
     engine = UnconvergingTowelConnectionSpikeEngine()
     main_store = InMemoryBoutLeaseStore()
     round5_store = InMemoryBoutLeaseStore(ring_key="round5")

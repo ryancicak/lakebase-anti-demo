@@ -32,6 +32,16 @@ export const ROUND_FIVE_BELL_PROTOCOL = 'round5-bell-to-10k-v4'
 const ROUND_FIVE_FANIN_SCHEMA_VERSION = 4
 const ROUND_FIVE_SAFETY_EVIDENCE_VERSION = 5
 const ROUND_FIVE_FANIN_TARGET_CLIENTS = 10_000
+/**
+ * The settled warm-pool baseline a lane may start with, mirroring
+ * `server/connection_fanin.MAX_PREEXISTING_CLIENT_SESSIONS` (and the runner's
+ * copy), which is checked by `tests/test_round5_frontend_contract_mirror.py`.
+ * Lakebase's pooler keeps its backends open between back-to-back bouts, so a
+ * nonzero baseline is the normal warm case, not contamination. Requiring zero
+ * here while the server accepts the baseline turned verified Lakebase wins into
+ * "NO DECLARED WINNER" with sharing blocked whenever the pool was still warm.
+ */
+export const ROUND_FIVE_MAX_PREEXISTING_CLIENT_SESSIONS = 60
 const ROUND_FIVE_FANIN_RUNNER = 'Python 3.12 event-driven TLS/native-password'
 const ROUND_FIVE_AUTH_METHODS = new Set(['tls-cleartext-password', 'scram-sha-256'])
 
@@ -224,7 +234,10 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     && (!fanIn || terminalFailures === 0)
     && (!fanIn || retries === 0)
     && (!fanIn || disconnectedDuringHold === 0)
-    && (!fanIn || preexistingClientRoleSessions === 0)
+    && (!fanIn || (
+      preexistingClientRoleSessions !== null
+      && preexistingClientRoleSessions <= ROUND_FIVE_MAX_PREEXISTING_CLIENT_SESSIONS
+    ))
     && (!fanIn || distinctSocketFds === targetClients)
     && (!fanIn || distinctLocalEndpoints === targetClients)
     && (!fanIn || observerDirect)

@@ -499,6 +499,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .armed-window[data-closing] { border-color: var(--yellow); color: var(--yellow); background: #1d1705; }
 .bell-button { position: relative; z-index: 2; min-width: min(430px, 34vw); padding: 1.4em 1.8em; border: clamp(5px, .55vw, 10px) solid var(--red); color: #10152f; background: var(--yellow); box-shadow: 8px 8px 0 #000; font-size: clamp(11px, 1.2vw, 23px); line-height: 1; text-transform: uppercase; }
 .bell-button:disabled { color: #8991ae; border-color: #424d79; background: #1b244d; box-shadow: none; }
+/* Quiet on purpose: the bell stays the one loud control. Changing the matchup is the
+   presenter's way back out of an armed card, not a second call to action. */
+.ready-cancel { position: relative; z-index: 2; margin-top: 1.6vh; padding: .9em 1.2em; border: 3px solid var(--cream); color: var(--cream); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .5vw, 10px); line-height: 1.2; text-transform: uppercase; }
+.ready-cancel:disabled { color: #8991ae; border-color: #424d79; box-shadow: none; }
 .sound-button { position: relative; z-index: 2; margin-top: 2.2vh; padding: .9em 1.2em; border: 3px solid #89919a; color: #d1d5d9; background: var(--navy); font-size: clamp(5px, .48vw, 9px); text-transform: uppercase; }
 /* The arena cut of the same control: same border, colour and type, but a
    header row has no vertical stack to space it against, and the grey is

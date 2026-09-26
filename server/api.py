@@ -205,6 +205,11 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
     the call. Reading it is a dict copy.
     """
 
+    round5_cleanup_overlay = getattr(
+        request.state,
+        "round5_cleanup_overlay",
+        None,
+    )
     # Through the shared accessor rather than off the sentry directly, and the
     # difference is one whole class of refusal. The deployed startup credential
     # check reports rather than raises, so a container can come up for the two
@@ -252,21 +257,65 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
     run_manager = getattr(request.app.state, "run_manager", None)
     warm_ring_ready = getattr(run_manager, "round5_ring_ready", None)
     warm_status = getattr(run_manager, "round5_warm_status", None)
+    if round5_cleanup_overlay is not None:
+        warm_ring_ready = False
+        warm_status = {
+            **(warm_status if isinstance(warm_status, dict) else {}),
+            **round5_cleanup_overlay,
+        }
     coordinator_present = isinstance(warm_status, dict)
     blocked_terminal = bool(
         coordinator_present and warm_status.get("round5_warm_blocked_terminal")
     )
+    warm_state = (
+        str(warm_status.get("round5_warm_state") or "")
+        if isinstance(warm_status, dict)
+        else ""
+    )
     warm_detail = None
     if coordinator_present and not warm_ring_ready:
+        start_stage = str(
+            warm_status.get("round5_start_stage")
+            or ("cleaning" if warm_state == "cleaning" else "rewarming")
+        ).upper()
+        generation = warm_status.get("round5_warm_generation")
+        stage_instruction = (
+            "pre-bell resident cleanup; auto-converge scheduled; "
+            "wait for READY / RING_READY TRUE"
+            if start_stage == "CLEANING"
+            and warm_status.get("round5_cleanup_scope") == "prebell_resident"
+            and warm_status.get("round5_cleanup_recovery_scheduled") is True
+            else "pre-bell resident cleanup; recovery worker not confirmed; "
+            "operator attention required"
+            if start_stage == "CLEANING"
+            and warm_status.get("round5_cleanup_scope") == "prebell_resident"
+            else
+            "auto-converge scheduled; cleanup completion only enqueues rewarming; "
+            "wait for READY / RING_READY TRUE"
+            if start_stage == "CLEANING"
+            and warm_status.get("round5_cleanup_recovery_scheduled") is True
+            else "cleanup worker not confirmed; operator attention required"
+            if start_stage == "CLEANING"
+            else "the abandoned claim is draining; wait for READY / RING_READY TRUE"
+            if start_stage == "CLAIM-DRAIN"
+            else "runner identity is refreshing; wait for READY / RING_READY TRUE"
+            if start_stage == "IDENTITY-REFRESH"
+            else "operator action required; ring remains closed until READY / RING_READY TRUE"
+            if start_stage == "TERMINAL-BLOCKED"
+            else "wait for READY / RING_READY TRUE"
+        )
         warm_detail = " · ".join(
             part
             for part in (
-                # A permanent block will not self-recover; do not imply it is
-                # merely "preparing" and will unlock on its own.
-                "Needs operator attention"
-                if blocked_terminal
-                else "Preparing backstage",
-                str(warm_status.get("round5_warm_state") or "warming").upper(),
+                "ROUND 5 NOT STARTABLE",
+                f"STAGE {start_stage}",
+                (
+                    f"GENERATION {generation}"
+                    if isinstance(generation, int)
+                    else "GENERATION PENDING"
+                ),
+                "CAN_START FALSE",
+                stage_instruction,
                 (
                     f"attempt {warm_status['round5_warm_attempt_count']}"
                     if warm_status.get("round5_warm_attempt_count")
@@ -286,11 +335,6 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
             if part
         )
     round5_reason_code = getattr(round5_status, "reason_code", None)
-    warm_state = (
-        str(warm_status.get("round5_warm_state") or "")
-        if isinstance(warm_status, dict)
-        else ""
-    )
     if coordinator_present:
         round5_reason_code = (
             "cleanup_in_progress"
@@ -320,16 +364,12 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         round5_detail=(
             None
             if coordinator_present and warm_ring_ready
-            else (
-                "CLEANUP IN PROGRESS · Round 5 will reopen automatically "
-                "after exact cleanup."
-            )
-            if warm_state == "cleaning"
             else warm_detail
             or (
                 "Round 5 needs operator attention and will not unlock automatically"
                 if blocked_terminal
-                else "Preparing backstage · Round 5 will unlock automatically"
+                else "ROUND 5 NOT STARTABLE · STAGE REWARMING · CAN_START FALSE · "
+                "wait for READY / RING_READY TRUE"
             )
             if coordinator_present
             else getattr(round5_status, "maintenance_detail", None)
@@ -340,6 +380,13 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
 @router.get("/catalog", response_model=CatalogResponse)
 async def get_catalog(request: Request) -> CatalogResponse:
     run_manager = manager(request)
+    if not getattr(request.state, "round5_cleanup_overlay_checked", False):
+        cleanup_overlay = None
+        read_cleanup = getattr(run_manager, "round5_durable_cleanup_overlay", None)
+        if callable(read_cleanup):
+            cleanup_overlay = await read_cleanup()
+        request.state.round5_cleanup_overlay = cleanup_overlay
+        request.state.round5_cleanup_overlay_checked = True
     refresh_storage = getattr(run_manager, "refresh_delta_storage_readiness", None)
     if callable(refresh_storage):
         # Read-only, cached, and single-flight. The first catalog answer must not
@@ -357,7 +404,8 @@ async def get_catalog(request: Request) -> CatalogResponse:
     return sealed.model_copy(
         update={
             "rounds": round_availability.apply(
-                sealed.rounds, _availability_signals(request)
+                sealed.rounds,
+                _availability_signals(request),
             )
         }
     )
@@ -411,6 +459,14 @@ def _fight_card_round_status(
     ring_holder: str | None = None,
 ) -> FightCardRoundStatus:
     active_phase = bout.phase if bout.active else None
+    availability_detail = getattr(availability, "availability_reason", None)
+    round5_stage_detail = (
+        availability_detail
+        if round_id == RoundId.SURVIVE_CONNECTION_SPIKE
+        and isinstance(availability_detail, str)
+        and availability_detail.startswith("ROUND 5 NOT STARTABLE")
+        else None
+    )
     if bout.active and active_phase == "cooldown_failed":
         state = FightCardState.UNAVAILABLE
         detail = (
@@ -419,10 +475,21 @@ def _fight_card_round_status(
         )
     elif bout.active and active_phase in _CLEANUP_PHASES:
         state = FightCardState.CLEANUP_IN_PROGRESS
+        durable_cleanup_detail = (
+            bout.maintenance_detail
+            if round_id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and isinstance(bout.maintenance_detail, str)
+            and bout.maintenance_detail.startswith("ROUND 5 NOT STARTABLE")
+            else None
+        )
         detail = (
-            _shared_ring_cleanup_detail(ring_holder)
+            durable_cleanup_detail
+            or round5_stage_detail
+            or _shared_ring_cleanup_detail(ring_holder)
             if rounds_share_one_ring
-            else _CLEANUP_DETAIL[round_id]
+            else durable_cleanup_detail
+            or round5_stage_detail
+            or _CLEANUP_DETAIL[round_id]
         )
     elif bout.active:
         state = FightCardState.BOUT_IN_PROGRESS
@@ -437,16 +504,36 @@ def _fight_card_round_status(
     elif getattr(availability, "availability_reason_code", None) == "cleanup_in_progress":
         state = FightCardState.CLEANUP_IN_PROGRESS
         detail = (
-            _shared_ring_cleanup_detail(ring_holder)
+            round5_stage_detail
+            or _shared_ring_cleanup_detail(ring_holder)
             if rounds_share_one_ring
-            else _CLEANUP_DETAIL[round_id]
+            else round5_stage_detail or _CLEANUP_DETAIL[round_id]
         )
     elif (
         getattr(availability, "availability", None) != Availability.READY
         or not bout.can_start
     ):
-        state = FightCardState.UNAVAILABLE
-        detail = (
+        # Round 5's own per-round gate can refuse while the catalog still says
+        # READY (the manager writes its reason into ``maintenance_detail``). That
+        # is the same automatic, self-clearing stage as a catalog refusal, so it
+        # must read TEMPORARILY UNAVAILABLE with its reason -- not the generic
+        # UNAVAILABLE fallback, which the fight card renders as "unavailable
+        # tonight" and which named nothing for eleven minutes on 2026-09-25.
+        round5_gate_detail = (
+            bout.maintenance_detail
+            if round_id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and isinstance(bout.maintenance_detail, str)
+            and bout.maintenance_detail.startswith("ROUND 5 NOT STARTABLE")
+            else None
+        )
+        round5_detail = round5_stage_detail or round5_gate_detail
+        state = (
+            FightCardState.TEMPORARILY_UNAVAILABLE
+            if round5_detail is not None
+            and "STAGE TERMINAL-BLOCKED" not in round5_detail
+            else FightCardState.UNAVAILABLE
+        )
+        detail = round5_detail or (
             getattr(availability, "availability_headline", None)
             or "This round is unavailable right now."
         )
@@ -461,6 +548,7 @@ def _fight_card_round_status(
         detail=detail,
         updated_at=bout.updated_at,
         expires_at=bout.expires_at,
+        round5_start=getattr(bout, "round5_start", None),
     )
 
 
@@ -471,6 +559,25 @@ async def get_all_bout_statuses(request: Request) -> AllBoutStatus:
     try:
         run_manager = manager(request)
         bouts = await run_manager.all_bout_statuses()
+        round5_bout = bouts[RoundId.SURVIVE_CONNECTION_SPIKE]
+        round5_start = round5_bout.round5_start
+        request.state.round5_cleanup_overlay = (
+            {
+                "round5_ring_ready": False,
+                "round5_cleanup_owed": True,
+                "round5_warm_state": "cleaning",
+                "round5_start_stage": "cleaning",
+                "round5_warm_generation": round5_start.generation,
+                "round5_cleanup_scope": round5_start.cleanup_scope,
+                "round5_cleanup_recovery_scheduled": (
+                    round5_start.recovery_scheduled
+                ),
+                "round5_cleanup_detail": round5_bout.maintenance_detail,
+            }
+            if round5_start is not None and round5_start.stage == "cleaning"
+            else None
+        )
+        request.state.round5_cleanup_overlay_checked = True
         live_catalog = await get_catalog(request)
         availability = {item.id: item for item in live_catalog.rounds}
         # Without per-round fences one bout locks the installation, and every round then

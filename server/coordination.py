@@ -1088,6 +1088,64 @@ class LakebaseBoutLeaseStore:
 
         return await self._run(claim_row)
 
+    async def reclaim_expired_cleanup(
+        self,
+        *,
+        session_id: str,
+        expected_previous_token: int,
+        ttl: timedelta,
+    ) -> BoutLease:
+        """Re-fence an inactive artifact ring for the authoritative cleanup owner.
+
+        ``expected_previous_token`` is the warm coordinator's bout fence, not this
+        artifact ring's fencing token.  Comparing those independent counters can
+        permanently strand cleanup after restart.  The caller proves the durable
+        cleanup authority before and immediately after this CAS; this operation
+        only claims an inactive ring and advances its own fence.
+        """
+
+        lease_id = str(uuid4())
+
+        async def reclaim_row(cursor: Any) -> BoutLease:
+            await cursor.execute(
+                f"""
+                UPDATE {COORDINATION_TABLE}
+                SET fencing_token = fencing_token + 1,
+                    lease_id = %s::uuid,
+                    session_id = %s,
+                    owner_subject = 'round5-cleanup-recovery',
+                    owner_display_name = 'Round 5 Cleanup Recovery',
+                    owner_email = NULL,
+                    phase = 'round5_cleanup',
+                    session_state = %s,
+                    round_id = 'survive_connection_spike',
+                    round_title = 'Survive a connection spike',
+                    competitor_id = 'cleanup_recovery',
+                    competitor_name = 'Cleanup recovery',
+                    started_at = clock_timestamp(),
+                    updated_at = clock_timestamp(),
+                    expires_at = clock_timestamp() + %s
+                WHERE ring_key = %s
+                  AND (lease_id IS NULL OR expires_at <= clock_timestamp())
+                RETURNING {self._returning_columns()}
+                """,
+                (
+                    lease_id,
+                    session_id,
+                    SessionState.TOWELLED.value,
+                    ttl,
+                    self.ring_key,
+                ),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    "Round 5 cleanup ring could not be reclaimed in its bout lineage"
+                )
+            return self._row_to_lease(row)
+
+        return await self._run(reclaim_row)
+
     async def transition(
         self,
         lease: BoutLease,

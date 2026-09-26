@@ -922,12 +922,28 @@ async def test_all_bout_statuses_cover_six_rounds_with_one_bounded_read(
     )
 
     reads = 0
+    primary_reads_entered: set[str] = set()
+    all_primary_reads_entered = asyncio.Event()
+    release_primary_reads = asyncio.Event()
+    primary_ring_keys = {
+        run_manager._lease_store_for_round(round_id).ring_key
+        for round_id in RoundId
+    }
     for store in run_manager._every_ring_store():
         current = store.current
+        ring_key = store.ring_key
 
-        async def counted_current(current=current):
+        async def counted_current(current=current, ring_key=ring_key):
             nonlocal reads
             reads += 1
+            if ring_key in primary_ring_keys:
+                primary_reads_entered.add(ring_key)
+                if len(primary_reads_entered) == len(RoundId):
+                    all_primary_reads_entered.set()
+                # A serial implementation can enter only its first read and
+                # deadlocks here. The production gather must enter all six
+                # independent primary rings before this gate opens.
+                await release_primary_reads.wait()
             return await current()
 
         store.current = counted_current  # type: ignore[method-assign]
@@ -939,7 +955,12 @@ async def test_all_bout_statuses_cover_six_rounds_with_one_bounded_read(
         transport=ASGITransport(app=api_app),
         base_url="http://anti-demo.test",
     ) as client:
-        response = await client.get("/api/bout/all")
+        request = asyncio.create_task(client.get("/api/bout/all"))
+        await asyncio.wait_for(all_primary_reads_entered.wait(), timeout=2)
+        assert primary_reads_entered == primary_ring_keys
+        assert not request.done()
+        release_primary_reads.set()
+        response = await asyncio.wait_for(request, timeout=2)
 
     assert response.status_code == 200
     payload = response.json()
@@ -1777,7 +1798,217 @@ def test_round_five_warm_cleaning_is_cleanup_in_progress(
     assert signals.round5_ring_ready is False
     assert signals.round5_reason_code == "cleanup_in_progress"
     assert signals.round5_detail is not None
-    assert signals.round5_detail.startswith("CLEANUP IN PROGRESS")
+    assert signals.round5_detail.startswith("ROUND 5 NOT STARTABLE · STAGE CLEANING")
+    assert "cleanup worker not confirmed" in signals.round5_detail
+    assert "operator attention required" in signals.round5_detail
+
+
+@pytest.mark.parametrize(
+    ("stage", "reason_code", "expected_state"),
+    [
+        ("CLEANING", "cleanup_in_progress", "cleanup_in_progress"),
+        ("REWARMING", None, "temporarily_unavailable"),
+        ("CLAIM-DRAIN", None, "temporarily_unavailable"),
+        ("IDENTITY-REFRESH", None, "temporarily_unavailable"),
+        ("TERMINAL-BLOCKED", None, "unavailable"),
+    ],
+)
+def test_round_five_fight_card_preserves_start_stage_and_diagnostics(
+    stage: str,
+    reason_code: str | None,
+    expected_state: str,
+) -> None:
+    round_five = next(
+        item
+        for item in sealed_catalog(connection_spike_available=True).rounds
+        if item.id == RoundId.SURVIVE_CONNECTION_SPIKE
+    ).model_copy(
+        update={
+            "availability": Availability.UNAVAILABLE,
+            "availability_reason_code": reason_code,
+            "availability_reason": (
+                f"ROUND 5 NOT STARTABLE · STAGE {stage} · GENERATION 17 · "
+                "CAN_START FALSE · retry 2026-09-24T01:00:00Z · "
+                "error warm_provider_retryable"
+            ),
+        }
+    )
+    bout = BoutStatus(
+        scope="round",
+        round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        ring_ready=False,
+        can_start=False,
+        maintenance_state="maintenance",
+        maintenance_detail=None,
+        active=False,
+    )
+
+    status = api_module._fight_card_round_status(
+        RoundId.SURVIVE_CONNECTION_SPIKE,
+        round_five,
+        bout,
+    )
+
+    assert status.state == expected_state
+    assert status.can_start is False
+    assert status.detail is not None
+    assert f"STAGE {stage}" in status.detail
+    assert "GENERATION 17" in status.detail
+    assert "retry 2026-09-24T01:00:00Z" in status.detail
+    assert "error warm_provider_retryable" in status.detail
+
+
+async def test_cross_replica_durable_cleanup_overrides_cached_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installation_id = "install-cross-replica-cleanup"
+    cleanup_store = InMemoryBoutLeaseStore(
+        ring_key=round_ring_key(
+            installation_id,
+            RoundId.SURVIVE_CONNECTION_SPIKE.value,
+            cleanup=True,
+        )
+    )
+    owner = BoutOperator(display_name="Process A", subject="process-a")
+    lease = await cleanup_store.claim(
+        session_id="prebell-session",
+        operator=owner,
+        phase="round5_cleanup",
+        session_state=SessionState.FAILED,
+        round_id=RoundId.SURVIVE_CONNECTION_SPIKE.value,
+        round_title="Round 5",
+        competitor_id=CompetitorId.AURORA_SERVERLESS_V2.value,
+        competitor_name="Aurora",
+        ttl=timedelta(seconds=90),
+    )
+    durable_slot = SimpleNamespace(
+        generation=23,
+        state="cleaning",
+        claim=SimpleNamespace(session_id="prebell-session"),
+        bell_id=None,
+        bell_at_utc=None,
+    )
+
+    class WarmStore:
+        async def read(self, _installation_id):
+            return durable_slot
+
+    stale_ready = {
+        "round5_warm_state": "ready",
+        "round5_start_stage": "ready",
+        "round5_ring_ready": True,
+        "round5_cleanup_owed": False,
+        "round5_warm_generation": 22,
+        "round5_warm_blocked_terminal": False,
+    }
+    coordinator = SimpleNamespace(
+        installation_id=installation_id,
+        store=WarmStore(),
+        ring_ready=True,
+        public_status_cached=lambda: stale_ready,
+    )
+    process_b = RunManager(
+        connection_spike_factory=lambda _competitor: object(),
+        round5_lease_store=cleanup_store,
+        round5_warm_coordinator=coordinator,
+        round_isolation=True,
+        installation_id=installation_id,
+    )
+    assert process_b._records == {}
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = process_b
+    api_app.state.readiness_gate = SimpleNamespace(
+        status=SimpleNamespace(ring_ready=True, maintenance_detail=None),
+        round5_status=SimpleNamespace(
+            ring_ready=True,
+            reason_code=None,
+            maintenance_state="ready",
+            maintenance_detail=None,
+        ),
+    )
+    monkeypatch.setattr(api_module, "effective_credential_verdict", lambda _state: None)
+    monkeypatch.setattr(api_module, "cached_installation_report", lambda: None)
+    monkeypatch.setattr(api_module.selfheal, "deployed", lambda: False)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        catalog = (await client.get("/api/catalog")).json()
+        board = (await client.get("/api/bout/all")).json()
+        created = await client.post(
+            "/api/sessions",
+            json={
+                "competitor": CompetitorId.AURORA_SERVERLESS_V2.value,
+                "primary_persona": "sre",
+                "corners": ["performance"],
+                "round_id": RoundId.SURVIVE_CONNECTION_SPIKE.value,
+            },
+        )
+        arm = await client.post(f"/api/sessions/{created.json()['id']}/arm")
+    catalog_round_five = next(
+        item
+        for item in catalog["rounds"]
+        if item["id"] == RoundId.SURVIVE_CONNECTION_SPIKE.value
+    )
+    assert catalog_round_five["availability"] == "unavailable"
+    assert "pre-bell resident cleanup" in catalog_round_five["availability_reason"].lower()
+    assert process_b.round5_ring_ready is False
+    assert arm.status_code == 409
+    assert "PRE-BELL RESIDENT CLEANUP" in arm.json()["detail"]
+    round_five = board["rounds"][RoundId.SURVIVE_CONNECTION_SPIKE.value]
+    assert round_five["can_start"] is False
+    assert round_five["state"] == "cleanup_in_progress"
+    assert "PRE-BELL RESIDENT CLEANUP" in round_five["detail"]
+    assert "RECOVERY WORKER NOT CONFIRMED" in round_five["detail"]
+    assert "Proxy" not in round_five["detail"]
+    assert "security group" not in round_five["detail"]
+    assert "reopen automatically" not in round_five["detail"]
+
+    monkeypatch.setattr(app.state, "run_manager", process_b, raising=False)
+    monkeypatch.setattr(
+        app.state,
+        "round5_warm_coordinator",
+        coordinator,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app.state,
+        "readiness_gate",
+        SimpleNamespace(
+            status=SimpleNamespace(
+                ring_ready=True,
+                maintenance_state="ready",
+                maintenance_detail=None,
+            )
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(app.state, "coordination_mode", "lakebase", raising=False)
+    monkeypatch.setattr(app.state, "readiness_verified", True, raising=False)
+
+    async def no_ingress():
+        return None
+
+    async def no_presence():
+        return None
+
+    monkeypatch.setattr(app_module, "operator_ingress_drift_async", no_ingress)
+    monkeypatch.setattr(app_module, "installation_presence_async", no_presence)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        readyz = (await client.get("/readyz")).json()
+    assert readyz["round5_ring_ready"] is False
+    assert readyz["round5_cleanup_owed"] is True
+    assert readyz["round5_cleanup_scope"] == "prebell_resident"
+    assert "PRE-BELL RESIDENT CLEANUP" in readyz["round5_cleanup_owed_detail"]
+
+    assert await cleanup_store.release(lease) is True
+    await process_b.close()
 
 
 def test_round_five_without_warm_coordinator_uses_readiness_gate(

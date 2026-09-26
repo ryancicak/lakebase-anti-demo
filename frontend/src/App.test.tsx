@@ -2380,6 +2380,356 @@ describe('backstage setup', () => {
     expect(screen.queryByText(/please wait · the current bout owns the ring/i)).not.toBeInTheDocument()
   })
 
+  it('refreshes a transient Round 5 identity refusal back to backstage preparation', async () => {
+    const warming = allReadyBoutBoard({
+      survive_connection_spike: {
+        state: 'unavailable',
+        can_start: false,
+        detail: 'Opaque compatibility sentence that must not drive Round 5 controls',
+        round5_start: {
+          stage: 'rewarming',
+          generation: 13,
+          recovery_scheduled: null,
+          cleanup_scope: null,
+        },
+      },
+    })
+    vi.mocked(api.allBoutStatuses)
+      .mockResolvedValueOnce(allReadyBoutBoard())
+      .mockResolvedValueOnce(allReadyBoutBoard())
+      .mockResolvedValue(warming)
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(session('draft')))
+      }
+      if (input.endsWith('/arm')) {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({
+            detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 13 · CAN_START FALSE · WAIT FOR READY / RING_READY TRUE',
+          }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'survive_connection_spike')
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+
+    expect((await screen.findAllByText(/Round 5 is warming its connection pool and will reopen automatically/i))[0]).toBeVisible()
+    expect(screen.queryByText(/can_start|stage rewarming|generation 13/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/opaque compatibility sentence/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.queryByText(/throwaway|fight card could not be prepared/i)).not.toBeInTheDocument()
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+  })
+
+  it('lets the owner release an armed Round 5 card instead of waiting out its window', async () => {
+    const roundFive = FALLBACK_CATALOG.rounds.find((round) => round.id === 'survive_connection_spike')!
+    const roundFiveSession = (state: DemoSession['state']): DemoSession => ({
+      ...session(state),
+      round: roundFive,
+      armed_expires_at: state === 'armed' ? new Date(Date.now() + 180_000).toISOString() : null,
+    })
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(roundFiveSession('draft')))
+      }
+      if (input.endsWith('/cancel-arm')) return Promise.resolve(jsonResponse(roundFiveSession('failed')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(roundFiveSession('armed')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'survive_connection_spike')
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await screen.findByRole('button', { name: /ring the bell/i })
+
+    await user.click(screen.getByRole('button', { name: /change the matchup/i }))
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/sessions/session-1/cancel-arm',
+      expect.objectContaining({ method: 'POST' }),
+    )
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/run'))).toBe(false)
+  })
+
+  it('offers no matchup release on an armed Round 1 card', async () => {
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await screen.findByRole('button', { name: /ring the bell/i })
+
+    expect(screen.queryByRole('button', { name: /change the matchup/i })).not.toBeInTheDocument()
+  })
+
+  it('uses newer WARMING state when a 409 refresh returns stale READY', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    let resolveConflictRefresh!: (board: AllBoutStatus) => void
+    const stalledConflictRefresh = new Promise<AllBoutStatus>((resolve) => {
+      resolveConflictRefresh = resolve
+    })
+    const warming = allReadyBoutBoard({
+      survive_connection_spike: {
+        state: 'unavailable',
+        can_start: false,
+        detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 13 · CAN_START FALSE · wait for READY / RING_READY TRUE',
+      },
+    })
+    vi.mocked(api.allBoutStatuses)
+      .mockResolvedValueOnce(allReadyBoutBoard())
+      .mockResolvedValueOnce(allReadyBoutBoard())
+      .mockReturnValueOnce(stalledConflictRefresh)
+      .mockResolvedValue(warming)
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(session('draft')))
+      }
+      if (input.endsWith('/arm')) {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({
+            detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 13 · CAN_START FALSE · WAIT FOR READY / RING_READY TRUE',
+          }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1_100)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_400)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(4)
+    await act(async () => {
+      resolveConflictRefresh(allReadyBoutBoard())
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.getAllByText(/not startable.*stage rewarming.*generation 13.*can_start false/i)[0]).toBeVisible()
+    expect(window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')).toBeNull()
+  })
+
+  it('uses newer READY state when prepare refresh returns stale WARMING', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    let resolvePrepareRefresh!: (board: AllBoutStatus) => void
+    const stalePrepareRefresh = new Promise<AllBoutStatus>((resolve) => {
+      resolvePrepareRefresh = resolve
+    })
+    const warming = allReadyBoutBoard({
+      survive_connection_spike: {
+        state: 'temporarily_unavailable',
+        can_start: false,
+        detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 13 · CAN_START FALSE',
+      },
+    })
+    vi.mocked(api.allBoutStatuses)
+      .mockResolvedValueOnce(allReadyBoutBoard())
+      .mockReturnValueOnce(stalePrepareRefresh)
+      .mockResolvedValue(allReadyBoutBoard())
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(session('draft')))
+      }
+      if (input.endsWith('/arm')) return new Promise(() => {})
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(3_500)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+
+    await act(async () => {
+      resolvePrepareRefresh(warming)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(fetchMock.mock.calls.filter(([input, init]) => (
+      input === '/api/sessions' && init?.method === 'POST'
+    ))).toHaveLength(1)
+  })
+
+  it('creates and arms at most one session on a rapid prepare double-click', async () => {
+    const arm = deferred<ReturnType<typeof jsonResponse>>()
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(session('draft')))
+      }
+      if (input.endsWith('/arm')) return arm.promise
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'survive_connection_spike')
+    const prepare = await screen.findByRole('button', { name: /prepare fight card/i })
+    fireEvent.click(prepare)
+    fireEvent.click(prepare)
+
+    await waitFor(() => expect(
+      fetchMock.mock.calls.filter(([input, init]) => (
+        input === '/api/sessions' && init?.method === 'POST'
+      )),
+    ).toHaveLength(1))
+    await waitFor(() => expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/arm')),
+    ).toHaveLength(1), { timeout: 2_000 })
+
+    arm.resolve(jsonResponse(session('armed')))
+    await waitFor(() => expect(
+      fetchMock.mock.calls.filter(([input, init]) => (
+        input === '/api/sessions' && init?.method === 'POST'
+      )),
+    ).toHaveLength(1))
+  })
+
+  it('clears the saved draft when a transient arm refusal arrives after unmount', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    const arm = deferred<Response>()
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse(session('draft')))
+      }
+      if (input.endsWith('/arm')) return arm.promise
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const rendered = render(<App />)
+    await waitFor(() => expect(
+      screen.getByRole('button', { name: /prepare fight card/i }),
+    ).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await waitFor(() => expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/arm')),
+    ).toHaveLength(1), { timeout: 2_000 })
+    expect(window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')).not.toBeNull()
+
+    rendered.unmount()
+    arm.resolve(new Response(
+      JSON.stringify({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 13 · CAN_START FALSE · WAIT FOR READY / RING_READY TRUE' }),
+      {
+        status: 409,
+        statusText: 'Conflict',
+        headers: { 'Content-Type': 'application/json' },
+      },
+    ))
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')).toBeNull()
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/arm'))).toHaveLength(1)
+  })
+
   it('locks an active round before posting without exposing its owner', async () => {
     vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
       wake_idle_app: {
@@ -2427,10 +2777,11 @@ describe('backstage setup', () => {
         detail: 'BOUT IN PROGRESS · This round is already in use. Other rounds remain available.',
       },
     }))
-    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
       throw new Error(`Unexpected request: ${input}`)
-    }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
     const user = userEvent.setup()
     render(<App />)
 
@@ -2573,6 +2924,82 @@ describe('backstage setup', () => {
     expect(screen.queryByText('CLEANUP IN PROGRESS')).not.toBeInTheDocument()
     expect(laneLinesOnScreen()).not.toContain('BOUT IN PROGRESS')
     expect(api.boutStatus).not.toHaveBeenCalled()
+  })
+
+  it('does not let a stalled prepare READY authorize after a newer WARMING response', async () => {
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      roundOverride: 'survive_connection_spike',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    let resolvePrepare!: (board: AllBoutStatus) => void
+    const stalledPrepare = new Promise<AllBoutStatus>((resolve) => { resolvePrepare = resolve })
+    const warming = allReadyBoutBoard({
+      survive_connection_spike: {
+        state: 'unavailable',
+        can_start: false,
+        detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 13 · CAN_START FALSE · wait for READY / RING_READY TRUE',
+      },
+    })
+    vi.mocked(api.allBoutStatuses)
+      .mockResolvedValueOnce(allReadyBoutBoard())
+      .mockReturnValueOnce(stalledPrepare)
+      .mockResolvedValue(warming)
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    const prepare = screen.getByRole('button', { name: /prepare fight card/i })
+    expect(prepare).toBeEnabled()
+    fireEvent.click(prepare)
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_500)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+    expect(prepare).toBeDisabled()
+
+    await act(async () => {
+      resolvePrepare(allReadyBoutBoard())
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(prepare).toBeDisabled()
+    expect(screen.getAllByText(/not startable.*stage rewarming.*generation 13.*can_start false/i)[0]).toBeVisible()
+    expect(
+      fetchMock.mock.calls.some(([input, init]) => (
+        input === '/api/sessions' && init?.method === 'POST'
+      )),
+    ).toBe(false)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_499)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(3)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1)
+    })
+    expect(api.allBoutStatuses).toHaveBeenCalledTimes(4)
   })
 
   it('preserves the last broad status through errors and retries safely', async () => {

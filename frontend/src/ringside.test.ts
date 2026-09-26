@@ -1014,10 +1014,10 @@ describe('Ringside output behavior', () => {
           expect(cue.say).toMatch(/\bup to 10,000 client connections\b/i)
           expect(cue.say).not.toMatch(sayProofJargon)
           expect(cue.show).toContain(
-            'Both paths connected and held 10,000 clients from the same start.',
+            'Both paths reached and held 10,000 clients, each timed from the same bell',
           )
-          expect(cue.show).toMatch(/passed 64 held-connection checks per lane/i)
-          expect(cue.show).toMatch(/transaction throughput were not measured/i)
+          expect(cue.show).toMatch(/answered all 64 test queries sent over those held connections/i)
+          expect(cue.show).toMatch(/Not measured:.*transaction throughput/i)
           // Under the bounded protocol the proof line was forbidden from naming
           // 10,000, because 10,000 was a product limit the bout never approached
           // and the round measured 128 attempts. The fan-in protocol measures

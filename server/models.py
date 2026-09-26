@@ -60,6 +60,27 @@ class BoutOperator(BaseModel):
     subject: str | None = Field(default=None, exclude=True)
 
 
+class RoundFiveStartStatus(BaseModel):
+    """Machine-readable Round 5 admission and recovery state."""
+
+    stage: Literal[
+        "ready",
+        "cleaning",
+        "claim-drain",
+        "terminal-blocked",
+        "identity-refresh",
+        "rewarming",
+    ]
+    generation: int | None = None
+    recovery_scheduled: bool | None = None
+    cleanup_scope: Literal["prebell_resident", "postbell_resources", "unknown"] | None = None
+    # Structured observability (B4): the durable warm-slot revision and the last warm
+    # error code, surfaced so operators/soaks can track idle keep-alive health from a
+    # stable public field instead of parsing the prose maintenance detail.
+    revision: int | None = None
+    last_error_code: str | None = None
+
+
 class BoutStatus(BaseModel):
     scope: Literal["global", "round"] = "global"
     round_id: RoundId | None = None
@@ -76,12 +97,17 @@ class BoutStatus(BaseModel):
     state: SessionState | None = None
     round_title: str | None = None
     competitor: str | None = None
+    round5_start: RoundFiveStartStatus | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class FightCardState(StrEnum):
     READY = "ready"
     BOUT_IN_PROGRESS = "bout_in_progress"
     CLEANUP_IN_PROGRESS = "cleanup_in_progress"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     UNAVAILABLE = "unavailable"
 
 
@@ -95,6 +121,10 @@ class FightCardRoundStatus(BaseModel):
     detail: str | None = None
     updated_at: datetime | None = None
     expires_at: datetime | None = None
+    round5_start: RoundFiveStartStatus | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class AllBoutStatus(BaseModel):

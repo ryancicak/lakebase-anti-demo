@@ -12,6 +12,7 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -97,6 +98,7 @@ from .round5_control import (
     Round5ControlBinding,
     Round5ControlEvent,
     Round5ControlKind,
+    Round5ResidentBindingChangedError,
     Round5ResidentTransport,
     canonical_request_sha256,
 )
@@ -190,6 +192,16 @@ DISPATCH_CAPSULE_REFRESH_INTERVAL_SECONDS = 30
 SETTLEMENT_TIMEOUT_SECONDS = 45.0
 SETUP_DEADLINE_SECONDS = 30 * 60.0
 PROXY_DELETION_TIMEOUT_SECONDS = 10 * 60.0
+# Swarm defect #4: how many bounded describe confirmations prove that an
+# ambiguous ``DBProxyAlreadyExistsFault`` was eventual consistency (our exact
+# Proxy is genuinely absent) before the create is retried.  A single describe is
+# not proof of absence.
+PROXY_CREATE_ABSENCE_CONFIRMATIONS = 3
+# Swarm defect #5: how many consecutive bounded NotFound describes prove a
+# per-bout Proxy is *definitively* gone during cleanup.  One NotFound is unknown
+# (control-plane eventual consistency after DeleteDBProxy acceptance), never
+# clean; cleanup debt is held until this many confirmations agree.
+PROXY_DELETE_ABSENCE_CONFIRMATIONS = 3
 RUNNER_PATH = "/opt/lakebase-anti-demo/round5/run_connection_spike.sh"
 SETUP_RUNNER_PATH = RUNNER_PATH
 TRUST_BUNDLE_PATH = "/opt/lakebase-anti-demo/round5/round5-ca.pem"
@@ -278,6 +290,31 @@ class ConnectionSpikeLiveTransientError(ConnectionSpikeLiveError):
     """A live dependency is temporarily unable to prove the sealed contract."""
 
 
+class ConnectionSpikeLiveSourceUnavailableError(ConnectionSpikeLiveTransientError):
+    """The sealed competitor source matches identity but is not yet available.
+
+    A *transient* condition -- the source is backing-up / modifying /
+    failing-over / rebooting -- never identity drift.  It self-heals on a bounded
+    retry and, if it persists, escalates to a SELF-VERIFIABLE block (the DB is
+    busy, not misconfigured); it must never latch ``warm_baseline_invalid``.
+    """
+
+
+class ConnectionSpikeLiveSourceUnresolvedError(ConnectionSpikeLiveSourceUnavailableError):
+    """A source describe did not resolve to exactly one matching row.
+
+    Swarm finding req #4 (identity inversion).  An EMPTY describe is retried
+    boundedly under provider eventual consistency, but -- unlike a busy-but-present
+    source -- if it stays unresolved past the transient budget it is NOT a
+    self-verifiable "the DB will recover" condition: the sealed source cannot be
+    found at all, which needs operator attention.  It therefore escalates to a
+    TERMINAL block (``warm_source_unresolved_persistent``, absent from
+    ``SELF_VERIFIABLE_BLOCK_CODES``) instead of rechecking forever.  A DUPLICATE
+    describe (more than one matching row) never reaches here: it is a terminal
+    configuration fault raised immediately at read time.
+    """
+
+
 class ConnectionSpikeLiveOperationError(ConnectionSpikeLiveError):
     """The remote runner did not produce a complete, sanitized proof."""
 
@@ -314,8 +351,87 @@ def _require_warm_runner_online(
         )
 
 
+def _require_warm_source_identity(
+    source: _CompetitorSource,
+    *,
+    expected_identifier: str,
+    expected_resource_id: str,
+    expected_direct_host: str,
+    expected_vpc_id: str,
+    expected_security_group_id: str | None,
+) -> None:
+    """Split immutable source identity (terminal) from availability (transient).
+
+    A true identifier / resource-id / host / VPC / security-group mismatch is
+    permanent drift from the sealed contract and raises
+    ``ConnectionSpikeLiveConfigurationError`` (``warm_baseline_invalid``, operator
+    attention).  Matching identity with a non-``available`` status -- or a
+    describe that momentarily returned no matching row -- is a transient provider
+    condition and raises ``ConnectionSpikeLiveSourceUnavailableError`` for a
+    bounded, self-healing retry.  An empty describe is treated as ambiguous
+    provider state (retry boundedly), never silently accepted as a valid identity.
+
+    ``expected_security_group_id`` is compared exactly when provided (the warm
+    contract seals exactly one group); pass ``None`` to require only that exactly
+    one group is attached (the preflight path derives it from the source itself).
+    """
+
+    if not source.identifier:
+        # Empty/absent describe: retried boundedly under eventual consistency, but
+        # (req #4) it escalates to a TERMINAL block if it persists rather than
+        # rechecking forever -- an unfindable sealed source needs operator
+        # attention, unlike a present-but-busy one.  A duplicate describe never
+        # reaches here (it is raised as a terminal configuration fault at read).
+        raise ConnectionSpikeLiveSourceUnresolvedError(
+            "Round 5 warm source did not resolve to exactly one matching row"
+        )
+    identity_changed = (
+        source.identifier != expected_identifier
+        or source.resource_id != expected_resource_id
+        or source.direct_host != expected_direct_host
+        or source.vpc_id != expected_vpc_id
+    )
+    if expected_security_group_id is not None:
+        identity_changed = identity_changed or (
+            source.security_group_ids != (expected_security_group_id,)
+        )
+    else:
+        identity_changed = identity_changed or (len(source.security_group_ids) != 1)
+    if identity_changed:
+        raise ConnectionSpikeLiveConfigurationError(
+            "Round 5 warm source identity changed"
+        )
+    if source.status != "available":
+        raise ConnectionSpikeLiveSourceUnavailableError(
+            "Round 5 warm source matches identity but is not available yet "
+            f"(status={source.status!r})"
+        )
+
+
 class ConnectionSpikeCleanupError(ConnectionSpikeLiveOperationError):
     """The exact command did not prove cleanup and flock release."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str | None = None,
+        reason_code: str | None = None,
+        lane: str | None = None,
+        job_id: str | None = None,
+        failures: Sequence[ConnectionSpikeCleanupError] = (),
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.reason_code = reason_code
+        self.lane = lane
+        self.job_id = job_id
+        self.failures = tuple(failures)
+
+    def underlying_causes(self) -> tuple[BaseException, ...]:
+        """Independent safe-to-enumerate failures for redacted diagnostics."""
+
+        return self.failures
 
 
 def _runner_error_code(output: str) -> str:
@@ -931,12 +1047,38 @@ class _SetupResources:
     proxy_security_group_id: str = ""
     rds_security_group_id: str = ""
     proxy_endpoint: str = ""
-    # Monotonic stamp taken at the CreateDBProxy request boundary (before the SDK
-    # call leaves this process), so the setup contract can score the real
-    # bell -> CreateDBProxy request latency instead of the workflow_launched
-    # lower bound.
+    proxy_arn: str = ""
+    # Monotonic stamp taken at the CreateDBProxy request boundary INSIDE the
+    # dedicated worker (immediately before the SDK call leaves this process), so
+    # the setup contract can score the real bell -> CreateDBProxy request latency
+    # instead of the workflow_launched lower bound.
     proxy_create_requested_ns: int | None = None
+    # Monotonic stamp taken on the event loop just before the CreateDBProxy call
+    # is submitted to its dedicated executor. The gap
+    # ``proxy_create_requested_ns - proxy_create_submitted_ns`` is the worker
+    # scheduling delay that a shared default executor would otherwise hide.
+    proxy_create_submitted_ns: int | None = None
     security_group_rule_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _BellCapability:
+    """A process-local, non-durable proof that this replica accepted the bell.
+
+    Swarm defect #2.  The single timed CreateDBProxy mutation must not perform any
+    remote fence I/O after the bell (that would sit on the T0 -> boto3 path), yet
+    it must still refuse to run for a stale owner.  This capability is minted on
+    the bell path, keyed to the exact bout and fence, with a monotonic expiry
+    covering the legitimate bout window.  ``_create_proxy`` checks it -- a pure,
+    synchronous, in-process lookup with no await -- immediately before submitting
+    the mutation.  A create whose bell was accepted more than a bout-deadline ago,
+    or under a different fence, is refused locally without touching AWS.
+    """
+
+    bout_id: str
+    fencing_token: int
+    minted_ns: int
+    expires_ns: int
 
 
 @dataclass(frozen=True)
@@ -1122,6 +1264,38 @@ class LakebaseCreationJournalStore:
             )
 
         return await self._run(select)
+
+    async def admitted_lifecycle_states(self) -> frozenset[str]:
+        """Return the ``lifecycle_state`` values the LIVE CHECK constraint admits.
+
+        Swarm req #3: readiness uses this to refuse ring readiness (and arm) when
+        the deployed journal CHECK cannot admit a state the arm/bell/cleanup path
+        emits -- the exact failure mode (code emits a state the live CHECK forbids)
+        that let the 2026-09-23 arm regression ship 'green' against fake journals.
+        Reads ``pg_get_constraintdef`` from the catalog (no table lock).
+        """
+
+        schema, _, table = ROUND5_CREATION_JOURNAL_TABLE.partition(".")
+
+        async def select(cursor: Any) -> str:
+            await cursor.execute(
+                """
+                SELECT pg_get_constraintdef(c.oid)
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = %s
+                  AND t.relname = %s
+                  AND c.contype = 'c'
+                  AND pg_get_constraintdef(c.oid) LIKE '%%lifecycle_state%%'
+                """,
+                (schema, table),
+            )
+            rows = await cursor.fetchall()
+            return " ".join(str(row[0]) for row in rows)
+
+        definition = await self._run(select)
+        return frozenset(re.findall(r"'([a-z_]+)'", definition))
 
     async def unresolved_bout_ids(self) -> Sequence[str]:
         """Return only bouts with journal-authorized resources not yet deleted."""
@@ -1314,6 +1488,21 @@ class LiveConnectionSpikeSetupOrchestrator:
         self._cleanup_start_lock = asyncio.Lock()
         self._cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._proxy_delete_accepted: dict[str, asyncio.Event] = {}
+        #: The proxy CREATE_INTENT committed on the bell path (swarm defect #1,
+        #: Approach A: precommit_launch_intent), keyed by bout.  ``setup()`` consumes
+        #: it so no journal write is awaited between the authoritative T0 and the
+        #: boto3 CreateDBProxy request.
+        self._promoted_proxy_intents: dict[str, JournalEvent] = {}
+        #: Process-local bell capabilities (swarm defect #2), keyed by bout.  Minted
+        #: on the bell path; checked -- with no await -- immediately before the
+        #: timed CreateDBProxy mutation so a stale owner cannot mutate.
+        self._bell_capabilities: dict[str, _BellCapability] = {}
+        #: A single reused worker for the timed CreateDBProxy dispatch (swarm
+        #: defect #3 + req #7).  Created ONCE and warmed before the scored window,
+        #: never inside it -- spawning a ThreadPoolExecutor (thread create + start)
+        #: between T0 and the boto3 request would add uncontrolled latency to the
+        #: scored bell -> CreateDBProxy delta.
+        self._createproxy_executor: ThreadPoolExecutor | None = None
 
     @staticmethod
     def names_for_bout(
@@ -1381,6 +1570,15 @@ class LiveConnectionSpikeSetupOrchestrator:
             )
             self._require_rule_bindings(resources)
             coordinator, specs = self._coordinator(scope, warm.clients, resources)
+            # Swarm defect #1 (Approach A): ARM writes NOTHING to the creation
+            # journal.  The timed CreateDBProxy CREATE_INTENT is made durable on the
+            # BELL path (``precommit_launch_intent``), before the authoritative T0
+            # and before Lakebase is released, so Lakebase can never be released
+            # while the competitor's create record does not yet exist -- and no
+            # journal write is charged against the bell-relative window.  Only
+            # already-allowed lifecycle states are ever written, so no schema
+            # migration is required (this replaces the reverted PENDING_LAUNCH
+            # pre-state that the live CHECK constraint rejected).
             self._coordinators[bout_id] = coordinator
             self._scopes[bout_id] = scope
             self._prepared[bout_id] = fencing_token
@@ -1388,7 +1586,107 @@ class LiveConnectionSpikeSetupOrchestrator:
             self._prepared_specs[bout_id] = specs
             self._resources_by_bout[bout_id] = resources
 
-    async def warm(self, generation: int) -> ConnectionSpikeWarmSetupContext:
+    async def precommit_launch_intent(self, bout_id: str, fencing_token: int) -> JournalEvent:
+        """Durably commit the timed CreateDBProxy CREATE_INTENT on the bell path.
+
+        Swarm defect #1 (Approach A).  Invoked on the bell path immediately before
+        the authoritative T0 (and before Lakebase is released), so the durable
+        create intent exists first and ``setup()`` awaits no coordination I/O
+        between T0 and the boto3 CreateDBProxy request.  Writes ``CREATE_INTENT``
+        directly -- an already-allowed journal ``lifecycle_state`` -- so no schema
+        migration is needed.  Idempotent for a duplicate ``/run``: a second call
+        returns the same already-committed intent instead of failing the bell.
+        """
+
+        scope = self._scopes.get(bout_id)
+        coordinator = self._coordinators.get(bout_id)
+        specs = self._prepared_specs.get(bout_id)
+        if (
+            self._prepared.get(bout_id) != fencing_token
+            or scope is None
+            or coordinator is None
+            or specs is None
+        ):
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 bell cannot stage a launch that ARM never prepared"
+            )
+        existing = self._promoted_proxy_intents.get(bout_id)
+        if existing is not None:
+            # A duplicate /run must re-mint the process-local bell capability under
+            # the current token (already validated to equal the prepared fence
+            # above) BEFORE returning the cached intent.  Without this the cached
+            # path inherited whatever expiry the first mint set, so a legitimate
+            # same-fence retry that arrived a whole setup-deadline after the first
+            # bell would present an expired capability and _require_bell_capability
+            # would refuse the timed CreateDBProxy.  Re-minting keeps the same-owner
+            # retry fresh; the fence check above still fails closed on real drift.
+            self.arm_bell_capability(bout_id, fencing_token)
+            return existing
+        proxy_spec = next(
+            (spec for spec in specs if spec.resource_kind == "rds_proxy"), None
+        )
+        if proxy_spec is None:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 competitor specs omitted the timed CreateDBProxy mutation"
+            )
+        intent = await coordinator.precommit_intent(scope, proxy_spec)
+        self._promoted_proxy_intents[bout_id] = intent
+        # Mint the local bell capability on the bell path, keyed to this exact
+        # bout/fence (swarm defect #2).  A duplicate /run re-promotes idempotently
+        # above and re-mints here with a fresh expiry, which is correct: the same
+        # in-process owner is still fresh.
+        self.arm_bell_capability(bout_id, fencing_token)
+        return intent
+
+    def arm_bell_capability(
+        self, bout_id: str, fencing_token: int, *, ttl_seconds: float | None = None
+    ) -> None:
+        """Mint a process-local bell capability for the timed CreateDBProxy.
+
+        Swarm defect #2.  Called on the bell path.  The default TTL is the setup
+        deadline: a create that has not fired within a whole bout window of the
+        bell is, by definition, a stale owner and must be refused locally.
+        """
+
+        ttl = self.config.deadline_seconds if ttl_seconds is None else ttl_seconds
+        now = self._monotonic_ns()
+        self._bell_capabilities[bout_id] = _BellCapability(
+            bout_id=bout_id,
+            fencing_token=fencing_token,
+            minted_ns=now,
+            expires_ns=now + int(ttl * 1_000_000_000),
+        )
+
+    def _require_bell_capability(self, bout_id: str, fencing_token: int) -> None:
+        """Refuse the timed mutation for a stale owner. Pure local, no await/I/O.
+
+        Deliberately synchronous so it can sit on the T0 -> boto3 path without
+        adding any awaited coordination.  Fail-closed on absence, fence drift, or
+        expiry.
+        """
+
+        capability = self._bell_capabilities.get(bout_id)
+        if capability is None:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 timed CreateDBProxy refused: no local bell capability for "
+                "this bout; the bell was not accepted by this replica"
+            )
+        if capability.fencing_token != fencing_token:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 bell capability fence does not match the CreateDBProxy scope"
+            )
+        if self._monotonic_ns() >= capability.expires_ns:
+            raise ConnectionSpikeLiveOperationError(
+                "Round 5 local bell capability expired before the timed CreateDBProxy "
+                "mutation; refusing a stale owner"
+            )
+
+    async def warm(
+        self,
+        generation: int,
+        *,
+        cleaned_bout_id: str | None = None,
+    ) -> ConnectionSpikeWarmSetupContext:
         """Perform every slow setup prerequisite before a session can claim."""
 
         clients = await self._assumed_clients(f"warm-{generation}")
@@ -1410,17 +1708,14 @@ class LiveConnectionSpikeSetupOrchestrator:
         )
         lakebase_runners = lakebase_managed.get("InstanceInformationList") or []
         competitor_runners = competitor_managed.get("InstanceInformationList") or []
-        if (
-            source.identifier != self.config.competitor_target_id
-            or source.resource_id != self.config.competitor_resource_id
-            or source.direct_host != self.config.competitor_direct_host
-            or source.status != "available"
-            or source.vpc_id != self.config.vpc_id
-            or source.security_group_ids != (self.config.competitor_security_group_id,)
-        ):
-            raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 warm source identity changed"
-            )
+        _require_warm_source_identity(
+            source,
+            expected_identifier=self.config.competitor_target_id,
+            expected_resource_id=self.config.competitor_resource_id,
+            expected_direct_host=self.config.competitor_direct_host,
+            expected_vpc_id=self.config.vpc_id,
+            expected_security_group_id=self.config.competitor_security_group_id,
+        )
         _require_warm_runner_online(
             lakebase_runners,
             expected_instance_id=self.config.runner_instance_id,
@@ -1437,6 +1732,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             clients,
             self.config.competitor_security_group_id,
             include_legacy=False,
+            bout_id=cleaned_bout_id,
         )
         context = ConnectionSpikeWarmSetupContext(
             clients=clients,
@@ -1561,21 +1857,24 @@ class LiveConnectionSpikeSetupOrchestrator:
             resources = prepared
             clients = warm.clients
 
-            # Journal-before-AWS durability for the timed CreateDBProxy mutation
-            # is satisfied HERE, before the authoritative comparison T0 is
-            # captured and before the shared gate releases. The intent commit is
-            # ~3 coordination-store round trips (fence assert + duplicate-ordinal
-            # read + durable intent write) that used to sit *after* T0 on the
-            # timed path and structurally blew the 100 ms bell-relative
-            # create_db_proxy_window (live proxy CREATE_INTENT durable wall was
-            # ~163 ms after T0). Pre-committing it before T0 keeps the reference
-            # (bell/T0) and the 100 ms budget intact while removing every awaited
-            # journal/fence op from the post-gate path: the first awaited call the
-            # competitor lane makes after the gate releases is the direct boto3
-            # CreateDBProxy request itself. This is not a pre-created Proxy -- no
-            # AWS mutation happens before T0, only the durable coordination write
-            # -- and it introduces no new orphan class because the intent is still
-            # journalled within this same ``setup()``/bell invocation.
+            # Req #7: warm the reused CreateDBProxy worker now, before the scored
+            # window, so no ThreadPoolExecutor is created between T0 and the boto3
+            # request.
+            self._ensure_createproxy_executor()
+
+            # Swarm defect #1 (Approach A): the timed CreateDBProxy CREATE_INTENT is
+            # made durable on the bell path (``precommit_launch_intent``, before the
+            # authoritative T0), NOT here.  ``setup()`` therefore awaits zero
+            # journal/fence I/O before releasing the gate -- the first awaited call
+            # the competitor lane makes after the gate is the direct boto3
+            # CreateDBProxy request itself.  We only consume the already-durable
+            # intent below.
+            #
+            # Fallback: if the bell path did not pre-commit (e.g. the non-atomic
+            # in-memory bell store, or a direct setup() invocation), commit it now
+            # through the same ``precommit_intent`` path so the semantics are
+            # identical.  This still commits before the gate releases, so no orphan
+            # class is introduced.
             proxy_spec = next(
                 (spec for spec in specs if spec.resource_kind == "rds_proxy"), None
             )
@@ -1583,7 +1882,14 @@ class LiveConnectionSpikeSetupOrchestrator:
                 raise ConnectionSpikeLiveOperationError(
                     "Round 5 competitor specs omitted the timed CreateDBProxy mutation"
                 )
-            proxy_intent = await coordinator.precommit_intent(scope, proxy_spec)
+            proxy_intent = self._promoted_proxy_intents.pop(bout_id, None)
+            if proxy_intent is None:
+                proxy_intent = await coordinator.precommit_intent(scope, proxy_spec)
+                # Fallback path (in-memory bell store / direct setup): the bell
+                # capability was not minted on a separate bell path, so mint it
+                # here.  Production always mints at precommit_launch_intent above
+                # and takes the pop branch, so this never re-mints a stale owner.
+                self.arm_bell_capability(bout_id, fencing_token)
 
             gate = asyncio.Event()
             t0_box: list[int] = []
@@ -1829,8 +2135,16 @@ class LiveConnectionSpikeSetupOrchestrator:
         coordinator = self._coordinators.get(bout_id)
         scope = self._scopes.get(bout_id)
         if coordinator is None or scope is None:
-            self._proxy_delete_accepted.setdefault(bout_id, asyncio.Event()).set()
-            return
+            # Process-local setup state is not an absence proof. In particular,
+            # CreateDBProxy may have crossed AWS immediately before a restart.
+            # Leave the handoff unset and force the durable warm owner through
+            # reconcile_failed_cleanup, which reconstructs exact tagged specs
+            # from the claim's bout id and fence.
+            raise ConnectionSpikeCleanupError(
+                "Round 5 cleanup requires durable resource reconstruction",
+                stage="cleanup_reconstruction",
+                reason_code="cleanup_reconstruction_required",
+            )
         receipt = self._receipts.get(bout_id)
         report = (
             await coordinator.cleanup(scope, receipt)
@@ -1838,9 +2152,27 @@ class LiveConnectionSpikeSetupOrchestrator:
             else await coordinator.reconcile_incomplete(scope)
         )
         if not report.complete:
-            raise ConnectionSpikeCleanupError(
-                "Round 5 per-bout setup cleanup was not ownership-confirmed"
+            proxy_spec = next(
+                (
+                    spec
+                    for spec in self._prepared_specs.get(bout_id, ())
+                    if spec.resource_kind == "rds_proxy"
+                ),
+                None,
             )
+            proxy_adapter = coordinator._adapters.get("rds_proxy")
+            if proxy_spec is None or proxy_adapter is None:
+                raise ConnectionSpikeLiveTransientError(
+                    "Round 5 per-bout setup cleanup is waiting on provider absence"
+                )
+            observed_proxy = await proxy_adapter.inspect(proxy_spec, provider_id=None)
+            if observed_proxy is not None:
+                await proxy_adapter.delete(observed_proxy)
+            remaining_proxy = await proxy_adapter.inspect(proxy_spec, provider_id=None)
+            if remaining_proxy is not None:
+                raise ConnectionSpikeLiveTransientError(
+                    "Round 5 bout-owned proxy is still present"
+                )
         self._receipts.pop(bout_id, None)
         self._results.pop(bout_id, None)
         self._coordinators.pop(bout_id, None)
@@ -1907,33 +2239,148 @@ class LiveConnectionSpikeSetupOrchestrator:
         """Prove a journal-free inherited claim left no provider resource."""
 
         LiveConnectionSpikeAdapter._validate_run_id(bout_id)
-        if bout_id in await self._journal.unresolved_bout_ids():
-            raise ConnectionSpikeCleanupError("Round 5 inherited claim still has journal debt")
-        clients = await self._assumed_clients(
-            f"cleanup-{bout_id}",
-            minimum_lifetime_seconds=45 * 60 + 60,
-        )
+        try:
+            unresolved = await self._journal.unresolved_bout_ids()
+        except Exception as exc:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 absence proof could not read cleanup ownership",
+                stage="journal_ownership",
+                reason_code="journal_ownership_unavailable",
+            ) from exc
+        if bout_id in unresolved:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 inherited claim still has journal debt",
+                stage="journal_ownership",
+                reason_code="current_bout_journal_debt",
+            )
+        try:
+            clients = await self._assumed_clients(
+                f"cleanup-{bout_id}",
+                minimum_lifetime_seconds=45 * 60 + 60,
+            )
+        except Exception as exc:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 absence proof could not acquire provider clients",
+                stage="provider_session",
+                reason_code="provider_session_unavailable",
+            ) from exc
         names = self.names_for_bout(
             self.config.deterministic_name_prefix,
             bout_id,
             self.config.secret_name_prefix or "anti-demo-round5",
         )
-        try:
-            response = await self._call(
-                clients.rds.describe_db_proxies,
-                DBProxyName=names.proxy_name,
-            )
-        except Exception as exc:
-            if self._error_code(exc) != "DBProxyNotFoundFault":
+
+        async def proxy_for_bout() -> Mapping[str, object]:
+            try:
+                return await self._call(
+                    clients.rds.describe_db_proxies,
+                    DBProxyName=names.proxy_name,
+                )
+            except Exception as exc:
+                if self._error_code(exc) == "DBProxyNotFoundFault":
+                    return {"DBProxies": []}
                 raise
-            response = {"DBProxies": []}
-        if response.get("DBProxies"):
-            raise ConnectionSpikeCleanupError("Round 5 inherited claim still owns an RDS Proxy")
-        await self._discover_orphaned_addons(
-            clients,
-            self.config.competitor_security_group_id,
-            include_legacy=False,
-        )
+
+        async def target_groups_for_bout() -> Mapping[str, object]:
+            try:
+                return await self._call(
+                    clients.rds.describe_db_proxy_target_groups,
+                    DBProxyName=names.proxy_name,
+                )
+            except Exception as exc:
+                code = self._error_code(exc)
+                if code == "DBProxyNotFoundFault":
+                    return {"TargetGroups": []}
+                if code == "InvalidDBProxyStateFault":
+                    raise ConnectionSpikeLiveTransientError(
+                        "Round 5 bout-owned proxy is still deleting"
+                    ) from exc
+                raise
+
+        # A just-accepted DeleteDBProxy can transiently describe as NotFound and
+        # then reappear while RDS finishes deletion.  This journal-free recovery
+        # path must therefore apply the same bounded proof as `_delete_proxy`:
+        # one empty/NotFound sample is unknown, not clean.  Keep the calls
+        # sequential so an enumerable parent fences immediately.  When the
+        # parent describe races to NotFound, still perform the named target-group
+        # describe; a group returned from that split-brain view is direct
+        # evidence that the bout is not absent.
+        try:
+            confirmations = 0
+            while confirmations < PROXY_DELETE_ABSENCE_CONFIRMATIONS:
+                response = await proxy_for_bout()
+                proxies = response.get("DBProxies") or []
+                if proxies:
+                    if all(
+                        str(proxy.get("Status") or "").lower() == "deleting"
+                        for proxy in proxies
+                    ):
+                        raise ConnectionSpikeLiveTransientError(
+                            "Round 5 bout-owned proxy is still deleting"
+                        )
+                    raise ConnectionSpikeCleanupError(
+                        "Round 5 inherited claim still owns an RDS Proxy",
+                        stage="exact_provider_absence",
+                        reason_code="current_bout_proxy_present",
+                    )
+                target_groups = await target_groups_for_bout()
+                if target_groups.get("TargetGroups"):
+                    raise ConnectionSpikeCleanupError(
+                        "Round 5 inherited claim still owns an RDS Proxy target group",
+                        stage="exact_provider_absence",
+                        reason_code="current_bout_target_group_present",
+                    )
+                confirmations += 1
+                if confirmations < PROXY_DELETE_ABSENCE_CONFIRMATIONS:
+                    await self._sleep(self.config.poll_interval_seconds)
+        except (
+            ConnectionSpikeCleanupError,
+            ConnectionSpikeLiveConfigurationError,
+            ConnectionSpikeLiveTransientError,
+        ):
+            # A bounded token/marker/truncation overrun is a configuration or
+            # inventory fault, not an opaque provider read failure; it must keep
+            # its own class so the operator sees "fix the inventory bound", not
+            # "the absence probe broke". In-flight DELETING is retryable.
+            raise
+        except Exception as exc:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 exact provider absence proof failed",
+                stage="exact_provider_absence",
+                reason_code="exact_provider_read_failed",
+            ) from exc
+
+        # Carry the exact bout identity into the broad clean-baseline scan.  Its
+        # named target-group extend is the final race fence; passing None here
+        # would silently replace that provider read with an empty synthetic page.
+        try:
+            await self._discover_orphaned_addons(
+                clients,
+                self.config.competitor_security_group_id,
+                # The old per-bout shape also created a secret, IAM role and
+                # runner inline policy. This is still a bout-scoped scan:
+                # canonical names or this bout's ownership tags block, while
+                # foreign prefix matches are ignored by the classifier below.
+                include_legacy=True,
+                bout_id=bout_id,
+            )
+        except (
+            ConnectionSpikeCleanupError,
+            ConnectionSpikeLiveConfigurationError,
+            ConnectionSpikeLiveTransientError,
+        ):
+            # Same taxonomy as the exact-absence block above: a bounded
+            # pagination/role-tag-truncation overrun surfaces as a configuration
+            # fault, and current-bout resources surface as a scoped cleanup
+            # block. Neither is flattened into scoped_orphan_read_failed.
+            # In-flight DELETING stays retryable.
+            raise
+        except Exception as exc:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 scoped orphan discovery failed",
+                stage="scoped_orphan_discovery",
+                reason_code="scoped_orphan_read_failed",
+            ) from exc
 
     async def assert_no_unresolved_bouts(
         self,
@@ -1959,6 +2406,8 @@ class LiveConnectionSpikeSetupOrchestrator:
         self,
         bout_id: str,
         current_fencing_token: int,
+        *,
+        cleanup_authority: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Recover persisted old ownership scopes under a fresh active fence."""
 
@@ -1969,7 +2418,55 @@ class LiveConnectionSpikeSetupOrchestrator:
             self.config.baseline_sha256,
         )
         async with self._lock:
-            await self._fence.assert_current(authority)
+            reclaim = getattr(self._fence, "reclaim_expired_cleanup", None)
+            # Warm-coordinator cleanup already holds CAS authority via
+            # ``cleanup_authority``. Calling reclaim while a live manager
+            # ``round5_cleanup`` lease is still active fights that owner
+            # ("prior cleanup owner is still active") and never reaches
+            # provider delete — the gen54 empty-AWS retry loop.
+            # Restart-during-cleanup is different: the coordinator CAS is
+            # new, the departed process's artifact ring is gone, and journal
+            # DELETED commits JOIN that ring. Skipping reclaim then makes
+            # "journal write lost its active lease fence" a permanent
+            # cleanup_reconcile_blocked after AWS is already absent.
+            using_reclaimed_fence = False
+            if callable(reclaim) and cleanup_authority is None:
+                authority = await reclaim(authority)
+                using_reclaimed_fence = True
+            elif callable(reclaim) and cleanup_authority is not None:
+                artifact_current = False
+                try:
+                    await self._fence.assert_current(authority)
+                    artifact_current = True
+                except Exception:
+                    artifact_current = False
+                if not artifact_current:
+                    try:
+                        authority = await reclaim(authority)
+                        using_reclaimed_fence = True
+                    except Exception as exc:
+                        text = str(exc)
+                        still_live_owner = type(exc).__name__ == "InvalidStateError" and (
+                            "still active" in text or "no longer current" in text
+                        )
+                        if not still_live_owner:
+                            raise
+
+            class CleanupFence:
+                async def assert_current(inner_self, _scope: CreationScope) -> None:
+                    if cleanup_authority is None:
+                        await self._fence.assert_current(authority)
+                    else:
+                        await cleanup_authority()
+                        if using_reclaimed_fence:
+                            await self._fence.assert_current(authority)
+
+            # CLAIMED -> CLEANING transfers mutation ownership from the bout ring
+            # to the durable warm coordinator. After a process restart the bout
+            # lease may be gone, so a reconstructed engine must use that current
+            # cleanup authority rather than repeatedly refusing the stale ring.
+            recovery_fence = CleanupFence()
+            await recovery_fence.assert_current(authority)
             # Same reasoning as `_begin_cleanup_once`, and it matters more here:
             # this is the path the automatic retry re-enters, so a settlement
             # that could refuse made every attempt fail at an identical point
@@ -1978,6 +2475,23 @@ class LiveConnectionSpikeSetupOrchestrator:
             clients = await self._assumed_clients(bout_id)
             rds_security_group_id = await self._baseline_rds_security_group(clients)
             scopes = tuple(await self._journal.scopes(bout_id))
+            resources = _SetupResources(
+                self.names_for_bout(
+                    self.config.deterministic_name_prefix,
+                    bout_id,
+                    self.config.secret_name_prefix or "anti-demo-round5",
+                ),
+                secret_arn=self.config.proxy_secret_arn,
+                proxy_role_arn=self.config.proxy_service_role_arn,
+            )
+            resources.rds_security_group_id = rds_security_group_id
+            coordinator, specs = self._coordinator(
+                authority,
+                clients,
+                resources,
+                fence=recovery_fence,
+            )
+            incomplete_child_journal = False
             for ownership_scope in scopes:
                 if (
                     ownership_scope.bout_id != bout_id
@@ -1986,17 +2500,6 @@ class LiveConnectionSpikeSetupOrchestrator:
                     raise ConnectionSpikeCleanupError(
                         "Round 5 persisted cleanup scope differs from the sealed bout"
                     )
-                resources = _SetupResources(
-                    self.names_for_bout(
-                        self.config.deterministic_name_prefix,
-                        bout_id,
-                        self.config.secret_name_prefix or "anti-demo-round5",
-                    ),
-                    secret_arn=self.config.proxy_secret_arn,
-                    proxy_role_arn=self.config.proxy_service_role_arn,
-                )
-                resources.rds_security_group_id = rds_security_group_id
-                coordinator, _ = self._coordinator(authority, clients, resources)
                 events = tuple(await self._journal.events(ownership_scope))
                 await self._restore_resource_bindings(
                     coordinator,
@@ -2008,14 +2511,62 @@ class LiveConnectionSpikeSetupOrchestrator:
                     authority_scope=authority,
                 )
                 if not report.complete:
-                    raise ConnectionSpikeCleanupError(
-                        "Round 5 persisted cleanup was not ownership-confirmed"
+                    incomplete_child_journal = True
+            # An empty or incomplete child journal is unknown ownership, never
+            # proof of absence and never a terminal block. CreateDBProxy may
+            # have crossed AWS before CREATE_INTENT became readable, or a
+            # child target-group confirm can lag while the tagged parent is
+            # still billable. Reconstruct the exact deterministic specs from
+            # the durable claim and delete the parent through the normal
+            # adapter. A still-present or DELETING parent is in-flight AWS,
+            # retried as a transient, not cleanup_reconcile_blocked.
+            proxy_spec = next(
+                spec for spec in specs if spec.resource_kind == "rds_proxy"
+            )
+            await recovery_fence.assert_current(authority)
+            proxy_adapter = coordinator._adapters["rds_proxy"]
+            observed_proxy = await proxy_adapter.inspect(proxy_spec, provider_id=None)
+            if observed_proxy is not None:
+                await recovery_fence.assert_current(authority)
+                await proxy_adapter.delete(observed_proxy)
+            remaining_proxy = await proxy_adapter.inspect(proxy_spec, provider_id=None)
+            if remaining_proxy is not None:
+                raise ConnectionSpikeLiveTransientError(
+                    "Round 5 bout-owned proxy is still present"
+                )
+            if incomplete_child_journal:
+                logger.warning(
+                    "Round 5 child cleanup journal is incomplete for %s; "
+                    "exact parent proxy absence is required",
+                    bout_id,
+                )
+            # Parent absence is not journal absence. Replica-local readiness
+            # treats any newest lifecycle_state <> deleted as unresolved debt and
+            # keeps the fight card unavailable while the warm slot is already
+            # READY. Re-inspect each child now that the parent is gone so
+            # inspect-None rows are committed DELETED.
+            for ownership_scope in scopes:
+                report = await coordinator.reconcile_incomplete(
+                    ownership_scope,
+                    authority_scope=authority,
+                )
+                if not report.complete:
+                    raise ConnectionSpikeLiveTransientError(
+                        "Round 5 cleanup journal is not sealed after parent absence"
                     )
             await self._discover_orphaned_addons(
                 clients,
                 rds_security_group_id,
                 include_legacy=True,
+                bout_id=bout_id,
             )
+            if using_reclaimed_fence:
+                release = getattr(self._fence, "release_cleanup", None)
+                if not callable(release):
+                    raise ConnectionSpikeCleanupError(
+                        "Round 5 reclaimed cleanup fence cannot be released"
+                    )
+                await release(authority)
 
     async def _baseline_rds_security_group(self, clients: _SetupAwsClients) -> str:
         source = await self._read_competitor_source(clients)
@@ -2038,6 +2589,15 @@ class LiveConnectionSpikeSetupOrchestrator:
                 DBInstanceIdentifier=self.config.competitor_target_id,
             )
             values = response.get("DBInstances") or []
+            if len(values) > 1:
+                # Req #4: a duplicate describe is an ambiguous identity, a terminal
+                # configuration fault -- never a transient "unavailable" that would
+                # retry forever.  (An empty describe collapses to {} below and is
+                # handled as bounded->terminal "unresolved".)
+                raise ConnectionSpikeLiveConfigurationError(
+                    "Round 5 competitor source describe returned more than one "
+                    "matching instance"
+                )
             source = values[0] if len(values) == 1 else {}
             return _CompetitorSource(
                 identifier=str(source.get("DBInstanceIdentifier") or ""),
@@ -2057,6 +2617,13 @@ class LiveConnectionSpikeSetupOrchestrator:
             DBClusterIdentifier=self.config.competitor_target_id,
         )
         values = response.get("DBClusters") or []
+        if len(values) > 1:
+            # Req #4: duplicate describe -> terminal ambiguous identity, not a
+            # transient that retries forever.
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 competitor source describe returned more than one "
+                "matching cluster"
+            )
         source = values[0] if len(values) == 1 else {}
         subnet_group_name = str(source.get("DBSubnetGroup") or "")
         subnet_groups: list[Mapping[str, object]] = []
@@ -2096,6 +2663,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             provider_ids.get("proxy_iam_role") or resources.proxy_role_arn
         )
         resources.proxy_security_group_id = str(provider_ids.get("proxy_security_group") or "")
+        resources.proxy_arn = str(provider_ids.get("rds_proxy") or "")
         by_kind = {
             event.resource_kind: ResourceSpec(
                 ordinal=event.ordinal,
@@ -2477,25 +3045,28 @@ class LiveConnectionSpikeSetupOrchestrator:
         )
         lakebase_runners = lakebase_managed.get("InstanceInformationList") or []
         competitor_runners = competitor_managed.get("InstanceInformationList") or []
-        if not source.identifier or len(lakebase_runners) != 1 or len(competitor_runners) != 1:
-            raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 clean baseline did not resolve exactly once"
-            )
-        if (
-            source.identifier != self.config.competitor_target_id
-            or source.resource_id != self.config.competitor_resource_id
-            or source.direct_host != self.config.competitor_direct_host
-            or source.status != "available"
-            or source.vpc_id != self.config.vpc_id
-            or len(source.security_group_ids) != 1
-            or lakebase_runners[0].get("InstanceId") != self.config.runner_instance_id
-            or lakebase_runners[0].get("PingStatus") != "Online"
-            or competitor_runners[0].get("InstanceId") != self.config.competitor_runner_instance_id
-            or competitor_runners[0].get("PingStatus") != "Online"
-        ):
-            raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 source or runner differs from the sealed clean baseline"
-            )
+        # Immutable identity drift is terminal (warm_baseline_invalid); a
+        # non-available status, an absent source describe, or a temporarily
+        # absent/ConnectionLost runner is a transient provider condition that must
+        # retry and self-heal instead of latching the warm slot for an operator.
+        _require_warm_source_identity(
+            source,
+            expected_identifier=self.config.competitor_target_id,
+            expected_resource_id=self.config.competitor_resource_id,
+            expected_direct_host=self.config.competitor_direct_host,
+            expected_vpc_id=self.config.vpc_id,
+            expected_security_group_id=None,
+        )
+        _require_warm_runner_online(
+            lakebase_runners,
+            expected_instance_id=self.config.runner_instance_id,
+            lane_id="lakebase",
+        )
+        _require_warm_runner_online(
+            competitor_runners,
+            expected_instance_id=self.config.competitor_runner_instance_id,
+            lane_id="competitor",
+        )
         resources.rds_security_group_id = source.security_group_ids[0]
         journal_events = tuple(await self._journal.events(scope))
         for event in journal_events:
@@ -2562,6 +3133,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         rds_security_group_id: str,
         *,
         include_legacy: bool = True,
+        bout_id: str | None = None,
     ) -> None:
         base_tags = dict(self.config.ownership_tags)
         iam_base_tags = {
@@ -2579,7 +3151,54 @@ class LiveConnectionSpikeSetupOrchestrator:
                 and (not iam or {key for key in measured if key.casefold() == "owner"} == {"owner"})
             )
 
-        groups_result, proxies_result, rules_result = await asyncio.gather(
+        names = (
+            self.names_for_bout(
+                self.config.deterministic_name_prefix,
+                bout_id,
+                self.config.secret_name_prefix or "anti-demo-round5",
+            )
+            if bout_id is not None
+            else None
+        )
+
+        def belongs_to_bout(
+            values: Sequence[Mapping[str, object]], *, iam: bool = False
+        ) -> bool:
+            if bout_id is None:
+                return owned(values, iam=iam)
+            measured = {
+                str(item.get("Key") or ""): str(item.get("Value") or "")
+                for item in values
+            }
+            expected = iam_base_tags if iam else base_tags
+            return (
+                all(measured.get(key) == value for key, value in expected.items())
+                and measured.get("anti-demo-bout-id") == bout_id
+            )
+
+        async def target_groups_for_bout() -> Mapping[str, object]:
+            if bout_id is None:
+                return {"TargetGroups": []}
+            assert names is not None
+            try:
+                return await self._call(
+                    clients.rds.describe_db_proxy_target_groups,
+                    DBProxyName=names.proxy_name,
+                )
+            except Exception as exc:
+                code = self._error_code(exc)
+                if code == "DBProxyNotFoundFault":
+                    return {"TargetGroups": []}
+                if code == "InvalidDBProxyStateFault":
+                    # AWS refuses TG describe while the parent is DELETING.
+                    # That is in-flight exact cleanup, not a dual-authority or
+                    # permanent ownership fault.
+                    raise ConnectionSpikeLiveTransientError(
+                        "Round 5 bout-owned proxy is still deleting"
+                    ) from exc
+                raise
+
+        groups_result, proxies_result, rules_result, target_groups_result = await asyncio.gather(
             self._call(
                 clients.ec2.describe_security_groups,
                 Filters=[{"Name": "vpc-id", "Values": [self.config.vpc_id]}],
@@ -2598,6 +3217,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                     }
                 ],
             ),
+            target_groups_for_bout(),
         )
         secrets_result: Mapping[str, object] = {}
         roles_result: Mapping[str, object] = {}
@@ -2624,6 +3244,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                 roles_result.get("IsTruncated"),
                 groups_result.get("NextToken"),
                 proxies_result.get("Marker"),
+                target_groups_result.get("Marker"),
                 policies_result.get("IsTruncated"),
                 rules_result.get("NextToken"),
             )
@@ -2633,55 +3254,130 @@ class LiveConnectionSpikeSetupOrchestrator:
             )
         prefix = self.config.deterministic_name_prefix[:40].rstrip("-") + "-"
         leftovers: list[str] = []
-        leftovers.extend(
-            "secret"
-            for value in secrets_result.get("SecretList") or []
-            if str(value.get("Name") or "").startswith(
-                self.config.secret_name_prefix.rstrip("/") + "/"
-            )
-        )
+        deleting_leftovers: list[str] = []
+        # Secrets carry their tags inline in ListSecrets, so a scoped scan blocks
+        # on the exact canonical name (missing/partial tags still block) OR on a
+        # noncanonical secret stamped with this bout's ownership tags. Unscoped,
+        # the installation-wide prefix behavior is preserved.
+        for value in secrets_result.get("SecretList") or []:
+            name = str(value.get("Name") or "")
+            if names is not None:
+                if name == names.secret_name or belongs_to_bout(
+                    value.get("Tags") or []
+                ):
+                    leftovers.append("secret")
+            elif name.startswith(self.config.secret_name_prefix.rstrip("/") + "/"):
+                leftovers.append("secret")
         for role in roles_result.get("Roles") or []:
             name = str(role.get("RoleName") or "")
-            if not name.startswith(prefix):
+            is_canonical = names is not None and name == names.proxy_role_name
+            # The enumeration net is the installation prefix in both modes; the
+            # exact canonical name is always in the net. A prefix role from
+            # another bout is fetched, found to be foreign by its ownership tag,
+            # and skipped -- it never blocks this scoped proof.
+            if not (is_canonical or name.startswith(prefix)):
                 continue
             tags = await self._call(clients.iam.list_role_tags, RoleName=name)
             if tags.get("IsTruncated"):
                 raise ConnectionSpikeLiveConfigurationError(
                     "Round 5 role-tag discovery exceeded its bounded page"
                 )
-            if not owned(tags.get("Tags") or [], iam=True):
+            role_tags = tags.get("Tags") or []
+            if names is not None:
+                if is_canonical:
+                    # Exact canonical name blocks even with missing/partial tags.
+                    leftovers.append(
+                        "role" if belongs_to_bout(role_tags, iam=True) else "role_tag_drift"
+                    )
+                elif belongs_to_bout(role_tags, iam=True):
+                    leftovers.append("role")
+            elif not owned(role_tags, iam=True):
                 leftovers.append("role_tag_drift")
             else:
                 leftovers.append("role")
         leftovers.extend(
             "security_group"
             for value in groups_result.get("SecurityGroups") or []
-            if str(value.get("GroupName") or "").startswith(prefix)
+            if (
+                (
+                    str(value.get("GroupName") or "")
+                    == names.proxy_security_group_name
+                    or belongs_to_bout(value.get("Tags") or [])
+                )
+                if names is not None
+                else str(value.get("GroupName") or "").startswith(prefix)
+            )
         )
         for proxy in proxies_result.get("DBProxies") or []:
-            if not str(proxy.get("DBProxyName") or "").startswith(prefix):
+            proxy_name = str(proxy.get("DBProxyName") or "")
+            is_canonical = names is not None and proxy_name == names.proxy_name
+            if not (is_canonical or proxy_name.startswith(prefix)):
                 continue
             tags = await self._call(
                 clients.rds.list_tags_for_resource,
                 ResourceName=str(proxy.get("DBProxyArn") or ""),
             )
-            if not owned(tags.get("TagList") or []):
-                leftovers.append("proxy_tag_drift")
+            proxy_tags = tags.get("TagList") or []
+            leftover_kind = ""
+            if names is not None:
+                if is_canonical:
+                    leftover_kind = (
+                        "proxy" if belongs_to_bout(proxy_tags) else "proxy_tag_drift"
+                    )
+                elif belongs_to_bout(proxy_tags):
+                    leftover_kind = "proxy"
+            elif not owned(proxy_tags):
+                leftover_kind = "proxy_tag_drift"
             else:
-                leftovers.append("proxy")
+                leftover_kind = "proxy"
+            if leftover_kind:
+                if str(proxy.get("Status") or "").lower() == "deleting":
+                    deleting_leftovers.append(leftover_kind)
+                else:
+                    leftovers.append(leftover_kind)
+        leftovers.extend(
+            "proxy_target_group"
+            for value in target_groups_result.get("TargetGroups") or []
+            if value
+        )
         leftovers.extend(
             "runner_policy"
             for name in policies_result.get("PolicyNames") or []
-            if str(name).startswith(prefix) and str(name).endswith("-runner-secret")
+            if (
+                str(name) == names.runner_policy_name
+                if names is not None
+                else str(name).startswith(prefix) and str(name).endswith("-runner-secret")
+            )
         )
         leftovers.extend(
             "security_group_rule"
             for value in rules_result.get("SecurityGroupRules") or []
-            if str(value.get("Description") or "").startswith(prefix)
+            if (
+                (
+                    str(value.get("Description") or "").startswith(
+                        names.proxy_name.removesuffix("-proxy") + "-"
+                    )
+                    or belongs_to_bout(value.get("Tags") or [])
+                )
+                if names is not None
+                else str(value.get("Description") or "").startswith(prefix)
+            )
         )
+        if deleting_leftovers and not leftovers:
+            raise ConnectionSpikeLiveTransientError(
+                "Round 5 bout-owned proxy is still deleting"
+            )
         if leftovers:
-            raise ConnectionSpikeLiveConfigurationError(
-                "Round 5 clean baseline contains prior-bout add-ons"
+            if names is None:
+                # Pre-T0/setup installation-wide scan: a leftover is a
+                # prior-bout add-on and remains a configuration/inventory fault.
+                raise ConnectionSpikeLiveConfigurationError(
+                    "Round 5 clean baseline contains prior-bout add-ons"
+                )
+            raise ConnectionSpikeCleanupError(
+                "Round 5 scoped absence proof found current-bout add-ons",
+                stage="scoped_orphan_discovery",
+                reason_code="current_bout_resource_present",
             )
 
     def _coordinator(
@@ -2689,10 +3385,28 @@ class LiveConnectionSpikeSetupOrchestrator:
         scope: CreationScope,
         clients: _SetupAwsClients,
         resources: _SetupResources,
+        *,
+        fence: FenceGuard | None = None,
     ) -> tuple[Round5CreationCoordinator, tuple[ResourceSpec, ...]]:
+        mutation_fence = fence or self._fence
+
+        async def assert_mutation_authority() -> None:
+            await mutation_fence.assert_current(scope)
+
         tags = dict(self.config.ownership_tags)
         tags["anti-demo-bout-id"] = scope.bout_id
         tags["anti-demo:bout-token"] = resources.names.token
+        # Swarm defect #2: the bout fence is an immutable operation-identity tag.
+        # It is verified EXACTLY on inspect/adopt/cleanup (``_require_exact_tags``),
+        # so a proxy created by one generation (fence N) can never be adopted by,
+        # or deleted as a replacement for, a later generation (fence N+1): their
+        # per-bout Proxies are distinct operations even when they share a
+        # bout-derived name.  This is the "never-reused operation identity" the
+        # generation-unique-name requirement is really after, expressed as a
+        # verified tag rather than only as a name string (which the journal-free
+        # absence-proof and reconcile paths must still be able to reconstruct from
+        # the bout id alone).
+        tags["anti-demo:bout-fence"] = str(scope.fencing_token)
         metadata = {
             "tags": tags,
             "baseline_sha256": self.config.baseline_sha256,
@@ -2750,12 +3464,13 @@ class LiveConnectionSpikeSetupOrchestrator:
             "runner_egress": self._security_rule_adapter(clients, resources, "runner_egress"),
             "rds_ingress": self._security_rule_adapter(clients, resources, "rds_ingress"),
             "rds_proxy": _SetupResourceAdapter(
-                lambda spec: self._create_proxy(clients, resources, spec),
+                lambda spec: self._create_proxy(clients, resources, spec, scope=scope),
                 lambda spec, provider_id: self._inspect_proxy(clients, spec, provider_id),
                 lambda observed: self._delete_proxy(
                     clients,
                     observed,
                     bout_id=scope.bout_id,
+                    assert_authority=assert_mutation_authority,
                 ),
             ),
             "proxy_target_group": _SetupResourceAdapter(
@@ -2763,20 +3478,30 @@ class LiveConnectionSpikeSetupOrchestrator:
                 lambda spec, provider_id: self._inspect_target_group(
                     clients, resources, spec, provider_id
                 ),
-                lambda observed: self._reset_target_group(clients, resources, observed),
+                lambda observed: self._reset_target_group_if_parent_matches(
+                    clients,
+                    resources,
+                    observed,
+                    assert_mutation_authority,
+                ),
             ),
             "proxy_target": _SetupResourceAdapter(
                 lambda spec: self._register_proxy_target(clients, resources, spec),
                 lambda spec, provider_id: self._inspect_proxy_target(
                     clients, resources, spec, provider_id
                 ),
-                lambda observed: self._deregister_proxy_target(clients, resources, observed),
+                lambda observed: self._deregister_proxy_target_if_parent_matches(
+                    clients,
+                    resources,
+                    observed,
+                    assert_mutation_authority,
+                ),
             ),
         }
         return (
             Round5CreationCoordinator(
                 journal=self._journal,
-                fence=self._fence,
+                fence=mutation_fence,
                 adapters=adapters,
             ),
             specs,
@@ -3470,15 +4195,72 @@ class LiveConnectionSpikeSetupOrchestrator:
         del resources
         await self._call(clients.ec2.delete_security_group, GroupId=observed.provider_id)
 
+    def _ensure_createproxy_executor(self) -> ThreadPoolExecutor:
+        """Return the reused CreateDBProxy worker, creating it if absent.
+
+        Warmed before the scored window (see ``setup()``); this creates a single
+        long-lived worker once and reuses it across bouts.  It must never be
+        called for the first time between T0 and the boto3 request (req #7): thread
+        creation there would add uncontrolled latency to the scored delta.
+        """
+
+        executor = self._createproxy_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="r5-createproxy"
+            )
+            self._createproxy_executor = executor
+        return executor
+
+    async def _dispatch_create_db_proxy(
+        self,
+        clients: _SetupAwsClients,
+        resources: _SetupResources,
+        create_kwargs: Mapping[str, Any],
+    ) -> Any:
+        """Issue the single timed CreateDBProxy mutation on the reused worker.
+
+        ``asyncio.to_thread`` (used by ``_call``) shares the event loop's default
+        ``ThreadPoolExecutor`` with every other lane and probe.  Under saturation
+        the ``create_db_proxy`` submission would queue behind unrelated work while
+        a pre-call stamp had already been taken -- so the scored bell ->
+        CreateDBProxy latency both understated the delay and the dispatch itself
+        was delayed.  A dedicated single-thread executor removes both: the stamp
+        is taken INSIDE the worker immediately before the SDK call, and no shared
+        queue sits in front of it.  The executor is REUSED (warmed before the
+        scored window), never created here inside it (req #7).
+        """
+
+        loop = asyncio.get_running_loop()
+        executor = self._ensure_createproxy_executor()
+
+        def _invoke() -> Any:
+            # Inside the dedicated worker, immediately before the SDK call leaves
+            # the process: the true, scored bell -> CreateDBProxy boundary.
+            resources.proxy_create_requested_ns = self._monotonic_ns()
+            return clients.rds.create_db_proxy(**create_kwargs)
+
+        task = asyncio.ensure_future(loop.run_in_executor(executor, _invoke))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await asyncio.shield(task)
+            raise
+
     async def _create_proxy(
-        self, clients: _SetupAwsClients, resources: _SetupResources, spec: ResourceSpec
+        self,
+        clients: _SetupAwsClients,
+        resources: _SetupResources,
+        spec: ResourceSpec,
+        *,
+        scope: CreationScope | None = None,
     ) -> ResourceObservation:
-        # Stamp the request boundary before the SDK call leaves this process. This
-        # is the real, scored bell -> CreateDBProxy latency; workflow_launched_ns
-        # is only a lower bound taken right after gate.wait().
-        resources.proxy_create_requested_ns = self._monotonic_ns()
-        await self._call(
-            clients.rds.create_db_proxy,
+        # Swarm defect #2: refuse a stale owner locally BEFORE any AWS mutation.
+        # This is a pure, synchronous, in-process check (no await, no I/O), so it
+        # is safe on the T0 -> boto3 path and adds nothing to the scored window.
+        if scope is not None:
+            self._require_bell_capability(scope.bout_id, scope.fencing_token)
+        create_kwargs: dict[str, Any] = dict(
             DBProxyName=resources.names.proxy_name,
             EngineFamily="POSTGRESQL",
             Auth=[
@@ -3495,6 +4277,14 @@ class LiveConnectionSpikeSetupOrchestrator:
             RequireTLS=True,
             Tags=self._tags(spec),
         )
+        # Submit boundary on the loop; the request boundary is stamped inside the
+        # dedicated worker in _dispatch_create_db_proxy immediately before the SDK
+        # call, so a saturated default executor can neither hide nor delay it.
+        resources.proxy_create_submitted_ns = self._monotonic_ns()
+        # Swarm defect #4: the happy path is a single dispatch (no extra awaits, so
+        # the scored window is untouched).  Only an ambiguous AlreadyExists takes
+        # the adopt/retry recovery below.
+        await self._create_or_adopt_db_proxy(clients, resources, spec, create_kwargs)
         response = await self._call(
             clients.rds.describe_db_proxies, DBProxyName=resources.names.proxy_name
         )
@@ -3510,7 +4300,64 @@ class LiveConnectionSpikeSetupOrchestrator:
             raise ConnectionSpikeLiveOperationError(
                 "RDS returned a per-bout Proxy outside the sealed account or region"
             )
+        resources.proxy_arn = proxy_arn
         return self._observation(spec, proxy_arn)
+
+    async def _create_or_adopt_db_proxy(
+        self,
+        clients: _SetupAwsClients,
+        resources: _SetupResources,
+        spec: ResourceSpec,
+        create_kwargs: Mapping[str, Any],
+    ) -> None:
+        """Issue CreateDBProxy, resolving an ambiguous AlreadyExists correctly.
+
+        Swarm defect #4.  ``CreateDBProxy`` has no client token, so a retried or
+        ambiguously-acknowledged send can surface ``DBProxyAlreadyExistsFault``.
+        The only safe responses are:
+
+        * **Adopt** iff inspection proves the existing Proxy is *our exact
+          operation* -- ``_inspect_proxy`` verifies account/region ARN prefix,
+          exact ownership tags (including the bout fence), and the deterministic
+          name.  A Proxy that shares the name but not the identity makes
+          ``_inspect_proxy`` raise, which propagates as a terminal refusal.
+        * **Retry only after proving absence** -- an AlreadyExists whose exact
+          Proxy then inspects as absent is control-plane eventual consistency; it
+          is confirmed absent over bounded describes before a single create retry,
+          so we never spin against a name a different owner holds.
+        """
+
+        try:
+            await self._dispatch_create_db_proxy(clients, resources, create_kwargs)
+            return
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is AlreadyExists
+            if self._error_code(exc) != "DBProxyAlreadyExistsFault":
+                raise
+            already_exists = exc
+        # Ambiguous AlreadyExists: adopt ONLY our exact Proxy.  ``_inspect_proxy``
+        # raises on an identity/tag mismatch (a name collision that is not ours),
+        # which is exactly the terminal refusal we want.
+        observed = await self._inspect_proxy(clients, spec, None)
+        if observed is not None:
+            return  # exact owned Proxy exists -> adopt; describe extracts endpoint
+        # AlreadyExists but our exact Proxy inspects absent: prove absence over
+        # bounded describes before one create retry.
+        for _ in range(PROXY_CREATE_ABSENCE_CONFIRMATIONS):
+            await self._sleep(self.config.poll_interval_seconds)
+            observed = await self._inspect_proxy(clients, spec, None)
+            if observed is not None:
+                return  # it materialized as ours in the meantime -> adopt
+        # Proven absent under our exact identity: one bounded create retry.
+        try:
+            await self._dispatch_create_db_proxy(clients, resources, create_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if self._error_code(exc) == "DBProxyAlreadyExistsFault":
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 CreateDBProxy reported AlreadyExists but no Proxy with the "
+                    "exact per-bout operation identity could be adopted after proving "
+                    "absence; refusing rather than adopting an unowned Proxy"
+                ) from already_exists
+            raise
 
     async def _configure_target_group(
         self, clients: _SetupAwsClients, resources: _SetupResources, spec: ResourceSpec
@@ -3576,12 +4423,24 @@ class LiveConnectionSpikeSetupOrchestrator:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 per-bout Proxy target-group identity changed"
             )
+        pool = group.get("ConnectionPoolConfig") or {}
+        if (
+            pool.get("MaxConnectionsPercent") == 100
+            and pool.get("MaxIdleConnectionsPercent") == 50
+            and pool.get("ConnectionBorrowTimeout") == 120
+        ):
+            # The cleanup mutation is already absent. RDS can drop tags from its
+            # provider-owned default target group after the reset; requiring
+            # those stale child tags before recognizing the exact sealed
+            # baseline wedges every retry at provider inspection. This branch
+            # authorizes no mutation: the exact parent/name/account identity and
+            # exact baseline settings are sufficient to report our action gone.
+            return None
         tags = await self._call(
             clients.rds.list_tags_for_resource,
             ResourceName=target_group_arn,
         )
         self._require_exact_tags(spec, tags.get("TagList") or [])
-        pool = group.get("ConnectionPoolConfig") or {}
         if pool.get("MaxConnectionsPercent") == 90 and pool.get("ConnectionBorrowTimeout") == 120:
             return self._observation(spec, provider_id or f"{resources.names.proxy_name}:default")
         return None
@@ -3603,6 +4462,19 @@ class LiveConnectionSpikeSetupOrchestrator:
                 "ConnectionBorrowTimeout": 120,
             },
         )
+
+    async def _reset_target_group_if_parent_matches(
+        self,
+        clients: _SetupAwsClients,
+        resources: _SetupResources,
+        observed: ResourceObservation,
+        assert_authority: Callable[[], Awaitable[None]],
+    ) -> None:
+        if not await self._cleanup_parent_matches(clients, resources, observed):
+            return
+        await assert_authority()
+        if await self._cleanup_parent_matches(clients, resources, observed):
+            await self._reset_target_group(clients, resources, observed)
 
     async def _register_proxy_target(
         self, clients: _SetupAwsClients, resources: _SetupResources, spec: ResourceSpec
@@ -3682,10 +4554,44 @@ class LiveConnectionSpikeSetupOrchestrator:
             **self.config.proxy_registration,
         )
 
+    async def _deregister_proxy_target_if_parent_matches(
+        self,
+        clients: _SetupAwsClients,
+        resources: _SetupResources,
+        observed: ResourceObservation,
+        assert_authority: Callable[[], Awaitable[None]],
+    ) -> None:
+        if not await self._cleanup_parent_matches(clients, resources, observed):
+            return
+        await assert_authority()
+        if await self._cleanup_parent_matches(clients, resources, observed):
+            await self._deregister_proxy_target(clients, resources, observed)
+
+    async def _cleanup_parent_matches(
+        self,
+        clients: _SetupAwsClients,
+        resources: _SetupResources,
+        child: ResourceObservation,
+    ) -> bool:
+        """Authorize a child mutation only for the exact journaled parent ARN."""
+
+        if not resources.proxy_arn:
+            return False
+        parent = await self._inspect_proxy(
+            clients,
+            ResourceSpec(
+                ordinal=1,
+                resource_kind="rds_proxy",
+                deterministic_name=resources.names.proxy_name,
+                metadata=child.metadata,
+            ),
+            resources.proxy_arn,
+        )
+        return parent is not None
+
     async def _inspect_proxy(
         self, clients: _SetupAwsClients, spec: ResourceSpec, provider_id: str | None
     ) -> ResourceObservation | None:
-        del provider_id
         try:
             response = await self._call(
                 clients.rds.describe_db_proxies,
@@ -3710,6 +4616,16 @@ class LiveConnectionSpikeSetupOrchestrator:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 per-bout Proxy account or region changed"
             )
+        # Swarm defect #5: when an expected ARN is supplied (cleanup and delete
+        # confirmation), a Proxy that shares the deterministic name but not the
+        # ARN is a *different operation* -- a generation-N+1 replacement that took
+        # the name after generation N's Proxy was removed (RDS allows only one
+        # Proxy per name at a time).  Our exact operation is therefore ABSENT: we
+        # return None instead of touching it, so a stale cleanup can never adopt,
+        # confirm against, or delete a replacement.  The adopt path passes
+        # ``provider_id=None`` and still matches by exact tags + name below.
+        if provider_id is not None and proxy_arn != provider_id:
+            return None
         try:
             tags = await self._call(
                 clients.rds.list_tags_for_resource,
@@ -3730,9 +4646,75 @@ class LiveConnectionSpikeSetupOrchestrator:
         observed: ResourceObservation,
         *,
         bout_id: str | None = None,
+        assert_authority: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         name = str(observed.deterministic_name or "")
-        await self._call(clients.rds.delete_db_proxy, DBProxyName=name)
+        if assert_authority is not None:
+            exact = await self._inspect_proxy(
+                clients,
+                ResourceSpec(
+                    ordinal=1,
+                    resource_kind="rds_proxy",
+                    deterministic_name=name,
+                    metadata=observed.metadata,
+                ),
+                observed.provider_id,
+            )
+            if exact is None:
+                return
+            await assert_authority()
+            exact = await self._inspect_proxy(
+                clients,
+                ResourceSpec(
+                    ordinal=1,
+                    resource_kind="rds_proxy",
+                    deterministic_name=name,
+                    metadata=observed.metadata,
+                ),
+                observed.provider_id,
+            )
+            if exact is None:
+                return
+        try:
+            await self._call(clients.rds.delete_db_proxy, DBProxyName=name)
+        except Exception as exc:
+            if self._error_code(exc) != "InvalidDBProxyStateFault":
+                raise
+            # A restart can observe the exact tagged Proxy after AWS has already
+            # accepted deletion. RDS rejects a duplicate DeleteDBProxy while the
+            # resource is DELETING; that is an accepted in-flight handoff, not a
+            # reason to strand cleanup. The exact-name/ARN/tag inspection happened
+            # before this adapter call. Re-read the exact operation and accept
+            # the duplicate-delete fault only if AWS says that same ARN is
+            # DELETING (or it has already disappeared).
+            exact = await self._inspect_proxy(
+                clients,
+                ResourceSpec(
+                    ordinal=1,
+                    resource_kind="rds_proxy",
+                    deterministic_name=name,
+                    metadata=observed.metadata,
+                ),
+                observed.provider_id,
+            )
+            if exact is not None:
+                state = await self._call(
+                    clients.rds.describe_db_proxies,
+                    DBProxyName=name,
+                )
+                exact_proxies = [
+                    proxy
+                    for proxy in state.get("DBProxies") or []
+                    if str(proxy.get("DBProxyArn") or "") == observed.provider_id
+                ]
+                if (
+                    len(exact_proxies) != 1
+                    or str(exact_proxies[0].get("Status") or "").lower()
+                    != "deleting"
+                ):
+                    raise
+            # The absence loop below still must prove the same ARN gone before
+            # debt can clear.
         # Round5CreationCoordinator durably commits DELETE_INTENT before invoking
         # this adapter.  Reaching this line therefore proves both the durable
         # intent and AWS API acceptance, without waiting minutes for absence.
@@ -3745,22 +4727,35 @@ class LiveConnectionSpikeSetupOrchestrator:
             # is `abandon_on_cancel` in the caller. Load-bearing only for a
             # responsive-but-slow Proxy delete; do not read it as protection
             # against a hang, and do not remove the outer bound believing it is.
+            #
+            # Swarm defect #5: a single NotFound is *unknown*, not clean -- the RDS
+            # control plane can momentarily describe a just-accepted delete as gone
+            # and then report it again.  Require bounded consecutive confirmations
+            # of exact-operation absence before declaring the billable Proxy
+            # definitively deleted; any reappearance of our exact ARN resets the
+            # count.  Until then the cleanup fence stays held (cleanup debt), and a
+            # timeout raises so the debt is reported rather than silently cleared.
+            confirmations = 0
             async with asyncio.timeout(PROXY_DELETION_TIMEOUT_SECONDS):
                 while True:
-                    if (
-                        await self._inspect_proxy(
-                            clients,
-                            ResourceSpec(
-                                ordinal=12,
-                                resource_kind="rds_proxy",
-                                deterministic_name=name,
-                                metadata=observed.metadata,
-                            ),
-                            observed.provider_id,
-                        )
-                        is None
-                    ):
-                        return
+                    if assert_authority is not None:
+                        await assert_authority()
+                    observed_now = await self._inspect_proxy(
+                        clients,
+                        ResourceSpec(
+                            ordinal=12,
+                            resource_kind="rds_proxy",
+                            deterministic_name=name,
+                            metadata=observed.metadata,
+                        ),
+                        observed.provider_id,
+                    )
+                    if observed_now is None:
+                        confirmations += 1
+                        if confirmations >= PROXY_DELETE_ABSENCE_CONFIRMATIONS:
+                            return
+                    else:
+                        confirmations = 0
                     await self._sleep(self.config.poll_interval_seconds)
         except TimeoutError as exc:
             raise ConnectionSpikeCleanupError("RDS Proxy deletion did not settle") from exc
@@ -4346,6 +5341,11 @@ class LiveConnectionSpikeAdapter:
         self._resident_process_boot_id = ""
         self._resident_process_pid = 0
         self._resident_warm_attempt_token = ""
+        # The exact resident-generation binding this adapter PRELOADed at its last
+        # successful stage. Retained so an attested identity-change re-establishment
+        # can durably CANCEL it (retire the old resident job) instead of leaving a
+        # wedged same-process resident beating a superseded token. None until staged.
+        self._resident_generation_binding: Round5ControlBinding | None = None
         self._resident_settlement_debt: dict[str, Round5ControlBinding] = {}
         self._resident_release_events: dict[str, Round5ControlEvent] = {}
 
@@ -4801,7 +5801,30 @@ class LiveConnectionSpikeAdapter:
         self._resident_process_boot_id = str(readiness["runner_process_boot_id"])
         self._resident_process_pid = int(readiness["process_pid"])
         self._resident_warm_attempt_token = warm_attempt_token
+        # Retain the exact binding this generation PRELOADed, purely for diagnostics
+        # and for a claim-BOUND retire path; a claim-less resident-generation PRELOAD
+        # is retired by the superseding fresh PRELOAD, not an explicit CANCEL (the
+        # control protocol forbids CANCEL on a claim-less binding).
+        self._resident_generation_binding = binding
         return readiness
+
+    async def retire_resident_generation(self) -> None:
+        """Forget the resident identity this adapter attested (identity-change retire).
+
+        Called during an attested identity-change re-establishment. The resident this
+        adapter attested is provably gone/replaced, so drop the retained binding and
+        the in-memory attested identity (boot/pid/token) that a stale
+        ``validate_ready_provenance`` static check would otherwise read as CURRENT.
+        The old resident generation itself is retired by the superseding fresh PRELOAD
+        the clean rewarm issues for a new token (a claim-less generation PRELOAD is not
+        CANCEL-able under the control protocol), so this method takes no external
+        control action and cannot block the recovery.
+        """
+
+        self._resident_generation_binding = None
+        self._resident_process_boot_id = ""
+        self._resident_process_pid = 0
+        self._resident_warm_attempt_token = ""
 
     async def _execute_reserved(
         self,
@@ -6536,11 +7559,18 @@ class LiveConnectionSpikeEngine:
         self._setup_bout_id: str | None = None
         self._setup_task: asyncio.Task[Any] | None = None
         self._cleanup_bout_id: str | None = None
+        self._cleanup_bout_required = False
         self._cleanup_start_lock = asyncio.Lock()
         #: Ramps started by a lane's own setup stop, awaited by `run`. Populated during the setup
         #: phase, which is the point: Lakebase's ten thousand is held while the AWS path is still
         #: building its Proxy.
         self._lane_bursts: dict[str, asyncio.Task[ConnectionSpikeLaneResult]] = {}
+        # ``run()`` pops ``_lane_bursts`` into a local ``launched`` map while it
+        # supervises them, so during a bout the burst tasks are no longer reachable
+        # through ``_lane_bursts``. Mirror them here so ``cancel_local_round5_run_tasks``
+        # can still cancel the ACTUALLY-running bursts on a towel/abandon -- otherwise
+        # a burst could dispatch after the slot is fenced CLEANING (Finding A).
+        self._run_burst_tasks: set[asyncio.Task[ConnectionSpikeLaneResult]] = set()
         self._lane_stops: dict[str, ConnectionSpikeSetupLaneStop] = {}
         self._lane_progress_callback: ProgressCallback | None = None
         self._lane_result_callback: ProgressCallback | None = None
@@ -6553,10 +7583,72 @@ class LiveConnectionSpikeEngine:
         self._bound_claim: object | None = None
         self._resident_bindings: dict[str, Round5ControlBinding] = {}
         self._durable_lakebase_release: Round5ControlEvent | None = None
+        # Blocker 2: durable authority guard the warm provider propagates. Consulted
+        # immediately before this engine's external mutation boundaries so a stale
+        # coordinator fence refuses the mutation even if cancellation was swallowed.
+        self.authority_guard: Callable[[], Awaitable[None]] | None = None
+
+    async def _check_authority(self) -> None:
+        guard = getattr(self, "authority_guard", None)
+        if guard is not None:
+            await guard()
 
     @property
     def has_timed_setup(self) -> bool:
         return self._setup_orchestrator is not None
+
+    def retain_cleaned_bout(self, bout_id: str) -> None:
+        """Carry the last exact cleanup proof into this warm-engine instance."""
+
+        LiveConnectionSpikeAdapter._validate_run_id(bout_id)
+        if self._cleanup_bout_id not in {None, bout_id}:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 engine already carries another cleanup bout"
+            )
+        self._cleanup_bout_id = bout_id
+        self._cleanup_bout_required = True
+
+    def _supersede_completed_cleanup_bout(self, bout_id: str) -> None:
+        """Reset a retained cleaned-bout id left by a COMPLETED predecessor cleanup.
+
+        Engine identity reuse across generations: the coordinator reuses this warm
+        engine, so a finished predecessor cleanup may still hold ``_cleanup_bout_id``
+        for lineage. A new claim's cleanup supersedes that predecessor -- mirroring
+        ``setup()``, which already clears the retained id when a different bout begins
+        -- so a subsequent ``retain_cleaned_bout(bout_id)`` is not refused with "Round
+        5 engine already carries another cleanup bout" (the live wedge that looped the
+        no-bell converge in ``cleanup_reconcile_blocked``). Same-bout is left intact so
+        a re-run stays idempotent. This never permits two CONCURRENT cleanup bouts on
+        one engine: the coordinator serializes cleanup per claim (single-owner
+        converge), so a differing retained id is always a finished predecessor, never
+        an in-flight bout. Cross-replica takeover still uses the durable journal/job
+        ids -- this only resets in-process engine identity.
+        """
+
+        if self._cleanup_bout_id is not None and self._cleanup_bout_id != bout_id:
+            self._cleanup_bout_id = None
+
+    def require_cleaned_bout(self) -> None:
+        """Mark this engine as belonging to a post-cleanup warm lineage."""
+
+        self._cleanup_bout_required = True
+
+    def _require_cleaned_bout_for_lineage(self) -> None:
+        if self._cleanup_bout_required and self._cleanup_bout_id is None:
+            raise ConnectionSpikeLiveConfigurationError(
+                "Round 5 post-cleanup warm omitted its retained cleaned bout"
+            )
+
+    async def verify_start_state(self, bout_id: str, fencing_token: int) -> None:
+        """Prove the warm/lease revision before any public CHECKING projection.
+
+        Orchestrator ``prepare`` is coordination-only (no AWS, no resident
+        stage). A failure here must roll the unstarted claim back to READY.
+        """
+
+        if self._setup_orchestrator is None:
+            return
+        await self._setup_orchestrator.prepare(bout_id, fencing_token)
 
     def bind_claim(self, claim: object) -> None:
         lakebase = str(getattr(claim, "lakebase_job_id", ""))
@@ -6631,17 +7723,25 @@ class LiveConnectionSpikeEngine:
     ) -> LiveRound5WarmEngineReceipt:
         """Prepare setup and both physical runner capsules backstage."""
 
+        self._require_cleaned_bout_for_lineage()
         if self._setup_orchestrator is None:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 automatic warm setup is not configured"
             )
+        # Authority boundary: refuse before the credential/AWS setup mutation.
+        await self._check_authority()
         setup_context, arm = await asyncio.gather(
-            self._setup_orchestrator.warm(generation),
+            self._setup_orchestrator.warm(
+                generation,
+                cleaned_bout_id=self._cleanup_bout_id,
+            ),
             self.check(),
         )
         self._warm_generation = generation
         self._warm_attempt_token = warm_attempt_token
         targets_by_lane = {target.lane_id: target for target in self._adapter.config.targets}
+        # Authority boundary: refuse before the runner STAGE/PRELOAD control dispatch.
+        await self._check_authority()
         await asyncio.gather(
             *(
                 adapter.stage_resident_generation(
@@ -6689,10 +7789,14 @@ class LiveConnectionSpikeEngine:
     async def refresh_warm(self, generation: int) -> LiveRound5WarmEngineReceipt:
         """Rotate launch credentials without rerunning the capacity benchmark."""
 
+        self._require_cleaned_bout_for_lineage()
         if self._setup_orchestrator is None or self._armed is None:
             raise ConnectionSpikeLiveOperationError("Round 5 cannot refresh before a complete warm")
         setup_context, *dispatch_expirations = await asyncio.gather(
-            self._setup_orchestrator.warm(generation),
+            self._setup_orchestrator.warm(
+                generation,
+                cleaned_bout_id=self._cleanup_bout_id,
+            ),
             *(
                 adapter.refresh_launch_context(f"warm-{generation}-{lane_id}-{uuid4().hex[:8]}")
                 for lane_id, adapter in self._lane_adapters.items()
@@ -6712,6 +7816,21 @@ class LiveConnectionSpikeEngine:
             warm_attempt_token=self._warm_attempt_token,
             dispatch_expires_at=dict(zip(self._lane_adapters, dispatch_expirations, strict=True)),
         )
+
+    async def retire_resident_generation(self) -> None:
+        """Retire (durably CANCEL) every lane's staged resident generation.
+
+        Used by the warm provider's attested identity-change re-establishment: the
+        resident this generation attests is provably gone/replaced, so drain each
+        lane's staged binding before the fresh rewarm re-PRELOADs. The authority guard
+        is checked first so a stale owner cannot mutate the resident control plane; a
+        lost fence propagates (the coordinator loop defers to the new owner). Each lane
+        retire is best-effort (see the adapter) so one lane cannot strand the other.
+        """
+
+        await self._check_authority()
+        for adapter in self._lane_adapters.values():
+            await adapter.retire_resident_generation()
 
     async def validate_ready_provenance(
         self,
@@ -6741,14 +7860,21 @@ class LiveConnectionSpikeEngine:
             for lane_id, receipt in expected.items()
         )
         if not static_current:
+            # In-process preflight identity (boot/pid/harness/model) no longer matches
+            # the prepared receipt: an ATTESTED runner change. Demote (return False).
             return False
+        from .round5_control import ResidentLiveness
+        from .round5_warm import RetryableWarmError
+
         checks = []
         for lane_id, receipt in expected.items():
             transport = self._lane_adapters[lane_id]._resident_transport
             if transport is None:
-                return False
+                # No transport to attest liveness right now -> transient, not an
+                # attested identity change. Strike, do not demote.
+                raise RetryableWarmError("runner_attestation_transport_absent")
             checks.append(
-                transport.resident_is_current(
+                transport.resident_liveness(
                     installation_id=(self._lane_adapters[lane_id].config.resident_installation_id),
                     lane_id=lane_id,
                     warm_attempt_token=warm_attempt_token,
@@ -6759,7 +7885,19 @@ class LiveConnectionSpikeEngine:
                     now=datetime.now(UTC),
                 )
             )
-        return all(await asyncio.gather(*checks))
+        liveness = await asyncio.gather(*checks)
+        # Idle keep-alive contract: only an ATTESTED identity change demotes. A merely
+        # STALE (beat aged past the window) or ABSENT (no beat yet) resident is a
+        # transient miss -> RetryableWarmError -> the coordinator's strike budget keeps
+        # READY. This is the primary fix for the idle "Temporarily Unavailable" flicker.
+        if any(state is ResidentLiveness.IDENTITY_CHANGED for state in liveness):
+            return False
+        if any(
+            state in (ResidentLiveness.STALE, ResidentLiveness.ABSENT)
+            for state in liveness
+        ):
+            raise RetryableWarmError("runner_attestation_stale")
+        return True
 
     async def warm_with_physical_runners_from(
         self,
@@ -6768,6 +7906,7 @@ class LiveConnectionSpikeEngine:
     ) -> LiveRound5WarmEngineReceipt:
         """Warm another target variant without benchmarking the runners again."""
 
+        source._require_cleaned_bout_for_lineage()
         if self._setup_orchestrator is None or source._armed is None:
             raise ConnectionSpikeLiveOperationError(
                 "Round 5 shared physical runner receipt is unavailable"
@@ -6776,7 +7915,10 @@ class LiveConnectionSpikeEngine:
         self._armed = source._armed
         self._warm_generation = generation
         self._warm_attempt_token = source._warm_attempt_token
-        setup_context = await self._setup_orchestrator.warm(generation)
+        setup_context = await self._setup_orchestrator.warm(
+            generation,
+            cleaned_bout_id=source._cleanup_bout_id,
+        )
         expirations = {
             lane_id: adapter.prepared_expires_at for lane_id, adapter in self._lane_adapters.items()
         }
@@ -6860,6 +8002,21 @@ class LiveConnectionSpikeEngine:
                 "warm slot; a cold per-bout stage here means the ring was not actually warm."
             ) from exc
 
+    async def precommit_launch_intent(self, bout_id: str, fencing_token: int) -> None:
+        """Durably commit the CreateDBProxy CREATE_INTENT on the bell path.
+
+        Swarm defect #1 (Approach A).  The manager awaits this immediately before
+        the authoritative bell transaction (before T0 and before Lakebase is
+        released), so the durable competitor create intent always exists first and
+        the post-T0 path awaits no coordination I/O.  A no-op when this
+        installation has no timed setup.  This is a required bell-seam method on
+        the engine, not an optional getattr hook.
+        """
+
+        if self._setup_orchestrator is None:
+            return
+        await self._setup_orchestrator.precommit_launch_intent(bout_id, fencing_token)
+
     async def setup(
         self,
         bout_id: str,
@@ -6872,6 +8029,14 @@ class LiveConnectionSpikeEngine:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 timed setup orchestration is not configured"
             )
+        if self._cleanup_bout_id == bout_id:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 cannot restart a bout already under its cleanup fence"
+            )
+        # The retained ID fenced warm/refresh against the previous bout. Once a
+        # different bout starts timed setup, its own cleanup identity supersedes
+        # that completed predecessor.
+        self._cleanup_bout_id = None
         self._setup_bout_id = bout_id
         self._lane_bursts = {}
         self._lane_stops = {}
@@ -7337,6 +8502,11 @@ class LiveConnectionSpikeEngine:
         diagnostics: dict[str, object] = {}
         try:
             launched = {lane_id: self._lane_bursts.pop(lane_id, None) for lane_id in lane_ids}
+            # Mirror the launched bursts so a concurrent towel/abandon can cancel the
+            # actually-running burst tasks (see _run_burst_tasks / Finding A).
+            self._run_burst_tasks = {
+                task for task in launched.values() if task is not None
+            }
             missing = [lane_id for lane_id, task in launched.items() if task is None]
             if missing:
                 raise ConnectionSpikeLiveOperationError(
@@ -7386,9 +8556,79 @@ class LiveConnectionSpikeEngine:
             await self._report(on_progress, "verified", "Runner evidence verified")
             return result
         finally:
+            # Finding A3: on run() cancel/exit (e.g. SIGTERM cancels this task), the
+            # launched bursts must NOT be silently orphaned by wiping the set -- an
+            # orphan could keep dispatching after teardown. Cancel+await them first,
+            # then clear. On the normal success path they are already done (no-op).
+            pending_bursts = {
+                task for task in self._run_burst_tasks if not task.done()
+            }
+            for task in pending_bursts:
+                task.cancel()
+            if pending_bursts:
+                await asyncio.gather(*pending_bursts, return_exceptions=True)
+            self._run_burst_tasks = set()
             for lane_id, run_id in tuple(self._active_run_ids.items()):
                 if not self._lane_adapters[lane_id].settlement_pending(run_id):
                     self._active_run_ids.pop(lane_id, None)
+
+    async def _cancel_local_bursts(self) -> None:
+        """Cancel+await EVERY in-process lane burst: both the pre-dispatch bursts still
+        parked in ``_lane_bursts`` and the already-dispatched bursts that ``run()``
+        popped into its local ``launched`` map (mirrored in ``_run_burst_tasks``).
+
+        Cancelling only ``_lane_bursts`` (which ``run()`` empties as it dispatches)
+        left the ACTUALLY-running bursts alive, so a burst could still dispatch after
+        the slot was fenced CLEANING / after the per-bout Proxy was deleted
+        (Findings A / A2). This is the single chokepoint every cleanup path uses
+        before any orchestrator begin_cleanup / Proxy delete.
+        """
+
+        # Defensive getattr: some cleanup paths run on engines built via
+        # ``object.__new__`` in tests (no __init__), so these attributes may be
+        # absent -- a missing burst registry simply means nothing to cancel.
+        current = asyncio.current_task()
+        lane_bursts = getattr(self, "_lane_bursts", {})
+        run_bursts = getattr(self, "_run_burst_tasks", ())
+        bursts = {
+            task
+            for task in (*lane_bursts.values(), *run_bursts)
+            if task is not None and task is not current
+        }
+        for burst in bursts:
+            if not burst.done():
+                burst.cancel()
+        if bursts:
+            await asyncio.gather(*bursts, return_exceptions=True)
+
+    async def cancel_local_round5_run_tasks(self) -> None:
+        """Cancel in-process setup/burst work without external cleanup mutation."""
+
+        current = asyncio.current_task()
+        setup_task = self._setup_task
+        if setup_task is not None and setup_task is not current:
+            setup_task.cancel()
+            await asyncio.gather(setup_task, return_exceptions=True)
+        await self._cancel_local_bursts()
+
+    async def _ensure_post_bell_provider_cleanup_started(self, claim: Any) -> None:
+        if self._cleanup_bout_id is not None:
+            return
+        bout_id = str(claim.bout_id)
+        # Whether or not timed setup already completed (``_setup_result`` present),
+        # post-bell cleanup MUST settle the ARM-staged residents AND cancel any
+        # still-running lane bursts -- not only the dispatched ``_active_run_ids``.
+        # ``_stop_setup_and_begin_cleanup_once`` performs that exact complete
+        # sequence (cancel setup task + cancel bursts + ``_settle_staged_residents``
+        # + cancel remaining active runs + begin durable cleanup); the narrower
+        # ``_stop_and_begin_cleanup_once`` skipped staged residents and bursts,
+        # leaking a prepared resident that quarantines the next warm generation.
+        setup = self._setup_result
+        if setup is not None:
+            await self._stop_setup_and_begin_cleanup_once(setup.bout_id)
+            return
+        if self._setup_bout_id == bout_id:
+            await self._stop_setup_and_begin_cleanup_once(bout_id)
 
     async def stop_and_begin_cleanup(self, arm: FanInArm) -> None:
         """Settle active commands and start Round 5 cleanup idempotently.
@@ -7397,6 +8637,8 @@ class LiveConnectionSpikeEngine:
         slow proof remains available through :meth:`wait_for_cleanup_complete`.
         """
 
+        if getattr(self, "_round5_cleanup_janitor_owned", False):
+            return
         if arm is not self._armed:
             raise ConnectionSpikeCleanupError("Round 5 cleanup arm is stale")
         starter = asyncio.create_task(
@@ -7411,6 +8653,17 @@ class LiveConnectionSpikeEngine:
         if binding is not None:
             await adapter.cancel_resident(binding=binding)
             return
+        # No staged binding for this lane (a dispatched run whose staged binding was
+        # already settled and popped by ``_settle_staged_residents``). The real
+        # adapter's ``cancel_resident`` is binding-only, so calling it with the
+        # legacy ``generation/lane_id/job_id`` kwargs raises TypeError. Settle the
+        # durable logical job by id through ``cancel_job`` when the adapter exposes
+        # it; only fall back to the legacy resident-cancel kwargs for older test
+        # doubles that still implement that signature and lack ``cancel_job``.
+        cancel_job = getattr(adapter, "cancel_job", None)
+        if callable(cancel_job):
+            await cancel_job(run_id)
+            return
         await adapter.cancel_resident(
             generation=self._warm_generation,
             lane_id=lane_id,
@@ -7421,6 +8674,10 @@ class LiveConnectionSpikeEngine:
         async with self._cleanup_start_lock:
             if self._cleanup_bout_id is not None:
                 return
+            # Finding A2: cancel+await every in-process burst (both _lane_bursts and the
+            # run()-popped _run_burst_tasks) before the orchestrator begin_cleanup /
+            # Proxy delete so no burst dispatches after teardown.
+            await self._cancel_local_bursts()
             for lane_id, run_id in tuple(self._active_run_ids.items()):
                 await self._cancel_resident_lane(lane_id, run_id)
                 if self._active_run_ids.get(lane_id) == run_id:
@@ -7439,6 +8696,8 @@ class LiveConnectionSpikeEngine:
     async def stop_setup_and_begin_cleanup(self, bout_id: str) -> None:
         """Attach a cancelled/incomplete timed setup to background cleanup."""
 
+        if getattr(self, "_round5_cleanup_janitor_owned", False):
+            return
         LiveConnectionSpikeAdapter._validate_run_id(bout_id)
         if bout_id not in {self._setup_bout_id, self._cleanup_bout_id}:
             raise ConnectionSpikeCleanupError("Round 5 setup cleanup bout is stale")
@@ -7448,36 +8707,55 @@ class LiveConnectionSpikeEngine:
         )
         await asyncio.shield(starter)
 
-    async def _stop_setup_and_begin_cleanup_once(self, bout_id: str) -> None:
-        setup_task = self._setup_task
-        if setup_task is not None and setup_task is not asyncio.current_task():
-            setup_task.cancel()
-            await asyncio.gather(setup_task, return_exceptions=True)
-        bursts = tuple(self._lane_bursts.values())
-        for burst in bursts:
-            if not burst.done():
-                burst.cancel()
-        if bursts:
-            await asyncio.gather(*bursts, return_exceptions=True)
-        # ARM stages the Lakebase resident before any lane is dispatched, so its
-        # binding is not yet represented in _active_run_ids.  Settle every
-        # recorded binding first; otherwise an abandoned arm leaves that exact
-        # prepared job resident and the subsequent warm generation is
-        # quarantined as resident_job_active.
+    async def _settle_staged_residents(self) -> set[str]:
+        """Cancel and settle every resident staged at ARM before a bell.
+
+        ARM stages the Lakebase resident (``prepare`` -> ``transport.stage``)
+        before any lane is dispatched, so its binding lives in
+        ``_resident_bindings`` and is *not* yet represented in
+        ``_active_run_ids``. Every abandon path -- an armed slot whose TTL
+        expired, an operator who cancelled the arm, a refused bell -- must settle
+        those staged residents. Otherwise the exact prepared job stays resident
+        on the runner and the next warm generation collides with it in
+        ``wait_agent_ready`` ("resident readiness binding changed"), which the
+        warm provider classifies as ``warm_baseline_unexpected`` and latches the
+        slot BLOCKED. Cancelling here returns the resident to idle so the next
+        ``stage_resident_generation`` re-attests cleanly.
+
+        Returns the set of job ids whose SETTLED observation was deferred past
+        the bounded budget. ``transport.cancel`` commits the durable CANCEL
+        before awaiting SETTLED, so a deferred job keeps both the engine binding
+        and the adapter settlement debt for restart reconciliation to finish --
+        it is never an unowned resident -- but the provider janitor (and its RDS
+        Proxy delete) is not held for the full 12-minute settlement deadline.
+        """
+
+        staged = tuple(self._resident_bindings.items())
+        if staged:
+            # Blocker 3: authority guard before beginning the settle mutations.
+            await self._check_authority()
+            # Observable on-success, not just on-timeout: an unstage is the exact
+            # action this fix exists to perform, and the original incident was
+            # invisible on every surface (the residue was only findable via SSM).
+            logger.info(
+                "round5_abandoned_arm_resident_settle_begin lanes=%s",
+                [lane_id for lane_id, _ in staged],
+            )
         deferred_resident_jobs: set[str] = set()
-        for lane_id, binding in tuple(self._resident_bindings.items()):
+        settled_lanes: list[str] = []
+        for lane_id, binding in staged:
+            # Blocker 3: authority guard before EACH resident cancel (not just at
+            # method entry) so a fence lost between lanes aborts the next mutation.
+            await self._check_authority()
             try:
                 async with asyncio.timeout(ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS):
                     await self._lane_adapters[lane_id].cancel_resident(binding=binding)
             except TimeoutError:
-                # transport.cancel committed durable CANCEL before waiting for
-                # SETTLED. Keep both the engine binding and adapter settlement
-                # debt so restart reconciliation can finish it, but do not hold
-                # the provider janitor (and its RDS Proxy delete) for 12 minutes.
                 deferred_resident_jobs.add(binding.job_id)
                 logger.error(
                     "round5_abandoned_arm_resident_settlement_deferred "
-                    "lane=%s job_id=%s budget_seconds=%.0f",
+                    "lane=%s job_id=%s budget_seconds=%.0f; a warm attempt in this "
+                    "window may block until restart reconciliation settles it",
                     lane_id,
                     binding.job_id,
                     ROUND5_ABANDONED_ARM_SETTLEMENT_SECONDS,
@@ -7487,6 +8765,52 @@ class LiveConnectionSpikeEngine:
                 self._resident_bindings.pop(lane_id, None)
             if self._active_run_ids.get(lane_id) == binding.job_id:
                 self._active_run_ids.pop(lane_id, None)
+            settled_lanes.append(lane_id)
+            logger.info(
+                "round5_abandoned_arm_resident_settled lane=%s job_id=%s",
+                lane_id,
+                binding.job_id,
+            )
+        if staged:
+            logger.info(
+                "round5_abandoned_arm_resident_settle_done settled=%s deferred=%d",
+                settled_lanes,
+                len(deferred_resident_jobs),
+            )
+        return deferred_resident_jobs
+
+    async def settle_abandoned_arm(self) -> set[str]:
+        """Settle residents staged at ARM when a bout is abandoned before setup.
+
+        The pure arm-abandon path: an armed slot that reached ARMED (staging the
+        Lakebase resident in ``prepare``) but was never rung, so timed ``setup``
+        never ran and there is no per-bout Proxy, security group, or dispatched
+        lane to tear down -- only the staged resident to unstage. This is
+        deliberately narrower than ``stop_setup_and_begin_cleanup``: it does not
+        require ``_setup_bout_id`` (which a pre-bell abandon never set), begins no
+        provider cleanup, and is idempotent, so it is safe on every abandon path
+        and a no-op once the residents are already settled. Deferred SETTLED
+        observations remain owned by ``_resident_settlement_debt`` for restart
+        reconciliation, exactly as in the post-bell cleanup path.
+        """
+
+        return await self._settle_staged_residents()
+
+    async def _stop_setup_and_begin_cleanup_once(self, bout_id: str) -> None:
+        setup_task = self._setup_task
+        if setup_task is not None and setup_task is not asyncio.current_task():
+            setup_task.cancel()
+            await asyncio.gather(setup_task, return_exceptions=True)
+        # Finding A2: cancel+await BOTH _lane_bursts AND the run()-popped
+        # _run_burst_tasks before any orchestrator begin_cleanup / Proxy delete, so no
+        # burst can dispatch after this bout is torn down. (Snapshotting only
+        # _lane_bursts missed the actually-running bursts once run() had popped them.)
+        await self._cancel_local_bursts()
+        # ARM stages the Lakebase resident before any lane is dispatched; settle
+        # those bindings first (see _settle_staged_residents) so an abandoned arm
+        # cannot leave a prepared job resident that quarantines the next warm
+        # generation as resident_job_active.
+        deferred_resident_jobs = await self._settle_staged_residents()
         for lane_id, run_id in tuple(self._active_run_ids.items()):
             if run_id in deferred_resident_jobs:
                 continue
@@ -7577,17 +8901,37 @@ class LiveConnectionSpikeEngine:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 timed setup orchestration is not configured"
             )
-        await self._setup_orchestrator.reconcile_failed_cleanup(
-            bout_id,
-            current_fencing_token,
+        reconstruct = getattr(
+            self._setup_orchestrator,
+            "reconcile_failed_cleanup",
+            None,
         )
+        if callable(reconstruct):
+            await reconstruct(
+                bout_id,
+                current_fencing_token,
+                cleanup_authority=self._check_authority,
+            )
+        else:
+            # Compatibility for narrow stateless test orchestrators. Every
+            # production orchestrator implements reconstructive cleanup.
+            await self._setup_orchestrator.prove_bout_absent(bout_id)
+        self.retain_cleaned_bout(bout_id)
         if self._setup_result is not None and self._setup_result.bout_id == bout_id:
             self._setup_result = None
 
     async def reconcile_claim(self, claim: Any) -> None:
         """Settle both logical jobs and prove exact provider absence on restart."""
 
+        # Authority boundary: refuse the job cancel/settle mutation under a lost fence.
+        await self._check_authority()
         self.bind_claim(claim)
+        # Engine identity reuse across generations (see helper): supersede a completed
+        # predecessor's retained cleaned-bout id BEFORE starting this bout's cleanup,
+        # so _ensure_post_bell_provider_cleanup_started does not early-return on a stale
+        # id and the terminal retain_cleaned_bout is not refused on a reused engine.
+        self._supersede_completed_cleanup_bout(str(claim.bout_id))
+        await self._ensure_post_bell_provider_cleanup_started(claim)
         settlement_results = await asyncio.gather(
             self._lane_adapters["lakebase"].cancel_job(self._job_ids["lakebase"]),
             self._lane_adapters["competitor"].cancel_job(self._job_ids["competitor"]),
@@ -7598,13 +8942,79 @@ class LiveConnectionSpikeEngine:
                 "Round 5 restart reconciliation could not prove both logical jobs settled"
             )
         bout_id = str(claim.bout_id)
-        unresolved = await self.unresolved_bout_ids()
-        if bout_id not in unresolved:
-            if self._setup_orchestrator is None:
-                raise ConnectionSpikeCleanupError("Round 5 setup orchestrator is unavailable")
-            await self._setup_orchestrator.prove_bout_absent(bout_id)
-            return
+        # Blocker 3: authority guard before the provider-absence/journal mutation.
+        await self._check_authority()
+        # Always enter reconstructive cleanup. Journal absence is not provider
+        # absence: CreateDBProxy may have crossed AWS before the intent/response
+        # became durable. The orchestrator rebuilds exact tagged specs from this
+        # durable claim and deletes them through the normal adapters.
         await self.reconcile_failed_cleanup(bout_id, int(claim.bout_fence))
+
+    async def reconcile_abandoned_claim(self, claim: Any) -> None:
+        """Recover a durable pre-bell claim without trusting an empty journal.
+
+        ARM stages resident logical jobs before timed setup writes any per-bout
+        resource journal. A restart can therefore observe CLEANING plus an empty
+        journal while a resident is still PREPARED. The claim's durable job IDs
+        are the recovery intent: cancel and settle both exact jobs first, then
+        prove the (necessarily pre-bell) provider scope absent.
+        """
+
+        # Authority boundary: refuse the resident cancel/settle control dispatch
+        # under a lost fence before issuing any external mutation.
+        await self._check_authority()
+        self.bind_claim(claim)
+        # Engine identity reuse across generations (see helper): supersede a completed
+        # predecessor's retained cleaned-bout id so the terminal retain_cleaned_bout
+        # is not refused. This is the exact live no-bell wedge fix.
+        self._supersede_completed_cleanup_bout(str(claim.bout_id))
+        lane_jobs = (
+            ("lakebase", self._job_ids["lakebase"]),
+            ("competitor", self._job_ids["competitor"]),
+        )
+        settlement_results = await asyncio.gather(
+            *(
+                self._lane_adapters[lane].cancel_job(job_id)
+                for lane, job_id in lane_jobs
+            ),
+            return_exceptions=True,
+        )
+        failures: list[ConnectionSpikeCleanupError] = []
+        causes: list[BaseException] = []
+        for (lane, job_id), result in zip(lane_jobs, settlement_results, strict=True):
+            if not isinstance(result, BaseException):
+                continue
+            failure = ConnectionSpikeCleanupError(
+                "Round 5 resident job settlement was not proven",
+                stage="resident_settlement",
+                reason_code="resident_job_not_settled",
+                lane=lane,
+                job_id=job_id,
+            )
+            failure.__cause__ = result
+            failures.append(failure)
+            causes.append(result)
+        if len(failures) == 1:
+            raise failures[0] from causes[0]
+        if failures:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 abandoned claim could not prove both resident jobs settled",
+                stage="resident_settlement",
+                reason_code="resident_jobs_not_settled",
+                failures=failures,
+            ) from BaseExceptionGroup("Round 5 resident settlement failures", causes)
+        if self._setup_orchestrator is None:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 setup orchestrator is unavailable",
+                stage="provider_absence",
+                reason_code="setup_orchestrator_unavailable",
+            )
+        bout_id = str(claim.bout_id)
+        # Blocker 3: authority guard before the provider-absence proof (the second
+        # external mutation phase), so a fence lost after the job cancels aborts here.
+        await self._check_authority()
+        await self._setup_orchestrator.prove_bout_absent(bout_id)
+        self.retain_cleaned_bout(bout_id)
 
     async def unresolved_bout_ids(self) -> tuple[str, ...]:
         """Return durable unresolved Round 5 bout IDs without mutating them."""
@@ -7748,6 +9158,8 @@ def build_connection_spike_live_engine(
 class LiveRound5WarmProvider:
     """Materialize both target variants and rotate their ephemeral capsules."""
 
+    ADOPTED_ENGINE_SAFETY_CAP = 64
+
     def __init__(
         self,
         manifest: DemoManifest,
@@ -7758,6 +9170,147 @@ class LiveRound5WarmProvider:
         self._engines: dict[str, LiveConnectionSpikeEngine] = {}
         self._receipts: dict[str, LiveRound5WarmEngineReceipt] = {}
         self._credential_generation = 0
+        self._cleaned_bout_id: str | None = None
+        self._requires_cleaned_bout = False
+        # Blocker 2: a durable authority guard the coordinator installs. Invoked
+        # immediately before every external mutation boundary so a stale owner is
+        # refused even if a cancellation was swallowed. None until installed.
+        self.authority_guard: Callable[[], Awaitable[None]] | None = None
+        # Finding 3: the manager ADOPTS its claimed engine (the one that holds the
+        # ARM-staged resident bindings) into the provider, keyed by claim_id, so the
+        # provider -- the SOLE cleanup janitor under the coordinator's lease/fence --
+        # can cancel those staged residents itself instead of the manager doing it.
+        self._adopted_engines: dict[str, LiveConnectionSpikeEngine] = {}
+        self._adopted_engine_order: list[str] = []
+        self._adopted_engine_cap_exceeded = 0
+        self._adopted_engine_high_water = 0
+        self._journal_sealed_generation: int | None = None
+
+    async def seal_absent_cleanup_journals(self, generation: int) -> None:
+        """Commit DELETED on leftover journal rows whose AWS parent is already gone.
+
+        Replica-local readiness treats newest lifecycle_state <> deleted as
+        unresolved debt and keeps the fight card unavailable even when the warm
+        slot is READY and proxies are absent.
+        """
+
+        if self._journal_sealed_generation == generation:
+            return
+        engine = self._engine_factory(CompetitorId.RDS_POSTGRES)
+        engine.authority_guard = self.authority_guard
+        orchestrator = engine._setup_orchestrator
+        if orchestrator is None:
+            return
+        leftover = tuple(await orchestrator.unresolved_bout_ids())
+        if not leftover:
+            self._journal_sealed_generation = generation
+            return
+        for bout_id in leftover:
+            scopes = tuple(await orchestrator._journal.scopes(bout_id))
+            token = max((int(scope.fencing_token) for scope in scopes), default=1)
+            # Journal DELETED commits require the artifact cleanup fence, not
+            # the warm-coordinator heartbeat. The engine path passes
+            # cleanup_authority and therefore skips reclaim.
+            await orchestrator.reconcile_failed_cleanup(bout_id, token)
+        remaining = tuple(await orchestrator.unresolved_bout_ids())
+        if remaining:
+            raise ConnectionSpikeLiveTransientError(
+                "Round 5 cleanup journal still has unresolved bouts after parent absence"
+            )
+        self._journal_sealed_generation = generation
+
+    def _mark_engine_cleanup_transferred(
+        self, engine: LiveConnectionSpikeEngine | None, *, transferred: bool
+    ) -> None:
+        if engine is None:
+            return
+        engine._round5_cleanup_janitor_owned = transferred
+
+    def _release_adopted_entry(self, claim_id: str) -> None:
+        key = str(claim_id)
+        engine = self._adopted_engines.pop(key, None)
+        if key in self._adopted_engine_order:
+            self._adopted_engine_order = [cid for cid in self._adopted_engine_order if cid != key]
+        self._mark_engine_cleanup_transferred(engine, transferred=False)
+
+    def release_adopted_engine(self, claim_id: str) -> None:
+        self._release_adopted_entry(claim_id)
+
+    def release_all_adopted_engines(self) -> None:
+        for claim_id in list(self._adopted_engines):
+            self._release_adopted_entry(claim_id)
+
+    def transfer_adopted_engine_at_cleaning(self, claim_id: str) -> None:
+        engine = self._adopted_engines.get(str(claim_id))
+        self._mark_engine_cleanup_transferred(engine, transferred=True)
+
+    def _enforce_adopted_engine_cap(self) -> None:
+        """Observability-only soft cap -- it NEVER evicts a live engine.
+
+        Every adopted engine is LIVE for its entire lifetime in the registry: it
+        holds the exact ARM-staged resident bindings that the provider (the sole
+        cleanup janitor under the coordinator's lease/fence) must cancel during
+        convergence. Evicting a live engine would silently discard those bindings
+        and re-introduce the original incident -- a rewarm/reconcile running over
+        an orphaned staged resident that latches ``warm_baseline_unexpected``
+        (terminal BLOCKED). A hard cap that drops active claims is therefore
+        unacceptable.
+
+        Entries leave the registry ONLY through the deterministic, durable-state-
+        driven lifecycle: released on convergence/abandon success (after the
+        durable store confirms the claim finished or advanced), on replacement by
+        a newer engine for the same claim, or on ``close``. Correct single-warm-
+        slot operation holds at most one live engine at a time, so that lifecycle
+        keeps the registry bounded. A sustained breach of the soft cap means
+        adopted engines are not being released (a leak); we surface it loudly for
+        operators rather than masking a leak by destroying cleanup state.
+        """
+        held = len(self._adopted_engines)
+        if held > self._adopted_engine_high_water:
+            self._adopted_engine_high_water = held
+        if held > self.ADOPTED_ENGINE_SAFETY_CAP:
+            self._adopted_engine_cap_exceeded += 1
+            logger.warning(
+                "round5_adopted_engine_cap_breached held=%d cap=%d "
+                "(NOT evicting: live engines hold staged cleanup bindings; "
+                "investigate unreleased adopted engines)",
+                held,
+                self.ADOPTED_ENGINE_SAFETY_CAP,
+            )
+
+    def adopt_claimed_engine(
+        self, claim_id: str, engine: LiveConnectionSpikeEngine
+    ) -> None:
+        key = str(claim_id)
+        previous = self._adopted_engines.get(key)
+        if previous is not engine:
+            self._release_adopted_entry(key)
+        self._adopted_engines[key] = engine
+        if key not in self._adopted_engine_order:
+            self._adopted_engine_order.append(key)
+        self._mark_engine_cleanup_transferred(engine, transferred=False)
+        self._enforce_adopted_engine_cap()
+
+    async def _check_authority(self) -> None:
+        guard = getattr(self, "authority_guard", None)
+        if guard is not None:
+            await guard()
+
+    def _factory_engine(
+        self,
+        competitor_id: CompetitorId,
+    ) -> LiveConnectionSpikeEngine:
+        engine = self._engine_factory(competitor_id)
+        if self._requires_cleaned_bout:
+            engine.require_cleaned_bout()
+        cleaned_bout_id = self._cleaned_bout_id
+        if cleaned_bout_id is not None:
+            engine.retain_cleaned_bout(cleaned_bout_id)
+        # Propagate the durable authority guard to the engine so its own external
+        # mutation boundaries (STAGE/PRELOAD, control dispatch, credential/AWS
+        # setup) refuse under a lost fence too.
+        engine.authority_guard = getattr(self, "authority_guard", None)
+        return engine
 
     async def reconcile(self, slot: object) -> bool:
         from .round5_warm import (
@@ -7765,23 +9318,57 @@ class LiveRound5WarmProvider:
             RetryableWarmError,
             Round5Variant,
             Round5WarmState,
+            WarmFenceLostError,
         )
 
-        if (
-            slot.state not in {Round5WarmState.RUNNING, Round5WarmState.CLEANING}
-            or slot.claim is None
-        ):
+        if slot.state not in {Round5WarmState.RUNNING, Round5WarmState.CLEANING}:
+            persisted = getattr(slot, "cleaned_bout_id", None)
+            self._requires_cleaned_bout = bool(
+                getattr(slot, "requires_cleaned_bout", persisted is not None)
+            )
+            if persisted is not None:
+                LiveConnectionSpikeAdapter._validate_run_id(persisted)
+            self._cleaned_bout_id = persisted if self._requires_cleaned_bout else None
+            return False
+        if slot.claim is None:
             return False
         competitor_id = (
             CompetitorId.AURORA_SERVERLESS_V2
             if slot.claim.selected_variant == Round5Variant.AURORA
             else CompetitorId.RDS_POSTGRES
         )
+        # Durable authority guard before the cleanup dispatch mutations (job
+        # cancel/settle, provider absence proof). Refuses under a lost fence.
+        await self._check_authority()
+        claim_id = str(slot.claim.claim_id)
         try:
-            engine = self._engine_factory(competitor_id)
-            await engine.reconcile_claim(slot.claim)
+            # Prefer the ADOPTED claimed engine (it holds the ARM-staged resident
+            # bindings) so the provider can cancel those residents itself; fall back
+            # to a fresh engine only when nothing was adopted (e.g. restart takeover).
+            engine = self._adopted_engines.get(claim_id)
+            if engine is None:
+                engine = self._engine_factory(competitor_id)
+            engine.authority_guard = getattr(self, "authority_guard", None)
+            if slot.bell_id is None and slot.bell_at_utc is None:
+                # The provider is the SOLE janitor for a no-bell abandon: it cancels
+                # the ARM-staged residents (on the adopted claimed engine, each under
+                # the coordinator's per-mutation authority guard) AND settles the
+                # exact durable jobs + proves provider absence.
+                settle = getattr(engine, "settle_abandoned_arm", None)
+                if callable(settle):
+                    await settle()
+                await engine.reconcile_abandoned_claim(slot.claim)
+            else:
+                await engine.reconcile_claim(slot.claim)
+            self._cleaned_bout_id = str(slot.claim.bout_id)
+            self._requires_cleaned_bout = True
+            self._release_adopted_entry(claim_id)
             return True
         except asyncio.CancelledError:
+            raise
+        except WarmFenceLostError:
+            # Authority moved mid-cleanup: propagate so the loop aborts without
+            # masking the fence loss as a retryable/blocked provider fault.
             raise
         except Exception as exc:
             if self._retryable(exc):
@@ -7813,6 +9400,41 @@ class LiveRound5WarmProvider:
                 raise RetryableWarmError("runner_provenance_probe_retryable") from exc
             return False
 
+    async def reestablish(self, slot: object) -> None:
+        """Retire the resident + discard stale engines after an attested identity change.
+
+        The coordinator calls this the instant ``validate_ready`` attests a resident
+        identity change. The installed ``_engines``/``_receipts`` pin the CHANGED
+        identity, so a rewarm over them would re-PRELOAD the stale binding; discard
+        them (forcing the next ``prepare`` to build fresh engines and issue a genuinely
+        fresh PRELOAD) and RETIRE the old resident generation job on each engine (drain
+        a wedged same-process resident). Best-effort per engine so one lane's failure
+        cannot strand the recovery; a lost fence propagates so the loop defers to the
+        new owner. Idempotent: safe to call on every attested-change beat.
+        """
+
+        from .round5_warm import WarmFenceLostError
+
+        del slot
+        # Refuse under a lost fence before mutating the resident control plane.
+        await self._check_authority()
+        for engine in list(self._engines.values()):
+            try:
+                await engine.retire_resident_generation()
+            except asyncio.CancelledError:
+                raise
+            except WarmFenceLostError:
+                raise
+            except Exception:
+                logger.warning(
+                    "round5_reestablish_retire_failed", exc_info=True
+                )
+        # Discard the stale engines/receipts so the next prepare() builds fresh ones.
+        # validate_ready returns False while empty, which is harmless: the slot is
+        # already WARMING for the clean rewarm.
+        self._engines = {}
+        self._receipts = {}
+
     @staticmethod
     def _retryable(error: BaseException) -> bool:
         if isinstance(
@@ -7828,22 +9450,41 @@ class LiveRound5WarmProvider:
             ),
         ):
             return True
-        response = getattr(error, "response", None)
-        if not isinstance(response, Mapping):
-            return False
-        code = str((response.get("Error") or {}).get("Code") or "")
-        status = int((response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
-        return (
-            status >= 500
-            or code.startswith("Throttl")
-            or code
-            in {
-                "RequestLimitExceeded",
-                "ServiceUnavailable",
-                "InternalFailure",
-                "PriorRequestNotComplete",
-            }
-        )
+        if type(error).__name__ == "InvalidStateError":
+            text = str(error)
+            if "still active" in text or "no longer current" in text:
+                return True
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, ConnectionSpikeLiveTransientError):
+                return True
+            if isinstance(current, ConnectionSpikeLiveOperationError) and (
+                "journal write lost its active lease fence" in str(current)
+            ):
+                return True
+            response = getattr(current, "response", None)
+            if isinstance(response, Mapping):
+                code = str((response.get("Error") or {}).get("Code") or "")
+                status = int(
+                    (response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0
+                )
+                if (
+                    status >= 500
+                    or code.startswith("Throttl")
+                    or code
+                    in {
+                        "RequestLimitExceeded",
+                        "ServiceUnavailable",
+                        "InternalFailure",
+                        "PriorRequestNotComplete",
+                        "InvalidDBProxyStateFault",
+                    }
+                ):
+                    return True
+            current = current.__cause__
+        return False
 
     async def prepare(
         self,
@@ -7853,6 +9494,7 @@ class LiveRound5WarmProvider:
         process_epoch: str,
         broker_epoch: str,
         warm_attempt_token: str,
+        requires_cleaned_bout: bool,
     ) -> object:
         from .round5_warm import (
             BlockedWarmError,
@@ -7861,13 +9503,20 @@ class LiveRound5WarmProvider:
         )
 
         del process_epoch
+        self._requires_cleaned_bout = requires_cleaned_bout
+        if not requires_cleaned_bout:
+            self._cleaned_bout_id = None
         variants = {
             Round5Variant.AURORA: CompetitorId.AURORA_SERVERLESS_V2,
             Round5Variant.RDS: CompetitorId.RDS_POSTGRES,
         }
+        # Durable authority guard immediately before the warm mutation sequence
+        # (setup/credential/AWS + runner STAGE). A stale owner is refused here even
+        # if _run_holding_lease's cancellation was swallowed.
+        await self._check_authority()
         try:
             engines = {
-                variant: self._engine_factory(competitor_id)
+                variant: self._factory_engine(competitor_id)
                 for variant, competitor_id in variants.items()
             }
             aurora_receipt = await engines[Round5Variant.AURORA].warm(
@@ -7901,6 +9550,34 @@ class LiveRound5WarmProvider:
             #     closed for operator attention, never be papered over as READY.
             #   * anything else unexpected -> fail closed rather than assume it is
             #     safe to retry.
+            if isinstance(exc, ConnectionSpikeLiveSourceUnresolvedError):
+                # Req #4: the sealed source did not resolve to exactly one row (an
+                # empty describe).  Retry boundedly for eventual consistency, but
+                # escalate to a TERMINAL block if it persists -- an unfindable
+                # source is a real problem, not a self-verifiable "the DB is busy"
+                # condition, and must not recheck forever.  (Subclass of
+                # SourceUnavailable, so this check MUST precede it.)
+                logger.warning(
+                    "round5_warm_source_unresolved generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise RetryableWarmError("warm_source_unresolved") from exc
+            if isinstance(exc, ConnectionSpikeLiveSourceUnavailableError):
+                # Identity is intact; only availability is temporarily missing
+                # (source backing-up/modifying/failing-over/rebooting). Distinct,
+                # self-verifiable transient taxonomy -- retryable like a throttle,
+                # but named so an operator can tell a source-availability blip
+                # apart from a generic AWS/Lakebase read failure. Never
+                # warm_baseline_invalid.
+                logger.warning(
+                    "round5_warm_source_unavailable generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise RetryableWarmError("warm_source_unavailable") from exc
             if self._retryable(exc):
                 logger.warning(
                     "round5_warm_provider_retryable generation=%s cause=%s: %s",
@@ -7917,6 +9594,26 @@ class LiveRound5WarmProvider:
                     exc,
                 )
                 raise BlockedWarmError("warm_baseline_invalid") from exc
+            if isinstance(exc, Round5ResidentBindingChangedError):
+                # A staged resident from a prior claim/ARM is still draining --
+                # an ownership TRANSITION, not a permanent baseline defect. While a
+                # cleanup lineage is in force (requires_cleaned_bout, i.e. a claim
+                # was just cleaned and its resident may not be fully settled), this
+                # is settle-first/RETRYABLE: the coordinator settles the exact
+                # residents and re-attempts, and it must NEVER latch the terminal
+                # warm_baseline_unexpected block the live no-bell wedge produced.
+                # With no claim/cleanup debt to explain it, a binding change is
+                # genuine baseline drift and still fails closed (below).
+                if requires_cleaned_bout:
+                    logger.warning(
+                        "round5_warm_resident_binding_transition generation=%s cause=%s: %s",
+                        generation,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    raise RetryableWarmError(
+                        "warm_resident_binding_transition"
+                    ) from exc
             logger.warning(
                 "round5_warm_baseline_unexpected generation=%s cause=%s: %s",
                 generation,
@@ -7925,6 +9622,25 @@ class LiveRound5WarmProvider:
             )
             raise BlockedWarmError("warm_baseline_unexpected") from exc
         receipts = dict(zip(engines, warmed, strict=True))
+        # Fresh-PRELOAD invariant (assert BEFORE installing the engines/receipts):
+        # both lane receipts must carry THIS attempt's token and an attested
+        # resident process identity that could only come from a PRELOAD ->
+        # agent_ready round trip observed this attempt (each warm builds fresh
+        # engines whose adapters start unattested). This fails closed with a
+        # distinct, non-secret code instead of installing engines and publishing
+        # READY on stale evidence -- the exact hazard a skipped or superseded
+        # re-PRELOAD would slip past. Raised outside the transient/blocked
+        # classifier above so it surfaces as its own terminal code.
+        for receipt in warmed:
+            boots = receipt.runner_process_boot_ids
+            if (
+                receipt.warm_attempt_token != warm_attempt_token
+                or set(boots) != {"lakebase", "competitor"}
+                or any(
+                    (not boot) or boot == "unattested" for boot in boots.values()
+                )
+            ):
+                raise BlockedWarmError("warm_ready_without_fresh_preload")
         self._engines = {variants[variant].value: engine for variant, engine in engines.items()}
         self._receipts = {variants[variant].value: receipt for variant, receipt in receipts.items()}
         self._credential_generation += 1
@@ -8130,7 +9846,16 @@ class LiveRound5WarmProvider:
         return self._assemble_preparation(
             generation=slot.generation,
             coordinator_fence=slot.coordinator_fence,
-            broker_epoch=f"broker-{uuid4().hex}",
+            # PRESERVE the slot's broker_epoch across a credential/receipt refresh.
+            # broker_epoch is a per-process identity used ONLY by the capsule-belonging
+            # checks (_capsule_belongs/_capsule_current); it has NO role in the resident
+            # control wire. Minting a fresh random broker_epoch here diverged it from the
+            # coordinator's stable self.broker_epoch (what the rewarm path stamps), so
+            # after this in-place refresh any later freshness_lost->rewarm published a
+            # capsule whose broker_epoch no longer matched the slot -> launch_capsule_missing
+            # -> the ~45-min idle rewarm storm. Keeping it stable makes refresh and rewarm
+            # produce belonging capsules interchangeably.
+            broker_epoch=slot.broker_epoch,
             warm_attempt_token=slot.warm_attempt_token,
             engines=engines,
             receipts=receipts,
@@ -8175,7 +9900,11 @@ class LiveRound5WarmProvider:
         return self._capsule(
             generation=slot.generation,
             coordinator_fence=slot.coordinator_fence,
-            broker_epoch=f"broker-{uuid4().hex}",
+            # PRESERVE the slot's broker_epoch (see refresh_preparation): a fresh random
+            # broker_epoch here diverged from the coordinator's stable self.broker_epoch and
+            # broke _capsule_belongs after a post-refresh rewarm. broker_epoch is not on the
+            # resident control wire; keeping it stable is correct and storm-free.
+            broker_epoch=slot.broker_epoch,
             engines=engines,
             receipts=receipts,
         )

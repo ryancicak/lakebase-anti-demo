@@ -515,6 +515,11 @@ def belongs_to_installation(receipt: BoutReceipt, installation: Installation) ->
 #: symptom is a 503 on a fresh install weeks later.
 BOUT_RECEIPT_TABLE = f"{COORDINATION_SCHEMA}.bout_receipt"
 
+#: Owner-defined least-privilege path for the mutable cleanup overlay.
+BOUT_RECEIPT_CLEANUP_FUNCTION = (
+    f"{COORDINATION_SCHEMA}.bout_receipt_cleanup_upsert_v1"
+)
+
 #: The store this process persists receipts to, or None when it has none.
 #:
 #: Process-global, which needs justifying. The write hook is
@@ -685,28 +690,13 @@ class DurableReceiptStore:
             async def upsert_cleanup(cursor: Any) -> None:
                 await cursor.execute(
                     f"""
-                    INSERT INTO {BOUT_RECEIPT_TABLE} (
-                        session_id, round_id, sealing_event, receipt, run_id,
-                        outcome, sealed_at, document
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                    ON CONFLICT (session_id, round_id, sealing_event) DO UPDATE
-                    SET receipt = EXCLUDED.receipt,
-                        run_id = EXCLUDED.run_id,
-                        outcome = EXCLUDED.outcome,
-                        sealed_at = EXCLUDED.sealed_at,
-                        document = EXCLUDED.document
-                    WHERE {BOUT_RECEIPT_TABLE}.sealed_at <= EXCLUDED.sealed_at
-                      AND (
-                        {BOUT_RECEIPT_TABLE}.document
-                            -> 'receipt' -> 'cleanup_failure'
-                        IS DISTINCT FROM
-                        EXCLUDED.document -> 'receipt' -> 'cleanup_failure'
-                      )
+                    SELECT {BOUT_RECEIPT_CLEANUP_FUNCTION}(
+                        %s, %s, %s, %s, %s, %s, %s::jsonb
+                    )
                     """,
                     (
                         receipt.session_id,
                         receipt.round_id.value,
-                        sealing_event,
                         receipt.receipt,
                         receipt.run_id,
                         receipt.outcome,

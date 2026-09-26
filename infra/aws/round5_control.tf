@@ -560,6 +560,17 @@ data "aws_iam_policy_document" "round5_execution_proxy" {
       values   = ["false"]
     }
 
+    # Require-present the immutable per-bout operation-identity fence on the timed
+    # CreateDBProxy request itself (Swarm defect #2 / Round 5 remediation A.2). The
+    # coordinator always stamps anti-demo:bout-fence = fencing_token on the Proxy
+    # (server/connection_spike_live.py _coordinator); a CreateDBProxy that somehow
+    # omits it must fail closed rather than create an unfenced, un-adoptable Proxy.
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/anti-demo:bout-fence"
+      values   = ["false"]
+    }
+
     condition {
       test     = "StringEquals"
       variable = "aws:PrincipalAccount"
@@ -639,6 +650,17 @@ data "aws_iam_policy_document" "round5_execution_proxy" {
     condition {
       test     = "Null"
       variable = "aws:RequestTag/anti-demo:bout-token"
+      values   = ["false"]
+    }
+
+    # Require-present the immutable per-bout operation-identity fence on the
+    # dependent AddTagsToResource as well (Round 5 remediation A.2). Both the Proxy
+    # (CreateDBProxy tag-on-create) and its default target group tag through this
+    # statement with anti-demo:bout-fence; either request that drops the fence must
+    # fail closed rather than tag an unfenced resource.
+    condition {
+      test     = "Null"
+      variable = "aws:RequestTag/anti-demo:bout-fence"
       values   = ["false"]
     }
 

@@ -989,11 +989,6 @@ def test_manifest_v7_round_trips_immutable_installation_and_exact_environments(
             "Round 6 adapter identities",
         ),
         (
-            ("round_environments", "put_model_score_in_app", "aurora"),
-            ("round_environments", "wake_idle_app", "aurora"),
-            "must not seal unused AWS databases",
-        ),
-        (
             ("databricks", "project_id"),
             "not-the-round1-project",
             "Round 1 mirror",
@@ -1016,3 +1011,55 @@ def test_manifest_v7_fails_closed_on_aliases_and_adapter_drift(
 
     with pytest.raises(ValidationError, match=message):
         DemoManifest.model_validate(payload)
+
+
+def test_manifest_v7_tolerates_live_round6_augmented_shape(tmp_path) -> None:
+    """R6-adjacent schema-compat: a live v7 manifest shaped by newer Round 6
+    (Lakeflow Connect) code carries fields this frozen R5 artifact does not model --
+    an extra ``round6.lakeflow_sources`` key, and an Aurora/RDS CDF-source seal on the
+    Lakebase-only ``put_model_score_in_app`` round. Strict ``extra="forbid"`` plus the
+    "must not seal unused AWS databases" rule made ``load_manifest`` reject it, which
+    crashed the deployed app's FastAPI lifespan. The loader must now PARSE that live
+    shape (Round 6 behavior stays frozen; the extra seals/fields are simply not used).
+
+    This is the exact production regression: reverting either compat change makes the
+    load below raise ``extra_forbidden`` / "must not seal unused AWS databases".
+    """
+
+    payload = _v7_manifest(tmp_path).model_dump(mode="json")
+
+    # 1. The extra Round 6 field that crashed the app (extra_forbidden).
+    payload["round6"]["lakeflow_sources"] = {
+        "aurora": {"identifier": "live-orders", "incremental_keep_size_mb": 1024},
+    }
+    # 2. A DISTINCT Aurora + RDS CDF-source seal (number 4 is otherwise unused) newer
+    #    R6 code puts on the Lakebase-only put_model_score_in_app round -- like the
+    #    live manifest, and not an alias of another round's seal.
+    payload["round_environments"]["put_model_score_in_app"]["aurora"] = _v7_aurora(
+        4
+    ).model_dump(mode="json")
+    payload["round_environments"]["put_model_score_in_app"]["rds"] = _v7_rds(
+        4
+    ).model_dump(mode="json")
+
+    # In-memory validation parses the live shape.
+    parsed = DemoManifest.model_validate(payload)
+    assert parsed.status == payload["status"]
+    # The ignored Round 6 key is dropped (no behavior reads it).
+    assert not hasattr(parsed.round6, "lakeflow_sources")
+
+    # And the app's ACTUAL loader (load_manifest via ANTI_DEMO_MANIFEST) parses it too
+    # -- this is the path whose failure bricked the lifespan.
+    manifest_file = tmp_path / "live-shaped-manifest.json"
+    manifest_file.write_text(json.dumps(payload), encoding="utf-8")
+    prev = os.environ.get("ANTI_DEMO_MANIFEST")
+    os.environ["ANTI_DEMO_MANIFEST"] = str(manifest_file)
+    try:
+        loaded = load_manifest()
+    finally:
+        if prev is None:
+            os.environ.pop("ANTI_DEMO_MANIFEST", None)
+        else:
+            os.environ["ANTI_DEMO_MANIFEST"] = prev
+    assert loaded.status == payload["status"]
+    assert loaded.manifest_version == 7

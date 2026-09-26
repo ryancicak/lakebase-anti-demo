@@ -378,7 +378,13 @@ class Round4Resources(BaseModel):
 class Round6Resources(BaseModel):
     """Sealed identifiers for the native Lakebase CDF live-order proof."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    # R6-adjacent schema-compat ONLY (Round 6 behavior stays frozen): a live v7
+    # manifest carries Round 6 fields this R5 artifact does not model -- e.g.
+    # ``lakeflow_sources`` -- and strict ``extra="forbid"`` made ``load_manifest``
+    # reject it, crashing the app's lifespan. Ignore unknown Round 6 keys so the
+    # loader parses a live, R6-augmented manifest and the app boots. No Round 6
+    # field is read and no Round 6 behavior is added; the ignored keys are dropped.
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
     warehouse_id: str = Field(min_length=1)
     setup_principal: str = Field(min_length=1)
@@ -1123,10 +1129,14 @@ class DemoManifest(BaseModel):
                 # what lets a pre-deletion manifest be read in order to reseal it.
                 if sealed.rds is None and rds_lane_is_scored(round_id):
                     raise ValueError(f"{round_id.value} requires a dedicated RDS seal")
-            for round_id in lakebase_only_rounds:
-                sealed = environments[round_id]
-                if sealed.aurora is not None or sealed.rds is not None:
-                    raise ValueError(f"{round_id.value} must not seal unused AWS databases")
+            # R6-adjacent schema-compat ONLY (Round 6 behavior stays frozen): a live
+            # v7 manifest shaped by newer Round 6 (Lakeflow Connect) code may seal an
+            # Aurora/RDS CDF source on a round this R5 artifact treats as Lakebase-
+            # only. This artifact never uses those seals, so rejecting them at LOAD
+            # time only bricks the app's lifespan on an otherwise-serviceable
+            # manifest. Tolerate them at load so the app boots; the aws_rounds seals
+            # above stay strictly required. (No behavior reads these seals.)
+            del lakebase_only_rounds
 
         self._require_unique_round_identity(
             "Lakebase project", [item.lakebase.project_id for item in environments.values()]

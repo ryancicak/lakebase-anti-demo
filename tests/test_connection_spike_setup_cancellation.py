@@ -270,8 +270,9 @@ def _orchestrator(
             return SimpleNamespace(provider_id=f"provider-{spec.ordinal}")
 
         async def precommit_intent(self, scope, spec):
-            # Pre-bell durable intent: no provider mutation, so nothing is
-            # appended to ``created`` here (it happens at complete_prestaged).
+            # Bell-path durable CREATE_INTENT (Approach A): no provider mutation, so
+            # nothing is appended to ``created`` here (it happens at
+            # complete_prestaged).
             del scope
             return SimpleNamespace(ordinal=spec.ordinal, resource_kind=spec.resource_kind)
 

@@ -383,6 +383,7 @@ class ShowtimeReadinessGate:
         recovery_factory: Callable[[DemoManifest], Any],
         round5_factory: Callable[[str, LakebaseCreationJournalStore, Any], Any] | None,
         round5_lease_store: BoutLeaseStore | None = None,
+        round5_cleanup_delegated: bool = False,
         manifest_check: Callable[[], None] | None = None,
         poll_seconds: float = 2.0,
         idle_poll_seconds: float = ROUND5_IDLE_POLL_SECONDS,
@@ -421,6 +422,7 @@ class ShowtimeReadinessGate:
         self._safe_change_factory = safe_change_factory
         self._recovery_factory = recovery_factory
         self._round5_factory = round5_factory
+        self._round5_cleanup_delegated = round5_cleanup_delegated
         self._manifest_check = manifest_check or (lambda: None)
         self._poll_seconds = poll_seconds
         self._idle_poll_seconds = idle_poll_seconds
@@ -934,6 +936,14 @@ class ShowtimeReadinessGate:
 
         bouts = await self._unresolved_round5_bouts(journal)
         if bouts:
+            if self._round5_cleanup_delegated:
+                # V4 has one cross-process AWS mutation owner: the durable warm
+                # coordinator. Startup readiness observes journal debt but never
+                # competes for a second artifact lease or calls an engine. The
+                # warm owner keeps CLEANING and its heartbeat until exact absence,
+                # then this observer sees the journal settle and admits READY.
+                self._round5_maintenance(reason_code="cleanup_in_progress")
+                return False
             self._round5_maintenance()
             await self._lead_round5_cleanup(journal=journal, bouts=bouts)
             return False
@@ -946,6 +956,15 @@ class ShowtimeReadinessGate:
             and durable.fencing_token == generation
             and durable.state == "ready"
         ):
+            # Swarm req #3: on the ONLY path that advertises ring readiness, refuse
+            # it if the LIVE journal CHECK cannot admit a lifecycle state the
+            # arm/bell/cleanup path emits. This is the runtime guard against
+            # code<->live-DB drift (a fake journal accepts anything; the deployed
+            # CHECK does not) -- exactly what would have kept the ring from
+            # reporting ready while every arm was rejected by the constraint. Run
+            # here (not before the active-lease/busy check) so an in-flight bout
+            # still reports maintenance rather than triggering a schema read.
+            await self._verify_round5_journal_lifecycle_contract(journal)
             self._round5_ready()
             return True
         await self._lead_round5_cleanup(journal=journal, bouts=())
@@ -1004,8 +1023,22 @@ class ShowtimeReadinessGate:
                         waiting_on=environment_fault_subject(exc),
                     )
                 else:
-                    self._round5_give_up(exc, attempts=failures)
-                    surrendered = True
+                    # Round 5 deterministic resources can still exist even when
+                    # journal reconstruction fails. "given_up" is therefore
+                    # illegal here: stopping retries before an exact provider
+                    # absence proof (or accepted deletion) strands billable
+                    # resources. Keep the named failure durable/visible and
+                    # retry at the bounded ceiling until an owner can prove clean.
+                    if first_failure_at is None:
+                        first_failure_at = time.monotonic()
+                    delay = self._retry_ceiling_seconds
+                    self._round5_retrying(
+                        exc,
+                        attempts=failures,
+                        delay=delay,
+                        escalated=True,
+                        waiting_on=environment_fault_subject(exc),
+                    )
             if answered:
                 failures = 0
                 first_failure_at = None
@@ -1015,6 +1048,34 @@ class ShowtimeReadinessGate:
                 await self._await_round5_recheck()
             else:
                 await asyncio.sleep(delay)
+
+    async def _verify_round5_journal_lifecycle_contract(
+        self, journal: LakebaseCreationJournalStore
+    ) -> None:
+        """Fail closed if the live journal CHECK cannot admit every emitted state.
+
+        Swarm req #3. The arm/bell/cleanup path can only durably write values from
+        :class:`server.connection_spike_journal.LifecycleState`; if the deployed
+        CHECK constraint admits fewer, an arm will be rejected by PostgreSQL and
+        the ring must NOT advertise readiness. Raised as a non-retryable startup
+        error so the round is surrendered (blocked), not retried forever.
+        """
+
+        if not self._manifest.round5_ready:
+            return
+        from .connection_spike_journal import LifecycleState
+
+        admitted = await journal.admitted_lifecycle_states()
+        required = {state.value for state in LifecycleState}
+        missing = sorted(required - admitted)
+        if missing:
+            raise RuntimeError(
+                "ROUND 5 JOURNAL SCHEMA MISMATCH: the live "
+                "round5_creation_journal lifecycle_state CHECK constraint does not "
+                f"admit {missing}, which the arm/bell/cleanup path emits. The ring "
+                "cannot arm until the schema is migrated; refusing to advertise "
+                "readiness rather than failing every arm at INSERT time."
+            )
 
     async def _unresolved_round5_bouts(
         self, journal: LakebaseCreationJournalStore

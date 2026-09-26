@@ -4,10 +4,10 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -540,6 +540,92 @@ def _round5_coordination_refusal(
     return None
 
 
+class _Round5ArtifactCleanupFence:
+    """Nested journal fence held only by the durable warm cleanup owner."""
+
+    def __init__(self, lease_store: Any) -> None:
+        self._lease_store = lease_store
+        self._cleanup_leases: dict[str, Any] = {}
+        self._cas_owned: set[str] = set()
+
+    async def assert_current(self, scope: Any) -> None:
+        reclaimed = self._cleanup_leases.get(scope.bout_id)
+        if reclaimed is not None and reclaimed.fencing_token == scope.fencing_token:
+            try:
+                reclaimed = await self._lease_store.renew(
+                    reclaimed,
+                    ttl=timedelta(seconds=90),
+                )
+            except Exception:
+                self._cleanup_leases.pop(scope.bout_id, None)
+                self._cas_owned.discard(scope.bout_id)
+                raise
+            self._cleanup_leases[scope.bout_id] = reclaimed
+            return
+        active = await self._lease_store.current()
+        # ARM prepare holds this ring in ``checking``; cleanup later
+        # transitions the same identity to ``round5_cleanup``. Authority is the
+        # session+token pair, not the phase, so a start-state check cannot
+        # require cleanup-only and then fail every Prepare that never ran.
+        if (
+            active is None
+            or active.fencing_token != scope.fencing_token
+            or str(active.session_id) != scope.bout_id
+        ):
+            raise InvalidStateError("Round 5 ring fence is no longer current")
+
+    async def reclaim_expired_cleanup(self, scope: Any) -> Any:
+        reclaimed = self._cleanup_leases.get(scope.bout_id)
+        if reclaimed is not None:
+            try:
+                reclaimed = await self._lease_store.renew(
+                    reclaimed,
+                    ttl=timedelta(seconds=90),
+                )
+            except Exception:
+                self._cleanup_leases.pop(scope.bout_id, None)
+                self._cas_owned.discard(scope.bout_id)
+                raise
+            self._cleanup_leases[scope.bout_id] = reclaimed
+            return replace(scope, fencing_token=reclaimed.fencing_token)
+        active = await self._lease_store.current()
+        if active is not None:
+            if active.phase != "round5_cleanup":
+                raise InvalidStateError("Round 5 prior cleanup fence is still active")
+            # Only another warm recovery process may be adopted. A manager or
+            # operator-owned cleanup is a live mutator even though it uses the
+            # same phase, so adopting it would let two coordinators mutate the
+            # proxy journal concurrently.
+            if active.owner_subject != "round5-cleanup-recovery":
+                raise InvalidStateError("Round 5 prior cleanup owner is still active")
+            self._cleanup_leases[scope.bout_id] = active
+            self._cas_owned.discard(scope.bout_id)
+            return replace(scope, fencing_token=active.fencing_token)
+        reclaim = getattr(self._lease_store, "reclaim_expired_cleanup", None)
+        if not callable(reclaim):
+            raise InvalidStateError("Round 5 cleanup fence cannot be reclaimed")
+        reclaimed = await reclaim(
+            session_id=scope.bout_id,
+            expected_previous_token=scope.fencing_token,
+            ttl=timedelta(seconds=90),
+        )
+        self._cleanup_leases[scope.bout_id] = reclaimed
+        self._cas_owned.add(scope.bout_id)
+        return replace(scope, fencing_token=reclaimed.fencing_token)
+
+    async def release_cleanup(self, scope: Any) -> None:
+        lease = self._cleanup_leases.get(scope.bout_id)
+        if lease is None or lease.fencing_token != scope.fencing_token:
+            raise InvalidStateError("Round 5 reclaimed cleanup fence identity changed")
+        if scope.bout_id in self._cas_owned:
+            if not await self._lease_store.release(lease):
+                raise InvalidStateError(
+                    "Round 5 reclaimed cleanup fence release lost authority"
+                )
+        self._cleanup_leases.pop(scope.bout_id, None)
+        self._cas_owned.discard(scope.bout_id)
+
+
 def connection_spike_factory_from_manifest(
     manifest: DemoManifest | None = None,
     *,
@@ -641,16 +727,6 @@ def connection_spike_factory_from_manifest(
                 dispatcher,
             )
 
-        class ActiveLeaseFence:
-            async def assert_current(self, scope: Any) -> None:
-                active = await lease_store.current()
-                if (
-                    active is None
-                    or active.session_id != scope.bout_id
-                    or active.fencing_token != scope.fencing_token
-                ):
-                    raise InvalidStateError("Round 5 ring fence is no longer current")
-
         deployed_runtime = os.environ.get("ANTI_DEMO_ENV") == "databricks-app" or bool(
             os.environ.get("DATABRICKS_APP_NAME")
         )
@@ -689,7 +765,7 @@ def connection_spike_factory_from_manifest(
                 lease_store._run,
                 authority_ring_key=lease_store.ring_key,
             ),
-            fence=ActiveLeaseFence(),
+            fence=_Round5ArtifactCleanupFence(lease_store),
             fresh_lakebase_host=fresh_lakebase_host,
             resident_transport=resident_transport,
         )
@@ -1219,13 +1295,31 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
                     fresh_lakebase_host=fresh_lakebase_host,
                 )
 
+            round5_resource_reader = getattr(
+                manifest, "require_round5_resources", None
+            )
+            round5_resources = (
+                round5_resource_reader()
+                if callable(round5_resource_reader)
+                else None
+            )
+            round5_cleanup_delegated = bool(
+                manifest.round5_ready
+                and getattr(round5_lease_store, "mode", None) == "lakebase"
+                and getattr(round5_resources, "v3_factory_ready", False)
+            )
             readiness_gate = ShowtimeReadinessGate(
                 manifest,
                 lease_store,
                 safe_change_factory=safe_change_cleanup,
                 recovery_factory=recovery_cleanup,
-                round5_factory=round5_cleanup if manifest.round5_ready else None,
+                round5_factory=(
+                    None
+                    if round5_cleanup_delegated
+                    else round5_cleanup if manifest.round5_ready else None
+                ),
                 round5_lease_store=round5_lease_store,
+                round5_cleanup_delegated=round5_cleanup_delegated,
                 manifest_check=require_ready_manifest,
             )
             readiness_task = asyncio.create_task(
@@ -2048,6 +2142,7 @@ _ROUND5_RECOVERY_DETAILS = {
 def _readiness_response(
     ingress_drift: OperatorIngressDrift | None = None,
     presence: InstallationPresence | None = None,
+    round5_cleanup_overlay: Mapping[str, object] | None = None,
 ) -> JSONResponse:
     gate = getattr(app.state, "readiness_gate", None)
     current = getattr(gate, "status", None)
@@ -2223,10 +2318,44 @@ def _readiness_response(
     warm_coordinator = getattr(app.state, "round5_warm_coordinator", None)
     if warm_coordinator is not None:
         existing_cleanup_owed = bool(payload.get("round5_cleanup_owed"))
-        warm_status = warm_coordinator.public_status_cached()
+        run_manager = getattr(app.state, "run_manager", None)
+        warm_status = (
+            getattr(run_manager, "round5_warm_status", None)
+            or warm_coordinator.public_status_cached()
+        )
         payload.update(warm_status)
-        payload["round5_cleanup_owed"] = existing_cleanup_owed or bool(
-            warm_status.get("round5_cleanup_owed")
+        payload["round5_cleanup_owed"] = (
+            existing_cleanup_owed
+            or bool(warm_status.get("round5_cleanup_owed"))
+            or bool(getattr(run_manager, "round5_cleanup_owed", False))
+        )
+        # The manager overlays local cleanup-lease ownership on the coordinator
+        # cache. Publish that same effective value so /readyz cannot say Round 5
+        # is startable while /api/bout/all sees the locally held cleanup fence.
+        payload["round5_ring_ready"] = bool(
+            getattr(
+                run_manager,
+                "round5_ring_ready",
+                warm_status.get("round5_ring_ready"),
+            )
+        )
+    if round5_cleanup_overlay is not None:
+        # A durable cleanup lease outranks every replica-local READY cache. In
+        # particular, never overwrite this False with the local manager property:
+        # another process may own the lease while this replica has no record.
+        payload["round5_ring_ready"] = False
+        payload["round5_cleanup_owed"] = True
+        for key in (
+            "round5_warm_state",
+            "round5_start_stage",
+            "round5_warm_generation",
+            "round5_cleanup_scope",
+            "round5_cleanup_recovery_scheduled",
+        ):
+            if key in round5_cleanup_overlay:
+                payload[key] = round5_cleanup_overlay[key]
+        payload["round5_cleanup_owed_detail"] = round5_cleanup_overlay.get(
+            "round5_cleanup_detail"
         )
     _apply_delta_storage_refusals(payload)
     # Last, so it yields the one `degraded_detail` sentence to all seven ranked
@@ -2658,11 +2787,31 @@ async def readiness() -> JSONResponse:
     # they are independent and a monitor should not pay for them in series.
     # `/healthz` is deliberately left alone: liveness must not depend on reaching
     # an external service.
-    ingress_drift, presence = await asyncio.gather(
+    run_manager = getattr(app.state, "run_manager", None)
+    read_cleanup = getattr(run_manager, "round5_durable_cleanup_overlay", None)
+
+    async def cleanup_overlay() -> Mapping[str, object] | None:
+        if not callable(read_cleanup):
+            return None
+        try:
+            return await read_cleanup()
+        except Exception:
+            # The manager returns a fail-closed overlay on read failure; this is
+            # a final guard for test doubles or a manager replacement.
+            return {
+                "round5_ring_ready": False,
+                "round5_cleanup_owed": True,
+                "round5_cleanup_detail": (
+                    "ROUND 5 NOT STARTABLE · DURABLE CLEANUP COULD NOT BE VERIFIED"
+                ),
+            }
+
+    ingress_drift, presence, round5_overlay = await asyncio.gather(
         operator_ingress_drift_async(),
         installation_presence_async(),
+        cleanup_overlay(),
     )
-    return _readiness_response(ingress_drift, presence)
+    return _readiness_response(ingress_drift, presence, round5_overlay)
 
 
 if FRONTEND_DIST.exists():

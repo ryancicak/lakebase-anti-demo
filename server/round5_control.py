@@ -55,6 +55,18 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 
 
+class Round5ResidentBindingChangedError(RuntimeError):
+    """Readiness events for a resident job carry a different binding than expected.
+
+    Raised by ``wait_agent_ready`` when the runner's readiness proof does not match
+    the binding this generation staged.  During an ownership transition (a prior
+    claim's staged resident is still draining), this is a settle-first/RETRYABLE
+    condition, not a permanent baseline defect: the warm provider classifies it as
+    retryable while resident-settlement debt exists, and only fails closed
+    (``warm_baseline_unexpected``) when there is no claim/debt to explain it.
+    """
+
+
 def canonical_json(value: object) -> bytes:
     try:
         return json.dumps(
@@ -93,6 +105,22 @@ class Round5ControlKind(StrEnum):
     STAGE = "stage"
     RELEASE = "release"
     CANCEL = "cancel"
+
+
+class ResidentLiveness(StrEnum):
+    """Tri-state (plus ABSENT) resident liveness for idle READY keep-alive.
+
+    The idle "Temporarily Unavailable" flicker came from collapsing these into one
+    boolean: a STALE or ABSENT heartbeat (transient, off-path) was indistinguishable
+    from an IDENTITY_CHANGED runner and demoted READY on the first miss. The contract
+    is: only IDENTITY_CHANGED (an attested runner change) demotes; STALE/ABSENT are
+    transient misses handled by the coordinator's strike budget (RetryableWarmError).
+    """
+
+    CURRENT = "current"
+    STALE = "stale"
+    IDENTITY_CHANGED = "identity_changed"
+    ABSENT = "absent"
 
 
 class Round5RunnerEventKind(StrEnum):
@@ -1068,15 +1096,20 @@ class Round5ControlDispatcher:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         on_persistent_failure: Callable[[str], Awaitable[None]] | None = None,
         persistent_failure_threshold: int = 3,
+        persistent_failure_window_seconds: float = 8.0,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if persistent_failure_threshold <= 0:
             raise ValueError("persistent failure threshold must be positive")
+        if persistent_failure_window_seconds < 0:
+            raise ValueError("persistent failure window cannot be negative")
         self.store = store
         self._send = send
         self._sleep = sleep
         self._on_persistent_failure = on_persistent_failure
         self._persistent_failure_threshold = persistent_failure_threshold
+        self._persistent_failure_window_seconds = persistent_failure_window_seconds
+        self._first_failure_at: datetime | None = None
         self._now = now
         self._wake = asyncio.Event()
         self._closed = False
@@ -1164,9 +1197,22 @@ class Round5ControlDispatcher:
                         )
                     self._held_releases.difference_update(expired)
                     self._allowed_releases.difference_update(expired)
-            for event in await self.store.pending(
-                allowed_release_ids=self._allowed_releases,
-            ):
+            try:
+                pending_events = await self.store.pending(
+                    allowed_release_ids=self._allowed_releases,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A failed SCAN of the outbox is NOT a delivery failure: there is no
+                # real outbox row we failed to publish. Counting an (idle, empty)
+                # scan blip toward the persistent-failure budget is what let a
+                # transient store hiccup withdraw idle READY and flash the fight card
+                # "Temporarily Unavailable". Log and treat as nothing-to-do; only a
+                # failed _send()/mark_published() of a real row (below) counts.
+                logger.warning("round5_control_outbox_scan_failed")
+                return 0
+            for event in pending_events:
                 # RELEASE is a durable intent, not permission to cross the
                 # measured edge.  Lakebase's row is committed with the bell and
                 # opened only after the process captures T0; the competitor row
@@ -1203,13 +1249,24 @@ class Round5ControlDispatcher:
     async def _record_delivery_failure(self) -> None:
         self._consecutive_failures += 1
         failures = self._consecutive_failures
+        now = self._now()
+        if self._first_failure_at is None:
+            self._first_failure_at = now
         if failures & (failures - 1) == 0:
             logger.warning(
                 "round5_control_outbox_publish_failed consecutive_failures=%d",
                 failures,
             )
+        # Withdraw readiness only for a GENUINELY persistent outbox failure -- both a
+        # count threshold AND a minimum elapsed WINDOW. The dispatcher polls the
+        # outbox at ~10Hz, so a bare count of 3 fired after ~0.3s: a transient DB
+        # blip during an idle outbox scan withdrew Round 5 readiness and flashed the
+        # fight card "Temporarily Unavailable". Requiring the failure to persist across
+        # a real wall-clock window keeps a sub-second blip from ever demoting READY.
+        elapsed = (now - self._first_failure_at).total_seconds()
         if (
             failures < self._persistent_failure_threshold
+            or elapsed < self._persistent_failure_window_seconds
             or self._persistent_failure_reported
             or self._on_persistent_failure is None
         ):
@@ -1233,6 +1290,7 @@ class Round5ControlDispatcher:
             )
         self._consecutive_failures = 0
         self._persistent_failure_reported = False
+        self._first_failure_at = None
 
     async def run(self) -> None:
         while not self._closed:
@@ -1249,8 +1307,17 @@ class Round5ControlDispatcher:
                 published = 0
             if published or self._wake.is_set():
                 continue
+            # Back off while the outbox is failing so a transient fault is not
+            # re-hit at the full ~10Hz idle poll rate (which turned a sub-second
+            # blip into the persistent-failure threshold almost instantly). A clean
+            # idle scan keeps the responsive 0.1s poll; consecutive failures grow the
+            # gap up to a 2s ceiling so the persistent-failure WINDOW reflects a real
+            # sustained outage rather than poll frequency.
+            idle_timeout = 0.1
+            if self._consecutive_failures:
+                idle_timeout = min(2.0, 0.1 * float(2 ** min(self._consecutive_failures, 5)))
             try:
-                await asyncio.wait_for(self._wake.wait(), timeout=0.1)
+                await asyncio.wait_for(self._wake.wait(), timeout=idle_timeout)
             except TimeoutError:
                 await self._sleep(0)
 
@@ -1446,7 +1513,9 @@ class Round5ResidentTransport:
                     expected_binding.pop("runner_process_boot_id")
                     process_boot_id = actual_binding.pop("runner_process_boot_id")
                     if actual_binding != expected_binding or process_boot_id in {"", "unattested"}:
-                        raise RuntimeError("resident readiness binding changed")
+                        raise Round5ResidentBindingChangedError(
+                            "resident readiness binding changed"
+                        )
                     sequence = event.sequence
                     if event.kind == Round5RunnerEventKind.AGENT_READY:
                         payload = event.payload
@@ -1540,19 +1609,67 @@ class Round5ResidentTransport:
         process_pid: int,
         harness_sha256: str,
         now: datetime,
-        heartbeat_seconds: float = 5.0,
+        heartbeat_seconds: float = 15.0,
     ) -> bool:
+        # Heartbeat freshness window aligned to PROVENANCE_FRESHNESS_SECONDS (15s):
+        # a 5s window was TIGHTER than the runner's own beat cadence, so an idle
+        # keep-alive probe routinely landed between beats, read "not current", and
+        # (via validate_ready -> False) demoted READY -> the idle "Temporarily
+        # Unavailable" flicker. A stale beat within this wider window is a transient
+        # miss handled by the coordinator's strike budget (validate_ready False =
+        # strike), NOT an attested identity change; the identity fields below are what
+        # actually attest a genuine runner change and demote once persistent.
+        return (
+            await self.resident_liveness(
+                installation_id=installation_id,
+                lane_id=lane_id,
+                warm_attempt_token=warm_attempt_token,
+                runner_boot_id=runner_boot_id,
+                process_boot_id=process_boot_id,
+                process_pid=process_pid,
+                harness_sha256=harness_sha256,
+                now=now,
+                heartbeat_seconds=heartbeat_seconds,
+            )
+        ) is ResidentLiveness.CURRENT
+
+    async def resident_liveness(
+        self,
+        *,
+        installation_id: str,
+        lane_id: str,
+        warm_attempt_token: str,
+        runner_boot_id: str,
+        process_boot_id: str,
+        process_pid: int,
+        harness_sha256: str,
+        now: datetime,
+        heartbeat_seconds: float = 15.0,
+    ) -> ResidentLiveness:
+        """Classify resident liveness for the idle keep-alive contract.
+
+        Separates an ATTESTED identity change (demote) from a transient STALE/ABSENT
+        heartbeat (strike). Identity is judged FIRST and independently of freshness, so
+        a runner that rebooted is IDENTITY_CHANGED even if its stale beat is recent, and
+        a runner whose identity still matches is only STALE (never a false identity
+        change) when its beat has merely aged past the window.
+        """
+
         event = await self.store.latest_resident_attestation(
             installation_id,
             lane_id,
             warm_attempt_token,
         )
-        return bool(
-            event is not None
-            and (now - event.occurred_at).total_seconds() <= heartbeat_seconds
-            and event.payload.get("runner_boot_id") == runner_boot_id
+        if event is None:
+            return ResidentLiveness.ABSENT
+        identity_ok = (
+            event.payload.get("runner_boot_id") == runner_boot_id
             and event.payload.get("runner_process_boot_id") == process_boot_id
             and event.payload.get("process_pid") == process_pid
             and event.payload.get("runner_harness_sha256") == harness_sha256
             and event.payload.get("worker_ready_indexes") == [0, 1, 2, 3]
         )
+        if not identity_ok:
+            return ResidentLiveness.IDENTITY_CHANGED
+        fresh = (now - event.occurred_at).total_seconds() <= heartbeat_seconds
+        return ResidentLiveness.CURRENT if fresh else ResidentLiveness.STALE

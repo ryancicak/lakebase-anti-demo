@@ -491,29 +491,36 @@ async def test_failed_cleanup_writes_the_proxy_name_onto_the_towel_and_the_setup
     manager._revalidated_snapshot = lambda value: value.model_copy(deep=True)
     await manager._mark_connection_spike_cleanup_pending(record)
 
+    # Automatic cleanup keeps retrying, so inside the owed notice's grace window
+    # this is an ordinary delete still in progress: it is recorded as retrying,
+    # but neither the towel nor the setup carries the billing alarm yet, and the
+    # towel is not failed -- the room saw that alarm flash on ordinary towels.
+    assert setup.cleanup_retryable is True
+    assert setup.cleanup_failure is None
+    assert towel.cleanup_failure is None
+    assert towel.state is None
+    assert round5_cleanup_owed_notice() is None
+
+    # Past the grace window the next failed attempt names the Proxy, because this
+    # bout's delete was never accepted (proxy_delete_accepted() is False here).
+    reset_round5_cleanup_owed()
+    record_round5_cleanup_owed(
+        "session-i",
+        resource="anti-demo-r5-session-i-proxy",
+        now=lambda: datetime.now(UTC) - timedelta(seconds=GRACE_SECONDS + 1),
+    )
+    await manager._mark_connection_spike_cleanup_pending(record)
+
     expected = "anti-demo-r5-session-i-proxy"
     assert expected in towel.cleanup_failure
     assert "MAY STILL BE RUNNING AND BILLING" in towel.cleanup_failure
     # One sentence, not two that can drift: the towel, the setup snapshot the
     # receipt is derived from, and `/readyz` all quote the same writer.
     assert setup.cleanup_failure == towel.cleanup_failure
-    # Automatic cleanup now keeps retrying, so the operator /readyz notice is
-    # grace-gated: a transient cleanup that converges in seconds never fires it.
-    # Within the grace window it is not yet due...
-    assert round5_cleanup_owed_notice() is None
-    # ...but if the failure persists past the grace window it becomes visible and
-    # still names the billing risk, because this bout's Proxy delete was never
-    # accepted (proxy_delete_accepted() is False here).
-    from datetime import UTC, datetime, timedelta
-
-    from server.round5_cleanup_owed import GRACE_SECONDS
-
-    later = datetime.now(UTC) + timedelta(seconds=GRACE_SECONDS + 1)
-    notice = round5_cleanup_owed_notice(now=lambda: later)
+    notice = round5_cleanup_owed_notice()
     assert notice is not None
     assert notice.detail == towel.cleanup_failure
-    assert "MAY STILL BE RUNNING AND BILLING" in notice.detail
-    assert [event for event, _ in published] == ["cleanup_update"]
+    assert [event for event, _ in published] == ["cleanup_update", "cleanup_update"]
 
 
 def test_only_one_place_in_the_tree_writes_the_leaked_proxy_sentence() -> None:
@@ -587,6 +594,41 @@ def test_readyz_names_a_proxy_cleanup_could_not_delete(
     detail = leaking["round5_cleanup_owed_detail"]
     assert "anti-demo-r5-0123456789abcdef-proxy" in detail
     assert "MAY STILL BE RUNNING AND BILLING" in detail
+
+
+def test_readyz_never_overrides_a_local_cleanup_lease_with_cached_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manager's cleanup fence outranks one stale READY warm-cache beat."""
+
+    warm_status = {
+        "round5_warm_state": "ready",
+        "round5_start_stage": "ready",
+        "round5_ring_ready": True,
+        "round5_cleanup_owed": False,
+        "round5_warm_generation": 17,
+    }
+    monkeypatch.setattr(
+        app_module.app.state,
+        "round5_warm_coordinator",
+        SimpleNamespace(public_status_cached=lambda: warm_status),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        app_module.app.state,
+        "run_manager",
+        SimpleNamespace(
+            round5_ring_ready=False,
+            round5_cleanup_owed=True,
+        ),
+        raising=False,
+    )
+
+    payload = _readyz(monkeypatch)
+
+    assert payload["round5_ring_ready"] is False
+    assert payload["round5_cleanup_owed"] is True
+    assert payload["round5_warm_generation"] == 17
 
 
 def test_a_leaked_proxy_does_not_lower_the_field_checked_before_a_demo(

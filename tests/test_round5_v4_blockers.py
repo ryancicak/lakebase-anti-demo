@@ -180,7 +180,15 @@ async def test_active_claim_is_renewed_through_arm() -> None:
     await manager.close()
 
 
-async def test_abandoned_claim_still_expires_and_releases() -> None:
+async def test_abandoned_expired_claim_fences_into_cleaning_with_claim_retained() -> None:
+    # The generic coordinator loop must fail SAFE: an expired, no-longer-active
+    # claim may have staged ARM residents whose exact job IDs live only in the
+    # durable claim, so it is fenced into CLEANING with the claim RETAINED rather
+    # than normalized back to READY/WARMING (which would abandon those residents
+    # and race the manager's begin_cleanup -- the live no-bell wedge). The fast
+    # pre-bell return-to-READY path still exists via coordinator.abandon_claim /
+    # store.release_claim; it is only this generic supervised-loop release that now
+    # fences. (Was: released to READY/WARMING with the claim dropped.)
     clock = Clock()
     provider = Provider(clock)
     manager = coordinator(clock, provider)
@@ -198,10 +206,11 @@ async def test_abandoned_claim_still_expires_and_releases() -> None:
     clock.advance(DEFAULT_CLAIM_TTL_SECONDS + 5)
     await manager.run_one_cycle()
 
-    released = await manager.store.read("install-one")
-    assert released is not None
-    assert released.state in {Round5WarmState.READY, Round5WarmState.WARMING}
-    assert released.claim is None
+    fenced = await manager.store.read("install-one")
+    assert fenced is not None
+    assert fenced.state == Round5WarmState.CLEANING
+    assert fenced.claim is not None
+    assert fenced.claim.claim_id == claimed.claim.claim_id
     await manager.close()
 
 
