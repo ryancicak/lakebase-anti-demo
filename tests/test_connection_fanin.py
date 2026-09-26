@@ -2703,8 +2703,18 @@ def test_callback_profiling_cpu_overhead_is_bounded() -> None:
             loop.close()
 
     callbacks = 10_000
-    baseline_ms = min(measure(probed=False, callbacks=callbacks) for _ in range(3))
-    profiled_ms = min(measure(probed=True, callbacks=callbacks) for _ in range(3))
+    # Interleaved and best of seven. The two figures are subtracted, so they must
+    # come from the same stretch of machine state, and the minimum is the least
+    # contended observation of each. Best of three, measured one after the other,
+    # read 2.01us against the ceiling on a shared CI runner on 2026-09-26 while the
+    # same commit's other run passed: noise at the boundary, not a regression.
+    baseline_runs: list[float] = []
+    profiled_runs: list[float] = []
+    for _ in range(7):
+        baseline_runs.append(measure(probed=False, callbacks=callbacks))
+        profiled_runs.append(measure(probed=True, callbacks=callbacks))
+    baseline_ms = min(baseline_runs)
+    profiled_ms = min(profiled_runs)
 
     # Budgeted per callback rather than as a ratio. The ratio was the wrong shape:
     # the baseline is a few milliseconds for 10,000 bare callbacks, so it measures
