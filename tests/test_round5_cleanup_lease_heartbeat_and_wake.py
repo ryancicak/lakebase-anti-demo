@@ -213,6 +213,50 @@ async def test_cleanup_reconcile_stays_inside_the_lease_heartbeat_wrapper() -> N
     assert "await self._run_holding_lease(holder, do_reconcile)" in source
 
 
+async def test_the_supervised_loop_joining_a_held_cleanup_does_not_cancel_it() -> None:
+    """Only another owner or fence may cancel a held cleanup; this process may not.
+
+    Live on 2026-09-26 (05:02-05:04Z) a 75 s Round 5 towel lost three 30 s
+    cleanup attempts in a row to ``coordinator fence lost during held provider
+    operation`` with no second process anywhere. The manager's ``begin_cleanup``
+    woke the supervised loop, whose ``acquire_coordinator`` advanced the slot
+    revision after the manager's cleanup task had read it, and the task's next
+    heartbeat refused that revision and cancelled the Proxy reconcile. This
+    replays the same order with the real loop cycle.
+    """
+
+    clock = Clock()
+    store = _HeartbeatCountingStore()
+    provider = _PausableReconcileProvider(clock)
+    provider.reconcile_result = True
+    manager, claim_id = await _cleaning_coordinator(
+        clock, store, provider, coordinator_ttl_seconds=0.09
+    )
+
+    cleanup = asyncio.create_task(manager.converge_cleanup(claim_id))
+    await asyncio.wait_for(provider.reconcile_started.wait(), timeout=1)
+    held = await store.read(manager.installation_id)
+    assert held is not None
+
+    loop_cycle = asyncio.create_task(manager.run_one_cycle())
+    await asyncio.sleep(0.25)
+
+    moved = await store.read(manager.installation_id)
+    assert moved is not None and moved.revision > held.revision
+    assert store.heartbeat_calls >= 2
+    assert not cleanup.done(), "this process's own loop cancelled the held cleanup"
+    assert provider.reconcile_cancelled is False
+
+    provider.release_reconcile.set()
+    warmed = await asyncio.wait_for(cleanup, timeout=1)
+    await asyncio.wait_for(loop_cycle, timeout=1)
+
+    assert warmed.state == Round5WarmState.WARMING
+    assert warmed.generation == 2
+    assert provider.reconcile_calls == 1
+    assert provider.reconcile_completed_normally is True
+
+
 # ---------------------------------------------------------------------------
 # 2. ``begin_cleanup``/``finish_cleanup_and_rewarm`` wake the supervised loop.
 # ---------------------------------------------------------------------------

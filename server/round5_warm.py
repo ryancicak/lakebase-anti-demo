@@ -3744,11 +3744,18 @@ class Round5WarmCoordinator:
                         ttl=self._coordinator_ttl,
                     )
                 except (WarmFenceLostError, WarmStoreConflictError):
-                    # Authority moved: abort the held provider operation instead of
-                    # letting it finish and CAS/block under a fence we no longer own.
-                    fence_lost = True
-                    op_task.cancel()
-                    return
+                    try:
+                        rebased = await self._rebase_held_slot(holder[0])
+                    except Exception:
+                        rebased = None
+                    if rebased is None:
+                        # Authority moved: abort the held provider operation instead
+                        # of letting it finish and CAS/block under a fence we no
+                        # longer own.
+                        fence_lost = True
+                        op_task.cancel()
+                        return
+                    holder[0] = rebased
 
         beat_task = asyncio.create_task(beat())
         try:
@@ -3770,6 +3777,44 @@ class Round5WarmCoordinator:
             if not op_task.done():
                 op_task.cancel()
             await asyncio.gather(beat_task, op_task, return_exceptions=True)
+
+    async def _rebase_held_slot(self, held: Round5WarmSlot) -> Round5WarmSlot | None:
+        """Renew a held operation's lease after this process moved the revision.
+
+        The revision is a compare-and-swap token, not authority. This process
+        advances it itself while a held operation runs: the supervised loop's
+        ``acquire_coordinator`` writes at the top of every cycle, and
+        ``begin_cleanup`` wakes that loop right after the manager's cleanup task
+        has read the slot. Reading that as a lost fence cancelled the cleanup at
+        its first beat, and the retries raced the same way (live 2026-09-26: a
+        75 s Round 5 towel lost three 30 s attempts in a row before converging).
+        Authority has moved only when another owner or fence holds the slot, or
+        the slot has left the held state, generation or claim. Then this returns
+        None and the caller cancels the operation exactly as before.
+        """
+
+        held_claim = held.claim.claim_id if held.claim is not None else None
+        for _ in range(3):
+            current = await self.store.read(self.installation_id)
+            if (
+                current is None
+                or current.coordinator_owner != self.process_epoch
+                or current.coordinator_fence != held.coordinator_fence
+                or current.generation != held.generation
+                or current.state != held.state
+                or (current.claim.claim_id if current.claim is not None else None)
+                != held_claim
+            ):
+                return None
+            try:
+                return await self.store.heartbeat_coordinator(
+                    current,
+                    now=self._clock(),
+                    ttl=self._coordinator_ttl,
+                )
+            except (WarmFenceLostError, WarmStoreConflictError):
+                continue
+        return None
 
     async def run_one_cycle(self) -> float:
         now = self._clock()
