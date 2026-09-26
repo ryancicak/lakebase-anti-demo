@@ -243,6 +243,9 @@ def _proxy_stamp_orchestrator():
 
     orchestrator = object.__new__(live.LiveConnectionSpikeSetupOrchestrator)
     orchestrator._monotonic_ns = time.monotonic_ns
+    # Req #7: the reused CreateDBProxy worker slot (created lazily via
+    # _ensure_createproxy_executor; __init__ is bypassed by object.__new__).
+    orchestrator._createproxy_executor = None
     orchestrator.config = SimpleNamespace(
         region="us-west-2",
         expected_account_id="123456789012",
@@ -1117,6 +1120,10 @@ async def test_run_returns_one_bell_and_two_advancing_clocks_without_provider_pr
         async def prepare(self, bout_id, fencing_token) -> None:
             assert bout_id and fencing_token > 0
 
+        async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
+            # Required bell seam (req #6): manager calls it directly before T0.
+            assert bout_id and fencing_token > 0
+
         async def setup(
             self,
             bout_id,
@@ -1252,6 +1259,10 @@ async def test_progress_terminal_inversion_is_ordered_and_late_callback_is_ignor
             assert claim.claim_id == "claim-order"
 
         async def prepare(self, bout_id, fencing_token) -> None:
+            assert bout_id and fencing_token > 0
+
+        async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
+            # Required bell seam (req #6): manager calls it directly before T0.
             assert bout_id and fencing_token > 0
 
         async def setup(
@@ -1468,6 +1479,10 @@ async def test_v3_towel_wins_lock_before_natural_setup_return() -> None:
             assert claim.claim_id == "claim-towel-first"
 
         async def prepare(self, bout_id, fencing_token) -> None:
+            assert bout_id and fencing_token > 0
+
+        async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
+            # Required bell seam (req #6): manager calls it directly before T0.
             assert bout_id and fencing_token > 0
 
         async def setup(

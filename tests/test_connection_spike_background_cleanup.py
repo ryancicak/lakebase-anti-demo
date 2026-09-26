@@ -215,8 +215,12 @@ async def test_cancelled_cleanup_starter_does_not_cancel_exact_cleanup() -> None
         if "bout-cancelled-caller" in orchestrator._cleanup_tasks:
             break
         await asyncio.sleep(0)
-    await orchestrator.wait_for_cleanup_complete("bout-cancelled-caller")
-    assert orchestrator.proxy_delete_accepted("bout-cancelled-caller") is True
+    with pytest.raises(
+        ConnectionSpikeCleanupError,
+        match="durable resource reconstruction",
+    ):
+        await orchestrator.wait_for_cleanup_complete("bout-cancelled-caller")
+    assert orchestrator.proxy_delete_accepted("bout-cancelled-caller") is False
 
 
 @pytest.mark.asyncio

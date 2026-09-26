@@ -1052,6 +1052,46 @@ async def test_a_stopped_pipeline_is_started_without_a_full_refresh_and_waited_f
     assert any("pipeline is running" in notice for notice in notices)
 
 
+async def test_a_restart_requires_stable_synced_table_status_before_handoff() -> None:
+    """A transient healthy projection must not outrun synced-table convergence."""
+
+    class EventuallyConsistentRestart(FakePipelineApi):
+        def __init__(self) -> None:
+            super().__init__(running=False)
+            self.restart_requested = False
+            self.post_restart_synced_reads = 0
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if method == "post" and path.endswith("/updates"):
+                self.restart_requested = True
+            result = super().__call__(
+                profile,
+                method,
+                path,
+                body=body,
+                timeout=timeout,
+            )
+            if (
+                self.restart_requested
+                and method == "get"
+                and "/database/synced_tables/" in path
+            ):
+                self.post_restart_synced_reads += 1
+                # The two provider endpoints briefly disagree in exactly the
+                # shape observed live after an early-towel stop and rapid re-arm.
+                if self.post_restart_synced_reads == 2:
+                    result["data_synchronization_status"].pop(
+                        "continuous_update_status",
+                        None,
+                    )
+            return result
+
+    api = EventuallyConsistentRestart()
+    await _activation(api).ensure_running(lambda status: _record([], status))
+
+    assert api.post_restart_synced_reads == 4
+
+
 async def test_a_repaired_source_rebases_the_same_pipeline_once() -> None:
     api = FakePipelineApi(running=False)
     activation = _activation(api)

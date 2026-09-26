@@ -137,6 +137,30 @@ ROUND4_BASELINE_PROOF_NONCE = "round4-baseline"
 ROUND5_NATIVE_ROLE = "anti_demo_burst"
 ROUND5_PROBE_IDENTITY = "public.anti_demo_probe"
 ROUND5_JOURNAL_TABLE = "anti_demo_coordination.round5_creation_journal"
+#: Every ``lifecycle_state`` the Round 5 creation journal may hold. Single source
+#: of truth for the durable table's inline CHECK constraint below. It MUST stay in
+#: sync with :class:`server.connection_spike_journal.LifecycleState`; a value in
+#: that enum but not here (or vice versa) is rejected by PostgreSQL at INSERT time
+#: -- the 2026-09-23 ``pending_launch`` arm regression, where code emitted a state
+#: the live CHECK forbade. Approach A emits only these already-allowed states, so
+#: no schema migration is ever required. The schema<->enum contract test and the
+#: startup readiness guard both pin this equality.
+ROUND5_JOURNAL_LIFECYCLE_STATES: tuple[str, ...] = (
+    "create_intent",
+    "created",
+    "create_failed",
+    "delete_intent",
+    "deleted",
+    "delete_failed",
+    "refused",
+)
+
+
+def _round5_journal_lifecycle_check_predicate() -> str:
+    """The ``lifecycle_state IN (...)`` predicate, from the single source list."""
+
+    states = ", ".join(f"'{state}'" for state in ROUND5_JOURNAL_LIFECYCLE_STATES)
+    return f"lifecycle_state IN ({states})"
 ROUND5_LEGACY_PARTIAL_ADDRESSES = {
     "aws_db_parameter_group.rds_round5",
     "aws_secretsmanager_secret.round5_lakebase_credentials",
@@ -8626,10 +8650,9 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
                         deterministic_name text,
                         client_token text,
                         provider_id text,
-                        lifecycle_state text NOT NULL CHECK (lifecycle_state IN (
-                            'create_intent', 'created', 'create_failed',
-                            'delete_intent', 'deleted', 'delete_failed', 'refused'
-                        )),
+                        lifecycle_state text NOT NULL CHECK (
+                            {_round5_journal_lifecycle_check_predicate()}
+                        ),
                         metadata jsonb NOT NULL CHECK (jsonb_typeof(metadata) = 'object'),
                         runtime_seal_sha256 char(64) NOT NULL CHECK (
                             runtime_seal_sha256 ~ '^[0-9a-f]{{64}}$'

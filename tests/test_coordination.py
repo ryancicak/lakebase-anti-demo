@@ -580,6 +580,81 @@ async def test_the_lakebase_refusal_reads_the_countdown_from_the_database_clock(
     assert "clock_timestamp() FROM anti_demo_coordination.ring_lease" in diagnosis_statement
 
 
+@pytest.mark.parametrize(
+    ("artifact_token", "prior_session"),
+    (
+        (7, "stale-bout"),
+        (43, None),
+        (99, "different-stale-bout"),
+    ),
+)
+async def test_cleanup_reclaim_does_not_compare_independent_fence_domains(
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_token: int,
+    prior_session: str | None,
+) -> None:
+    monkeypatch.delenv("ANTI_DEMO_LEASE_HEARTBEAT_SECONDS", raising=False)
+    row_time = datetime(2026, 8, 20, 19, 0, tzinfo=UTC)
+    cursor = _FakeCursor(
+        [
+            (
+                "00000000-0000-0000-0000-000000000002",
+                artifact_token + 1,
+                "session-a",
+                "round5-cleanup-recovery",
+                "Round 5 Cleanup Recovery",
+                None,
+                "round5_cleanup",
+                SessionState.TOWELLED.value,
+                "survive_connection_spike",
+                "Survive a connection spike",
+                "aurora_serverless_v2",
+                "Aurora Serverless v2",
+                row_time,
+                row_time,
+                row_time + timedelta(minutes=65),
+            )
+        ]
+    )
+    store = LakebaseBoutLeaseStore(
+        endpoint_name="coordination-endpoint",
+        database="anti_demo",
+        host="coordination.example",
+        user="service-principal",
+        connector=lambda **_kwargs: _ready(_FakeConnection(cursor)),
+        workspace_client=SimpleNamespace(
+            postgres=SimpleNamespace(
+                generate_database_credential=lambda _name: SimpleNamespace(
+                    token="coordination-token"
+                )
+            )
+        ),
+        ring_key=ROUND5_RING_KEY,
+    )
+
+    lease = await store.reclaim_expired_cleanup(
+        session_id="session-a",
+        # This is the warm coordinator's bout fence.  The returned row's fence
+        # is the independent artifact-ring counter and is intentionally lower.
+        expected_previous_token=43,
+        ttl=timedelta(minutes=65),
+    )
+
+    assert lease.session_id == "session-a"
+    assert lease.fencing_token == artifact_token + 1
+    statement = cursor.statements[0]
+    # The inactive pre-CAS row may be released (null session) or retain stale
+    # metadata from another bout.  Neither value is an ownership predicate:
+    # durable warm authority is checked around this artifact-ring CAS.
+    assert prior_session is None or prior_session != lease.session_id
+    assert "session_id = %s" in statement
+    assert "fencing_token >= %s" not in statement
+    assert "(session_id = %s OR lease_id IS NULL)" not in statement
+    assert "(lease_id IS NULL OR expires_at <= clock_timestamp())" in statement
+    assert "owner_subject = 'round5-cleanup-recovery'" in statement
+    assert "fencing_token = fencing_token + 1" in statement
+
+
 def test_no_lease_store_exposes_a_force_or_steal_path() -> None:
     for store in (InMemoryBoutLeaseStore(), InMemoryBoutLeaseStore(ring_key=ROUND5_RING_KEY)):
         forced = [

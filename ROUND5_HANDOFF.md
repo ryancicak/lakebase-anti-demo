@@ -335,3 +335,310 @@ claims.
 - **Per-round ring isolation requires manifest v7.** `server/lifecycle.py` pins the version to 5
   while `round6` is unsealed. This installation is now v7 (Round 6 sealed via `antidemo resume`), so
   one bout no longer locks all six rounds.
+
+---
+
+## Addendum 2026-09-25: idle keep-alive fixed; POST-BOUT REWARM storm still open
+
+Deployed child `3a0d483` (chain: e3a3fd0 -> 220810b -> 3a0d483; over 094f16d).
+Isolated full suite: exactly the 8 baseline failures, 0 new (2775 passed).
+
+### What is FIXED and PROVEN live
+- Idle keep-alive flicker class: tri-state resident liveness (STALE/ABSENT -> RetryableWarmError
+  strike; only IDENTITY_CHANGED demotes), claim-aware outbox soft-degrade + duration window +
+  backoff, lead-time credential refresh before the true `launch_margin_cliff()`, `_claimable` no
+  longer gated on `renew_by`, cleanup-overlay no-latch-on-read-exception, outbox scan != delivery
+  failure, 15s heartbeat window, Round-5 bout_status decoupled from global readiness, and public
+  `RoundFiveStartStatus.revision` / `.last_error_code` (B1-B5 mutation tests).
+- LIVE PROOF: fresh-warm idle soak = 150 samples / 7 min, ZERO flickers, `can_start=true` steady.
+
+### What is STILL BROKEN (distinct bug, NOT the idle-decay class)
+- LIVE: a post-bout rewarm (gen N+1 after a towel) storms: 149/149 idle samples flickered
+  (warm_state warming<->ready, can_start=False, last_error=None, revision climbing). A restart/
+  fresh warm recovers (currently READY gen29).
+
+### Root cause (narrowed, with pointers)
+The resident runner rejects a PRELOAD while it still has an in-flight job:
+`runner/connection_spike_runner.py:4582  if kind == "preload": if active: raise resident_job_active`
+(`active` is the dict of running jobs; entries added at ~4662, popped at ~4235/4481; a CANCEL sets
+the cancel event at ~4691). `warm()` establishes the resident for the new token via
+`stage_resident_generation` -> `transport.preload` + `wait_agent_ready`
+(`server/connection_spike_live.py:5437`). But the rewarm runs on a FRESH engine
+(`LiveRound5WarmProvider._factory_engine`), and only the ADOPTED engine (used during cleanup) holds
+the binding needed to cancel the OLD resident job (`cancel_resident` at
+`server/connection_spike_live.py:5661`, reached via `_cancel_resident_lane`:8278 /
+`cancel_local_round5_run_tasks`:8232). If the old resident job is not fully drained before the
+fresh-engine rewarm PRELOADs (or the durable resident never clears `active`), every rewarm PRELOAD
+is rejected -> the resident never emits a CURRENT heartbeat for the churning new
+`warm_attempt_token` -> `validate_ready` sees STALE/ABSENT -> strike -> freshness_lost -> new token
+-> perpetual churn. A fresh PROCESS recovers because it does a full clean PRELOAD.
+
+### Recommended fix (own immutable child + full re-cert + >=60min post-chaos soak)
+Enforce the invariant: a rewarm attempt must (a) ensure the prior resident job is durably
+CANCELLED/drained (not `active`) and (b) re-PRELOAD + wait_agent_ready on BOTH lanes for its
+current `warm_attempt_token` BEFORE publish_ready -- without minting a fresh token every WARMING
+cycle faster than the resident can attest (stop the token-churn race), without reusing a superseded
+token where anti-replay needs uniqueness, and without leaving a duplicate resident process/pool.
+Likely touch points: the towel/cleanup must guarantee resident CANCEL settles before
+finish_cleanup_and_rewarm; and/or the rewarm's prepare must cancel-then-preload the durable
+resident. Add real provider/engine/runner-boundary mutation tests for the A->B->C generation
+sequence + restart path, then redeploy and re-run the full release gates.
+
+---
+
+## Addendum 2026-09-25 (later): attested IDENTITY-change loop fixed (child over 399ba35)
+
+Child on `agent/round5-rewarm-token-lifecycle` over `399ba35` (which fixed the post-bout rewarm
+storm above: bounded token mint + fresh-PRELOAD invariant). This child fixes a DISTINCT defect.
+
+### The distinct defect (observed during a concurrent R2 `make_schema_change_safely` load)
+Round 5 sat idle READY while the shared single-bout resident RESPAWNED (a genuinely NEW process
+boot id / pid) under the other round's DB contention. `validate_ready` then read an ATTESTED
+`IDENTITY_CHANGED` (not a transient STALE/ABSENT). The old handler did a bare `freshness_lost` and
+re-warmed -- but over the SAME stale provider engines, and `publish_ready` cleared `last_error` at
+the transient READY. So the coordinator looped **identity-refresh <-> rewarming** (public
+`start_stage`), generation fixed, `err=None`, ring un-claimable, for ~20 min; only a full process
+restart minted one clean PRELOAD and recovered.
+
+### Root cause (in-repo, testable -- no live AWS needed)
+On an attested identity change the READY branch (`server/round5_warm.py`) only cleared the in-memory
+capsule + `freshness_lost`. It did NOT (a) discard the provider's stale engines/receipts/preparation
+(so the rewarm re-preloaded the changed identity), (b) keep the recovery observable (the transient
+`publish_ready` reset `_local_readiness_error_code` to None -> `err=None`), or (c) bound the churn
+(each recovery reached `publish_ready`, which resets the token + `attempt_count`, defeating the
+399ba35 token bound and the `MAX_TRANSIENT_WARM_ATTEMPTS` escalation -> an unbounded token/PRELOAD
+flood that never blocked).
+
+### The fix (coordinator + provider; `server/round5_warm.py`, `server/connection_spike_live.py`)
+`Round5WarmCoordinator._reestablish_identity` now drives a CLEAN, FENCED, BOUNDED, OBSERVABLE
+re-establishment on an attested `IDENTITY_CHANGED`:
+- discards the stale capsule and calls `provider.reestablish()` -> `LiveRound5WarmProvider` discards
+  its `_engines`/`_receipts` and forgets each adapter's attested identity, so the next `prepare`
+  builds fresh engines and issues a genuinely fresh PRELOAD (the superseding PRELOAD is the retire
+  for a claim-less resident-generation binding -- the control protocol forbids CANCEL on it);
+- records a DURABLE named recovery marker (`runner_identity_reestablishing`) that the transient
+  `publish_ready` does NOT clear, so the ring stays un-claimable and `public_status` names WHY across
+  the whole recovery, lifted ONLY by a CURRENT probe (proven-stable identity);
+- mints ONE bounded in-flight token per episode (399ba35 reuse) and requires fresh agent_ready
+  identities on BOTH lanes before READY (`_require_fresh_preload`); anti-replay and the single
+  resident owner are preserved (no duplicate resident process);
+- BOUNDS the churn: after `MAX_IDENTITY_REESTABLISH_ATTEMPTS` (5) attested changes without a stable
+  CURRENT, escalates to the named, self-verifiable block `runner_identity_unstable` (rechecked on a
+  bounded interval; self-recovers once the resident settles) instead of an invisible flood.
+
+### Tests (mutation-sensitive; real control store + transport + resident_liveness)
+`tests/test_round5_identity_reestablish_seam.py`: one-lane change -> one clean rewarm to a fresh
+token whose receipts capture the NEW identity -> validate CURRENT -> claimable (current-generation
+semantics, supersede proof); observability across the transient READY (named error, un-claimable,
+`start_stage=identity-refresh`); persistent churn -> bounded distinct tokens + named
+`runner_identity_unstable` block; churn-then-stabilize self-recovers WITHOUT a restart; repeated
+distinct episodes mint distinct tokens (anti-replay); and a provider-level discard+retire check.
+Verified failing against the pre-fix routing, passing with the fix.
+
+Isolated full suite: **8 failed, 2790 passed, 2 skipped** -- exactly the 8 pre-existing baseline
+failures (test_no_live_identifiers_committed, test_publish_runbook_is_ignored_and_present, 2x
+test_receipts cleanup-recovery, 4x test_round5_chaos_stabilization absence-proof), 0 new. The 6 new
+tests account for the +6 over 399ba35's 2784.
+
+### Remaining LIVE blocker (NOT deployed / not live-proven)
+The installation expired 2026-09-23 and sandbox AWS SSO is unavailable, so a live bout / resident
+cannot run. The identity-change recovery therefore has NOT been reproduced or soaked live (that needs
+a real resident respawn storm under a concurrent-round DB load on a valid installation). Proof here
+is the mutation suite at the real control-plane seam. Next step once infra returns: redeploy the
+child, reproduce the R2-load identity churn, and run a >=60 min post-chaos idle soak asserting
+`start_stage` converges to `ready` with `last_error_code=None` (and, under sustained churn,
+`runner_identity_unstable` surfaced + self-recovery once load subsides).
+
+---
+
+## Addendum 2026-09-25 (later): LIVE-reproduced post-bout capsule storm; bounded (grandchild over 63e6698)
+
+The identity-reestablish child `63e6698` (over 399ba35) was deployed live and the towel->READY
+A/B was run for the first time on real infra. It STILL STORMED -- a DISTINCT defect from the
+attested identity-change class 63e6698 fixed.
+
+### The distinct defect (LIVE-reproduced, then diagnosed to root)
+Real bout on `63e6698`: Lakebase verified 13ms / held 10,000, AWS toweled @ t+71s. Cleanup
+converged (gen 31->32). The post-bout rewarm then stormed: ~5 min, generation FROZEN at 32,
+`attempt` 1->20+, `start_stage` oscillating `identity-refresh <-> rewarming` (28+ flips),
+`round5_warm_last_error_code=None`, `ring_ready`/`can_start` never true. A process restart
+recovered; the durable loop did not self-heal. Evidence:
+`~/Documents/round5-chaos-evidence-*/STORM_RECURRENCE_63e6698.md` + `soak-63e6698.jsonl`.
+
+### Root cause (in-repo, `server/round5_warm.py`)
+The READY keep-alive tears the slot down when the launch capsule no longer belongs
+(`_capsule_belongs` False -> `freshness_lost("launch_capsule_missing")`). That rewarm SUCCEEDS,
+so the `MAX_TRANSIENT_WARM_ATTEMPTS` bound (checked ONLY in the rewarm ERROR path) never fires,
+and each transient `publish_ready` clears `last_error` -> an invisible, UNBOUNDED
+`launch_capsule_missing` flood. Unlike the identity path, this tear-down had NO counter and NO
+named block, and `_capsule_belongs` is NOT an attested identity change (boot_ids stable), so the
+`runner_identity_unstable` bound never engaged. (Note a latent lineage gap the repro exploits:
+`publish_ready` validates capsule generation/fence/token but NOT `broker_epoch`, while
+`_capsule_belongs`/`_capsule_current` DO -- so a drifted-`broker_epoch` capsule publishes READY
+yet fails the next probe.)
+
+### The fix (grandchild over 63e6698; `server/round5_warm.py`)
+Mirror the identity-reestablish pattern for the capsule path: a new `_reestablish_capsule` bounds
++ names + surfaces the churn.
+- New `_capsule_missing_failures` counter; the READY branch calls `_reestablish_capsule` instead
+  of a bare `freshness_lost`.
+- A DURABLE marker `warm_capsule_reestablishing` that the transient `publish_ready` does NOT
+  clear (guarded on `_capsule_missing_failures == 0`), so the churn is OBSERVABLE across the
+  transient READY (no more `err=None`).
+- After `MAX_CAPSULE_REESTABLISH_ATTEMPTS` (5) consecutive non-belonging probes, escalate to the
+  named, SELF-VERIFIABLE block `warm_capsule_unrecoverable` (in `SELF_VERIFIABLE_BLOCK_CODES`,
+  rechecked every 60s, self-recovers the instant a rewarm's capsule belongs).
+- The budget resets ONLY when the capsule actually belongs (READY branch) or a CURRENT probe
+  passes -- never at the transient `publish_ready`.
+
+### Tests (mutation-sensitive; real coordinator + transport + control store)
+`tests/test_round5_capsule_reestablish_seam.py`: persistent non-belonging capsule ->
+bounded/named `warm_capsule_unrecoverable` block (self-verifiable, not terminal); observable
+named error across the transient READY; drift-clears -> self-recovers to claimable READY without
+a restart + budget reset. Verified FAILING on `63e6698` (unbounded flood, err=None, never blocks)
+and PASSING on the grandchild.
+
+Isolated full suite: **8 failed, 2793 passed, 2 skipped** -- exactly the 8 pre-existing baseline
+failures, 0 new; the 3 new tests are the +3 over 63e6698's 2790.
+
+---
+
+## Addendum 2026-09-25 (later): idle refresh broke capsule-belonging (great-grandchild over 82628a0)
+
+`82628a0` was deployed and passed the towel->READY A/B (cleanup 32->33, converged in one rewarm,
+0 flips) and held a clean idle soak. At ~50 min the credential/receipt REFRESH horizon fired and
+Round 5 fell into the launch_capsule_missing churn again -- but this time `82628a0` did its job:
+the churn was OBSERVABLE and BOUNDED (`warm_capsule_reestablishing` -> named
+`warm_capsule_unrecoverable` self-verifiable block), not the old invisible flood. Still a ~4-min
+idle Temporarily-Unavailable window, so NOT zero-idle-TU. That exposed the true ROOT.
+
+### Root cause (in-repo, `server/connection_spike_live.py`)
+`LiveRound5WarmProvider.refresh_preparation` / `refresh_capsule` minted a FRESH RANDOM
+`broker_epoch` (`broker-{uuid4()}`) on every credential/receipt refresh. `broker_epoch` is a
+per-process identity used ONLY by the capsule-belonging checks (`_capsule_belongs`/
+`_capsule_current`) -- it has ZERO references on the resident control wire (`round5_control.py`).
+The coordinator stamps every REWARM's capsule with its STABLE `self.broker_epoch`. Once a refresh
+rotated the slot's broker_epoch to a random value (`update_capsule_receipt` validates
+generation/fence/token but SYNCS broker_epoch from the capsule), the next freshness_lost->rewarm
+published a capsule whose broker_epoch no longer matched the slot -> `_capsule_belongs` False ->
+`launch_capsule_missing` -> the ~45-min idle rewarm storm.
+
+### The fix (great-grandchild over 82628a0; `server/connection_spike_live.py`)
+`refresh_preparation` and `refresh_capsule` now pass `broker_epoch=slot.broker_epoch` (preserve),
+never a fresh random one. Refresh and rewarm therefore produce belonging capsules
+interchangeably; the idle refresh no longer triggers the churn. (82628a0's bound remains as
+defense-in-depth for any other non-belonging cause.)
+
+### Tests
+`tests/test_round5_capsule_refresh_broker_epoch.py` (2): captures the broker_epoch the live
+refresh hands the capsule builders and asserts it is `slot.broker_epoch`. FAILS on 82628a0
+(random `broker-<uuid4>`), PASSES on the fix. Isolated full suite: **8 failed, 2795 passed,
+2 skipped** -- the 8 baseline, 0 new (+5 over 63e6698: 3 capsule-reestablish + 2 broker_epoch).
+
+### LIVE CERTIFICATION GREEN (deployed runtime SHA = c07966d)
+All six gates passed live on the deployed `c07966d` (this note is documentation-only; the
+certified/deployed runtime is `c07966d`):
+1. Deploy exact SHA + source parity + app ready (`./bootstrap.sh --deploy-only`, not git-pushed).
+2. Towel A/B: bout + towel@~75s -> cleanup gen N->N+1 -> rewarm cleaning->ready in ONE step, 0 flips
+   (proven on 82628a0 mid-soak and c07966d post-soak).
+3. >=60 min idle soak, ZERO idle TU: **61.7 min, 1335 samples, 0 flickers**, all last_error=None /
+   HTTP 200, including a clean crossing of the ~46-min credential/receipt REFRESH horizon that
+   flickered on 82628a0.
+4. Concurrent serial R1/R2 during soak: R5 stayed ring_ready/can_start; no debt.
+5. Post-soak R5 bout + cleanup -> READY N+1 (gen 34), no capsule/identity storm.
+Final state: status ready; R5 gen 34 ring_ready=true err=None; no cleanup/stop debt; all six rounds
+can_start=true. Evidence: ~/Documents/round5-chaos-evidence-20260925T090739Z/CERT_PROGRESS.md +
+soak-c07966d.jsonl.
+
+---
+
+## Addendum 2026-09-25: all-round serial live chaos pass green
+
+One additional paid pass ran R1, R2, R3, R4, R6, then R5 strictly serially. Every active and
+cleanup poll asserted the other five rounds remained independently `ready` / `can_start=true`.
+R5 used the sealed native credential, `-pooler`, `verify-full` path; Lakebase verified exactly
+10,000 held clients in 14,476.55 ms with zero errors, then AWS was toweled at 73.45 s. Cleanup
+converged generation 35 -> 36 in the same app process, with no capsule/identity flip or error.
+A five-minute post-chaos watch recorded 105/105 clean samples at generation 36/stage READY.
+Final state: all six startable; no active bout; R4/R5 debt false; no DB Proxy, bout-tagged SG,
+or `adsc-*`/`adr-*` RDS orphan found. Full evidence and confidence limits:
+`~/Documents/all-rounds-chaos-evidence-20260925T131000Z/REPORT.md`.
+
+---
+
+## Addendum 2026-09-25: restart-safe Round 5 cleanup
+
+The gen-43 parallel-chaos failure exposed a separate cleanup-restart defect: the
+durable warm slot remained `CLEANING`, but a replacement process rebuilt its
+engine with the expired bout-ring fence. Every retry failed before
+`DeleteDBProxy`, leaving the deterministic bout Proxy available and the public
+error empty.
+
+The repair makes the durable warm coordinator the sole cross-process cleanup
+mutator. A reconstructed engine now derives exact Proxy identity and ownership
+tags from the durable claim (bout id + fence) and sealed manifest, uses the
+current warm-coordinator authority, and inspects/deletes the exact tagged Proxy
+even when the creation journal is empty. Startup readiness observes this debt
+without becoming a second janitor. Missing process-local cleanup state is no
+longer treated as success.
+
+Cleanup failures remain `CLEANING`, retain the claim, and persist a named error
+plus bounded retry time. The fight-card overlay carries that durable error.
+Non-retryable startup reconstruction errors continue retrying rather than
+entering `given_up`; fence loss stays in `CLEANING` for takeover and emits an
+explicit takeover diagnostic. Duplicate `DeleteDBProxy` is accepted only when
+the exact ARN is already `DELETING`. Child target/target-group mutations first
+verify the exact journaled parent ARN and tags, preventing stale cleanup from
+touching a replacement Proxy. Static security groups and R4/R6 are outside the
+reconstructed deletion scope.
+
+Mutation tests for F1-F4 fail 4/4 on parent `ac1e4e9` and pass on the repair.
+The warm owner also CAS-reclaims the exact expired artifact-journal fence for
+90 seconds, renews it during Proxy polling, and releases it only after exact
+absence. It never adopts an active predecessor lease; a crash becomes
+reclaimable within 90 seconds, so this nested journal fence does not create a
+second mutation owner.
+
+The isolated suite result before deployment is **8 failed, 2820 passed,
+2 skipped, 1 deselected**: exactly the eight known baseline failures and zero
+new failures. Final live recovery and towel/restart evidence is recorded in the
+corresponding `~/Documents/round5-cleanup-recovery-evidence-20260925.md` note.
+
+---
+
+## Addendum 2026-09-25: Prepare projection and atomic rollback
+
+Two consecutive user Prepare attempts failed with `Round 5 ring fence is no
+longer current`. The manager had already committed the warm claim and projected
+`CHECKING`, so the fight card falsely showed a bout. Its generic no-bell failure
+path then converted a coordination-only refusal into durable `CLEANING` and a
+generation rewarm, causing the observed bout -> cleanup -> temporarily
+unavailable flap despite zero AWS or runner starts.
+
+The start-state proof now runs synchronously after the atomic
+READY+main-ring+artifact-ring claim but before public `CHECKING`. It uses the
+same warm capsule, claim, bout id, and artifact fencing token that ARM will use.
+An unstarted refusal atomically returns `CLAIMED -> READY` and clears both exact
+ring rows in the same Lakebase transaction. Once resident staging starts, the
+existing CLEANING authority remains mandatory; staged failures never use the
+unstarted shortcut.
+
+Mutation coverage repeats the failed Prepare twice and proves: the session
+remains DRAFT, no active bout projects, `can_start` remains true, both leases
+are absent, the same generation remains READY, and AWS/runner/cleanup-start
+counters remain zero. Cleanup transition coverage proves CLEANING -> WARMING
+never exposes fake READY and a successful bounded next cycle reaches READY
+generation N+1 with no error or oscillation.
+
+The live observation at 20:46:57Z was not another failed-Prepare ghost. A real
+bout (`916063a6032d4a1fb56a03df9e0b5ebd`) rang at 20:46:56Z and toweled at
+20:46:57Z. The card truthfully moved through cleanup and a short generation
+49 -> 50 rewarm; generation 50 published READY at 20:47:03.439873Z. By
+20:48:27Z repeated GETs were stable READY / `can_start=true`; at 20:49:00Z:
+revision 72291, `cleanup_owed=false`, `ring_ready=true`, `last_error=null`.
+AWS listed zero `ibb*` DB Proxies. There was no capsule-missing/identity-refresh
+storm, `given_up`, or unnamed cleanup failure.
+
+The locked isolated suite after this repair is **8 failed, 2826 passed,
+2 skipped, 1 deselected**: the same eight known baseline failures and zero new
+failures. Ruff and `git diff --check` pass.

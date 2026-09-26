@@ -101,6 +101,7 @@ from .models import (
     RoundFiveSetupLaneSnapshot,
     RoundFiveSetupSnapshot,
     RoundFiveSetupState,
+    RoundFiveStartStatus,
     RoundId,
     RunEvent,
     SessionCreate,
@@ -137,6 +138,8 @@ from .round5_warm import (
     Round5WarmCoordinator,
     Round5WarmSlot,
     Round5WarmState,
+    WarmClaimUnavailableError,
+    WarmStoreConflictError,
 )
 from .round_availability import (
     GRANT_REFUSAL_HEADLINE,
@@ -256,6 +259,28 @@ def _redacted_link(error: BaseException) -> str:
     operation = str(getattr(error, "operation_name", "") or "")
     if operation and operation.replace("_", "").isalnum():
         value = f"{value}@{operation}"
+    # Attribute names are not provenance. Provider exceptions can carry fields
+    # named stage/reason_code/lane whose values are credentials or identifiers;
+    # even alphanumeric values are not safe merely because they fit a regex.
+    # Import lazily to keep manager's module graph independent of the live AWS
+    # implementation during startup while still requiring the trusted type.
+    from .connection_spike_live import ConnectionSpikeCleanupError
+
+    if isinstance(error, ConnectionSpikeCleanupError):
+        cleanup_fields = (
+            ("stage", error.stage),
+            ("code", error.reason_code),
+            ("lane", error.lane),
+        )
+        safe_cleanup_fields = [
+            f"{label}={field}"
+            for label, field in cleanup_fields
+            if isinstance(field, str)
+            and field
+            and field.replace("_", "").replace("-", "").isalnum()
+        ]
+        if safe_cleanup_fields:
+            value = f"{value}[{','.join(safe_cleanup_fields)}]"
     return value
 
 
@@ -491,6 +516,12 @@ _ROUND_FIVE_CONCURRENCY = 10_000
 _ROUND_FIVE_WITNESS_CLIENTS = 64
 _ROUND_FIVE_RUNNER = "Python 3.12 event-driven TLS/native-password"
 _ROUND_FIVE_CLEANUP_PENDING = "Round 5 cleanup is settling automatically · Ring remains protected"
+
+#: Rounds whose towel cleanup deletes isolated AWS environments and so can race an
+#: in-flight create; their cleanup retries automatically before it reports FAILED.
+_TOWEL_CLEANUP_AUTO_RETRY_ROUNDS = frozenset(
+    {RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}
+)
 
 #: The two honest accounts of a control action aimed at a fight card this process
 #: does not have. Both lead with what did *not* happen, because the operator's
@@ -851,6 +882,11 @@ class RunManager:
         self._round5_readiness_check = round5_readiness_check or (lambda: None)
         self._round5_readiness_status = round5_readiness_status
         self._round5_prearm_guard = round5_prearm_guard
+        # Refreshed by the same durable cleanup read used by bout status,
+        # catalog admission, and ARM. A positive observation remains a
+        # synchronous subtraction from ring_ready until a later durable read
+        # proves the cleanup fence gone.
+        self._round5_durable_cleanup_blocked = False
         # Rounds Databricks has refused on authorization in this process. Kept
         # here rather than on the session because the point of keeping it is to
         # stop the *next* fight card being offered, and the session that was
@@ -942,10 +978,28 @@ class RunManager:
         self._shutdown_cleanup_timeout = float(
             os.environ.get("ANTI_DEMO_SHUTDOWN_CLEANUP_TIMEOUT_SECONDS", "30")
         )
+        # Bounded, fail-safe budget for cancelling local Round 5 lane bursts/run
+        # tasks BEFORE begin_cleanup makes the slot CLEANING visible. If local
+        # cancellation stalls past this, we still enter durable CLEANING so the
+        # coordinator fence/authority is preserved.
+        self._round5_local_cancel_timeout = float(
+            os.environ.get("ANTI_DEMO_ROUND5_LOCAL_CANCEL_TIMEOUT_SECONDS", "5")
+        )
         self._cleanup_retry_initial = float(
             os.environ.get("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "1")
         )
         self._cleanup_retry_max = float(os.environ.get("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "30"))
+        # Rounds 2 and 3 delete isolated AWS environments on a towel, and a towel
+        # that lands mid-create races the lane's own teardown: the first reset can
+        # find a clone whose ownership is not provable yet and refuse it. That is a
+        # cleanup still settling, not a failure, so it retries on its own (with the
+        # backoff above) inside this window before the towel reports FAILED and
+        # asks for Retry. Live 2026-09-26: a 78 s Round 2 towel sat in cleanup for
+        # ~20 minutes until its lease expired, although one retry would have passed.
+        self._towel_cleanup_retry_window = max(
+            0.0,
+            float(os.environ.get("ANTI_DEMO_TOWEL_CLEANUP_RETRY_WINDOW_SECONDS", "600")),
+        )
         # How long a towelled run task gets to notice the cooperative stop
         # before it is cancelled outright. Rounds 1 and 3 have no explicit
         # cancel -- they stop by observing a control -- so a task parked in a
@@ -1031,17 +1085,297 @@ class RunManager:
 
     @property
     def round5_ring_ready(self) -> bool:
+        # A local artifact lease is a third, synchronous gate. It closes the
+        # health/catalog race where the warm cache still said READY for one beat
+        # after cleanup authority moved to ``round5_cleanup``.
+        #
+        # Only an unexpired lease can close it. A lease past its expiry is no
+        # longer authority anywhere -- the durable ring would admit the next
+        # atomic claim -- so a record that kept one after a refused Prepare must
+        # not hold the fight card at UNAVAILABLE until the process restarts
+        # (observed live for 11 minutes on 2026-09-25). The durable claim still
+        # decides who may arm; this gate only stops reporting a stale veto.
+        now = datetime.now(UTC)
+        if self._round5_durable_cleanup_blocked or any(
+            record.round5_lease is not None and record.round5_lease.expires_at > now
+            for record in self._records.values()
+            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+        ):
+            return False
         return bool(
             self._round5_warm_coordinator is not None
             and self._round5_warm_coordinator.ring_ready
         )
 
     @property
+    def round5_cleanup_owed(self) -> bool:
+        """Whether this process holds or is retrying Round 5 cleanup work."""
+
+        return any(
+            record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and (
+                (
+                    record.snapshot.round5_setup is not None
+                    and record.snapshot.round5_setup.cleanup_retryable
+                )
+                or (
+                    record.round5_lease is not None
+                    and record.round5_lease.phase == "round5_cleanup"
+                )
+            )
+            for record in self._records.values()
+        )
+
+    @property
     def round5_warm_status(self) -> Mapping[str, object] | None:
+        coordinator = self._round5_warm_coordinator
+        if coordinator is None:
+            return None
+        status = dict(coordinator.public_status_cached())
+        cleanup_records = tuple(
+            record
+            for record in self._records.values()
+            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and (
+                (
+                    record.round5_lease is not None
+                    and record.round5_lease.phase == "round5_cleanup"
+                )
+                or (
+                    record.snapshot.round5_setup is not None
+                    and record.snapshot.round5_setup.cleanup_retryable
+                )
+            )
+        )
+        if cleanup_records:
+            recovery_scheduled = any(
+                (
+                    record.connection_spike_cleanup_task is not None
+                    and not record.connection_spike_cleanup_task.done()
+                )
+                or (
+                    record.connection_spike_cleanup_retry_task is not None
+                    and not record.connection_spike_cleanup_retry_task.done()
+                )
+                for record in cleanup_records
+            )
+            prebell_resident_cleanup = any(
+                self._round5_prebell_cleanup_required(record)
+                for record in cleanup_records
+            )
+            status.update(
+                {
+                    "round5_warm_state": "cleaning",
+                    "round5_start_stage": "cleaning",
+                    "round5_ring_ready": False,
+                    "round5_cleanup_owed": True,
+                    "round5_cleanup_recovery_scheduled": recovery_scheduled,
+                    "round5_cleanup_scope": (
+                        "prebell_resident"
+                        if prebell_resident_cleanup
+                        else "postbell_resources"
+                    ),
+                }
+            )
+        return status
+
+    @staticmethod
+    def _round5_prebell_cleanup_required(record: SessionRecord) -> bool:
+        """Whether the warm claim never crossed the bell transaction.
+
+        Derived from durable bell/session truth, NOT solely a cached warm slot: a
+        durable bell acceptance records ``record.round5_bell_context`` (and the
+        RUNNING session state), which is authoritative even if the cached
+        ``round5_warm_slot`` still reads CLAIMED/null-bell because the local record
+        was not yet refreshed from the RUNNING slot. Misreading a post-bell abort
+        as pre-bell would skip the mandatory post-setup teardown
+        (cancel_setup_and_settle / journal / provider absence) for a bout that had
+        already created a per-bout Proxy intent and setup resources.
+        """
+
+        if getattr(record, "round5_bell_context", None) is not None:
+            return False
+        slot = record.round5_warm_slot
+        if slot is not None and getattr(slot, "bell_id", None) is not None:
+            return False
+        return bool(
+            slot is not None
+            and slot.claim is not None
+            and hasattr(slot, "bell_id")
+            and hasattr(slot, "bell_at_utc")
+            and slot.bell_id is None
+            and slot.bell_at_utc is None
+        )
+
+    async def round5_durable_cleanup_overlay(
+        self,
+        lease: BoutLease | None = None,
+    ) -> Mapping[str, object] | None:
+        """Read the durable cleanup fence and warm claim for health surfaces."""
+
+        if lease is None:
+            try:
+                lease = await self._round5_cleanup_store().current()
+            except Exception:
+                # A SINGLE failed read of the cleanup-fence lease (a transient store
+                # blip) must NOT latch ``_round5_durable_cleanup_blocked`` and paint the
+                # idle fight card "Temporarily Unavailable" for ~30s across board polls
+                # while the warm slot is still READY. The warm coordinator's own
+                # ``cleanup_owed``/``claim`` fields are the authority for whether a
+                # cleanup is actually owed; a read blip here is UNKNOWN, not blocked.
+                # Return no overlay (do not withdraw READY) and leave the latch as-is so
+                # a genuine cleanup lease (read successfully below) still surfaces.
+                return None
+        if lease is None or lease.phase != "round5_cleanup":
+            self._round5_durable_cleanup_blocked = False
+            return None
+        self._round5_durable_cleanup_blocked = True
+
+        slot = None
+        coordinator = self._round5_warm_coordinator
+        store = getattr(coordinator, "store", None)
+        read = getattr(store, "read", None)
+        installation_id = getattr(coordinator, "installation_id", None)
+        if callable(read) and isinstance(installation_id, str):
+            try:
+                slot = await read(installation_id)
+            except Exception:
+                slot = None
+        prebell = bool(
+            slot is not None
+            and slot.claim is not None
+            and slot.claim.session_id == lease.session_id
+            and slot.bell_id is None
+            and slot.bell_at_utc is None
+        )
+        local = self._records.get(lease.session_id)
+        recovery_scheduled = bool(
+            local is not None
+            and (
+                (
+                    local.connection_spike_cleanup_task is not None
+                    and not local.connection_spike_cleanup_task.done()
+                )
+                or (
+                    local.connection_spike_cleanup_retry_task is not None
+                    and not local.connection_spike_cleanup_retry_task.done()
+                )
+            )
+        )
+        generation = getattr(slot, "generation", None)
+        revision = getattr(slot, "revision", None)
+        last_error_code = getattr(slot, "last_error_code", None)
+        generation_detail = (
+            f"GENERATION {generation}"
+            if isinstance(generation, int)
+            else "GENERATION PENDING"
+        )
+        scope_detail = (
+            "PRE-BELL RESIDENT CLEANUP"
+            if prebell
+            else "ROUND 5 RESOURCE CLEANUP"
+        )
+        worker_detail = (
+            "AUTO-CONVERGE SCHEDULED"
+            if recovery_scheduled
+            else "RECOVERY WORKER NOT CONFIRMED"
+        )
+        return {
+            "round5_ring_ready": False,
+            "round5_cleanup_owed": True,
+            "round5_warm_state": "cleaning",
+            "round5_start_stage": "cleaning",
+            "round5_warm_generation": generation,
+            "round5_warm_revision": revision,
+            "round5_warm_last_error_code": last_error_code,
+            "round5_cleanup_scope": (
+                "prebell_resident" if prebell else "postbell_resources"
+            ),
+            "round5_cleanup_recovery_scheduled": recovery_scheduled,
+            "round5_cleanup_detail": (
+                f"ROUND 5 NOT STARTABLE · STAGE CLEANING · {generation_detail} · "
+                f"CAN_START FALSE"
+                + (
+                    f" · ERROR {last_error_code}"
+                    if isinstance(last_error_code, str) and last_error_code
+                    else ""
+                )
+                + f" · {scope_detail} · {worker_detail} · "
+                "WAIT FOR READY / RING_READY TRUE"
+            ),
+        }
+
+    @staticmethod
+    def _round5_structured_start(
+        status: Mapping[str, object] | None,
+    ) -> RoundFiveStartStatus | None:
+        if status is None:
+            return None
+        allowed_stages = {
+            "ready",
+            "cleaning",
+            "claim-drain",
+            "terminal-blocked",
+            "identity-refresh",
+            "rewarming",
+        }
+        stage = str(status.get("round5_start_stage") or "rewarming").lower()
+        if stage not in allowed_stages:
+            stage = "rewarming"
+        generation = status.get("round5_warm_generation")
+        recovery = status.get("round5_cleanup_recovery_scheduled")
+        scope = status.get("round5_cleanup_scope")
+        revision = status.get("round5_warm_revision")
+        last_error_code = status.get("round5_warm_last_error_code")
+        return RoundFiveStartStatus(
+            stage=stage,
+            generation=(
+                generation
+                if isinstance(generation, int) and not isinstance(generation, bool)
+                else None
+            ),
+            recovery_scheduled=recovery if isinstance(recovery, bool) else None,
+            cleanup_scope=(
+                scope
+                if scope in {"prebell_resident", "postbell_resources", "unknown"}
+                else None
+            ),
+            revision=(
+                revision
+                if isinstance(revision, int) and not isinstance(revision, bool)
+                else None
+            ),
+            last_error_code=str(last_error_code) if last_error_code else None,
+        )
+
+    def _round5_start_refusal(self) -> str:
+        status = self.round5_warm_status or {}
+        stage = str(status.get("round5_start_stage") or "rewarming").upper()
+        generation = status.get("round5_warm_generation")
+        generation_detail = (
+            f"GENERATION {generation}"
+            if isinstance(generation, int)
+            else "GENERATION PENDING"
+        )
+        error = status.get("round5_warm_last_error_code")
+        error_detail = f" · ERROR {error}" if isinstance(error, str) and error else ""
+        recovery_detail = (
+            " · AUTO-CONVERGE SCHEDULED"
+            if stage == "CLEANING"
+            and status.get("round5_cleanup_recovery_scheduled") is True
+            else " · RECOVERY WORKER NOT CONFIRMED"
+            if stage == "CLEANING"
+            else ""
+        )
+        scope_detail = (
+            " · PRE-BELL RESIDENT CLEANUP"
+            if status.get("round5_cleanup_scope") == "prebell_resident"
+            else ""
+        )
         return (
-            self._round5_warm_coordinator.public_status_cached()
-            if self._round5_warm_coordinator is not None
-            else None
+            f"ROUND 5 NOT STARTABLE · STAGE {stage} · {generation_detail} · "
+            f"CAN_START FALSE{error_detail}{scope_detail}{recovery_detail} · "
+            "WAIT FOR READY / RING_READY TRUE"
         )
 
     @property
@@ -1503,6 +1837,27 @@ class RunManager:
             settled: dict[str, bool] = {}
             for record in records:
                 self._cancel_armed_expiry(record)
+                # Finding A3: cancelling record.task alone does NOT stop the lane bursts
+                # that run() popped into its launched map -- an orphaned burst could
+                # keep dispatching. Explicitly cancel the engine's local run tasks
+                # (both _lane_bursts and _run_burst_tasks) before the coordinator is
+                # closed, so no burst survives manager shutdown. Idempotent + local-only.
+                engine = record.connection_spike_engine
+                cancel_local = (
+                    getattr(engine, "cancel_local_round5_run_tasks", None)
+                    if engine is not None
+                    else None
+                )
+                if callable(cancel_local):
+                    try:
+                        await cancel_local()
+                    except Exception:
+                        logger.error(
+                            "Round 5 local run-task cancellation failed during "
+                            "shutdown session=%s",
+                            record.snapshot.id,
+                            exc_info=True,
+                        )
                 operations = {
                     operation
                     for operation in (
@@ -1633,6 +1988,15 @@ class RunManager:
             round_id = record.snapshot.round.id
             if round_id == RoundId.SURVIVE_CONNECTION_SPIKE:
                 if record.connection_spike_engine is None:
+                    return False
+                if self._round5_warm_coordinator is not None:
+                    # With a coordinator the manager's own cleanup is a local no-op
+                    # and is NOT external cleanup proof. Shutdown must not release
+                    # the ring / Round 5 leases on the strength of it while a shared
+                    # converge may still be mutating -- the coordinator.close drains
+                    # those tasks separately and safely. Report "not verified" so
+                    # close() retains durable CLEANING + leases/fencing for startup/
+                    # takeover reconciliation instead of releasing from a no-op.
                     return False
                 return await self._cleanup_connection_spike(record)
             if round_id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY:
@@ -1971,9 +2335,17 @@ class RunManager:
         session_id: str,
         operator: BoutOperator,
     ) -> SessionSnapshot:
-        """Cancel a Round 1 start-state check before any timed work begins."""
+        """Cancel a fight card before its bell.
+
+        Round 1 cancels a start-state check that is still running. Round 5 cancels an
+        ARMED card that has not rung, through the same no-bell cleanup the armed-window
+        expiry uses, so changing the matchup costs one reset rather than the rest of
+        the three-minute window.
+        """
         self._require_open()
         record = await self._record(session_id)
+        if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+            return await self._cancel_armed_round5(record, operator)
         async with record.lock:
             if (
                 record.snapshot.state == SessionState.FAILED
@@ -2044,6 +2416,36 @@ class RunManager:
         )
         return snapshot
 
+    async def _cancel_armed_round5(
+        self,
+        record: SessionRecord,
+        operator: BoutOperator,
+    ) -> SessionSnapshot:
+        async with record.lock:
+            self._assert_operator(record.operator, operator)
+            if (
+                record.snapshot.state == SessionState.FAILED
+                and record.snapshot.run_started_at is None
+            ):
+                # Already released -- a second click, or the window expired first.
+                return self._revalidated_snapshot(record.snapshot)
+            if (
+                record.snapshot.state != SessionState.ARMED
+                or record.snapshot.run_started_at is not None
+                or record.armed_at_monotonic is None
+            ):
+                raise InvalidStateError(
+                    "Only an armed Round 5 fight card that has not rung can be cancelled"
+                )
+            armed_at = record.armed_at_monotonic
+            self._cancel_armed_expiry(record)
+        if not await self._abandon_armed_bout(record, armed_at):
+            raise InvalidStateError(
+                "The Round 5 fight card changed before it could be cancelled"
+            )
+        async with record.lock:
+            return self._revalidated_snapshot(record.snapshot)
+
     async def start_arm(
         self,
         session_id: str,
@@ -2071,6 +2473,14 @@ class RunManager:
             is_connection_spike = record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
             is_live_orders = record.snapshot.round.id == RoundId.ANALYZE_LIVE_ORDERS
             if is_connection_spike:
+                durable_cleanup = await self.round5_durable_cleanup_overlay()
+                if durable_cleanup is not None:
+                    raise InvalidStateError(
+                        str(
+                            durable_cleanup.get("round5_cleanup_detail")
+                            or "ROUND 5 NOT STARTABLE · DURABLE CLEANUP IS STILL ACTIVE"
+                        )
+                    )
                 self._round5_readiness_check()
             if is_model_score and self._model_score_factory is None:
                 raise InvalidStateError("Round 4 live adapter is not configured.")
@@ -2099,6 +2509,16 @@ class RunManager:
                             authority.fencing_token,
                         )
                 except Exception as exc:
+                    # No engine or resident mutation exists yet. Return the
+                    # coherent READY claim and both ring rows together; routing
+                    # this through CLEANING creates the false cleanup -> TU flap
+                    # the operator saw after a refused Prepare.
+                    if await self._rollback_unstarted_round5_arm(record):
+                        if isinstance(exc, InvalidStateError):
+                            raise
+                        raise InvalidStateError(
+                            "The Round 5 start state could not be verified."
+                        ) from exc
                     if (
                         self._round5_warm_coordinator is not None
                         and record.round5_warm_slot is not None
@@ -2106,10 +2526,8 @@ class RunManager:
                     ):
                         claim_id = record.round5_warm_slot.claim.claim_id
                         try:
-                            await self._round5_warm_coordinator.begin_cleanup(
-                                claim_id
-                            )
-                            await self._round5_warm_coordinator.finish_cleanup_and_rewarm(
+                            await self._round5_warm_coordinator.begin_cleanup(claim_id)
+                            await self._round5_warm_coordinator.converge_cleanup(
                                 claim_id
                             )
                         except Exception:
@@ -2147,6 +2565,10 @@ class RunManager:
                         ),
                         bout_fence=authority.fencing_token,
                     )
+                except (WarmClaimUnavailableError, WarmStoreConflictError) as exc:
+                    await self._release_round5_lease(record)
+                    await self._release_bout(record)
+                    raise InvalidStateError(self._round5_start_refusal()) from exc
                 except Exception:
                     await self._release_round5_lease(record)
                     await self._release_bout(record)
@@ -2179,6 +2601,21 @@ class RunManager:
             record.live_orders_guardrail_order = None
             record.run_started_monotonic_ns = None
             record.towel_stop_event = None
+            if is_connection_spike:
+                try:
+                    await self._verify_round5_start_state(record)
+                except Exception as exc:
+                    await self._rollback_unstarted_round5_arm(record)
+                    if isinstance(exc, InvalidStateError):
+                        raise
+                    raise InvalidStateError(
+                        self._arm_refusal(
+                            record,
+                            "The Round 5 start state could not be verified.",
+                            exc,
+                            round_number=5,
+                        )
+                    ) from exc
             if is_model_score or is_live_orders:
                 competitor = record.snapshot.lanes["competitor"]
                 competitor.state = LaneState.NOT_SUPPORTED
@@ -2354,44 +2791,174 @@ class RunManager:
                     raise InvalidStateError(
                         "Round 5 warm claim is unavailable"
                     )
-                if round5_atomic_bell:
-                    main_lease = record.lease
-                    cleanup_lease = record.round5_lease
-                    if main_lease is None or cleanup_lease is None:
-                        raise InvalidStateError(
-                            "Round 5 bell leases are unavailable"
+                # Swarm defect #1 (Approach A) + finding 4(b): durably commit the
+                # timed CreateDBProxy CREATE_INTENT BEFORE the authoritative bell
+                # transaction captures T0 and before Lakebase is released, so the
+                # competitor's create record always exists first.  This is the only
+                # coordination write ordered ahead of the bell for the timed lane;
+                # after T0 the competitor path awaits no journal I/O before boto3
+                # CreateDBProxy.
+                #
+                # ``precommit_launch_intent`` is a REQUIRED bell-seam method on the
+                # Round 5 engine (req #6), invoked directly -- not an optional
+                # getattr hook whose absence would silently no-op the durability
+                # guarantee.  It self-no-ops only when the engine has no timed
+                # setup.
+                #
+                # The precommit AND bell acceptance share one compensation scope: a
+                # failure of either (refused precommit, or a bell CAS that loses the
+                # claim/broker epoch) must release the round-5 lease and the bout
+                # and ring nothing.  This is safe because Lakebase is only actually
+                # released later, by ``bind_bell`` -> ``allow_release``, which runs
+                # OUTSIDE this block after the durable commit: on every path handled
+                # here, no lane has launched, so releasing is clean.  A
+                # committed-then-failed bell leaves only an orphan CREATE_INTENT,
+                # which automatic reconciliation settles.  Idempotent for a
+                # duplicate /run.
+                precommit_launch = record.connection_spike_engine.precommit_launch_intent
+                launch_lease = record.round5_lease
+                try:
+                    if launch_lease is not None:
+                        await precommit_launch(
+                            record.snapshot.id, launch_lease.fencing_token
                         )
-                    (
-                        context,
-                        committed_main,
-                        committed_cleanup,
-                    ) = await self._round5_warm_coordinator.accept_bell_with_leases(
-                        claim.claim_id,
-                        main_store=self._lease_store_for_record(record),
-                        main_lease=main_lease,
-                        cleanup_store=self._round5_cleanup_store(),
-                        cleanup_lease=cleanup_lease,
-                        ttl=timedelta(seconds=self._running_lease_ttl),
-                        release_event_factory=getattr(
-                            record.connection_spike_engine,
-                            "lakebase_release_event",
-                            None,
-                        ),
+                    if round5_atomic_bell:
+                        main_lease = record.lease
+                        cleanup_lease = record.round5_lease
+                        if main_lease is None or cleanup_lease is None:
+                            raise InvalidStateError(
+                                "Round 5 bell leases are unavailable"
+                            )
+                        (
+                            context,
+                            committed_main,
+                            committed_cleanup,
+                        ) = await self._round5_warm_coordinator.accept_bell_with_leases(
+                            claim.claim_id,
+                            main_store=self._lease_store_for_record(record),
+                            main_lease=main_lease,
+                            cleanup_store=self._round5_cleanup_store(),
+                            cleanup_lease=cleanup_lease,
+                            ttl=timedelta(seconds=self._running_lease_ttl),
+                            release_event_factory=getattr(
+                                record.connection_spike_engine,
+                                "lakebase_release_event",
+                                None,
+                            ),
+                        )
+                        record.lease = committed_main
+                        record.round5_lease = committed_cleanup
+                        self._start_lease_heartbeat(
+                            record,
+                            timedelta(seconds=self._running_lease_ttl),
+                        )
+                        self._start_round5_lease_heartbeat(
+                            record,
+                            timedelta(seconds=self._running_lease_ttl),
+                        )
+                    else:
+                        context = await self._round5_warm_coordinator.accept_bell(
+                            claim.claim_id
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "Round 5 bell failed before RUNNING session=%s diagnosis=%s",
+                        record.snapshot.id,
+                        operator_diagnosis(exc),
+                        exc_info=True,
                     )
-                    record.lease = committed_main
-                    record.round5_lease = committed_cleanup
-                    self._start_lease_heartbeat(
-                        record,
-                        timedelta(seconds=self._running_lease_ttl),
-                    )
-                    self._start_round5_lease_heartbeat(
-                        record,
-                        timedelta(seconds=self._running_lease_ttl),
-                    )
-                else:
-                    context = await self._round5_warm_coordinator.accept_bell(
-                        claim.claim_id
-                    )
+                    # A refused bell ALWAYS enters durable CLEANING and converges
+                    # through the coordinator's single owner (provider reconcile on
+                    # the adopted engine). The manager performs no external cleanup
+                    # mutation of its own.
+                    settlement_deferred = True
+                    if self._round5_warm_coordinator is not None:
+                        await self._begin_round5_warm_cleanup(record)
+                    else:
+                        settle_abandoned = getattr(
+                            record.connection_spike_engine, "settle_abandoned_arm", None
+                        )
+                        settlement_deferred = settle_abandoned is None
+                        if settle_abandoned is not None:
+                            try:
+                                settlement_deferred = bool(await settle_abandoned())
+                            except Exception:
+                                settlement_deferred = True
+                                logger.error(
+                                    "Round 5 refused-bell resident settle failed "
+                                    "session=%s; restart reconciliation will settle it",
+                                    record.snapshot.id,
+                                    exc_info=True,
+                                )
+                    if settlement_deferred:
+                        self._cancel_armed_expiry(record)
+                        record.snapshot.state = SessionState.FAILED
+                        record.snapshot.failure = _ROUND_FIVE_CLEANUP_PENDING
+                        record.snapshot.remembered_result = None
+                        record.snapshot.updated_at = datetime.now(UTC)
+                        record.armed_at_monotonic = None
+                        for lane in record.snapshot.lanes.values():
+                            lane.state = LaneState.FAILED
+                            lane.status = _ROUND_FIVE_CLEANUP_PENDING
+                            lane.error = _ROUND_FIVE_CLEANUP_PENDING
+                            lane.activity = LaneActivity(phase="cleanup_failed")
+                        if effective_operator is not None:
+                            try:
+                                await self._retain_connection_spike_cleanup_lease(
+                                    record,
+                                    effective_operator,
+                                    session_state=SessionState.FAILED,
+                                    allow_claim=False,
+                                )
+                            except Exception:
+                                logger.error(
+                                    "Round 5 refused-bell cleanup fence could not "
+                                    "be transitioned session=%s",
+                                    record.snapshot.id,
+                                    exc_info=True,
+                                )
+                        owed = self._note_round5_proxy_at_risk(
+                            record,
+                            still_retrying=True,
+                            force=True,
+                        )
+                        setup = record.snapshot.round5_setup
+                        if setup is not None:
+                            setup.state = RoundFiveSetupState.CLEANUP_FAILED
+                            setup.cleanup_retryable = True
+                            setup.cleanup_failure = (
+                                owed.detail
+                                if owed is not None
+                                else "Automatic backstage cleanup is retrying."
+                            )
+                            setup.failure = setup.cleanup_failure
+                        self._schedule_connection_spike_cleanup_convergence(record)
+                    else:
+                        await self._release_round5_lease(record)
+                        await self._release_bout(record)
+                    if isinstance(exc, InvalidStateError):
+                        raise
+                    raise InvalidStateError(
+                        "Round 5 bell could not start; nothing was launched."
+                    ) from exc
+                # Blocker 1: the accept_bell transaction has COMMITTED, so record the
+                # durable post-bell truth (bell context + authoritative RUNNING slot)
+                # BEFORE bind_bell. If bind_bell -- or any later step -- raises, a
+                # subsequent cleanup still classifies as post-bell and runs the
+                # mandatory post-setup teardown instead of misreading a stale CLAIMED
+                # slot as pre-bell. (Cleanup also has a durable-store fallback, see
+                # _refresh_round5_slot_from_durable.)
+                record.round5_bell_context = context
+                running_slot = getattr(
+                    self._round5_warm_coordinator, "last_slot", None
+                )
+                if (
+                    running_slot is not None
+                    and getattr(running_slot, "claim", None) is not None
+                    and running_slot.claim.claim_id == claim.claim_id
+                    and getattr(running_slot, "bell_id", None) is not None
+                ):
+                    record.round5_warm_slot = running_slot
                 bind_bell = getattr(
                     record.connection_spike_engine,
                     "bind_bell",
@@ -2399,7 +2966,6 @@ class RunManager:
                 )
                 if callable(bind_bell):
                     bind_bell(context)
-                record.round5_bell_context = context
                 record.snapshot.state = SessionState.RUNNING
                 record.snapshot.run_started_at = context.bell_at_utc
                 record.run_started_monotonic_ns = context.t0_monotonic_ns
@@ -2637,6 +3203,8 @@ class RunManager:
                 record.connection_spike_engine = engine
             setup.cleanup_retryable = True
             setup.cleanup_failure = None
+            self._note_round5_proxy_at_risk(record, force=True)
+            self._schedule_connection_spike_cleanup_convergence(record)
             if record.snapshot.towel is not None:
                 record.snapshot.towel.state = TowelState.CLEANING
                 record.snapshot.towel.cleanup_failure = None
@@ -3120,12 +3688,24 @@ class RunManager:
                 "For liveness alone, use /api/health."
             )
         readiness = self._readiness_status() if self._readiness_status else None
+        warm_status = (
+            self.round5_warm_status
+            if round_id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and self._round5_warm_coordinator is not None
+            else None
+        )
+        round5_start = self._round5_structured_start(warm_status)
         if (
             self._round_isolation
             and round_id == RoundId.SURVIVE_CONNECTION_SPIKE
-            and (readiness is None or readiness.ring_ready)
             and self._round5_readiness_status is not None
         ):
+            # Round 5 bout_status answers from the round5-specific readiness/warm
+            # signal ALONE -- never gated on the installation-wide ``readiness``
+            # (Finding 2). Requiring the global ring to be ready first coupled Round 5
+            # availability to unrelated installation/other-round startup state, so a
+            # global blip could report Round 5 unavailable even though its own
+            # per-round ring/warm coordinator was healthy.
             readiness = self._round5_readiness_status()
         readiness_fields = (
             {
@@ -3136,6 +3716,22 @@ class RunManager:
             if readiness is not None
             else {}
         )
+        if (
+            self._round_isolation
+            and round_id == RoundId.SURVIVE_CONNECTION_SPIKE
+            and self._round5_warm_coordinator is not None
+            and not self.round5_ring_ready
+        ):
+            warm_status = warm_status or {}
+            readiness_fields = {
+                "ring_ready": False,
+                "maintenance_state": (
+                    "blocked"
+                    if warm_status.get("round5_warm_blocked_terminal")
+                    else "maintenance"
+                ),
+                "maintenance_detail": self._round5_start_refusal(),
+            }
         # During startup maintenance the gate's replica-local cache mirrors the
         # durable readiness row. Viewer polling must not fan out into one
         # coordination query per browser; only the bounded gate poller reads it.
@@ -3152,6 +3748,27 @@ class RunManager:
         lease = await store.current()
         if scoped_round == RoundId.SURVIVE_CONNECTION_SPIKE and lease is None:
             lease = await self._round5_cleanup_store().current()
+            if lease is None:
+                # The durable cleanup ring was just read and is empty, which is
+                # the same fact that lets ``round5_durable_cleanup_overlay`` lift
+                # its latch. Lift it here too: otherwise only /api/catalog or a
+                # restart ever cleared it, and a fight card polled through
+                # /api/bout/all alone could keep reporting Round 5 closed behind
+                # a cleanup that had already finished.
+                self._round5_durable_cleanup_blocked = False
+        if (
+            scoped_round == RoundId.SURVIVE_CONNECTION_SPIKE
+            and lease is not None
+            and lease.phase == "round5_cleanup"
+        ):
+            overlay = await self.round5_durable_cleanup_overlay(lease)
+            if overlay is not None:
+                readiness_fields = {
+                    "ring_ready": False,
+                    "maintenance_state": "maintenance",
+                    "maintenance_detail": overlay["round5_cleanup_detail"],
+                }
+                round5_start = self._round5_structured_start(overlay)
         if lease is not None:
             # A real lease outranks a replica-local readiness cache. This matters
             # most for Round 5: its reconciler deliberately marks the artifact
@@ -3171,12 +3788,14 @@ class RunManager:
                 state=lease.session_state,
                 round_title=lease.round_title,
                 competitor=lease.competitor_name,
+                round5_start=round5_start,
             )
         return BoutStatus(
             active=False,
-            can_start=bool(readiness is None or readiness.ring_ready),
+            can_start=bool(readiness_fields.get("ring_ready", True)),
             **status_scope,
             **readiness_fields,
+            round5_start=round5_start,
         )
 
     async def all_bout_statuses(self) -> dict[RoundId, BoutStatus]:
@@ -3469,9 +4088,16 @@ class RunManager:
                     type(exc).__name__,
                     str(exc),
                 )
-                raise InvalidStateError(
-                    "ROUND 5 IS PREPARING BACKSTAGE · OTHER ROUNDS ARE READY"
-                ) from exc
+                if isinstance(
+                    exc,
+                    (
+                        LeaseHeldError,
+                        WarmClaimUnavailableError,
+                        WarmStoreConflictError,
+                    ),
+                ):
+                    raise InvalidStateError(self._round5_start_refusal()) from exc
+                raise
             record.lease = main_lease
             record.round5_lease = cleanup_lease
             record.round5_warm_slot = warm_slot
@@ -3516,9 +4142,7 @@ class RunManager:
                 record.round5_lease = await claim(self._round5_cleanup_store())
             except LeaseHeldError as exc:
                 await self._release_bout(record)
-                raise InvalidStateError(
-                    "ROUND 5 BACKSTAGE CLEANUP IS STILL FINISHING · OTHER ROUNDS ARE READY"
-                ) from exc
+                raise InvalidStateError(self._round5_start_refusal()) from exc
             except LeaseLostError as exc:
                 await self._release_bout(record)
                 raise InvalidStateError(str(exc)) from exc
@@ -3767,6 +4391,34 @@ class RunManager:
                 await self._release_round5_lease(record)
                 await self._release_bout(record)
             raise InvalidStateError(str(transition_error)) from transition_error
+        # Blocker 5: register the AUTHORITATIVE armed-lease deadline with the warm
+        # coordinator so it renews the pre-bell claim through exactly this deadline
+        # (honoring a long configured arm TTL, e.g. 1800s) and stops after -- not the
+        # coarse leak-fallback horizon, which now applies ONLY when no armed deadline
+        # was ever registered (a leaked active-id that never learned its deadline).
+        if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+            coordinator = self._round5_warm_coordinator
+            warm_slot = record.round5_warm_slot
+            claim = warm_slot.claim if warm_slot is not None else None
+            setter = (
+                getattr(coordinator, "set_active_claim_deadline", None)
+                if coordinator is not None
+                else None
+            )
+            if callable(setter) and claim is not None:
+                setter(claim.claim_id, expires_at)
+            # Finding 3: hand the claimed engine (now holding the ARM-staged resident
+            # bindings) to the coordinator/provider so the provider -- the sole
+            # cleanup janitor -- can cancel those residents itself. The manager does
+            # no external cleanup mutation of its own when a coordinator is present.
+            adopt = (
+                getattr(coordinator, "adopt_claimed_engine", None)
+                if coordinator is not None
+                else None
+            )
+            engine = record.connection_spike_engine
+            if callable(adopt) and claim is not None and engine is not None:
+                adopt(claim.claim_id, engine)
         # The one success exit, and the last line of it deliberately. An arm that
         # got here made the round's calls and Databricks did not refuse them,
         # which is the only evidence more recent and more authoritative than a
@@ -4099,6 +4751,8 @@ class RunManager:
                         setup.cleanup_retryable = True
                         setup.downstream_validated = False
                         setup.failure = "Automatic cleanup verification is in progress"
+                    self._note_round5_proxy_at_risk(record, force=True)
+                    self._schedule_connection_spike_cleanup_convergence(record)
                     self._advance_round5_revision_locked(record)
                     record.snapshot.updated_at = datetime.now(UTC)
                     snapshot = record.snapshot.model_copy(deep=True)
@@ -4172,6 +4826,33 @@ class RunManager:
             self._start_lease_heartbeat(record, timedelta(seconds=ttl_seconds))
         return False
 
+    # _abandon_round5_warm_claim (direct pre-bell return-to-READY) was removed:
+    # every no-bell abandon now enters CLEANING via _begin_round5_warm_cleanup and
+    # converges through exact durable SETTLED + provider absence + rewarm N+1.
+
+    async def _begin_round5_warm_cleanup(self, record: SessionRecord) -> bool:
+        """Move the held warm claim to CLEANING and stop claim renewal."""
+
+        coordinator = self._round5_warm_coordinator
+        warm_slot = record.round5_warm_slot
+        claim = warm_slot.claim if warm_slot is not None else None
+        if coordinator is None or claim is None:
+            return True
+        coordinator.release_claim_active(claim.claim_id)
+        try:
+            record.round5_warm_slot = await coordinator.begin_cleanup(
+                claim.claim_id
+            )
+        except Exception as exc:
+            logger.error(
+                "Round 5 abandoned claim could not enter durable cleanup "
+                "session=%s diagnostic=%s",
+                record.snapshot.id,
+                _redacted_exception_chain(exc),
+            )
+            return False
+        return True
+
     async def _release_round5_lease(self, record: SessionRecord) -> bool:
         self._cancel_round5_lease_heartbeat(record)
         # Stop backstage renewal of the warm claim so an abandoned arm's claim can
@@ -4205,6 +4886,7 @@ class RunManager:
                 current = record.round5_lease
                 if current is not None and self._same_exact_lease(current, lease):
                     record.round5_lease = None
+                self._round5_durable_cleanup_blocked = False
                 return True
         current = record.round5_lease
         if current is not None and self._same_exact_lease(current, lease):
@@ -4748,85 +5430,104 @@ class RunManager:
             await asyncio.sleep(self._armed_ttl)
         except asyncio.CancelledError:
             return
+        await self._abandon_armed_bout(record, armed_at_monotonic)
+
+    async def _abandon_armed_bout(
+        self,
+        record: SessionRecord,
+        armed_at_monotonic: float,
+    ) -> bool:
+        """Release an armed fight card that never rang.
+
+        Reached when the armed window expires, and for Round 5 also when its owner
+        cancels the card, so that "prepare, then change the matchup" converges through
+        the same no-bell cleanup the expiry already uses instead of holding the ring
+        for the rest of the window. Returns False, changing nothing, when the session
+        already moved on (rang, cancelled, or re-armed).
+        """
         message = (
             "Fight card expired before the bell. The ring was released automatically; "
             "prepare it again."
         )
+        cleanup_pending = False
         async with record.lock:
             if (
                 record.snapshot.state != SessionState.ARMED
                 or record.armed_at_monotonic != armed_at_monotonic
             ):
-                return
+                return False
             if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
-                cleanup_ok = await self._cleanup_connection_spike(record)
+                # A no-bell abandon ALWAYS enters CLEANING (retaining the claim). The
+                # AUTHORITATIVE convergence -- exact durable SETTLED of the claim jobs
+                # + provider/journal absence + finish_cleanup_and_rewarm to N+1 -- is
+                # the coordinator's SINGLE owner (converge_cleanup on the retry worker;
+                # the manager no longer reconciles independently). The provider
+                # janitor settles staged residents during convergence; the manager
+                # performs no external cleanup mutation when a coordinator exists.
+                if self._round5_warm_coordinator is None:
+                    await self._cleanup_connection_spike(record)
                 record.snapshot.metrics = []
                 record.snapshot.comparison = None
                 if record.snapshot.round5_setup is not None:
                     record.snapshot.round5_setup.state = RoundFiveSetupState.FAILED
                     record.snapshot.round5_setup.failure = "The clean per-bout baseline expired"
-                if not cleanup_ok:
-                    if record.operator is not None:
-                        try:
-                            await self._retain_connection_spike_cleanup_lease(
-                                record,
-                                record.operator,
-                            )
-                        except InvalidStateError:
-                            pass
-                    message = _ROUND_FIVE_CLEANUP_PENDING
-                    setup = record.snapshot.round5_setup
-                    if setup is not None:
-                        setup.state = RoundFiveSetupState.CLEANUP_FAILED
-                        setup.cleanup_retryable = True
-                        setup.downstream_validated = False
-                        setup.failure = "Automatic cleanup verification is in progress"
-                    record.snapshot.state = SessionState.FAILED
-                    record.snapshot.failure = message
-                    record.snapshot.remembered_result = None
-                    record.snapshot.updated_at = datetime.now(UTC)
-                    record.armed_at_monotonic = None
+                if record.operator is not None:
+                    try:
+                        await self._retain_connection_spike_cleanup_lease(
+                            record,
+                            record.operator,
+                        )
+                    except InvalidStateError:
+                        pass
+                await self._begin_round5_warm_cleanup(record)
+                message = _ROUND_FIVE_CLEANUP_PENDING
+                setup = record.snapshot.round5_setup
+                if setup is not None:
+                    setup.state = RoundFiveSetupState.CLEANUP_FAILED
+                    setup.cleanup_retryable = True
+                    setup.downstream_validated = False
+                    setup.failure = "Automatic cleanup verification is in progress"
+                self._note_round5_proxy_at_risk(record, force=True)
+                self._schedule_connection_spike_cleanup_convergence(record)
+                record.snapshot.state = SessionState.FAILED
+                record.snapshot.failure = message
+                record.snapshot.remembered_result = None
+                record.snapshot.updated_at = datetime.now(UTC)
+                record.armed_at_monotonic = None
+                record.armed_expiry_task = None
+                for lane in record.snapshot.lanes.values():
+                    lane.state = LaneState.FAILED
+                    lane.status = message
+                    lane.error = message
+                    lane.activity = LaneActivity(phase="cleanup_failed")
+                snapshot = record.snapshot.model_copy(deep=True)
+                cleanup_pending = True
+            if not cleanup_pending:
+                if not await self._confirm_terminal_release(record):
                     record.armed_expiry_task = None
-                    for lane in record.snapshot.lanes.values():
-                        lane.state = LaneState.FAILED
-                        lane.status = message
-                        lane.error = message
-                        lane.activity = LaneActivity(phase="cleanup_failed")
-                    snapshot = record.snapshot.model_copy(deep=True)
-                    await record.event_log.publish(
-                        "session_failed",
-                        {
-                            "state": SessionState.FAILED,
-                            "message": message,
-                            "session": snapshot.model_dump(mode="json"),
-                        },
-                    )
-                    return
-            if not await self._confirm_terminal_release(record):
+                    return False
+                if (
+                    record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+                    and not await self._release_round5_lease(record)
+                ):
+                    record.armed_expiry_task = None
+                    return False
+                record.snapshot.state = SessionState.FAILED
+                record.snapshot.failure = message
+                record.snapshot.remembered_result = None
+                if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+                    record.snapshot.metrics = []
+                    record.snapshot.comparison = None
+                    if record.snapshot.round5_setup is not None:
+                        record.snapshot.round5_setup.state = RoundFiveSetupState.FAILED
+                        record.snapshot.round5_setup.downstream_validated = False
+                        record.snapshot.round5_setup.failure = (
+                            "Setup or downstream verification did not complete"
+                        )
+                record.snapshot.updated_at = datetime.now(UTC)
+                record.armed_at_monotonic = None
                 record.armed_expiry_task = None
-                return
-            if (
-                record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
-                and not await self._release_round5_lease(record)
-            ):
-                record.armed_expiry_task = None
-                return
-            record.snapshot.state = SessionState.FAILED
-            record.snapshot.failure = message
-            record.snapshot.remembered_result = None
-            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
-                record.snapshot.metrics = []
-                record.snapshot.comparison = None
-                if record.snapshot.round5_setup is not None:
-                    record.snapshot.round5_setup.state = RoundFiveSetupState.FAILED
-                    record.snapshot.round5_setup.downstream_validated = False
-                    record.snapshot.round5_setup.failure = (
-                        "Setup or downstream verification did not complete"
-                    )
-            record.snapshot.updated_at = datetime.now(UTC)
-            record.armed_at_monotonic = None
-            record.armed_expiry_task = None
-            snapshot = record.snapshot.model_copy(deep=True)
+                snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
             "session_failed",
             {
@@ -4835,6 +5536,12 @@ class RunManager:
                 "session": snapshot.model_dump(mode="json"),
             },
         )
+        if cleanup_pending:
+            # The invariant: retryable cleanup always has both an owed notice and
+            # a live convergence worker. This call is outside ``record.lock``
+            # because it publishes its own cleanup snapshot under that lock.
+            await self._mark_connection_spike_cleanup_pending(record)
+        return True
 
     def _arm_refusal(
         self,
@@ -5370,6 +6077,86 @@ class RunManager:
                 round_number=4,
             )
 
+    @staticmethod
+    def _round5_arm_has_started_mutation(engine: object | None) -> bool:
+        if engine is None:
+            return False
+        bindings = getattr(engine, "_resident_bindings", None)
+        return bool(isinstance(bindings, dict) and bindings)
+
+    async def _verify_round5_start_state(self, record: SessionRecord) -> None:
+        """Refuse Round 5 CHECKING until the claimed fence/capsule still match."""
+
+        factory = self._connection_spike_factory
+        capsule = record.round5_launch_capsule
+        warm_slot = record.round5_warm_slot
+        if factory is None and capsule is None:
+            raise InvalidStateError("Round 5 live adapter is not configured.")
+        if capsule is not None and warm_slot is not None:
+            variant = (
+                Round5Variant.AURORA
+                if record.snapshot.competitor.id == CompetitorId.AURORA_SERVERLESS_V2
+                else Round5Variant.RDS
+            )
+            engine = capsule.variant_contexts[variant]
+        else:
+            assert factory is not None
+            engine = factory(record.snapshot.competitor.id)
+        record.connection_spike_engine = engine
+        lease = record.round5_lease
+        if lease is None:
+            raise InvalidStateError("Round 5 automatic warm context is unavailable")
+        claim = warm_slot.claim if warm_slot is not None else None
+        bind_claim = getattr(engine, "bind_claim", None)
+        if claim is not None and callable(bind_claim):
+            bind_claim(claim)
+        verify = getattr(engine, "verify_start_state", None)
+        if callable(verify):
+            await verify(record.snapshot.id, lease.fencing_token)
+            return
+        # Compatibility engines expose only prepare(). Keep them under the same
+        # no-ghost contract instead of leaving a second caller family that can
+        # publish CHECKING before discovering its start fence is stale.
+        if self._round_five_has_timed_setup(engine):
+            prepare = getattr(engine, "prepare", None)
+            if callable(prepare):
+                await prepare(record.snapshot.id, lease.fencing_token)
+
+    async def _rollback_unstarted_round5_arm(self, record: SessionRecord) -> bool:
+        """Drop a failed prepare that never started AWS or resident work.
+
+        Returns True when the claim was returned to READY and both rings were
+        released. Returns False when cleanup still owns the bout.
+        """
+
+        engine = record.connection_spike_engine
+        if self._round5_arm_has_started_mutation(engine):
+            return False
+        coordinator = self._round5_warm_coordinator
+        warm_slot = record.round5_warm_slot
+        claim = warm_slot.claim if warm_slot is not None else None
+        if coordinator is not None and claim is not None:
+            returned = getattr(coordinator, "return_unstarted_claim", None)
+            if not callable(returned):
+                return False
+            try:
+                record.round5_warm_slot = await returned(
+                    claim.claim_id,
+                    main_store=self._lease_store_for_record(record),
+                    main_lease=record.lease,
+                    cleanup_store=self._round5_cleanup_store(),
+                    cleanup_lease=record.round5_lease,
+                )
+            except Exception:
+                logger.error(
+                    "Round 5 unstarted claim could not return to READY",
+                    exc_info=True,
+                )
+                return False
+        await self._release_round5_lease(record)
+        await self._release_bout(record)
+        return True
+
     async def _arm_connection_spike(self, record: SessionRecord) -> None:
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         factory = self._connection_spike_factory
@@ -5379,7 +6166,9 @@ class RunManager:
             await self._fail(record, "Round 5 live adapter is not configured.")
             return
         try:
-            if capsule is not None and warm_slot is not None:
+            if record.connection_spike_engine is not None:
+                engine = record.connection_spike_engine
+            elif capsule is not None and warm_slot is not None:
                 variant = (
                     Round5Variant.AURORA
                     if record.snapshot.competitor.id
@@ -5482,25 +6271,45 @@ class RunManager:
                 },
             )
         except Exception as exc:
-            # Taken once and used on both exits. Round 5 is the one arm handler
-            # with two terminal paths, and building the message separately in
-            # each is how the two would drift into saying different things about
-            # the same refusal.
             message = self._arm_refusal(
                 record,
                 "The Round 5 start state could not be verified.",
                 exc,
                 round_number=5,
             )
-            cleanup_ok = await self._cleanup_connection_spike(record)
-            if cleanup_ok:
-                await self._fail(record, message)
-            else:
+            coordinator = self._round5_warm_coordinator
+            warm_slot = record.round5_warm_slot
+            claim = warm_slot.claim if warm_slot is not None else None
+            engine = record.connection_spike_engine
+            if coordinator is not None and claim is not None:
+                # Arm failed AFTER prepare staged the Lakebase resident but before
+                # (or during) _mark_bout_armed. The manager's coordinator-path
+                # cleanup is a no-op that must NOT be treated as external cleanup
+                # proof: doing so would release the leases and re-warm over the
+                # orphaned staged resident (warm_baseline_unexpected). Instead adopt
+                # the EXACT engine holding the staged resident (so the provider --
+                # the sole janitor -- cancels that resident), then drive durable
+                # CLEANING + convergence through the failure handoff. Leases are
+                # retained until convergence proves cleanup; nothing is released
+                # from the no-op here.
+                adopt = getattr(coordinator, "adopt_claimed_engine", None)
+                if callable(adopt) and engine is not None:
+                    adopt(claim.claim_id, engine)
                 await self._finish_connection_spike_failure(
                     record,
                     message,
                     cleanup_verified=False,
                 )
+            else:
+                cleanup_ok = await self._cleanup_connection_spike(record)
+                if cleanup_ok:
+                    await self._fail(record, message)
+                else:
+                    await self._finish_connection_spike_failure(
+                        record,
+                        message,
+                        cleanup_verified=False,
+                    )
 
     async def _arm_live_orders(self, record: SessionRecord) -> None:
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
@@ -6468,33 +7277,87 @@ class RunManager:
             await self._mark_connection_spike_cleanup_pending(record)
             return
         try:
-            await self._retain_connection_spike_cleanup_lease(
-                record,
-                operator,
-                session_state=record.snapshot.state,
-                allow_claim=False,
-            )
-            if (
-                self._round5_warm_coordinator is not None
-                and record.round5_warm_slot is not None
+            coordinator = self._round5_warm_coordinator
+            claim_id = (
+                record.round5_warm_slot.claim.claim_id
+                if record.round5_warm_slot is not None
                 and record.round5_warm_slot.claim is not None
-            ):
-                record.round5_warm_slot = (
-                    await self._round5_warm_coordinator.begin_cleanup(
-                        record.round5_warm_slot.claim.claim_id
+                else None
+            )
+            if coordinator is not None and claim_id is not None:
+                # Finding A + H3: cancel ALL local in-process work (setup task, the
+                # lane bursts still parked in _lane_bursts AND the ones run() popped
+                # into its launched map, plus the in-flight run task itself) BEFORE
+                # begin_cleanup makes the slot CLEANING visible and wakes the loop --
+                # otherwise a burst could dispatch AFTER CLEANING (or the loop's
+                # converge could race a live burst). Bounded and fail-safe: if local
+                # cancellation stalls or raises we STILL enter durable CLEANING so the
+                # coordinator fence/authority is preserved (a stalled local task must
+                # never block the durable transition).
+                cancel_local = getattr(engine, "cancel_local_round5_run_tasks", None)
+                if callable(cancel_local):
+                    try:
+                        async with asyncio.timeout(
+                            max(0.001, self._round5_local_cancel_timeout)
+                        ):
+                            await cancel_local()
+                    except TimeoutError:
+                        logger.error(
+                            "Round 5 local run-task cancellation did not complete "
+                            "before CLEANING session=%s; entering durable cleanup "
+                            "anyway to preserve authority",
+                            record.snapshot.id,
+                        )
+                    except Exception:
+                        logger.error(
+                            "Round 5 local run-task cancellation failed session=%s; "
+                            "entering durable cleanup anyway",
+                            record.snapshot.id,
+                            exc_info=True,
+                        )
+                # Retain the cleanup lease BEST EFFORT before begin_cleanup: on
+                # success the round5_cleanup phase is retained so a begin_cleanup CAS
+                # conflict can be retried under that authority by the convergence
+                # worker. Finding C: a retain FAILURE (e.g. _mark_bout_armed already
+                # lost/released the lease on a LeaseLostError) must NOT skip
+                # begin_cleanup -- otherwise the slot stays CLAIMED with an orphaned
+                # staged resident. So swallow retain failures and fence CLEANING
+                # regardless; the warm coordinator owns the warm slot independently of
+                # the ring/cleanup lease.
+                try:
+                    await self._retain_connection_spike_cleanup_lease(
+                        record,
+                        operator,
+                        session_state=record.snapshot.state,
+                        allow_claim=False,
                     )
+                except Exception:
+                    logger.error(
+                        "Round 5 cleanup-lease retain failed before CLEANING "
+                        "session=%s; fencing CLEANING anyway (convergence/takeover "
+                        "will proceed)",
+                        record.snapshot.id,
+                        exc_info=True,
+                    )
+                record.round5_warm_slot = await coordinator.begin_cleanup(claim_id)
+            else:
+                await self._retain_connection_spike_cleanup_lease(
+                    record,
+                    operator,
+                    session_state=record.snapshot.state,
+                    allow_claim=False,
                 )
-            stop_run = getattr(engine, "stop_and_begin_cleanup", None)
-            stop_setup = getattr(engine, "stop_setup_and_begin_cleanup", None)
-            if (
-                stop_run is not None
-                and record.connection_spike_arm is not None
-                and record.snapshot.round5_setup is not None
-                and record.snapshot.round5_setup.setup_validated
-            ):
-                await stop_run(record.connection_spike_arm)
-            elif stop_setup is not None:
-                await stop_setup(record.snapshot.id)
+                stop_run = getattr(engine, "stop_and_begin_cleanup", None)
+                stop_setup = getattr(engine, "stop_setup_and_begin_cleanup", None)
+                if (
+                    stop_run is not None
+                    and record.connection_spike_arm is not None
+                    and record.snapshot.round5_setup is not None
+                    and record.snapshot.round5_setup.setup_validated
+                ):
+                    await stop_run(record.connection_spike_arm)
+                elif stop_setup is not None:
+                    await stop_setup(record.snapshot.id)
         except Exception as exc:
             logger.error(
                 "Round 5 cleanup handoff failed session=%s diagnostic=%s",
@@ -6627,6 +7490,10 @@ class RunManager:
     ) -> None:
         task = asyncio.current_task()
         try:
+            if self._round5_warm_coordinator is not None:
+                if not await self._retry_connection_spike_cleanup(record, engine):
+                    raise InvalidStateError("Round 5 cleanup could not be verified")
+                return
             wait_accepted = getattr(engine, "wait_for_proxy_delete_accepted", None)
             wait_complete = getattr(engine, "wait_for_cleanup_complete", None)
             if wait_accepted is not None and wait_complete is not None:
@@ -6658,6 +7525,12 @@ class RunManager:
                 raise InvalidStateError("Round 5 cleanup lease release is still pending")
             await self._mark_connection_spike_cleanup_complete(record)
         except asyncio.CancelledError:
+            # Cancellation is a lost handoff, not a reason to leave a CLEANING
+            # generation and a renewing lease with no worker. Publish retryable
+            # debt and install the convergence backstop before propagating it.
+            await asyncio.shield(
+                self._mark_connection_spike_cleanup_pending(record)
+            )
             raise
         except Exception as exc:
             logger.error(
@@ -6809,36 +7682,52 @@ class RunManager:
             # Automatic convergence keeps retrying (below), so the operator
             # notice reflects "still retrying", never "gave up, ask a human".
             still_retrying=True,
+            # ``cleanup_retryable`` is itself the admission that deletion and
+            # durable rewarm are not confirmed. It must always have a matching
+            # owed record, even if AWS accepted an earlier delete request.
+            force=True,
         )
+        # Inside the owed notice's grace window a cleanup that is still retrying is
+        # an ordinary Proxy delete in progress, not a failure. Surfacing the
+        # leaked-Proxy sentence and a failed towel with a Retry control there put
+        # an alarm on the result screen ~30 s into ordinary towel cleanups, then
+        # took it back seconds later. The session now waits for the same due time
+        # /readyz already honours; a cleanup still unconfirmed after it escalates
+        # on the next failed attempt exactly as before.
+        due = owed is None or datetime.now(UTC) >= owed.due_at
         cleanup_failure = (
-            owed.detail
-            if owed is not None
-            else "Automatic backstage cleanup is retrying."
+            (owed.detail if owed is not None else "Automatic backstage cleanup is retrying.")
+            if due
+            else None
         )
-        async with record.lock:
-            setup = record.snapshot.round5_setup
-            if setup is not None:
-                setup.cleanup_retryable = True
-                setup.cleanup_failure = cleanup_failure
-                if record.snapshot.towel is not None:
-                    setup.state = RoundFiveSetupState.TOWELLED
-                elif record.snapshot.state == SessionState.FAILED:
-                    setup.state = RoundFiveSetupState.CLEANUP_FAILED
-                    setup.failure = setup.cleanup_failure
-            if record.snapshot.towel is not None:
-                record.snapshot.towel.state = TowelState.FAILED
-                record.snapshot.towel.cleanup_failure = cleanup_failure
-            record.snapshot.updated_at = datetime.now(UTC)
-            snapshot = self._revalidated_snapshot(record.snapshot)
-            await record.event_log.publish(
-                "cleanup_update",
-                {"session": snapshot.model_dump(mode="json")},
-            )
-        # Never leave a stalled cleanup waiting on a human. This is a no-op when a
-        # convergence loop (or a live bout / in-flight cleanup task) is already
-        # running, so a reconcile that itself marks pending cannot spawn a second
-        # loop.
-        self._schedule_connection_spike_cleanup_convergence(record)
+        try:
+            async with record.lock:
+                setup = record.snapshot.round5_setup
+                if setup is not None:
+                    setup.cleanup_retryable = True
+                    setup.cleanup_failure = cleanup_failure
+                    if record.snapshot.towel is not None:
+                        setup.state = RoundFiveSetupState.TOWELLED
+                    elif record.snapshot.state == SessionState.FAILED:
+                        setup.state = RoundFiveSetupState.CLEANUP_FAILED
+                        setup.failure = (
+                            setup.cleanup_failure
+                            or "Automatic cleanup verification is in progress"
+                        )
+                if record.snapshot.towel is not None and due:
+                    record.snapshot.towel.state = TowelState.FAILED
+                    record.snapshot.towel.cleanup_failure = cleanup_failure
+                record.snapshot.updated_at = datetime.now(UTC)
+                snapshot = self._revalidated_snapshot(record.snapshot)
+                await record.event_log.publish(
+                    "cleanup_update",
+                    {"session": snapshot.model_dump(mode="json")},
+                )
+        finally:
+            # Never leave a stalled cleanup waiting on a human, even if publishing
+            # the operator snapshot itself failed. This is a no-op when a
+            # convergence loop is already running.
+            self._schedule_connection_spike_cleanup_convergence(record)
 
     def _note_round5_proxy_at_risk(
         self,
@@ -6846,6 +7735,7 @@ class RunManager:
         *,
         attempts: int | None = None,
         still_retrying: bool = True,
+        force: bool = False,
     ) -> Round5CleanupOwed | None:
         """Put a Proxy that cleanup has not deleted where ``/readyz`` can see it.
 
@@ -6868,7 +7758,7 @@ class RunManager:
         if engine is None:
             return None
         accepted = getattr(engine, "proxy_delete_accepted", None)
-        if still_retrying and accepted is not None:
+        if not force and still_retrying and accepted is not None:
             try:
                 if bool(accepted()):
                     return None
@@ -7392,12 +8282,23 @@ class RunManager:
         record: SessionRecord,
         engine: object,
     ) -> bool:
-        reconcile = getattr(engine, "reconcile_failed_cleanup", None)
+        await self._refresh_round5_slot_from_durable(record)
+        # Finding 1: if the durable head proves THIS claim's cleanup already
+        # completed and the generation advanced (finished by another owner or the
+        # supervised loop), the stale local claim/cleanup lease must be retired --
+        # rather than begin_cleanup-ing a claim that no longer exists (WarmFenceLost)
+        # and heartbeating a dead round5_cleanup lease that keeps the overlay
+        # unstartable. Never retire on unrelated/blocking states: only when our claim
+        # is gone from the head AND the generation advanced past it.
+        coordinator = self._round5_warm_coordinator
+        if coordinator is not None:
+            durable = await self._read_round5_durable_slot()
+            if durable is not None and self._round5_cleanup_completed_and_advanced(
+                record, durable
+            ):
+                return await self._retire_completed_round5_cleanup(record, durable)
         async with record.lease_lock:
             lease = record.round5_lease
-        if reconcile is None:
-            await self._mark_connection_spike_cleanup_pending(record)
-            return False
         if lease is None or lease.phase != "round5_cleanup":
             operator = record.operator
             if operator is not None:
@@ -7421,11 +8322,19 @@ class RunManager:
             and record.round5_warm_slot.claim is not None
             else None
         )
-        if self._round5_warm_coordinator is not None and claim_id is not None:
+        coordinator = self._round5_warm_coordinator
+        converge = (
+            getattr(coordinator, "converge_cleanup", None)
+            if coordinator is not None
+            else None
+        )
+        if coordinator is not None and claim_id is not None and callable(converge):
+            # SINGLE-OWNER path (a warm coordinator exists): the manager requests +
+            # awaits the coordinator's coalesced convergence and NEVER
+            # settles/cancels/reconciles external resources itself. begin_cleanup is
+            # a durable store CAS (ownership fence), not an external mutation.
             try:
-                record.round5_warm_slot = (
-                    await self._round5_warm_coordinator.begin_cleanup(claim_id)
-                )
+                record.round5_warm_slot = await coordinator.begin_cleanup(claim_id)
             except Exception as exc:
                 logger.error(
                     "Round 5 durable cleanup start is not settled session=%s "
@@ -7435,37 +8344,71 @@ class RunManager:
                 )
                 await self._mark_connection_spike_cleanup_pending(record)
                 return False
-        try:
-            await reconcile(record.snapshot.id, lease.fencing_token)
-        except Exception as exc:
-            logger.error(
-                "Round 5 cleanup is not settled session=%s diagnostic=%s",
-                record.snapshot.id,
-                _redacted_exception_chain(exc),
-            )
-            await self._mark_connection_spike_cleanup_pending(record)
-            return False
-
-        if (
-            self._round5_warm_coordinator is not None
-            and claim_id is not None
-        ):
+            # THE single external-mutation owner: the coordinator's coalesced
+            # convergence performs the exact durable SETTLED + provider/journal
+            # absence under the lease heartbeat, then finish_cleanup_and_rewarm to
+            # generation N+1. Concurrent triggers (this worker, the supervised loop,
+            # a takeover) collapse to one reconcile sequence; a lost fence aborts
+            # without mutating.
             try:
-                record.round5_warm_slot = (
-                    await self._round5_warm_coordinator.finish_cleanup_and_rewarm(
-                        claim_id
-                    )
-                )
-                record.round5_launch_capsule = None
+                converged = await converge(claim_id)
             except Exception as exc:
                 logger.error(
-                    "Round 5 durable rewarm transition is not settled session=%s "
+                    "Round 5 durable cleanup convergence is not settled session=%s "
                     "diagnostic=%s",
                     record.snapshot.id,
                     _redacted_exception_chain(exc),
                 )
                 await self._mark_connection_spike_cleanup_pending(record)
                 return False
+            if converged.state != Round5WarmState.WARMING:
+                # Not yet proven SETTLED + absent; the slot stays CLEANING (visible
+                # as cleanup owed) and the worker retries -- never a silent strand.
+                record.round5_warm_slot = converged
+                await self._mark_connection_spike_cleanup_pending(record)
+                return False
+            record.round5_warm_slot = converged
+            record.round5_launch_capsule = None
+        else:
+            # LEGACY path: NO warm coordinator is configured, so there is nothing to
+            # delegate to and the manager is the SOLE cleanup owner (still exactly
+            # one owner -- not dual ownership). Drive the engine reconcile directly.
+            reconcile = getattr(engine, "reconcile_failed_cleanup", None)
+            if reconcile is None:
+                await self._mark_connection_spike_cleanup_pending(record)
+                return False
+            if self._round5_prebell_cleanup_required(record):
+                reconcile_abandoned = getattr(engine, "reconcile_abandoned_claim", None)
+                claim = (
+                    record.round5_warm_slot.claim
+                    if record.round5_warm_slot is not None
+                    else None
+                )
+                if not callable(reconcile_abandoned) or claim is None:
+                    await self._mark_connection_spike_cleanup_pending(record)
+                    return False
+                try:
+                    await reconcile_abandoned(claim)
+                except Exception as exc:
+                    logger.error(
+                        "Round 5 pre-bell resident cleanup is not settled "
+                        "session=%s diagnostic=%s",
+                        record.snapshot.id,
+                        _redacted_exception_chain(exc),
+                    )
+                    await self._mark_connection_spike_cleanup_pending(record)
+                    return False
+            else:
+                try:
+                    await reconcile(record.snapshot.id, lease.fencing_token)
+                except Exception as exc:
+                    logger.error(
+                        "Round 5 cleanup is not settled session=%s diagnostic=%s",
+                        record.snapshot.id,
+                        _redacted_exception_chain(exc),
+                    )
+                    await self._mark_connection_spike_cleanup_pending(record)
+                    return False
         self._require_round5_rewarm_transition(record)
         main_released = await self._release_bout(record)
         round5_released = (
@@ -7478,22 +8421,163 @@ class RunManager:
         snapshot = await self.get(record.snapshot.id)
         return not (snapshot.round5_setup is not None and snapshot.round5_setup.cleanup_retryable)
 
+    async def _read_round5_durable_slot(self):
+        """Best-effort read of the authoritative durable warm slot (or None)."""
+
+        coordinator = self._round5_warm_coordinator
+        if coordinator is None:
+            return None
+        try:
+            return await coordinator.store.read(coordinator.installation_id)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _round5_cleanup_completed_and_advanced(record: SessionRecord, durable) -> bool:
+        """Whether THIS claim's cleanup already completed and advanced the generation.
+
+        True only when our claim is no longer the durable head AND the durable
+        generation has advanced past the one the claim was created against -- i.e.
+        finish_cleanup_and_rewarm ran (here or under another owner). A head still
+        bearing our claim (cleanup in progress), or at/below our generation (a stall
+        or a block on our own generation), is NOT complete, so this never retires on
+        an unrelated or blocking state.
+        """
+
+        slot = record.round5_warm_slot
+        claim = getattr(slot, "claim", None) if slot is not None else None
+        if claim is None or durable is None:
+            return False
+        durable_claim = getattr(durable, "claim", None)
+        durable_claim_id = (
+            durable_claim.claim_id if durable_claim is not None else None
+        )
+        return (
+            durable_claim_id != claim.claim_id
+            and durable.generation > claim.capsule_generation
+        )
+
+    async def _retire_completed_round5_cleanup(
+        self, record: SessionRecord, durable
+    ) -> bool:
+        """Retire a stale local claim whose cleanup completed+advanced elsewhere.
+
+        Adopts the durable head, drops the stale launch capsule, stops the cleanup
+        heartbeat and releases the cleanup + ring leases so the overlay is startable
+        again. Marks the local cleanup complete; never issues external mutation.
+        """
+
+        record.round5_warm_slot = durable
+        record.round5_launch_capsule = None
+        main_released = await self._release_bout(record)
+        round5_released = (
+            await self._release_round5_lease(record) if main_released else False
+        )
+        if main_released and round5_released:
+            await self._mark_connection_spike_cleanup_complete(record)
+            return True
+        await self._mark_connection_spike_cleanup_pending(record)
+        return False
+
+    async def _refresh_round5_slot_from_durable(self, record: SessionRecord) -> None:
+        """Refresh the cached warm slot from durable truth for cleanup classification.
+
+        Blocker 1: cleanup's pre/post-bell classification must be derivable from the
+        COMMITTED store keyed by this claim, not only a local cache that a crash
+        between accept_bell and the local update could have left stale. Best-effort
+        and same-claim only (never clobbers across generations).
+        """
+
+        coordinator = self._round5_warm_coordinator
+        if coordinator is None:
+            return
+        try:
+            durable = await coordinator.store.read(coordinator.installation_id)
+        except Exception:
+            return
+        if durable is None:
+            return
+        durable_claim = getattr(durable, "claim", None)
+        if durable_claim is None:
+            return
+        cached = record.round5_warm_slot
+        cached_claim = getattr(cached, "claim", None) if cached is not None else None
+        if cached is None or (
+            cached_claim is not None and cached_claim.claim_id == durable_claim.claim_id
+        ):
+            record.round5_warm_slot = durable
+
     async def _cleanup_connection_spike(self, record: SessionRecord) -> bool:
+        # Adopt durable post-bell truth before classifying pre/post-bell cleanup.
+        await self._refresh_round5_slot_from_durable(record)
+        # Finding 3: when a warm coordinator is configured it (via converge_cleanup ->
+        # provider.reconcile on the ADOPTED claimed engine) is the SOLE external
+        # cleanup janitor -- staged-resident cancel, per-bout Proxy delete, journal
+        # absence. The manager therefore performs NO external mutation here: it only
+        # drops its local, non-mutating setup cache. This eliminates the dual-mutation
+        # where the manager ran the full janitor while the coordinator reconciled a
+        # fresh engine. (The legacy branch below is the degraded/no-coordinator SOLE
+        # owner; see _round5_cleanup_uses_coordinator.)
+        if self._round5_warm_coordinator is not None:
+            record.connection_spike_setup_result = None
+            return True
         engine = record.connection_spike_engine
         arm = record.connection_spike_arm
+        settle_abandoned = (
+            getattr(engine, "settle_abandoned_arm", None) if engine is not None else None
+        )
         cleanup = getattr(engine, "cancel_and_cleanup", None) if engine is not None else None
         setup_cleanup = (
             getattr(engine, "cancel_setup_and_settle", None) if engine is not None else None
         )
         ok = True
+        # Unstage the Lakebase resident staged at ARM before any other teardown.
+        # ARM prepares that resident ahead of the bell, so on a pre-bell abandon
+        # (armed-TTL expiry, refused bell, arm failure) it is not represented in
+        # the dispatched-lane cleanup below and would otherwise stay resident,
+        # colliding with the next warm generation's wait_agent_ready ("resident
+        # readiness binding changed") and latching the slot BLOCKED
+        # (warm_baseline_unexpected). Idempotent and a no-op once settled, so it
+        # is safe on every cleanup path including a fully-run bout.
+        try:
+            if settle_abandoned is not None:
+                task = asyncio.create_task(settle_abandoned())
+                deferred = await asyncio.shield(task)
+                if deferred:
+                    ok = False
+                    logger.error(
+                        "Round 5 abandoned-arm resident settlement remains deferred "
+                        "session=%s jobs=%d; cleanup fence retained",
+                        record.snapshot.id,
+                        len(deferred),
+                    )
+        except Exception as exc:
+            ok = False
+            logger.error(
+                "Round 5 abandoned-arm resident settle failed session=%s diagnosis=%s; "
+                "the warm slot is held closed until it settles",
+                record.snapshot.id,
+                operator_diagnosis(exc),
+                exc_info=True,
+            )
         try:
             if cleanup is not None and arm is not None:
                 task = asyncio.create_task(cleanup(arm))
                 await asyncio.shield(task)
         except Exception:
             ok = False
+        # A pre-bell abandon (the claim never crossed the bell transaction) created
+        # no per-bout Proxy and no timed-setup resources, so it must NOT invoke the
+        # post-setup teardown seam. ``cancel_setup_and_settle`` tears down timed
+        # setup a pre-bell claim never ran and, on the real engine, raises "setup
+        # cleanup bout is stale" (no ``_setup_bout_id`` was recorded), turning a
+        # clean unstage into a spurious cleanup failure. The staged ARM residents
+        # are already settled above by ``settle_abandoned_arm``; the durable
+        # resident reconcile (``reconcile_abandoned_claim``) proves provider
+        # absence on the retry worker.
+        prebell = self._round5_prebell_cleanup_required(record)
         try:
-            if setup_cleanup is not None:
+            if setup_cleanup is not None and not prebell:
                 task = asyncio.create_task(setup_cleanup(record.snapshot.id))
                 await asyncio.shield(task)
         except Exception:
@@ -9456,6 +10540,98 @@ class RunManager:
             return
 
         settlement_error: str | None = None
+        retry_deadline = time.monotonic() + self._towel_cleanup_retry_window
+        retry_delay = max(0.05, self._cleanup_retry_initial)
+        attempt = 0
+        while True:
+            attempt += 1
+            settlement_error = await self._settle_towel_once(
+                record, round_id, run_task, wait_for_run=wait_for_run
+            )
+            if (
+                settlement_error is None
+                or round_id not in _TOWEL_CLEANUP_AUTO_RETRY_ROUNDS
+                or time.monotonic() + retry_delay > retry_deadline
+            ):
+                break
+            logger.warning(
+                "Towel cleanup attempt %d has not converged session=%s diagnostic=%s; "
+                "retrying automatically in %.1fs",
+                attempt,
+                record.snapshot.id,
+                settlement_error,
+                retry_delay,
+            )
+            try:
+                await asyncio.sleep(retry_delay)
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    asyncio.create_task(
+                        self._mark_towel_cleanup_failed(
+                            record,
+                            "Towel cleanup was cancelled before the ring could be "
+                            "released; retry cleanup.",
+                        ),
+                        name=f"towel-cancelled-{record.snapshot.id}",
+                    )
+                )
+                raise
+            retry_delay = min(retry_delay * 2, max(retry_delay, self._cleanup_retry_max))
+            async with record.lock:
+                if record.snapshot.towel is None:
+                    return
+                record.snapshot.cooldown = self._new_towel_cooldown(record)
+                record.snapshot.updated_at = datetime.now(UTC)
+                snapshot = record.snapshot.model_copy(deep=True)
+            await record.event_log.publish(
+                "towel_update",
+                {"session": snapshot.model_dump(mode="json")},
+            )
+
+        if settlement_error is None:
+            await self._settle_towel_cost_window(record)
+        round_one_cooldown_held = (
+            settlement_error is None and round_id == RoundId.WAKE_IDLE_APP
+        )
+        released = round_one_cooldown_held or (
+            settlement_error is None and await self._release_bout(record)
+        )
+        if settlement_error is None and not released:
+            settlement_error = "Ring release could not be confirmed; retry towel cleanup."
+
+        async with record.lock:
+            towel = record.snapshot.towel
+            if towel is None:
+                return
+            if settlement_error is None:
+                towel.state = TowelState.READY
+                towel.cleanup_failure = None
+                event = "towel_finished"
+            else:
+                towel.state = TowelState.FAILED
+                towel.cleanup_failure = settlement_error
+                event = "towel_update"
+            record.snapshot.updated_at = datetime.now(UTC)
+            snapshot = record.snapshot.model_copy(deep=True)
+        await record.event_log.publish(
+            event,
+            {"session": snapshot.model_dump(mode="json")},
+        )
+        if settlement_error is None and round_id == RoundId.WAKE_IDLE_APP:
+            if record.cooldown_task is asyncio.current_task():
+                record.cooldown_task = None
+            self._schedule_round_one_cooldown(record)
+
+    async def _settle_towel_once(
+        self,
+        record: SessionRecord,
+        round_id: RoundId,
+        run_task: asyncio.Task[None] | None,
+        *,
+        wait_for_run: bool,
+    ) -> str | None:
+        """Run one towel settlement for a non-Round-5 round; return why it failed, or None."""
+
         try:
             if round_id in {
                 RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
@@ -9542,41 +10718,8 @@ class RunManager:
             )
             raise
         except Exception as exc:
-            settlement_error = str(exc) or "Automatic towel cleanup could not be verified"
-
-        if settlement_error is None:
-            await self._settle_towel_cost_window(record)
-        round_one_cooldown_held = (
-            settlement_error is None and round_id == RoundId.WAKE_IDLE_APP
-        )
-        released = round_one_cooldown_held or (
-            settlement_error is None and await self._release_bout(record)
-        )
-        if settlement_error is None and not released:
-            settlement_error = "Ring release could not be confirmed; retry towel cleanup."
-
-        async with record.lock:
-            towel = record.snapshot.towel
-            if towel is None:
-                return
-            if settlement_error is None:
-                towel.state = TowelState.READY
-                towel.cleanup_failure = None
-                event = "towel_finished"
-            else:
-                towel.state = TowelState.FAILED
-                towel.cleanup_failure = settlement_error
-                event = "towel_update"
-            record.snapshot.updated_at = datetime.now(UTC)
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            event,
-            {"session": snapshot.model_dump(mode="json")},
-        )
-        if settlement_error is None and round_id == RoundId.WAKE_IDLE_APP:
-            if record.cooldown_task is asyncio.current_task():
-                record.cooldown_task = None
-            self._schedule_round_one_cooldown(record)
+            return str(exc) or "Automatic towel cleanup could not be verified"
+        return None
 
     async def _reset_safe_change(self, record: SessionRecord) -> None:
         engine = record.safe_change_engine
@@ -9975,6 +11118,32 @@ class RunManager:
                         source_lane.state == LaneState.VERIFIED
                         and source_lane.connection_closed_at is not None
                     )
+                    # A pre-verify towel has no verified lane whose connection-close
+                    # evidence can be reconciled. Requiring that impossible evidence
+                    # made an accepted early towel time out even after the control
+                    # plane repeatedly proved IDLE. This exception is deliberately
+                    # bout-wide and towel-specific: if either lane verified, its real
+                    # cleanup evidence remains required, and an ordinary unverified
+                    # failure still cannot pass vacuously.
+                    preverify_towel = bool(
+                        record.snapshot.state == SessionState.TOWELLED
+                        and record.snapshot.towel is not None
+                        and not any(
+                            candidate.state == LaneState.VERIFIED
+                            for candidate in record.snapshot.lanes.values()
+                        )
+                    )
+                    settled_towel_without_close = bool(
+                        record.snapshot.state == SessionState.TOWELLED
+                        and record.snapshot.towel is not None
+                        and record.snapshot.towel.state == TowelState.READY
+                        and source_lane.connection_closed_at is None
+                    )
+                    activity_reconciled = (
+                        activity_proved
+                        or preverify_towel
+                        or settled_towel_without_close
+                    )
                     provider_updated_at = self._cooldown_timestamp(
                         check.get("provider_updated_at")
                     )
@@ -10002,7 +11171,7 @@ class RunManager:
                         and now_ns > first_observed_ns
                         and dwell_seconds >= self._lakebase_idle_dwell
                     )
-                    if activity_proved and (
+                    if activity_reconciled and (
                         provider_corrobates_post_close or dwell_confirmed
                     ):
                         # This is an observed-by upper bound. Even when the
@@ -10018,19 +11187,43 @@ class RunManager:
                                 (completed_at - lane.started_at).total_seconds() * 1000,
                             ),
                         )
-                        basis = (
-                            "provider_update_corroboration"
-                            if provider_corrobates_post_close
-                            else "observed_idle_dwell"
-                        )
+                        if preverify_towel:
+                            basis = (
+                                "preverify_towel_provider_idle"
+                                if provider_corrobates_post_close
+                                else "preverify_towel_observed_idle_dwell"
+                            )
+                        elif settled_towel_without_close:
+                            basis = (
+                                "settled_towel_provider_idle"
+                                if provider_corrobates_post_close
+                                else "settled_towel_observed_idle_dwell"
+                            )
+                        else:
+                            basis = (
+                                "provider_update_corroboration"
+                                if provider_corrobates_post_close
+                                else "observed_idle_dwell"
+                            )
                         assign("confirmation_basis", basis)
-                        status = (
-                            "IDLE confirmed by current control-plane state; endpoint "
-                            "update metadata corroborates a post-close observation"
-                            if provider_corrobates_post_close
-                            else "IDLE confirmed by repeated independent control-plane "
-                            "observations after the lane connection closed"
-                        )
+                        if preverify_towel:
+                            status = (
+                                "IDLE confirmed after a pre-verify towel; no verified "
+                                "lane activity exists to reconcile"
+                            )
+                        elif settled_towel_without_close:
+                            status = (
+                                "IDLE confirmed after the towel settled the run whose "
+                                "connection-close timestamp did not arrive"
+                            )
+                        else:
+                            status = (
+                                "IDLE confirmed by current control-plane state; endpoint "
+                                "update metadata corroborates a post-close observation"
+                                if provider_corrobates_post_close
+                                else "IDLE confirmed by repeated independent control-plane "
+                                "observations after the lane connection closed"
+                            )
                         activity = LaneActivity(
                             phase="confirmed_zero",
                             wire_call=wire_call,

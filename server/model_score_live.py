@@ -1290,12 +1290,21 @@ class Round4PipelineActivation:
         self._started_by_arm = True
         self._started_by_process = True
         deadline = self._clock() + self._wait_timeout_seconds
+        healthy_observations = 0
         while True:
             await self._sleep(self._poll_seconds)
             signals = await self._read_signals()
             if self._healthy(signals):
-                await notify("The Managed Sync pipeline is running. Verifying the baseline.")
-                return
+                healthy_observations += 1
+                if healthy_observations >= 2:
+                    await notify("The Managed Sync pipeline is running. Verifying the baseline.")
+                    return
+            else:
+                # The pipeline and synced-table status endpoints can briefly
+                # disagree while a stopped continuous update is resuming. One
+                # healthy projection followed by a stopped-shaped projection
+                # is not a safe handoff to the stricter baseline inspector.
+                healthy_observations = 0
             if (
                 requested.update_id
                 and signals.update_id == requested.update_id

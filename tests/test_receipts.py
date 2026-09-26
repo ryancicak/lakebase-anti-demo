@@ -120,6 +120,25 @@ class FakeCoordinationCursor:
                 )
             self.schema_present = True
             self.table_present = True
+        elif "bout_receipt_cleanup_upsert_v1(" in statement:
+            # The SECURITY DEFINER cleanup overlay (sql/round5_receipt_least_privilege.sql).
+            # Same guard as the INSERT branch below -- never move a newer overlay, only
+            # replace it when the diagnostic changed -- with the sealing event fixed to
+            # 'cleanup_update' by the function rather than supplied by the caller.
+            session_id, round_id, receipt, run_id, outcome, sealed_at, document = params
+            key = (session_id, round_id, "cleanup_update")
+            row = (
+                session_id, round_id, "cleanup_update", receipt,
+                run_id, outcome, sealed_at, document,
+            )
+            current = self.rows.get(key)
+            if current is None:
+                self.rows[key] = row
+            else:
+                current_failure = json.loads(current[7])["receipt"].get("cleanup_failure")
+                new_failure = json.loads(document)["receipt"].get("cleanup_failure")
+                if current[6] <= sealed_at and current_failure != new_failure:
+                    self.rows[key] = row
         elif statement.startswith(f"INSERT INTO {BOUT_RECEIPT_TABLE}"):
             key = (params[0], params[1], params[2])
             current = self.rows.get(key)

@@ -77,6 +77,13 @@ locals {
   round5_bout_tag_keys = sort(keys(merge(local.round5_bout_base_tags, {
     "anti-demo-bout-id"    = ""
     "anti-demo:bout-token" = ""
+    # The per-bout Proxy/target-group carry an immutable operation-identity fence
+    # tag (server/connection_spike_live.py _coordinator: tags["anti-demo:bout-fence"]).
+    # It MUST be in this set or CreateDBProxy's dependent rds:AddTagsToResource is
+    # denied (ForAllValues aws:TagKeys), which fails the competitor lane at the
+    # bell. Membership here also extends the tag-hijack Deny guard to the fence,
+    # matching the "verified EXACTLY on inspect/adopt/cleanup" contract.
+    "anti-demo:bout-fence" = ""
   })))
 
   database_name   = "anti_demo"

@@ -537,6 +537,40 @@ async def test_arm_requires_cdf_continuous_caught_up_exact_baseline() -> None:
         await engine.arm()
 
 
+async def test_arm_retries_a_transient_provider_projection_then_validates_strictly() -> None:
+    contract = model_score_contract()
+
+    class TransientProjectionAdapter(FakeModelScoreAdapter):
+        transient_projection = True
+
+        async def inspect_sync(self) -> ManagedSyncStatus:
+            if self.transient_projection:
+                self.transient_projection = False
+                self.inspection_calls += 1
+                raise ModelScorePipelineError(
+                    "synced-table continuous status is temporarily absent"
+                )
+            return await super().inspect_sync()
+
+    adapter = TransientProjectionAdapter(
+        contract,
+        statuses=[healthy_status(9, 9), warm_up_status(10), warm_up_status(10)],
+        commits=[warm_up_commit(10)],
+    )
+    engine = ModelScoreEngine(
+        adapter,
+        contract=contract,
+        max_poll_attempts=4,
+        poll_interval_seconds=0,
+        now=lambda: NOW,
+    )
+
+    arm = await engine.arm()
+
+    assert arm.source_version == 10
+    assert adapter.inspection_calls == 4
+
+
 async def test_arm_restores_only_matching_demo_owned_prior_proof_off_clock() -> None:
     contract = model_score_contract()
     prior = ModelScoreRow(

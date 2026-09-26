@@ -277,6 +277,12 @@ export interface FightCardRoundStatus {
   detail: string | null
   updated_at: string | null
   expires_at: string | null
+  round5_start?: {
+    stage: 'ready' | 'cleaning' | 'claim-drain' | 'terminal-blocked' | 'identity-refresh' | 'rewarming'
+    generation: number | null
+    recovery_scheduled: boolean | null
+    cleanup_scope: 'prebell_resident' | 'postbell_resources' | 'unknown' | null
+  } | null
 }
 
 export interface AllBoutStatus {

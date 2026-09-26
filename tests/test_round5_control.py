@@ -770,6 +770,10 @@ async def test_persistent_delivery_failure_reports_only_sanitized_reason(
             result=reasons.append(code),
         ),
         persistent_failure_threshold=2,
+        # This test targets sanitization of the persistent-failure reason, not the
+        # anti-flicker time window; keep it count-based so two real-row send failures
+        # trip the withdrawal. (The window is covered by a dedicated test.)
+        persistent_failure_window_seconds=0.0,
     )
     caplog.set_level(logging.WARNING, logger="server.round5_control")
 
@@ -784,24 +788,223 @@ async def test_persistent_delivery_failure_reports_only_sanitized_reason(
 async def test_outbox_dispatch_failure_is_visible_without_leaking_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class FailingStore(InMemoryRound5ControlStore):
-        async def pending(
-            self,
-            limit: int = 32,
-            *,
-            allowed_release_ids=(),
-        ) -> tuple[Round5ControlEvent, ...]:
-            raise RuntimeError("secret-provider-detail")
+    # A REAL outbox row whose delivery (_send) fails is a genuine publish failure
+    # (visible, sanitized). A failed empty-outbox SCAN is deliberately NOT a delivery
+    # failure (Fix E) and is covered separately, so this test enqueues a real row and
+    # fails the send.
+    store = InMemoryRound5ControlStore()
+    request = canonical_request()
+    event = Round5ControlEvent.create(
+        binding=binding(claim_bound=False, request=request),
+        sequence=1,
+        kind=Round5ControlKind.PRELOAD,
+        payload={"request": request},
+    )
+    await store.enqueue(event)
 
-    dispatcher = Round5ControlDispatcher(FailingStore(), lambda _event: asyncio.sleep(0))
+    async def fail(_event: Round5ControlEvent) -> None:
+        raise RuntimeError("secret-provider-detail")
+
+    dispatcher = Round5ControlDispatcher(store, fail)
     caplog.set_level(logging.WARNING, logger="server.round5_control")
 
-    await dispatcher.start()
-    await asyncio.sleep(0)
-    await dispatcher.close()
+    with pytest.raises(RuntimeError):
+        await dispatcher.publish_once()
 
     assert "round5_control_outbox_publish_failed consecutive_failures=1" in caplog.text
     assert "secret-provider-detail" not in caplog.text
+
+
+async def test_validate_ready_provenance_tri_state_precedence() -> None:
+    # B1: exercise the REAL LiveConnectionSpikeEngine.validate_ready_provenance against
+    # a boundary transport returning each ResidentLiveness state, and assert the mapping
+    # + precedence: all CURRENT -> True; any STALE/ABSENT -> RetryableWarmError (strike);
+    # any IDENTITY_CHANGED -> False (demote); IDENTITY_CHANGED beats STALE (identity wins).
+    from types import SimpleNamespace
+
+    from server.connection_spike_live import LiveConnectionSpikeEngine
+    from server.round5_control import ResidentLiveness
+    from server.round5_warm import RetryableWarmError
+
+    def receipt(lane: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            boot_id=f"boot-{lane}",
+            process_boot_id=f"pboot-{lane}",
+            process_pid=100,
+            loaded_harness_sha256="h",
+            capacity_model_sha256="m",
+        )
+
+    shared = SimpleNamespace(
+        lakebase_runner=receipt("lakebase"),
+        competitor_runner=receipt("competitor"),
+    )
+
+    def make_engine(states: dict[str, ResidentLiveness]) -> LiveConnectionSpikeEngine:
+        class _Transport:
+            async def resident_liveness(self, **kw: object) -> ResidentLiveness:
+                return states[kw["lane_id"]]
+
+        engine = object.__new__(LiveConnectionSpikeEngine)
+        engine._armed = SimpleNamespace(
+            preflights={
+                lane: SimpleNamespace(
+                    boot_id=f"boot-{lane}", runner_harness_sha256="h", model_sha256="m"
+                )
+                for lane in ("lakebase", "competitor")
+            }
+        )
+        engine._lane_adapters = {
+            lane: SimpleNamespace(
+                _resident_process_boot_id=f"pboot-{lane}",
+                _resident_process_pid=100,
+                _resident_transport=_Transport(),
+                config=SimpleNamespace(resident_installation_id="inst"),
+            )
+            for lane in ("lakebase", "competitor")
+        }
+        return engine
+
+    both_current = {"lakebase": ResidentLiveness.CURRENT, "competitor": ResidentLiveness.CURRENT}
+    assert await make_engine(both_current).validate_ready_provenance(shared, "tok") is True
+
+    with pytest.raises(RetryableWarmError):
+        await make_engine(
+            {"lakebase": ResidentLiveness.CURRENT, "competitor": ResidentLiveness.STALE}
+        ).validate_ready_provenance(shared, "tok")
+    with pytest.raises(RetryableWarmError):
+        await make_engine(
+            {"lakebase": ResidentLiveness.ABSENT, "competitor": ResidentLiveness.CURRENT}
+        ).validate_ready_provenance(shared, "tok")
+
+    assert (
+        await make_engine(
+            {"lakebase": ResidentLiveness.IDENTITY_CHANGED, "competitor": ResidentLiveness.CURRENT}
+        ).validate_ready_provenance(shared, "tok")
+        is False
+    )
+    # Precedence: an attested identity change on ANY lane wins over a stale lane.
+    assert (
+        await make_engine(
+            {"lakebase": ResidentLiveness.IDENTITY_CHANGED, "competitor": ResidentLiveness.STALE}
+        ).validate_ready_provenance(shared, "tok")
+        is False
+    )
+
+
+async def test_outbox_scan_failure_does_not_increment_delivery_streak() -> None:
+    # B5: a repeatedly-failing outbox SCAN (pending() raises) logs a warning, returns 0,
+    # and does NOT increment the delivery-failure streak or invalidate readiness -- there
+    # is no real outbox row that failed to deliver. Mutation: counting a scan failure as
+    # a delivery failure trips the persistent-failure withdrawal (idle TU flicker).
+    class ScanFailStore(InMemoryRound5ControlStore):
+        async def pending(self, limit: int = 32, *, allowed_release_ids=()):
+            raise RuntimeError("transient-scan-blip")
+
+    invalidated: list[str] = []
+
+    async def on_fail(code: str) -> None:
+        invalidated.append(code)
+
+    dispatcher = Round5ControlDispatcher(
+        ScanFailStore(),
+        lambda _event: asyncio.sleep(0),
+        on_persistent_failure=on_fail,
+        persistent_failure_threshold=1,
+        persistent_failure_window_seconds=0.0,
+    )
+    for _ in range(5):
+        assert await dispatcher.publish_once() == 0
+    assert dispatcher._consecutive_failures == 0
+    assert invalidated == []
+
+
+async def test_round5_structured_start_surfaces_revision_and_error() -> None:
+    # B4: the machine-readable Round 5 start status exposes the durable warm revision and
+    # last error code so a soak can track idle keep-alive health from stable fields.
+    from server.manager import RunManager
+
+    status = RunManager._round5_structured_start(
+        {
+            "round5_start_stage": "rewarming",
+            "round5_warm_generation": 28,
+            "round5_warm_revision": 58482,
+            "round5_warm_last_error_code": "warm_fence_contention",
+        }
+    )
+    assert status is not None
+    assert status.generation == 28
+    assert status.revision == 58482
+    assert status.last_error_code == "warm_fence_contention"
+    # Absent/blank values normalize to None rather than leaking a falsy placeholder.
+    cleared = RunManager._round5_structured_start(
+        {"round5_start_stage": "ready", "round5_warm_revision": None}
+    )
+    assert cleared is not None
+    assert cleared.revision is None
+    assert cleared.last_error_code is None
+
+
+async def test_cleanup_overlay_read_exception_does_not_latch_blocked() -> None:
+    # B3/D: a single failed read of the cleanup-fence lease (a transient store blip) must
+    # NOT latch _round5_durable_cleanup_blocked or return a Temporarily Unavailable
+    # overlay; it returns None (unknown, warm status governs) so the fight card stays
+    # startable across board polls. Mutation: latching blocked + returning a TU overlay
+    # on the read exception fails this test.
+    from server.manager import RunManager
+
+    manager = object.__new__(RunManager)
+    manager._round5_durable_cleanup_blocked = False
+
+    class _FailingCleanupStore:
+        async def current(self) -> object:
+            raise RuntimeError("transient-lease-read-blip")
+
+    manager._round5_cleanup_store = lambda: _FailingCleanupStore()
+
+    overlay = await manager.round5_durable_cleanup_overlay()
+
+    assert overlay is None
+    assert manager._round5_durable_cleanup_blocked is False
+
+
+async def test_outbox_persistent_failure_requires_sustained_window_not_burst() -> None:
+    # Fix B/E: withdrawing Round 5 readiness for an outbox failure requires the failure
+    # to PERSIST across a real wall-clock window, not just a sub-second burst at the
+    # ~10Hz idle poll rate. Mutation: dropping the window (count-only) fires the
+    # readiness withdrawal on the burst and reintroduces the idle "Temporarily
+    # Unavailable" flicker from a transient store blip.
+    invalidated: list[str] = []
+    clk = {"t": datetime(2026, 1, 1, tzinfo=UTC)}
+
+    async def on_fail(code: str) -> None:
+        invalidated.append(code)
+
+    store = InMemoryRound5ControlStore()
+    dispatcher = Round5ControlDispatcher(
+        store,
+        lambda _event: asyncio.sleep(0),
+        on_persistent_failure=on_fail,
+        persistent_failure_threshold=3,
+        persistent_failure_window_seconds=8.0,
+        now=lambda: clk["t"],
+    )
+
+    # A sub-second burst well past the COUNT threshold must NOT withdraw readiness,
+    # because the failure has not persisted across the wall-clock WINDOW.
+    for _ in range(12):
+        clk["t"] += timedelta(seconds=0.05)
+        await dispatcher._record_delivery_failure()
+    assert invalidated == []
+
+    # Once the failure has persisted past the window, it withdraws (fails closed).
+    clk["t"] += timedelta(seconds=9)
+    await dispatcher._record_delivery_failure()
+    assert invalidated == ["resident_control_delivery_failed"]
+
+    # Recovery resets the window so a later isolated blip starts fresh.
+    dispatcher._record_delivery_success()
+    assert dispatcher._first_failure_at is None
 
 
 async def test_injected_fifteen_second_preparation_finishes_before_stage_returns() -> None:
@@ -1663,6 +1866,113 @@ async def test_restart_reconciliation_uses_resident_registry_not_ssm() -> None:
     adapter._resident_transport = Transport()
     await adapter.cancel_job("a" * 64)
     assert calls == ["a" * 64]
+
+
+async def test_prebell_restart_settles_claim_jobs_before_absence_proof() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class Adapter:
+        def __init__(self, lane_id):
+            self.lane_id = lane_id
+
+        async def cancel_job(self, job_id):
+            calls.append((self.lane_id, job_id))
+
+    class Orchestrator:
+        async def prove_bout_absent(self, bout_id):
+            assert calls == [
+                ("lakebase", "a" * 64),
+                ("competitor", "b" * 64),
+            ]
+            calls.append(("prove_absent", bout_id))
+
+    engine = object.__new__(LiveConnectionSpikeEngine)
+    engine._lane_adapters = {
+        "lakebase": Adapter("lakebase"),
+        "competitor": Adapter("competitor"),
+    }
+    engine._setup_orchestrator = Orchestrator()
+    engine._warm_attempt_token = ""
+    engine._bound_claim = None
+    engine._cleanup_bout_id = None
+    claim = SimpleNamespace(
+        lakebase_job_id="a" * 64,
+        competitor_job_id="b" * 64,
+        capsule_generation=7,
+        warm_attempt_token="attempt-prebell-restart",
+        bout_id="bout-prebell-restart",
+    )
+
+    await engine.reconcile_abandoned_claim(claim)
+
+    assert calls[-1] == ("prove_absent", "bout-prebell-restart")
+
+
+async def test_reused_engine_second_abandon_supersedes_first_cleaned_bout() -> None:
+    """Engine identity reuse across generations (the live Case A no-bell wedge): the
+    coordinator reuses ONE warm engine, so a COMPLETED predecessor cleanup leaves
+    ``_cleanup_bout_id`` retained. A subsequent no-bell abandon for a DIFFERENT claim
+    on the SAME engine must settle (retain its own bout) rather than refuse with
+    ConnectionSpikeCleanupError "Round 5 engine already carries another cleanup bout"
+    (which converged to BlockedWarmError and looped cleanup_reconcile_blocked live).
+
+    Real LiveConnectionSpikeEngine (only the lane adapters / setup orchestrator are
+    controlled boundary fakes). Mutation: without the supersede reset, the terminal
+    retain_cleaned_bout for bout B raises here because _cleanup_bout_id still holds A.
+    """
+
+    class Adapter:
+        def __init__(self, lane_id: str) -> None:
+            self.lane_id = lane_id
+            self.cancelled: list[str] = []
+
+        async def cancel_job(self, job_id: str) -> None:
+            self.cancelled.append(job_id)
+
+    class Orchestrator:
+        def __init__(self) -> None:
+            self.proved: list[str] = []
+
+        async def prove_bout_absent(self, bout_id: str) -> None:
+            self.proved.append(bout_id)
+
+    engine = object.__new__(LiveConnectionSpikeEngine)
+    engine._lane_adapters = {"lakebase": Adapter("lakebase"), "competitor": Adapter("competitor")}
+    engine._setup_orchestrator = Orchestrator()
+    engine._warm_attempt_token = ""
+    engine._bound_claim = None
+    engine._cleanup_bout_id = None
+    engine._cleanup_bout_required = False
+
+    claim_a = SimpleNamespace(
+        lakebase_job_id="a" * 64,
+        competitor_job_id="b" * 64,
+        capsule_generation=7,
+        warm_attempt_token="attempt-reuse-a",
+        bout_id="bout-reuse-a",
+    )
+    await engine.reconcile_abandoned_claim(claim_a)
+    # Production leaves the completed bout A retained on this reused engine.
+    assert engine._cleanup_bout_id == "bout-reuse-a"
+
+    # SAME engine instance, a DIFFERENT claim/bout B (the second successive cleanup).
+    claim_b = SimpleNamespace(
+        lakebase_job_id="c" * 64,
+        competitor_job_id="d" * 64,
+        capsule_generation=8,
+        warm_attempt_token="attempt-reuse-b",
+        bout_id="bout-reuse-b",
+    )
+    # Between generations the coordinator RE-WARMS this reused engine, so its resident
+    # warm attempt becomes the new generation's; simulate that re-warm. The retained
+    # _cleanup_bout_id lineage from bout A intentionally persists across it -- that is
+    # exactly the engine-identity reuse under test.
+    engine._warm_attempt_token = claim_b.warm_attempt_token
+    assert engine._cleanup_bout_id == "bout-reuse-a"
+    # Must NOT raise "engine already carries another cleanup bout": it settles to B.
+    await engine.reconcile_abandoned_claim(claim_b)
+    assert engine._cleanup_bout_id == "bout-reuse-b"
+    assert engine._setup_orchestrator.proved == ["bout-reuse-a", "bout-reuse-b"]
 
 
 async def test_local_observer_cancellation_retains_resident_settlement_debt() -> None:

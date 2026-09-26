@@ -116,6 +116,11 @@ import { Summary } from './summary'
 
 type ApiStatus = 'checking' | 'online' | 'offline'
 
+interface BoutBoardRefresh {
+  board: AllBoutStatus
+  applied: boolean
+}
+
 function roundCanStart(status: FightCardRoundStatus | null): boolean {
   return status?.can_start ?? false
 }
@@ -148,7 +153,7 @@ const ROUND_CLEANUP_COPY: Record<RoundId, string> = {
   make_schema_change_safely: 'This round will reopen when both isolated environments are confirmed deleted. Other rounds remain available.',
   recover_deleted_order: 'This round will reopen when both recovery environments are confirmed deleted. Other rounds remain available.',
   put_model_score_in_app: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
-  survive_connection_spike: 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.',
+  survive_connection_spike: 'Round 5 is removing the last bout\'s RDS Proxy and will reopen automatically once AWS confirms it is deleted. Other rounds remain available.',
   analyze_live_orders_without_slowing_checkout: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
 }
 
@@ -175,15 +180,55 @@ function roundCardState(
   return round.availability === 'ready' ? 'available' : 'unavailable'
 }
 
+/**
+ * What a presenter reads while Round 5 cannot start.
+ *
+ * Every stage except terminal-blocked is automatic and ends on its own, so the
+ * copy says that in a sentence instead of printing the readiness machine's
+ * tokens ("STAGE REWARMING · CAN_START FALSE"), which read as a fault on a
+ * projector. The exact stage, generation and error code stay machine-readable in
+ * `round5_start` and `/readyz` for operators and soak monitors.
+ */
+function roundFiveStartMessage(status: FightCardRoundStatus): string {
+  if (status.state === 'bout_in_progress') return BOUT_IN_PROGRESS
+  const start = status.round5_start!
+  switch (start.stage) {
+    case 'cleaning':
+      if (start.recovery_scheduled === false) {
+        return 'Round 5 is finishing cleanup backstage. Other rounds remain available.'
+      }
+      return start.cleanup_scope === 'postbell_resources'
+        ? ROUND_CLEANUP_COPY.survive_connection_spike
+        : 'Round 5 is resetting after the last fight card and will reopen automatically in under a minute. Other rounds remain available.'
+    case 'claim-drain':
+      return 'Another Round 5 fight card was just prepared. Round 5 reopens automatically if it is not used. Other rounds remain available.'
+    case 'rewarming':
+    case 'identity-refresh':
+      return 'Round 5 is warming its connection pool and will reopen automatically in under a minute. Other rounds remain available.'
+    case 'terminal-blocked':
+      return 'Round 5 needs operator attention and will not reopen on its own. Other rounds remain available.'
+    case 'ready':
+      return 'Round 5 is getting ready and will reopen automatically. Other rounds remain available.'
+  }
+}
+
 function roundBoardMessage(
   roundId: RoundId,
   status: FightCardRoundStatus | null,
 ): string {
+  if (
+    roundId === 'survive_connection_spike'
+    && status
+    && !status.can_start
+    && status.round5_start
+  ) {
+    return roundFiveStartMessage(status)
+  }
   if (status?.detail) return status.detail
   if (status?.state === 'bout_in_progress') return BOUT_IN_PROGRESS
   if (status?.state === 'cleanup_in_progress') return ROUND_CLEANUP_COPY[roundId]
   if (status?.state === 'temporarily_unavailable') {
-    return 'TEMPORARILY UNAVAILABLE · Round 5 is under operator maintenance. Other rounds remain available.'
+    return 'Round 5 is resetting and will reopen automatically. Other rounds remain available.'
   }
   if (status?.state === 'unavailable') return 'This round is unavailable right now.'
   return 'CHECKING ALL SIX ROUNDS…'
@@ -1087,7 +1132,7 @@ function roundLockNote(
     return 'CLEANUP IN PROGRESS · OTHER ROUNDS REMAIN AVAILABLE'
   }
   if (state === 'temporarily_unavailable') {
-    return 'TEMPORARILY UNAVAILABLE · OTHER ROUNDS REMAIN AVAILABLE'
+    return 'RESETTING · REOPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
   }
   const alternative = rounds.some((item) => (
     item.id !== round.id
@@ -3304,6 +3349,9 @@ function App() {
   const [activeBout, setActiveBout] = useState<BoutStatus | null>(null)
   const [boutBoard, setBoutBoard] = useState<AllBoutStatus | null>(null)
   const [boutBoardFresh, setBoutBoardFresh] = useState(false)
+  const boutBoardRequestSequence = useRef(0)
+  const boutBoardAppliedSequence = useRef(0)
+  const boutBoardApplied = useRef<AllBoutStatus | null>(null)
   const [sound, setSound] = useState(initialProgress.sound)
   const [titleMusicPlaying, setTitleMusicPlaying] = useState(false)
   const [scorecard, setScorecard] = useState<ScorecardEntry[]>(loadScorecard)
@@ -3592,6 +3640,31 @@ function App() {
     saveScorecard(scorecard)
   }, [scorecard])
 
+  const refreshBoutBoard = useCallback(async (): Promise<BoutBoardRefresh> => {
+    const requestSequence = ++boutBoardRequestSequence.current
+    try {
+      const board = await api.allBoutStatuses()
+      if (requestSequence >= boutBoardAppliedSequence.current) {
+        boutBoardAppliedSequence.current = requestSequence
+        boutBoardApplied.current = board
+        setBoutBoard(board)
+        setBoutBoardFresh(true)
+        return { board, applied: true }
+      }
+      const authoritative = boutBoardApplied.current
+      if (authoritative === null) {
+        throw new Error('Discarded stale bout board without an authoritative state')
+      }
+      return { board: authoritative, applied: false }
+    } catch (cause) {
+      if (requestSequence >= boutBoardAppliedSequence.current) {
+        boutBoardAppliedSequence.current = requestSequence
+        setBoutBoardFresh(false)
+      }
+      throw cause
+    }
+  }, [])
+
   useEffect(() => {
     let active = true
     let inFlight = false
@@ -3640,12 +3713,10 @@ function App() {
     const inspect = () => {
       if (!active || inFlight) return
       inFlight = true
-      api.allBoutStatuses()
-        .then((status) => {
+      refreshBoutBoard()
+        .then((result) => {
           if (!active) return
-          setBoutBoardFresh(true)
-          setBoutBoard(status)
-          const blocked = Object.values(status.rounds).some((round) => !round.can_start)
+          const blocked = Object.values(result.board.rounds).some((round) => !round.can_start)
           timer = window.setTimeout(
             inspect,
             blocked
@@ -3657,7 +3728,6 @@ function App() {
         })
         .catch(() => {
           if (!active) return
-          setBoutBoardFresh(false)
           // A failed observation is not evidence that six known states became
           // unknown. Keep the last board painted while retrying; clearing it
           // hides another viewer's active bout and makes a later tile press look
@@ -3675,7 +3745,7 @@ function App() {
       active = false
       if (timer !== undefined) window.clearTimeout(timer)
     }
-  }, [uiReview])
+  }, [refreshBoutBoard, uiReview])
 
   useEffect(() => {
     if (!sessionId || uiReview) return
@@ -3984,12 +4054,9 @@ function App() {
     if (!uiReview) {
       let selectionRingStatus: FightCardRoundStatus | null
       try {
-        const board = await api.allBoutStatuses()
-        setBoutBoard(board)
-        setBoutBoardFresh(true)
-        selectionRingStatus = board.rounds[selectionRoundId]
+        const result = await refreshBoutBoard()
+        selectionRingStatus = result.board.rounds[selectionRoundId]
       } catch {
-        setBoutBoardFresh(false)
         setError('Round status could not be refreshed. Prepare stays locked until the board answers.')
         return
       }
@@ -4037,6 +4104,7 @@ function App() {
         corners: selection.corners,
         round_id: selection.roundOverride,
       })
+      sessionRef.current = created
       setCommentaryOpen(true)
       setSession(created)
       navigate('matchup', 'card')
@@ -4048,6 +4116,27 @@ function App() {
         navigate('ready', 'card', 'replace')
       }
     } catch (cause) {
+      if (
+        cause instanceof ApiError
+        && cause.status === 409
+        && cause.message.includes('ROUND 5 NOT STARTABLE')
+      ) {
+        sessionRef.current = null
+        saveActiveSessionPointer(null)
+        if (!mountedRef.current) return
+        setSession((current) => current?.id === created?.id ? null : current)
+        if (transition !== transitionRef.current) return
+        navigate('setup', 'card', 'replace')
+        try {
+          const result = await refreshBoutBoard()
+          setError(roundBoardMessage(selectionRoundId, result.board.rounds[selectionRoundId]))
+        } catch {
+          setError(
+            'Round 5 is resetting and will reopen automatically. Other rounds remain available.',
+          )
+        }
+        return
+      }
       if (transition !== transitionRef.current) return
       if (cause instanceof ApiError && cause.status === 409 && cause.message.includes('BOUT IN PROGRESS')) {
         // Keep the server's refusal verbatim. It names the round, the phase and,
@@ -4148,6 +4237,30 @@ function App() {
       navigate('setup', 'card', 'replace')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'The start-state check could not be cancelled.')
+    } finally {
+      setArmCancelPending(false)
+    }
+  }
+
+  async function cancelArmedRoundFive() {
+    if (
+      !session
+      || session.state !== 'armed'
+      || !isRoundFive(session)
+      || armCancelPending
+      || ringPendingRef.current
+    ) return
+    transitionRef.current += 1
+    setArmCancelPending(true)
+    setError(null)
+    try {
+      await api.cancelArm(session.id)
+      sessionRef.current = null
+      saveActiveSessionPointer(null)
+      setSession(null)
+      navigate('setup', 'card', 'replace')
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'The fight card could not be released.')
     } finally {
       setArmCancelPending(false)
     }
@@ -4505,6 +4618,9 @@ function App() {
         onHome={requestTitle}
         error={error}
         uiReview={uiReview}
+        canCancel={!uiReview && isRoundFive(session) && session.state === 'armed'}
+        cancelPending={armCancelPending}
+        onCancel={cancelArmedRoundFive}
       />
     )
   }
@@ -4799,12 +4915,12 @@ function Setup(props: {
     || selectedRoundState === 'unavailable'
   const selectedWhy = selectedRoundState === 'cleanup_in_progress'
     ? {
-        headline: props.ringStatus?.detail ?? ROUND_CLEANUP_COPY[selectedRound.id],
+        headline: roundBoardMessage(selectedRound.id, props.ringStatus),
         detail: null,
       }
     : (selectedRoundState === 'temporarily_unavailable'
       || selectedRoundState === 'unavailable') && props.ringStatus?.detail
-      ? { headline: props.ringStatus.detail, detail: null }
+      ? { headline: roundBoardMessage(selectedRound.id, props.ringStatus), detail: null }
     : selectedRoundWhy(selectedRound, props.recommendation)
   const selectedCompetitor = props.catalog.competitors.find((item) => item.id === props.competitor)!
   const selectedOpponent = fightCardOpponentLabel(selectedRound.id, props.competitor, selectedCompetitor.short_name)
@@ -5272,6 +5388,9 @@ function Ready(props: {
   onHome: () => void
   error: string | null
   uiReview: boolean
+  canCancel?: boolean
+  cancelPending?: boolean
+  onCancel?: () => void
 }) {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
@@ -5289,6 +5408,7 @@ function Ready(props: {
   const windowClosing = secondsRemaining !== null && secondsRemaining <= ARMED_WINDOW_WARNING_SECONDS
   const capabilityGap = props.competitorLaneState === 'not_supported'
   const canRing = !props.ringBlocked
+    && !props.cancelPending
     && (props.uiReview || (props.sessionState === 'armed' && secondsRemaining !== 0))
   const kicker = capabilityGap
     ? props.uiReview
@@ -5324,6 +5444,11 @@ function Ready(props: {
           : props.sessionState === 'running' ? 'Round in progress'
           : 'Round already run'}
       </button>
+      {props.canCancel && props.onCancel && (
+        <button className="ready-cancel" disabled={props.cancelPending || props.ringBlocked} onClick={props.onCancel}>
+          {props.cancelPending ? 'Releasing the ring…' : 'B · Change the matchup'}
+        </button>
+      )}
       <SoundToggle sound={props.sound} onToggle={props.onToggleSound} />
     </main>
   )
