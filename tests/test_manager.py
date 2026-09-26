@@ -6287,7 +6287,10 @@ async def test_towel_wins_the_race_when_the_competitor_fails_during_the_transiti
     assert await lease_store.current() is None
 
 
-async def test_round_three_towel_cleanup_failure_retries_under_retained_lease() -> None:
+async def test_round_three_towel_cleanup_heals_a_transient_failure_on_its_own() -> None:
+    # A towel that lands mid-restore can find the owned environment not yet
+    # provable; the first reset refuses it. The cleanup retries by itself and the
+    # presenter never sees FAILED or has to press Retry.
     lease_store = InMemoryBoutLeaseStore()
     engine = TowelRecoveryEngine(reset_failures=1)
     manager = RunManager(
@@ -6295,6 +6298,78 @@ async def test_round_three_towel_cleanup_failure_retries_under_retained_lease() 
         lease_store=lease_store,
         clock_ns=lambda: 100_005_678_901,
     )
+    manager._cleanup_retry_initial = 0.01
+    request = SessionCreate(
+        competitor=CompetitorId.RDS_POSTGRES,
+        primary_persona="software_engineer",
+        corners=[Corner.SIMPLICITY],
+        round_id=RoundId.RECOVER_DELETED_ORDER,
+    )
+    first = await manager.create(request)
+    events = manager._records[first.id].event_log
+
+    await manager.start_arm(first.id)
+    await wait_for_state(manager, first.id, SessionState.ARMED)
+    await manager.start_run(first.id)
+    await asyncio.wait_for(engine.towel_ready.wait(), timeout=1)
+    await manager.start_towel(first.id)
+    finished = await wait_for_towel(manager, first.id, "ready")
+
+    assert finished.towel is not None and finished.towel.cleanup_failure is None
+    assert engine.timeline == ["settle", "reset", "settle", "reset"]
+    assert await lease_store.current() is None
+    published_towel_states = [
+        ((event.payload.get("session") or {}).get("towel") or {}).get("state")
+        for event in events.events
+        if event.event in {"towel_update", "towel_finished"}
+    ]
+    assert "failed" not in published_towel_states
+
+
+async def test_round_two_late_towel_cleanup_heals_a_refused_reset_on_its_own() -> None:
+    # Live 2026-09-26: a 78 s Round 2 towel caught the Aurora clone mid-create, the
+    # reset could not prove its ownership yet and refused it, and the round sat in
+    # cleanup for ~20 minutes. One retry passes, so the cleanup now makes it.
+    lease_store = InMemoryBoutLeaseStore()
+    engine = BlockingTowelSafeChangeEngine()
+    engine.reset_failures = 1
+    manager = RunManager(
+        safe_change_factory=lambda: engine,
+        lease_store=lease_store,
+    )
+    manager._cleanup_retry_initial = 0.01
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="software_engineer",
+            corners=[Corner.SIMPLICITY],
+            round_id=RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
+        )
+    )
+    await manager.start_arm(created.id)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id)
+    await asyncio.wait_for(engine.run_entered.wait(), timeout=1)
+
+    await manager.start_towel(created.id)
+    finished = await wait_for_towel(manager, created.id, "ready")
+
+    assert finished.towel is not None and finished.towel.cleanup_failure is None
+    assert engine.reset_failures == 0
+    assert await lease_store.current() is None
+
+
+async def test_round_three_towel_cleanup_failure_past_the_window_retries_under_retained_lease(
+) -> None:
+    lease_store = InMemoryBoutLeaseStore()
+    engine = TowelRecoveryEngine(reset_failures=1_000)
+    manager = RunManager(
+        recovery_factory=lambda: engine,
+        lease_store=lease_store,
+        clock_ns=lambda: 100_005_678_901,
+    )
+    manager._cleanup_retry_initial = 0.01
+    manager._towel_cleanup_retry_window = 0.3
     request = SessionCreate(
         competitor=CompetitorId.RDS_POSTGRES,
         primary_persona="software_engineer",
@@ -6316,15 +6391,16 @@ async def test_round_three_towel_cleanup_failure_retries_under_retained_lease() 
 
     assert failed.state == SessionState.TOWELLED
     assert failed.towel is not None and failed.towel.cleanup_failure is not None
+    assert engine.timeline.count("reset") > 1
     retained = lease_store._lease
     assert retained is not None and retained.phase == "towel_cleanup"
     with pytest.raises(InvalidStateError, match="BOUT IN PROGRESS"):
         await manager.start_arm(challenger.id)
 
+    engine.reset_failures = 0
     await manager.start_towel(first.id)
     finished = await wait_for_towel(manager, first.id, "ready")
     assert finished.towel is not None and finished.towel.cleanup_failure is None
-    assert engine.timeline == ["settle", "reset", "settle", "reset"]
     assert lease_store._generation == 1
     assert await lease_store.current() is None
 
@@ -7272,12 +7348,16 @@ async def test_cancelled_towel_cleanup_lands_on_failed_and_stays_retryable() -> 
 # T3 · the ring refusal must name what is holding it, not just that it is held.
 async def test_a_wedged_towel_names_itself_in_the_ring_refusal() -> None:
     lease_store = InMemoryBoutLeaseStore()
-    engine = TowelRecoveryEngine(reset_failures=1)
+    # Wedged means still failing after the automatic retry window, not one
+    # transient refusal, which now heals on its own.
+    engine = TowelRecoveryEngine(reset_failures=1_000)
     manager = RunManager(
         recovery_factory=lambda: engine,
         lease_store=lease_store,
         clock_ns=lambda: 100_005_678_901,
     )
+    manager._cleanup_retry_initial = 0.01
+    manager._towel_cleanup_retry_window = 0.2
     created = await running_round_three(manager, engine)
     challenger = await manager.create(round_three_request())
 
@@ -7293,6 +7373,7 @@ async def test_a_wedged_towel_names_itself_in_the_ring_refusal() -> None:
     assert "TOWEL CLEANUP FAILED" in message
     assert failed.towel.cleanup_failure in message
 
+    engine.reset_failures = 0
     await manager.start_towel(created.id)
     settled = await wait_for_towel(manager, created.id, "ready")
     assert settled.towel is not None and settled.towel.cleanup_failure is None

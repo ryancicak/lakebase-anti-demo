@@ -517,6 +517,12 @@ _ROUND_FIVE_WITNESS_CLIENTS = 64
 _ROUND_FIVE_RUNNER = "Python 3.12 event-driven TLS/native-password"
 _ROUND_FIVE_CLEANUP_PENDING = "Round 5 cleanup is settling automatically · Ring remains protected"
 
+#: Rounds whose towel cleanup deletes isolated AWS environments and so can race an
+#: in-flight create; their cleanup retries automatically before it reports FAILED.
+_TOWEL_CLEANUP_AUTO_RETRY_ROUNDS = frozenset(
+    {RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}
+)
+
 #: The two honest accounts of a control action aimed at a fight card this process
 #: does not have. Both lead with what did *not* happen, because the operator's
 #: first question at the bell is whether a bout is running somewhere and the old
@@ -983,6 +989,17 @@ class RunManager:
             os.environ.get("ANTI_DEMO_CLEANUP_RETRY_INITIAL_SECONDS", "1")
         )
         self._cleanup_retry_max = float(os.environ.get("ANTI_DEMO_CLEANUP_RETRY_MAX_SECONDS", "30"))
+        # Rounds 2 and 3 delete isolated AWS environments on a towel, and a towel
+        # that lands mid-create races the lane's own teardown: the first reset can
+        # find a clone whose ownership is not provable yet and refuse it. That is a
+        # cleanup still settling, not a failure, so it retries on its own (with the
+        # backoff above) inside this window before the towel reports FAILED and
+        # asks for Retry. Live 2026-09-26: a 78 s Round 2 towel sat in cleanup for
+        # ~20 minutes until its lease expired, although one retry would have passed.
+        self._towel_cleanup_retry_window = max(
+            0.0,
+            float(os.environ.get("ANTI_DEMO_TOWEL_CLEANUP_RETRY_WINDOW_SECONDS", "600")),
+        )
         # How long a towelled run task gets to notice the cooperative stop
         # before it is cancelled outright. Rounds 1 and 3 have no explicit
         # cancel -- they stop by observing a control -- so a task parked in a
@@ -10523,6 +10540,98 @@ class RunManager:
             return
 
         settlement_error: str | None = None
+        retry_deadline = time.monotonic() + self._towel_cleanup_retry_window
+        retry_delay = max(0.05, self._cleanup_retry_initial)
+        attempt = 0
+        while True:
+            attempt += 1
+            settlement_error = await self._settle_towel_once(
+                record, round_id, run_task, wait_for_run=wait_for_run
+            )
+            if (
+                settlement_error is None
+                or round_id not in _TOWEL_CLEANUP_AUTO_RETRY_ROUNDS
+                or time.monotonic() + retry_delay > retry_deadline
+            ):
+                break
+            logger.warning(
+                "Towel cleanup attempt %d has not converged session=%s diagnostic=%s; "
+                "retrying automatically in %.1fs",
+                attempt,
+                record.snapshot.id,
+                settlement_error,
+                retry_delay,
+            )
+            try:
+                await asyncio.sleep(retry_delay)
+            except asyncio.CancelledError:
+                await asyncio.shield(
+                    asyncio.create_task(
+                        self._mark_towel_cleanup_failed(
+                            record,
+                            "Towel cleanup was cancelled before the ring could be "
+                            "released; retry cleanup.",
+                        ),
+                        name=f"towel-cancelled-{record.snapshot.id}",
+                    )
+                )
+                raise
+            retry_delay = min(retry_delay * 2, max(retry_delay, self._cleanup_retry_max))
+            async with record.lock:
+                if record.snapshot.towel is None:
+                    return
+                record.snapshot.cooldown = self._new_towel_cooldown(record)
+                record.snapshot.updated_at = datetime.now(UTC)
+                snapshot = record.snapshot.model_copy(deep=True)
+            await record.event_log.publish(
+                "towel_update",
+                {"session": snapshot.model_dump(mode="json")},
+            )
+
+        if settlement_error is None:
+            await self._settle_towel_cost_window(record)
+        round_one_cooldown_held = (
+            settlement_error is None and round_id == RoundId.WAKE_IDLE_APP
+        )
+        released = round_one_cooldown_held or (
+            settlement_error is None and await self._release_bout(record)
+        )
+        if settlement_error is None and not released:
+            settlement_error = "Ring release could not be confirmed; retry towel cleanup."
+
+        async with record.lock:
+            towel = record.snapshot.towel
+            if towel is None:
+                return
+            if settlement_error is None:
+                towel.state = TowelState.READY
+                towel.cleanup_failure = None
+                event = "towel_finished"
+            else:
+                towel.state = TowelState.FAILED
+                towel.cleanup_failure = settlement_error
+                event = "towel_update"
+            record.snapshot.updated_at = datetime.now(UTC)
+            snapshot = record.snapshot.model_copy(deep=True)
+        await record.event_log.publish(
+            event,
+            {"session": snapshot.model_dump(mode="json")},
+        )
+        if settlement_error is None and round_id == RoundId.WAKE_IDLE_APP:
+            if record.cooldown_task is asyncio.current_task():
+                record.cooldown_task = None
+            self._schedule_round_one_cooldown(record)
+
+    async def _settle_towel_once(
+        self,
+        record: SessionRecord,
+        round_id: RoundId,
+        run_task: asyncio.Task[None] | None,
+        *,
+        wait_for_run: bool,
+    ) -> str | None:
+        """Run one towel settlement for a non-Round-5 round; return why it failed, or None."""
+
         try:
             if round_id in {
                 RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
@@ -10609,41 +10718,8 @@ class RunManager:
             )
             raise
         except Exception as exc:
-            settlement_error = str(exc) or "Automatic towel cleanup could not be verified"
-
-        if settlement_error is None:
-            await self._settle_towel_cost_window(record)
-        round_one_cooldown_held = (
-            settlement_error is None and round_id == RoundId.WAKE_IDLE_APP
-        )
-        released = round_one_cooldown_held or (
-            settlement_error is None and await self._release_bout(record)
-        )
-        if settlement_error is None and not released:
-            settlement_error = "Ring release could not be confirmed; retry towel cleanup."
-
-        async with record.lock:
-            towel = record.snapshot.towel
-            if towel is None:
-                return
-            if settlement_error is None:
-                towel.state = TowelState.READY
-                towel.cleanup_failure = None
-                event = "towel_finished"
-            else:
-                towel.state = TowelState.FAILED
-                towel.cleanup_failure = settlement_error
-                event = "towel_update"
-            record.snapshot.updated_at = datetime.now(UTC)
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            event,
-            {"session": snapshot.model_dump(mode="json")},
-        )
-        if settlement_error is None and round_id == RoundId.WAKE_IDLE_APP:
-            if record.cooldown_task is asyncio.current_task():
-                record.cooldown_task = None
-            self._schedule_round_one_cooldown(record)
+            return str(exc) or "Automatic towel cleanup could not be verified"
+        return None
 
     async def _reset_safe_change(self, record: SessionRecord) -> None:
         engine = record.safe_change_engine
