@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from databricks.sdk.errors.platform import ResourceConflict
 
 from server import model_score_live
 from server.model_score import (
@@ -1090,6 +1091,70 @@ async def test_a_restart_requires_stable_synced_table_status_before_handoff() ->
     await _activation(api).ensure_running(lambda status: _record([], status))
 
     assert api.post_restart_synced_reads == 4
+
+
+class StopStillSettling(FakePipelineApi):
+    """A towel's stop has returned but its update is still STOPPING.
+
+    The shape the live re-arm met on 2026-09-26: ``pipeline RUNNING · update
+    STOPPING · SYNCED_TABLE_ONLINE_PIPELINE_FAILED, no continuous update``. While
+    the stop settles, a start conflicts with the dying update, exactly as the
+    control plane answers it.
+    """
+
+    def __init__(self, stopping_reads: int) -> None:
+        super().__init__(running=False)
+        self.stopping_reads = stopping_reads
+        self.started_while_stopping = 0
+
+    def __call__(self, profile, method, path, *, body=None, timeout=600):
+        stopping = self.stopping_reads > 0
+        if method == "post" and path.endswith("/updates") and stopping:
+            self.started_while_stopping += 1
+            raise ResourceConflict("An active update already exists")
+        if method == "get" and "/pipelines/" in path and stopping:
+            self.calls.append((method, path))
+            if path.endswith("/pipeline-1"):
+                self.stopping_reads -= 1
+            return {
+                "state": "RUNNING",
+                "pipeline_id": "pipeline-1",
+                "latest_updates": [{"state": "STOPPING", "update_id": "u-stopping"}],
+            }
+        return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+
+async def test_an_arm_right_after_a_towel_waits_for_the_stop_then_starts_fresh() -> None:
+    api = StopStillSettling(stopping_reads=3)
+    notices: list[str] = []
+
+    await _activation(api).ensure_running(lambda status: _record(notices, status))
+
+    assert api.started_while_stopping == 0
+    assert api.update_bodies == [{"full_refresh": False}]
+    assert any("finish stopping" in notice for notice in notices)
+    assert any("pipeline is running" in notice for notice in notices)
+
+
+async def test_a_stop_landing_between_the_check_and_the_start_is_waited_out(
+    monkeypatch,
+) -> None:
+    api = FakePipelineApi(running=False)
+    real_start = model_score_live.pipeline_power.start
+    raced = {"count": 0}
+
+    def start_once_into_a_stop(*args, **kwargs):
+        if raced["count"] == 0:
+            raced["count"] += 1
+            raise model_score_live.pipeline_power.PipelineUpdateStoppingError("still stopping")
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(model_score_live.pipeline_power, "start", start_once_into_a_stop)
+
+    await _activation(api).ensure_running(lambda status: _record([], status))
+
+    assert raced["count"] == 1
+    assert api.update_bodies == [{"full_refresh": False}]
 
 
 async def test_a_repaired_source_rebases_the_same_pipeline_once() -> None:
