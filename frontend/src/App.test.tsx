@@ -5881,6 +5881,67 @@ describe('backstage setup', () => {
     expect(replay).not.toHaveTextContent(/0\.000ms/)
   })
 
+  function towelRaceFetch(towelDetail: string, finishesFirst: boolean) {
+    const running: DemoSession = { ...rdsSession('armed'), state: 'running' }
+    let towelSent = false
+    return vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(rdsSession('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(rdsSession('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(running))
+      if (input.endsWith('/towel')) {
+        towelSent = true
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({ detail: towelDetail }),
+        })
+      }
+      if (input === '/api/sessions/session-1') {
+        return Promise.resolve(jsonResponse(towelSent && finishesFirst ? rdsSession('verified') : running))
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+  }
+
+  async function throwTowelInRoundOneAgainstRds() {
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('radio', { name: /rds postgresql/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    await user.click(await screen.findByRole('button', { name: /throw in the towel/i }))
+  }
+
+  it('lands a towel that lost the race with the finish on the result, not on an error', async () => {
+    // Round 1 against RDS times Lakebase alone, so it can finish before a towel
+    // thrown mid-bout arrives; the server refuses that towel with a 409. Found by
+    // a chaos wave on 2026-09-26: the refusal used to be the presenter's banner.
+    const detail = 'The bout must be running before throwing in the towel'
+    vi.stubGlobal('fetch', towelRaceFetch(detail, true))
+    vi.stubGlobal('EventSource', FakeEventSource)
+
+    await throwTowelInRoundOneAgainstRds()
+
+    expect(await screen.findByText('LAKEBASE WINS — RDS CANNOT ENTER THE ROUND')).toBeInTheDocument()
+    expect(screen.queryByText(detail)).not.toBeInTheDocument()
+  })
+
+  it('still says so when a refused towel leaves the bout running', async () => {
+    const detail = 'The towel could not be accepted yet'
+    vi.stubGlobal('fetch', towelRaceFetch(detail, false))
+    vi.stubGlobal('EventSource', FakeEventSource)
+
+    await throwTowelInRoundOneAgainstRds()
+
+    expect(await screen.findByText(detail)).toBeInTheDocument()
+  })
+
   it('throws the Round 3 towel, exposes Next immediately, and cleanup-gates receipt actions', async () => {
     const eligible = recoveryTowelSession('eligible')
     const stopping = recoveryTowelSession('stopping')

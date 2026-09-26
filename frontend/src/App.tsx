@@ -4522,12 +4522,27 @@ function App() {
       !retryingNonRoundFiveCleanup
       && (session.state !== 'running' || session.towel)
     ) return
+    const sessionId = session.id
     setError(null)
     try {
-      const latest = await api.throwTowel(session.id)
+      const latest = await api.throwTowel(sessionId)
       setSession((current) => selectRound4Session(current, latest))
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'The towel request could not be accepted.')
+      const refusal = cause instanceof Error ? cause.message : 'The towel request could not be accepted.'
+      // A towel that loses the race with the finish is refused (409 "The bout
+      // must be running"), and that refusal is not something a presenter can act
+      // on: the bout they meant to stop has already stopped. Show where it is,
+      // and say something only when the towel is still owed.
+      try {
+        const latest = await api.getSession(sessionId)
+        setSession((current) => selectRound4Session(current, latest))
+        const stillOwed = retryingNonRoundFiveCleanup
+          ? latest.towel?.state === 'failed'
+          : latest.state === 'running' && !latest.towel
+        if (stillOwed) setError(refusal)
+      } catch {
+        setError(refusal)
+      }
     }
   }
 
