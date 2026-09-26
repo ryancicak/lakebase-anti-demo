@@ -269,6 +269,45 @@ def test_a_first_provision_derives_the_role_arn_before_it_exists(monkeypatch):
     assert pairs["round5_app_principal_arn"] == RUNTIME_ROLE_ARN
 
 
+def test_a_new_installation_names_a_runtime_role_of_its_own(monkeypatch):
+    """`anti-demo-runtime` was one name per account (found 2026-09-26).
+
+    A second installation's first apply failed on EntityAlreadyExists after its
+    databases and runners were already billing. A new installation's name is
+    derived from its installation ID: its own, and the same on every run.
+    """
+
+    monkeypatch.setenv("ROUND5_APP_PRINCIPAL_ARN", APP_USER_ARN)
+    monkeypatch.setenv(
+        lifecycle.ANTI_DEMO_RUNTIME_PRINCIPALS_ENV, f"{APP_USER_ARN},{SSO_ROLE_ARN}"
+    )
+    first = manifest_stub().model_copy(
+        update={"installation_id": "11111111-1111-4111-8111-111111111111"}
+    )
+    second = manifest_stub().model_copy(
+        update={"installation_id": "22222222-2222-4222-8222-222222222222"}
+    )
+
+    name = lifecycle.anti_demo_runtime_role_name(first)
+    assert name.startswith(f"{lifecycle.ANTI_DEMO_RUNTIME_ROLE_NAME}-")
+    assert name == lifecycle.anti_demo_runtime_role_name(first)
+    assert name != lifecycle.anti_demo_runtime_role_name(second)
+    assert len(name) <= 64
+    pairs = dict(
+        argument.split("=", 1) for argument in lifecycle._terraform_variables(first)[1::2]
+    )
+    assert pairs["anti_demo_runtime_role_name"] == name
+    # The Round 5 control role trusts the role that will exist, before it does.
+    assert pairs["round5_app_principal_arn"] == f"arn:aws:iam::{ACCOUNT}:role/{name}"
+
+
+def test_a_sealed_role_keeps_the_name_it_was_created_under():
+    sealed = sealed_manifest().model_copy(
+        update={"installation_id": "11111111-1111-4111-8111-111111111111"}
+    )
+    assert lifecycle.anti_demo_runtime_role_name(sealed) == "anti-demo-runtime"
+
+
 def test_unsealed_installation_asks_terraform_for_no_role(monkeypatch):
     monkeypatch.setenv("ROUND5_APP_PRINCIPAL_ARN", APP_USER_ARN)
     monkeypatch.delenv(lifecycle.ANTI_DEMO_RUNTIME_PRINCIPALS_ENV, raising=False)

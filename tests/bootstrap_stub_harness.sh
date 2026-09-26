@@ -637,6 +637,38 @@ STUB
   check "creates its own app" "created 'lakebase-anti-demo-2' and recorded its immutable client ID"
   check "publishes into its own scope" "secret scope 'lakebase-anti-demo-2-gen'"
   check_absent "never the default installation's scope" "scope 'lakebase-anti-demo-gen'"
+  # What lets cleanup delete the scope, and so the AWS key pair inside it.
+  if jq -e '.databricks_secret_scope_created == "lakebase-anti-demo-2-gen"' \
+    "$gen/bootstrap.json" >/dev/null 2>&1; then
+    printf '  %sok%s   records that it created the scope\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s did not record creating the scope\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # A scope that was already there is used, and never recorded as ours.
+  gen="$(mktemp -d)/gen"
+  source="$gen/ready-source.json"
+  write_manifest "$source"
+  sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$gen"$'/antidemo-apply-stub\nDATABRICKS_APP_NAME=lakebase-anti-demo-3\nANTI_DEMO_SECRET_SCOPE=lakebase-anti-demo-.anti-demo-v7' sandbox)"
+  cat >"$gen/antidemo-apply-stub" <<STUB
+#!/usr/bin/env bash
+set -eu
+cp "$source" "\$ANTI_DEMO_MANIFEST"
+STUB
+  chmod +x "$gen/antidemo-apply-stub"
+  run "$sb" --apply --deploy-app --yes
+  check "uses the scope that was already there" \
+    "secret scope 'lakebase-anti-demo-.anti-demo-v7' already exists"
+  if [[ -f "$gen/bootstrap.json" ]] &&
+    ! jq -e 'has("databricks_secret_scope_created")' "$gen/bootstrap.json" >/dev/null 2>&1; then
+    printf '  %sok%s   and does not claim to have created it\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s claimed an existing scope as its own\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
 }
 
 case_multiple_warehouses_are_derived() {

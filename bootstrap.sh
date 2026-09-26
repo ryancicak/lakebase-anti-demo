@@ -2064,9 +2064,9 @@ if ((DATABRICKS_OK == 1)) &&
     [[ -f "$ANTI_DEMO_MANIFEST" ]] && APP_OWN_LINE="
         * if it is this installation's app, say so: DATABRICKS_APP_CLIENT_ID=$APP_PROBE_CLIENT_ID"
     fail "A Databricks App named '$APP_NAME' already exists in this workspace, and nothing in
-      $MANIFEST_DIR says it belongs to this installation, so it is almost certainly
-      serving another one. Adopting it would publish this installation into it and
-      replace that demo. Nothing has been created. Either:
+      this installation ($(basename "$MANIFEST_DIR")) says it is this installation's, so it
+      is almost certainly serving another one. Adopting it would publish this installation
+      into it and replace that demo. Nothing has been created. Either:
         * give this installation its own app -- add a line to $ENV_FILE:
               DATABRICKS_APP_NAME=lakebase-anti-demo-2
           (lowercase letters, digits and hyphens; any name no app in the workspace has), or
@@ -2987,6 +2987,21 @@ if databricks secrets list-scopes "${DATABRICKS_ARGS[@]}" -o json 2>/dev/null |
 else
   if OUT="$(databricks secrets create-scope "$SECRET_SCOPE" "${DATABRICKS_ARGS[@]}" 2>&1)"; then
     ok "created secret scope '$SECRET_SCOPE'"
+    # Provenance, recorded the way the app's is: cleanup deletes a scope only
+    # when this installation created it (server/lifecycle.py:_delete_secret_scope),
+    # because it holds the AWS key pair published below. A scope found already
+    # there, or created by a racing run, is never recorded as ours.
+    STATE_FILE="$STATE_FILE" SECRET_SCOPE="$SECRET_SCOPE" python3 - <<'PY' ||
+import json, os, pathlib
+
+path = pathlib.Path(os.environ["STATE_FILE"])
+record = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+record["databricks_secret_scope_created"] = os.environ["SECRET_SCOPE"]
+path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+      warn "created '$SECRET_SCOPE' but could not record that in $STATE_FILE, so
+        './antidemo cleanup' will report the scope rather than delete it"
   elif printf '%s' "$OUT" | grep -qi 'already exists\|RESOURCE_ALREADY_EXISTS'; then
     ok "secret scope '$SECRET_SCOPE' already exists"
   else

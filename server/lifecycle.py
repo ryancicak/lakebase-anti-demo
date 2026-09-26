@@ -100,10 +100,9 @@ BASE_SCHEMA_PATHS = (
     PROJECT_ROOT / "sql" / "002_orders_base.sql",
 )
 ANTI_DEMO_RUNTIME_PRINCIPALS_ENV = "ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS"
-#: Fixed, and must equal `var.anti_demo_runtime_role_name`'s default. The name is
-#: deliberately not generated: the operator's `~/.aws/config` carries this ARN in
-#: a `role_arn` key, and a per-install suffix would mean editing that file after
-#: every sweep -- the recurring manual step this role exists to remove.
+#: Must equal `var.anti_demo_runtime_role_name`'s default. The name of every
+#: runtime role sealed before 2026-09-26, and the stem of every one since: see
+#: `anti_demo_runtime_role_name` for why a new installation's is its own.
 ANTI_DEMO_RUNTIME_ROLE_NAME = "anti-demo-runtime"
 #: The bare unique principal ID IAM leaves behind in a trust policy once the
 #: principal it named has been deleted. While the principal exists IAM reverse-
@@ -1148,6 +1147,31 @@ def anti_demo_runtime_principals(manifest: DemoManifest) -> tuple[str, ...]:
     return configured
 
 
+def anti_demo_runtime_role_name(manifest: DemoManifest) -> str:
+    """The name this installation's runtime role has, or will be created under.
+
+    The seal wins, so every installation already provisioned keeps the name it
+    has. A new one gets a name of its own. `anti-demo-runtime` alone was one name
+    per AWS account: a second installation's first apply failed on
+    EntityAlreadyExists after its databases and runners were already billing
+    (found 2026-09-26, installing beside a live installation).
+
+    The suffix is a digest of the installation ID -- the way `infra/aws/locals.tf`
+    names every per-round resource -- so it is stable for the installation's
+    whole life, and the reason the name was never `name_prefix`d still holds: an
+    operator's `~/.aws/config` carries this ARN across the fortnightly sweep, and
+    the recreated role comes back under the same name. The operator policies
+    already grant `role/anti-demo-runtime*` and `policy/anti-demo-runtime-*`.
+    """
+
+    if manifest.aws.runtime_role_arn:
+        return manifest.aws.runtime_role_arn.rsplit("/", 1)[-1]
+    if manifest.installation_id is None:
+        return ANTI_DEMO_RUNTIME_ROLE_NAME
+    digest = hashlib.sha256(f"{manifest.installation_id.strip()}:runtime".encode()).hexdigest()
+    return f"{ANTI_DEMO_RUNTIME_ROLE_NAME}-{digest[:12]}"
+
+
 def _terraform_variables(
     manifest: DemoManifest,
     *,
@@ -1169,11 +1193,11 @@ def _terraform_variables(
         # unchanged: bootstrap still derives ROUND5_APP_PRINCIPAL_ARN from the
         # caller, and it is simply not the answer once a runtime role exists.
         #
-        # Knowable before Terraform runs only because the role's name is fixed
-        # rather than `name_prefix`d -- see the comment on the resource. Sealed
+        # Knowable before Terraform runs only because the role's name is derived
+        # rather than `name_prefix`d -- see `anti_demo_runtime_role_name`. Sealed
         # installations read the seal instead, so an overridden name still works.
         round5_app_principal = manifest.aws.runtime_role_arn or (
-            f"arn:aws:iam::{manifest.aws.account_id}:role/{ANTI_DEMO_RUNTIME_ROLE_NAME}"
+            f"arn:aws:iam::{manifest.aws.account_id}:role/{anti_demo_runtime_role_name(manifest)}"
         )
     else:
         round5_app_principal = (
@@ -1232,9 +1256,7 @@ def _terraform_variables(
         # Pinned from here rather than left to Terraform's own default, so the
         # name this file derives an ARN from and the name Terraform creates can
         # never drift apart.
-        "anti_demo_runtime_role_name": (
-            manifest.aws.runtime_role_arn or ANTI_DEMO_RUNTIME_ROLE_NAME
-        ).rsplit("/", 1)[-1],
+        "anti_demo_runtime_role_name": anti_demo_runtime_role_name(manifest),
     }
     if manifest.installation_id is not None:
         values["installation_id"] = manifest.installation_id
@@ -1965,6 +1987,10 @@ def _terraform_state_resource_values(
     return found
 
 
+#: Terraform resource types IAM gives no tags to, whose ownership is the role's.
+_UNTAGGABLE_ROLE_CHILD_TYPES = frozenset({"aws_iam_role_policy", "aws_iam_role_policy_attachment"})
+
+
 def _validate_partial_aws_destroy_retry(
     manifest: DemoManifest,
     managed_addresses: set[str],
@@ -2019,19 +2045,46 @@ def _validate_partial_aws_destroy_retry(
         # resource, so it cannot carry ownership tags.
         "terraform_data.round5_destroy_guard",
     }
-    for address in round5_addresses:
+
+    def tags_verify(address: str) -> bool | None:
+        """True when the state tags match the seal, False when they differ, None if absent."""
         values = state_values[address]
         tags = values.get("tags_all") or values.get("tags") or {}
-        if isinstance(tags, dict) and tags:
-            required_tags = _required_tags_for_address(manifest, address)
-            if any(str(tags.get(key) or "") != value for key, value in required_tags.items()):
-                raise RuntimeError(
-                    f"Cleanup refused: Terraform state ownership tags differ for {address}"
-                )
-        elif address not in allowed_round5_children:
+        if not (isinstance(tags, dict) and tags):
+            return None
+        required_tags = _required_tags_for_address(manifest, address)
+        return all(str(tags.get(key) or "") == value for key, value in required_tags.items())
+
+    # An inline role policy and a managed-policy attachment cannot carry tags at
+    # all -- IAM exposes no tagging for either -- so their ownership is their
+    # role's: accepted when the role they bind is a role in this same state whose
+    # own tags verify. By type, because the named list above went stale once
+    # already: the two-runner Round 5 added four such children, and a partial
+    # install could no longer be inventoried, let alone cleaned up (2026-09-26).
+    owned_role_names = {
+        str(state_values[address].get("name") or "")
+        for address in round5_addresses
+        if address.startswith("aws_iam_role.") and tags_verify(address) is True
+    }
+    owned_role_names.discard("")
+    for address in round5_addresses:
+        verdict = tags_verify(address)
+        if verdict is True:
+            continue
+        if verdict is False:
             raise RuntimeError(
-                f"Cleanup refused: remaining Round 5 resource has no ownership tags: {address}"
+                f"Cleanup refused: Terraform state ownership tags differ for {address}"
             )
+        if address in allowed_round5_children:
+            continue
+        if (
+            address.split(".", 1)[0] in _UNTAGGABLE_ROLE_CHILD_TYPES
+            and str(state_values[address].get("role") or "") in owned_role_names
+        ):
+            continue
+        raise RuntimeError(
+            f"Cleanup refused: remaining Round 5 resource has no ownership tags: {address}"
+        )
     for address in managed_addresses & set(expected_identities):
         field, expected = expected_identities[address]
         if not expected or str(state_values[address].get(field) or "") != expected:
@@ -11838,9 +11891,10 @@ def _delete_detached_runtime_role(manifest: DemoManifest) -> None:
     if iam.list_instance_profiles_for_role(RoleName=role_name).get("InstanceProfiles"):
         raise RuntimeError("Cleanup refused: the runtime role belongs to an instance profile")
 
+    # Named for this role, not for the stem every installation's role shares.
     expected_prefix = (
         f"arn:{role_arn.split(':', 2)[1]}:iam::{manifest.aws.account_id}:"
-        f"policy/{ANTI_DEMO_RUNTIME_ROLE_NAME}-"
+        f"policy/{role_name}-"
     )
     attached = iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies") or []
     if len(attached) > len(_ANTI_DEMO_RUNTIME_POLICY_KEYS) or any(
@@ -12117,6 +12171,136 @@ def _round4_survivor_lines(manifest: DemoManifest) -> list[str]:
     return lines
 
 
+#: bootstrap.sh writes this into bootstrap.json when it creates the app's secret
+#: scope, and only then. It is the scope's provenance, as
+#: `databricks_app_created_client_id` is the app's: a scope this installation
+#: found already there is reported and never deleted.
+SECRET_SCOPE_CREATED_KEY = "databricks_secret_scope_created"
+
+
+def _recorded_secret_scope(manifest: DemoManifest) -> tuple[str, bool]:
+    """The scope this installation's app read its seal from, and whether bootstrap created it.
+
+    Named by `app-deploy.json`, else by `bootstrap.json`, the same falling order
+    `_deployed_app_name` uses; `("", False)` when neither names one.
+    """
+
+    record = _round4_app_record(manifest) or {}
+    bootstrap = _read_json_object(manifest_path().parent / BOOTSTRAP_RECORD_NAME) or {}
+    name = str(record.get("secret_scope") or bootstrap.get("secret_scope") or "").strip()
+    created = str(bootstrap.get(SECRET_SCOPE_CREATED_KEY) or "").strip()
+    return name, bool(name) and created == name
+
+
+def _secret_scope_listed(profile: str, scope: str) -> bool:
+    payload = _databricks_api(profile, "GET", "/api/2.0/secrets/scopes/list")
+    return any(str(item.get("name") or "") == scope for item in payload.get("scopes") or [])
+
+
+#: Where the app listing gives up. A workspace with ten thousand apps is not one
+#: this was run in; a page token that never ends is a bug, not a workspace.
+_APP_LIST_PAGE_LIMIT = 100
+
+
+def _apps_reading_secret_scope(profile: str, scope: str) -> list[str]:
+    """Every app in the workspace with a resource bound to `scope`.
+
+    Raises when the listing cannot be read to the end: an incomplete list cannot
+    show that nothing reads the scope, and that is the question it answers.
+    """
+
+    readers: list[str] = []
+    token = ""
+    for _ in range(_APP_LIST_PAGE_LIMIT):
+        path = "/api/2.0/apps?page_size=100"
+        if token:
+            path += f"&page_token={quote(token, safe='')}"
+        payload = _databricks_api(profile, "GET", path)
+        for app in payload.get("apps") or []:
+            if any(
+                str(((resource or {}).get("secret") or {}).get("scope") or "") == scope
+                for resource in app.get("resources") or []
+            ):
+                readers.append(str(app.get("name") or "an unnamed app"))
+        token = str(payload.get("next_page_token") or "")
+        if not token:
+            return readers
+    raise RuntimeError(f"The workspace app list did not end within {_APP_LIST_PAGE_LIMIT} pages")
+
+
+def _secret_scope_survivor_lines(manifest: DemoManifest) -> list[str]:
+    """Name the app's secret scope, which no Terraform state or bill ever lists.
+
+    It costs nothing, and that is how it went unreported: what it holds is the
+    reason to report it -- the app's seal and the AWS key pair bootstrap
+    published for the app. Never raises; this runs inside the inventory.
+    """
+
+    name, created = _recorded_secret_scope(manifest)
+    if not name:
+        return []
+    profile = manifest.databricks.profile
+    try:
+        listed = _secret_scope_listed(profile, name)
+    except Exception as error:
+        return [
+            f"OWNED secret scope: {name} (the workspace could not be asked: "
+            f"{type(error).__name__}). Check by hand: databricks secrets list-scopes -p {profile}"
+        ]
+    if not listed:
+        return [f"OWNED secret scope: {name} (not in the workspace)"]
+    if created:
+        return [
+            f"OWNED secret scope: {name} · holds the app's seal and AWS key pair · "
+            f"DELETED BY THIS CLEANUP once no app reads it"
+        ]
+    return [
+        f"OWNED secret scope: {name} · holds the app's seal and AWS key pair · "
+        f"SURVIVES THIS CLEANUP",
+        f"      Not deleted here: bootstrap did not record creating it, so it cannot be "
+        f"shown to be this installation's alone. Remove it by hand if it is: "
+        f"databricks secrets delete-scope {name} -p {profile}",
+    ]
+
+
+def _delete_secret_scope(manifest: DemoManifest) -> None:
+    """Delete the secret scope bootstrap created for this installation's app.
+
+    An uninstall that leaves it behind leaves a copy of a permanent AWS
+    credential in the workspace, and nothing else reports it. Deleted on
+    provenance only -- bootstrap recorded creating this exact scope -- and only
+    once no app reads it, which is why this runs after the owned app is gone.
+
+    Never raises. Nothing about a scope bills, so a scope that cannot be deleted
+    must not be what fails a teardown that has already removed everything that
+    does; it is said loudly instead, with the command that finishes the job.
+    """
+
+    name, created = _recorded_secret_scope(manifest)
+    if not name or not created:
+        return
+    profile = manifest.databricks.profile
+    by_hand = f"databricks secrets delete-scope {name} -p {profile}"
+    try:
+        if not _secret_scope_listed(profile, name):
+            return
+        readers = _apps_reading_secret_scope(profile, name)
+        if readers:
+            print(
+                f"KEEP  secret scope {name}: still read by {', '.join(sorted(readers))}",
+                flush=True,
+            )
+            return
+        print(f"DELETE secret scope {name}", flush=True)
+        _databricks_api(profile, "POST", "/api/2.0/secrets/scopes/delete", body={"scope": name})
+    except Exception as error:
+        print(
+            f"WARN  secret scope {name} was not deleted ({type(error).__name__}). It still "
+            f"holds the app's AWS key pair. Remove it: {by_hand}",
+            flush=True,
+        )
+
+
 def _refuse_or_report(finding: str, *, dry_run: bool) -> None:
     """One rule, both of cleanup's cost gates: `--yes` refuses, a dry run reports.
 
@@ -12274,6 +12458,8 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
     round4_state = "exists" if round4_inventory[1] is not None else "already removed"
     print(f"OWNED Round 4 synced table: {round4_inventory[0]['resource_name']} ({round4_state})")
     for line in _round4_survivor_lines(manifest):
+        print(line, flush=True)
+    for line in _secret_scope_survivor_lines(manifest):
         print(line, flush=True)
     if aws_resources_exist:
         print(f"OWNED Aurora cluster: {manifest.aws.resources.aurora_cluster_id}")
@@ -12451,6 +12637,10 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
             )
         if delete_detached_runtime_role:
             _delete_detached_runtime_role(manifest)
+        # Last, and after the app: nothing about a scope bills, so it must never
+        # be what strands the destroy above, and an app that still reads it is
+        # a reason to keep it. See `_delete_secret_scope`.
+        _delete_secret_scope(manifest)
     except BaseException:
         # Not on a dry run. `cleanup_failed` means "a teardown ran partway and a
         # human must adjudicate what survived" -- `require_ready_manifest`

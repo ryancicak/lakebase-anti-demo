@@ -290,8 +290,12 @@ is awkward, because `antidemo doctor` needs that same SSO shell for its EC2 read
 An installation sealed to the SSO role has the mirror-image problem.
 
 A single role trusted by both collapses that. Whoever starts the process,
-`sts:GetCallerIdentity` returns `assumed-role/anti-demo-runtime/<session>`, and
-`principal_matches` resolves it to the same sealed ARN either way. The Round 5
+`sts:GetCallerIdentity` returns `assumed-role/<runtime role>/<session>`, and
+`principal_matches` resolves it to the same sealed ARN either way. The role is
+`anti-demo-runtime-<12 hex digits>`, a digest of the installation ID, so two
+installations in one account each have their own and it keeps its name across
+the fortnightly sweep; installations sealed before that naming keep plain
+`anti-demo-runtime`. The operator policies grant `role/anti-demo-runtime*`. The Round 5
 control role then trusts the runtime role — still exactly one principal, which is
 why the two-principal change does not disturb `round5_secret_free_topology`.
 

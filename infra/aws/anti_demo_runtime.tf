@@ -99,13 +99,15 @@ data "aws_iam_policy_document" "anti_demo_runtime_assume" {
 resource "aws_iam_role" "anti_demo_runtime" {
   count = local.anti_demo_runtime_enabled ? 1 : 0
 
-  # A fixed name, deliberately, where every other IAM resource here uses
+  # A stable name, deliberately, where every other IAM resource here uses
   # `name_prefix`. The operator's `~/.aws/config` carries this ARN in a
   # `role_arn` key, and the sweep is expected to remove and the installer to
-  # recreate this role every fortnight. A generated suffix would mean editing
+  # recreate this role every fortnight. A random suffix would mean editing
   # `~/.aws/config` after every sweep, which is exactly the recurring manual
-  # step this role exists to remove. Override the name when two installations
-  # must share one account without sharing a principal.
+  # step this role exists to remove. Stable per installation, not per account:
+  # server/lifecycle.py:anti_demo_runtime_role_name derives it from the
+  # installation ID, because one fixed name made a second installation in the
+  # same account fail its first apply on EntityAlreadyExists.
   name                 = var.anti_demo_runtime_role_name
   description          = "Single sealed principal assumed by both the operator SSO role and the deployed app's IAM user"
   assume_role_policy   = data.aws_iam_policy_document.anti_demo_runtime_assume[0].json
