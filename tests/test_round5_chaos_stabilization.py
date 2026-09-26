@@ -80,6 +80,22 @@ from tests.test_round5_pre_deploy_acceptance import (
 )
 from tests.test_round5_warm import DIGEST, Clock, Provider, preparation
 
+#: How long a test waits for the app to reach a state, in wall time. Not a count
+#: of yields: the code under test sleeps for real -- resident settlement polls
+#: every 50 ms -- so 400 zero-length yields ran out before a restart's cleanup
+#: finished on a loaded CI runner, and the test failed with the slot still
+#: CLEANING (2026-09-26). A passing wait still ends at its first poll that holds.
+_WAIT_SECONDS = 30.0
+_POLL_SECONDS = 0.01
+
+
+def _deadline() -> float:
+    return asyncio.get_running_loop().time() + _WAIT_SECONDS
+
+
+def _past(deadline: float) -> bool:
+    return asyncio.get_running_loop().time() >= deadline
+
 
 def _client_error(code: str) -> Exception:
     error = Exception(code)
@@ -2146,13 +2162,14 @@ async def test_full_process_replacement_fails_closed_then_converges(
             )
             started = await client.post(f"/api/sessions/{second_id}/run")
             assert started.status_code == 200
-            for _ in range(400):
+            deadline = _deadline()
+            while True:
                 terminal = (
                     await client.get(f"/api/sessions/{second_id}")
                 ).json()
-                if terminal["state"] == SessionState.VERIFIED.value:
+                if terminal["state"] == SessionState.VERIFIED.value or _past(deadline):
                     break
-                await asyncio.sleep(0)
+                await asyncio.sleep(_POLL_SECONDS)
             assert terminal["state"] == SessionState.VERIFIED.value
     await registry_transport.dispatcher.close()
 
@@ -2440,14 +2457,16 @@ async def test_live_proxy_target_group_recovery_rewarms_new_engines_after_restar
                 )
                 started = await client.post(f"/api/sessions/{second_id}/run")
                 assert started.status_code == 200
-                for _ in range(400):
+                deadline = _deadline()
+                while True:
                     terminal = (await client.get(f"/api/sessions/{second_id}")).json()
-                    if terminal["state"] == SessionState.VERIFIED.value:
+                    if terminal["state"] == SessionState.VERIFIED.value or _past(deadline):
                         break
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(_POLL_SECONDS)
                 assert terminal["state"] == SessionState.VERIFIED.value
 
-                for _ in range(400):
+                deadline = _deadline()
+                while True:
                     current = await replacement_store.read(
                         "install-absence-restart"
                     )
@@ -2456,9 +2475,9 @@ async def test_live_proxy_target_group_recovery_rewarms_new_engines_after_restar
                         current is not None
                         and current.state == Round5WarmState.WARMING
                         and cleanup_lease is None
-                    ):
+                    ) or _past(deadline):
                         break
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(_POLL_SECONDS)
                 assert current is not None and current.state == Round5WarmState.WARMING
                 second_proxy_name = replacement_orchestrator.proxy_name_for_bout(
                     second_id
@@ -2726,11 +2745,12 @@ async def test_refused_bell_deferred_settlement_retains_fence_and_absence_debt(
             assert second_operator is not None
             started = await manager.start_run(second_id, second_operator)
             assert started.state == SessionState.RUNNING
-            for _ in range(400):
+            deadline = _deadline()
+            while True:
                 terminal = (await client.get(f"/api/sessions/{second_id}")).json()
-                if terminal["state"] == SessionState.VERIFIED.value:
+                if terminal["state"] == SessionState.VERIFIED.value or _past(deadline):
                     break
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(_POLL_SECONDS)
             assert second_engine._fatal_lane_error is None, repr(
                 second_engine._fatal_lane_error
             )
@@ -2888,11 +2908,12 @@ async def test_timeout_success_cannot_rewarm_until_durable_jobs_settle(
             assert second_operator is not None
             started = await manager.start_run(second_id, second_operator)
             assert started.state == SessionState.RUNNING
-            for _ in range(400):
+            deadline = _deadline()
+            while True:
                 terminal = (await client.get(f"/api/sessions/{second_id}")).json()
-                if terminal["state"] == SessionState.VERIFIED.value:
+                if terminal["state"] == SessionState.VERIFIED.value or _past(deadline):
                     break
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(_POLL_SECONDS)
             assert terminal["state"] == SessionState.VERIFIED.value
     finally:
         await manager.close()
