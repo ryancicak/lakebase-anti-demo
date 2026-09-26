@@ -55,6 +55,26 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$")
 
 
+_RUNNER_CODE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+
+
+class Round5ResidentRunnerError(RuntimeError):
+    """A resident runner wait failed on what the runner itself reported.
+
+    Defined here rather than raised as a bare ``RuntimeError`` so operator logs
+    quote the message: ``manager._message_is_ours_to_quote`` quotes only
+    server-defined exceptions, and on 2026-09-26 a Round 5 Lakebase lane that
+    failed at 8,000 held clients logged nothing but "RuntimeError <-
+    CancelledError". Runner-supplied codes pass through :func:`_runner_code`
+    first, so only bounded tokens ever reach a log.
+    """
+
+
+def _runner_code(payload: Mapping[str, object], default: str) -> str:
+    code = payload.get("code")
+    return code if isinstance(code, str) and _RUNNER_CODE.fullmatch(code) else default
+
+
 class Round5ResidentBindingChangedError(RuntimeError):
     """Readiness events for a resident job carry a different binding than expected.
 
@@ -1470,7 +1490,7 @@ class Round5ResidentTransport:
                 )
                 for event in events:
                     if event.binding != binding:
-                        raise RuntimeError("resident runner event binding changed")
+                        raise Round5ResidentRunnerError("resident runner event binding changed")
                     sequence = event.sequence
                     if event.kind == Round5RunnerEventKind.PROGRESS:
                         if on_progress is not None:
@@ -1478,16 +1498,18 @@ class Round5ResidentTransport:
                     elif event.kind == Round5RunnerEventKind.RESULT:
                         result = dict(event.payload)
                     elif event.kind == Round5RunnerEventKind.FAILED:
-                        failure = str(event.payload.get("code") or "resident_runner_failed")
+                        failure = _runner_code(event.payload, "resident_runner_failed")
                     elif event.kind == Round5RunnerEventKind.QUARANTINED:
-                        raise RuntimeError(
-                            str(event.payload.get("code") or "resident_control_quarantined")
+                        raise Round5ResidentRunnerError(
+                            _runner_code(event.payload, "resident_control_quarantined")
                         )
                     elif event.kind == Round5RunnerEventKind.SETTLED:
                         if failure is not None:
-                            raise RuntimeError(failure)
+                            raise Round5ResidentRunnerError(failure)
                         if result is None:
-                            raise RuntimeError("resident settled without publishing a result")
+                            raise Round5ResidentRunnerError(
+                                "resident settled without publishing a result"
+                            )
                         return result
                 await self._sleep(0.05)
 
@@ -1563,8 +1585,8 @@ class Round5ResidentTransport:
                         Round5RunnerEventKind.FAILED,
                         Round5RunnerEventKind.QUARANTINED,
                     }:
-                        raise RuntimeError(
-                            str(event.payload.get("code") or "resident_preparation_failed")
+                        raise Round5ResidentRunnerError(
+                            _runner_code(event.payload, "resident_preparation_failed")
                         )
                 await self._sleep(0.05)
 
@@ -1582,8 +1604,8 @@ class Round5ResidentTransport:
                     if event.kind == Round5RunnerEventKind.SETTLED:
                         return
                     if event.kind == Round5RunnerEventKind.QUARANTINED:
-                        raise RuntimeError(
-                            str(event.payload.get("code") or "resident_control_quarantined")
+                        raise Round5ResidentRunnerError(
+                            _runner_code(event.payload, "resident_control_quarantined")
                         )
                 await self._sleep(0.05)
 
