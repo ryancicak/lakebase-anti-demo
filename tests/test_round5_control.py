@@ -1855,6 +1855,51 @@ async def test_permanent_quarantine_fails_transport_wait_immediately() -> None:
         await transport.result(event_binding, on_progress=None)
 
 
+@pytest.mark.parametrize(
+    ("code", "quoted"),
+    [
+        ("resident_fanin_client_errors", "resident_fanin_client_errors"),
+        ("fan-in stopped: 7 clients refused by host-a", "resident_runner_failed"),
+        (None, "resident_runner_failed"),
+    ],
+)
+async def test_a_runner_reported_failure_reaches_the_operator_log_as_a_bounded_code(
+    code: str | None,
+    quoted: str,
+) -> None:
+    """2026-09-26: a lane failed at 8,000 held clients and the log said only
+    "RuntimeError <- CancelledError", because a bare RuntimeError is never quoted."""
+
+    from server.manager import operator_diagnosis
+    from server.round5_control import Round5ResidentRunnerError
+
+    store = InMemoryRound5ControlStore()
+    dispatcher = Round5ControlDispatcher(store, lambda _event: asyncio.sleep(0))
+    transport = Round5ResidentTransport(store, dispatcher, sleep=lambda _delay: asyncio.sleep(0))
+    event_binding = binding()
+    for sequence, kind, payload in (
+        (1, Round5RunnerEventKind.FAILED, {} if code is None else {"code": code}),
+        (2, Round5RunnerEventKind.SETTLED, {"state": "failed"}),
+    ):
+        await store.append_runner_event(
+            Round5RunnerEvent(
+                event_id=str(sequence) * 64,
+                binding=event_binding,
+                sequence=sequence,
+                kind=kind,
+                occurred_at=datetime.now(UTC),
+                payload=payload,
+            )
+        )
+
+    with pytest.raises(Round5ResidentRunnerError) as raised:
+        await transport.result(event_binding, on_progress=None)
+
+    assert str(raised.value) == quoted
+    assert quoted in operator_diagnosis(raised.value)
+    assert "host-a" not in operator_diagnosis(raised.value)
+
+
 async def test_restart_reconciliation_uses_resident_registry_not_ssm() -> None:
     calls: list[str] = []
 
