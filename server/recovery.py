@@ -415,7 +415,35 @@ class RecoveryEngine:
             wire_call="PostgreSQL SELECT → INSERT → COMMIT → clock_timestamp()",
         )
         if await adapter.inspect_recovery(plan) is not None:
-            raise RecoveryNotArmedError("Owned recovery environment already exists")
+            # The artifact ID is deterministic per installation, so a restore that a
+            # restarted process never finished deleting refused every later arm; the
+            # startup reap declines anything younger than a full bout (live
+            # 2026-09-26: Round 3 read READY and every Prepare failed). Arm holds
+            # this round's ring lease, so nothing live can own it. Clear it the way
+            # Round 2's arm clears its own (safe_change._preflight_lane,
+            # cleanup_existing=True); delete_recovery still refuses anything whose
+            # ownership it cannot prove.
+            await self._emit(
+                on_progress,
+                plan,
+                RecoveryPhase.RESETTING,
+                "Clearing the previous owned recovery environment",
+            )
+            reset = await self._reset_lane(plan, on_progress)
+            if not reset.ok:
+                raise RecoveryNotArmedError(
+                    "Could not clear the previous owned recovery environment: "
+                    f"{reset.error or 'cleanup incomplete'}"
+                )
+            if await adapter.inspect_recovery(plan) is not None:
+                raise RecoveryNotArmedError("Owned recovery environment already exists")
+            await self._emit(
+                on_progress,
+                plan,
+                RecoveryPhase.PREPARING_INCIDENT,
+                "Previous owned environment cleared · committing the exact incident row",
+                wire_call="PostgreSQL SELECT → INSERT → COMMIT → clock_timestamp()",
+            )
         source = await adapter.connect_source(plan)
         try:
             row = await source.fetch_one(

@@ -522,6 +522,67 @@ async def test_arm_accepts_exact_existing_row_but_rejects_mismatched_payload() -
     assert aurora.source_row[0] == "someone-else@example.com"
 
 
+def _owned_artifact(engine, plan) -> ArtifactInspection:
+    return ArtifactInspection(
+        artifact_id=plan.artifact_id,
+        provider=plan.provider,
+        source_id=plan.source_id,
+        run_id=engine.scope.run_id,
+        owner=engine.scope.owner,
+        state="READY",
+    )
+
+
+async def test_arm_clears_a_previous_bouts_owned_environment_then_arms() -> None:
+    """A restart mid-bout left both recovery environments behind (live 2026-09-26).
+
+    The IDs are deterministic per installation, so arm used to refuse every later
+    bout with "Owned recovery environment already exists" while the card read
+    READY. Arm holds the ring, so it clears them, as Round 2's arm does.
+    """
+
+    engine, lakebase, aurora, _, timeline = build_engine()
+    lakebase_plan, aurora_plan = engine.plans_for(CompetitorId.AURORA_SERVERLESS_V2)
+    lakebase.artifact = _owned_artifact(engine, lakebase_plan)
+    aurora.artifact = _owned_artifact(engine, aurora_plan)
+    lakebase.provider_account.add(lakebase_plan.artifact_id)
+    aurora.provider_account.add(aurora_plan.artifact_id)
+    progress: list[str] = []
+
+    async def on_progress(event) -> None:
+        progress.append(event.status)
+
+    arm = await engine.arm(CompetitorId.AURORA_SERVERLESS_V2, on_progress)
+
+    assert set(arm.lanes) == {"lakebase", "competitor"}
+    assert lakebase.delete_calls == aurora.delete_calls == 1
+    assert lakebase.artifact is None and aurora.artifact is None
+    assert lakebase.provider_account == aurora.provider_account == set()
+    assert lakebase.source_row == aurora.source_row == engine.contract.row
+    assert "Clearing the previous owned recovery environment" in progress
+    assert all(adapter.create_calls == 0 for adapter in (lakebase, aurora))
+    assert timeline  # the source was reached only after the leftover was cleared
+
+
+async def test_arm_refuses_when_the_previous_environment_cannot_be_cleared() -> None:
+    engine, lakebase, aurora, _, _ = build_engine()
+    _, aurora_plan = engine.plans_for(CompetitorId.AURORA_SERVERLESS_V2)
+    aurora.artifact = _owned_artifact(engine, aurora_plan)
+    aurora.source_row = (
+        "someone-else@example.com",
+        1,
+        "foreign",
+        engine.contract.created_at,
+    )
+
+    with pytest.raises(RecoveryNotArmedError, match="Could not clear the previous owned"):
+        await engine.arm(CompetitorId.AURORA_SERVERLESS_V2)
+
+    assert aurora.delete_calls == 0
+    assert aurora.artifact is not None
+    assert aurora.source_row[0] == "someone-else@example.com"
+
+
 async def test_default_recovery_order_is_deterministic_and_run_owned() -> None:
     first, *_ = build_engine()
     repeated, *_ = build_engine()
