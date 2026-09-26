@@ -42,6 +42,15 @@ const ROUND_FIVE_FANIN_TARGET_CLIENTS = 10_000
  * "NO DECLARED WINNER" with sharing blocked whenever the pool was still warm.
  */
 export const ROUND_FIVE_MAX_PREEXISTING_CLIENT_SESSIONS = 60
+/**
+ * Retried connects one lane may spend, mirroring `server/connection_fanin.MAX_RETRIES`
+ * and the runner's copy (checked by `tests/test_round5_frontend_contract_mirror.py`).
+ * Zero until 2026-09-26: the Lakebase pooler's documented ceiling is exactly the
+ * 10,000 clients a lane opens, and one refused login failed a whole bout. A retry
+ * is timed and shown on the lane ("Failures / retries"); it never excuses a
+ * terminal failure, a missing client or a hold disconnect.
+ */
+export const ROUND_FIVE_MAX_RETRIES = 100
 const ROUND_FIVE_FANIN_RUNNER = 'Python 3.12 event-driven TLS/native-password'
 const ROUND_FIVE_AUTH_METHODS = new Set(['tls-cleartext-password', 'scram-sha-256'])
 
@@ -232,7 +241,7 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     && (!fanInCurrent || hardSafetyVerified)
     && (!fanInCurrent || portAccountingVerified)
     && (!fanIn || terminalFailures === 0)
-    && (!fanIn || retries === 0)
+    && (!fanIn || (retries !== null && retries <= ROUND_FIVE_MAX_RETRIES))
     && (!fanIn || disconnectedDuringHold === 0)
     && (!fanIn || (
       preexistingClientRoleSessions !== null

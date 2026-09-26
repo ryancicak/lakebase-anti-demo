@@ -72,7 +72,11 @@ PROXY_ENDPOINT_RESOLVE_POLL_SECONDS = 2.0
 SAMPLED_QUERIES_PER_LANE = 64
 SAMPLE_GROUPS = 8
 CLIENTS_PER_SAMPLE_GROUP = 8
-MAX_RETRIES = 0
+#: Retried connects a lane may spend across all of its worker shards (1% of the
+#: lane). Zero until 2026-09-26, when one 08P01 refusal from the Lakebase pooler --
+#: whose documented ceiling is exactly the 10,000 clients this lane opens -- failed
+#: a whole bout. Every retry is inside the timed window and counted in the evidence.
+MAX_RETRIES = 100
 INITIAL_WAVE_SIZE = 100
 MIN_WAVE_SIZE = 20
 MICRO_BATCH_SIZE = 2
@@ -105,6 +109,27 @@ TLS_HANDSHAKE_CPU_MS = 1.6
 #: Capping the drain instead is not an option; see `READY_CALLBACK_BATCH_LIMIT` below.
 LANE_CONNECT_CONCURRENCY = int((50.0 / 2) / TLS_HANDSHAKE_CPU_MS)
 PARTITION_CLIENTS_PER_LANE = TARGET_CLIENTS_PER_LANE // WORKER_COUNT
+#: Each shard owns an equal slice of the lane's retry budget, so the lane can
+#: never spend more than MAX_RETRIES however the refusals fall across shards.
+PARTITION_RETRY_BUDGET = MAX_RETRIES // WORKER_COUNT
+#: A single client slot is retried at most this many times, after these pauses.
+MAX_RETRIES_PER_CLIENT = 3
+CONNECT_RETRY_BACKOFF_SECONDS = (0.05, 0.2, 0.5)
+#: Connect failures that are the pooler or the regional front door refusing or
+#: dropping a login before it completed -- PgBouncer's 08P01 (max_client_conn and
+#: its other admission refusals), too_many_connections, cannot_connect_now, a reset
+#: or refused socket. Never credentials, SCRAM, TLS identity or protocol shape:
+#: those stay terminal on the first failure, and so does a login timeout, which is
+#: congestion a retry would only lengthen.
+RETRYABLE_CONNECT_CODES = frozenset(
+    {
+        "postgres_error_08p01",
+        "postgres_error_53300",
+        "postgres_error_57p03",
+        "connection_lost_before_authentication",
+        "connect_failed",
+    }
+)
 MAX_IN_FLIGHT_CONNECTS_PER_LANE = LANE_CONNECT_CONCURRENCY * WORKER_COUNT
 # Readiness burst used by the no-endpoint preflight probe. One worker loop can
 # only have LANE_CONNECT_CONCURRENCY * RUNNER_LANE_COUNT (64) connects in flight,
@@ -2839,88 +2864,125 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
                 "milestone_monotonic_ns": runtime.first_launch_ns,
             }
         )
+    def new_client() -> PostgresClient:
+        return PostgresClient(
+            lane_id=runtime.lane_id,
+            ordinal=ordinal,
+            database=runtime.database,
+            application_name=runtime.application_name,
+            ssl_context=runtime.ssl_context,
+            on_unexpected_disconnect=lambda lane_id: runtime.unexpected_disconnect(
+                lane_id,
+                ordinal,
+            ),
+            key_cache=runtime.key_cache,
+        )
+
     allocation_started_ns = time.perf_counter_ns()
-    client = PostgresClient(
-        lane_id=runtime.lane_id,
-        ordinal=ordinal,
-        database=runtime.database,
-        application_name=runtime.application_name,
-        ssl_context=runtime.ssl_context,
-        on_unexpected_disconnect=lambda lane_id: runtime.unexpected_disconnect(
-            lane_id,
-            ordinal,
-        ),
-        key_cache=runtime.key_cache,
-    )
+    client = new_client()
+    # The slot keeps one list position for its whole life; a retry replaces the
+    # failed client in place, so the lane never holds more than one per ordinal.
+    slot = len(runtime.clients)
     runtime.clients.append(client)
     _record_phase("client_allocate_and_append", allocation_started_ns)
+    # Timed from the slot's first attempt, so a retried login costs its lane in the
+    # connect latencies and in time-to-target exactly as a slow one would.
     started_ns = time.monotonic_ns()
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.create_connection(
-            lambda: client,
-            host=runtime.connect_host or str(runtime.database["host"]),
-            port=int(runtime.database["port"]),
-        )
-        async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
-            await client.authenticated
-        completed_ns = time.monotonic_ns()
-        runtime.authenticated += 1
-        if runtime.authenticated == 1:
-            _progress(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "protocol": PROTOCOL,
-                    "lane_id": runtime.lane_id,
-                    "phase": "ramp",
-                    "initiated_clients": runtime.initiated,
-                    "authenticated_clients": runtime.authenticated,
-                    "held_clients": sum(
-                        client.ready and not client.closed.done()
-                        for client in runtime.clients
-                    ),
-                    "terminal_failures": runtime.terminal_failures,
-                    "sampled_queries_succeeded": 0,
-                    "sampled_queries_failed": 0,
-                    "elapsed_ms": (time.monotonic_ns() - t0_ns) / 1_000_000,
-                    "time_to_target_ms": None,
-                    "milestone": "first_client_authenticated",
-                    "milestone_monotonic_ns": completed_ns,
-                }
+    slot_retries = 0
+    while True:
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.create_connection(
+                lambda attempt=client: attempt,
+                host=runtime.connect_host or str(runtime.database["host"]),
+                port=int(runtime.database["port"]),
             )
-        runtime.auth_methods.add(client.auth_method)
-        runtime.connect_latencies_ms.append((completed_ns - started_ns) / 1_000_000)
-        if runtime.authenticated == runtime.target_clients:
-            runtime.target_elapsed_ns = completed_ns - t0_ns
-    except asyncio.CancelledError:
-        # The launch already owns an ordinal and is included in ``initiated``.  Account for that
-        # terminal disposition before propagating cancellation; otherwise a telemetry stop or a
-        # towel leaves initiated > authenticated + failures with no explanation.
-        runtime.cancelled += 1
-        client.close()
-        raise
-    except Exception as exc:
-        runtime.terminal_failures += 1
-        if isinstance(exc, FanInProtocolError):
-            raw_code = str(exc)
-            code = (
-                raw_code
-                if raw_code and len(raw_code) <= 64 and raw_code.replace("_", "").isalnum()
-                else "protocol_failed"
+            async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
+                await client.authenticated
+            completed_ns = time.monotonic_ns()
+            runtime.authenticated += 1
+            if runtime.authenticated == 1:
+                _progress(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "protocol": PROTOCOL,
+                        "lane_id": runtime.lane_id,
+                        "phase": "ramp",
+                        "initiated_clients": runtime.initiated,
+                        "authenticated_clients": runtime.authenticated,
+                        "held_clients": sum(
+                            client.ready and not client.closed.done()
+                            for client in runtime.clients
+                        ),
+                        "terminal_failures": runtime.terminal_failures,
+                        "sampled_queries_succeeded": 0,
+                        "sampled_queries_failed": 0,
+                        "elapsed_ms": (time.monotonic_ns() - t0_ns) / 1_000_000,
+                        "time_to_target_ms": None,
+                        "milestone": "first_client_authenticated",
+                        "milestone_monotonic_ns": completed_ns,
+                    }
+                )
+            runtime.auth_methods.add(client.auth_method)
+            runtime.connect_latencies_ms.append((completed_ns - started_ns) / 1_000_000)
+            if runtime.authenticated == runtime.target_clients:
+                runtime.target_elapsed_ns = completed_ns - t0_ns
+            return
+        except asyncio.CancelledError:
+            # The launch already owns an ordinal and is included in ``initiated``.  Account for
+            # that terminal disposition before propagating cancellation; otherwise a telemetry
+            # stop or a towel leaves initiated > authenticated + failures with no explanation.
+            runtime.cancelled += 1
+            client.close()
+            raise
+        except Exception as exc:
+            code = _connect_failure_code(exc)
+            client.close()
+            if (
+                code in RETRYABLE_CONNECT_CODES
+                and slot_retries < MAX_RETRIES_PER_CLIENT
+                and runtime.retries < PARTITION_RETRY_BUDGET
+            ):
+                runtime.retries += 1
+                runtime.record_connection_diagnostic(
+                    ordinal=ordinal,
+                    stage="connect_retry",
+                    code=code,
+                )
+                try:
+                    await asyncio.sleep(CONNECT_RETRY_BACKOFF_SECONDS[slot_retries])
+                except asyncio.CancelledError:
+                    runtime.cancelled += 1
+                    raise
+                slot_retries += 1
+                client = new_client()
+                runtime.clients[slot] = client
+                continue
+            runtime.terminal_failures += 1
+            runtime.failure_codes[code] = runtime.failure_codes.get(code, 0) + 1
+            runtime.record_connection_diagnostic(
+                ordinal=ordinal,
+                stage="connect",
+                code=code,
             )
-        elif isinstance(exc, TimeoutError):
-            code = "connect_timeout"
-        elif isinstance(exc, ssl.SSLError):
-            code = "tls_failed"
-        else:
-            code = "connect_failed"
-        runtime.failure_codes[code] = runtime.failure_codes.get(code, 0) + 1
-        runtime.record_connection_diagnostic(
-            ordinal=ordinal,
-            stage="connect",
-            code=code,
+            return
+
+
+def _connect_failure_code(exc: Exception) -> str:
+    """The bounded code a failed connect is counted and, if retryable, retried under."""
+
+    if isinstance(exc, FanInProtocolError):
+        raw_code = str(exc)
+        return (
+            raw_code
+            if raw_code and len(raw_code) <= 64 and raw_code.replace("_", "").isalnum()
+            else "protocol_failed"
         )
-        client.close()
+    if isinstance(exc, TimeoutError):
+        return "connect_timeout"
+    if isinstance(exc, ssl.SSLError):
+        return "tls_failed"
+    return "connect_failed"
 
 
 async def _open_equal_wave(

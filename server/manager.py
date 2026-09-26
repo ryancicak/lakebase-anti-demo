@@ -508,6 +508,7 @@ def _round_six_remembered_result(elapsed_ms: float) -> str:
 
 #: The fan-in target, read from the contract so this file cannot disagree with the runner
 #: about what 10,000 means.
+from .connection_fanin import MAX_RETRIES as ROUND5_MAX_RETRIES  # noqa: E402
 from .connection_fanin import TARGET_CLIENTS_PER_LANE  # noqa: E402
 
 _ROUND_FIVE_SCHEDULED_CLIENTS = 128
@@ -6246,7 +6247,7 @@ class RunManager:
                     target_clients_per_lane=TARGET_CLIENTS_PER_LANE,
                     hold_seconds=30,
                     sampled_queries_per_lane=64,
-                    max_retries=0,
+                    max_retries=ROUND5_MAX_RETRIES,
                 )
                 for lane in record.snapshot.lanes.values():
                     lane.state = LaneState.SEALED
@@ -7972,7 +7973,7 @@ class RunManager:
                 target_clients_per_lane=TARGET_CLIENTS_PER_LANE,
                 hold_seconds=30,
                 sampled_queries_per_lane=64,
-                max_retries=0,
+                max_retries=ROUND5_MAX_RETRIES,
             )
             raw_downstream = self._round_five_value(result, "lanes", {})
             setup_result = self._round_five_finalize_setup(
