@@ -159,7 +159,14 @@ invocation exits.
 A lane verifies only when all of these hold:
 
 - exactly 10,000 initiated, authenticated, distinct, and simultaneously retained clients;
-- zero terminal failures, retries, and hold disconnects;
+- zero terminal failures and hold disconnects;
+- at most 100 retried connects per lane (`MAX_RETRIES`, split evenly across the four shards,
+  at most three per client), and only for a login the pooler or the regional front door refused
+  or dropped before it completed (PgBouncer's `08P01`, `53300`, `57P03`, a reset or refused
+  socket). Credentials, SCRAM, TLS identity, protocol shape and login timeouts stay terminal on
+  the first failure. Every retry is inside the timed window and reported on the lane as
+  "Failures / retries". Zero until 2026-09-26: the Lakebase pooler's documented ceiling is
+  exactly the 10,000 clients a lane opens, and one refused login failed a whole bout;
 - at least a 30-second hold;
 - 64/64 sparse queries;
 - multiplexing, identity, observer separation, clean-start, fairness, versioned hard-safety

@@ -411,11 +411,13 @@ export interface FairnessSnapshot {
    */
   hold_seconds?: number
   /**
-   * Retries allowed per client: 0 under the exact fan-in protocol.
+   * Retried connects one lane may spend under the exact fan-in protocol (100 since
+   * 2026-09-26; 0 before).
    *
    * Disclosed because it is the difference between "10,000 connected" and "10,000
-   * connected on the first attempt". A protocol that retried could reach the target
-   * while hiding the failures that make the number interesting.
+   * connected on the first attempt". Retries are allowed only for logins the pooler
+   * or front door refused, each one is inside the timed window, and every lane shows
+   * how many it used, so a retry can never hide the failure it absorbed.
    */
   max_retries?: number
 }
