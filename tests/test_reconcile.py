@@ -308,6 +308,63 @@ def test_residue_from_an_earlier_installation_is_flagged_not_ignored() -> None:
     assert orphan.usd_per_day == Decimal("0.504")  # 0.016*24 + 0.005*24
 
 
+def test_another_installation_in_the_account_is_reported_not_held_against_this_one() -> None:
+    """A second installation failed its own setup on the first one's fleet (2026-09-26).
+
+    The first installation's resources were findings, so `ok` was False and setup's
+    closing doctor check refused; their public addresses were counted as this
+    seal's IPv4 drift. They are still reported -- a dead run's residue costs money
+    -- but as the neighbour's, not as this installation's drift.
+    """
+
+    observed = [
+        *_resident(),
+        ObservedResource(
+            RDS_INSTANCE,
+            f"lakebase-anti-demo-{OTHER_RUN}-rds",
+            "available",
+            run_id=OTHER_RUN,
+            public_ipv4=True,
+            instance_class="db.t4g.micro",
+        ),
+        ObservedResource(
+            AURORA_WRITER,
+            f"lakebase-anti-demo-{OTHER_RUN}-writer",
+            "available",
+            run_id=OTHER_RUN,
+            public_ipv4=True,
+        ),
+    ]
+
+    report = reconcile(_manifest(), observed)
+
+    assert report.ok
+    assert [finding.code for finding in report.neighbours] == [ORPHAN_FOREIGN_RUN] * 2
+    assert IPV4_DRIFT not in {finding.code for finding in report.findings}
+    assert "2 resource(s) tagged for other runs" in report.summary()
+    assert any(OTHER_RUN in line for line in report.report_lines())
+
+
+def test_this_runs_own_drift_still_fails_beside_a_neighbour() -> None:
+    observed = [
+        *_resident(),
+        ObservedResource(
+            RDS_INSTANCE, "neighbour-rds", "available", run_id=OTHER_RUN, public_ipv4=True
+        ),
+        ObservedResource(
+            RDS_INSTANCE, "hand-made-experiment", "available", run_id=RUN_ID, public_ipv4=True
+        ),
+    ]
+
+    report = reconcile(_manifest(), observed)
+
+    assert not report.ok
+    assert report.summary().startswith("1 orphan(s)")
+    assert {ORPHAN_UNEXPECTED, ORPHAN_FOREIGN_RUN, IPV4_DRIFT} <= {
+        finding.code for finding in report.findings
+    }
+
+
 def test_demo_tagged_resource_outside_the_seal_is_unexpected_not_ephemeral() -> None:
     observed = [
         *_resident(),

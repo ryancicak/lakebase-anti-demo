@@ -11472,18 +11472,23 @@ def setup(
     if not round6_prepared:
         manifest = _prepare_and_reseal_round6(manifest, timeout=timeout_seconds)
     failures: list[str] = []
+    # Why, and not only which: a real install stopped on "Setup checks failed:
+    # aurora:resource_reconciliation, rds:resource_reconciliation" and nothing
+    # else, leaving the operator to guess. Once per distinct reason, because the
+    # account-wide checks fail identically for both competitors.
+    reasons: dict[tuple[str, str], None] = {}
     for competitor in ("aurora", "rds"):
         # Advisory checks are skipped here for the same reason they are skipped in
         # the CLI: they have already printed themselves, and they describe
         # something an operator should know rather than something setup must not
         # proceed past.
-        failures.extend(
-            f"{competitor}:{check.name}"
-            for check in doctor(competitor, timeout_seconds=timeout_seconds)
-            if not check.ok and not check.advisory
-        )
+        for check in doctor(competitor, timeout_seconds=timeout_seconds):
+            if not check.ok and not check.advisory:
+                failures.append(f"{competitor}:{check.name}")
+                reasons[(check.name, check.detail)] = None
     if failures:
-        raise RuntimeError("Setup checks failed: " + ", ".join(failures))
+        detail = "\n".join(f"  {name}: {reason}" for name, reason in reasons)
+        raise RuntimeError("Setup checks failed: " + ", ".join(failures) + "\n" + detail)
     return manifest
 
 

@@ -1388,6 +1388,10 @@ def _drift(report: DriftReport | None, now: datetime) -> StandingCostDrift:
 
     observed = {resource.identifier: resource for resource in report.observed}
     short_of_seal = report.observed_public_ipv4 < report.expected_public_ipv4
+    # Another run's resources are not this installation's standing cost: a
+    # second installation in the account put its whole fleet on this panel as
+    # "unexpected" (2026-09-26). `antidemo doctor` and cleanup still list them.
+    neighbours = set(report.neighbours)
     findings = [
         _drift_finding(
             finding,
@@ -1396,6 +1400,7 @@ def _drift(report: DriftReport | None, now: datetime) -> StandingCostDrift:
             charging_for_absent=finding.code == IPV4_DRIFT and short_of_seal,
         )
         for finding in report.findings
+        if finding not in neighbours
     ]
     if not findings:
         return StandingCostDrift(

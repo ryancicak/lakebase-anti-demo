@@ -2519,6 +2519,54 @@ def test_round5_cleanup_ring_key_tracks_manifest_generation() -> None:
     )
 
 
+def test_setup_says_why_its_closing_checks_failed(monkeypatch, tmp_path) -> None:
+    """A real install stopped on the check names alone and left the reason to guesswork."""
+
+    manifest = make_manifest(status="ready")
+    attach_round4(manifest)
+    manifest.round5 = ready_round5_stub()
+    manifest.round6 = SimpleNamespace()
+    manifest.manifest_version = 6
+    owned_manifest = tmp_path / "manifest.json"
+    owned_manifest.touch()
+    monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr("server.lifecycle._require_round5_clean_baseline", lambda candidate: None)
+    monkeypatch.setattr("server.lifecycle.reconcile_infrastructure", lambda candidate: candidate)
+    monkeypatch.setattr("server.lifecycle.reset", lambda timeout: manifest)
+    for stage in ("_prepare_and_reseal_round5", "_prepare_and_reseal_round6"):
+        monkeypatch.setattr(f"server.lifecycle.{stage}", lambda candidate, *, timeout: candidate)
+
+    def doctor(competitor, *, timeout_seconds):
+        checks = [Check("resource_reconciliation", False, "1 orphan(s), 0 missing")]
+        if competitor == "aurora":
+            checks.append(Check("aurora_scale_zero", False, "Aurora is still resuming"))
+        return checks
+
+    monkeypatch.setattr("server.lifecycle.doctor", doctor)
+
+    with pytest.raises(RuntimeError) as failure:
+        setup(
+            databricks_profile="",
+            aws_profile="",
+            aws_region="",
+            expected_account="",
+            owner="",
+            operator_cidr=None,
+            ttl_hours=None,
+            timeout_seconds=321,
+        )
+
+    message = str(failure.value)
+    assert message.startswith(
+        "Setup checks failed: aurora:resource_reconciliation, aurora:aurora_scale_zero, "
+        "rds:resource_reconciliation"
+    )
+    # Once per distinct reason: the account-wide check fails the same way twice.
+    assert message.count("resource_reconciliation: 1 orphan(s), 0 missing") == 1
+    assert "aurora_scale_zero: Aurora is still resuming" in message
+
+
 def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_path) -> None:
     manifest = make_manifest(status="ready")
     attach_round4(manifest)
