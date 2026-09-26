@@ -209,6 +209,40 @@ def test_start_refuses_to_join_a_conflicting_update_with_a_different_contract(
         start(manifest, api, marker_path=tmp_path / "power.json")
 
 
+@pytest.mark.parametrize("where", ["latest_updates", "update_detail"])
+def test_start_refuses_to_join_an_update_that_is_still_stopping(tmp_path, where: str) -> None:
+    """A stopping update can only end CANCELED; joining it failed a re-arm (2026-09-26)."""
+
+    manifest = _manifest_with_round4()
+    pipeline_id = manifest.round4.pipeline_id
+    update_id = "stopping-update"
+    marker = tmp_path / "power.json"
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        del profile, body, timeout
+        if method == "post":
+            raise ResourceConflict("An active update already exists")
+        if path == f"/api/2.0/pipelines/{pipeline_id}":
+            listed = "STOPPING" if where == "latest_updates" else "RUNNING"
+            return {
+                "pipeline_id": pipeline_id,
+                "latest_updates": [{"update_id": update_id, "state": listed}],
+            }
+        return {
+            "update": {
+                "pipeline_id": pipeline_id,
+                "update_id": update_id,
+                "state": "STOPPING",
+                "full_refresh": False,
+            }
+        }
+
+    with pytest.raises(pipeline_power.PipelineUpdateStoppingError, match="still stopping"):
+        start(manifest, api, marker_path=marker)
+
+    assert not marker.exists()
+
+
 def test_start_refuses_an_unidentified_update_before_writing_resume_intent(tmp_path) -> None:
     manifest = _manifest_with_round4()
     marker = tmp_path / "power.json"
