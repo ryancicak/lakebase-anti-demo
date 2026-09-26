@@ -2273,13 +2273,19 @@ if [[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] &&
           ;;
         *)
           APP_SERVING="no"
-          # Deliberately loud even in check mode. "The platform says the app is
-          # fine and the app is not" is the single most misleading state this
-          # tool can be run against.
-          warn "the deployed app is NOT serving: GET /api/health -> $PROBE_CODE, despite
+          if [[ "$APP_DEPLOY_STATE" == "NONE" ]]; then
+            # Never deployed: an app created a step ago has nothing to serve,
+            # and calling that "already broken" alarmed a first install.
+            info "nothing is deployed to it yet (GET /api/health -> $PROBE_CODE); this is its first deploy"
+          else
+            # Deliberately loud even in check mode. "The platform says the app is
+            # fine and the app is not" is the single most misleading state this
+            # tool can be run against.
+            warn "the deployed app is NOT serving: GET /api/health -> $PROBE_CODE, despite
                 deployment $APP_DEPLOY_STATE. It is already broken, so a deploy from here
                 can only improve matters -- but check the logs for why:
                     databricks apps logs $APP_NAME --tail-lines 100 ${DATABRICKS_ARGS[*]}"
+          fi
           ;;
       esac
     fi
@@ -2287,7 +2293,9 @@ if [[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] &&
 
   BOUND_SCOPE="$(printf '%s' "$APP_STATE_JSON" |
     jq -r --arg n "anti-demo-manifest-json" '.resources[]? | select(.name==$n) | .secret.scope // empty')"
-  if [[ -z "$BOUND_SCOPE" ]]; then
+  if [[ -z "$BOUND_SCOPE" && "$APP_DEPLOY_STATE" == "NONE" ]]; then
+    info "no seal is bound to it yet; the deploy binds scope '$SECRET_SCOPE'"
+  elif [[ -z "$BOUND_SCOPE" ]]; then
     warn "the app has no 'anti-demo-manifest-json' resource, so it has no seal at all"
   else
     ok "the app reads its seal from scope '$BOUND_SCOPE'"
@@ -2843,13 +2851,21 @@ say ""
 SETUP_STATUS=0
 "${ANTI_DEMO_EXECUTABLE:-./antidemo}" "${SETUP_ARGS[@]}" || SETUP_STATUS=$?
 if ((SETUP_STATUS != 0)); then
+  CONTINUE_HINT="./bootstrap.sh --apply   (resumes; does not duplicate)"
+  # Setup's closing checks run after the last seal, so it can fail on a complete
+  # installation -- and --apply then refuses that as ready, one more round trip
+  # for someone who just did what this message said (found 2026-09-26).
+  if apply_targets_complete_ready_install "$ANTI_DEMO_MANIFEST"; then
+    CONTINUE_HINT="fix what setup's closing checks name above, then
+                                   ./bootstrap.sh --deploy-only   (provisioning finished)"
+  fi
   die "'./antidemo setup' exited $SETUP_STATUS, and it does not undo what it created.
        Anything Terraform applied before the failure exists now and is billing now.
        External expiry may later reap tagged AWS resources, but it does not
        guarantee complete cleanup of this partial installation.
 
        Find out what is running:   ./antidemo cleanup --dry-run
-       Continue where it stopped:  ./bootstrap.sh --apply   (resumes; does not duplicate)
+       Continue where it stopped:  $CONTINUE_HINT
        Stop the spend:             ./antidemo cleanup --yes
 
        All three need this generation, so keep ANTI_DEMO_MANIFEST pointed at

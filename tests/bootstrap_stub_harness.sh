@@ -671,6 +671,22 @@ STUB
   fi
 }
 
+# 2026-09-26: the first deploy of a freshly created app warned that it "is NOT
+# serving ... It is already broken" and "has no seal at all" -- both simply the
+# state of an app nothing has been deployed to yet.
+case_first_deploy_is_not_called_broken() {
+  printf '\n%s== an app nothing was deployed to is not called broken ==%s\n' "$BOLD" "$RESET"
+  local sb gen
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_APP_DEPLOY=NONE STUB_PREFLIGHT_CODE=502 run "$sb"
+  check "says what a never-deployed app is" "nothing is deployed to it yet (GET /api/health -> 502)"
+  check_absent "and does not call it broken" "It is already broken"
+  STUB_APP_DEPLOY=SUCCEEDED STUB_PREFLIGHT_CODE=502 run "$sb"
+  check "a deployed app serving 502 still is" "It is already broken"
+}
+
 case_multiple_warehouses_are_derived() {
   printf '\n%s== multiple warehouses need no sixth input ==%s\n' "$BOLD" "$RESET"
   local sb gen status
@@ -2157,6 +2173,7 @@ CASES=(
   case_check_clean
   case_operator_ip_fallback
   case_foreign_app_is_not_adopted
+  case_first_deploy_is_not_called_broken
   case_multiple_warehouses_are_derived
   case_five_input_full_acceptance
   case_fresh_app_creation_provenance
