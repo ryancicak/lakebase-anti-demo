@@ -12462,8 +12462,15 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
     for line in _secret_scope_survivor_lines(manifest):
         print(line, flush=True)
     if aws_resources_exist:
-        print(f"OWNED Aurora cluster: {manifest.aws.resources.aurora_cluster_id}")
-        print(f"OWNED RDS instance: {manifest.aws.resources.rds_instance_id}")
+        # What the destroy below acts on. The two named lines are the Round 1
+        # fields a v1 seal filled; a v7 installation seals its per-round fleet
+        # elsewhere and leaves them empty, and "OWNED Aurora cluster: " with
+        # nothing after it read as a finding on a real partial install.
+        print(f"OWNED Terraform-managed AWS resources: {len(managed_addresses)}")
+        if manifest.aws.resources.aurora_cluster_id:
+            print(f"OWNED Aurora cluster: {manifest.aws.resources.aurora_cluster_id}")
+        if manifest.aws.resources.rds_instance_id:
+            print(f"OWNED RDS instance: {manifest.aws.resources.rds_instance_id}")
         print("PLAN  Terraform destroy after Round 5 clean-baseline authorization")
     else:
         # An empty Terraform state is not evidence of an empty account, and
