@@ -181,9 +181,10 @@ is then passed to every `antidemo` command.
 | `ANTI_DEMO_MANIFEST` | the highest existing `.anti-demo-v*/manifest.json`, or a new `.anti-demo-v7` |
 | `DATABRICKS_PROFILE` | `anti-demo-<workspace subdomain>`, written from the OAuth credentials |
 | `DATABRICKS_WAREHOUSE_ID` | selected deterministically from visible warehouses: serverless, then running, then name and ID |
-| `DATABRICKS_APP_CLIENT_ID` | the Databricks App's service principal, by adopting or creating the app |
+| `DATABRICKS_APP_CLIENT_ID` | the Databricks App's service principal, by creating the app, or by adopting it when this installation's manifest or `bootstrap.json` already names that service principal — see [a second installation in the same workspace](#a-second-installation-in-the-same-workspace) |
+| secret scope | `<app name>-<generation directory>`, so every installation's seal has a scope of its own |
 | `AWS_REGION` | mirrored from `AWS_DEFAULT_REGION`, because `server/cli.py` reads only the former |
-| operator ingress `/32` | `checkip.amazonaws.com`, the same source `antidemo setup` uses |
+| operator ingress `/32` | the first of `checkip.amazonaws.com`, `api.ipify.org` and `ipv4.icanhazip.com` (all HTTPS) to answer — the same list `antidemo setup` uses — or `ANTI_DEMO_OPERATOR_IP` when a network blocks all three |
 
 `AWS_PROFILE` and `AWS_DEFAULT_PROFILE` are unset on the public path. A stale
 `AWS_SESSION_TOKEN` inherited from an SSO session is also cleared; the
@@ -214,8 +215,10 @@ about the environment.
 
 1. All nine prerequisite binaries, including the seven `antidemo doctor` checks for.
 2. `sts:GetCallerIdentity`, and that the account is 12 digits.
-3. That a public IPv4 address is detectable — `detect_operator_cidr` rejects
-   IPv6 and there is no fallback.
+3. That a public IPv4 address is detectable — `detect_operator_cidr` asks three
+   HTTPS echoes in order and rejects IPv6. On a network that blocks all three,
+   set `ANTI_DEMO_OPERATOR_IP` to this host's public IPv4 in `.env.bootstrap` or
+   the environment; `antidemo` carries it too, for `renew` and the ingress repair.
 4. Fourteen read probes across RDS, EC2, Secrets Manager, SSM, CloudWatch and
    IAM, plus real EC2 authorisation dry runs for `CreateSecurityGroup` and
    `RunInstances`.
@@ -233,6 +236,10 @@ about the environment.
 8. On an existing installation, that the manifest's AWS account, region and
    Databricks principal all match what you supplied. `reconcile_infrastructure`
    refuses on any of those mismatches, and finding out here costs nothing.
+9. That an app already holding the app name is this installation's: its service
+   principal must be the one the manifest sealed into Round 4, or the one this
+   generation's `bootstrap.json` recorded. Anything else is refused — see [a
+   second installation in the same workspace](#a-second-installation-in-the-same-workspace).
 
 `rds:Create*`, `iam:CreateRole` and `secretsmanager:CreateSecret` have no dry
 run. The script says so rather than implying it proved them.
@@ -296,7 +303,37 @@ interrupted-provision resume path.
 `.anti-demo-v<N+1>` and leaves the existing generation, its Terraform state and
 everything it owns untouched. **This is a second full fleet and a second full
 bill.** The first one keeps billing until `./antidemo cleanup --yes` is run against
-its own manifest; nothing about creating a second generation stops the first.
+its own manifest; nothing about creating a second generation stops the first. The
+first generation's app is one of the things it owns, so the new generation needs
+an app of its own — set `DATABRICKS_APP_NAME`, as below.
+
+### A second installation in the same workspace
+
+Every installation of this repository defaults to the app name
+`lakebase-anti-demo`, and every first install is `.anti-demo-v7`. So a second
+installation in a workspace that already has one — a teammate's, a fresh clone of
+your own, or `--new-generation` — finds an app under that name that nothing in
+its own generation vouches for. Bootstrap refuses it at preflight, before
+anything is created, rather than adopt it: adopting it published the new
+installation's seal into the running demo and replaced it, and cleaning the new
+installation up later left that app serving resources that no longer existed.
+
+Give the second installation its own app, with one line in `.env.bootstrap`:
+
+```bash
+DATABRICKS_APP_NAME=lakebase-anti-demo-2
+```
+
+Any name no app in the workspace already has works: lowercase letters, digits
+and hyphens. The app, its service principal and its secret scope
+(`<app name>-<generation directory>`) are then all its own. Everything else an
+installation creates is already unique to it: AWS resources are named from a
+digest of its installation ID, Lakebase projects from the ID itself, and Round 4
+schemas from its run ID.
+
+If the app under the name is left over from an installation whose directory is
+gone, delete it instead (`databricks apps delete <name> -p <profile>`) and run
+again; the new installation creates a fresh one.
 
 "Highest" is now numeric rather than lexical. The previous last-wins loop over
 `.anti-demo-v*/` would have adopted `.anti-demo-v9` while `.anti-demo-v10` was

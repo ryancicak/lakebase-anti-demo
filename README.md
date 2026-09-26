@@ -39,9 +39,11 @@ You need:
   grant its own permissions, because creating and attaching IAM policies is more
   privilege than the set being granted
 
-Copy the environment template:
+Clone the repository and copy the environment template:
 
 ```bash
+git clone https://github.com/ryancicak/lakebase-anti-demo.git
+cd lakebase-anti-demo
 cp docs/bootstrap.env.example .env.bootstrap
 ```
 
@@ -60,7 +62,11 @@ Use a permanent IAM user pair (the normal 20-character access key ID and
 belongs to, verifies the AWS account, and seals the exact stable IAM principal
 into the shared runtime-role trust automatically. It also derives the region,
 workspace, app, warehouse, secret scope, and every resource identifier; none is
-a sixth setup value.
+a sixth setup value. The one exception is a workspace that already has an
+installation of this demo: bootstrap will not take over that one's app, and says
+so before creating anything. Give yours its own app with one more line,
+`DATABRICKS_APP_NAME=lakebase-anti-demo-2` — see
+[a second installation in the same workspace](docs/BOOTSTRAP.md#a-second-installation-in-the-same-workspace).
 
 Check your machine and accounts. This command provisions nothing:
 

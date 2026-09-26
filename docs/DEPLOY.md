@@ -704,12 +704,15 @@ matters yet.
 
 ### Scope naming
 
-Default: `lakebase-anti-demo-<generation directory>`, keyed on the generation,
-which is stable across resets. The existing hand-made convention embeds `run_id`,
-which changes on every reset and forces the app's resource bindings to be
-rewritten alongside the secret. If the app is already bound to a different
-scope, bootstrap adopts that one rather than orphaning it. Override with
-`ANTI_DEMO_SECRET_SCOPE`.
+Default: `<app name>-<generation directory>` — `lakebase-anti-demo-.anti-demo-v7`
+for a first install under the default app name. Keyed on the generation, which
+is stable across resets: the existing hand-made convention embeds `run_id`, which
+changes on every reset and forces the app's resource bindings to be rewritten
+alongside the secret. Keyed on the app as well, because every first install is
+`.anti-demo-v7`: keyed on the generation alone, a second installation in the same
+workspace published its seal into the first one's scope even under its own app
+name. If the app is already bound to a different scope, bootstrap adopts that one
+rather than orphaning it. Override with `ANTI_DEMO_SECRET_SCOPE`.
 
 ### Grants the deploy cannot issue itself
 

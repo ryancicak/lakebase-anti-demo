@@ -391,21 +391,75 @@ def _new_run_id() -> str:
     return f"ad-{stamp}-{secrets.token_hex(2)}"
 
 
-def detect_operator_cidr(*, timeout_seconds: float = 10.0) -> str:
-    """Ask AWS which address it sees this host as, and express it as a /32.
+#: The HTTPS echoes asked, in order, which address this host egresses from.
+#: Several, because one blocked endpoint used to stop the whole install: on
+#: 2026-09-26 a filtered network timed out on https://checkip.amazonaws.com while
+#: both of the others answered. Never plain HTTP -- the answer becomes the one
+#: /32 the database security groups admit. Mirrored in bootstrap.sh.
+OPERATOR_IP_ENDPOINTS = (
+    "https://checkip.amazonaws.com",
+    "https://api.ipify.org",
+    "https://ipv4.icanhazip.com",
+)
+#: Names this host's public IPv4 outright, for networks that block every echo
+#: above. Honoured by bootstrap.sh and by every command that re-reads the address.
+OPERATOR_IP_ENV = "ANTI_DEMO_OPERATOR_IP"
 
-    `timeout_seconds` exists for the runtime drift probe below, which runs beside
-    a demo and must not sit on a ten-second socket. Every mutator keeps the
-    original default: a provision or a repair is allowed to wait.
+
+def detect_operator_cidr(*, timeout_seconds: float = 10.0) -> str:
+    """Find the public IPv4 this host egresses from, and express it as a /32.
+
+    `timeout_seconds` bounds each echo, and exists for the runtime drift probe
+    below, which runs beside a demo and must not sit on a ten-second socket. Every
+    mutator keeps the original default: a provision or a repair is allowed to wait.
+    A network failure on every echo re-raises the last one, so callers that read
+    "could not tell" from OSError or TimeoutError keep doing so.
     """
-    with urllib.request.urlopen(
-        "https://checkip.amazonaws.com", timeout=timeout_seconds
-    ) as response:
-        raw = response.read(128).decode("ascii").strip()
-    address = ipaddress.ip_address(raw)
-    if address.version != 4:
+    override = os.environ.get(OPERATOR_IP_ENV, "").strip()
+    if override:
+        # RuntimeError, not ValueError: `_require_operator_cidr` reads ValueError
+        # as "no echo answered", which is the wrong advice for a mistyped value.
+        try:
+            declared = ipaddress.ip_address(override)
+        except ValueError:
+            declared = None
+        if declared is None or declared.version != 4 or not declared.is_global:
+            raise RuntimeError(
+                f"{OPERATOR_IP_ENV}={override} is not a public IPv4 address. Set it to "
+                "the address this host reaches AWS from, or unset it to detect one."
+            )
+        return f"{declared}/32"
+    last_failure: BaseException | None = None
+    ipv6_seen = False
+    for endpoint in OPERATOR_IP_ENDPOINTS:
+        try:
+            with urllib.request.urlopen(endpoint, timeout=timeout_seconds) as response:
+                raw = response.read(128).decode("ascii").strip()
+            address = ipaddress.ip_address(raw)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            last_failure = exc
+            continue
+        if address.version != 4:
+            ipv6_seen = True
+            continue
+        return f"{address}/32"
+    if ipv6_seen:
         raise RuntimeError("Round 1 currently requires an operator public IPv4 address")
-    return f"{address}/32"
+    assert last_failure is not None
+    raise last_failure
+
+
+def _require_operator_cidr() -> str:
+    """The operator /32 for a command that changes ingress, or a refusal naming the way out."""
+
+    try:
+        return detect_operator_cidr()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Could not detect this host's public IPv4 address from "
+            f"{', '.join(OPERATOR_IP_ENDPOINTS)}. Set {OPERATOR_IP_ENV} to it "
+            "and run again."
+        ) from exc
 
 
 def _validate_operator_cidr(value: str) -> str:
@@ -868,12 +922,17 @@ def _operator_cidr_check(manifest: DemoManifest) -> Check:
     except Exception as exc:
         return Check("operator_cidr", False, str(exc))
     configured = manifest.aws.operator_cidr
+    # A declared address is not a detected one, and a stale declaration is the
+    # one mismatch re-running the repair cannot fix on its own.
+    current = current_cidr
+    if os.environ.get(OPERATOR_IP_ENV, "").strip():
+        current = f"{current_cidr} (from {OPERATOR_IP_ENV})"
     if current_cidr == configured:
-        return Check("operator_cidr", True, f"current {current_cidr}; configured {configured}")
+        return Check("operator_cidr", True, f"current {current}; configured {configured}")
     return Check(
         "operator_cidr",
         False,
-        f"current {current_cidr}; configured {configured} · every round that "
+        f"current {current}; configured {configured} · every round that "
         f"connects directly to Aurora or RDS will fail until the security groups "
         f"are rebound · run '{OPERATOR_INGRESS_REPAIR_COMMAND}'",
     )
@@ -9538,7 +9597,7 @@ def provision(
     databricks_user = _verify_databricks_identity(databricks_profile)
     print("CHECK explicit AWS account binding", flush=True)
     _verify_aws_identity(auth.profile, aws_region, expected_account, auth.mode)
-    cidr = _validate_operator_cidr(operator_cidr or detect_operator_cidr())
+    cidr = _validate_operator_cidr(operator_cidr or _require_operator_cidr())
     # Before the first apply, so the groups Terraform creates admit the deployed
     # app. See `_seal_initial_serverless_egress`.
     egress_cidrs, egress_published_at = _seal_initial_serverless_egress(aws_region)
@@ -9614,7 +9673,7 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         manifest.aws.account_id,
         manifest.aws.auth_mode,
     )
-    current_cidr = detect_operator_cidr()
+    current_cidr = _require_operator_cidr()
     if current_cidr != manifest.aws.operator_cidr:
         raise RuntimeError(
             f"Operator public IP changed to {current_cidr}; provisioned ingress is "
@@ -9686,7 +9745,7 @@ def reset(timeout_seconds: float = 900) -> DemoManifest:
                 "Round 5 reset refused: deterministic-prefix residue has no "
                 "ownership-authorizing journal scope"
             )
-    current_cidr = detect_operator_cidr()
+    current_cidr = _require_operator_cidr()
     if current_cidr != manifest.aws.operator_cidr:
         raise RuntimeError(
             f"Operator public IP changed to {current_cidr}; provisioned ingress is "
@@ -9705,7 +9764,7 @@ def reset(timeout_seconds: float = 900) -> DemoManifest:
 
 def _refresh_operator_cidr(manifest: DemoManifest) -> None:
     """Rebind owned database ingress when the local operator's public IP changes."""
-    current_cidr = detect_operator_cidr()
+    current_cidr = _require_operator_cidr()
     if current_cidr == manifest.aws.operator_cidr:
         return
     ownership = _aws_ownership(manifest)

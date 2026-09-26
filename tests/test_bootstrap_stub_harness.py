@@ -14,6 +14,8 @@ HARNESS = REPO / "tests" / "bootstrap_stub_harness.sh"
 # rather than silently going unrun.
 EXPECTED_CASES = {
     "case_check_clean",
+    "case_operator_ip_fallback",
+    "case_foreign_app_is_not_adopted",
     "case_multiple_warehouses_are_derived",
     "case_banned_files",
     "case_print_env",

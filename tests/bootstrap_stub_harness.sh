@@ -156,7 +156,18 @@ case "$args" in
     echo '{"status":"ready","credentials_state":"ok","degraded":false,"ring_ready":true,"round5_ring_ready":true}' ;;
   *"/api/catalog"*)
     echo '{"rounds":[{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"},{"availability":"ready"}]}' ;;
-  *"checkip.amazonaws.com"*) echo "203.0.113.7" ;;
+  *"checkip.amazonaws.com"* | *"api.ipify.org"* | *"ipv4.icanhazip.com"*)
+    # STUB_IP_ECHO_BLOCKED lists echo hosts that time out, the way a filtered
+    # network answers (curl exit 28). Each echo answers differently, so a case can
+    # tell which one the address came from.
+    for blocked in ${STUB_IP_ECHO_BLOCKED:-}; do
+      [[ "$args" == *"$blocked"* ]] && exit 28
+    done
+    case "$args" in
+      *"checkip.amazonaws.com"*) echo "203.0.113.7" ;;
+      *"api.ipify.org"*) echo "203.0.113.8" ;;
+      *) echo "203.0.113.9" ;;
+    esac ;;
   *) echo '{}' ;;
 esac
 STUB
@@ -402,7 +413,9 @@ path.write_text(json.dumps({
                 "arn:aws:iam::111122223333:user/stub"
             ]},
     "databricks": {"user": "stub@example.com", "profile": "stub"},
-    "round4": {"storage_catalog": "stubcat"},
+    # The app it deployed: what makes the stub app this installation's.
+    "round4": {"storage_catalog": "stubcat",
+               "app_service_principal_client_id": "app-client-stub"},
     "round5": {
         "control_role_trusted_principal_arn":
             "arn:aws:iam::111122223333:role/anti-demo-runtime"
@@ -416,10 +429,22 @@ PY
 # ---------------------------------------------------------------------------
 
 # run <sandbox> <args...> -> writes $OUT, returns exit code
+#
+# The workspace a case runs against has this installation's app exactly when
+# there is an installation: a first provision meets a workspace without one,
+# which is where a real first install starts, and bootstrap refuses to adopt an
+# app nothing in the generation vouches for. A case that wants a foreign app in
+# front of a first provision says so with STUB_APP_MISSING=0. Stub state lives
+# in the sandbox unless a case names somewhere else, so an app one case created
+# cannot turn up in the next.
 run() {
-  local sb="$1"
+  local sb="$1" manifest app_missing=1
   shift
+  manifest="$(sed -n 's/^ANTI_DEMO_MANIFEST=//p' "$sb/env" | tail -1)"
+  [[ -n "$manifest" && -f "$manifest" ]] && app_missing=0
   OUT="$(HOME="$sb/home" ANTI_DEMO_ROUND5_WARM_DEADLINE_SECONDS=3 \
+    STUB_APP_MISSING="${STUB_APP_MISSING:-$app_missing}" \
+    STUB_STATE_DIR="${STUB_STATE_DIR:-$sb}" \
     PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
     bash ./bootstrap.sh --env-file "$sb/env" "$@" 2>&1)"
   return $?
@@ -494,6 +519,126 @@ case_check_clean() {
   fi
 }
 
+# 2026-09-26: a filtered network timed out on checkip.amazonaws.com and the
+# install stopped at preflight, although the other two echoes answered.
+case_operator_ip_fallback() {
+  printf '\n%s== operator address survives a blocked echo ==%s\n' "$BOLD" "$RESET"
+  local sb gen status all_echoes declared
+  all_echoes="checkip.amazonaws.com api.ipify.org ipv4.icanhazip.com"
+  # A declared address must be globally routable, and a routable literal is what
+  # tests/test_no_live_identifiers_committed.py refuses to see published, so it is
+  # assembled the way that file assembles its own. Invented.
+  declared="$(printf '%s.' 45 45 45)45"
+  gen="$(mktemp -d)/gen"
+
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_IP_ECHO_BLOCKED="checkip.amazonaws.com" run "$sb"
+  check "falls through to the next echo" "operator ingress will be locked to 203.0.113.8/32"
+  check_absent "does not refuse the install" "Could not detect a public IPv4 address"
+
+  STUB_IP_ECHO_BLOCKED="$all_echoes" run "$sb"
+  status=$?
+  check "names every echo it asked" "checkip.amazonaws.com, api.ipify.org"
+  check "names the way out" "set ANTI_DEMO_OPERATOR_IP=<your public IPv4>"
+  if ((status != 0)); then
+    printf '  %sok%s   every echo blocked exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s every echo blocked exited 0\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # Declared in the env file, the way the failure above says to.
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json
+ANTI_DEMO_OPERATOR_IP=$declared" sandbox)"
+  STUB_IP_ECHO_BLOCKED="$all_echoes" run "$sb"
+  check "a declared address needs no echo" \
+    "operator ingress will be locked to $declared/32 (from ANTI_DEMO_OPERATOR_IP)"
+  check_absent "and is not second-guessed" "Could not detect a public IPv4 address"
+
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json
+ANTI_DEMO_OPERATOR_IP=192.168.1.20" sandbox)"
+  run "$sb"
+  check "a LAN address is refused at preflight" \
+    "ANTI_DEMO_OPERATOR_IP=192.168.1.20 is not a public IPv4 address"
+  check_absent "and never becomes the ingress" "locked to 192.168.1.20/32"
+}
+
+# 2026-09-26: a fresh clone run with the same five inputs as a live installation
+# found the live app under the default name and would have adopted it, and even
+# under its own app name would have published into the live app's secret scope,
+# because every first install is .anti-demo-v7. Found before it happened.
+case_foreign_app_is_not_adopted() {
+  printf '\n%s== a second installation cannot take over the first one'"'"'s app ==%s\n' "$BOLD" "$RESET"
+  local sb gen status mutations source
+
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_APP_MISSING=0 run "$sb"
+  status=$?
+  check "a foreign app in front of a first provision is refused" \
+    "A Databricks App named 'lakebase-anti-demo' already exists in this workspace"
+  check "names the way to install alongside it" "DATABRICKS_APP_NAME=lakebase-anti-demo-2"
+  check_absent "never offers the line that adopts it" "DATABRICKS_APP_CLIENT_ID="
+  check_absent "and does not adopt it" "adopted the existing app"
+  if ((status != 0)); then
+    printf '  %sok%s   the refusal exits non-zero\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the refusal exited 0\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+
+  STUB_APP_MISSING=0 run "$sb" --apply --deploy-app --yes
+  mutations="$(grep -E 'apps create|apps deploy|apps update|secrets create-scope|secrets put-secret' \
+    "$sb/databricks-calls.log" 2>/dev/null || true)"
+  # The log has to have seen the probe, or an empty grep proves nothing.
+  if grep -q 'apps get' "$sb/databricks-calls.log" 2>/dev/null &&
+    [[ -z "$mutations" && ! -e "$gen/bootstrap.json" ]]; then
+    printf '  %sok%s   --apply refuses before a single write\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s --apply wrote before refusing:\n%s\n' "$RED" "$RESET" "$mutations"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # The installation that deployed it adopts it, on the seal's say-so.
+  gen="$(mktemp -d)/gen"
+  write_manifest "$gen/manifest.json"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  run "$sb"
+  check "the owning installation adopts its app" \
+    "app 'lakebase-anti-demo' is this installation's (the service principal this manifest sealed into Round 4)"
+
+  # A seal that names another service principal: the name moved to another app.
+  python3 - "$gen/manifest.json" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+doc = json.loads(p.read_text())
+doc["round4"]["app_service_principal_client_id"] = "app-client-replaced"
+p.write_text(json.dumps(doc, indent=2) + "\n")
+PY
+  run "$sb"
+  check "an app the seal does not name is refused" \
+    "The Databricks App 'lakebase-anti-demo' is not the app this installation knows"
+
+  # Under its own name, a second installation gets its own scope too.
+  gen="$(mktemp -d)/gen"
+  source="$gen/ready-source.json"
+  write_manifest "$source"
+  sb="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$gen"$'/antidemo-apply-stub\nDATABRICKS_APP_NAME=lakebase-anti-demo-2' sandbox)"
+  cat >"$gen/antidemo-apply-stub" <<STUB
+#!/usr/bin/env bash
+set -eu
+cp "$source" "\$ANTI_DEMO_MANIFEST"
+STUB
+  chmod +x "$gen/antidemo-apply-stub"
+  run "$sb" --apply --deploy-app --yes
+  check "creates its own app" "created 'lakebase-anti-demo-2' and recorded its immutable client ID"
+  check "publishes into its own scope" "secret scope 'lakebase-anti-demo-2-gen'"
+  check_absent "never the default installation's scope" "scope 'lakebase-anti-demo-gen'"
+}
+
 case_multiple_warehouses_are_derived() {
   printf '\n%s== multiple warehouses need no sixth input ==%s\n' "$BOLD" "$RESET"
   local sb gen status
@@ -556,7 +701,9 @@ STUB
   check "publishes the access key secret" "rotated aws-access-key-id"
   check "publishes the secret-key secret" "rotated aws-secret-access-key"
   check "reaches platform readiness verification" "compute ACTIVE, deployment SUCCEEDED"
-  check "reaches serving verification" "GET /api/health -> 200"
+  # The deployed app's own answer. A first install creates its app, so there is
+  # no pre-deploy "serving now" probe to see; that one is an adopted app's.
+  check "reaches serving verification" "GET /api/health returned"
   check "reaches all-six readiness verification" \
     "GET /readyz is ready and all six catalog rounds are ready"
   check_absent "never logs the access key" "AKIA""0000000000000000"
@@ -726,12 +873,16 @@ case_print_env() {
   local sb tmp
   tmp="$(mktemp -d)"
   sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$tmp/gen/manifest.json" sandbox)"
+  # Not through `run`, which merges stderr into stdout, so its first-provision
+  # workspace is spelled out here: no app yet, and stub state in the sandbox.
   OUT="$(HOME="$sb/home" PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+    STUB_APP_MISSING=1 STUB_STATE_DIR="$sb" \
     bash ./bootstrap.sh --env-file "$sb/env" --print-env 2>/dev/null)"
   check "only exports on stdout" "export ANTI_DEMO_MANIFEST="
   check_absent "no narration on stdout" "==>"
   check_absent "no ok lines on stdout" "  ok    "
   if HOME="$sb/home" PATH="$sb/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+    STUB_APP_MISSING=1 STUB_STATE_DIR="$sb" \
     bash -c "eval \"\$(./bootstrap.sh --env-file $sb/env --print-env 2>/dev/null)\"" 2>/dev/null; then
     printf '  %sok%s   evals without error\n' "$GREEN" "$RESET"
     PASS=$((PASS + 1))
@@ -1972,6 +2123,8 @@ case_no_regression() {
 
 CASES=(
   case_check_clean
+  case_operator_ip_fallback
+  case_foreign_app_is_not_adopted
   case_multiple_warehouses_are_derived
   case_five_input_full_acceptance
   case_fresh_app_creation_provenance
