@@ -563,7 +563,7 @@ async def test_setup_connection_retries_transient_failure_then_preserves_autocom
     assert [call["connect_timeout"] for call in connect_calls] == [15, 15]
     assert all(call["autocommit"] is True for call in connect_calls)
     assert capsys.readouterr().out == (
-        "WAIT PostgreSQL setup connection not ready; retrying in 2s\n"
+        "WAIT PostgreSQL setup connection to setup.test not ready; retrying in 2s\n"
     )
 
 
@@ -581,7 +581,7 @@ async def test_setup_connection_fatal_sqlstate_fails_without_retry(monkeypatch, 
 
     with pytest.raises(
         RuntimeError,
-        match=r"^PostgreSQL setup connection failed \(SQLSTATE 28P01\)$",
+        match=r"^PostgreSQL setup connection to setup\.test failed \(SQLSTATE 28P01\)$",
     ):
         await _connect(setup_connection_material())
 
@@ -615,10 +615,14 @@ async def test_setup_connection_exhaustion_respects_monotonic_deadline(monkeypat
 
     monkeypatch.setattr("server.lifecycle.time", FakeTime)
     monkeypatch.setattr("server.lifecycle.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("server.lifecycle._observe_operator_ingress", lambda manifest: (None, 0))
 
     with pytest.raises(
         RuntimeError,
-        match="^PostgreSQL setup connection did not become ready within 120 seconds$",
+        match=(
+            r"^PostgreSQL setup connection to setup\.test did not become ready "
+            r"within 120 seconds$"
+        ),
     ):
         await _connect(setup_connection_material())
 
@@ -626,6 +630,68 @@ async def test_setup_connection_exhaustion_respects_monotonic_deadline(monkeypat
     assert connect_calls == 14
     assert sleeps[:4] == [2, 4, 8, 10]
     assert max(sleeps) == 10
+
+
+def _exhaust_setup_connection(monkeypatch, error: Exception) -> None:
+    now = 0.0
+
+    class FakeAsyncConnection:
+        @staticmethod
+        async def connect(**_):
+            raise error
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    class FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return now
+
+    monkeypatch.setattr("server.lifecycle.psycopg.AsyncConnection", FakeAsyncConnection)
+    monkeypatch.setattr("server.lifecycle.time", FakeTime)
+    monkeypatch.setattr("server.lifecycle.asyncio.sleep", fake_sleep)
+
+
+async def test_a_setup_connection_that_timed_out_says_how_without_quoting_libpq(
+    monkeypatch,
+) -> None:
+    _exhaust_setup_connection(
+        monkeypatch,
+        psycopg.OperationalError(
+            'connection to server at "setup.test", port 5432 failed: timeout expired '
+            "password=must-not-leak"
+        ),
+    )
+    monkeypatch.setattr("server.lifecycle._observe_operator_ingress", lambda manifest: (None, 0))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _connect(setup_connection_material())
+
+    message = str(excinfo.value)
+    assert message.endswith("within 120 seconds; the last attempt timed out")
+    assert "must-not-leak" not in message
+
+
+async def test_a_setup_connection_blocked_by_a_moved_address_names_the_way_on(
+    monkeypatch,
+) -> None:
+    """2026-09-27: the network re-addressed the laptop mid-install; say so, and how to go on."""
+
+    _exhaust_setup_connection(monkeypatch, psycopg.OperationalError("timeout expired"))
+    drift = lifecycle.OperatorIngressDrift(
+        sealed_cidr="203.0.113.59/32", observed_cidr="203.0.113.48/32"
+    )
+    monkeypatch.setattr("server.lifecycle._observe_operator_ingress", lambda manifest: (drift, 0))
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await _connect(setup_connection_material())
+
+    message = str(excinfo.value)
+    assert "public address is now 203.0.113.48/32" in message
+    assert "security groups admit 203.0.113.59/32" in message
+    assert "Run ./bootstrap.sh --apply to resume; it rebinds the ingress" in message
 
 
 def attach_anchor(manifest: DemoManifest) -> None:
@@ -799,6 +865,151 @@ def test_operator_cidr_refresh_rebinds_only_after_ownership_verification(monkeyp
 
     assert manifest.aws.operator_cidr == "203.0.113.11/32"
     assert saved == ["203.0.113.11/32"]
+
+
+def _following_the_address(
+    monkeypatch, *, current: str = "203.0.113.11/32", plan=None, owned: bool = True
+):
+    """Stubs for `_follow_operator_address`: what it planned, applied and saved."""
+
+    calls: list[str] = []
+    saved: list[str] = []
+    monkeypatch.setattr("server.lifecycle.detect_operator_cidr", lambda: current)
+    monkeypatch.setattr(
+        "server.lifecycle._aws_ownership",
+        lambda candidate: Check("aws_ownership", owned, "owned"),
+    )
+    monkeypatch.setattr("server.lifecycle._sealed_databases_absent", lambda candidate: False)
+    monkeypatch.setattr(
+        "server.lifecycle.save_manifest",
+        lambda candidate: saved.append(candidate.aws.operator_cidr),
+    )
+    monkeypatch.setattr("server.lifecycle._terraform_init", lambda candidate: calls.append("init"))
+
+    def fake_plan(candidate, **_):
+        calls.append(f"plan {candidate.aws.operator_cidr}")
+        return Path("aws-create.tfplan")
+
+    monkeypatch.setattr("server.lifecycle._terraform_plan", fake_plan)
+    monkeypatch.setattr(
+        "server.lifecycle._terraform_plan_json",
+        lambda candidate, path: plan if plan is not None else {"resource_changes": []},
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._terraform_apply", lambda candidate, path: calls.append("apply")
+    )
+    return calls, saved
+
+
+def _security_group_address(manifest: DemoManifest) -> str:
+    return sorted(
+        address
+        for address in lifecycle._expected_aws_state_addresses(manifest)
+        if address.startswith("aws_security_group.")
+    )[0]
+
+
+def _ingress_update(address: str, *, extra: dict | None = None) -> dict:
+    before = {"name": "sg", "ingress": [{"cidr_blocks": ["203.0.113.10/32"]}]}
+    after = {"name": "sg", "ingress": [{"cidr_blocks": ["203.0.113.11/32"]}], **(extra or {})}
+    return {
+        "address": address,
+        "type": "aws_security_group",
+        "change": {"actions": ["update"], "before": before, "after": after},
+    }
+
+
+def test_an_unmoved_operator_address_is_left_alone(monkeypatch) -> None:
+    manifest = make_manifest(status="seeding")
+    calls, saved = _following_the_address(monkeypatch, current="203.0.113.10/32")
+
+    lifecycle._follow_operator_address(manifest)
+
+    assert (calls, saved) == ([], [])
+
+
+def test_a_moved_operator_address_is_followed_with_an_ingress_only_apply(
+    monkeypatch, capsys
+) -> None:
+    """2026-09-27: a rotating NAT moved the laptop between the first apply and the seed."""
+
+    manifest = make_manifest(status="seeding")
+    plan = {"resource_changes": [_ingress_update(_security_group_address(manifest))]}
+    calls, saved = _following_the_address(monkeypatch, plan=plan)
+
+    lifecycle._follow_operator_address(manifest)
+
+    assert calls == ["init", "plan 203.0.113.11/32", "apply"]
+    assert saved == ["203.0.113.11/32"]
+    assert manifest.aws.operator_cidr == "203.0.113.11/32"
+    assert "REBIND operator ingress 203.0.113.10/32 -> 203.0.113.11/32" in capsys.readouterr().out
+
+
+def test_before_the_first_apply_only_the_manifest_follows_the_address(monkeypatch) -> None:
+    """The provision's own apply is about to carry the new address."""
+
+    manifest = make_manifest(status="provisioning")
+    calls, saved = _following_the_address(monkeypatch)
+
+    lifecycle._follow_operator_address(manifest)
+
+    assert (calls, saved) == ([], ["203.0.113.11/32"])
+
+
+def test_a_rebind_plan_that_does_more_is_refused_and_the_old_address_kept(monkeypatch) -> None:
+    manifest = make_manifest(status="seeding")
+    replaced = {
+        "address": sorted(lifecycle._expected_aws_state_addresses(manifest))[0],
+        "type": "aws_db_instance",
+        "change": {"actions": ["delete", "create"], "before": {}, "after": {}},
+    }
+    calls, saved = _following_the_address(monkeypatch, plan={"resource_changes": [replaced]})
+
+    with pytest.raises(RuntimeError, match="does more than move the operator ingress"):
+        lifecycle._follow_operator_address(manifest)
+
+    assert "apply" not in calls
+    assert saved == []
+    assert manifest.aws.operator_cidr == "203.0.113.10/32"
+
+
+def test_a_rebind_on_unverified_ownership_is_refused(monkeypatch) -> None:
+    manifest = make_manifest(status="seeding")
+    calls, saved = _following_the_address(monkeypatch, owned=False)
+
+    with pytest.raises(RuntimeError, match="could not be verified"):
+        lifecycle._follow_operator_address(manifest)
+
+    assert (calls, saved) == ([], [])
+
+
+def test_the_ingress_plan_check_admits_only_an_ingress_update() -> None:
+    manifest = make_manifest(status="seeding")
+    group = _security_group_address(manifest)
+    other = next(
+        address
+        for address in sorted(lifecycle._expected_aws_state_addresses(manifest))
+        if not address.startswith("aws_security_group.")
+    )
+
+    assert lifecycle._ingress_plan_violations(
+        manifest, {"resource_changes": [_ingress_update(group)]}
+    ) == []
+    violations = lifecycle._ingress_plan_violations(
+        manifest,
+        {
+            "resource_changes": [
+                _ingress_update(group, extra={"name": "renamed"}),
+                {**_ingress_update(other), "type": "aws_db_instance"},
+                {**_ingress_update(group), "address": "aws_security_group.stranger"},
+            ]
+        },
+    )
+    assert violations == [
+        f"{group}: changes name",
+        f"{other}: plans update, not an ingress update",
+        "aws_security_group.stranger: not a manifest-owned address",
+    ]
 
 
 def test_operator_cidr_refresh_fails_closed_when_ownership_is_not_verified(
@@ -2025,12 +2236,19 @@ def test_interrupted_seeding_resumes_without_staging_recovery_points(monkeypatch
         "server.lifecycle._terraform_init",
         lambda candidate: pytest.fail("resume must not reprovision AWS resources"),
     )
+    # First, before the seed opens its connections: a rotating NAT can move this
+    # host during the first apply (2026-09-27).
+    monkeypatch.setattr(
+        "server.lifecycle._follow_operator_address",
+        lambda candidate: calls.append("follow"),
+    )
 
     recovered = _complete_provision(manifest, 123)
 
     assert recovered.status == "ready"
     assert recovered.round3_anchor is None
     assert calls == [
+        "follow",
         "save:seeding:False",
         "seed",
         "coordination",
@@ -2643,6 +2861,9 @@ def test_setup_resumes_an_incomplete_ready_seal_without_reset(monkeypatch, tmp_p
 
     monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
     monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle.detect_operator_cidr", lambda **_: manifest.aws.operator_cidr
+    )
     monkeypatch.setattr(
         "server.lifecycle.resume_provision",
         lambda timeout: calls.append(f"resume:{timeout}") or manifest,

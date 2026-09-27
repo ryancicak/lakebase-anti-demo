@@ -345,7 +345,7 @@ refuses to re-provision an installation whose manifest says `ready`, it asks
   read and none exists): it says so, asks once (`--yes` answers for you), moves
   the dead installation's records into `.anti-demo-v7/reaped-<time>/`, and
   installs afresh in the same directory. `bootstrap.json` stays behind, because
-  it is how the new installation recognises — and can re-adopt — the app and
+  it is how the new installation recognizes — and can re-adopt — the app and
   secret scope this directory created. If a sweep also deleted the installation's
   runtime role, the check reads AWS with your own keys instead, only once IAM
   itself says the role no longer exists, and only when those keys are in the
@@ -848,6 +848,16 @@ detector is cached (five minutes; thirty seconds after a failed probe), is
 short-timeout, and treats an unreachable network or an IPv6-only one as "unknown"
 rather than as drift — a false positive here sends an operator to re-apply
 Terraform for nothing.
+
+During an install the address is followed automatically. A first install spends
+long enough in Terraform for a network that rotates its NAT address to move this
+host; on 2026-09-27 one did, between the first apply and the seed. So the
+installer re-checks the address before each step that connects from here to
+Aurora or RDS, and a resume (`./bootstrap.sh --apply` on an unfinished install)
+does the same instead of refusing. Each rebind prints `REBIND operator ingress`,
+and is one Terraform plan that may do nothing but move the security groups'
+ingress; a plan that would do anything more is refused. The address it moves to
+is this host's own, detected the same way as at the start.
 
 ## Stopping the spend
 

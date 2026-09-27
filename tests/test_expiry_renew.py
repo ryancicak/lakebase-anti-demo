@@ -1055,6 +1055,11 @@ def test_a_first_provision_defaults_to_the_longer_window(monkeypatch, tmp_path) 
         "provision",
         lambda **kwargs: seen.update(ttl_hours=kwargs["ttl_hours"]) or make_manifest(),
     )
+    # The address the manifest seals, so following it is a no-op and never a
+    # network call from a unit test.
+    monkeypatch.setattr(
+        lifecycle, "detect_operator_cidr", lambda **_: make_manifest().aws.operator_cidr
+    )
     monkeypatch.setattr(
         lifecycle,
         "_prepare_and_reseal_round4",

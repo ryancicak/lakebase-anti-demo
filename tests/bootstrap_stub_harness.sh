@@ -826,7 +826,7 @@ PY
   gen="$(cat "$sb/gen")"
   ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
   status=$?
-  check "a swept installation is recognised" "That is what the AWS sandbox sweep leaves behind"
+  check "a swept installation is recognized" "That is what the AWS sandbox sweep leaves behind"
   check "and rebuilt in place" "rebuilding in place: 'antidemo setup' re-applies Terraform"
   check_absent "not refused as ready" "--apply is not a resume"
   if ((status == 0)) && [[ -z "$(find "$gen" -maxdepth 1 -name 'reaped-*')" ]]; then

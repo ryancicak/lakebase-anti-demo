@@ -6806,17 +6806,64 @@ def _wait_round4_cross_endpoint_table(
         time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 
+def _setup_connection_failure_kind(error: psycopg.OperationalError) -> str:
+    """How a setup connection failed, as a fixed phrase and never as the error's text.
+
+    libpq's messages can quote the connection details they were given, so the
+    text itself is not repeated anywhere; only which of these it matched.
+    """
+
+    text = str(error).casefold()
+    if "timeout expired" in text or "timed out" in text:
+        return "timed out"
+    if "connection refused" in text:
+        return "was refused"
+    if any(
+        marker in text
+        for marker in ("could not translate host name", "name or service not known", "nodename")
+    ):
+        return "could not resolve the host"
+    if error.sqlstate == "57P03":
+        return "found the server not yet accepting connections"
+    return ""
+
+
+def _setup_connection_timeout(material: ConnectionMaterial, last_failure: str) -> str:
+    """What a setup connection that never came up says, with the likeliest why.
+
+    It used to say only that "a" connection did not become ready. On 2026-09-27
+    that sentence, 42 retries deep, was all a first install left behind when the
+    network re-addressed this host mid-install, so nothing on screen named the
+    database, how it failed, or the address the security groups still admitted.
+    """
+
+    message = (
+        f"PostgreSQL setup connection to {material.host} did not become ready within "
+        "120 seconds"
+    )
+    if last_failure:
+        message += f"; the last attempt {last_failure}"
+    drift, _ = _observe_operator_ingress(None)
+    if drift is not None:
+        message += (
+            f". This host's public address is now {drift.observed_cidr}, but the database "
+            f"security groups admit {drift.sealed_cidr}: the network re-addressed it during "
+            "the install. Run ./bootstrap.sh --apply to resume; it rebinds the ingress to "
+            "the new address and carries on"
+        )
+    return message
+
+
 async def _connect(material: ConnectionMaterial, *, autocommit: bool = False):
     deadline = time.monotonic() + 120
     retry_delays = (2, 4, 8, 10)
     failure_count = 0
+    last_failure = ""
 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(
-                "PostgreSQL setup connection did not become ready within 120 seconds"
-            )
+            raise RuntimeError(_setup_connection_timeout(material, last_failure))
 
         try:
             async with asyncio.timeout(remaining):
@@ -6832,25 +6879,23 @@ async def _connect(material: ConnectionMaterial, *, autocommit: bool = False):
                     autocommit=autocommit,
                 )
         except TimeoutError:
-            raise RuntimeError(
-                "PostgreSQL setup connection did not become ready within 120 seconds"
-            ) from None
+            raise RuntimeError(_setup_connection_timeout(material, last_failure)) from None
         except psycopg.OperationalError as exc:
             sqlstate = exc.sqlstate
             retryable = sqlstate is None or sqlstate.startswith("08") or sqlstate == "57P03"
             if not retryable:
                 raise RuntimeError(
-                    f"PostgreSQL setup connection failed (SQLSTATE {sqlstate})"
+                    f"PostgreSQL setup connection to {material.host} failed (SQLSTATE {sqlstate})"
                 ) from None
+            last_failure = _setup_connection_failure_kind(exc)
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError(
-                    "PostgreSQL setup connection did not become ready within 120 seconds"
-                ) from None
+                raise RuntimeError(_setup_connection_timeout(material, last_failure)) from None
             delay = min(retry_delays[min(failure_count, len(retry_delays) - 1)], remaining)
             print(
-                f"WAIT PostgreSQL setup connection not ready; retrying in {max(1, round(delay))}s"
+                f"WAIT PostgreSQL setup connection to {material.host} not ready; retrying in "
+                f"{max(1, round(delay))}s"
             )
             await asyncio.sleep(delay)
             failure_count += 1
@@ -9754,6 +9799,10 @@ def _complete_provision(manifest: DemoManifest, zero_timeout_seconds: float) -> 
         save_manifest(manifest)
 
     if manifest.status == "seeding":
+        # The first apply takes ten minutes or more, which is long enough for a
+        # rotating NAT to move this host, and the seed is the first thing that
+        # connects from here to Aurora and RDS.
+        _follow_operator_address(manifest)
         manifest.round3_anchor = None
         manifest.last_reset_at = datetime.now(UTC)
         manifest.schema_sha256 = _schema_sha256()
@@ -9921,14 +9970,12 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         manifest.aws.account_id,
         manifest.aws.auth_mode,
     )
-    current_cidr = _require_operator_cidr()
-    if current_cidr != manifest.aws.operator_cidr:
-        raise RuntimeError(
-            f"Operator public IP changed to {current_cidr}; provisioned ingress is "
-            f"{manifest.aws.operator_cidr}"
-        )
-    # After every free check above (both identities and the operator CIDR), so a
-    # resume that a changed IP would abort does not resume a warehouse first. The
+    # A resume follows the address rather than refusing on it: refusing stranded a
+    # half-built install that a network had simply re-addressed, with nothing on
+    # screen saying how to go on. See `_follow_operator_address`.
+    _follow_operator_address(manifest)
+    # After every check above (both identities and the operator address), so a
+    # resume that one of them would abort does not resume a warehouse first. The
     # same read-only proof as a fresh provision, on the warehouse this
     # installation is bound to: a resume probes the sealed `round4.warehouse_id`,
     # not whatever the resuming shell exports, and does so before any
@@ -9966,11 +10013,16 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         and not round5_seal_in_progress
     ):
         manifest = _complete_provision(manifest, zero_timeout_seconds)
+    # Each seal below connects from this host to Aurora or RDS, and each takes
+    # minutes, so the address is followed before every one of them.
+    _follow_operator_address(manifest)
     manifest = _prepare_and_reseal_round4(manifest, timeout=zero_timeout_seconds)
     if not manifest.round5_ready:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round5(manifest, timeout=zero_timeout_seconds)
     if manifest.round6_ready:
         return manifest
+    _follow_operator_address(manifest)
     return _prepare_and_reseal_round6(manifest, timeout=zero_timeout_seconds)
 
 
@@ -10037,6 +10089,92 @@ def _refresh_operator_cidr(manifest: DemoManifest) -> None:
         f"REBIND operator ingress {previous_cidr} -> {current_cidr}",
         flush=True,
     )
+
+
+def _follow_operator_address(manifest: DemoManifest) -> None:
+    """Rebind database ingress to this host's address when it moves mid-install.
+
+    The database security groups admit the operator as one /32: the address the
+    install detected when it started. A network that rotates its NAT address can
+    hand this host a new one while Terraform runs. On 2026-09-27 the preflight saw
+    one address and the seed, fifteen minutes later, left from another, so every
+    setup connection to Aurora or RDS timed out, and the resume the failure
+    recommended then refused on the mismatch.
+
+    The install locked the ingress to its own address, so following the address is
+    the same authority used again. The one plan applied here may do nothing but
+    move that ingress (`_ingress_plan_violations`), and the manifest is written only
+    after it applies, so a failed apply leaves the mismatch for the next run to
+    find. Before the first apply there is nothing to move: the provision's own
+    apply carries the new address.
+    """
+
+    current = _require_operator_cidr()
+    previous = manifest.aws.operator_cidr
+    if current == previous:
+        return
+    print(
+        f"REBIND operator ingress {previous} -> {current}: this host's public address "
+        "changed during the install",
+        flush=True,
+    )
+    if manifest.status == "provisioning":
+        manifest.aws.operator_cidr = current
+        save_manifest(manifest)
+        return
+    ownership = _aws_ownership(manifest)
+    if not ownership.ok and not _sealed_databases_absent(manifest):
+        raise RuntimeError(
+            "Refusing to change database ingress because owned AWS resources could not be verified"
+        )
+    manifest.aws.operator_cidr = current
+    try:
+        _terraform_init(manifest)
+        plan = _terraform_plan(manifest)
+        violations = _ingress_plan_violations(manifest, _terraform_plan_json(manifest, plan))
+        if violations:
+            raise RuntimeError(
+                "the plan does more than move the operator ingress: " + "; ".join(violations)
+            )
+        _terraform_apply(manifest, plan)
+    except BaseException:
+        manifest.aws.operator_cidr = previous
+        raise
+    save_manifest(manifest)
+    reset_operator_ingress_cache()
+
+
+def _ingress_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) -> list[str]:
+    """Reject any plan that does more than move the security groups' ingress.
+
+    The shape of `_renew_plan_violations`, for the same reason: a rebind that
+    quietly replaced a database because the plan also held some other drift would
+    be an outage under the name of an address change.
+    """
+
+    allowed_addresses = _expected_aws_state_addresses(manifest)
+    violations: list[str] = []
+    for entry in plan.get("resource_changes") or []:
+        address = str(entry.get("address") or "?")
+        change = entry.get("change") or {}
+        actions = [str(action) for action in (change.get("actions") or [])]
+        if not actions or actions == ["no-op"] or actions == ["read"]:
+            continue
+        if address not in allowed_addresses:
+            violations.append(f"{address}: not a manifest-owned address")
+            continue
+        if entry.get("type") != "aws_security_group" or actions != ["update"]:
+            violations.append(f"{address}: plans {'+'.join(actions)}, not an ingress update")
+            continue
+        before = change.get("before") or {}
+        after = change.get("after") or {}
+        unknown = change.get("after_unknown") or {}
+        touched = {key for key in {*before, *after} if before.get(key) != after.get(key)}
+        touched |= {str(key) for key, flag in unknown.items() if flag}
+        forbidden = sorted(touched - {"ingress"})
+        if forbidden:
+            violations.append(f"{address}: changes {', '.join(forbidden)}")
+    return violations
 
 
 def _refresh_serverless_egress_cidrs(manifest: DemoManifest) -> None:
@@ -11660,12 +11798,21 @@ def setup(
             zero_timeout_seconds=timeout_seconds,
         )
 
+    # As in `resume_provision`: every seal and the checks below connect from this
+    # host to Aurora or RDS, and a first install spends long enough in them for a
+    # rotating NAT to move it.
     if not round4_prepared:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round4(manifest, timeout=timeout_seconds)
     if not round5_prepared:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round5(manifest, timeout=timeout_seconds)
     if not round6_prepared:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round6(manifest, timeout=timeout_seconds)
+        # Once more for the checks below. A ready install rebinds in
+        # `reconcile_infrastructure` and a resume in `resume_provision`.
+        _follow_operator_address(manifest)
     failures: list[str] = []
     # Why, and not only which: a real install stopped on "Setup checks failed:
     # aurora:resource_reconciliation, rds:resource_reconciliation" and nothing
