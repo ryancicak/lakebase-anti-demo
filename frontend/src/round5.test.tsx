@@ -8,6 +8,7 @@ import { buildRingsideCue, classifyOutcome } from './ringside-cues'
 import { applyRunEventSnapshot, reconcileRunEventSession, selectRound4Session } from './round4'
 import { resetCanvasRecordings } from './test/setup'
 import {
+  ROUND_FIVE_MAX_RETRIES,
   isRoundFiveSetupEvidence,
   roundFiveFightCardOpening,
   roundFiveHasComparison,
@@ -495,6 +496,32 @@ it('accepts exactly the server warm-baseline ceiling and nothing above it', () =
   expect(roundFiveLaneResult(verifiedV4RoundFiveSession(60).lanes.lakebase).contractVerified).toBe(true)
   expect(roundFiveLaneResult(verifiedV4RoundFiveSession(61).lanes.lakebase).contractVerified).toBe(false)
   expect(roundFiveHasComparison(verifiedV4RoundFiveSession(61))).toBe(false)
+})
+
+it('declares the win when a lane retried a refused login inside the retry budget', () => {
+  // Live 2026-09-26: one 08P01 from the Lakebase pooler at its documented
+  // 10,000-client ceiling failed a whole bout. A retried login is timed and shown
+  // on the lane; the server verifies it, so the browser must not overrule it.
+  const session = verifiedV4RoundFiveSession(0)
+  session.lanes.lakebase.evidence = { ...session.lanes.lakebase.evidence, retries: 1 }
+
+  expect(roundFiveLaneResult(session.lanes.lakebase).retries).toBe(1)
+  expect(roundFiveLaneResult(session.lanes.lakebase).contractVerified).toBe(true)
+  const outcome = classifyOutcome(session)
+  expect(outcome.status).toBe('declared_comparison')
+  expect(outcome.shareable).toBe(true)
+})
+
+it('accepts exactly the server retry budget and nothing above it', () => {
+  const lane = (retries: unknown) => {
+    const session = verifiedV4RoundFiveSession(0)
+    session.lanes.lakebase.evidence = { ...session.lanes.lakebase.evidence, retries }
+    return roundFiveLaneResult(session.lanes.lakebase)
+  }
+
+  expect(lane(ROUND_FIVE_MAX_RETRIES).contractVerified).toBe(true)
+  expect(lane(ROUND_FIVE_MAX_RETRIES + 1).contractVerified).toBe(false)
+  expect(lane(undefined).contractVerified).toBe(false)
 })
 
 it('keeps a warm-baseline win shareable while the per-bout Proxy is still being deleted', () => {

@@ -33,7 +33,12 @@ HOLD_SECONDS = 30
 SAMPLED_QUERIES_PER_LANE = 64
 SAMPLE_GROUPS = 8
 CLIENTS_PER_SAMPLE_GROUP = 8
-MAX_RETRIES = 0
+#: Mirrors runner.round5_fanin: the retried connects one lane may spend (1% of the
+#: lane). Zero until 2026-09-26, when a single 08P01 refusal from the Lakebase
+#: pooler -- whose documented ceiling is exactly this lane's 10,000 clients --
+#: failed a whole bout. Retries are timed and reported; they never excuse a
+#: terminal failure, a missing client or a hold disconnect.
+MAX_RETRIES = 100
 INITIAL_WAVE_SIZE = 100
 MIN_WAVE_SIZE = 20
 MICRO_BATCH_SIZE = 2
@@ -1127,7 +1132,7 @@ def finalize_lane(
         and cancelled == 0
         and initiated == authenticated + terminal_failures + cancelled
         and sum(failure_codes.values()) == terminal_failures
-        and retries == MAX_RETRIES
+        and 0 <= retries <= MAX_RETRIES
         and disconnected == 0
     )
     hold = hold_ms >= HOLD_SECONDS * 1_000

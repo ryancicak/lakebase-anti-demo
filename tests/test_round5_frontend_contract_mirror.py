@@ -29,3 +29,13 @@ def test_the_frontend_warm_baseline_ceiling_matches_the_server_and_runner() -> N
     frontend = _frontend_int("ROUND_FIVE_MAX_PREEXISTING_CLIENT_SESSIONS")
     assert frontend == connection_fanin.MAX_PREEXISTING_CLIENT_SESSIONS
     assert frontend == runner_fanin.MAX_PREEXISTING_CLIENT_SESSIONS
+
+
+def test_the_frontend_retry_budget_matches_the_server_and_runner() -> None:
+    """A lane the server verified with one retried login must not read as a loss."""
+
+    frontend = _frontend_int("ROUND_FIVE_MAX_RETRIES")
+    assert frontend == connection_fanin.MAX_RETRIES
+    assert frontend == runner_fanin.MAX_RETRIES
+    shard_budgets = runner_fanin.PARTITION_RETRY_BUDGET * runner_fanin.WORKER_COUNT
+    assert shard_budgets <= runner_fanin.MAX_RETRIES

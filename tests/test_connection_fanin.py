@@ -19,6 +19,7 @@ from server.connection_fanin import (
     FANIN_SCHEMA_VERSION,
     LAUNCH_SKEW_SEMANTICS,
     MAX_PREEXISTING_CLIENT_SESSIONS,
+    MAX_RETRIES,
     OWNED_STALL_READY_BATCH,
     CapacityPreflight,
     ConnectionSpikeArm,
@@ -388,7 +389,7 @@ def test_preprovision_capacity_refuses_large_and_accepts_the_selected_shape() ->
           "distinct_local_endpoints": 9_999}, "exact_count"),
         ({"terminal_failures": 1}, "zero_failures"),
         ({"cancelled_clients": 1}, "zero_failures"),
-        ({"retries": 1}, "zero_failures"),
+        ({"retries": MAX_RETRIES + 1}, "zero_failures"),
         ({"hold_elapsed_ms": 29_999.999}, "hold"),
         ({"sampled_queries_succeeded": 63, "sampled_queries_failed": 1},
          "sampled_queries"),
@@ -422,6 +423,20 @@ def test_exact_stop_gate_rejects_every_mutation(
     result = finalize(raw)
     assert not result.verified
     assert failed_gate in result.gates.failures
+
+
+@pytest.mark.parametrize("retries", [1, MAX_RETRIES])
+def test_retried_logins_inside_the_budget_still_verify_the_exact_lane(retries: int) -> None:
+    """2026-09-26: one pooler refusal (08P01) at the 10,000-client ceiling failed a bout.
+
+    A retried login is inside the timed window and reported on the lane; it is not a
+    terminal failure, and it cannot stand in for a missing client or a hold disconnect.
+    """
+
+    result = finalize({**raw_lane("lakebase"), "retries": retries})
+
+    assert result.verified
+    assert "zero_failures" not in result.gates.failures
 
 
 def test_advisory_loop_cpu_and_scheduling_pressure_do_not_fail_exact_proof() -> None:
@@ -1289,6 +1304,165 @@ async def test_cancelled_connect_is_explicitly_accounted(
     assert runtime.terminal_failures == 0
     assert runtime.cancelled == 1
     assert runtime.clients[0].closed.done()
+
+
+def _retry_runtime(**overrides: object) -> SimpleNamespace:
+    diagnostics: list[dict[str, object]] = []
+    runtime = SimpleNamespace(
+        first_launch_ns=None,
+        initiated=0,
+        authenticated=0,
+        cancelled=0,
+        terminal_failures=0,
+        retries=0,
+        target_clients=2_500,
+        lane_id="lakebase",
+        database={"host": "example.test", "port": 5432},
+        connect_host="127.0.0.1",
+        application_name="test",
+        ssl_context=object(),
+        unexpected_disconnect=lambda *unused: None,
+        key_cache=object(),
+        clients=[],
+        auth_methods=set(),
+        connect_latencies_ms=[],
+        target_elapsed_ns=None,
+        failure_codes={},
+        diagnostics=diagnostics,
+        record_connection_diagnostic=lambda **item: diagnostics.append(item),
+    )
+    for name, value in overrides.items():
+        setattr(runtime, name, value)
+    return runtime
+
+
+def _scripted_connects(
+    monkeypatch: pytest.MonkeyPatch,
+    outcomes: list[BaseException | None],
+) -> list[object]:
+    """Each connect attempt resolves its login with the next outcome (None = success)."""
+
+    made: list[object] = []
+
+    class Client:
+        def __init__(self, **unused) -> None:
+            loop = asyncio.get_running_loop()
+            self.authenticated = loop.create_future()
+            self.closed = loop.create_future()
+            self.auth_method = "cleartext"
+            self.ready = False
+            made.append(self)
+
+        def close(self) -> None:
+            if not self.closed.done():
+                self.closed.set_result(None)
+
+    async def create_connection(factory, *unused_args, **unused_kwargs):
+        client = factory()
+        outcome = outcomes.pop(0)
+        if outcome is None:
+            client.ready = True
+            client.authenticated.set_result(None)
+        else:
+            client.authenticated.set_exception(outcome)
+        return object(), client
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(runner, "PostgresClient", Client)
+    monkeypatch.setattr(loop, "create_connection", create_connection)
+    monkeypatch.setattr(runner, "CONNECT_RETRY_BACKOFF_SECONDS", (0, 0, 0))
+    return made
+
+
+async def test_a_pooler_refusal_is_retried_into_the_same_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-09-26: one 08P01 from the Lakebase pooler at its 10,000-client ceiling failed a
+    whole bout. The slot now retries; the lane still counts one client for it."""
+
+    made = _scripted_connects(
+        monkeypatch,
+        [runner.FanInProtocolError("postgres_error_08p01"), None],
+    )
+    runtime = _retry_runtime()
+
+    await runner._open_client(runtime, time.monotonic_ns())
+
+    assert (runtime.initiated, runtime.authenticated, runtime.terminal_failures) == (1, 1, 0)
+    assert runtime.retries == 1
+    assert runtime.failure_codes == {}
+    assert runtime.clients == [made[1]]
+    assert made[0].closed.done() and not made[1].closed.done()
+    assert runtime.diagnostics == [
+        {"ordinal": 0, "stage": "connect_retry", "code": "postgres_error_08p01"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        runner.FanInProtocolError("scram_server_refused"),
+        runner.FanInProtocolError("postgres_error_28p01"),
+        runner.FanInProtocolError("tls_verify_full_not_established"),
+        TimeoutError(),
+    ],
+)
+async def test_credentials_tls_and_timeouts_stay_terminal_on_the_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    _scripted_connects(monkeypatch, [failure, None])
+    runtime = _retry_runtime()
+
+    await runner._open_client(runtime, time.monotonic_ns())
+
+    assert (runtime.authenticated, runtime.terminal_failures, runtime.retries) == (0, 1, 0)
+    assert sum(runtime.failure_codes.values()) == 1
+
+
+async def test_a_slot_stops_retrying_after_its_own_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refusal = runner.FanInProtocolError("postgres_error_08p01")
+    _scripted_connects(monkeypatch, [refusal] * (runner.MAX_RETRIES_PER_CLIENT + 1))
+    runtime = _retry_runtime()
+
+    await runner._open_client(runtime, time.monotonic_ns())
+
+    assert runtime.retries == runner.MAX_RETRIES_PER_CLIENT
+    assert runtime.terminal_failures == 1
+    assert runtime.failure_codes == {"postgres_error_08p01": 1}
+
+
+async def test_an_exhausted_shard_budget_makes_the_next_refusal_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scripted_connects(monkeypatch, [runner.FanInProtocolError("postgres_error_08p01"), None])
+    runtime = _retry_runtime(retries=runner.PARTITION_RETRY_BUDGET)
+
+    await runner._open_client(runtime, time.monotonic_ns())
+
+    assert runtime.retries == runner.PARTITION_RETRY_BUDGET
+    assert (runtime.authenticated, runtime.terminal_failures) == (0, 1)
+
+
+async def test_a_towel_during_the_retry_pause_is_counted_as_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scripted_connects(monkeypatch, [runner.FanInProtocolError("postgres_error_08p01"), None])
+    monkeypatch.setattr(runner, "CONNECT_RETRY_BACKOFF_SECONDS", (30, 30, 30))
+    retrying = asyncio.Event()
+    runtime = _retry_runtime(record_connection_diagnostic=lambda **unused: retrying.set())
+
+    operation = asyncio.create_task(runner._open_client(runtime, time.monotonic_ns()))
+    await asyncio.wait_for(retrying.wait(), timeout=1)
+    operation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await operation
+
+    accounted = runtime.authenticated + runtime.terminal_failures + runtime.cancelled
+    assert runtime.initiated == accounted
+    assert runtime.cancelled == 1
 
 
 async def test_equal_wave_scheduler_bounds_each_mirrored_microbatch(
