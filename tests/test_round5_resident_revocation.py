@@ -945,6 +945,76 @@ def test_ready_provenance_requires_all_lanes_current() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# A DSN republished under a running agent is picked up without a restart.
+# --------------------------------------------------------------------------- #
+async def test_a_republished_control_dsn_is_used_after_the_old_one_is_refused(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The 2026-09-27 stranding, from the agent's side.
+
+    The agent reads its DSN at startup; setup then publishes one with a new
+    password, and the database refuses the old. The agent used to fail every
+    control message from then on. Now the refusal makes it re-read the secret,
+    and the redelivered PRELOAD reaches readiness on the published DSN.
+    """
+    plane = _FakeControlPlane()
+    event, _ = _preload_event(lane_id="lakebase", token="attempt-B", job_id="b" * 64)
+    plane.dispatch(event)
+    plane.make_current("attempt-B")
+    # Two distinct DSNs stand in for the same login before and after a password
+    # change; no credential appears in either.
+    old = "postgresql://resident@coord-before/anti_demo"
+    new = "postgresql://resident@coord-after/anti_demo"
+    published = {"dsn": old}
+    used: list[str] = []
+
+    class RepublishedSecrets(_FakeSecrets):
+        def get_secret_value(self, *, SecretId):  # noqa: N803
+            del SecretId
+            return {"SecretString": published["dsn"]}
+
+    def connect(dsn, *args, **kwargs):
+        del args, kwargs
+        used.append(dsn)
+        if dsn != published["dsn"]:
+            raise runner.psycopg.OperationalError("password authentication failed")
+        return _FakeConnection(plane)
+
+    sqs = _FakeSqs(
+        [
+            [{"Body": event.encoded_body(), "ReceiptHandle": "first"}],
+            [{"Body": event.encoded_body(), "ReceiptHandle": "redelivered"}],
+        ],
+        # Setup republishes after the agent has read the DSN at startup.
+        hooks=[lambda: published.update(dsn=new), None],
+    )
+    _install_fakes(monkeypatch, tmp_path, plane, sqs)
+    secrets_client = RepublishedSecrets()
+    monkeypatch.setattr(
+        runner.boto3,
+        "client",
+        lambda name: sqs if name == "sqs" else secrets_client,
+    )
+    monkeypatch.setattr(runner.psycopg, "connect", connect)
+    try:
+        await runner._resident_agent(
+            lane_id="lakebase",
+            generation=GENERATION,
+            queue_url="q",
+            control_secret_arn="arn",
+        )
+    except _StopLoop:
+        pass
+
+    output = capsys.readouterr().out
+    assert "RESIDENT_CONTROL_TRANSIENT:OperationalError" in output
+    assert "RESIDENT_CONTROL_DSN_REFRESHED" in output
+    assert used[0] == old and used[-1] == new
+    assert "attempt-B" in _agent_ready_tokens(plane)
+    assert "first" not in sqs.deleted
+
+
+# --------------------------------------------------------------------------- #
 # Resident burst lock is separate from the setup runner's LOCK_PATH so the
 # Aurora pending-capacity wake can run in parallel with a staged burst.
 # --------------------------------------------------------------------------- #
