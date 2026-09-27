@@ -1992,6 +1992,10 @@ def build_model_score_engine(manifest: DemoManifest) -> ModelScoreEngine:
         adapter,
         contract=contract,
         inspect_timeout_seconds=30.0,
+        # An arm right after a settle restarts the pipeline, and a restarted
+        # pipeline needs seconds to publish its status and catch up; refusing
+        # inside that window turned a short wait into a failed arm (2026-09-27).
+        arm_catch_up_seconds=120.0,
         # Built from the adapter's own WorkspaceClient rather than a second one,
         # so the pipeline is powered by exactly the identity that inspects it. On
         # the deployed path that is the app's service principal, which now holds

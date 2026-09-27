@@ -1816,6 +1816,15 @@ async def test_cancel_waits_for_durable_resident_settlement() -> None:
         sleep=lambda _delay: asyncio.sleep(0),
     )
     event_binding = binding()
+    # Staged first: only a job the runner was handed has anything to settle.
+    await store.enqueue(
+        Round5ControlEvent.create(
+            binding=event_binding,
+            sequence=1,
+            kind=Round5ControlKind.STAGE,
+            payload={"request": canonical_request()},
+        )
+    )
     cancellation = asyncio.create_task(transport.cancel(binding=event_binding))
     await asyncio.sleep(0)
     assert not cancellation.done()
@@ -1830,6 +1839,24 @@ async def test_cancel_waits_for_durable_resident_settlement() -> None:
         )
     )
     await asyncio.wait_for(cancellation, timeout=1)
+
+
+async def test_a_job_never_handed_to_the_runner_is_not_cancelled_on_it() -> None:
+    """2026-09-27: a towel two seconds after the bell, before the competitor's STAGE.
+
+    The runner quarantines a CANCEL for a job it does not hold, and cleanup then
+    re-read that quarantine on every retry: Round 5 stayed CLEANING for good.
+    """
+
+    store = InMemoryRound5ControlStore()
+    dispatcher = Round5ControlDispatcher(store, lambda _event: asyncio.sleep(0))
+    transport = Round5ResidentTransport(store, dispatcher)
+
+    await asyncio.wait_for(transport.cancel(binding=binding()), timeout=1)
+
+    assert not any(
+        event.kind == Round5ControlKind.CANCEL for event, _published in store.outbox.values()
+    )
 
 
 async def test_permanent_quarantine_fails_transport_wait_immediately() -> None:

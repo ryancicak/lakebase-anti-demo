@@ -250,6 +250,11 @@ async def test_settle_abandoned_arm_cancels_and_clears_every_staged_binding() ->
 
     lakebase = replace(_arm_binding(job_id="b" * 64, request=request), lane_id="lakebase")
     competitor = replace(_arm_binding(job_id="e" * 64, request=request), lane_id="competitor")
+    # ARM stages the Lakebase resident. The competitor's binding is recorded before
+    # its STAGE is written behind the Proxy gate (`_stage_competitor_burst`), so a
+    # towel between the two leaves it recorded and never handed to the runner --
+    # the 2026-09-27 shape, two seconds after the bell.
+    await transport.stage(binding=lakebase, request=request)
 
     adapter = _adapter(transport)
     engine = object.__new__(LiveConnectionSpikeEngine)
@@ -259,7 +264,9 @@ async def test_settle_abandoned_arm_cancels_and_clears_every_staged_binding() ->
 
     await asyncio.wait_for(engine.settle_abandoned_arm(), timeout=2)
 
-    # Both staged residents are cancelled and forgotten.
+    # Both are forgotten, and only the job the runner holds is cancelled on it: a
+    # CANCEL for the unstaged one is quarantined as binding-invalid, and that
+    # quarantine no retry can clear.
     assert engine._resident_bindings == {}
     assert adapter._resident_settlement_debt == {}
     cancels = {
@@ -267,7 +274,7 @@ async def test_settle_abandoned_arm_cancels_and_clears_every_staged_binding() ->
         for event, _published in store.outbox.values()
         if event.kind == Round5ControlKind.CANCEL
     }
-    assert cancels == {"b" * 64, "e" * 64}
+    assert cancels == {"b" * 64}
 
     # Idempotent: a second settle is a clean no-op.
     await asyncio.wait_for(engine.settle_abandoned_arm(), timeout=2)

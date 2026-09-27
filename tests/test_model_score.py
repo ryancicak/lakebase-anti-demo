@@ -571,6 +571,106 @@ async def test_arm_retries_a_transient_provider_projection_then_validates_strict
     assert adapter.inspection_calls == 4
 
 
+def _catch_up_engine(adapter, contract, *, bound: float) -> tuple[ModelScoreEngine, list[float]]:
+    """An engine whose arm may wait `bound` seconds, on a clock its sleeps advance."""
+
+    clock = [0]
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += int(seconds * 1_000_000_000)
+
+    engine = ModelScoreEngine(
+        adapter,
+        contract=contract,
+        max_poll_attempts=2,
+        poll_interval_seconds=0,
+        arm_catch_up_seconds=bound,
+        arm_catch_up_poll_seconds=2.0,
+        clock_ns=lambda: clock[0],
+        now=lambda: NOW,
+        sleep=sleep,
+    )
+    return engine, sleeps
+
+
+async def test_an_arm_waits_out_a_restarted_pipeline_that_is_still_catching_up() -> None:
+    """2026-09-27: refused inside 36 s while the restarted pipeline caught up."""
+
+    contract = model_score_contract()
+    adapter = FakeModelScoreAdapter(
+        contract,
+        statuses=[
+            healthy_status(9, 8),
+            healthy_status(9, 8),
+            healthy_status(9, 9),
+            warm_up_status(10),
+            warm_up_status(10),
+        ],
+        commits=[warm_up_commit(10)],
+    )
+    engine, sleeps = _catch_up_engine(adapter, contract, bound=120)
+    progress: list[str] = []
+
+    async def record(update) -> None:
+        progress.append(update.status)
+
+    arm = await engine.arm(record)
+
+    assert arm.source_version == 10
+    assert sleeps.count(2.0) == 2
+    assert progress.count("Waiting for Managed Sync to catch up after its restart") == 1
+
+
+async def test_an_arm_waits_out_a_status_not_yet_published_after_a_restart() -> None:
+    """The other 2026-09-27 refusal: no continuous status yet, beyond the poll budget."""
+
+    contract = model_score_contract()
+
+    class UnpublishedThenHealthy(FakeModelScoreAdapter):
+        unpublished = 5
+
+        async def inspect_sync(self) -> ManagedSyncStatus:
+            if self.unpublished:
+                self.unpublished -= 1
+                self.inspection_calls += 1
+                raise ModelScorePipelineError("continuous update status is missing")
+            return await super().inspect_sync()
+
+    adapter = UnpublishedThenHealthy(
+        contract,
+        statuses=[healthy_status(9, 9), warm_up_status(10), warm_up_status(10)],
+        commits=[warm_up_commit(10)],
+    )
+    engine, _ = _catch_up_engine(adapter, contract, bound=120)
+
+    assert (await engine.arm()).source_version == 10
+
+
+async def test_an_arm_still_refuses_a_pipeline_that_never_catches_up() -> None:
+    contract = model_score_contract()
+    adapter = FakeModelScoreAdapter(
+        contract, statuses=[healthy_status(10, 9)] * 100, commits=[]
+    )
+    engine, sleeps = _catch_up_engine(adapter, contract, bound=10)
+
+    with pytest.raises(ModelScoreNotArmedError, match="not fully caught up"):
+        await engine.arm()
+    assert sum(sleeps) >= 10
+
+
+async def test_an_arm_does_not_wait_on_a_status_that_waiting_cannot_fix() -> None:
+    contract = model_score_contract()
+    drifted = replace(healthy_status(9, 8), pipeline_id="someone-elses-pipeline")
+    adapter = FakeModelScoreAdapter(contract, statuses=[drifted] * 10, commits=[])
+    engine, sleeps = _catch_up_engine(adapter, contract, bound=120)
+
+    with pytest.raises(ModelScoreNotArmedError, match="identity does not match"):
+        await engine.arm()
+    assert sleeps == []
+
+
 async def test_arm_restores_only_matching_demo_owned_prior_proof_off_clock() -> None:
     contract = model_score_contract()
     prior = ModelScoreRow(

@@ -1458,6 +1458,19 @@ class Round5ResidentTransport:
         binding: Round5ControlBinding,
         await_settlement: bool = True,
     ) -> None:
+        if (
+            await self.store.control_event(binding.job_id, 1) is None
+            and await self.store.control_event(binding.job_id, 2) is None
+        ):
+            # Never handed to the runner: no STAGE, PRELOAD or RELEASE was ever
+            # written for this job, so the runner holds nothing to cancel. It answers a CANCEL
+            # for a job it does not hold by quarantining it, and every retry then
+            # re-reads that quarantine. On 2026-09-27 a towel two seconds after the
+            # bell landed between the competitor's binding being recorded and its
+            # STAGE being written behind the Proxy gate, and left Round 5 CLEANING
+            # for good. Callers cancel only after stopping what would have staged
+            # it (`_stop_setup_and_begin_cleanup_once` awaits the setup task first).
+            return
         await self._enqueue(
             binding=binding,
             sequence=3,
