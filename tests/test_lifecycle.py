@@ -3780,13 +3780,15 @@ def _deploy_doc_grants() -> dict[tuple[str, str], frozenset[str]]:
 
 def _parse_grant(statement: str) -> dict[tuple[str, str], frozenset[str]]:
     match = re.fullmatch(
-        r"GRANT (?P<privileges>[A-Z, ]+) ON (?:(?P<kind>DATABASE|SCHEMA|SEQUENCE|TABLE) )?"
-        r'(?P<name>[\w."]+) TO "(?P<role>[^"]+)"',
+        r"GRANT (?P<privileges>[A-Z, ]+) ON "
+        r"(?:(?P<kind>DATABASE|SCHEMA|SEQUENCE|TABLE|FUNCTION) )?"
+        r'(?P<name>[\w."]+(?: ?\([\w, ]*\))?) TO "(?P<role>[^"]+)"',
         statement,
     )
     assert match is not None, f"unparsed grant: {statement}"
     kind = match.group("kind") or "TABLE"
-    name = match.group("name").replace('"', "")
+    # A function is named by its signature; compared without its spacing.
+    name = "".join(match.group("name").replace('"', "").split())
     privileges = frozenset(part.strip() for part in match.group("privileges").split(","))
     return {(kind, name): privileges}
 
@@ -4355,7 +4357,16 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
     )
 
     coordination: dict[tuple[str, str], frozenset[str]] = {}
+    revoked = [s for s in issued["coordination.test"] if s.startswith("REVOKE")]
+    # The receipt cleanup function is created with PUBLIC's EXECUTE revoked, so the
+    # app's own EXECUTE (in the documented set) is the only way it reaches it.
+    assert revoked == [
+        "REVOKE ALL ON FUNCTION anti_demo_coordination.bout_receipt_cleanup_upsert_v1"
+        "(text, text, text, text, text, timestamptz, jsonb) FROM PUBLIC"
+    ]
     for statement in issued["coordination.test"]:
+        if statement in revoked:
+            continue
         assert f'TO "{principal}"' in statement, statement
         coordination.update(_parse_grant(statement))
     assert coordination == documented

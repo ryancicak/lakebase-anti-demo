@@ -8222,6 +8222,7 @@ async def _grant_round4_postgres(
     manifest: DemoManifest, names: dict[str, str], app_client_id: str | None
 ) -> None:
     from .coordination import COORDINATION_SCHEMA, read_coordination_objects
+    from .receipts import BOUT_RECEIPT_CLEANUP_SIGNATURE, bout_receipt_cleanup_function_ddl
 
     if app_client_id is None:
         return
@@ -8324,6 +8325,21 @@ async def _grant_round4_postgres(
                             role,
                         )
                     )
+            # The receipt cleanup overlay's only write path, a SECURITY DEFINER
+            # function with PUBLIC's EXECUTE revoked, so the app needs its own.
+            # Created again first because this is the grant step every provision
+            # and resume reaches, and a GRANT cannot name a missing function.
+            await cursor.execute(bout_receipt_cleanup_function_ddl())
+            await cursor.execute(
+                sql.SQL("REVOKE ALL ON FUNCTION {} FROM PUBLIC").format(
+                    sql.SQL(BOUT_RECEIPT_CLEANUP_SIGNATURE)
+                )
+            )
+            await cursor.execute(
+                sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+                    sql.SQL(BOUT_RECEIPT_CLEANUP_SIGNATURE), role
+                )
+            )
         await coordination.commit()
 
 
@@ -8886,6 +8902,13 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
         # `readiness.py` reaches it when it builds this store for the app.
         await StartupReadinessStore(store._run).initialize()
         await DurableReceiptStore(store._run).initialize()
+        await DurableReceiptStore(store._run).ensure_cleanup_function()
+        if manifest.round4 is not None:
+            # A ready install re-running setup reaches this and not the first
+            # grant, so the app's EXECUTE is issued here too once Round 4 names it.
+            await DurableReceiptStore(store._run).grant_cleanup_function(
+                manifest.round4.app_service_principal_client_id
+            )
         await DurablePipelinePowerStore(store._run).initialize()
 
         async def migrate_round5(cursor: Any) -> None:

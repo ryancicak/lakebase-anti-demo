@@ -10,6 +10,7 @@ import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
+from server import receipts as receipts_module
 from server.api import router
 from server.coordination import CoordinationObjectsMissingError
 from server.manager import EventLog, RunManager
@@ -1153,3 +1154,83 @@ async def test_publish_writes_a_receipt_without_holding_the_condition(
         receipts_root() / day / f"{receipt_id(snapshot.id)}-{snapshot.round.id.value}.json"
     ).exists()
     assert observed == [True]
+
+
+# 2026-09-27: setup never created the cleanup overlay's definer function, so every
+# fresh install logged "function ... bout_receipt_cleanup_upsert_v1(...) does not
+# exist" on each bout that reached cleanup. Setup now creates it from the one SQL file
+# that defines it, and an install that predates that says so once, with the fix.
+
+
+def test_setup_creates_the_cleanup_function_from_its_one_definition() -> None:
+    ddl = receipts_module.bout_receipt_cleanup_function_ddl()
+
+    assert ddl.startswith(
+        "CREATE OR REPLACE FUNCTION anti_demo_coordination.bout_receipt_cleanup_upsert_v1("
+    )
+    assert ddl.endswith("$function$;")
+    assert "SECURITY DEFINER" in ddl
+    # Only the function: the psql-variable grants in the same file are setup's own.
+    assert ":\"app_role\"" not in ddl
+
+
+async def test_the_owner_path_creates_the_function_and_revokes_public() -> None:
+    executed: list[str] = []
+
+    class Cursor:
+        async def execute(self, statement, parameters=None) -> None:
+            executed.append(statement)
+
+    async def run(operation):
+        return await operation(Cursor())
+
+    await DurableReceiptStore(run).ensure_cleanup_function()
+
+    assert executed == [
+        receipts_module.bout_receipt_cleanup_function_ddl(),
+        f"REVOKE ALL ON FUNCTION {receipts_module.BOUT_RECEIPT_CLEANUP_SIGNATURE} FROM PUBLIC",
+    ]
+
+
+async def test_a_missing_cleanup_function_is_reported_once_with_its_fix(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    monkeypatch.setenv("ANTI_DEMO_ARTIFACT_ROOT", str(tmp_path))
+    monkeypatch.setattr(receipts_module, "_missing_cleanup_function_reported", False)
+    snapshot = await verified_round_one_snapshot()
+    payload = {"session": snapshot.model_dump(mode="json")}
+
+    async def undefined(_operation):
+        raise psycopg.errors.UndefinedFunction("function does not exist")
+
+    install_receipt_store(DurableReceiptStore(undefined))
+
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            record_sealed_bout("run_finished", payload)
+            await drain_receipt_writes()
+
+    reports = [r for r in caplog.records if "./antidemo setup" in r.getMessage()]
+    assert len(reports) == 1
+    assert reports[0].exc_info is None
+    assert "Could not record bout receipt" not in caplog.text
+
+
+async def test_the_app_is_granted_the_cleanup_function_by_name() -> None:
+    """The grant a ready install re-running setup reaches (`ensure_coordination`)."""
+
+    executed: list[str] = []
+
+    class Cursor:
+        async def execute(self, statement, parameters=None) -> None:
+            executed.append(statement.as_string())
+
+    async def run(operation):
+        return await operation(Cursor())
+
+    await DurableReceiptStore(run).grant_cleanup_function("app-client-stub")
+
+    assert executed == [
+        f"GRANT EXECUTE ON FUNCTION {receipts_module.BOUT_RECEIPT_CLEANUP_SIGNATURE} "
+        'TO "app-client-stub"'
+    ]

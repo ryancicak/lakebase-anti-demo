@@ -520,6 +520,31 @@ BOUT_RECEIPT_CLEANUP_FUNCTION = (
     f"{COORDINATION_SCHEMA}.bout_receipt_cleanup_upsert_v1"
 )
 
+#: Its full signature, which GRANT and REVOKE have to name.
+BOUT_RECEIPT_CLEANUP_SIGNATURE = (
+    f"{BOUT_RECEIPT_CLEANUP_FUNCTION}(text, text, text, text, text, timestamptz, jsonb)"
+)
+
+#: The one file that defines that function. Setup reads the DDL from here, so the
+#: installer and the documented psql path in the file cannot drift apart.
+BOUT_RECEIPT_CLEANUP_SQL = (
+    Path(__file__).resolve().parents[1] / "sql" / "round5_receipt_least_privilege.sql"
+)
+
+
+def bout_receipt_cleanup_function_ddl() -> str:
+    """The `CREATE OR REPLACE FUNCTION` statement, exactly as the SQL file has it."""
+
+    text = BOUT_RECEIPT_CLEANUP_SQL.read_text(encoding="utf-8")
+    start = text.index("CREATE OR REPLACE FUNCTION")
+    end = text.index("$function$;", start) + len("$function$;")
+    return text[start:end]
+
+
+#: Whether the missing cleanup function has already been reported, so an
+#: installation set up before setup created it says so once, not once per bout.
+_missing_cleanup_function_reported = False
+
 #: The store this process persists receipts to, or None when it has none.
 #:
 #: Process-global, which needs justifying. The write hook is
@@ -675,6 +700,43 @@ class DurableReceiptStore:
                 ) from exc
 
         await self._run(ensure)
+
+    async def ensure_cleanup_function(self) -> None:
+        """Create the definer function the cleanup overlay writes through. Owner only.
+
+        Like the table's DDL, this runs from setup as the identity that owns the
+        coordination schema, and a SECURITY DEFINER function runs as whoever
+        created it. Only the documented psql path in the SQL file ever did this.
+        Setup did not, so no installed app could record a cleanup overlay: on
+        2026-09-27 a fresh install logged "function ...
+        bout_receipt_cleanup_upsert_v1(...) does not exist" on every bout.
+        """
+
+        async def ensure(cursor: Any) -> None:
+            await cursor.execute(bout_receipt_cleanup_function_ddl())
+            await cursor.execute(
+                f"REVOKE ALL ON FUNCTION {BOUT_RECEIPT_CLEANUP_SIGNATURE} FROM PUBLIC"
+            )
+
+        await self._run(ensure)
+
+    async def grant_cleanup_function(self, app_role: str) -> None:
+        """Let the deployed app write its cleanup overlay. Owner only.
+
+        Separate from `ensure_cleanup_function` because the app's identity is only
+        known once Round 4 has sealed it, and a ready install re-running setup
+        creates coordination objects without passing through the first grant.
+        """
+
+        async def grant(cursor: Any) -> None:
+            await cursor.execute(
+                psycopg.sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+                    psycopg.sql.SQL(BOUT_RECEIPT_CLEANUP_SIGNATURE),
+                    psycopg.sql.Identifier(app_role),
+                )
+            )
+
+        await self._run(grant)
 
     async def append(self, receipt: BoutReceipt, snapshot: SessionSnapshot) -> None:
         """Record one sealed bout. Idempotent per (bout, round, terminal event)."""
@@ -850,8 +912,23 @@ def _schedule_durable_receipt(receipt: BoutReceipt, snapshot: SessionSnapshot) -
         return False
 
     async def write() -> None:
+        global _missing_cleanup_function_reported
         try:
             await store.append(receipt, snapshot)
+        except psycopg.errors.UndefinedFunction:
+            # The store calls exactly one function, the cleanup overlay's, so this
+            # is an installation whose setup predates creating it. Every overlay
+            # fails the same way: say so once, with the fix, not a traceback a bout.
+            if not _missing_cleanup_function_reported:
+                _missing_cleanup_function_reported = True
+                logger.warning(
+                    "Could not record the cleanup update of bout receipt %s: the "
+                    "coordination database has no %s. Run './antidemo setup' to "
+                    "create it; until then cleanup updates are not recorded, and "
+                    "every other receipt still is.",
+                    receipt.receipt,
+                    BOUT_RECEIPT_CLEANUP_FUNCTION,
+                )
         except Exception:
             logger.warning(
                 "Could not record bout receipt %s in the coordination database",
