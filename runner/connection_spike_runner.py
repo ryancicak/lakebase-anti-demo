@@ -4133,6 +4133,25 @@ async def _resident_agent(
             break
         await asyncio.sleep(3)
 
+    async def republished_control_dsn() -> str:
+        """The lane's control DSN as published now, or "" when it cannot be read.
+
+        Read once above, the DSN can still change under a running agent: setup
+        republishes it, and a republish that changes the password leaves this
+        agent's copy rejected by the database. On 2026-09-27 that left both
+        agents failing every control message until `antidemo runner refresh`
+        restarted them. Setup no longer changes a published password, and this
+        is the second line: the agent notices on the next failure by itself.
+        """
+        try:
+            current = await asyncio.to_thread(
+                secrets_client.get_secret_value, SecretId=control_secret_arn
+            )
+        except Exception:  # noqa: BLE001 - a failed re-read keeps the DSN in hand
+            return ""
+        value = str(current.get("SecretString") or "")
+        return value if value.startswith(("postgresql://", "postgres://")) else ""
+
     def binding_of(event: Mapping[str, object]) -> dict[str, object]:
         value = event.get("binding")
         if not isinstance(value, Mapping):
@@ -4761,6 +4780,14 @@ async def _resident_agent(
                             "RESIDENT_CONTROL_TRANSIENT:" + type(exc).__name__,
                             flush=True,
                         )
+                        # A refused connection is where a republished DSN shows.
+                        # The message is not acknowledged, so its redelivery, and
+                        # every message after it, uses what is published now.
+                        if isinstance(exc, psycopg.OperationalError):
+                            republished = await republished_control_dsn()
+                            if republished and republished != control_dsn:
+                                control_dsn = republished
+                                print("RESIDENT_CONTROL_DSN_REFRESHED", flush=True)
                 finally:
                     if acknowledge:
                         await asyncio.to_thread(
