@@ -1642,6 +1642,48 @@ async def test_cleanup_fence_loss_stays_cleaning_and_names_takeover(
     assert "action=await_takeover" in caplog.text
 
 
+async def test_begin_cleanup_rides_out_its_own_loops_revision_churn() -> None:
+    """Live 2026-09-26: a verified bout's handoff logged three "durable cleanup start
+    is not settled" errors because the supervised loop rewrote the slot between the
+    read and the compare-and-swap. The transition now re-reads and retries."""
+
+    class ChurningStore(InMemoryRound5WarmStore):
+        conflicts = 3
+
+        async def begin_cleanup(self, slot, **kwargs):
+            if self.conflicts:
+                self.conflicts -= 1
+                await self.heartbeat_coordinator(
+                    slot,
+                    now=kwargs["now"],
+                    ttl=timedelta(seconds=90),
+                )
+                raise WarmStoreConflictError("forced revision churn")
+            return await super().begin_cleanup(slot, **kwargs)
+
+    clock = Clock()
+    store = ChurningStore()
+    provider = Provider(clock)
+    manager = coordinator(clock, provider, store)
+    await warm_ready(manager, provider)
+    claimed, _capsule = await manager.claim(
+        session_id="session-one",
+        bout_id="bout-one",
+        selected_variant=Round5Variant.AURORA,
+        bout_fence=1,
+    )
+    assert claimed.claim is not None
+    await manager.accept_bell(claimed.claim.claim_id)
+
+    cleaning = await manager.begin_cleanup(claimed.claim.claim_id)
+
+    assert store.conflicts == 0
+    assert cleaning.state == Round5WarmState.CLEANING
+    assert cleaning.claim is not None and cleaning.claim.claim_id == claimed.claim.claim_id
+    events = await store.events("install-one")
+    assert sum(event.event_type == "cleanup_started" for event in events) == 1
+
+
 async def test_cleanup_conflict_reaches_next_generation_exactly_once() -> None:
     class ChurningStore(InMemoryRound5WarmStore):
         conflicts = 3

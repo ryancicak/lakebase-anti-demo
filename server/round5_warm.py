@@ -5319,16 +5319,31 @@ class Round5WarmCoordinator:
                     "Round 5 coordinator is closing; begin_cleanup refused"
                 )
             self.release_claim_active(claim_id)
-            slot = await self.store.read(self.installation_id)
-            if slot is None:
-                raise WarmFenceLostError("Round 5 warm slot is unavailable")
-            now = self._clock()
-            self._require_current_cleanup_owner(slot, now=now)
-            cleaning = await self.store.begin_cleanup(
-                slot,
-                claim_id=claim_id,
-                now=now,
-            )
+            for attempt in range(CLEANUP_FINALIZE_CONFLICT_ATTEMPTS):
+                slot = await self.store.read(self.installation_id)
+                if slot is None:
+                    raise WarmFenceLostError("Round 5 warm slot is unavailable")
+                now = self._clock()
+                self._require_current_cleanup_owner(slot, now=now)
+                try:
+                    cleaning = await self.store.begin_cleanup(
+                        slot,
+                        claim_id=claim_id,
+                        now=now,
+                    )
+                    break
+                except WarmStoreConflictError:
+                    # The compare-and-swap lost to this process's own supervised
+                    # loop, which rewrites the slot on every cycle while a bout is
+                    # RUNNING. Live 2026-09-26 a verified bout's handoff logged three
+                    # "durable cleanup start is not settled" errors in a row before
+                    # the manager's retry won. Re-read and retry with the same
+                    # jittered backoff finish_cleanup uses; a real owner, fence or
+                    # claim change still refuses through the checks above.
+                    if attempt + 1 >= CLEANUP_FINALIZE_CONFLICT_ATTEMPTS:
+                        raise
+                    ceiling = min(0.25, 0.01 * (2 ** min(attempt, 5)))
+                    await self._sleep(self._random.uniform(0.0, ceiling))
             self._last_slot = cleaning
             self._cleanup_origins[claim_id] = (
                 cleaning.generation,
