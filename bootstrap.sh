@@ -1182,14 +1182,46 @@ else
   # the runtime role from itself, and would also select temporary STS credentials
   # for Databricks secret publication instead of the saved APP_AWS_* pair.
 
-  OPERATOR_IP="$(curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]' || true)"
-  if [[ "$OPERATOR_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    ok "operator ingress will be locked to ${OPERATOR_IP}/32"
+  # Several HTTPS echoes, in server/lifecycle.py:OPERATOR_IP_ENDPOINTS order: one
+  # blocked endpoint used to stop the install (2026-09-26, a filtered network that
+  # timed out on checkip.amazonaws.com while the others answered). Never plain
+  # HTTP -- the answer becomes the one /32 the database security groups admit.
+  # ANTI_DEMO_OPERATOR_IP names the address outright when every echo is blocked.
+  OPERATOR_IP=""
+  if [[ -n "${ANTI_DEMO_OPERATOR_IP:-}" ]]; then
+    # The rule detect_operator_cidr applies to a declared address, applied here so
+    # a LAN address or a typo is refused now rather than after the first apply.
+    if python3 -c 'import ipaddress, sys; a = ipaddress.ip_address(sys.argv[1]); sys.exit(a.version != 4 or not a.is_global)' \
+      "$ANTI_DEMO_OPERATOR_IP" 2>/dev/null; then
+      OPERATOR_IP="$ANTI_DEMO_OPERATOR_IP"
+      ok "operator ingress will be locked to ${OPERATOR_IP}/32 (from ANTI_DEMO_OPERATOR_IP)"
+    else
+      fail "ANTI_DEMO_OPERATOR_IP=$ANTI_DEMO_OPERATOR_IP is not a public IPv4 address. The
+      database security groups admit exactly that /32, so a private (LAN) or IPv6 address
+      admits nothing. Set it to the address this host reaches AWS from, or remove it to
+      detect one."
+    fi
   else
-    fail "Could not detect a public IPv4 address from checkip.amazonaws.com.
-      server/lifecycle.py:detect_operator_cidr needs one and rejects IPv6, and the database
-      security groups allow exactly one /32. An IPv6-only network cannot provision this."
+    for OPERATOR_IP_ENDPOINT in https://checkip.amazonaws.com https://api.ipify.org https://ipv4.icanhazip.com; do
+      OPERATOR_IP_ANSWER="$(curl -fsS --max-time 10 "$OPERATOR_IP_ENDPOINT" 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ "$OPERATOR_IP_ANSWER" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        OPERATOR_IP="$OPERATOR_IP_ANSWER"
+        break
+      fi
+    done
+    if [[ -n "$OPERATOR_IP" ]]; then
+      ok "operator ingress will be locked to ${OPERATOR_IP}/32"
+    else
+      fail "Could not detect a public IPv4 address from checkip.amazonaws.com, api.ipify.org
+      or ipv4.icanhazip.com. The database security groups allow exactly one /32, so this
+      host's public IPv4 is required; an IPv6-only network cannot provision this. If your
+      network blocks those services, set ANTI_DEMO_OPERATOR_IP=<your public IPv4> in
+      .env.bootstrap or the environment and run again."
+    fi
   fi
+  # One answer for the whole run: every later lookup in this process tree reads
+  # it back, so the /32 printed above is the /32 that gets sealed.
+  [[ -z "$OPERATOR_IP" ]] || export ANTI_DEMO_OPERATOR_IP="$OPERATOR_IP"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1991,6 +2023,65 @@ elif ((DATABRICKS_OK == 0)); then
   skipped "the SQL warehouse presence check, because nothing authenticated to Databricks"
 fi
 
+# Whose app is APP_NAME? Adopting one is only safe when this generation already
+# knows it. The default name is shared by every installation of this repository,
+# so a fresh clone run with the same five inputs as a live installation found the
+# live app and would have adopted it: this installation's seal published into it,
+# the live demo replaced, and a later cleanup of this installation leaving it
+# serving destroyed resources (found 2026-09-26, before it happened).
+#
+# The evidence is local because it has to be -- the app's bound seal cannot be
+# read back, see the drift note in 6b. In order: a DATABRICKS_APP_CLIENT_ID the
+# operator supplied, the client ID this manifest sealed into Round 4, and the
+# one this generation's bootstrap.json recorded when it created or adopted the
+# app. server/lifecycle.py:_owned_app proves ownership the same way before
+# cleanup deletes anything.
+if ((DATABRICKS_OK == 1)) &&
+  APP_PROBE_JSON="$(databricks apps get "$APP_NAME" "${DATABRICKS_ARGS[@]}" 2>/dev/null)"; then
+  APP_PROBE_CLIENT_ID="$(printf '%s' "$APP_PROBE_JSON" | jq -r '.service_principal_client_id // empty')"
+  APP_KNOWN_CLIENT_ID="${DATABRICKS_APP_CLIENT_ID:-}"
+  APP_KNOWN_SOURCE="the DATABRICKS_APP_CLIENT_ID supplied to this run"
+  if [[ -z "$APP_KNOWN_CLIENT_ID" && -f "$ANTI_DEMO_MANIFEST" ]]; then
+    APP_KNOWN_CLIENT_ID="$(jq -r '.round4.app_service_principal_client_id // empty' \
+      "$ANTI_DEMO_MANIFEST" 2>/dev/null || true)"
+    APP_KNOWN_SOURCE="the service principal this manifest sealed into Round 4"
+  fi
+  if [[ -z "$APP_KNOWN_CLIENT_ID" && -f "$MANIFEST_DIR/bootstrap.json" ]]; then
+    APP_KNOWN_CLIENT_ID="$(jq -r '.databricks_app_client_id // empty' \
+      "$MANIFEST_DIR/bootstrap.json" 2>/dev/null || true)"
+    APP_KNOWN_SOURCE="the app $MANIFEST_DIR/bootstrap.json recorded"
+  fi
+  if [[ -z "$APP_PROBE_CLIENT_ID" ]]; then
+    : # the adoption step below refuses an app with no service principal
+  elif [[ -f "$MANIFEST_DIR/bootstrap.json" ]] &&
+    jq -e '.databricks_app_creation_pending == true' "$MANIFEST_DIR/bootstrap.json" >/dev/null 2>&1; then
+    : # an interrupted creation is adjudicated by its own refusal after the gate
+  elif [[ -z "$APP_KNOWN_CLIENT_ID" ]]; then
+    APP_OWN_LINE=""
+    # Only an installation that already exists can be the app's owner without a
+    # record of it (a manifest from the manual './antidemo setup' path). A fresh
+    # one cannot, and offering it the line that adopts the app hands it the hijack.
+    [[ -f "$ANTI_DEMO_MANIFEST" ]] && APP_OWN_LINE="
+        * if it is this installation's app, say so: DATABRICKS_APP_CLIENT_ID=$APP_PROBE_CLIENT_ID"
+    fail "A Databricks App named '$APP_NAME' already exists in this workspace, and nothing in
+      this installation ($(basename "$MANIFEST_DIR")) says it is this installation's, so it
+      is almost certainly serving another one. Adopting it would publish this installation
+      into it and replace that demo. Nothing has been created. Either:
+        * give this installation its own app -- add a line to $ENV_FILE:
+              DATABRICKS_APP_NAME=lakebase-anti-demo-2
+          (lowercase letters, digits and hyphens; any name no app in the workspace has), or
+        * if that app is left over from an installation whose directory is gone, delete
+          it first: databricks apps delete $APP_NAME -p $DATABRICKS_PROFILE$APP_OWN_LINE"
+  elif [[ "$APP_PROBE_CLIENT_ID" != "$APP_KNOWN_CLIENT_ID" ]]; then
+    fail "The Databricks App '$APP_NAME' is not the app this installation knows: its service
+      principal is $APP_PROBE_CLIENT_ID, and $APP_KNOWN_SOURCE is $APP_KNOWN_CLIENT_ID.
+      It was recreated, or the name now belongs to another installation, so nothing will be
+      published into it. Set DATABRICKS_APP_NAME to this installation's app in $ENV_FILE."
+  else
+    ok "app '$APP_NAME' is this installation's ($APP_KNOWN_SOURCE)"
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # 6a. The preflight gate
 # ---------------------------------------------------------------------------
@@ -2083,7 +2174,14 @@ if [[ -z "$SECRET_SCOPE" ]]; then
   # embeds run_id, which changes on every reset and forces the app's resource
   # bindings to be rewritten alongside the secret. A stable scope means only the
   # secret value moves.
-  SECRET_SCOPE="lakebase-anti-demo-$(basename "$MANIFEST_DIR" | tr -cd 'a-zA-Z0-9._-')"
+  #
+  # And keyed on the app. Every first install is .anti-demo-v7, so a scope keyed
+  # on the directory alone was one scope for every installation in a workspace: a
+  # second install, even under its own app name, published its seal over the
+  # first's, and the first app loaded the second's manifest at its next restart
+  # (found 2026-09-26, before it happened). App names are unique per workspace,
+  # and the default name yields the scope every existing installation already has.
+  SECRET_SCOPE="$(printf '%s-%s' "$APP_NAME" "$(basename "$MANIFEST_DIR")" | tr -cd 'a-zA-Z0-9._-')"
 fi
 SECRET_MANIFEST_KEY="manifest-json"
 DEPLOY_RECORD="$MANIFEST_DIR/app-deploy.json"
@@ -2175,13 +2273,19 @@ if [[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] &&
           ;;
         *)
           APP_SERVING="no"
-          # Deliberately loud even in check mode. "The platform says the app is
-          # fine and the app is not" is the single most misleading state this
-          # tool can be run against.
-          warn "the deployed app is NOT serving: GET /api/health -> $PROBE_CODE, despite
+          if [[ "$APP_DEPLOY_STATE" == "NONE" ]]; then
+            # Never deployed: an app created a step ago has nothing to serve,
+            # and calling that "already broken" alarmed a first install.
+            info "nothing is deployed to it yet (GET /api/health -> $PROBE_CODE); this is its first deploy"
+          else
+            # Deliberately loud even in check mode. "The platform says the app is
+            # fine and the app is not" is the single most misleading state this
+            # tool can be run against.
+            warn "the deployed app is NOT serving: GET /api/health -> $PROBE_CODE, despite
                 deployment $APP_DEPLOY_STATE. It is already broken, so a deploy from here
                 can only improve matters -- but check the logs for why:
                     databricks apps logs $APP_NAME --tail-lines 100 ${DATABRICKS_ARGS[*]}"
+          fi
           ;;
       esac
     fi
@@ -2189,7 +2293,9 @@ if [[ -n "${DATABRICKS_APP_CLIENT_ID:-}" ]] &&
 
   BOUND_SCOPE="$(printf '%s' "$APP_STATE_JSON" |
     jq -r --arg n "anti-demo-manifest-json" '.resources[]? | select(.name==$n) | .secret.scope // empty')"
-  if [[ -z "$BOUND_SCOPE" ]]; then
+  if [[ -z "$BOUND_SCOPE" && "$APP_DEPLOY_STATE" == "NONE" ]]; then
+    info "no seal is bound to it yet; the deploy binds scope '$SECRET_SCOPE'"
+  elif [[ -z "$BOUND_SCOPE" ]]; then
     warn "the app has no 'anti-demo-manifest-json' resource, so it has no seal at all"
   else
     ok "the app reads its seal from scope '$BOUND_SCOPE'"
@@ -2745,13 +2851,21 @@ say ""
 SETUP_STATUS=0
 "${ANTI_DEMO_EXECUTABLE:-./antidemo}" "${SETUP_ARGS[@]}" || SETUP_STATUS=$?
 if ((SETUP_STATUS != 0)); then
+  CONTINUE_HINT="./bootstrap.sh --apply   (resumes; does not duplicate)"
+  # Setup's closing checks run after the last seal, so it can fail on a complete
+  # installation -- and --apply then refuses that as ready, one more round trip
+  # for someone who just did what this message said (found 2026-09-26).
+  if apply_targets_complete_ready_install "$ANTI_DEMO_MANIFEST"; then
+    CONTINUE_HINT="fix what setup's closing checks name above, then
+                                   ./bootstrap.sh --deploy-only   (provisioning finished)"
+  fi
   die "'./antidemo setup' exited $SETUP_STATUS, and it does not undo what it created.
        Anything Terraform applied before the failure exists now and is billing now.
        External expiry may later reap tagged AWS resources, but it does not
        guarantee complete cleanup of this partial installation.
 
        Find out what is running:   ./antidemo cleanup --dry-run
-       Continue where it stopped:  ./bootstrap.sh --apply   (resumes; does not duplicate)
+       Continue where it stopped:  $CONTINUE_HINT
        Stop the spend:             ./antidemo cleanup --yes
 
        All three need this generation, so keep ANTI_DEMO_MANIFEST pointed at
@@ -2889,6 +3003,21 @@ if databricks secrets list-scopes "${DATABRICKS_ARGS[@]}" -o json 2>/dev/null |
 else
   if OUT="$(databricks secrets create-scope "$SECRET_SCOPE" "${DATABRICKS_ARGS[@]}" 2>&1)"; then
     ok "created secret scope '$SECRET_SCOPE'"
+    # Provenance, recorded the way the app's is: cleanup deletes a scope only
+    # when this installation created it (server/lifecycle.py:_delete_secret_scope),
+    # because it holds the AWS key pair published below. A scope found already
+    # there, or created by a racing run, is never recorded as ours.
+    STATE_FILE="$STATE_FILE" SECRET_SCOPE="$SECRET_SCOPE" python3 - <<'PY' ||
+import json, os, pathlib
+
+path = pathlib.Path(os.environ["STATE_FILE"])
+record = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+record["databricks_secret_scope_created"] = os.environ["SECRET_SCOPE"]
+path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+PY
+      warn "created '$SECRET_SCOPE' but could not record that in $STATE_FILE, so
+        './antidemo cleanup' will report the scope rather than delete it"
   elif printf '%s' "$OUT" | grep -qi 'already exists\|RESOURCE_ALREADY_EXISTS'; then
     ok "secret scope '$SECRET_SCOPE' already exists"
   else

@@ -52,6 +52,7 @@ from server.reconcile import (
     IPV4_DRIFT,
     MISSING_RESIDENT,
     ORPHAN_EPHEMERAL,
+    ORPHAN_FOREIGN_RUN,
     RDS_INSTANCE,
     Finding,
     ObservedResource,
@@ -845,6 +846,25 @@ class TestDrift:
         assert clean.totals is not None and drifting.totals is not None
         assert drifting.totals.installation.usd_per_day == clean.totals.installation.usd_per_day
         assert "never added to the totals" in drifting.drift.separation_note
+
+    def test_a_neighbours_fleet_is_not_this_installations_drift(self):
+        """A second installation in the account put its fleet on this panel (2026-09-26)."""
+
+        report = self._report(
+            findings=(
+                Finding(
+                    ORPHAN_FOREIGN_RUN,
+                    RDS_INSTANCE,
+                    "neighbour-rds",
+                    "tagged for another run, which this manifest does not own",
+                    usd_per_day=Decimal("1.56"),
+                    basis="db.t4g.medium compute + 1 public IPv4",
+                ),
+            ),
+        )
+        drift = build(posted=posted_usage(), report=report).drift
+        assert drift.state == "sealed_shape_holds"
+        assert drift.unexpected_usd_per_day is None
 
     def test_a_clean_account_says_so_rather_than_saying_nothing(self):
         drift = full().drift

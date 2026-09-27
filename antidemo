@@ -92,6 +92,10 @@ ANTI_DEMO_CARRIED=(
   AWS_SESSION_TOKEN
   AWS_DEFAULT_REGION
   AWS_REGION
+  # Not a credential, but the same kind of fact: where this host is, which the
+  # manifest cannot know for the next run. Needed by renew and the ingress repair
+  # on a network that blocks every public-IP echo bootstrap.sh would ask.
+  ANTI_DEMO_OPERATOR_IP
 )
 
 if [[ -f "$ENV_FILE" ]]; then

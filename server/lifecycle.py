@@ -100,10 +100,9 @@ BASE_SCHEMA_PATHS = (
     PROJECT_ROOT / "sql" / "002_orders_base.sql",
 )
 ANTI_DEMO_RUNTIME_PRINCIPALS_ENV = "ANTI_DEMO_RUNTIME_PRINCIPAL_ARNS"
-#: Fixed, and must equal `var.anti_demo_runtime_role_name`'s default. The name is
-#: deliberately not generated: the operator's `~/.aws/config` carries this ARN in
-#: a `role_arn` key, and a per-install suffix would mean editing that file after
-#: every sweep -- the recurring manual step this role exists to remove.
+#: Must equal `var.anti_demo_runtime_role_name`'s default. The name of every
+#: runtime role sealed before 2026-09-26, and the stem of every one since: see
+#: `anti_demo_runtime_role_name` for why a new installation's is its own.
 ANTI_DEMO_RUNTIME_ROLE_NAME = "anti-demo-runtime"
 #: The bare unique principal ID IAM leaves behind in a trust policy once the
 #: principal it named has been deleted. While the principal exists IAM reverse-
@@ -391,21 +390,75 @@ def _new_run_id() -> str:
     return f"ad-{stamp}-{secrets.token_hex(2)}"
 
 
-def detect_operator_cidr(*, timeout_seconds: float = 10.0) -> str:
-    """Ask AWS which address it sees this host as, and express it as a /32.
+#: The HTTPS echoes asked, in order, which address this host egresses from.
+#: Several, because one blocked endpoint used to stop the whole install: on
+#: 2026-09-26 a filtered network timed out on https://checkip.amazonaws.com while
+#: both of the others answered. Never plain HTTP -- the answer becomes the one
+#: /32 the database security groups admit. Mirrored in bootstrap.sh.
+OPERATOR_IP_ENDPOINTS = (
+    "https://checkip.amazonaws.com",
+    "https://api.ipify.org",
+    "https://ipv4.icanhazip.com",
+)
+#: Names this host's public IPv4 outright, for networks that block every echo
+#: above. Honoured by bootstrap.sh and by every command that re-reads the address.
+OPERATOR_IP_ENV = "ANTI_DEMO_OPERATOR_IP"
 
-    `timeout_seconds` exists for the runtime drift probe below, which runs beside
-    a demo and must not sit on a ten-second socket. Every mutator keeps the
-    original default: a provision or a repair is allowed to wait.
+
+def detect_operator_cidr(*, timeout_seconds: float = 10.0) -> str:
+    """Find the public IPv4 this host egresses from, and express it as a /32.
+
+    `timeout_seconds` bounds each echo, and exists for the runtime drift probe
+    below, which runs beside a demo and must not sit on a ten-second socket. Every
+    mutator keeps the original default: a provision or a repair is allowed to wait.
+    A network failure on every echo re-raises the last one, so callers that read
+    "could not tell" from OSError or TimeoutError keep doing so.
     """
-    with urllib.request.urlopen(
-        "https://checkip.amazonaws.com", timeout=timeout_seconds
-    ) as response:
-        raw = response.read(128).decode("ascii").strip()
-    address = ipaddress.ip_address(raw)
-    if address.version != 4:
+    override = os.environ.get(OPERATOR_IP_ENV, "").strip()
+    if override:
+        # RuntimeError, not ValueError: `_require_operator_cidr` reads ValueError
+        # as "no echo answered", which is the wrong advice for a mistyped value.
+        try:
+            declared = ipaddress.ip_address(override)
+        except ValueError:
+            declared = None
+        if declared is None or declared.version != 4 or not declared.is_global:
+            raise RuntimeError(
+                f"{OPERATOR_IP_ENV}={override} is not a public IPv4 address. Set it to "
+                "the address this host reaches AWS from, or unset it to detect one."
+            )
+        return f"{declared}/32"
+    last_failure: BaseException | None = None
+    ipv6_seen = False
+    for endpoint in OPERATOR_IP_ENDPOINTS:
+        try:
+            with urllib.request.urlopen(endpoint, timeout=timeout_seconds) as response:
+                raw = response.read(128).decode("ascii").strip()
+            address = ipaddress.ip_address(raw)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            last_failure = exc
+            continue
+        if address.version != 4:
+            ipv6_seen = True
+            continue
+        return f"{address}/32"
+    if ipv6_seen:
         raise RuntimeError("Round 1 currently requires an operator public IPv4 address")
-    return f"{address}/32"
+    assert last_failure is not None
+    raise last_failure
+
+
+def _require_operator_cidr() -> str:
+    """The operator /32 for a command that changes ingress, or a refusal naming the way out."""
+
+    try:
+        return detect_operator_cidr()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "Could not detect this host's public IPv4 address from "
+            f"{', '.join(OPERATOR_IP_ENDPOINTS)}. Set {OPERATOR_IP_ENV} to it "
+            "and run again."
+        ) from exc
 
 
 def _validate_operator_cidr(value: str) -> str:
@@ -868,12 +921,17 @@ def _operator_cidr_check(manifest: DemoManifest) -> Check:
     except Exception as exc:
         return Check("operator_cidr", False, str(exc))
     configured = manifest.aws.operator_cidr
+    # A declared address is not a detected one, and a stale declaration is the
+    # one mismatch re-running the repair cannot fix on its own.
+    current = current_cidr
+    if os.environ.get(OPERATOR_IP_ENV, "").strip():
+        current = f"{current_cidr} (from {OPERATOR_IP_ENV})"
     if current_cidr == configured:
-        return Check("operator_cidr", True, f"current {current_cidr}; configured {configured}")
+        return Check("operator_cidr", True, f"current {current}; configured {configured}")
     return Check(
         "operator_cidr",
         False,
-        f"current {current_cidr}; configured {configured} · every round that "
+        f"current {current}; configured {configured} · every round that "
         f"connects directly to Aurora or RDS will fail until the security groups "
         f"are rebound · run '{OPERATOR_INGRESS_REPAIR_COMMAND}'",
     )
@@ -1089,6 +1147,31 @@ def anti_demo_runtime_principals(manifest: DemoManifest) -> tuple[str, ...]:
     return configured
 
 
+def anti_demo_runtime_role_name(manifest: DemoManifest) -> str:
+    """The name this installation's runtime role has, or will be created under.
+
+    The seal wins, so every installation already provisioned keeps the name it
+    has. A new one gets a name of its own. `anti-demo-runtime` alone was one name
+    per AWS account: a second installation's first apply failed on
+    EntityAlreadyExists after its databases and runners were already billing
+    (found 2026-09-26, installing beside a live installation).
+
+    The suffix is a digest of the installation ID -- the way `infra/aws/locals.tf`
+    names every per-round resource -- so it is stable for the installation's
+    whole life, and the reason the name was never `name_prefix`d still holds: an
+    operator's `~/.aws/config` carries this ARN across the fortnightly sweep, and
+    the recreated role comes back under the same name. The operator policies
+    already grant `role/anti-demo-runtime*` and `policy/anti-demo-runtime-*`.
+    """
+
+    if manifest.aws.runtime_role_arn:
+        return manifest.aws.runtime_role_arn.rsplit("/", 1)[-1]
+    if manifest.installation_id is None:
+        return ANTI_DEMO_RUNTIME_ROLE_NAME
+    digest = hashlib.sha256(f"{manifest.installation_id.strip()}:runtime".encode()).hexdigest()
+    return f"{ANTI_DEMO_RUNTIME_ROLE_NAME}-{digest[:12]}"
+
+
 def _terraform_variables(
     manifest: DemoManifest,
     *,
@@ -1110,11 +1193,11 @@ def _terraform_variables(
         # unchanged: bootstrap still derives ROUND5_APP_PRINCIPAL_ARN from the
         # caller, and it is simply not the answer once a runtime role exists.
         #
-        # Knowable before Terraform runs only because the role's name is fixed
-        # rather than `name_prefix`d -- see the comment on the resource. Sealed
+        # Knowable before Terraform runs only because the role's name is derived
+        # rather than `name_prefix`d -- see `anti_demo_runtime_role_name`. Sealed
         # installations read the seal instead, so an overridden name still works.
         round5_app_principal = manifest.aws.runtime_role_arn or (
-            f"arn:aws:iam::{manifest.aws.account_id}:role/{ANTI_DEMO_RUNTIME_ROLE_NAME}"
+            f"arn:aws:iam::{manifest.aws.account_id}:role/{anti_demo_runtime_role_name(manifest)}"
         )
     else:
         round5_app_principal = (
@@ -1173,9 +1256,7 @@ def _terraform_variables(
         # Pinned from here rather than left to Terraform's own default, so the
         # name this file derives an ARN from and the name Terraform creates can
         # never drift apart.
-        "anti_demo_runtime_role_name": (
-            manifest.aws.runtime_role_arn or ANTI_DEMO_RUNTIME_ROLE_NAME
-        ).rsplit("/", 1)[-1],
+        "anti_demo_runtime_role_name": anti_demo_runtime_role_name(manifest),
     }
     if manifest.installation_id is not None:
         values["installation_id"] = manifest.installation_id
@@ -1906,6 +1987,10 @@ def _terraform_state_resource_values(
     return found
 
 
+#: Terraform resource types IAM gives no tags to, whose ownership is the role's.
+_UNTAGGABLE_ROLE_CHILD_TYPES = frozenset({"aws_iam_role_policy", "aws_iam_role_policy_attachment"})
+
+
 def _validate_partial_aws_destroy_retry(
     manifest: DemoManifest,
     managed_addresses: set[str],
@@ -1960,19 +2045,46 @@ def _validate_partial_aws_destroy_retry(
         # resource, so it cannot carry ownership tags.
         "terraform_data.round5_destroy_guard",
     }
-    for address in round5_addresses:
+
+    def tags_verify(address: str) -> bool | None:
+        """True when the state tags match the seal, False when they differ, None if absent."""
         values = state_values[address]
         tags = values.get("tags_all") or values.get("tags") or {}
-        if isinstance(tags, dict) and tags:
-            required_tags = _required_tags_for_address(manifest, address)
-            if any(str(tags.get(key) or "") != value for key, value in required_tags.items()):
-                raise RuntimeError(
-                    f"Cleanup refused: Terraform state ownership tags differ for {address}"
-                )
-        elif address not in allowed_round5_children:
+        if not (isinstance(tags, dict) and tags):
+            return None
+        required_tags = _required_tags_for_address(manifest, address)
+        return all(str(tags.get(key) or "") == value for key, value in required_tags.items())
+
+    # An inline role policy and a managed-policy attachment cannot carry tags at
+    # all -- IAM exposes no tagging for either -- so their ownership is their
+    # role's: accepted when the role they bind is a role in this same state whose
+    # own tags verify. By type, because the named list above went stale once
+    # already: the two-runner Round 5 added four such children, and a partial
+    # install could no longer be inventoried, let alone cleaned up (2026-09-26).
+    owned_role_names = {
+        str(state_values[address].get("name") or "")
+        for address in round5_addresses
+        if address.startswith("aws_iam_role.") and tags_verify(address) is True
+    }
+    owned_role_names.discard("")
+    for address in round5_addresses:
+        verdict = tags_verify(address)
+        if verdict is True:
+            continue
+        if verdict is False:
             raise RuntimeError(
-                f"Cleanup refused: remaining Round 5 resource has no ownership tags: {address}"
+                f"Cleanup refused: Terraform state ownership tags differ for {address}"
             )
+        if address in allowed_round5_children:
+            continue
+        if (
+            address.split(".", 1)[0] in _UNTAGGABLE_ROLE_CHILD_TYPES
+            and str(state_values[address].get("role") or "") in owned_role_names
+        ):
+            continue
+        raise RuntimeError(
+            f"Cleanup refused: remaining Round 5 resource has no ownership tags: {address}"
+        )
     for address in managed_addresses & set(expected_identities):
         field, expected = expected_identities[address]
         if not expected or str(state_values[address].get(field) or "") != expected:
@@ -9538,7 +9650,7 @@ def provision(
     databricks_user = _verify_databricks_identity(databricks_profile)
     print("CHECK explicit AWS account binding", flush=True)
     _verify_aws_identity(auth.profile, aws_region, expected_account, auth.mode)
-    cidr = _validate_operator_cidr(operator_cidr or detect_operator_cidr())
+    cidr = _validate_operator_cidr(operator_cidr or _require_operator_cidr())
     # Before the first apply, so the groups Terraform creates admit the deployed
     # app. See `_seal_initial_serverless_egress`.
     egress_cidrs, egress_published_at = _seal_initial_serverless_egress(aws_region)
@@ -9614,7 +9726,7 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         manifest.aws.account_id,
         manifest.aws.auth_mode,
     )
-    current_cidr = detect_operator_cidr()
+    current_cidr = _require_operator_cidr()
     if current_cidr != manifest.aws.operator_cidr:
         raise RuntimeError(
             f"Operator public IP changed to {current_cidr}; provisioned ingress is "
@@ -9686,7 +9798,7 @@ def reset(timeout_seconds: float = 900) -> DemoManifest:
                 "Round 5 reset refused: deterministic-prefix residue has no "
                 "ownership-authorizing journal scope"
             )
-    current_cidr = detect_operator_cidr()
+    current_cidr = _require_operator_cidr()
     if current_cidr != manifest.aws.operator_cidr:
         raise RuntimeError(
             f"Operator public IP changed to {current_cidr}; provisioned ingress is "
@@ -9705,7 +9817,7 @@ def reset(timeout_seconds: float = 900) -> DemoManifest:
 
 def _refresh_operator_cidr(manifest: DemoManifest) -> None:
     """Rebind owned database ingress when the local operator's public IP changes."""
-    current_cidr = detect_operator_cidr()
+    current_cidr = _require_operator_cidr()
     if current_cidr == manifest.aws.operator_cidr:
         return
     ownership = _aws_ownership(manifest)
@@ -11360,18 +11472,23 @@ def setup(
     if not round6_prepared:
         manifest = _prepare_and_reseal_round6(manifest, timeout=timeout_seconds)
     failures: list[str] = []
+    # Why, and not only which: a real install stopped on "Setup checks failed:
+    # aurora:resource_reconciliation, rds:resource_reconciliation" and nothing
+    # else, leaving the operator to guess. Once per distinct reason, because the
+    # account-wide checks fail identically for both competitors.
+    reasons: dict[tuple[str, str], None] = {}
     for competitor in ("aurora", "rds"):
         # Advisory checks are skipped here for the same reason they are skipped in
         # the CLI: they have already printed themselves, and they describe
         # something an operator should know rather than something setup must not
         # proceed past.
-        failures.extend(
-            f"{competitor}:{check.name}"
-            for check in doctor(competitor, timeout_seconds=timeout_seconds)
-            if not check.ok and not check.advisory
-        )
+        for check in doctor(competitor, timeout_seconds=timeout_seconds):
+            if not check.ok and not check.advisory:
+                failures.append(f"{competitor}:{check.name}")
+                reasons[(check.name, check.detail)] = None
     if failures:
-        raise RuntimeError("Setup checks failed: " + ", ".join(failures))
+        detail = "\n".join(f"  {name}: {reason}" for name, reason in reasons)
+        raise RuntimeError("Setup checks failed: " + ", ".join(failures) + "\n" + detail)
     return manifest
 
 
@@ -11779,9 +11896,10 @@ def _delete_detached_runtime_role(manifest: DemoManifest) -> None:
     if iam.list_instance_profiles_for_role(RoleName=role_name).get("InstanceProfiles"):
         raise RuntimeError("Cleanup refused: the runtime role belongs to an instance profile")
 
+    # Named for this role, not for the stem every installation's role shares.
     expected_prefix = (
         f"arn:{role_arn.split(':', 2)[1]}:iam::{manifest.aws.account_id}:"
-        f"policy/{ANTI_DEMO_RUNTIME_ROLE_NAME}-"
+        f"policy/{role_name}-"
     )
     attached = iam.list_attached_role_policies(RoleName=role_name).get("AttachedPolicies") or []
     if len(attached) > len(_ANTI_DEMO_RUNTIME_POLICY_KEYS) or any(
@@ -12058,6 +12176,136 @@ def _round4_survivor_lines(manifest: DemoManifest) -> list[str]:
     return lines
 
 
+#: bootstrap.sh writes this into bootstrap.json when it creates the app's secret
+#: scope, and only then. It is the scope's provenance, as
+#: `databricks_app_created_client_id` is the app's: a scope this installation
+#: found already there is reported and never deleted.
+SECRET_SCOPE_CREATED_KEY = "databricks_secret_scope_created"
+
+
+def _recorded_secret_scope(manifest: DemoManifest) -> tuple[str, bool]:
+    """The scope this installation's app read its seal from, and whether bootstrap created it.
+
+    Named by `app-deploy.json`, else by `bootstrap.json`, the same falling order
+    `_deployed_app_name` uses; `("", False)` when neither names one.
+    """
+
+    record = _round4_app_record(manifest) or {}
+    bootstrap = _read_json_object(manifest_path().parent / BOOTSTRAP_RECORD_NAME) or {}
+    name = str(record.get("secret_scope") or bootstrap.get("secret_scope") or "").strip()
+    created = str(bootstrap.get(SECRET_SCOPE_CREATED_KEY) or "").strip()
+    return name, bool(name) and created == name
+
+
+def _secret_scope_listed(profile: str, scope: str) -> bool:
+    payload = _databricks_api(profile, "GET", "/api/2.0/secrets/scopes/list")
+    return any(str(item.get("name") or "") == scope for item in payload.get("scopes") or [])
+
+
+#: Where the app listing gives up. A workspace with ten thousand apps is not one
+#: this was run in; a page token that never ends is a bug, not a workspace.
+_APP_LIST_PAGE_LIMIT = 100
+
+
+def _apps_reading_secret_scope(profile: str, scope: str) -> list[str]:
+    """Every app in the workspace with a resource bound to `scope`.
+
+    Raises when the listing cannot be read to the end: an incomplete list cannot
+    show that nothing reads the scope, and that is the question it answers.
+    """
+
+    readers: list[str] = []
+    token = ""
+    for _ in range(_APP_LIST_PAGE_LIMIT):
+        path = "/api/2.0/apps?page_size=100"
+        if token:
+            path += f"&page_token={quote(token, safe='')}"
+        payload = _databricks_api(profile, "GET", path)
+        for app in payload.get("apps") or []:
+            if any(
+                str(((resource or {}).get("secret") or {}).get("scope") or "") == scope
+                for resource in app.get("resources") or []
+            ):
+                readers.append(str(app.get("name") or "an unnamed app"))
+        token = str(payload.get("next_page_token") or "")
+        if not token:
+            return readers
+    raise RuntimeError(f"The workspace app list did not end within {_APP_LIST_PAGE_LIMIT} pages")
+
+
+def _secret_scope_survivor_lines(manifest: DemoManifest) -> list[str]:
+    """Name the app's secret scope, which no Terraform state or bill ever lists.
+
+    It costs nothing, and that is how it went unreported: what it holds is the
+    reason to report it -- the app's seal and the AWS key pair bootstrap
+    published for the app. Never raises; this runs inside the inventory.
+    """
+
+    name, created = _recorded_secret_scope(manifest)
+    if not name:
+        return []
+    profile = manifest.databricks.profile
+    try:
+        listed = _secret_scope_listed(profile, name)
+    except Exception as error:
+        return [
+            f"OWNED secret scope: {name} (the workspace could not be asked: "
+            f"{type(error).__name__}). Check by hand: databricks secrets list-scopes -p {profile}"
+        ]
+    if not listed:
+        return [f"OWNED secret scope: {name} (not in the workspace)"]
+    if created:
+        return [
+            f"OWNED secret scope: {name} · holds the app's seal and AWS key pair · "
+            f"DELETED BY THIS CLEANUP once no app reads it"
+        ]
+    return [
+        f"OWNED secret scope: {name} · holds the app's seal and AWS key pair · "
+        f"SURVIVES THIS CLEANUP",
+        f"      Not deleted here: bootstrap did not record creating it, so it cannot be "
+        f"shown to be this installation's alone. Remove it by hand if it is: "
+        f"databricks secrets delete-scope {name} -p {profile}",
+    ]
+
+
+def _delete_secret_scope(manifest: DemoManifest) -> None:
+    """Delete the secret scope bootstrap created for this installation's app.
+
+    An uninstall that leaves it behind leaves a copy of a permanent AWS
+    credential in the workspace, and nothing else reports it. Deleted on
+    provenance only -- bootstrap recorded creating this exact scope -- and only
+    once no app reads it, which is why this runs after the owned app is gone.
+
+    Never raises. Nothing about a scope bills, so a scope that cannot be deleted
+    must not be what fails a teardown that has already removed everything that
+    does; it is said loudly instead, with the command that finishes the job.
+    """
+
+    name, created = _recorded_secret_scope(manifest)
+    if not name or not created:
+        return
+    profile = manifest.databricks.profile
+    by_hand = f"databricks secrets delete-scope {name} -p {profile}"
+    try:
+        if not _secret_scope_listed(profile, name):
+            return
+        readers = _apps_reading_secret_scope(profile, name)
+        if readers:
+            print(
+                f"KEEP  secret scope {name}: still read by {', '.join(sorted(readers))}",
+                flush=True,
+            )
+            return
+        print(f"DELETE secret scope {name}", flush=True)
+        _databricks_api(profile, "POST", "/api/2.0/secrets/scopes/delete", body={"scope": name})
+    except Exception as error:
+        print(
+            f"WARN  secret scope {name} was not deleted ({type(error).__name__}). It still "
+            f"holds the app's AWS key pair. Remove it: {by_hand}",
+            flush=True,
+        )
+
+
 def _refuse_or_report(finding: str, *, dry_run: bool) -> None:
     """One rule, both of cleanup's cost gates: `--yes` refuses, a dry run reports.
 
@@ -12216,9 +12464,18 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
     print(f"OWNED Round 4 synced table: {round4_inventory[0]['resource_name']} ({round4_state})")
     for line in _round4_survivor_lines(manifest):
         print(line, flush=True)
+    for line in _secret_scope_survivor_lines(manifest):
+        print(line, flush=True)
     if aws_resources_exist:
-        print(f"OWNED Aurora cluster: {manifest.aws.resources.aurora_cluster_id}")
-        print(f"OWNED RDS instance: {manifest.aws.resources.rds_instance_id}")
+        # What the destroy below acts on. The two named lines are the Round 1
+        # fields a v1 seal filled; a v7 installation seals its per-round fleet
+        # elsewhere and leaves them empty, and "OWNED Aurora cluster: " with
+        # nothing after it read as a finding on a real partial install.
+        print(f"OWNED Terraform-managed AWS resources: {len(managed_addresses)}")
+        if manifest.aws.resources.aurora_cluster_id:
+            print(f"OWNED Aurora cluster: {manifest.aws.resources.aurora_cluster_id}")
+        if manifest.aws.resources.rds_instance_id:
+            print(f"OWNED RDS instance: {manifest.aws.resources.rds_instance_id}")
         print("PLAN  Terraform destroy after Round 5 clean-baseline authorization")
     else:
         # An empty Terraform state is not evidence of an empty account, and
@@ -12392,6 +12649,10 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
             )
         if delete_detached_runtime_role:
             _delete_detached_runtime_role(manifest)
+        # Last, and after the app: nothing about a scope bills, so it must never
+        # be what strands the destroy above, and an app that still reads it is
+        # a reason to keep it. See `_delete_secret_scope`.
+        _delete_secret_scope(manifest)
     except BaseException:
         # Not on a dry run. `cleanup_failed` means "a teardown ran partway and a
         # human must adjudicate what survived" -- `require_ready_manifest`

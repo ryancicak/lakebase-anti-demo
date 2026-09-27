@@ -335,6 +335,18 @@ class ReconciliationReport:
         return tuple(finding for finding in self.findings if finding.is_orphan)
 
     @property
+    def neighbours(self) -> tuple[Finding, ...]:
+        """Resources tagged for another run: reported, never held against this one.
+
+        A prior run's residue, or another live installation sharing the account.
+        Either way it is not this seal's drift. Counting it as such made a second
+        installation in an account fail its own setup on the first one's fleet
+        (found 2026-09-26), and put that fleet on the first one's cost panel.
+        """
+
+        return tuple(f for f in self.findings if f.code == ORPHAN_FOREIGN_RUN)
+
+    @property
     def missing(self) -> tuple[Finding, ...]:
         return tuple(f for f in self.findings if f.code == MISSING_RESIDENT)
 
@@ -344,28 +356,39 @@ class ReconciliationReport:
 
     @property
     def ok(self) -> bool:
-        return not self.unavailable and not self.findings
+        return not self.unavailable and all(f.code == ORPHAN_FOREIGN_RUN for f in self.findings)
 
     def summary(self) -> str:
         """One line, always. Silence would look the same as never having run."""
 
         if self.unavailable:
             return f"not reconciled: {self.unavailable}"
+        neighbours = ""
+        if self.neighbours:
+            neighbour_usd = sum((f.usd_per_day for f in self.neighbours), Decimal(0))
+            neighbours = (
+                f"; {len(self.neighbours)} resource(s) tagged for other runs, not this "
+                f"installation's, carrying ${neighbour_usd:.4f}/day"
+            )
         if self.ok:
             return (
                 f"{len(self.expected)} sealed AWS resources present, "
-                f"{self.observed_public_ipv4} public IPv4, no orphans"
+                f"{self.observed_public_ipv4} public IPv4, no orphans{neighbours}"
             )
+        own = len(self.orphans) - len(self.neighbours)
+        own_usd = self.orphan_usd_per_day - sum(
+            (f.usd_per_day for f in self.neighbours), Decimal(0)
+        )
         return (
-            f"{len(self.orphans)} orphan(s), {len(self.missing)} missing, "
+            f"{own} orphan(s), {len(self.missing)} missing, "
             f"public IPv4 {self.observed_public_ipv4} vs {self.expected_public_ipv4} expected, "
-            f"orphan carrying cost ${self.orphan_usd_per_day:.4f}/day"
+            f"orphan carrying cost ${own_usd:.4f}/day{neighbours}"
         )
 
     def report_lines(self) -> tuple[str, ...]:
         """Operator-facing detail, orphans first because they cost money now."""
 
-        if self.unavailable or self.ok:
+        if self.unavailable or not self.findings:
             return ()
         lines = [finding.line() for finding in self.findings]
         if self.orphans:
@@ -559,7 +582,11 @@ def reconcile(
             )
 
     expected_ipv4 = sum(1 for resource in expected if resource.public_ipv4)
-    observed_ipv4 = sum(1 for resource in live if resource.public_ipv4)
+    # This run's addresses only: another run's are priced on its own findings
+    # above, and counting them here reported every shared account as drifted.
+    observed_ipv4 = sum(
+        1 for resource in live if resource.public_ipv4 and resource.run_id == manifest.run_id
+    )
     if expected_ipv4 != observed_ipv4:
         findings.append(
             Finding(

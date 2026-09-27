@@ -14,6 +14,9 @@ HARNESS = REPO / "tests" / "bootstrap_stub_harness.sh"
 # rather than silently going unrun.
 EXPECTED_CASES = {
     "case_check_clean",
+    "case_operator_ip_fallback",
+    "case_foreign_app_is_not_adopted",
+    "case_first_deploy_is_not_called_broken",
     "case_multiple_warehouses_are_derived",
     "case_banned_files",
     "case_print_env",
@@ -369,10 +372,12 @@ def test_a_failed_provision_says_what_is_already_billing(tmp_path):
     script.write_text(
         "set -euo pipefail\n"
         "RED=''; RESET=''\n"
+        "MODE=apply\n"
         "ANTI_DEMO_MANIFEST=/tmp/gen/manifest.json\n"
         "MANIFEST_DIR=/tmp/gen\n"
         "SETUP_ARGS=(setup --owner me --no-serve)\n"
         + _extract(source, "die() {\n", "\n}\n")
+        + _extract(source, "apply_targets_complete_ready_install() {", "\n}\n")
         + _extract(source, "SETUP_STATUS=0\n", "\nfi\n"),
         encoding="utf-8",
     )
@@ -408,6 +413,55 @@ def test_a_failed_provision_says_what_is_already_billing(tmp_path):
         "/tmp/gen/manifest.json",
     ):
         assert instruction in result.stderr, f"{instruction!r} missing from:\n{result.stderr}"
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not on PATH")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
+def test_a_setup_that_failed_after_sealing_names_the_deploy_path(tmp_path):
+    """Setup's closing checks run after the last seal, so it can fail on a ready install.
+
+    A real fresh-clone install did exactly that on 2026-09-26, and the message
+    above then said to run `./bootstrap.sh --apply` -- which refuses a ready
+    installation. Same extraction as the test above, plus the predicate that
+    decides which way forward to name.
+    """
+
+    source = (REPO / "bootstrap.sh").read_text(encoding="utf-8")
+    manifest = tmp_path / "gen" / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps({"status": "ready", "manifest_version": 7, "round6": {}}), encoding="utf-8"
+    )
+    script = tmp_path / "block.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        "RED=''; RESET=''\n"
+        "MODE=apply\n"
+        f"ANTI_DEMO_MANIFEST={manifest}\n"
+        f"MANIFEST_DIR={manifest.parent}\n"
+        "SETUP_ARGS=(setup --owner me --no-serve)\n"
+        + _extract(source, "die() {\n", "\n}\n")
+        + _extract(source, "apply_targets_complete_ready_install() {", "\n}\n")
+        + _extract(source, "SETUP_STATUS=0\n", "\nfi\n"),
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "antidemo"
+    launcher.write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+    launcher.chmod(0o755)
+
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", str(script)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "exited 3" in result.stderr, result.stderr
+    assert "./bootstrap.sh --deploy-only" in result.stderr, result.stderr
+    assert "closing checks" in result.stderr
+    assert "./bootstrap.sh --apply" not in result.stderr
 
 
 def _run_ready_gate(

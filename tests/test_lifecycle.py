@@ -1694,6 +1694,62 @@ def test_an_inline_role_policy_is_recognised_by_the_name_terraform_gives_it(monk
         _validate_partial_aws_destroy_retry(manifest, {"aws_security_group.round5_proxy"})
 
 
+def test_untaggable_iam_children_are_owned_through_the_role_they_bind(monkeypatch) -> None:
+    """A partial two-runner install could not even be inventoried (2026-09-26).
+
+    The named list above predated the second runner, and the four inline
+    policies and attachments it added were refused as "no ownership tags" --
+    by `cleanup --dry-run`, the command the failed install's own message named
+    as the way to find out what was billing. They are recognised by type now,
+    and their ownership is still proven, by the role they bind: a role in this
+    same state whose tags verify. A child of any other role is still refused.
+    """
+
+    manifest = make_manifest(status="cleanup_failed")
+    expires_at = manifest.expires_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    owned = {
+        "anti-demo-run-id": manifest.run_id,
+        "owner": manifest.owner,
+        "expires-at": expires_at,
+        "managed-by": "terraform",
+    }
+    role = "aws_iam_role.round5_competitor_runner"
+    children = {
+        "aws_iam_role_policy.round5_competitor_runner_control": {"role": "r5-competitor"},
+        "aws_iam_role_policy.round5_competitor_runner_baseline_secret": {"role": "r5-competitor"},
+        "aws_iam_role_policy_attachment.round5_competitor_runner_ssm": {"role": "r5-competitor"},
+    }
+
+    def state_is(values):
+        monkeypatch.setattr(
+            "server.lifecycle._terraform_state_resource_values", lambda *_a, **_k: values
+        )
+        return set(values)
+
+    monkeypatch.setattr(
+        "server.lifecycle._aws_session",
+        lambda _: SimpleNamespace(client=lambda _name: SimpleNamespace()),
+    )
+
+    addresses = state_is({role: {"name": "r5-competitor", "tags_all": owned}, **children})
+    _validate_partial_aws_destroy_retry(manifest, addresses)
+
+    stray = {"aws_iam_role_policy_attachment.round5_competitor_runner_ssm": {"role": "not-ours"}}
+    addresses = state_is({role: {"name": "r5-competitor", "tags_all": owned}, **stray})
+    with pytest.raises(RuntimeError, match="no ownership tags"):
+        _validate_partial_aws_destroy_retry(manifest, addresses)
+
+    # The role itself is what vouches, so a child cannot outlive its role's proof.
+    addresses = state_is(
+        {
+            role: {"name": "r5-competitor", "tags_all": {**owned, "owner": "someone.else"}},
+            **children,
+        }
+    )
+    with pytest.raises(RuntimeError, match="Cleanup refused"):
+        _validate_partial_aws_destroy_retry(manifest, addresses)
+
+
 def test_round5_legacy_partial_restores_default_before_obsolete_state_can_leave(
     monkeypatch,
 ) -> None:
@@ -2461,6 +2517,54 @@ def test_round5_cleanup_ring_key_tracks_manifest_generation() -> None:
     assert _round5_cleanup_ring_key(current) == (
         "installation:install-a:round:survive_connection_spike:cleanup"
     )
+
+
+def test_setup_says_why_its_closing_checks_failed(monkeypatch, tmp_path) -> None:
+    """A real install stopped on the check names alone and left the reason to guesswork."""
+
+    manifest = make_manifest(status="ready")
+    attach_round4(manifest)
+    manifest.round5 = ready_round5_stub()
+    manifest.round6 = SimpleNamespace()
+    manifest.manifest_version = 6
+    owned_manifest = tmp_path / "manifest.json"
+    owned_manifest.touch()
+    monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr("server.lifecycle._require_round5_clean_baseline", lambda candidate: None)
+    monkeypatch.setattr("server.lifecycle.reconcile_infrastructure", lambda candidate: candidate)
+    monkeypatch.setattr("server.lifecycle.reset", lambda timeout: manifest)
+    for stage in ("_prepare_and_reseal_round5", "_prepare_and_reseal_round6"):
+        monkeypatch.setattr(f"server.lifecycle.{stage}", lambda candidate, *, timeout: candidate)
+
+    def doctor(competitor, *, timeout_seconds):
+        checks = [Check("resource_reconciliation", False, "1 orphan(s), 0 missing")]
+        if competitor == "aurora":
+            checks.append(Check("aurora_scale_zero", False, "Aurora is still resuming"))
+        return checks
+
+    monkeypatch.setattr("server.lifecycle.doctor", doctor)
+
+    with pytest.raises(RuntimeError) as failure:
+        setup(
+            databricks_profile="",
+            aws_profile="",
+            aws_region="",
+            expected_account="",
+            owner="",
+            operator_cidr=None,
+            ttl_hours=None,
+            timeout_seconds=321,
+        )
+
+    message = str(failure.value)
+    assert message.startswith(
+        "Setup checks failed: aurora:resource_reconciliation, aurora:aurora_scale_zero, "
+        "rds:resource_reconciliation"
+    )
+    # Once per distinct reason: the account-wide check fails the same way twice.
+    assert message.count("resource_reconciliation: 1 orphan(s), 0 missing") == 1
+    assert "aurora_scale_zero: Aurora is still resuming" in message
 
 
 def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_path) -> None:
@@ -4793,6 +4897,178 @@ def test_owned_app_delete_refuses_when_the_app_never_disappears(
 
     with pytest.raises(RuntimeError, match="still exists after 10 minutes"):
         _delete_databricks_app(manifest)
+
+
+# --------------------------------------------------------------------------
+# The app's secret scope survived every uninstall (2026-09-26)
+# --------------------------------------------------------------------------
+#
+# It holds the app's seal and the AWS key pair bootstrap published for the app,
+# and nothing deleted it or reported it: an uninstall left a permanent AWS
+# credential in the workspace. It is deleted now on the same kind of proof the
+# app is -- bootstrap recorded creating that exact scope -- and only once no app
+# reads it.
+
+SCOPE = "lakebase-anti-demo-2-.anti-demo-v7"
+
+
+def _scope_record(directory, **extra) -> None:
+    (directory / "bootstrap.json").write_text(
+        json.dumps({"secret_scope": SCOPE, **extra}) + "\n", encoding="utf-8"
+    )
+
+
+def _scope_workspace(monkeypatch, *, scopes, app_pages):
+    """Stub the three calls the scope teardown makes, and record every one."""
+
+    calls: list[tuple[str, str, object]] = []
+    pages = iter(app_pages)
+
+    def api(profile, method, path, *, body=None, timeout=600):
+        calls.append((method, path, body))
+        if path == "/api/2.0/secrets/scopes/list":
+            return {"scopes": [{"name": name} for name in scopes]}
+        if path.startswith("/api/2.0/apps?"):
+            return next(pages)
+        if path == "/api/2.0/secrets/scopes/delete":
+            return {}
+        raise AssertionError(f"unexpected Databricks call: {method} {path}")
+
+    monkeypatch.setattr("server.lifecycle._databricks_api", api)
+    return calls
+
+
+def _reader(name: str, scope: str = SCOPE) -> dict[str, object]:
+    return {
+        "name": name,
+        "resources": [{"name": "anti-demo-manifest-json", "secret": {"scope": scope, "key": "k"}}],
+    }
+
+
+def _deleted(calls) -> list[object]:
+    return [body for method, path, body in calls if path == "/api/2.0/secrets/scopes/delete"]
+
+
+def test_a_scope_this_installation_created_is_deleted_once_no_app_reads_it(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    _scope_record(
+        isolated_lifecycle_manifest.parent, **{lifecycle.SECRET_SCOPE_CREATED_KEY: SCOPE}
+    )
+    calls = _scope_workspace(
+        monkeypatch,
+        scopes=[SCOPE, "someone-elses-scope"],
+        app_pages=[{"apps": [_reader("unrelated", scope="someone-elses-scope")]}],
+    )
+
+    lifecycle._delete_secret_scope(make_manifest())
+
+    assert _deleted(calls) == [{"scope": SCOPE}]
+
+
+def test_a_scope_another_app_still_reads_is_kept(
+    monkeypatch, isolated_lifecycle_manifest, capsys
+) -> None:
+    """Read to the last page: the reader here is on the second one."""
+
+    _scope_record(
+        isolated_lifecycle_manifest.parent, **{lifecycle.SECRET_SCOPE_CREATED_KEY: SCOPE}
+    )
+    calls = _scope_workspace(
+        monkeypatch,
+        scopes=[SCOPE],
+        app_pages=[
+            {"apps": [_reader("unrelated", scope="other")], "next_page_token": "page 2"},
+            {"apps": [_reader("still-bound")]},
+        ],
+    )
+
+    lifecycle._delete_secret_scope(make_manifest())
+
+    assert _deleted(calls) == []
+    assert "still read by still-bound" in capsys.readouterr().out
+    assert any("page_token=page%202" in path for _, path, _ in calls)
+
+
+def test_a_scope_bootstrap_did_not_create_is_reported_never_deleted(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    """Found already there, or recorded by a bootstrap that predates provenance."""
+
+    _scope_record(isolated_lifecycle_manifest.parent)
+    calls = _scope_workspace(monkeypatch, scopes=[SCOPE], app_pages=[{"apps": []}])
+    manifest = make_manifest()
+
+    lines = lifecycle._secret_scope_survivor_lines(manifest)
+    lifecycle._delete_secret_scope(manifest)
+
+    assert any("SURVIVES THIS CLEANUP" in line for line in lines)
+    assert any(f"databricks secrets delete-scope {SCOPE}" in line for line in lines)
+    assert _deleted(calls) == []
+
+
+def test_provenance_for_another_scope_is_not_provenance_for_this_one(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    _scope_record(
+        isolated_lifecycle_manifest.parent,
+        **{lifecycle.SECRET_SCOPE_CREATED_KEY: "lakebase-anti-demo-.anti-demo-v7"},
+    )
+    calls = _scope_workspace(monkeypatch, scopes=[SCOPE], app_pages=[{"apps": []}])
+
+    lifecycle._delete_secret_scope(make_manifest())
+
+    assert _deleted(calls) == []
+
+
+def test_the_inventory_says_the_created_scope_goes(
+    monkeypatch, isolated_lifecycle_manifest
+) -> None:
+    _scope_record(
+        isolated_lifecycle_manifest.parent, **{lifecycle.SECRET_SCOPE_CREATED_KEY: SCOPE}
+    )
+    _scope_workspace(monkeypatch, scopes=[SCOPE], app_pages=[])
+
+    lines = lifecycle._secret_scope_survivor_lines(make_manifest())
+
+    assert lines == [
+        f"OWNED secret scope: {SCOPE} · holds the app's seal and AWS key pair · "
+        "DELETED BY THIS CLEANUP once no app reads it"
+    ]
+
+
+def test_a_scope_that_cannot_be_deleted_never_fails_the_teardown(
+    monkeypatch, isolated_lifecycle_manifest, capsys
+) -> None:
+    """Nothing about a scope bills; the teardown it follows already removed what does."""
+
+    _scope_record(
+        isolated_lifecycle_manifest.parent, **{lifecycle.SECRET_SCOPE_CREATED_KEY: SCOPE}
+    )
+
+    def refuse(profile, method, path, *, body=None, timeout=600):
+        raise RuntimeError("PERMISSION_DENIED")
+
+    monkeypatch.setattr("server.lifecycle._databricks_api", refuse)
+
+    lifecycle._delete_secret_scope(make_manifest())
+    lines = lifecycle._secret_scope_survivor_lines(make_manifest())
+
+    out = capsys.readouterr().out
+    assert f"WARN  secret scope {SCOPE} was not deleted" in out
+    assert f"databricks secrets delete-scope {SCOPE}" in out
+    assert any("could not be asked" in line for line in lines)
+
+
+def test_cleanup_deletes_the_scope_after_everything_that_bills() -> None:
+    import inspect
+
+    source = inspect.getsource(lifecycle.cleanup)
+    scope = source.index("_delete_secret_scope(manifest)")
+    assert source.index("_delete_databricks_app(manifest)") < scope
+    assert source.index("_terraform_apply(manifest, destroy_plan)") < scope
+    assert source.index('"delete-project"') < scope
+    assert "_secret_scope_survivor_lines(manifest)" in source
 
 
 def test_a_pipeline_that_outlived_its_synced_table_is_deleted_not_assumed_gone(

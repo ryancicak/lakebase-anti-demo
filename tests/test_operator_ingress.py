@@ -1016,3 +1016,123 @@ def test_the_doctor_line_reports_a_failed_probe_rather_than_passing(monkeypatch)
 
     assert check.ok is False
     assert "no route to host" in check.detail
+
+
+# --------------------------------------------------------------------------
+# Finding the operator address when an echo is blocked (2026-09-26)
+# --------------------------------------------------------------------------
+
+#: A declared address has to be globally routable, and a routable literal is
+#: what tests/test_no_live_identifiers_committed.py refuses to see published, so
+#: this one is assembled the way that file assembles its own. Invented.
+DECLARED_PUBLIC_IP = ".".join(("45", "45", "45", "45"))
+
+
+class _Echo:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def read(self, limit: int) -> bytes:
+        return self.body[:limit]
+
+    def __enter__(self) -> _Echo:
+        return self
+
+    def __exit__(self, *unused: object) -> None:
+        return None
+
+
+def _echoes(monkeypatch: pytest.MonkeyPatch, answers: dict[str, object]) -> list[str]:
+    asked: list[str] = []
+
+    def urlopen(url: str, timeout: float):
+        asked.append(url)
+        answer = answers[url]
+        if isinstance(answer, BaseException):
+            raise answer
+        return _Echo(answer)
+
+    monkeypatch.setattr(lifecycle.urllib.request, "urlopen", urlopen)
+    monkeypatch.delenv(lifecycle.OPERATOR_IP_ENV, raising=False)
+    return asked
+
+
+def test_a_blocked_first_echo_falls_through_to_the_next(monkeypatch) -> None:
+    """A filtered network timed out on checkip.amazonaws.com and stopped the install."""
+
+    first, second, _third = lifecycle.OPERATOR_IP_ENDPOINTS
+    asked = _echoes(monkeypatch, {first: TimeoutError(), second: b"198.51.100.24\n"})
+
+    assert lifecycle.detect_operator_cidr() == "198.51.100.24/32"
+    assert asked == [first, second]
+
+
+def test_every_echo_is_https() -> None:
+    assert lifecycle.OPERATOR_IP_ENDPOINTS
+    assert all(url.startswith("https://") for url in lifecycle.OPERATOR_IP_ENDPOINTS)
+
+
+def test_the_explicit_address_wins_without_asking_anyone(monkeypatch) -> None:
+    asked = _echoes(monkeypatch, {})
+    monkeypatch.setenv(lifecycle.OPERATOR_IP_ENV, DECLARED_PUBLIC_IP)
+
+    assert lifecycle.detect_operator_cidr() == f"{DECLARED_PUBLIC_IP}/32"
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    "value", ["10.0.0.5", "192.168.1.20", "198.51.100.24", "2001:db8::1", "999.1.1.1", "my-laptop"]
+)
+def test_a_private_or_ipv6_explicit_address_is_refused(monkeypatch, value) -> None:
+    _echoes(monkeypatch, {})
+    monkeypatch.setenv(lifecycle.OPERATOR_IP_ENV, value)
+
+    with pytest.raises(RuntimeError, match=lifecycle.OPERATOR_IP_ENV):
+        lifecycle.detect_operator_cidr()
+
+
+def test_every_echo_failing_still_reads_as_could_not_tell(monkeypatch) -> None:
+    """The drift probe maps OSError and TimeoutError to unknown; keep that contract."""
+
+    _echoes(monkeypatch, {url: OSError("blocked") for url in lifecycle.OPERATOR_IP_ENDPOINTS})
+
+    with pytest.raises(OSError, match="blocked"):
+        lifecycle.detect_operator_cidr()
+
+
+def test_an_ipv6_only_network_still_names_the_ipv4_requirement(monkeypatch) -> None:
+    _echoes(
+        monkeypatch,
+        {url: b"2001:db8::7" for url in lifecycle.OPERATOR_IP_ENDPOINTS},
+    )
+
+    with pytest.raises(RuntimeError, match="IPv4"):
+        lifecycle.detect_operator_cidr()
+
+
+def test_a_mutator_that_cannot_find_the_address_names_the_override(monkeypatch) -> None:
+    _echoes(monkeypatch, {url: OSError("blocked") for url in lifecycle.OPERATOR_IP_ENDPOINTS})
+
+    with pytest.raises(RuntimeError, match=lifecycle.OPERATOR_IP_ENV):
+        lifecycle._require_operator_cidr()
+
+
+def test_a_mistyped_explicit_address_is_not_blamed_on_the_echoes(monkeypatch) -> None:
+    """'Could not detect ... set ANTI_DEMO_OPERATOR_IP' is wrong advice to someone who did."""
+
+    asked = _echoes(monkeypatch, {})
+    monkeypatch.setenv(lifecycle.OPERATOR_IP_ENV, "999.1.1.1")
+
+    with pytest.raises(RuntimeError, match="999.1.1.1 is not a public IPv4 address"):
+        lifecycle._require_operator_cidr()
+    assert asked == []
+
+
+def test_the_doctor_line_says_when_the_address_was_declared(monkeypatch) -> None:
+    monkeypatch.setattr(lifecycle, "detect_operator_cidr", lambda **_kwargs: SEALED)
+    monkeypatch.setenv(lifecycle.OPERATOR_IP_ENV, SEALED.removesuffix("/32"))
+
+    check = lifecycle._operator_cidr_check(make_manifest())
+
+    assert check.ok is True
+    assert f"(from {lifecycle.OPERATOR_IP_ENV})" in check.detail
