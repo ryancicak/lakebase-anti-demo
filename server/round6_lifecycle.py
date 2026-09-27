@@ -1466,7 +1466,15 @@ def cleanup_round6(
     if not ok and not forcing:
         if dry_run:
             return _round6_cleanup_report(manifest, detail, findings)
-        raise RuntimeError(f"Cleanup refused: {detail}")
+        # Name the way out: an installation whose earlier cleanup removed part
+        # of Round 6 before failing later refuses here on every retry, and the
+        # sanctioned override was written for exactly that.
+        sentence = detail if detail.rstrip().endswith((".", "!", "?")) else f"{detail}."
+        raise RuntimeError(
+            f"Cleanup refused: {sentence} If an earlier cleanup already removed part of "
+            f"Round 6, run it again with --force-round6 {manifest.run_id}: that prints "
+            "everything it will destroy first, and every ownership check still applies."
+        )
     if not forcing and dry_run:
         return ()
     workspace = workspace or _workspace(manifest)
