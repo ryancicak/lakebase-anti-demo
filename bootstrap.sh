@@ -739,8 +739,8 @@ refuse_ready_install() { # <run id, possibly empty> [what is left of it] [what t
   if [[ -n "${2:-}" ]]; then
     left="
        What is left of it, read just now:
-$2
-${3:-}
+$2${3:+
+$3}
 "
   fi
   die "installation ${1:-} is already 'ready', and --apply is not a resume of it.
