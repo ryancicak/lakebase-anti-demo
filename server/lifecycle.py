@@ -8009,6 +8009,37 @@ async def _retire_round5_shared_resident_login(
     )
 
 
+def _published_resident_password(secrets_manager: Any, secret_arn: str, role: str) -> str | None:
+    """The password already published for one lane's resident login, or None.
+
+    The resident agent reads its control DSN once, when it starts, and keeps it
+    for the life of the process (`runner/connection_spike_runner.py`). Every
+    Round 5 preparation restarts the agent *before* it calls
+    `ensure_coordination`, and `reset` calls it without restarting the agent at
+    all. So minting a new password on every call left a running agent holding a
+    password its role no longer had: every control message failed with
+    `RESIDENT_CONTROL_TRANSIENT:OperationalError`, Round 5 warmed until it gave
+    up, and only `antidemo runner refresh` brought it back. That is what a
+    resumed install did on 2026-09-27, and what `setup` on a ready install and
+    `renew` would do too.
+
+    So the published password is kept, and re-applying it keeps the role and
+    the running agent in agreement. Only a secret that is missing, unreadable,
+    malformed or bound to another role gets a new one -- the first publication,
+    or a repair.
+    """
+    try:
+        value = str(secrets_manager.get_secret_value(SecretId=secret_arn).get("SecretString") or "")
+    except ClientError:
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"postgresql", "postgres"}:
+        return None
+    if unquote(parsed.username or "") != role or not parsed.password:
+        return None
+    return unquote(parsed.password)
+
+
 def _round5_resident_dsn(
     *,
     host: str,
@@ -9009,9 +9040,25 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
                 "lakebase": f"anti_demo_r5_lakebase_{installation_digest}",
                 "competitor": f"anti_demo_r5_competitor_{installation_digest}",
             }
-            resident_passwords = {
-                lane_id: secrets.token_urlsafe(48) for lane_id in resident_roles
+            secret_arns = {
+                "lakebase": resources.runner_control_secret_arn,
+                "competitor": resources.competitor_runner_control_secret_arn,
             }
+            if any(not value for value in secret_arns.values()):
+                raise RuntimeError("Round 5 lane-scoped resident event DSN secrets are not sealed")
+            secrets_manager = _aws_session(manifest).client("secretsmanager")
+            # The published password is re-applied rather than replaced; see
+            # `_published_resident_password` for the outage minting a new one
+            # on every call caused.
+            resident_passwords: dict[str, str] = {}
+            for lane_id, role in resident_roles.items():
+                published = await asyncio.to_thread(
+                    _published_resident_password,
+                    secrets_manager,
+                    str(secret_arns[lane_id]),
+                    role,
+                )
+                resident_passwords[lane_id] = published or secrets.token_urlsafe(48)
 
             async def rotate_resident_login(cursor: Any) -> None:
                 for lane_id, role in resident_roles.items():
@@ -9029,13 +9076,6 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
                 )
 
             await store._run(rotate_resident_login)
-            secret_arns = {
-                "lakebase": resources.runner_control_secret_arn,
-                "competitor": resources.competitor_runner_control_secret_arn,
-            }
-            if any(not value for value in secret_arns.values()):
-                raise RuntimeError("Round 5 lane-scoped resident event DSN secrets are not sealed")
-            secrets_manager = _aws_session(manifest).client("secretsmanager")
             for lane_id, role in resident_roles.items():
                 resident_dsn = _round5_resident_dsn(
                     host=host,
