@@ -847,8 +847,8 @@ $summary"
        Its workspace, $workspace, no longer exists, but part of its AWS side is still
        there, and still billing. './antidemo cleanup' cannot remove it: it proves the
        workspace identity before it touches anything, and that workspace is gone.
-       Every resource it left is tagged anti-demo-run-id=$run. Delete those in the
-       AWS console, or leave them to the account's own sweep, then run this again."
+       What it left is tagged anti-demo-run-id=$run. Delete that in the AWS console,
+       or leave it to the account's own sweep, then run this again."
       else
         refuse_ready_install "$run" "$summary" "
        Part of it was deleted -- by a sandbox reaper, say -- and part of it is still
