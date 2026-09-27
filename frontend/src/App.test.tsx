@@ -5,6 +5,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { ApiError, api } from './api/client'
+import { APP_VERSION_LABEL } from './version'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
 import {
   getCanvasRecordings,
@@ -6313,6 +6314,15 @@ describe('the staff roll entry points', () => {
     vi.unstubAllGlobals()
     window.localStorage.clear()
     window.history.replaceState({}, '', '/')
+  })
+
+  it('shows which release is running on the title screen', () => {
+    const { container } = render(<App />)
+
+    // The first screen anyone sees, so a running app always says what it is.
+    const stamp = container.querySelector('.title-cartridge > .title-version')
+    expect(stamp).toHaveTextContent(APP_VERSION_LABEL)
+    expect(APP_VERSION_LABEL).toMatch(/^v\d+\.\d+\.\d+$/)
   })
 
   it('bills the title-screen entry as a staff roll, never as arcade credits', () => {

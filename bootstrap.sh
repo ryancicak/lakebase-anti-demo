@@ -3451,6 +3451,33 @@ else
   die "databricks sync failed: $(printf '%s' "$OUT" | tail -3)"
 fi
 
+# Which commit this deploy is, for the app's /api/version (server/version.py).
+# The release number cannot tell two builds of one release apart -- the fixes
+# between tags -- and only this step knows which tree it just shipped. Written
+# into the workspace copy and never into the local tree, so a checkout can never
+# carry a stale stamp; `databricks sync` leaves a file it did not upload alone.
+# Best effort: a deploy that cannot stamp is still a correct deploy.
+BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || true)"
+if [[ "$BUILD_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  BUILD_DIRTY=false
+  [[ -n "$(git status --porcelain --untracked-files=no 2>/dev/null)" ]] && BUILD_DIRTY=true
+  BUILD_INFO_FILE="$(mktemp)"
+  jq -n --arg commit "$BUILD_COMMIT" --argjson dirty "$BUILD_DIRTY" \
+    --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{commit: $commit, dirty: $dirty, deployed_at: $deployed_at}' >"$BUILD_INFO_FILE"
+  if databricks workspace import "$WORKSPACE_SRC/build-info.json" --file "$BUILD_INFO_FILE" \
+    --format AUTO --overwrite "${DATABRICKS_ARGS[@]}" >/dev/null 2>&1; then
+    BUILD_NOTE=""
+    [[ "$BUILD_DIRTY" == true ]] && BUILD_NOTE=", with uncommitted changes"
+    ok "stamped build ${BUILD_COMMIT:0:12}$BUILD_NOTE for /api/version"
+  else
+    warn "could not stamp the build commit; /api/version will name the release without it"
+  fi
+  rm -f "$BUILD_INFO_FILE"
+else
+  info "not a git checkout, so /api/version will name the release without a commit"
+fi
+
 # That frontend/dist exists locally says nothing about whether it reached the
 # workspace, and the workspace copy is what the container runs. Ask the
 # workspace directly rather than reading the sync output: sync is incremental

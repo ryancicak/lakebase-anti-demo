@@ -41,6 +41,7 @@ import { CREDITS_THEME_BELL_SECONDS } from './credits-score'
 import { useReducedMotion } from './hooks/useReducedMotion'
 import type { CreditsTally } from './credits-tally'
 import type { CompetitorDefinition } from './api/types'
+import { APP_VERSION_LABEL } from './version'
 import './credits.css'
 /* The authorship card and the held outro are styled here, not in credits.css.
    Both sheets are hand-authored and they split the roll between them:
@@ -434,7 +435,7 @@ export function Credits({
           <Block kicker="No stunt doubles">
             <Name role="Application and verifier" name="FastAPI · React · psycopg 3" />
             <Name role="Owned environment" name="Terraform · AWS SDK · Databricks SDK" />
-            <Name role="Neutral burst runner" name="SSM-managed m6i.large" />
+            <Name role="Neutral burst runners" name="SSM-managed c7i.2xlarge, one per lane" />
             <Name role="Ring lease" name="Fenced Lakebase coordination branch" />
           </Block>
 
@@ -517,6 +518,7 @@ export function Credits({
             <span aria-hidden="true" />
           </p>
           <em className="credits-outro-tagline">The Anti-Demo</em>
+          <small className="credits-outro-version">{APP_VERSION_LABEL}</small>
         </div>
       )}
       {/* The exit. `B · BACK` matches the app's own arcade prompt convention.
@@ -539,6 +541,10 @@ function CreditsTitle({ tally }: { tally: CreditsTally }) {
       <img className="credits-ring" src={brandAssets.headerRing} alt="" />
       <strong>Lakebase</strong>
       <em>The Anti-Demo</em>
+      {/* Which release, on the title beat rather than after the author card
+          the roll closes on. Here the roll carries it on its own: under reduced
+          motion the held card, which repeats it, is never shown. */}
+      <small className="credits-version">{APP_VERSION_LABEL}</small>
       <p>
         {tally.bouts === 0
           ? 'No bout completed on this card'

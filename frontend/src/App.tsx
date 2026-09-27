@@ -31,6 +31,7 @@ import {
   stopOriginalTitleTheme,
 } from './audio'
 import { CreditsButton, type CreditsEntry } from './credits-entry'
+import { APP_VERSION_LABEL } from './version'
 import { creditsTally } from './credits-tally'
 import { brandAssets, personaPortraits } from './assets'
 import { useAccessibleDialog } from './hooks/useAccessibleDialog'
@@ -4836,6 +4837,9 @@ function TitleScreen({
             coin counter (CREDITS 00 / INSERT COIN), so the old wording read as a
             balance rather than a control. Staff roll is the era's own term for
             the sequence and cannot be misread here. */}
+        {/* Which release is on the screen. Stencilled in the frame gutter
+            opposite nothing, so it can never cover a control. */}
+        <p className="title-version">{APP_VERSION_LABEL}</p>
         <CreditsButton entry={credits} className="credits-entry title-credits">
           Staff roll
         </CreditsButton>

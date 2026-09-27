@@ -1132,6 +1132,24 @@ case_deploy_happy() {
   fi
   check "binds resources" "app resources bound to scope"
   check "syncs source" "source synced"
+  # Which commit this is, for /api/version (server/version.py): written into the
+  # workspace copy after the sync, never into the local tree.
+  check "stamps the deployed commit for /api/version" "for /api/version"
+  if grep -Eq 'workspace import /Workspace/.*/build-info\.json --file .* --format AUTO --overwrite' \
+    "$sb/databricks-calls.log" 2>/dev/null; then
+    printf '  %sok%s   the stamp went to the workspace copy of the source\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s no build-info.json import in the workspace\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  fi
+  if [[ -e build-info.json ]]; then
+    printf '  %sFAIL%s the stamp landed in the local working tree\n' "$RED" "$RESET"
+    FAIL=$((FAIL + 1))
+  else
+    printf '  %sok%s   the local working tree carries no stamp\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  fi
   check "deploys" "deployment accepted"
   check "restarts" "restart requested"
   check "verifies startup" "compute ACTIVE, deployment SUCCEEDED"

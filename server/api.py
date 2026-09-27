@@ -42,6 +42,7 @@ from .models import (
 )
 from .receipts import ReceiptsResponse, current_installation, load_receipts_async
 from .reconcile import presence_from_report
+from .version import build_info
 
 SESSION_STREAM_ROTATE_SECONDS = 240.0
 
@@ -182,6 +183,17 @@ async def _control_operation(
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "database_connections": "sealed"}
+
+
+@router.get("/version")
+async def version() -> dict[str, object]:
+    """Which release is running, and from which commit when a deploy recorded it.
+
+    A separate route rather than a field on /health: `antidemo` and bootstrap.sh
+    compare the health payload exactly, and it is the wrong place to change.
+    """
+
+    return build_info()
 
 
 def _availability_signals(request: Request) -> round_availability.AvailabilitySignals:
