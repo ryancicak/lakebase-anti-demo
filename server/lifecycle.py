@@ -9413,6 +9413,48 @@ def _write_round5_clean_receipt(manifest: DemoManifest) -> Path:
     return receipt
 
 
+#: Written beside the manifest once a real cleanup has torn Round 6 down. A retry
+#: of that cleanup after a later step failed -- 2026-09-27: the Round 3 reset,
+#: after Round 6 had gone -- would otherwise re-verify a seal whose objects it had
+#: deleted, and refuse on their absence for ever.
+ROUND6_CLEAN_RECEIPT_NAME = "round6-clean-receipt.json"
+
+
+def _round6_already_cleaned(manifest: DemoManifest) -> bool:
+    """Whether an earlier cleanup of this installation finished Round 6's teardown."""
+
+    sealed = manifest.round6
+    if sealed is None:
+        return False
+    record = _read_json_object(manifest_path().parent / ROUND6_CLEAN_RECEIPT_NAME) or {}
+    return (
+        record.get("run_id") == manifest.run_id
+        and record.get("cdf_config_name") == sealed.cdf_config_name
+    )
+
+
+def _write_round6_clean_receipt(manifest: DemoManifest) -> None:
+    sealed = manifest.round6
+    if sealed is None:
+        return
+    receipt = manifest_path().parent / ROUND6_CLEAN_RECEIPT_NAME
+    temporary = receipt.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "run_id": manifest.run_id,
+                "cdf_config_name": sealed.cdf_config_name,
+                "cleaned_at": datetime.now(UTC).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, receipt)
+
+
 async def wait_for_scale_zero(manifest: DemoManifest, timeout_seconds: float) -> None:
     apply_manifest_environment(manifest)
     targets = (LakebaseCredentialProvider(), AuroraCredentialProvider())
@@ -12952,8 +12994,20 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         # 4/schema/project deletion because the CDF config still refers to its
         # source and destination schemas. A dry run reports a seal mismatch here
         # instead of raising, so a drifted environment stays inspectable.
-        for finding in cleanup_round6(manifest, dry_run=dry_run, force_token=force_round6):
-            print(finding, flush=True)
+        if _round6_already_cleaned(manifest):
+            # A retry after a later step failed. Round 6 was verified and torn
+            # down by that earlier run, so its absence now is the teardown, not
+            # drift, and re-verifying would refuse on the objects it deleted.
+            print(
+                f"ALREADY Round 6 was removed by an earlier cleanup of {manifest.run_id} "
+                f"({ROUND6_CLEAN_RECEIPT_NAME})",
+                flush=True,
+            )
+        else:
+            for finding in cleanup_round6(manifest, dry_run=dry_run, force_token=force_round6):
+                print(finding, flush=True)
+            if not dry_run:
+                _write_round6_clean_receipt(manifest)
         if complete_baseline:
             _require_round5_clean_baseline(manifest)
         if dry_run:

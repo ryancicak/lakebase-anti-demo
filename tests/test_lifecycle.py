@@ -5648,10 +5648,73 @@ def test_cleanup_still_refuses_the_same_drifted_round6_for_real(
         cleanup(dry_run=False)
 
     assert str(refusal.value) == (
-        "Cleanup refused: Round 6 endpoint identity or scale-to-zero contract changed"
+        "Cleanup refused: Round 6 endpoint identity or scale-to-zero contract changed. "
+        "If an earlier cleanup already removed part of Round 6, run it again with "
+        f"--force-round6 {manifest.run_id}: that prints everything it will destroy first, "
+        "and every ownership check still applies."
     )
     assert manifest.status == "cleanup_failed"
     assert json.loads(isolated_lifecycle_manifest.read_text())["status"] == "cleanup_failed"
+
+
+def test_a_cleanup_retry_skips_the_round6_an_earlier_run_tore_down(
+    monkeypatch, tmp_path, isolated_lifecycle_manifest, capsys
+) -> None:
+    """2026-09-27: an uninstall removed Round 6, then failed on a later step, and
+    every retry refused on the absence of what it had itself deleted."""
+
+    manifest = _stub_round6_drifted_cleanup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "server.lifecycle.reconcile_live", lambda candidate, factory: reconcile(candidate, ())
+    )
+    (isolated_lifecycle_manifest.parent / lifecycle.ROUND6_CLEAN_RECEIPT_NAME).write_text(
+        json.dumps(
+            {"run_id": manifest.run_id, "cdf_config_name": manifest.round6.cdf_config_name}
+        )
+    )
+    monkeypatch.setattr(
+        "server.round6_lifecycle.cleanup_round6",
+        lambda *args, **kwargs: pytest.fail("a torn-down Round 6 must not be re-verified"),
+    )
+
+    try:
+        cleanup(dry_run=False)
+    except RuntimeError as later:
+        assert "Round 6" not in str(later)
+    assert "ALREADY Round 6 was removed by an earlier cleanup" in capsys.readouterr().out
+
+
+def test_a_round6_teardown_is_recorded_even_when_a_later_step_fails(
+    monkeypatch, tmp_path, isolated_lifecycle_manifest
+) -> None:
+    manifest = _stub_round6_drifted_cleanup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "server.lifecycle.reconcile_live", lambda candidate, factory: reconcile(candidate, ())
+    )
+    monkeypatch.setattr("server.round6_lifecycle.cleanup_round6", lambda *args, **kwargs: ())
+
+    # A step after Round 6 fails in this stubbed account (its app cannot be asked
+    # about), which is the 2026-09-27 shape: Round 6 gone, the cleanup refused later.
+    with pytest.raises(RuntimeError) as later:
+        cleanup(dry_run=False)
+    assert "Round 6" not in str(later.value)
+
+    receipt = json.loads(
+        (isolated_lifecycle_manifest.parent / lifecycle.ROUND6_CLEAN_RECEIPT_NAME).read_text()
+    )
+    assert receipt["run_id"] == manifest.run_id
+    assert lifecycle._round6_already_cleaned(manifest)
+
+
+def test_a_round6_receipt_from_another_run_is_not_honored(
+    monkeypatch, tmp_path, isolated_lifecycle_manifest
+) -> None:
+    manifest = _stub_round6_drifted_cleanup(monkeypatch, tmp_path)
+    (isolated_lifecycle_manifest.parent / lifecycle.ROUND6_CLEAN_RECEIPT_NAME).write_text(
+        json.dumps({"run_id": "ad-someone-else", "cdf_config_name": "x"})
+    )
+
+    assert not lifecycle._round6_already_cleaned(manifest)
 
 
 def _stub_refusable_cleanup(monkeypatch, manifest, reconciliation, *, addresses=frozenset()):

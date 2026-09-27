@@ -561,7 +561,10 @@ def test_real_cleanup_still_refuses_the_same_drifted_endpoint(tmp_path) -> None:
         cleanup_round6(manifest, dry_run=False, workspace=workspace)
 
     assert str(refusal.value) == (
-        "Cleanup refused: Round 6 endpoint identity or scale-to-zero contract changed"
+        "Cleanup refused: Round 6 endpoint identity or scale-to-zero contract changed. "
+        "If an earlier cleanup already removed part of Round 6, run it again with "
+        f"--force-round6 {manifest.run_id}: that prints everything it will destroy first, "
+        "and every ownership check still applies."
     )
     assert deletions == []
 
@@ -987,7 +990,10 @@ def test_an_absent_flag_leaves_the_seal_check_exactly_as_it_was(tmp_path) -> Non
         with pytest.raises(RuntimeError) as refusal:
             cleanup_round6(manifest, dry_run=False, workspace=workspace, force_token=empty)
         assert str(refusal.value) == (
-            "Cleanup refused: Round 6 endpoint identity or scale-to-zero contract changed"
+            "Cleanup refused: Round 6 endpoint identity or scale-to-zero contract changed. "
+            "If an earlier cleanup already removed part of Round 6, run it again with "
+            f"--force-round6 {manifest.run_id}: that prints everything it will destroy "
+            "first, and every ownership check still applies."
         )
     assert deletions == []
 
