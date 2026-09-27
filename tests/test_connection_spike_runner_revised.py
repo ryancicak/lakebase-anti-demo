@@ -953,6 +953,21 @@ async def test_revised_aws_gate_reuses_source_password_and_keeps_receipt_secret_
     }
     assert stored["password"] not in json.dumps(result)
 
+    # A re-seal re-asserts against an idle installation, where Aurora sits at
+    # scale zero: its first connection lands in the automatic-resume window. It
+    # retries that restart race exactly as the first seal does; RDS does not.
+    retried: dict[str, object] = {}
+
+    async def configure(admin, ordinary, **kwargs):
+        del admin, ordinary
+        retried.update(kwargs)
+
+    with monkeypatch.context() as reassert_patch:
+        reassert_patch.setattr(runner, "_configure_ordinary_role", configure)
+        await runner._execute_setup(decoded)
+    assert retried["create_if_missing"] is False
+    assert retried["retry_transient_restart"] is (setup_lane_id == "aurora")
+
     restart_connections = []
     retry_delays: list[float] = []
 
