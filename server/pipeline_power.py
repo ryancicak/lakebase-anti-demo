@@ -329,6 +329,17 @@ class PipelineUpdateConflictError(PipelinePowerError):
     """A conflicting pipeline update could not be proven safe to join."""
 
 
+class PipelineUpdateStoppingError(PipelineUpdateConflictError):
+    """The conflicting update is being stopped, so it can only end CANCELED.
+
+    A stop returns before its update has finished stopping, so a start issued in
+    that window (an immediate re-arm after a towel) meets a conflict whose active
+    update is STOPPING. Joining it waited on a run that could never come up and
+    failed the arm as "start failed in the control plane". The caller waits for
+    the stop to finish and starts again.
+    """
+
+
 def owed_stop_sentence(owed_since: str) -> str:
     """The one sentence every surface says about a stop that was owed and lost.
 
@@ -1160,6 +1171,10 @@ def _adopt_exact_active_update(
         raise PipelineUpdateConflictError(
             "The conflicting Round 4 update is not an identifiable active update"
         )
+    if update_state == "STOPPING":
+        raise PipelineUpdateStoppingError(
+            "The conflicting Round 4 update is still stopping; start again once it has stopped"
+        )
     detail = api(
         profile,
         "get",
@@ -1174,6 +1189,10 @@ def _adopt_exact_active_update(
             "The active Round 4 update omitted its exact update contract"
         )
     detail_state = str(update.get("state") or "").strip().upper()
+    if detail_state == "STOPPING":
+        raise PipelineUpdateStoppingError(
+            "The conflicting Round 4 update is still stopping; start again once it has stopped"
+        )
     if (
         update.get("pipeline_id") != pipeline_id
         or update.get("update_id") != update_id

@@ -1273,12 +1273,28 @@ class Round4PipelineActivation:
             self._persist(record)
 
         full_refresh = self._full_refresh_required
-        requested = pipeline_power.start(
-            self._manifest,
-            self._api,
-            full_refresh=full_refresh,
-            on_record=remember,
-        )
+        # A towel's stop (or the idle release) returns while its update is still
+        # STOPPING. Starting inside that window met a conflict, joined the dying
+        # update, and failed the arm as "start failed in the control plane" (live
+        # 2026-09-26: an immediate Round 4 re-arm after a towel). Let the stop
+        # finish, then ask for a fresh update; a stop that lands between the check
+        # and the request is waited out the same way.
+        await self._await_update_not_stopping(signals, notify)
+        attempts = 0
+        while True:
+            try:
+                requested = pipeline_power.start(
+                    self._manifest,
+                    self._api,
+                    full_refresh=full_refresh,
+                    on_record=remember,
+                )
+                break
+            except pipeline_power.PipelineUpdateStoppingError:
+                attempts += 1
+                if attempts >= 3:
+                    raise
+                await self._await_update_not_stopping(await self._read_signals(), notify)
         # A refused/conflicting request made no rebase happen. Keep the request
         # latched so a later retry cannot silently downgrade a required full
         # refresh to an ordinary resume.
@@ -1335,6 +1351,30 @@ class Round4PipelineActivation:
             "arm rather than measure a pipeline that is still coming up. Check "
             "'antidemo pipeline status'."
         )
+
+    async def _await_update_not_stopping(
+        self,
+        signals: PipelineSignals,
+        notify: Callable[[str], Awaitable[None]],
+    ) -> PipelineSignals:
+        """Return once the newest update is no longer STOPPING, within the start budget."""
+
+        deadline = self._clock() + self._wait_timeout_seconds
+        while signals.update_state.strip().upper() == "STOPPING":
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                raise ModelScoreLiveOperationError(
+                    "The previous Managed Sync update did not finish stopping within "
+                    f"{self._wait_timeout_seconds:.0f}s, so Round 4 cannot start a new one "
+                    "yet. Check 'antidemo pipeline status'."
+                )
+            await notify(
+                "Waiting for the previous Managed Sync run to finish stopping "
+                f"({int(remaining)}s left before this arm gives up)."
+            )
+            await self._sleep(self._poll_seconds)
+            signals = await self._read_signals()
+        return signals
 
     async def release_now(self) -> None:
         """Give the pipeline back at once, for a bout that left no redo behind.
