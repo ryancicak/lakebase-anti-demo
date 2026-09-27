@@ -268,6 +268,8 @@ class ModelScoreEngine:
         read_timeout_seconds: float = 30.0,
         progress_timeout_seconds: float = 2.0,
         max_status_age_seconds: float = 30.0,
+        arm_catch_up_seconds: float = 0.0,
+        arm_catch_up_poll_seconds: float = 2.0,
         clock_ns: Callable[[], int] = time.monotonic_ns,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -275,6 +277,8 @@ class ModelScoreEngine:
     ) -> None:
         if max_poll_attempts < 1:
             raise ValueError("max_poll_attempts must be at least one")
+        if arm_catch_up_seconds < 0 or arm_catch_up_poll_seconds < 0:
+            raise ValueError("the arm catch-up bound and its poll cannot be negative")
         if poll_interval_seconds < 0:
             raise ValueError("poll_interval_seconds cannot be negative")
         if inspect_timeout_seconds <= 0:
@@ -296,6 +300,8 @@ class ModelScoreEngine:
         self.read_timeout_seconds = read_timeout_seconds
         self.progress_timeout_seconds = progress_timeout_seconds
         self.max_status_age_seconds = max_status_age_seconds
+        self.arm_catch_up_seconds = arm_catch_up_seconds
+        self.arm_catch_up_poll_seconds = arm_catch_up_poll_seconds
         self._clock_ns = clock_ns
         self._now = now
         self._sleep = sleep
@@ -474,9 +480,7 @@ class ModelScoreEngine:
                 )
         await self._ensure_pipeline_running(on_progress)
         await self._emit(on_progress, ModelScorePhase.PREFLIGHT, "Inspecting Managed Sync")
-        status = await self._inspect_sync_for_arm()
-        self._validate_contract_status(status, arming=True)
-        self._validate_caught_up_baseline(status)
+        status = await self._await_arm_status(on_progress)
 
         source = await self._read_source(
             self.contract.entity_id,
@@ -991,6 +995,65 @@ class ModelScoreEngine:
             raise ModelScoreTimeoutError(
                 "Managed Sync inspection exceeded its wall-clock bound"
             ) from exc
+
+    async def _await_arm_status(
+        self, on_progress: ProgressCallback | None
+    ) -> ManagedSyncStatus:
+        """The first status a just-started pipeline can be armed on, within a bound.
+
+        An arm right after a settle meets a pipeline that was just stopped and is
+        starting again. On 2026-09-27 two such arms were refused within 36
+        seconds: one while the restarted pipeline had not yet published its
+        continuous status, one while it was still processing the last Delta
+        version. Each would have armed seconds later. So those two shapes are
+        waited out, visibly, for up to `arm_catch_up_seconds`. That wait comes out
+        of the operator's patience before the bell and never out of the
+        measurement (see `_ensure_pipeline_running`).
+
+        The validators are unchanged: only a status that passes them is ever
+        returned. Anything other than those two shapes -- identity, CDF,
+        continuity, staleness, health -- still refuses at once. With a zero
+        bound this is exactly the old single inspection.
+        """
+
+        if self.arm_catch_up_seconds <= 0:
+            # Not even a clock read: the proof clock is the bout's own, and a test
+            # of it asserts nothing touches it before the bell.
+            status = await self._inspect_sync_for_arm()
+            self._validate_contract_status(status, arming=True)
+            self._validate_caught_up_baseline(status)
+            return status
+        deadline_ns = self._clock_ns() + int(self.arm_catch_up_seconds * 1_000_000_000)
+        announced = False
+        while True:
+            status: ManagedSyncStatus | None
+            try:
+                status = await self._inspect_sync_for_arm()
+            except ModelScoreError:
+                if self._clock_ns() >= deadline_ns:
+                    raise
+                status = None
+            if status is not None:
+                self._validate_contract_status(status, arming=True)
+                if self._is_caught_up(status) or self._clock_ns() >= deadline_ns:
+                    self._validate_caught_up_baseline(status)
+                    return status
+            if not announced:
+                announced = True
+                await self._emit(
+                    on_progress,
+                    ModelScorePhase.PREFLIGHT,
+                    "Waiting for Managed Sync to catch up after its restart",
+                )
+            await self._sleep(self.arm_catch_up_poll_seconds)
+
+    @staticmethod
+    def _is_caught_up(status: ManagedSyncStatus) -> bool:
+        return status.sync_end_time is not None and (
+            status.source_version
+            == status.last_processed_version
+            == status.last_sync_delta_version
+        )
 
     async def _inspect_sync_for_arm(self) -> ManagedSyncStatus:
         """Fence transient provider projections before validating the arm.
