@@ -12,17 +12,19 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 import boto3
@@ -1079,6 +1081,135 @@ def installation_presence_check(manifest: DemoManifest | None = None) -> Check:
     if presence.state == PRESENCE_UNVERIFIED:
         return Check("installation_presence", True, presence.detail, advisory=True)
     return Check("installation_presence", True, presence.detail)
+
+
+class _ForeignAccountKeys(RuntimeError):
+    """The AWS keys in hand belong to an account other than the sealed one."""
+
+
+def _presence_session(manifest: DemoManifest) -> boto3.Session:
+    """`_aws_session`, except where an account sweep has deleted the runtime role.
+
+    Read-only callers only. A reaped installation is exactly the one whose sealed
+    role is gone, and without this its remnants could not even be counted: every
+    AWS read would fail on the AssumeRole. The source principal is used only on
+    IAM's own word that the role does not exist, and only when it is in the sealed
+    account; any other refusal is re-raised.
+    """
+
+    try:
+        return _aws_session(manifest)
+    except ClientError:
+        role_arn = manifest.aws.runtime_role_arn
+        if role_arn is None:
+            raise
+        source = _aws_source_session(manifest)
+        # Keys from another account find no such role there either, and would
+        # then read every sealed resource as absent: a whole installation
+        # declared gone by looking for it in the wrong account.
+        identity = source.client("sts", region_name=manifest.aws.region).get_caller_identity()
+        account = str(identity.get("Account") or "")
+        if account != manifest.aws.account_id:
+            raise _ForeignAccountKeys(
+                f"the AWS keys are for account {account or 'unknown'}, "
+                f"not the sealed {manifest.aws.account_id}"
+            ) from None
+        try:
+            source.client("iam").get_role(RoleName=role_arn.rsplit("/", 1)[-1])
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                return source
+        raise
+
+
+def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any]:
+    """What is left of this installation in AWS and in its workspace. Read-only.
+
+    For a re-run of bootstrap.sh on a manifest that says `ready`: whether the
+    installation is really there, or whether a sandbox reaper has taken it. Each
+    part says `unverified` rather than guess when it cannot be read. `gone` is
+    true only when every sealed AWS resource and every sealed Lakebase project
+    was read and found absent -- the one state in which nothing is left to bill,
+    so installing afresh cannot orphan anything. The app is reported, not
+    counted: a directory that created it re-adopts it on the strength of its
+    bootstrap.json, and cleanup deletes it on the same proof.
+
+    A workspace that has itself been deleted cannot be asked about its projects,
+    so on the platform's own word that it is gone (`databricks_workspace_liveness`)
+    a project it cannot be asked about is counted absent -- still asked, so a
+    project that does answer is never hidden by that verdict.
+
+    Never raises.
+    """
+
+    try:
+        manifest = manifest or load_manifest()
+    except Exception as exc:
+        return {"gone": False, "error": f"the manifest could not be read ({type(exc).__name__})"}
+
+    aws: dict[str, Any]
+    try:
+        presence = presence_from_report(reconcile_live(manifest, _presence_session))
+        aws = {
+            "state": presence.state,
+            "sealed": presence.sealed,
+            "absent": presence.absent,
+            "reason": presence.reason,
+        }
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, _ForeignAccountKeys) else type(exc).__name__
+        aws = {"state": PRESENCE_UNVERIFIED, "sealed": 0, "absent": 0, "reason": reason}
+
+    host = _databricks_profile_host(manifest.databricks.profile)
+    workspace_state, workspace_reason = databricks_workspace_liveness(host)
+    workspace_gone = workspace_state == WORKSPACE_GONE
+
+    expected = absent = unreadable = 0
+    if manifest.round_environments is not None and manifest.coordination_lakebase is not None:
+        sealed_projects = [
+            environment.lakebase for environment in manifest.round_environments.values()
+        ]
+        sealed_projects.append(manifest.coordination_lakebase)
+        for sealed in sealed_projects:
+            expected += 1
+            try:
+                project = _get_lakebase_project_or_none(manifest, project_id=sealed.project_id)
+            except Exception:
+                if workspace_gone:
+                    absent += 1
+                else:
+                    unreadable += 1
+                continue
+            if project is None:
+                absent += 1
+    else:
+        # Only a v7 seal lists every project it owns; anything older is never
+        # declared gone on a count that could be incomplete.
+        unreadable = 1
+    lakebase = {"expected": expected, "absent": absent, "unreadable": unreadable}
+
+    app = _owned_app(manifest)
+    if app.unreadable and workspace_gone:
+        app_state = "absent"
+    else:
+        app_state = "unreadable" if app.unreadable else ("present" if app.present else "absent")
+
+    gone = (
+        aws["state"] == PRESENCE_MISSING
+        and aws["sealed"] > 0
+        and aws["absent"] == aws["sealed"]
+        and expected > 0
+        and absent == expected
+        and unreadable == 0
+    )
+    return {
+        "run_id": manifest.run_id,
+        "aws": aws,
+        "workspace": {"host": host, "state": workspace_state, "reason": workspace_reason},
+        "lakebase": lakebase,
+        "app": {"name": app.name, "state": app_state, "owned": app.owned},
+        "gone": gone,
+    }
 
 
 def _terraform_environment(manifest: DemoManifest) -> dict[str, str]:
@@ -3208,6 +3339,63 @@ def _databricks_profile_host(profile: str) -> str:
     return ""
 
 
+WORKSPACE_LIVE = "live"
+WORKSPACE_GONE = "gone"
+WORKSPACE_UNVERIFIED = "unverified"
+_WORKSPACE_DISCOVERY_PATH = "/oidc/.well-known/oauth-authorization-server"
+_WORKSPACE_UNKNOWN_MARKER = "unable to determine workspace context"
+#: Resolves whenever Databricks' own DNS answers, so a workspace name that does
+#: not resolve beside it has been removed, rather than this host being offline.
+_DATABRICKS_DNS_WITNESS = "accounts.cloud.databricks.com"
+
+
+def databricks_workspace_liveness(host: str, *, timeout: float = 15.0) -> tuple[str, str]:
+    """Whether `host` is a live Databricks workspace: ``(state, why)``.
+
+    Asked of the workspace's own front door, because the CLI cannot tell: it
+    words a deleted workspace exactly as it words a wrong secret ("cannot
+    configure default credentials"). A workspace deleted in September 2026 still
+    resolved, and its OAuth discovery answered HTTP 400 "Unable to determine
+    workspace context"; a name whose DNS record is gone does not resolve at all.
+    `gone` is returned on those two answers only, the second only while
+    Databricks' own DNS answers. Everything else is `unverified`, never `gone`.
+    Mirrored in bootstrap.sh:databricks_host_verdict.
+    """
+
+    hostname = urlsplit(host if "://" in host else f"https://{host}").hostname or ""
+    if not hostname:
+        return WORKSPACE_UNVERIFIED, "no workspace host is recorded for the sealed profile"
+    try:
+        socket.getaddrinfo(hostname, 443)
+    except socket.gaierror as error:
+        try:
+            socket.getaddrinfo(_DATABRICKS_DNS_WITNESS, 443)
+        except OSError:
+            return WORKSPACE_UNVERIFIED, f"{hostname} could not be looked up, nor could Databricks"
+        if error.errno != socket.EAI_NONAME:
+            return WORKSPACE_UNVERIFIED, f"{hostname} could not be looked up ({error.strerror})"
+        return WORKSPACE_GONE, f"{hostname} no longer resolves"
+    request = urllib.request.Request(
+        f"https://{hostname}{_WORKSPACE_DISCOVERY_PATH}", headers={"Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read(65536) or b"{}")
+    except urllib.error.HTTPError as error:
+        body = error.read(4096).decode("utf-8", "replace").casefold()
+        if _WORKSPACE_UNKNOWN_MARKER in body:
+            return (
+                WORKSPACE_GONE,
+                f"{hostname} answered HTTP {error.code}: Unable to determine workspace context",
+            )
+        return WORKSPACE_UNVERIFIED, f"{hostname} answered HTTP {error.code}"
+    except (OSError, ValueError) as error:
+        return WORKSPACE_UNVERIFIED, f"{hostname} could not be asked ({type(error).__name__})"
+    if isinstance(payload, dict) and payload.get("token_endpoint"):
+        return WORKSPACE_LIVE, f"{hostname} answered as a workspace"
+    return WORKSPACE_UNVERIFIED, f"{hostname} answered, but not as a workspace"
+
+
 def _databricks_identity_failure_message(*, host: str, profile: str, raw: str) -> str:
     """Operator-facing identity-failure text: names the cause and host, not a secret.
 
@@ -3253,10 +3441,17 @@ def _verify_databricks_identity(profile: str) -> str:
         # bootstrap.sh preflight classifies the full multi-line capture, and the
         # shared behavioral corpus keeps the two in step on the single-line
         # errors the CLI actually produces.
+        host = _databricks_profile_host(profile)
+        # The workspace's own word first, as bootstrap.sh asks it: the CLI words a
+        # deleted workspace exactly as it words a wrong secret.
+        state, why = databricks_workspace_liveness(host) if host else (WORKSPACE_UNVERIFIED, "")
+        if state == WORKSPACE_GONE:
+            raise RuntimeError(
+                f"The Databricks workspace at {host} no longer exists: {why}. A reaper or an "
+                "admin deleted it, so no credential can work there."
+            ) from exc
         raise RuntimeError(
-            _databricks_identity_failure_message(
-                host=_databricks_profile_host(profile), profile=profile, raw=str(exc)
-            )
+            _databricks_identity_failure_message(host=host, profile=profile, raw=str(exc))
         ) from exc
     user = str(current_user.get("userName") or "")
     if not user:
@@ -6611,17 +6806,64 @@ def _wait_round4_cross_endpoint_table(
         time.sleep(min(2, max(0, deadline - time.monotonic())))
 
 
+def _setup_connection_failure_kind(error: psycopg.OperationalError) -> str:
+    """How a setup connection failed, as a fixed phrase and never as the error's text.
+
+    libpq's messages can quote the connection details they were given, so the
+    text itself is not repeated anywhere; only which of these it matched.
+    """
+
+    text = str(error).casefold()
+    if "timeout expired" in text or "timed out" in text:
+        return "timed out"
+    if "connection refused" in text:
+        return "was refused"
+    if any(
+        marker in text
+        for marker in ("could not translate host name", "name or service not known", "nodename")
+    ):
+        return "could not resolve the host"
+    if error.sqlstate == "57P03":
+        return "found the server not yet accepting connections"
+    return ""
+
+
+def _setup_connection_timeout(material: ConnectionMaterial, last_failure: str) -> str:
+    """What a setup connection that never came up says, with the likeliest why.
+
+    It used to say only that "a" connection did not become ready. On 2026-09-27
+    that sentence, 42 retries deep, was all a first install left behind when the
+    network re-addressed this host mid-install, so nothing on screen named the
+    database, how it failed, or the address the security groups still admitted.
+    """
+
+    message = (
+        f"PostgreSQL setup connection to {material.host} did not become ready within "
+        "120 seconds"
+    )
+    if last_failure:
+        message += f"; the last attempt {last_failure}"
+    drift, _ = _observe_operator_ingress(None)
+    if drift is not None:
+        message += (
+            f". This host's public address is now {drift.observed_cidr}, but the database "
+            f"security groups admit {drift.sealed_cidr}: the network re-addressed it during "
+            "the install. Run ./bootstrap.sh --apply to resume; it rebinds the ingress to "
+            "the new address and carries on"
+        )
+    return message
+
+
 async def _connect(material: ConnectionMaterial, *, autocommit: bool = False):
     deadline = time.monotonic() + 120
     retry_delays = (2, 4, 8, 10)
     failure_count = 0
+    last_failure = ""
 
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise RuntimeError(
-                "PostgreSQL setup connection did not become ready within 120 seconds"
-            )
+            raise RuntimeError(_setup_connection_timeout(material, last_failure))
 
         try:
             async with asyncio.timeout(remaining):
@@ -6637,25 +6879,23 @@ async def _connect(material: ConnectionMaterial, *, autocommit: bool = False):
                     autocommit=autocommit,
                 )
         except TimeoutError:
-            raise RuntimeError(
-                "PostgreSQL setup connection did not become ready within 120 seconds"
-            ) from None
+            raise RuntimeError(_setup_connection_timeout(material, last_failure)) from None
         except psycopg.OperationalError as exc:
             sqlstate = exc.sqlstate
             retryable = sqlstate is None or sqlstate.startswith("08") or sqlstate == "57P03"
             if not retryable:
                 raise RuntimeError(
-                    f"PostgreSQL setup connection failed (SQLSTATE {sqlstate})"
+                    f"PostgreSQL setup connection to {material.host} failed (SQLSTATE {sqlstate})"
                 ) from None
+            last_failure = _setup_connection_failure_kind(exc)
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise RuntimeError(
-                    "PostgreSQL setup connection did not become ready within 120 seconds"
-                ) from None
+                raise RuntimeError(_setup_connection_timeout(material, last_failure)) from None
             delay = min(retry_delays[min(failure_count, len(retry_delays) - 1)], remaining)
             print(
-                f"WAIT PostgreSQL setup connection not ready; retrying in {max(1, round(delay))}s"
+                f"WAIT PostgreSQL setup connection to {material.host} not ready; retrying in "
+                f"{max(1, round(delay))}s"
             )
             await asyncio.sleep(delay)
             failure_count += 1
@@ -7982,6 +8222,7 @@ async def _grant_round4_postgres(
     manifest: DemoManifest, names: dict[str, str], app_client_id: str | None
 ) -> None:
     from .coordination import COORDINATION_SCHEMA, read_coordination_objects
+    from .receipts import BOUT_RECEIPT_CLEANUP_SIGNATURE, bout_receipt_cleanup_function_ddl
 
     if app_client_id is None:
         return
@@ -8084,6 +8325,21 @@ async def _grant_round4_postgres(
                             role,
                         )
                     )
+            # The receipt cleanup overlay's only write path, a SECURITY DEFINER
+            # function with PUBLIC's EXECUTE revoked, so the app needs its own.
+            # Created again first because this is the grant step every provision
+            # and resume reaches, and a GRANT cannot name a missing function.
+            await cursor.execute(bout_receipt_cleanup_function_ddl())
+            await cursor.execute(
+                sql.SQL("REVOKE ALL ON FUNCTION {} FROM PUBLIC").format(
+                    sql.SQL(BOUT_RECEIPT_CLEANUP_SIGNATURE)
+                )
+            )
+            await cursor.execute(
+                sql.SQL("GRANT EXECUTE ON FUNCTION {} TO {}").format(
+                    sql.SQL(BOUT_RECEIPT_CLEANUP_SIGNATURE), role
+                )
+            )
         await coordination.commit()
 
 
@@ -8646,6 +8902,13 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
         # `readiness.py` reaches it when it builds this store for the app.
         await StartupReadinessStore(store._run).initialize()
         await DurableReceiptStore(store._run).initialize()
+        await DurableReceiptStore(store._run).ensure_cleanup_function()
+        if manifest.round4 is not None:
+            # A ready install re-running setup reaches this and not the first
+            # grant, so the app's EXECUTE is issued here too once Round 4 names it.
+            await DurableReceiptStore(store._run).grant_cleanup_function(
+                manifest.round4.app_service_principal_client_id
+            )
         await DurablePipelinePowerStore(store._run).initialize()
 
         async def migrate_round5(cursor: Any) -> None:
@@ -9559,6 +9822,10 @@ def _complete_provision(manifest: DemoManifest, zero_timeout_seconds: float) -> 
         save_manifest(manifest)
 
     if manifest.status == "seeding":
+        # The first apply takes ten minutes or more, which is long enough for a
+        # rotating NAT to move this host, and the seed is the first thing that
+        # connects from here to Aurora and RDS.
+        _follow_operator_address(manifest)
         manifest.round3_anchor = None
         manifest.last_reset_at = datetime.now(UTC)
         manifest.schema_sha256 = _schema_sha256()
@@ -9726,14 +9993,12 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         manifest.aws.account_id,
         manifest.aws.auth_mode,
     )
-    current_cidr = _require_operator_cidr()
-    if current_cidr != manifest.aws.operator_cidr:
-        raise RuntimeError(
-            f"Operator public IP changed to {current_cidr}; provisioned ingress is "
-            f"{manifest.aws.operator_cidr}"
-        )
-    # After every free check above (both identities and the operator CIDR), so a
-    # resume that a changed IP would abort does not resume a warehouse first. The
+    # A resume follows the address rather than refusing on it: refusing stranded a
+    # half-built install that a network had simply re-addressed, with nothing on
+    # screen saying how to go on. See `_follow_operator_address`.
+    _follow_operator_address(manifest)
+    # After every check above (both identities and the operator address), so a
+    # resume that one of them would abort does not resume a warehouse first. The
     # same read-only proof as a fresh provision, on the warehouse this
     # installation is bound to: a resume probes the sealed `round4.warehouse_id`,
     # not whatever the resuming shell exports, and does so before any
@@ -9771,11 +10036,16 @@ def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
         and not round5_seal_in_progress
     ):
         manifest = _complete_provision(manifest, zero_timeout_seconds)
+    # Each seal below connects from this host to Aurora or RDS, and each takes
+    # minutes, so the address is followed before every one of them.
+    _follow_operator_address(manifest)
     manifest = _prepare_and_reseal_round4(manifest, timeout=zero_timeout_seconds)
     if not manifest.round5_ready:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round5(manifest, timeout=zero_timeout_seconds)
     if manifest.round6_ready:
         return manifest
+    _follow_operator_address(manifest)
     return _prepare_and_reseal_round6(manifest, timeout=zero_timeout_seconds)
 
 
@@ -9842,6 +10112,92 @@ def _refresh_operator_cidr(manifest: DemoManifest) -> None:
         f"REBIND operator ingress {previous_cidr} -> {current_cidr}",
         flush=True,
     )
+
+
+def _follow_operator_address(manifest: DemoManifest) -> None:
+    """Rebind database ingress to this host's address when it moves mid-install.
+
+    The database security groups admit the operator as one /32: the address the
+    install detected when it started. A network that rotates its NAT address can
+    hand this host a new one while Terraform runs. On 2026-09-27 the preflight saw
+    one address and the seed, fifteen minutes later, left from another, so every
+    setup connection to Aurora or RDS timed out, and the resume the failure
+    recommended then refused on the mismatch.
+
+    The install locked the ingress to its own address, so following the address is
+    the same authority used again. The one plan applied here may do nothing but
+    move that ingress (`_ingress_plan_violations`), and the manifest is written only
+    after it applies, so a failed apply leaves the mismatch for the next run to
+    find. Before the first apply there is nothing to move: the provision's own
+    apply carries the new address.
+    """
+
+    current = _require_operator_cidr()
+    previous = manifest.aws.operator_cidr
+    if current == previous:
+        return
+    print(
+        f"REBIND operator ingress {previous} -> {current}: this host's public address "
+        "changed during the install",
+        flush=True,
+    )
+    if manifest.status == "provisioning":
+        manifest.aws.operator_cidr = current
+        save_manifest(manifest)
+        return
+    ownership = _aws_ownership(manifest)
+    if not ownership.ok and not _sealed_databases_absent(manifest):
+        raise RuntimeError(
+            "Refusing to change database ingress because owned AWS resources could not be verified"
+        )
+    manifest.aws.operator_cidr = current
+    try:
+        _terraform_init(manifest)
+        plan = _terraform_plan(manifest)
+        violations = _ingress_plan_violations(manifest, _terraform_plan_json(manifest, plan))
+        if violations:
+            raise RuntimeError(
+                "the plan does more than move the operator ingress: " + "; ".join(violations)
+            )
+        _terraform_apply(manifest, plan)
+    except BaseException:
+        manifest.aws.operator_cidr = previous
+        raise
+    save_manifest(manifest)
+    reset_operator_ingress_cache()
+
+
+def _ingress_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) -> list[str]:
+    """Reject any plan that does more than move the security groups' ingress.
+
+    The shape of `_renew_plan_violations`, for the same reason: a rebind that
+    quietly replaced a database because the plan also held some other drift would
+    be an outage under the name of an address change.
+    """
+
+    allowed_addresses = _expected_aws_state_addresses(manifest)
+    violations: list[str] = []
+    for entry in plan.get("resource_changes") or []:
+        address = str(entry.get("address") or "?")
+        change = entry.get("change") or {}
+        actions = [str(action) for action in (change.get("actions") or [])]
+        if not actions or actions == ["no-op"] or actions == ["read"]:
+            continue
+        if address not in allowed_addresses:
+            violations.append(f"{address}: not a manifest-owned address")
+            continue
+        if entry.get("type") != "aws_security_group" or actions != ["update"]:
+            violations.append(f"{address}: plans {'+'.join(actions)}, not an ingress update")
+            continue
+        before = change.get("before") or {}
+        after = change.get("after") or {}
+        unknown = change.get("after_unknown") or {}
+        touched = {key for key in {*before, *after} if before.get(key) != after.get(key)}
+        touched |= {str(key) for key, flag in unknown.items() if flag}
+        forbidden = sorted(touched - {"ingress"})
+        if forbidden:
+            violations.append(f"{address}: changes {', '.join(forbidden)}")
+    return violations
 
 
 def _refresh_serverless_egress_cidrs(manifest: DemoManifest) -> None:
@@ -11465,12 +11821,21 @@ def setup(
             zero_timeout_seconds=timeout_seconds,
         )
 
+    # As in `resume_provision`: every seal and the checks below connect from this
+    # host to Aurora or RDS, and a first install spends long enough in them for a
+    # rotating NAT to move it.
     if not round4_prepared:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round4(manifest, timeout=timeout_seconds)
     if not round5_prepared:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round5(manifest, timeout=timeout_seconds)
     if not round6_prepared:
+        _follow_operator_address(manifest)
         manifest = _prepare_and_reseal_round6(manifest, timeout=timeout_seconds)
+        # Once more for the checks below. A ready install rebinds in
+        # `reconcile_infrastructure` and a resume in `resume_provision`.
+        _follow_operator_address(manifest)
     failures: list[str] = []
     # Why, and not only which: a real install stopped on "Setup checks failed:
     # aurora:resource_reconciliation, rds:resource_reconciliation" and nothing

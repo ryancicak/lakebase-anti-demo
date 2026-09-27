@@ -335,6 +335,51 @@ If the app under the name is left over from an installation whose directory is
 gone, delete it instead (`databricks apps delete <name> -p <profile>`) and run
 again; the new installation creates a fresh one.
 
+### If a sandbox reaper deleted your installation
+
+Run the same command again: `./bootstrap.sh --apply --deploy-app`. Before it
+refuses to re-provision an installation whose manifest says `ready`, it asks
+`./antidemo presence` — read-only, and it writes nothing — what is really left:
+
+- **All of it is gone** (every sealed AWS resource and every Lakebase project was
+  read and none exists): it says so, asks once (`--yes` answers for you), moves
+  the dead installation's records into `.anti-demo-v7/reaped-<time>/`, and
+  installs afresh in the same directory. `bootstrap.json` stays behind, because
+  it is how the new installation recognizes — and can re-adopt — the app and
+  secret scope this directory created. If a sweep also deleted the installation's
+  runtime role, the check reads AWS with your own keys instead, only once IAM
+  itself says the role no longer exists, and only when those keys are in the
+  installation's own account.
+- **The workspace itself was deleted, and the AWS side with it**: the same, except
+  that `bootstrap.json` is moved aside too — the app and secret scope it records
+  went with the workspace. A deleted workspace cannot be asked about its
+  projects, so the check asks the workspace's own front door instead, and counts
+  them gone only on its answer: a name that no longer resolves, or Databricks
+  answering "Unable to determine workspace context". Offline, or any other
+  answer, is never taken as gone.
+- **Only the AWS side is gone** (the account's fortnightly sweep; the workspace
+  and its Lakebase projects are intact): it offers to rebuild the AWS side in
+  place — `terraform apply`, then a reseed of both lanes, as `--reset-ready`
+  would.
+- **Some of it is still there**: it refuses, lists what is left, and names the
+  way to start over — `./antidemo cleanup --yes`, then run the installer again.
+  Nothing is moved aside while anything could still be billing.
+- **All of it is there**: the ordinary refusal above; nothing was reaped.
+
+If the reaper took your credentials too, the preflight says which of the five
+inputs no longer works, once each, and nothing starts until you replace it in
+`.env.bootstrap`:
+
+- a deleted IAM user or key: *AWS does not know the persistent app access key ID
+  (InvalidClientTokenId)*;
+- a secret that is not the key's: *AWS_SECRET_ACCESS_KEY is not its secret
+  (SignatureDoesNotMatch)*;
+- a deleted workspace: *The Databricks workspace at … no longer exists*, with the
+  workspace's own answer. Point `DATABRICKS_HOST` at a live workspace, and the
+  client ID and secret at a service principal that can use it;
+- a live workspace that refuses the service principal: *is live — it answered
+  just now — and it rejected these credentials*.
+
 "Highest" is now numeric rather than lexical. The previous last-wins loop over
 `.anti-demo-v*/` would have adopted `.anti-demo-v9` while `.anti-demo-v10` was
 the live installation, because `v10` sorts before `v7` as a string — and then
@@ -803,6 +848,16 @@ detector is cached (five minutes; thirty seconds after a failed probe), is
 short-timeout, and treats an unreachable network or an IPv6-only one as "unknown"
 rather than as drift — a false positive here sends an operator to re-apply
 Terraform for nothing.
+
+During an install the address is followed automatically. A first install spends
+long enough in Terraform for a network that rotates its NAT address to move this
+host; on 2026-09-27 one did, between the first apply and the seed. So the
+installer re-checks the address before each step that connects from here to
+Aurora or RDS, and a resume (`./bootstrap.sh --apply` on an unfinished install)
+does the same instead of refusing. Each rebind prints `REBIND operator ingress`,
+and is one Terraform plan that may do nothing but move the security groups'
+ingress; a plan that would do anything more is refused. The address it moves to
+is this host's own, detected the same way as at the start.
 
 ## Stopping the spend
 

@@ -846,6 +846,13 @@ GRANT SELECT, INSERT, DELETE ON anti_demo_coordination.cost_calibration_profile
 -- read, never an overwrite.
 GRANT SELECT, INSERT ON anti_demo_coordination.bout_receipt
   TO "<app-client-id>";
+-- Its one mutable row per bout, the cleanup overlay, is written only through
+-- this SECURITY DEFINER function (sql/round5_receipt_least_privilege.sql), so the
+-- table stays un-updatable by the app. Setup creates the function as the schema
+-- owner and revokes PUBLIC's EXECUTE; this is the app's own.
+GRANT EXECUTE ON FUNCTION anti_demo_coordination.bout_receipt_cleanup_upsert_v1(
+  text, text, text, text, text, timestamptz, jsonb
+) TO "<app-client-id>";
 
 -- Round 4 pipeline power history: which deliberate stops and starts this
 -- installation has made. Append-only for the same reason as the journal above,

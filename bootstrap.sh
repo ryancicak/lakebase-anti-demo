@@ -218,6 +218,63 @@ sanitize_databricks_output() {
     | sed -E 's/([Bb]earer|[Bb]asic)[[:space:]]+[A-Za-z0-9._~+/=-]{16,}/\1 [redacted]/g'
 }
 
+# The part of a failed CLI call worth quoting under a message: its `Error:` lines
+# when it has any, else its last four. The CLI also writes notices to stderr --
+# "Databricks skills are not installed ... run: databricks aitools install" on
+# 2026-09-27 -- which, quoted under a failure, read as the fix. Redacted, and
+# indented to sit under the eight spaces the message puts before its first line.
+databricks_reply_excerpt() {
+  local text excerpt
+  text="$(sanitize_databricks_output "$1")"
+  excerpt="$(printf '%s\n' "$text" | grep -E '^Error:' || true)"
+  [[ -n "$excerpt" ]] || excerpt="$(printf '%s\n' "$text" | tail -4)"
+  printf '%s\n' "$excerpt" | sed '2,$s/^/        /'
+}
+
+# Whether a host is a live Databricks workspace, asked of its own front door:
+# sets HOST_VERDICT to live, gone or unverified, and HOST_VERDICT_WHY. The CLI
+# cannot tell -- it words a deleted workspace exactly as it words a wrong secret
+# ("default auth: cannot configure default credentials"), which is how, on
+# 2026-09-27, a workspace a reaper had deleted was reported as rejected
+# credentials. A deleted workspace still resolved, and its OAuth discovery
+# answered HTTP 400 "Unable to determine workspace context"; a name whose DNS
+# record is gone does not resolve at all, which counts only while Databricks'
+# own DNS answers. Anything else is unverified, never gone. Mirrors
+# server/lifecycle.py:databricks_workspace_liveness.
+HOST_VERDICT=""
+HOST_VERDICT_WHY=""
+databricks_host_verdict() { # <workspace URL>
+  local hostname="${1#*://}" body code status=0
+  hostname="${hostname%%/*}"
+  body="$(mktemp)"
+  code="$(curl -sS -m 20 -o "$body" -w '%{http_code}' \
+    "https://$hostname/oidc/.well-known/oauth-authorization-server" 2>/dev/null)" || status=$?
+  if ((status == 6)); then
+    status=0
+    curl -sS -m 20 -o /dev/null "https://accounts.cloud.databricks.com/" 2>/dev/null || status=$?
+    if ((status == 6)); then
+      HOST_VERDICT=unverified
+      HOST_VERDICT_WHY="$hostname could not be looked up, nor could Databricks"
+    else
+      HOST_VERDICT=gone
+      HOST_VERDICT_WHY="$hostname no longer resolves"
+    fi
+  elif ((status != 0)); then
+    HOST_VERDICT=unverified
+    HOST_VERDICT_WHY="$hostname could not be asked (curl exit $status)"
+  elif [[ "$code" == "200" ]] && grep -q '"token_endpoint"' "$body" 2>/dev/null; then
+    HOST_VERDICT=live
+    HOST_VERDICT_WHY="$hostname answered as a workspace"
+  elif grep -qi 'unable to determine workspace context' "$body" 2>/dev/null; then
+    HOST_VERDICT=gone
+    HOST_VERDICT_WHY="$hostname answered HTTP $code: Unable to determine workspace context"
+  else
+    HOST_VERDICT=unverified
+    HOST_VERDICT_WHY="$hostname answered HTTP ${code:-nothing}, but not as a workspace"
+  fi
+  rm -f "$body"
+}
+
 preflight_gate() {
   ((${#PREFLIGHT_FAILURES[@]} > 0)) || return 0
   printf '\n%sFAIL%s  %d preflight %s. Nothing was provisioned and nothing was written\n' \
@@ -677,7 +734,15 @@ apply_targets_complete_ready_install() { # <manifest path, possibly empty>
 # Refused rather than confirmed, because the overwhelmingly common reason to be
 # here on a ready install is wanting the app redeployed -- which is
 # --deploy-only, touches no database and runs no Terraform.
-refuse_ready_install() { # <run id, possibly empty>
+refuse_ready_install() { # <run id, possibly empty> [what is left of it] [what to do about it]
+  local left=""
+  if [[ -n "${2:-}" ]]; then
+    left="
+       What is left of it, read just now:
+$2${3:+
+$3}
+"
+  fi
   die "installation ${1:-} is already 'ready', and --apply is not a resume of it.
 
        './antidemo setup' would reconcile it: 'terraform plan' and 'terraform apply'
@@ -695,13 +760,147 @@ refuse_ready_install() { # <run id, possibly empty>
        return to a known state -- say so explicitly:
 
          ./bootstrap.sh --apply --reset-ready
-
+$left
        Nothing was changed."
+}
+
+# The lines `antidemo presence` (server/lifecycle.py:installation_remnants)
+# reports, as a refusal quotes them. Empty when there is no report to quote.
+remnants_summary() { # <presence JSON>
+  printf '%s' "$1" | jq -r '
+    select(type == "object" and has("aws")) |
+    "         AWS: \(.aws.absent) of \(.aws.sealed) sealed resources absent (\(.aws.state)" +
+      (if (.aws.reason // "") != "" then ": \(.aws.reason)" else "" end) + ")",
+    (if (.workspace.state // "") == "gone"
+     then "         Workspace \(.workspace.host): gone (\(.workspace.reason))" else empty end),
+    "         Lakebase: \(.lakebase.absent) of \(.lakebase.expected) projects absent" +
+      (if .lakebase.unreadable > 0 then ", \(.lakebase.unreadable) could not be read" else "" end) +
+      (if (.workspace.state // "") == "gone" then ", with the workspace" else "" end),
+    "         Databricks App \(.app.name): \(.app.state)"' 2>/dev/null || true
+}
+
+# A `ready` manifest whose installation a sandbox reaper has deleted is not an
+# installation to protect from a re-provision: it is a directory to start again
+# in (asked for on 2026-09-27). Asked here, before anything is written, by the
+# read-only `antidemo presence`, which uses only what this directory already
+# has -- its venv, its manifest's own Databricks profile and the AWS pair
+# ./antidemo carries from the env file. Anything short of "every sealed AWS
+# resource and every Lakebase project was read and is gone" keeps the refusal,
+# which then says what is left.
+recover_if_reaped() { # <manifest path>
+  local manifest="$1" run dir report summary verdict answer archive entry workspace
+  run="$(jq -r '.run_id // empty' "$manifest" 2>/dev/null || true)"
+  dir="$(dirname "$manifest")"
+  report=""
+  if [[ -n "${ANTI_DEMO_PRESENCE_EXECUTABLE:-}" || -x "$ROOT/.venv/bin/python" ]]; then
+    report="$(ANTI_DEMO_MANIFEST="$manifest" ANTI_DEMO_ENV_FILE="$ENV_FILE_ABS" \
+      "${ANTI_DEMO_PRESENCE_EXECUTABLE:-$ROOT/antidemo}" presence 2>/dev/null | tail -1 || true)"
+  fi
+  summary="$(remnants_summary "$report")"
+  verdict="$(printf '%s' "$report" | jq -r '
+    if (.gone // false) then "gone"
+    elif .aws.state == "verified_missing" and (.aws.sealed // 0) > 0
+         and .aws.absent == .aws.sealed and (.lakebase.expected // 0) > 0
+         and .lakebase.absent == 0 and .lakebase.unreadable == 0 then "swept"
+    elif .aws.state == "unverified" then "unreadable"
+    elif (.aws.absent // 0) > 0 or (.lakebase.absent // 0) > 0 then "partial"
+    else "whole" end' 2>/dev/null || true)"
+  # A workspace that is itself gone took its app and secret scope with it, and
+  # every credential for it: the five inputs need a live one before anything can
+  # be installed again.
+  workspace="$(printf '%s' "$report" | jq -r '
+    select((.workspace.state // "") == "gone") | "\(.workspace.host)"' 2>/dev/null || true)"
+  case "$verdict" in
+    gone) ;;
+    swept)
+      # The account's fortnightly sweep takes the AWS side and leaves the
+      # workspace alone, and the recovery for exactly that already exists:
+      # `antidemo setup` on a ready install re-applies Terraform and reseeds
+      # (tests/test_reaper_recovery.py). So this is --reset-ready, offered.
+      say ""
+      warn "installation $run says 'ready', but its AWS side is gone: every sealed AWS resource
+        was read just now and none of them exists, while its Lakebase projects are intact.
+        That is what the AWS sandbox sweep leaves behind.
+$summary"
+      if ((ASSUME_YES == 0)); then
+        [[ -t 0 ]] || die "rebuilding a swept installation needs a terminal to confirm on, or --yes"
+        printf '  Rebuild the AWS side in place (terraform apply, then a reseed)? [y/N] '
+        read -r answer </dev/tty || answer=""
+        [[ "$answer" == [yY]* ]] || die "not confirmed; nothing was changed"
+      fi
+      RESET_READY=1
+      info "rebuilding in place: 'antidemo setup' re-applies Terraform and reseeds both lanes"
+      return 0 ;;
+    unreadable)
+      refuse_ready_install "$run" "$summary" "
+       Its AWS side could not be read with these keys. The AWS sandbox sweep deletes
+       IAM users along with the databases; if that happened, put a new key pair in
+       $ENV_FILE and run this again -- it checks again before anything starts.${workspace:+
+       Its workspace, $workspace, no longer exists either: point DATABRICKS_HOST and
+       the service principal credentials at a live workspace too.}" ;;
+    partial)
+      if [[ -n "$workspace" ]]; then
+        # './antidemo cleanup' proves the workspace identity before it touches
+        # anything, so it cannot tear down an AWS side whose workspace is gone;
+        # sending the operator there would be a second dead end.
+        refuse_ready_install "$run" "$summary" "
+       Its workspace, $workspace, no longer exists, but part of its AWS side is still
+       there, and still billing. './antidemo cleanup' cannot remove it: it proves the
+       workspace identity before it touches anything, and that workspace is gone.
+       What it left is tagged anti-demo-run-id=$run. Delete that in the AWS console,
+       or leave it to the account's own sweep, then run this again."
+      else
+        refuse_ready_install "$run" "$summary" "
+       Part of it was deleted -- by a sandbox reaper, say -- and part of it is still
+       there, so it is not rebuilt or replaced automatically. To start over, remove
+       what is left, then install:
+         ./antidemo cleanup --yes   then   ./bootstrap.sh --apply --deploy-app"
+      fi ;;
+    *) refuse_ready_install "$run" "$summary" ;;
+  esac
+  say ""
+  if [[ -n "$workspace" ]]; then
+    warn "installation $run says 'ready', but it is gone: the workspace it lived in,
+        $workspace, no longer exists, and every sealed AWS resource was read just now
+        and none of them exists. That is what a sandbox reaper leaves behind.
+$summary"
+  else
+    warn "installation $run says 'ready', but it is gone: every sealed AWS resource and every
+        Lakebase project was read just now, and none of them exists. That is what a
+        sandbox reaper leaves behind.
+$summary"
+  fi
+  if ((ASSUME_YES == 0)); then
+    [[ -t 0 ]] || die "starting over on a reaped installation needs a terminal to confirm on, or --yes"
+    printf '  Install afresh in this directory? Its old records are moved aside first. [y/N] '
+    read -r answer </dev/tty || answer=""
+    [[ "$answer" == [yY]* ]] || die "not confirmed; nothing was changed"
+  fi
+  archive="$dir/reaped-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -m 700 "$archive" || die "could not create $archive"
+  for entry in "$dir"/* "$dir"/.[!.]*; do
+    [[ -e "$entry" ]] || continue
+    case "$(basename "$entry")" in
+      # bootstrap.json says which app and secret scope this directory made, which
+      # is what lets the fresh install re-adopt them and cleanup delete them --
+      # unless they went with their workspace, when it is as dead as the rest.
+      bootstrap.json) [[ -n "$workspace" ]] || continue ;;
+      mutation.lock | reaped-*) continue ;;
+    esac
+    mv "$entry" "$archive/" || die "could not move $(basename "$entry") into $archive"
+  done
+  ok "moved the reaped installation's records to $archive"
+  if [[ -n "$workspace" ]]; then
+    info "continuing as a first install. DATABRICKS_HOST and the service principal in
+        $ENV_FILE must name a live workspace now; every input is validated below"
+  else
+    info "continuing as a first install; every input is validated below"
+  fi
 }
 
 EARLY_MANIFEST="$(manifest_this_run_would_adopt)"
 if ((RESET_READY == 0)) && apply_targets_complete_ready_install "$EARLY_MANIFEST"; then
-  refuse_ready_install "$(jq -r '.run_id // empty' "$EARLY_MANIFEST" 2>/dev/null || true)"
+  recover_if_reaped "$EARLY_MANIFEST"
 fi
 unset EARLY_MANIFEST
 
@@ -948,6 +1147,9 @@ else
   # newer than the built index.html, which is what makes a second bootstrap run
   # cost a second rather than a minute.
   NEED_NPM_CI=0
+  # Set when a failure is already reported, so its consequences -- a build with no
+  # toolchain, then no index.html -- are not reported again as findings of their own.
+  FRONTEND_FAILED=0
   [[ -d frontend/node_modules ]] || NEED_NPM_CI=1
   [[ -f frontend/package-lock.json && frontend/package-lock.json -nt frontend/node_modules ]] &&
     NEED_NPM_CI=1
@@ -956,6 +1158,7 @@ else
     if (cd frontend && npm ci --omit=dev); then
       ok "npm ci --omit=dev"
     else
+      FRONTEND_FAILED=1
       fail "'npm ci --omit=dev' failed in frontend/, so frontend/dist cannot be built and the
       deployed UI would answer 503. package-lock.json is committed, so this is not a
       resolution problem: it is the network, the Node version, or the registry this
@@ -976,11 +1179,14 @@ else
     done < <(find frontend/src frontend/index.html frontend/package.json frontend/vite.config.ts \
       -newer frontend/dist/index.html 2>/dev/null)
   fi
-  if ((NEED_BUILD == 1)); then
+  if ((FRONTEND_FAILED == 1)); then
+    skipped "the frontend build, because its dependencies did not install"
+  elif ((NEED_BUILD == 1)); then
     info "building the frontend (npm run build)"
     if (cd frontend && npm run build); then
       ok "frontend/dist built"
     else
+      FRONTEND_FAILED=1
       fail "'npm run build' failed, so frontend/dist is missing or stale. The app serves
       503 for every UI request without it (frontend/dist is deliberately not committed)."
     fi
@@ -1019,7 +1225,8 @@ else
   fail "there is still no interpreter at $PYTHON_ENVIRONMENT/bin/python, so './antidemo'
       will refuse every subcommand including the provision this script is about to run."
 fi
-[[ -f frontend/dist/index.html ]] || fail "frontend/dist/index.html is still missing after the build step"
+[[ -f frontend/dist/index.html || "${FRONTEND_FAILED:-0}" == "1" ]] ||
+  fail "frontend/dist/index.html is still missing after the build step"
 else
 # Deliberately not a numbered step: STEP_TOTAL does not count a step that is
 # not run, and a counter that skips a number is a counter nobody trusts.
@@ -1054,6 +1261,7 @@ AWS_ACCOUNT_ID=""
 CALLER_ARN=""
 APP_AWS_ACCOUNT_ID=""
 APP_CALLER_ARN=""
+APP_PAIR_REJECTED=0
 if APP_CALLER_JSON="$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
   AWS_ACCESS_KEY_ID="$APP_AWS_ACCESS_KEY_ID" \
   AWS_SECRET_ACCESS_KEY="$APP_AWS_SECRET_ACCESS_KEY" \
@@ -1062,8 +1270,35 @@ if APP_CALLER_JSON="$(env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
   APP_AWS_ACCOUNT_ID="$(printf '%s' "$APP_CALLER_JSON" | jq -r '.Account // empty' 2>/dev/null || true)"
   APP_CALLER_ARN="$(printf '%s' "$APP_CALLER_JSON" | jq -r '.Arn // empty' 2>/dev/null || true)"
 else
-  fail "The persistent app AWS credential pair was rejected by sts:GetCallerIdentity.
-      The credential values are withheld. Replace the pair together and retry."
+  # Which refusal it was decides what to replace, and AWS's error code says so
+  # without either value: an unknown key ID is a deleted key or IAM user (the AWS
+  # sandbox sweep deletes IAM users), a bad signature is a secret that is not
+  # this key's. With no code at all the call never reached STS.
+  STS_REPLY="$APP_CALLER_JSON"
+  [[ -n "$APP_AWS_ACCESS_KEY_ID" ]] && STS_REPLY="${STS_REPLY//"$APP_AWS_ACCESS_KEY_ID"/[withheld]}"
+  [[ -n "$APP_AWS_SECRET_ACCESS_KEY" ]] && STS_REPLY="${STS_REPLY//"$APP_AWS_SECRET_ACCESS_KEY"/[withheld]}"
+  STS_CODE="$(printf '%s\n' "$STS_REPLY" | sed -nE 's/.*An error occurred \(([A-Za-z]+)\).*/\1/p' | head -1)"
+  case "$STS_CODE" in
+    InvalidClientTokenId)
+      fail "AWS does not know the persistent app access key ID (InvalidClientTokenId): the
+      key, or the IAM user it belonged to, was deleted -- the AWS sandbox sweep deletes IAM
+      users -- or the ID is mistyped. Create a new access key and put both halves in
+      $ENV_FILE. The credential values are withheld." ;;
+    SignatureDoesNotMatch)
+      fail "AWS knows the persistent app access key ID, but AWS_SECRET_ACCESS_KEY is not its
+      secret (SignatureDoesNotMatch). Replace the pair together. The credential values are
+      withheld." ;;
+    "")
+      fail "sts:GetCallerIdentity could not be called with the persistent app AWS credential
+      pair, so it was never checked. The credential values are withheld. The AWS CLI said:
+        $(printf '%s\n' "$STS_REPLY" | sed '/^[[:space:]]*$/d' | tail -1 | cut -c1-200)" ;;
+    *)
+      fail "The persistent app AWS credential pair was rejected by sts:GetCallerIdentity
+      ($STS_CODE). The credential values are withheld. Replace the pair together and retry." ;;
+  esac
+  # Nothing to read an account from, so no second finding about an empty one.
+  APP_CALLER_JSON=""
+  APP_PAIR_REJECTED=1
 fi
 
 if [[ -n "$AWS_OPERATOR_PROFILE" ]]; then
@@ -1087,12 +1322,13 @@ if [[ -n "$CALLER_JSON" ]]; then
     fail "sts:GetCallerIdentity returned account '$AWS_ACCOUNT_ID', which is not 12 digits."
   fi
 fi
-if [[ "$APP_AWS_ACCOUNT_ID" != "$AWS_ACCOUNT_ID" ]]; then
+if ((APP_PAIR_REJECTED == 0)) && [[ "$APP_AWS_ACCOUNT_ID" != "$AWS_ACCOUNT_ID" ]]; then
   fail "The persistent app credential resolves to account ${APP_AWS_ACCOUNT_ID:-unknown},
       but provisioning resolves to account ${AWS_ACCOUNT_ID:-unknown}. Refusing before
       Terraform: app runtime trust cannot cross this account boundary."
 fi
-if [[ -n "${AWS_EXPECTED_ACCOUNT_ID:-}" && "$AWS_ACCOUNT_ID" != "$AWS_EXPECTED_ACCOUNT_ID" ]]; then
+if [[ -n "${AWS_EXPECTED_ACCOUNT_ID:-}" && -n "$AWS_ACCOUNT_ID" &&
+  "$AWS_ACCOUNT_ID" != "$AWS_EXPECTED_ACCOUNT_ID" ]]; then
   fail "Provisioning resolves to account $AWS_ACCOUNT_ID, but AWS_EXPECTED_ACCOUNT_ID is
       $AWS_EXPECTED_ACCOUNT_ID. Refusing before Terraform."
 fi
@@ -1714,18 +1950,33 @@ if ((ME_STATUS == 0)); then
         $(sanitize_databricks_output "$ME_JSON$ME_ERR" | tr '\n' ' ' | cut -c1-240)"
   fi
 else
-  # Classified from everything the CLI said, as it always was.
+  # Classified from everything the CLI said, as it always was -- unless the
+  # workspace itself says it is gone, which no wording of the CLI's overrules.
   ME_JSON="$ME_JSON${ME_JSON:+$'\n'}$ME_ERR"
   # One failure, three causes. Say which, name the host in every branch, and echo
-  # a secret-redacted tail of the control plane's own words.
-  DB_ERR="$(sanitize_databricks_output "$ME_JSON" | tail -4)"
-  case "$(databricks_failure_category "$ME_JSON")" in
+  # the control plane's own words, secret-redacted.
+  DB_ERR="$(databricks_reply_excerpt "$ME_JSON")"
+  databricks_host_verdict "$DATABRICKS_HOST"
+  DB_CATEGORY="$(databricks_failure_category "$ME_JSON")"
+  [[ "$HOST_VERDICT" == "gone" ]] && DB_CATEGORY="workspace-deleted"
+  DB_ASKED=""
+  [[ "$HOST_VERDICT" == "unverified" ]] && DB_ASKED="
+      Asking the workspace itself did not settle it: $HOST_VERDICT_WHY."
+  case "$DB_CATEGORY" in
+    workspace-deleted)
+      fail "The Databricks workspace at $DATABRICKS_HOST no longer exists: $HOST_VERDICT_WHY.
+      A reaper or an admin deleted it, or the URL is mistyped, so no credential can work
+      there. Put a live workspace's URL in DATABRICKS_HOST, and in DATABRICKS_CLIENT_ID and
+      DATABRICKS_CLIENT_SECRET the OAuth (M2M) credentials of a service principal that can
+      use it, then re-run.
+      'databricks current-user me -p $DATABRICKS_PROFILE' said:
+        $DB_ERR" ;;
     workspace-gone)
       fail "The Databricks workspace could not be reached or no longer exists: $DATABRICKS_HOST
       If a reaper or an admin deleted it, DATABRICKS_HOST now points at nothing and the
       service principal credentials may be perfectly valid. Confirm the workspace exists
       and DATABRICKS_HOST is its current URL. If the host is right, also confirm you are
-      online and not behind a TLS-intercepting proxy, then re-run.
+      online and not behind a TLS-intercepting proxy, then re-run.$DB_ASKED
       'databricks current-user me -p $DATABRICKS_PROFILE' said:
         $DB_ERR" ;;
     no-access)
@@ -1735,17 +1986,26 @@ else
       'databricks current-user me -p $DATABRICKS_PROFILE' said:
         $DB_ERR" ;;
     bad-token)
-      fail "The Databricks workspace at $DATABRICKS_HOST rejected these credentials. Check
+      if [[ "$HOST_VERDICT" == "live" ]]; then
+        fail "The Databricks workspace at $DATABRICKS_HOST is live -- it answered just now -- and
+      it rejected these credentials. Check DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET:
+      this path needs a workspace service principal's OAuth (M2M) secret, not a personal
+      access token.
+      'databricks current-user me -p $DATABRICKS_PROFILE' said:
+        $DB_ERR"
+      else
+        fail "The Databricks workspace at $DATABRICKS_HOST rejected these credentials. Check
       DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET: this path needs a workspace service
       principal's OAuth (M2M) secret, not a personal access token. If the workspace was
-      recently deleted or recreated, DATABRICKS_HOST may also be stale.
+      recently deleted or recreated, DATABRICKS_HOST may also be stale.$DB_ASKED
       'databricks current-user me -p $DATABRICKS_PROFILE' said:
-        $DB_ERR" ;;
+        $DB_ERR"
+      fi ;;
     *)
       fail "Could not establish a Databricks identity at $DATABRICKS_HOST. This is one of:
       the workspace no longer exists, this service principal cannot access it, or
       DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET are wrong. Verify the host is a live
-      workspace and the OAuth (M2M) credentials belong to it, then re-run.
+      workspace and the OAuth (M2M) credentials belong to it, then re-run.$DB_ASKED
       'databricks current-user me -p $DATABRICKS_PROFILE' said:
         $DB_ERR" ;;
   esac

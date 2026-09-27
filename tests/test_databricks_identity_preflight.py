@@ -282,8 +282,30 @@ class TestProfileHost:
 class TestVerifyIdentity:
     """The end-to-end contract callers depend on: fail closed, classified, no leak."""
 
-    def _host(self, monkeypatch, host="https://dbc-stub-0000.cloud.databricks.com"):
+    def _host(
+        self,
+        monkeypatch,
+        host="https://dbc-stub-0000.cloud.databricks.com",
+        liveness=(lifecycle.WORKSPACE_UNVERIFIED, "not asked in a unit test"),
+    ):
         monkeypatch.setattr(lifecycle, "_databricks_profile_host", lambda _profile: host)
+        monkeypatch.setattr(lifecycle, "databricks_workspace_liveness", lambda _host: liveness)
+
+    def test_a_workspace_that_says_it_is_gone_is_named_deleted(self, monkeypatch):
+        """The CLI's words blame the credentials; the workspace's own answer wins."""
+
+        answer = "dbc-stub-0000.cloud.databricks.com answered HTTP 400: Unable to determine"
+        self._host(monkeypatch, liveness=(lifecycle.WORKSPACE_GONE, answer))
+
+        def boom(*_a, **_k):
+            raise RuntimeError("default auth: cannot configure default credentials")
+
+        monkeypatch.setattr(lifecycle, "_databricks_json", boom)
+        with pytest.raises(RuntimeError) as excinfo:
+            lifecycle._verify_databricks_identity("anti-demo-x")
+        message = str(excinfo.value)
+        assert "no longer exists: " + answer in message
+        assert "rejected these credentials" not in message
 
     def test_success_returns_user(self, monkeypatch):
         monkeypatch.setattr(
