@@ -32,6 +32,11 @@ locals {
     round => "${substr(var.name_prefix, 0, 12)}-${substr(var.run_id, 0, 8)}-${slug}"
   }
 
+  # `expires-at` is a lease, not an ownership tag. Terraform writes it once, at
+  # creation, and the serving app moves it forward while people use the
+  # installation (server/lease.py). So every tagged resource carries
+  # `ignore_changes = [tags["expires-at"]]` -- a moved lease is not drift -- and
+  # tests/test_installation_lease.py fails if a tagged resource lacks it.
   required_tags = {
     "anti-demo-run-id" = var.run_id
     "Owner"            = trimspace(var.owner)

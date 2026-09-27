@@ -103,6 +103,9 @@ APP_RUNTIME_SURFACES: tuple[RuntimeSurface, ...] = (
     RuntimeSurface("startup_credential_probe", ("aws_credential_probe",), "probe_once"),
     RuntimeSurface("startup_orphan_sweep", ("reap",), "AwsOrphanDeleter"),
     RuntimeSurface("installation_presence", ("reconcile",), "collect_observed"),
+    # The serving process moves the resources' `expires-at` lease while the
+    # installation is in use, so its describes and tag writes are the app's own.
+    RuntimeSurface("installation_lease", ("lease",), "LeaseKeeper"),
 )
 
 #: Modules that open an AWS client and never do so inside the deployed app.

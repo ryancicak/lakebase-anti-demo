@@ -7013,21 +7013,15 @@ def _competitor_manifest_bindings(
     return bindings
 
 
-def _warn_if_expired(manifest: DemoManifest) -> None:
-    """Report a passed TTL without deciding that Round 5 must stop.
-
-    Same reasoning as the Round 2/3 builder: expiry is a provision-time
-    wall-clock value that says nothing about whether the Round 5 sources are
-    healthy.  Refusing here was worse than in Round 2, because `app.py` builds
-    the Round 5 engine inside `except (RuntimeError, ValueError): return None`,
-    so the refusal was swallowed and the round simply vanished from a running
-    installation with no diagnosis anywhere.  The sealed-digest, completeness
-    and readiness checks below are real signals and still refuse.
-    """
-
-    expiry_warning = manifest.expiry_warning()
-    if expiry_warning is not None:
-        print(f"WARN  {expiry_warning}", flush=True)
+# There is deliberately no expiry check in either builder below. Same reasoning as
+# the Round 2/3 builder: expiry is a provision-time wall-clock value that says
+# nothing about whether the Round 5 sources are healthy. Refusing on it was worse
+# than in Round 2, because `app.py` builds the Round 5 engine inside
+# `except (RuntimeError, ValueError): return None`, so the refusal was swallowed
+# and the round simply vanished from a running installation with no diagnosis
+# anywhere. Warning on it printed a false alarm on every bout once the app began
+# keeping the resources' lease current (`server/lease.py`). The sealed-digest,
+# completeness and readiness checks below are real signals and still refuse.
 
 
 def connection_spike_live_config_from_manifest(
@@ -7036,7 +7030,6 @@ def connection_spike_live_config_from_manifest(
     *,
     runner_lane: Literal["lakebase", "competitor"] = "lakebase",
 ) -> ConnectionSpikeLiveConfig:
-    _warn_if_expired(manifest)
     resources = manifest.require_round5_resources()
     target_id, resource_id, direct_host, credential_sha256, proxy_secret_arn, _ = (
         _competitor_manifest_bindings(manifest, competitor_id)
@@ -7127,7 +7120,6 @@ def connection_spike_setup_config_from_manifest(
     manifest: DemoManifest,
     competitor_id: str,
 ) -> ConnectionSpikeSetupConfig:
-    _warn_if_expired(manifest)
     resources = manifest.require_round5_resources()
     (
         target_id,

@@ -178,11 +178,14 @@ selected-path comparison.
 
 ## Cost and safety
 
-This project runs no expiry timer of its own. External account automation may
-reap AWS resources carrying the generated `expires-at` tag, potentially leaving
-a partial installation; Databricks resources are not covered by that tag.
-Deliberate cleanup is still the only path that verifies the whole installation
-is gone. Three separate things bill, they stop at three different times, and only
+You never renew anything by hand. Every AWS resource carries an `expires-at` tag
+for account automation that reaps by it, and that tag is a lease: it starts 72
+hours out, and the app moves it forward while anyone uses the installation. Leave
+the installation unused for 72 hours and the lease lapses, and automation that
+honors the tag may then reap it, possibly leaving a partial installation. Nothing
+in this project deletes anything on that clock, and Databricks resources are not
+covered by the tag. Deliberate cleanup is still the only path that verifies the
+whole installation is gone. Three separate things bill, they stop at three different times, and only
 the first is a cost you pay simply for having this installed. Read the middle
 column before the number. These rates came from one installation in `us-west-2`:
 

@@ -2762,6 +2762,7 @@ def test_setup_says_why_its_closing_checks_failed(monkeypatch, tmp_path) -> None
         return checks
 
     monkeypatch.setattr("server.lifecycle.doctor", doctor)
+    monkeypatch.setattr("server.lifecycle._keep_lease_current", lambda candidate: None)
 
     with pytest.raises(RuntimeError) as failure:
         setup(
@@ -2825,6 +2826,9 @@ def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_pat
             or [Check("ready", True, "ready")]
         ),
     )
+    monkeypatch.setattr(
+        "server.lifecycle._keep_lease_current", lambda candidate: calls.append("lease")
+    )
 
     prepared = setup(
         databricks_profile="",
@@ -2843,10 +2847,13 @@ def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_pat
     # Round 5 is resealed *before* reset: reset() -> ensure_coordination writes
     # the resident event DSN into the sealed control secrets and reads their ARNs
     # from the seal, so the seal must carry the two-runner control plane first.
+    # A setup is a use of the installation, so it moves the lease before the
+    # doctor reads it.
     assert calls == [
         "reconcile",
         "round5:321",
         "reset:321",
+        "lease",
         "doctor:aurora:321",
         "doctor:rds:321",
     ]
@@ -2891,6 +2898,9 @@ def test_setup_resumes_an_incomplete_ready_seal_without_reset(monkeypatch, tmp_p
             or [Check("ready", True, "ready")]
         ),
     )
+    monkeypatch.setattr(
+        "server.lifecycle._keep_lease_current", lambda candidate: calls.append("lease")
+    )
 
     assert (
         setup(
@@ -2908,6 +2918,7 @@ def test_setup_resumes_an_incomplete_ready_seal_without_reset(monkeypatch, tmp_p
     assert calls == [
         "resume:321",
         "round6:321",
+        "lease",
         "doctor:aurora:321",
         "doctor:rds:321",
     ]

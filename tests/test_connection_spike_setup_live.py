@@ -1444,14 +1444,16 @@ def test_v7_round5_rds_setup_uses_dedicated_instance_and_security_group(tmp_path
 def test_no_round5_manifest_gate_consults_expiry_at_all(
     tmp_path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    """Both Round 5 gates must report a passed TTL, never refuse on it.
+    """Both Round 5 gates must build past a passed TTL, and say nothing about it.
 
     This used to install a detonating `assert_not_expired` to prove the call was
     gone rather than merely no longer fatal. That method has since been deleted
     outright -- `tests/test_expiry_renew.py` asserts it cannot come back -- so
     there is nothing left to detonate, and what remains to check here is the
-    behaviour: both configs build from a manifest that is hours past its TTL, and
-    the only trace of the expiry is the advisory line.
+    behaviour: both configs build from a manifest that is hours past its TTL.
+    They used to print an advisory line too, on every bout. The sealed expiry is
+    no longer the resources' lease -- the app keeps that moving while the
+    installation is in use -- so the line was a false alarm and is gone.
     """
     from test_manifest import _v7_manifest
 
@@ -1466,9 +1468,9 @@ def test_no_round5_manifest_gate_consults_expiry_at_all(
         assert connection_spike_live_config_from_manifest(manifest, competitor_id)
         assert connection_spike_setup_config_from_manifest(manifest, competitor_id)
 
-    # The same line the Round 2/3 builder prints, so an operator reading an
-    # expired installation's log cannot tell the rounds apart.
-    assert f"WARN  {manifest.expiry_warning()}" in capsys.readouterr().out
+    # Silent, like the Round 2/3 builder, so neither prints a stale expiry
+    # warning into the log of an installation whose lease is current.
+    assert "expiry" not in capsys.readouterr().out
 
 
 def test_expired_manifest_no_longer_deletes_round5_from_a_running_installation(

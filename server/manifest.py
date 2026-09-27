@@ -1325,32 +1325,44 @@ class DemoManifest(BaseModel):
     # was *not* being called.
     #
     # `expires_at` is consumed by external account governance, not enforced by
-    # this process. It is never re-based automatically, so callers warn before
-    # the deadline and still ask each required resource for liveness. Turning the
-    # timestamp itself into a local gate recreated a partial outage; ignoring it
-    # claimed resources would survive an external reaper. Both are false.
-    def expiry_warning(self, *, now: datetime | None = None) -> str | None:
+    # this process. Turning the timestamp into a local gate recreated a partial
+    # outage; ignoring it claimed resources would survive an external reaper.
+    # Both are false.
+    #
+    # It is also no longer the resources' lease. The serving app moves the
+    # `expires-at` tag forward while people use the installation
+    # (`server/lease.py`), so the sealed value only says when an installation
+    # nobody used would have lapsed. Pass the lease the resources really carry as
+    # `lease`; without one this falls back to the seal, which is right only for an
+    # installation that has never been used since it was set up.
+    def expiry_warning(
+        self,
+        *,
+        now: datetime | None = None,
+        lease: datetime | None = None,
+    ) -> str | None:
         """Warn before external expiry without using the clock as a health check."""
 
         observed = datetime.now(UTC) if now is None else now.astimezone(UTC)
-        remaining = self.expires_at.astimezone(UTC) - observed
+        deadline = (lease or self.expires_at).astimezone(UTC)
+        remaining = deadline - observed
         if remaining > EXPIRY_WARNING_WINDOW:
             return None
         if remaining.total_seconds() > 0:
             hours = max(1, int((remaining.total_seconds() + 3599) // 3600))
             return (
                 f"Demo AWS resources are tagged for external expiry at "
-                f"{self.expires_at.isoformat()} (about {hours}h remaining). Account "
-                "automation may reap tagged resources at or after that deadline: run "
-                "'antidemo renew --ttl-hours N' before it, or 'antidemo cleanup --yes' "
-                "to end the installation deliberately."
+                f"{deadline.isoformat()} (about {hours}h remaining), because nobody has "
+                "used the installation for a while. Account automation may reap tagged "
+                "resources at or after that deadline. Using the app moves it forward; "
+                "'antidemo cleanup --yes' ends the installation deliberately."
             )
         return (
-            f"Demo resources passed their declared expiry at {self.expires_at.isoformat()}. "
-            "External account automation may already have reaped tagged AWS resources. "
-            "Run 'antidemo status' to inventory what remains; use "
-            "'antidemo renew --ttl-hours N' only for an intact installation, otherwise "
-            "run 'antidemo cleanup --yes' and provision fresh."
+            f"Demo resources passed their declared expiry at {deadline.isoformat()}: "
+            "nobody used the installation before it lapsed. External account automation "
+            "may already have reaped tagged AWS resources. Run 'antidemo status' to "
+            "inventory what remains. An intact installation renews itself the next time "
+            "the app is used; otherwise run 'antidemo cleanup --yes' and provision fresh."
         )
 
 

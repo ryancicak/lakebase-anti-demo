@@ -57,6 +57,8 @@ resource "aws_db_subnet_group" "round1" {
   tags        = local.required_tags
 
   lifecycle {
+    ignore_changes = [tags["expires-at"]]
+
     precondition {
       condition     = length(local.selected_subnet_ids) >= 2
       error_message = "The selected network must provide at least two subnets."
@@ -127,9 +129,10 @@ resource "aws_security_group" "aurora" {
 
   # AWS does not allow Terraform to replace an attached RDS security group by
   # detaching its managed ENI. Existing runs keep their legacy description;
-  # new runs receive the current one. Rules and tags remain fully managed.
+  # new runs receive the current one. Rules and tags remain fully managed,
+  # except the expires-at lease, which the serving app moves (see locals.tf).
   lifecycle {
-    ignore_changes = [description]
+    ignore_changes = [description, tags["expires-at"]]
   }
 }
 
@@ -182,9 +185,10 @@ resource "aws_security_group" "rds_control_plane_only" {
 
   # AWS does not allow Terraform to replace an attached RDS security group by
   # detaching its managed ENI. Existing runs keep their legacy description;
-  # new runs receive the current one. Rules and tags remain fully managed.
+  # new runs receive the current one. Rules and tags remain fully managed,
+  # except the expires-at lease, which the serving app moves (see locals.tf).
   lifecycle {
-    ignore_changes = [description]
+    ignore_changes = [description, tags["expires-at"]]
   }
 }
 
@@ -205,7 +209,7 @@ resource "aws_security_group" "round5_runner" {
   # graph cycle. Keep the sealed group in place; rules and tags stay managed.
   # Same rationale as the aurora/rds groups above.
   lifecycle {
-    ignore_changes = [description]
+    ignore_changes = [description, tags["expires-at"]]
   }
 }
 
@@ -221,7 +225,7 @@ resource "aws_security_group" "round5_competitor_runner" {
 
   # Same ENI-attachment constraint as the Lakebase runner group above.
   lifecycle {
-    ignore_changes = [description]
+    ignore_changes = [description, tags["expires-at"]]
   }
 }
 
@@ -240,6 +244,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_lakebase_runner_https" {
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "lakebase"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_https" {
@@ -253,6 +261,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_https" {
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "competitor"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 # Lakebase is publicly reachable and does not publish a stable customer-specific
@@ -269,6 +281,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_lakebase_runner_postgres" 
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "lakebase"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 # The v4 two-runner control plane requires BOTH residents to write their
@@ -293,6 +309,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_postgres
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "competitor"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 # Stable least-privilege Proxy network fixtures. The per-bout Proxy is still
@@ -309,6 +329,10 @@ resource "aws_security_group" "round5_proxy" {
     "anti-demo-warm-fixture" = "proxy-network"
     "anti-demo-variant"      = each.key
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "round5_runner_to_proxy" {
@@ -332,6 +356,10 @@ resource "aws_vpc_security_group_ingress_rule" "round5_runner_to_proxy" {
     "anti-demo-warm-fixture" = "proxy-network"
     "anti-demo-variant"      = each.key
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_to_proxy" {
@@ -348,6 +376,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_to_proxy
     "anti-demo-runner-lane" = "competitor"
     "anti-demo-variant"     = each.key
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_to_database" {
@@ -367,6 +399,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_competitor_runner_to_datab
     "anti-demo-runner-lane" = "competitor"
     "anti-demo-variant"     = each.key
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "round5_proxy_to_database" {
@@ -387,6 +423,10 @@ resource "aws_vpc_security_group_egress_rule" "round5_proxy_to_database" {
     "anti-demo-warm-fixture" = "proxy-network"
     "anti-demo-variant"      = each.key
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_db_subnet_group" "by_round" {
@@ -398,6 +438,8 @@ resource "aws_db_subnet_group" "by_round" {
   tags        = local.v7_round_tags[each.key]
 
   lifecycle {
+    ignore_changes = [tags["expires-at"]]
+
     precondition {
       condition     = length(local.selected_subnet_ids) >= 2
       error_message = "The selected network must provide at least two subnets."
@@ -468,6 +510,10 @@ resource "aws_security_group" "aurora_by_round" {
   }
 
   tags = local.v7_round_tags[each.key]
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_security_group" "rds_by_round" {
@@ -522,4 +568,8 @@ resource "aws_security_group" "rds_by_round" {
   }
 
   tags = local.v7_round_tags[each.key]
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }

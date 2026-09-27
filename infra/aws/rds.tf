@@ -40,6 +40,10 @@ resource "aws_db_instance" "rds_control_plane_only" {
   monitoring_interval          = 0
 
   tags = local.required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_db_instance" "rds_by_round" {
@@ -82,4 +86,8 @@ resource "aws_db_instance" "rds_by_round" {
   monitoring_interval          = 0
 
   tags = local.v7_round_tags[each.key]
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }

@@ -125,6 +125,75 @@
         "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anti-demo-runtime*",
         "arn:aws:iam::<AWS_ACCOUNT_ID>:role/*-r5-exec-*"
       ]
+    },
+    {
+      "Sid": "ListWhatCarriesTheInstallationLease",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeSecurityGroupRules",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeVolumes",
+        "secretsmanager:ListSecrets"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "ReadTheInstallationsOwnRolesAndQueues",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetInstanceProfile",
+        "iam:GetRole",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListPolicyTags",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ListQueueTags"
+      ],
+      "Resource": [
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anti-demo-runtime*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/anti-demo-runtime-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/i*-r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/i*-r5-*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:instance-profile/r5-*",
+        "arn:aws:sqs:<AWS_REGION>:<AWS_ACCOUNT_ID>:i*-r5-*",
+        "arn:aws:sqs:<AWS_REGION>:<AWS_ACCOUNT_ID>:r5-*"
+      ]
+    },
+    {
+      "Sid": "MoveOnlyTheExpiresAtLeaseOnTerraformMadeResources",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateTags",
+        "iam:TagInstanceProfile",
+        "iam:TagPolicy",
+        "iam:TagRole",
+        "rds:AddTagsToResource",
+        "secretsmanager:TagResource",
+        "sqs:TagQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "expires-at"
+          ]
+        },
+        "StringEquals": {
+          "aws:ResourceTag/managed-by": "terraform"
+        },
+        "Null": {
+          "aws:ResourceTag/anti-demo-run-id": "false"
+        }
+      }
     }
   ]
 }

@@ -19,6 +19,7 @@ from test_lifecycle import attach_round4, make_manifest, ready_round5_stub
 import app as app_module
 from server import cli as cli_module
 from server import lifecycle
+from server.lease import LeaseInventory, LeaseRenewal, LeaseTarget
 from server.lifecycle import (
     DEFAULT_TTL_HOURS,
     MAX_TTL_HOURS,
@@ -63,8 +64,11 @@ def test_expired_manifest_no_longer_blocks_app_startup(monkeypatch, caplog) -> N
     with caplog.at_level("WARNING"):
         assert app_module._load_ready_manifest(require_v2=True) is manifest
 
-    assert "passed their declared expiry" in caplog.text
-    assert "antidemo renew" in caplog.text
+    # Nor does it warn on it any more. The sealed expiry is not the resources'
+    # lease -- the app keeps that current while the installation is in use -- so
+    # the warning told the operator of an installation in daily use to renew it.
+    assert "declared expiry" not in caplog.text
+    assert "antidemo renew" not in caplog.text
 
 
 def test_expired_manifest_no_longer_blocks_the_six_control_actions(monkeypatch) -> None:
@@ -127,8 +131,13 @@ def test_a_non_ready_status_still_refuses(monkeypatch) -> None:
         app_module._load_ready_manifest()
 
 
-def test_reset_and_reconcile_warn_instead_of_refusing(monkeypatch, capsys) -> None:
-    """These are what actually broke `antidemo setup`, before doctor was ever reached."""
+def test_reset_neither_refuses_nor_warns_on_the_sealed_expiry(monkeypatch, capsys) -> None:
+    """These are what actually broke `antidemo setup`, before doctor was ever reached.
+
+    They used to warn instead of refusing. They do neither now: `setup` moves the
+    lease itself once they return (`_keep_lease_current`), so a warning printed
+    here was about a deadline the same command was about to push back.
+    """
     manifest = expired_manifest()
     monkeypatch.setattr(lifecycle, "load_manifest", lambda: manifest)
     monkeypatch.setattr(lifecycle, "detect_operator_cidr", lambda: manifest.aws.operator_cidr)
@@ -141,14 +150,16 @@ def test_reset_and_reconcile_warn_instead_of_refusing(monkeypatch, capsys) -> No
     )
 
     assert lifecycle.reset(1) is manifest
-    assert "passed their declared expiry" in capsys.readouterr().out
+    assert "declared expiry" not in capsys.readouterr().out
 
 
 async def _completed(value):
     return value
 
 
-def test_reconcile_infrastructure_warns_instead_of_refusing(monkeypatch, capsys) -> None:
+def test_reconcile_infrastructure_neither_refuses_nor_warns_on_the_sealed_expiry(
+    monkeypatch, capsys
+) -> None:
     manifest = expired_manifest()
     monkeypatch.setattr(
         lifecycle,
@@ -164,26 +175,53 @@ def test_reconcile_infrastructure_warns_instead_of_refusing(monkeypatch, capsys)
 
     with pytest.raises(_StopHere):
         lifecycle.reconcile_infrastructure(manifest)
-    assert "passed their declared expiry" in capsys.readouterr().out
+    assert "declared expiry" not in capsys.readouterr().out
 
 
 class _StopHere(RuntimeError):
     """Marks that a function ran past the gate under test."""
 
 
-def test_the_doctor_expiry_line_still_prints_but_no_longer_fails_the_run(capsys) -> None:
-    expired = _expiry_check(expired_manifest())
-    assert expired.ok is False
-    assert expired.advisory is True
-    assert "passed their declared expiry" in expired.detail
-    assert "External account automation may already have reaped" in expired.detail
-    assert "antidemo renew" in expired.detail
-    assert "antidemo cleanup --yes" in expired.detail
+def _leased(*leases: datetime | None) -> LeaseInventory:
+    return LeaseInventory(
+        tuple(
+            LeaseTarget("rds", f"arn:aws:rds:us-west-2:123:db:d{index}", lease)
+            for index, lease in enumerate(leases)
+        )
+    )
 
-    live_manifest = make_manifest()
-    live_manifest.expires_at = datetime.now(UTC) + timedelta(hours=25)
-    live = _expiry_check(live_manifest)
-    assert live.ok is True and live.advisory is True
+
+def test_the_doctor_expiry_line_reads_the_lease_the_resources_carry(capsys) -> None:
+    """A sealed expiry long past is not a finding while the resources are current.
+
+    The app moves `expires-at` forward while the installation is in use, so the
+    doctor reads the tag, not the seal. An installation provisioned with a
+    72-hour TTL and used daily for a month has a seal a month stale and a lease
+    days ahead, and must not be told to renew.
+    """
+    stale_seal = expired_manifest()
+    current = _expiry_check(
+        stale_seal, inventory=_leased(datetime.now(UTC) + timedelta(hours=60))
+    )
+    assert current.ok is True and current.advisory is True
+    assert "the app moves it forward while the installation is in use" in current.detail
+
+    # The soonest lease decides, so one resource left behind is what is reported.
+    lapsed = _expiry_check(
+        stale_seal,
+        inventory=_leased(datetime.now(UTC) + timedelta(hours=60), EXPIRED_AT),
+    )
+    assert lapsed.ok is False
+    assert lapsed.advisory is True
+    assert "passed their declared expiry" in lapsed.detail
+    assert "nobody used the installation before it lapsed" in lapsed.detail
+    assert "External account automation may already have reaped" in lapsed.detail
+    assert "antidemo cleanup --yes" in lapsed.detail
+
+    unreadable = _expiry_check(stale_seal, inventory=_leased(None))
+    assert unreadable.ok is True and "no readable expires-at" in unreadable.detail
+
+    expired = lapsed
 
     cli_module.print_checks([expired], False)
     printed = capsys.readouterr().out
@@ -205,12 +243,19 @@ def test_expiry_warning_starts_before_external_reaping_and_uses_injected_utc() -
     assert warning is not None
     assert "about 24h remaining" in warning
     assert "Account automation may reap tagged resources" in warning
-    assert "before it" in warning
+    assert "Using the app moves it forward" in warning
 
     expired = manifest.expiry_warning(now=deadline + timedelta(seconds=1))
     assert expired is not None
     assert "may already have reaped tagged AWS resources" in expired
-    assert "only for an intact installation" in expired
+    assert "renews itself the next time the app is used" in expired
+
+    # The lease the resources carry, when given, decides instead of the seal.
+    later = deadline + timedelta(days=30)
+    assert manifest.expiry_warning(now=deadline + timedelta(days=1), lease=later) is None
+    assert later.isoformat() in (
+        manifest.expiry_warning(now=later - timedelta(hours=2), lease=later) or ""
+    )
 
 
 def test_setup_does_not_fail_on_an_advisory_doctor_finding(monkeypatch, tmp_path) -> None:
@@ -237,10 +282,12 @@ def test_setup_does_not_fail_on_an_advisory_doctor_finding(monkeypatch, tmp_path
         "_prepare_and_reseal_round6",
         lambda candidate, *, timeout: candidate,
     )
+    lapsed = _leased(EXPIRED_AT)
+    monkeypatch.setattr(lifecycle, "_keep_lease_current", lambda candidate: None)
     monkeypatch.setattr(
         lifecycle,
         "doctor",
-        lambda competitor, *, timeout_seconds: [_expiry_check(manifest)],
+        lambda competitor, *, timeout_seconds: [_expiry_check(manifest, inventory=lapsed)],
     )
 
     assert _run_setup(ttl_hours=None) is manifest
@@ -249,7 +296,7 @@ def test_setup_does_not_fail_on_an_advisory_doctor_finding(monkeypatch, tmp_path
         lifecycle,
         "doctor",
         lambda competitor, *, timeout_seconds: [
-            _expiry_check(manifest),
+            _expiry_check(manifest, inventory=lapsed),
             Check("aws_ownership", False, "tag mismatch"),
         ],
     )
@@ -295,11 +342,12 @@ def test_the_refusing_expiry_gate_no_longer_exists_to_be_called() -> None:
 
 
 def test_no_decoupled_path_consults_expiry_at_all(monkeypatch, capsys) -> None:
-    """The gates report a passed TTL; none of them may refuse on one.
+    """No gate may refuse on a passed TTL, or warn on the sealed one.
 
-    Behavioural, not structural: `require_ready_manifest` and `_warn_if_expired`
-    are handed a manifest that is hours past its TTL and must both complete, with
-    the warning as their only reaction.
+    Behavioural, not structural: `require_ready_manifest` is handed a manifest
+    that is hours past its TTL and must complete without a word about it. The
+    control-path warning that used to accompany it (`_warn_if_expired`) is gone:
+    the sealed value is not the resources' lease, which the app keeps current.
     """
     manifest = expired_manifest()
 
@@ -307,8 +355,8 @@ def test_no_decoupled_path_consults_expiry_at_all(monkeypatch, capsys) -> None:
     monkeypatch.setattr(lifecycle, "load_manifest", lambda: manifest)
 
     app_module.require_ready_manifest()
-    lifecycle._warn_if_expired(manifest)
-    assert "passed their declared expiry" in capsys.readouterr().out
+    assert not hasattr(lifecycle, "_warn_if_expired")
+    assert "declared expiry" not in capsys.readouterr().out
 
     # Cleanup deliberately worked regardless of expiry before and must still. It
     # fails here for its own reasons -- this stub manifest has no live Round 5
@@ -468,6 +516,21 @@ def _install_renew_fakes(
         "_prepare_and_reseal_round6",
         lambda candidate, *, timeout: recorded["order"].append("reseal6") or candidate,
     )
+
+    def fake_lease(candidate, target):
+        recorded["order"].append("lease")
+        recorded["lease_target"] = target
+        return LeaseRenewal(
+            target=target,
+            resources=3,
+            renewed=3,
+            vanished=0,
+            failed=(),
+            unreadable=(),
+            earliest=target,
+        )
+
+    monkeypatch.setattr(lifecycle, "_move_installation_lease", fake_lease)
     recorded["store"] = store
     recorded["journal"] = tmp_path / lifecycle.RENEW_JOURNAL_NAME
     return recorded
@@ -490,14 +553,18 @@ def test_renew_moves_every_copy_and_applies_before_it_writes(monkeypatch, tmp_pa
     before = datetime.now(UTC)
     result = renew(ttl_hours=48)
 
-    assert recorded["order"] == ["plan", "apply", "save", "reseal5", "save"]
+    assert recorded["order"] == ["plan", "apply", "save", "reseal5", "save", "lease"]
     # Copy 1: the manifest.
     assert result.expires_at > before + timedelta(hours=47)
     # Copy 2: the frozen Round 5 ownership tag set, re-sealed from live Terraform.
     assert result.round5.ownership_tags.expires_at == lifecycle._utc_tag(result.expires_at)
     # Copy 3: the Terraform variable, overridden so the apply carries the new
-    # value while the manifest still held the old one.
+    # value -- into the Round 5 IAM conditions -- while the manifest still held
+    # the old one.
     assert recorded["override"] == result.expires_at
+    # Copy 4: the lease tag on every resource. Terraform ignores that tag after
+    # creation now, so the apply no longer moves it; the lease path does, last.
+    assert recorded["lease_target"] == result.expires_at
     assert recorded["store"].claims == ["maintenance_renew"]
     assert recorded["store"].released == 1
     assert not recorded["journal"].exists()
@@ -842,6 +909,39 @@ def test_a_failed_reseal_is_reported_as_bouts_only(monkeypatch, tmp_path) -> Non
     assert "PARTIAL" in message
     assert "cleanup is safe and unaffected" in message
     assert "denied at creation rather than creating anything un-cleanable" in message
+    assert recorded["journal"].exists()
+
+
+def test_a_lease_that_could_not_be_moved_keeps_the_journal_and_names_the_retry(
+    monkeypatch, tmp_path
+) -> None:
+    """The last stage fails narrowest: seal and IAM moved, some tags did not."""
+    manifest = expired_manifest()
+    monkeypatch.setattr(type(manifest), "round5_ready", property(lambda self: True))
+    recorded = _install_renew_fakes(monkeypatch, tmp_path, manifest)
+    monkeypatch.setattr(
+        lifecycle,
+        "_move_installation_lease",
+        lambda candidate, target: LeaseRenewal(
+            target=target,
+            resources=4,
+            renewed=3,
+            vanished=0,
+            failed=("iam-role AccessDenied",),
+            unreadable=(),
+            earliest=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        renew(ttl_hours=48)
+
+    message = str(caught.value)
+    assert "but not the lease on every AWS resource" in message
+    assert "3 of 4 resources moved" in message
+    assert "iam-role AccessDenied" in message
+    assert "cleanup is unaffected" in message
+    assert "re-run 'antidemo renew'" in message
     assert recorded["journal"].exists()
 
 

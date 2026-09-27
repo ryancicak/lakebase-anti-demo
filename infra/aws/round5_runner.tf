@@ -160,7 +160,7 @@ resource "aws_iam_policy" "round5_runner_boundary" {
   # by this ignore.
   lifecycle {
     create_before_destroy = true
-    ignore_changes        = [description]
+    ignore_changes        = [description, tags["expires-at"]]
   }
 }
 
@@ -172,6 +172,8 @@ resource "aws_iam_policy" "round5_competitor_runner_boundary" {
   tags = local.round5_policy_tags
 
   lifecycle {
+    ignore_changes = [tags["expires-at"]]
+
     create_before_destroy = true
   }
 }
@@ -183,6 +185,10 @@ resource "aws_iam_role" "round5_runner" {
   permissions_boundary = aws_iam_policy.round5_runner_boundary.arn
 
   tags = local.round5_iam_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_role" "round5_competitor_runner" {
@@ -197,6 +203,10 @@ resource "aws_iam_role" "round5_competitor_runner" {
   permissions_boundary = aws_iam_policy.round5_competitor_runner_boundary.arn
 
   tags = local.round5_iam_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "round5_runner_ssm" {
@@ -256,6 +266,10 @@ resource "aws_secretsmanager_secret" "round5_runner_control" {
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "lakebase"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_secretsmanager_secret" "round5_competitor_runner_control" {
@@ -265,6 +279,10 @@ resource "aws_secretsmanager_secret" "round5_competitor_runner_control" {
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "competitor"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_sqs_queue" "round5_lakebase_control" {
@@ -283,6 +301,10 @@ resource "aws_sqs_queue" "round5_lakebase_control" {
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "lakebase"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_sqs_queue" "round5_competitor_control" {
@@ -301,6 +323,10 @@ resource "aws_sqs_queue" "round5_competitor_control" {
   tags = merge(local.round5_required_tags, {
     "anti-demo-runner-lane" = "competitor"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_sqs_queue" "round5_lakebase_control_dlq" {
@@ -319,6 +345,10 @@ resource "aws_sqs_queue" "round5_lakebase_control_dlq" {
     "anti-demo-runner-lane" = "lakebase"
     "anti-demo-queue-role"  = "dead-letter"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_sqs_queue" "round5_competitor_control_dlq" {
@@ -337,6 +367,10 @@ resource "aws_sqs_queue" "round5_competitor_control_dlq" {
     "anti-demo-runner-lane" = "competitor"
     "anti-demo-queue-role"  = "dead-letter"
   })
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_role_policy" "round5_runner_baseline_secret" {
@@ -392,6 +426,10 @@ resource "aws_iam_instance_profile" "round5_runner" {
   role        = aws_iam_role.round5_runner.name
 
   tags = local.round5_iam_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_instance_profile" "round5_competitor_runner" {
@@ -401,6 +439,10 @@ resource "aws_iam_instance_profile" "round5_competitor_runner" {
   role        = aws_iam_role.round5_competitor_runner.name
 
   tags = local.round5_iam_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_instance" "round5_runner" {
@@ -432,6 +474,8 @@ resource "aws_instance" "round5_runner" {
   tags = local.round5_required_tags
 
   lifecycle {
+    ignore_changes = [tags["expires-at"], root_block_device[0].tags["expires-at"]]
+
     precondition {
       condition     = contains(local.selected_subnet_ids, local.selected_runner_subnet_id)
       error_message = "runner_subnet_id must be one of the selected database subnet_ids."
@@ -488,6 +532,8 @@ resource "aws_instance" "round5_competitor_runner" {
   })
 
   lifecycle {
+    ignore_changes = [tags["expires-at"], root_block_device[0].tags["expires-at"]]
+
     precondition {
       condition     = contains(local.selected_subnet_ids, local.selected_runner_subnet_id)
       error_message = "runner_subnet_id must be one of the selected database subnet_ids."

@@ -2156,8 +2156,9 @@ if [[ -f "$ANTI_DEMO_MANIFEST" ]]; then
   MANIFEST_ACCOUNT="$(jq -r '.aws.account_id' "$ANTI_DEMO_MANIFEST")"
   MANIFEST_REGION="$(jq -r '.aws.region' "$ANTI_DEMO_MANIFEST")"
   MANIFEST_USER="$(jq -r '.databricks.user' "$ANTI_DEMO_MANIFEST")"
-  MANIFEST_EXPIRY="$(jq -r '.expires_at' "$ANTI_DEMO_MANIFEST")"
-  ok "existing installation $MANIFEST_RUN, status $MANIFEST_STATUS, expires $MANIFEST_EXPIRY"
+  # The sealed expires_at is not printed: once the app has been used it is not
+  # the lease the resources carry (server/lease.py), and `doctor` reads that one.
+  ok "existing installation $MANIFEST_RUN, status $MANIFEST_STATUS"
   if ((RUN_AWS_SECTIONS == 1 && AWS_IDENTITY_OK == 1)); then
     [[ "$MANIFEST_ACCOUNT" == "$AWS_ACCOUNT_ID" ]] ||
       fail "This manifest owns resources in AWS account $MANIFEST_ACCOUNT but the supplied
@@ -2185,10 +2186,10 @@ if [[ -f "$ANTI_DEMO_MANIFEST" ]]; then
       (server/lifecycle.py:5148) refuses on exactly this mismatch. Use the original
       principal, or clean up and re-provision."
   fi
-  # Advisory by clock, structural by live inventory: the final 24 hours and a
-  # passed deadline are both reported, while per-resource checks decide what
-  # external account cleanup actually removed.
-  info "expires_at warns before external cleanup; live checks decide availability"
+  # Advisory by clock, structural by live inventory: `doctor` reports a lease in
+  # its final 24 hours, while per-resource checks decide what external account
+  # cleanup actually removed.
+  info "expires-at is a lease the app keeps moving while the installation is in use"
 else
   ok "no manifest yet; this will be a first provision (TTL ${TTL_HOURS}h)"
   if [[ "$MODE" == "deploy" ]]; then
@@ -2666,9 +2667,11 @@ aurora_floor_daily() {
 }
 
 cat <<SUMMARY
-  This provisions real, billed infrastructure. External account automation may
-  reap tagged AWS resources at expires-at, but that can leave a partial
-  installation; only 'antidemo cleanup --yes' verifies deliberate teardown.
+  This provisions real, billed infrastructure. Its expires-at tag is a lease the
+  app moves forward while anyone uses the installation; unused for ${TTL_HOURS}h,
+  it lapses, and account automation that honors the tag may reap it, which can
+  leave a partial installation. Only 'antidemo cleanup --yes' verifies
+  deliberate teardown.
   Counts come from infra/aws (locals.tf v7_round_keys and
   v7_rds_round_keys); rates are the us-west-2 list prices in
   server/cost_model.py, which is authoritative for the app's own accounting.
