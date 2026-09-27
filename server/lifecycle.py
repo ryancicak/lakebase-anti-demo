@@ -9426,7 +9426,12 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
             if tags is None and role_name:
                 tags = iam.list_role_tags(RoleName=role_name).get("Tags", [])
             if identity in static_iam_roles:
-                if tags_for(tags or []) != expected_static_iam_tags:
+                # Exact on everything but the lease, which the app moves while
+                # the installation is in use and which proves nothing about
+                # ownership (`server/lease.py`). An extra tag still refuses.
+                static_tags = tags_for(tags or [])
+                static_tags.pop("expires-at", None)
+                if static_tags != expected_static_iam_tags:
                     raise RuntimeError(
                         "Round 5 cleanup refused: static Terraform ownership tags differ for "
                         f"{identity}"
