@@ -1680,21 +1680,42 @@ DATABRICKS_ARGS=(-p "$DATABRICKS_PROFILE" -o json)
 
 DATABRICKS_OK=0
 DATABRICKS_PRINCIPAL=""
-if ME_JSON="$(databricks current-user me "${DATABRICKS_ARGS[@]}" 2>&1)"; then
+# The reply is stdout alone, and a reply without a userName is asked again. Both
+# because a fresh install stopped here on 2026-09-26 with "returned no workspace
+# userName" while the same call, made by hand straight after, answered cleanly
+# every time: with stderr folded into the reply, anything the CLI says on stderr
+# turns a good answer into one jq cannot read. A failed call is not retried --
+# the cases below are all persistent, and each is told apart from its stderr.
+ME_ERR_FILE="$(mktemp)"
+ME_STATUS=0
+for ME_ATTEMPT in 1 2 3; do
+  ME_STATUS=0
+  ME_JSON="$(databricks current-user me "${DATABRICKS_ARGS[@]}" 2>"$ME_ERR_FILE")" || ME_STATUS=$?
+  ((ME_STATUS == 0)) || break
   DATABRICKS_PRINCIPAL="$(printf '%s' "$ME_JSON" | jq -r '.userName // empty' 2>/dev/null || true)"
+  [[ -n "$DATABRICKS_PRINCIPAL" ]] && break
+  ((ME_ATTEMPT < 3)) && sleep "$ME_ATTEMPT"
+done
+ME_ERR="$(cat "$ME_ERR_FILE" 2>/dev/null || true)"
+rm -f "$ME_ERR_FILE"
+if ((ME_STATUS == 0)); then
   if [[ -n "$DATABRICKS_PRINCIPAL" ]]; then
     DATABRICKS_OK=1
     ok "authenticated as $DATABRICKS_PRINCIPAL"
   else
     # A 200 with no userName is not an identity. Naming the host keeps this from
     # reading as a credential problem when the reply came from the wrong place
-    # (an account-console URL, a proxy login page).
+    # (an account-console URL, a proxy login page) -- and quoting the reply says
+    # which of those it was.
     fail "Databricks answered at $DATABRICKS_HOST but returned no workspace userName, so no
-      identity could be established. Confirm DATABRICKS_HOST is a workspace URL, not an
-      account console. server/lifecycle.py:_verify_databricks_identity requires a userName
-      and refuses to provision without one."
+      identity could be established (asked 3 times). Confirm DATABRICKS_HOST is a workspace
+      URL, not an account console. server/lifecycle.py:_verify_databricks_identity requires
+      a userName and refuses to provision without one. It answered:
+        $(sanitize_databricks_output "$ME_JSON$ME_ERR" | tr '\n' ' ' | cut -c1-240)"
   fi
 else
+  # Classified from everything the CLI said, as it always was.
+  ME_JSON="$ME_JSON${ME_JSON:+$'\n'}$ME_ERR"
   # One failure, three causes. Say which, name the host in every branch, and echo
   # a secret-redacted tail of the control plane's own words.
   DB_ERR="$(sanitize_databricks_output "$ME_JSON" | tail -4)"
