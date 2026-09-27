@@ -2084,13 +2084,29 @@ if ((DATABRICKS_OK == 1)) &&
     # one cannot, and offering it the line that adopts the app hands it the hijack.
     [[ -f "$ANTI_DEMO_MANIFEST" ]] && APP_OWN_LINE="
         * if it is this installation's app, say so: DATABRICKS_APP_CLIENT_ID=$APP_PROBE_CLIENT_ID"
+    # A name that is actually free. The suggestion used to be a fixed
+    # "lakebase-anti-demo-2" -- the second installation's own name by the time a
+    # third arrived, so following the advice was refused with the same advice
+    # (2026-09-27). One listing, then the first unused lakebase-anti-demo-N.
+    APP_NAMES_TAKEN="$(databricks apps list "${DATABRICKS_ARGS[@]}" 2>/dev/null |
+      jq -r 'if type == "array" then .[] else (.apps // [])[] end | .name // empty' 2>/dev/null || true)"
+    SUGGESTED_APP_NAME=""
+    for APP_SUFFIX in $(seq 2 99); do
+      APP_CANDIDATE="lakebase-anti-demo-$APP_SUFFIX"
+      [[ "$APP_CANDIDATE" == "$APP_NAME" ]] && continue
+      printf '%s\n' "$APP_NAMES_TAKEN" | grep -qxF -- "$APP_CANDIDATE" && continue
+      SUGGESTED_APP_NAME="$APP_CANDIDATE"
+      break
+    done
+    [[ -n "$SUGGESTED_APP_NAME" ]] || SUGGESTED_APP_NAME="lakebase-anti-demo-<your-initials>"
     fail "A Databricks App named '$APP_NAME' already exists in this workspace, and nothing in
       this installation ($(basename "$MANIFEST_DIR")) says it is this installation's, so it
       is almost certainly serving another one. Adopting it would publish this installation
       into it and replace that demo. Nothing has been created. Either:
         * give this installation its own app -- add a line to $ENV_FILE:
-              DATABRICKS_APP_NAME=lakebase-anti-demo-2
-          (lowercase letters, digits and hyphens; any name no app in the workspace has), or
+              DATABRICKS_APP_NAME=$SUGGESTED_APP_NAME
+          (no app in this workspace has that name yet; any unused name of lowercase
+          letters, digits and hyphens works), or
         * if that app is left over from an installation whose directory is gone, delete
           it first: databricks apps delete $APP_NAME -p $DATABRICKS_PROFILE$APP_OWN_LINE"
   elif [[ "$APP_PROBE_CLIENT_ID" != "$APP_KNOWN_CLIENT_ID" ]]; then

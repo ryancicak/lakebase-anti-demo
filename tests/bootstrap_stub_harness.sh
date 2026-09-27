@@ -232,6 +232,16 @@ case "$args" in
   *"catalogs get"*)
     [[ "${STUB_CATALOG_MISSING:-0}" == "1" ]] && { echo "does not exist" >&2; exit 1; }
     echo '{"name":"stubcat"}' ;;
+  *"apps list"*)
+    # STUB_APP_LIST: space-separated names already taken in the workspace, which
+    # is what a refusal's suggested free name is chosen against.
+    printf '['
+    sep=""
+    for app_name in ${STUB_APP_LIST:-}; do
+      printf '%s{"name":"%s"}' "$sep" "$app_name"
+      sep=","
+    done
+    printf ']\n' ;;
   *"apps get"*)
     app_marker="${STUB_STATE_DIR:-/tmp}/app-created"
     attempt_marker="${STUB_STATE_DIR:-/tmp}/app-create-attempted"
@@ -601,6 +611,18 @@ case_foreign_app_is_not_adopted() {
     printf '  %sFAIL%s the refusal exited 0\n' "$RED" "$RESET"
     FAIL=$((FAIL + 1))
   fi
+
+  # A third installation, 2026-09-27: the fixed suggestion was the second
+  # installation's own name by then, so following the advice was refused with the
+  # same advice. The suggestion is the first name nothing in the workspace has.
+  STUB_APP_MISSING=0 STUB_APP_LIST="lakebase-anti-demo lakebase-anti-demo-2" run "$sb"
+  check "suggests a name that is actually free" "DATABRICKS_APP_NAME=lakebase-anti-demo-3"
+  sb3="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json
+DATABRICKS_APP_NAME=lakebase-anti-demo-2" sandbox)"
+  STUB_APP_MISSING=0 STUB_APP_LIST="lakebase-anti-demo lakebase-anti-demo-2" run "$sb3"
+  check "a taken chosen name is refused too" "A Databricks App named 'lakebase-anti-demo-2' already exists"
+  check_absent "and never suggested back" "DATABRICKS_APP_NAME=lakebase-anti-demo-2"
+  check "but the next free one is" "DATABRICKS_APP_NAME=lakebase-anti-demo-3"
 
   STUB_APP_MISSING=0 run "$sb" --apply --deploy-app --yes
   mutations="$(grep -E 'apps create|apps deploy|apps update|secrets create-scope|secrets put-secret' \
