@@ -195,6 +195,19 @@ case "$args" in
       echo '{"id":"42"}'
       exit 0
     fi
+    # STUB_DB_ME_NOISE puts a notice on stderr beside a good reply, which is
+    # what a reply read with stderr folded in turned into "no userName".
+    [[ -n "${STUB_DB_ME_NOISE:-}" ]] && printf '%s\n' "$STUB_DB_ME_NOISE" >&2
+    # STUB_DB_ME_BLIPS answers that many times without a userName first, then
+    # properly: the transient the retry exists for.
+    if [[ -n "${STUB_DB_ME_BLIPS:-}" && -n "${STUB_STATE_DIR:-}" ]]; then
+      me_count="$STUB_STATE_DIR/current-user-me-calls"
+      echo "$(( $(cat "$me_count" 2>/dev/null || echo 0) + 1 ))" >"$me_count"
+      if (( $(cat "$me_count") <= STUB_DB_ME_BLIPS )); then
+        echo '{}'
+        exit 0
+      fi
+    fi
     echo "{\"userName\":\"${STUB_DB_USER:-stub@example.com}\",\"id\":\"42\"}" ;;
   *"postgres list-projects"*)
     # STUB_LAKEBASE_FAILS reproduces an authenticated principal that still cannot
@@ -219,6 +232,16 @@ case "$args" in
   *"catalogs get"*)
     [[ "${STUB_CATALOG_MISSING:-0}" == "1" ]] && { echo "does not exist" >&2; exit 1; }
     echo '{"name":"stubcat"}' ;;
+  *"apps list"*)
+    # STUB_APP_LIST: space-separated names already taken in the workspace, which
+    # is what a refusal's suggested free name is chosen against.
+    printf '['
+    sep=""
+    for app_name in ${STUB_APP_LIST:-}; do
+      printf '%s{"name":"%s"}' "$sep" "$app_name"
+      sep=","
+    done
+    printf ']\n' ;;
   *"apps get"*)
     app_marker="${STUB_STATE_DIR:-/tmp}/app-created"
     attempt_marker="${STUB_STATE_DIR:-/tmp}/app-create-attempted"
@@ -588,6 +611,18 @@ case_foreign_app_is_not_adopted() {
     printf '  %sFAIL%s the refusal exited 0\n' "$RED" "$RESET"
     FAIL=$((FAIL + 1))
   fi
+
+  # A third installation, 2026-09-27: the fixed suggestion was the second
+  # installation's own name by then, so following the advice was refused with the
+  # same advice. The suggestion is the first name nothing in the workspace has.
+  STUB_APP_MISSING=0 STUB_APP_LIST="lakebase-anti-demo lakebase-anti-demo-2" run "$sb"
+  check "suggests a name that is actually free" "DATABRICKS_APP_NAME=lakebase-anti-demo-3"
+  sb3="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json
+DATABRICKS_APP_NAME=lakebase-anti-demo-2" sandbox)"
+  STUB_APP_MISSING=0 STUB_APP_LIST="lakebase-anti-demo lakebase-anti-demo-2" run "$sb3"
+  check "a taken chosen name is refused too" "A Databricks App named 'lakebase-anti-demo-2' already exists"
+  check_absent "and never suggested back" "DATABRICKS_APP_NAME=lakebase-anti-demo-2"
+  check "but the next free one is" "DATABRICKS_APP_NAME=lakebase-anti-demo-3"
 
   STUB_APP_MISSING=0 run "$sb" --apply --deploy-app --yes
   mutations="$(grep -E 'apps create|apps deploy|apps update|secrets create-scope|secrets put-secret' \
@@ -1459,8 +1494,20 @@ case_databricks_identity_failures() {
   status=$?
   check "no-userName is named, not swallowed" "returned no workspace userName"
   check "no-userName names the host" "$host"
+  check "no-userName quotes what came back" "It answered:"
   _id_failclosed "no-userName"
   _id_nonzero "no-userName" "$status"
+
+  # 2026-09-26: a fresh install stopped here on a reply that a direct re-run of
+  # the same call read cleanly. A notice on stderr is not part of the reply, and
+  # one blip without a userName is asked again rather than reported.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_ME_NOISE="Warning: a newer Databricks CLI is available" run "$sb"
+  check "a stderr notice does not spoil a good reply" "authenticated as stub@example.com"
+  STUB_STATE_DIR="$sb" STUB_DB_ME_BLIPS=2 run "$sb"
+  check "two blips then an answer still authenticates" "authenticated as stub@example.com"
+  check_absent "and are not reported" "returned no workspace userName"
 
   # Authenticated, but Lakebase not usable by this principal.
   gen="$(mktemp -d)/gen"

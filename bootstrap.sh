@@ -1680,21 +1680,42 @@ DATABRICKS_ARGS=(-p "$DATABRICKS_PROFILE" -o json)
 
 DATABRICKS_OK=0
 DATABRICKS_PRINCIPAL=""
-if ME_JSON="$(databricks current-user me "${DATABRICKS_ARGS[@]}" 2>&1)"; then
+# The reply is stdout alone, and a reply without a userName is asked again. Both
+# because a fresh install stopped here on 2026-09-26 with "returned no workspace
+# userName" while the same call, made by hand straight after, answered cleanly
+# every time: with stderr folded into the reply, anything the CLI says on stderr
+# turns a good answer into one jq cannot read. A failed call is not retried --
+# the cases below are all persistent, and each is told apart from its stderr.
+ME_ERR_FILE="$(mktemp)"
+ME_STATUS=0
+for ME_ATTEMPT in 1 2 3; do
+  ME_STATUS=0
+  ME_JSON="$(databricks current-user me "${DATABRICKS_ARGS[@]}" 2>"$ME_ERR_FILE")" || ME_STATUS=$?
+  ((ME_STATUS == 0)) || break
   DATABRICKS_PRINCIPAL="$(printf '%s' "$ME_JSON" | jq -r '.userName // empty' 2>/dev/null || true)"
+  [[ -n "$DATABRICKS_PRINCIPAL" ]] && break
+  ((ME_ATTEMPT < 3)) && sleep "$ME_ATTEMPT"
+done
+ME_ERR="$(cat "$ME_ERR_FILE" 2>/dev/null || true)"
+rm -f "$ME_ERR_FILE"
+if ((ME_STATUS == 0)); then
   if [[ -n "$DATABRICKS_PRINCIPAL" ]]; then
     DATABRICKS_OK=1
     ok "authenticated as $DATABRICKS_PRINCIPAL"
   else
     # A 200 with no userName is not an identity. Naming the host keeps this from
     # reading as a credential problem when the reply came from the wrong place
-    # (an account-console URL, a proxy login page).
+    # (an account-console URL, a proxy login page) -- and quoting the reply says
+    # which of those it was.
     fail "Databricks answered at $DATABRICKS_HOST but returned no workspace userName, so no
-      identity could be established. Confirm DATABRICKS_HOST is a workspace URL, not an
-      account console. server/lifecycle.py:_verify_databricks_identity requires a userName
-      and refuses to provision without one."
+      identity could be established (asked 3 times). Confirm DATABRICKS_HOST is a workspace
+      URL, not an account console. server/lifecycle.py:_verify_databricks_identity requires
+      a userName and refuses to provision without one. It answered:
+        $(sanitize_databricks_output "$ME_JSON$ME_ERR" | tr '\n' ' ' | cut -c1-240)"
   fi
 else
+  # Classified from everything the CLI said, as it always was.
+  ME_JSON="$ME_JSON${ME_JSON:+$'\n'}$ME_ERR"
   # One failure, three causes. Say which, name the host in every branch, and echo
   # a secret-redacted tail of the control plane's own words.
   DB_ERR="$(sanitize_databricks_output "$ME_JSON" | tail -4)"
@@ -2063,13 +2084,29 @@ if ((DATABRICKS_OK == 1)) &&
     # one cannot, and offering it the line that adopts the app hands it the hijack.
     [[ -f "$ANTI_DEMO_MANIFEST" ]] && APP_OWN_LINE="
         * if it is this installation's app, say so: DATABRICKS_APP_CLIENT_ID=$APP_PROBE_CLIENT_ID"
+    # A name that is actually free. The suggestion used to be a fixed
+    # "lakebase-anti-demo-2" -- the second installation's own name by the time a
+    # third arrived, so following the advice was refused with the same advice
+    # (2026-09-27). One listing, then the first unused lakebase-anti-demo-N.
+    APP_NAMES_TAKEN="$(databricks apps list "${DATABRICKS_ARGS[@]}" 2>/dev/null |
+      jq -r 'if type == "array" then .[] else (.apps // [])[] end | .name // empty' 2>/dev/null || true)"
+    SUGGESTED_APP_NAME=""
+    for APP_SUFFIX in $(seq 2 99); do
+      APP_CANDIDATE="lakebase-anti-demo-$APP_SUFFIX"
+      [[ "$APP_CANDIDATE" == "$APP_NAME" ]] && continue
+      printf '%s\n' "$APP_NAMES_TAKEN" | grep -qxF -- "$APP_CANDIDATE" && continue
+      SUGGESTED_APP_NAME="$APP_CANDIDATE"
+      break
+    done
+    [[ -n "$SUGGESTED_APP_NAME" ]] || SUGGESTED_APP_NAME="lakebase-anti-demo-<your-initials>"
     fail "A Databricks App named '$APP_NAME' already exists in this workspace, and nothing in
       this installation ($(basename "$MANIFEST_DIR")) says it is this installation's, so it
       is almost certainly serving another one. Adopting it would publish this installation
       into it and replace that demo. Nothing has been created. Either:
         * give this installation its own app -- add a line to $ENV_FILE:
-              DATABRICKS_APP_NAME=lakebase-anti-demo-2
-          (lowercase letters, digits and hyphens; any name no app in the workspace has), or
+              DATABRICKS_APP_NAME=$SUGGESTED_APP_NAME
+          (no app in this workspace has that name yet; any unused name of lowercase
+          letters, digits and hyphens works), or
         * if that app is left over from an installation whose directory is gone, delete
           it first: databricks apps delete $APP_NAME -p $DATABRICKS_PROFILE$APP_OWN_LINE"
   elif [[ "$APP_PROBE_CLIENT_ID" != "$APP_KNOWN_CLIENT_ID" ]]; then
