@@ -158,8 +158,9 @@ sites by `server/aws_permissions.py` rather than listed in the test, so adding a
   4 Aurora, 3 RDS, 1 runner (`network.tf`). Round 5 creates one more per bout at
   runtime (`server/connection_spike_live.py`). `vpc/*` is included because
   `ec2:CreateSecurityGroup` authorises the target VPC as a dependent resource.
-- **`RunAndRetireRound5Runner`** — one `m6i.large` with a 20 GiB encrypted gp3
-  root volume, IMDSv2 required (`round5_runner.tf:147`).
+- **`RunAndRetireRound5Runner`** — two `c7i.2xlarge` runners, one per Round 5
+  lane, each with a 20 GiB encrypted gp3 root volume and IMDSv2 required
+  (`round5_runner.tf`; `variables.tf` refuses any other instance type).
 - **`ReadAmazonLinuxAmiPointerOnly`** — scoped to the single SSM public
   parameter path the AMI is resolved from (`round5_runner.tf:3`). This grants no
   access to any parameter you own.
@@ -418,7 +419,7 @@ Give these to whoever approves the policy.
    shared account, and prefer a dedicated sandbox account.
 2. **`ec2:RunInstances` and `ec2:CreateVolume` on `*`, region-scoped only.**
    EC2 cannot restrict instance type or AMI through a resource ARN. The demo
-   needs exactly one `m6i.large`. **Mitigation:** add a condition on
+   needs exactly two `c7i.2xlarge`. **Mitigation:** add a condition on
    `ec2:InstanceType` and `ec2:Vpc` if your account standard requires it; the
    demo will still work.
 3. **`rds:CreateDBProxy` and `rds:CreateDBInstance`-class actions where the

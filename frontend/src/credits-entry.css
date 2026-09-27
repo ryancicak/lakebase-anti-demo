@@ -264,3 +264,21 @@
   text-align: center;
   text-transform: uppercase;
 }
+/* Which release this is, under the mark and quieter than it, the way a
+   cartridge label carries its revision. */
+.credits-outro-version {
+  color: #8f9bd0;
+  font-size: clamp(6px, .55vw, 11px);
+  letter-spacing: .18em;
+  text-align: center;
+}
+
+/* The same, on the roll's title beat. See the note in credits.tsx. */
+.credits-version {
+  display: block;
+  margin: 0;
+  color: #8f9bd0;
+  font-size: clamp(6px, .55vw, 11px);
+  letter-spacing: .18em;
+  text-align: center;
+}

@@ -13,6 +13,7 @@ import { Credits, CONTRIBUTE_REPO, CONTRIBUTE_URL } from './credits'
 import { CREDITS_THEME_BELL_SECONDS } from './credits-score'
 import type { CreditsTally } from './credits-tally'
 import type { CompetitorDefinition } from './api/types'
+import { APP_VERSION_LABEL } from './version'
 
 /* Both paths matter here. The roll is animated, so "is the link clickable" has
    a different answer while it is crawling than it does under reduced motion,
@@ -496,6 +497,24 @@ describe('the held card after the crawl', () => {
     // The two coloured rules either side of the name are the one piece of the
     // old production line worth keeping here.
     expect(outro.querySelectorAll('.credits-outro-title > span')).toHaveLength(2)
+  })
+
+  it('says which release this is, on the held card and at the end of the roll', async () => {
+    motion.reduced = false
+    const user = userEvent.setup()
+    const { container } = roll()
+
+    // The roll carries it on its own, on its title beat -- never after the
+    // author card it closes on -- because under reduced motion the held card
+    // is never shown.
+    const title = container.querySelector('.credits-roll .credits-title') as HTMLElement
+    expect(within(title).getByText(APP_VERSION_LABEL)).toBeInTheDocument()
+    expect(APP_VERSION_LABEL).toMatch(/^v\d+\.\d+\.\d+$/)
+
+    await user.click(container.querySelector('.credits-frame') as HTMLElement)
+
+    const outro = container.querySelector('.credits-outro') as HTMLElement
+    expect(within(outro).getByText(APP_VERSION_LABEL)).toBeInTheDocument()
   })
 
   it('does not claim authorship a second time', async () => {
