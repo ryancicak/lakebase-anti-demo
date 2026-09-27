@@ -1324,8 +1324,16 @@ def test_round5_inventory_distinguishes_static_terraform_role_from_bout_roles(
                     {
                         "Arn": control_role_arn,
                         "RoleName": f"{prefix}exec-static",
+                        # What Terraform really writes on the role, including the
+                        # `expires-at` lease -- here one the app has since moved.
+                        # A fixture built from the expected set alone once hid an
+                        # exact comparison that refused every real installation.
                         "Tags": [
-                            {"Key": key, "Value": value} for key, value in static_tags.items()
+                            {"Key": key, "Value": value}
+                            for key, value in {
+                                **static_tags,
+                                "expires-at": "2031-01-01T00:00:00Z",
+                            }.items()
                         ],
                     },
                     {
