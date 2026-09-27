@@ -17,6 +17,7 @@ EXPECTED_CASES = {
     "case_operator_ip_fallback",
     "case_foreign_app_is_not_adopted",
     "case_first_deploy_is_not_called_broken",
+    "case_reaped_installation_starts_over",
     "case_multiple_warehouses_are_derived",
     "case_banned_files",
     "case_print_env",

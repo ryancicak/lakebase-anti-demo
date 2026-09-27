@@ -722,6 +722,111 @@ case_first_deploy_is_not_called_broken() {
   check "a deployed app serving 502 still is" "It is already broken"
 }
 
+# 2026-09-27: a directory whose `ready` installation a sandbox reaper deleted was
+# refused as "already ready". The early gate now asks `antidemo presence` (a stub
+# here) first: all gone starts over, anything left is refused with what is left.
+case_reaped_installation_starts_over() {
+  printf '\n%s== a reaped installation starts over; anything left is refused ==%s\n' "$BOLD" "$RESET"
+  local sb gen source status archived
+
+  # Called as $(...), a subshell, so the generation it made is left in the
+  # sandbox for the caller to read back rather than in a variable.
+  reaped_sandbox() { # <presence JSON> -> prints the sandbox; $box/gen holds the generation
+    local box
+    gen="$(mktemp -d)/gen"
+    write_manifest "$gen/manifest.json"
+    python3 - "$gen/manifest.json" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+doc = json.loads(p.read_text())
+doc["round6"] = {"sealed": True}  # a complete seal, which is what the early gate refuses
+p.write_text(json.dumps(doc, indent=2) + "\n")
+PY
+    printf '{"databricks_app_name": "lakebase-anti-demo", "databricks_app_client_id": "app-client-stub"}\n' \
+      >"$gen/bootstrap.json"
+    source="$(dirname "$gen")/fresh-source.json"
+    write_manifest "$source"
+    box="$(EXTRA_ENV=$'ANTI_DEMO_MANIFEST='"$gen"$'/manifest.json\nANTI_DEMO_EXECUTABLE='"$gen"$'/../apply-stub' sandbox)"
+    printf '#!/usr/bin/env bash\nset -eu\ncp "%s" "$ANTI_DEMO_MANIFEST"\n' "$source" >"$gen/../apply-stub"
+    chmod +x "$gen/../apply-stub"
+    printf '%s\n' "$1" >"$box/presence.json"
+    printf '#!/usr/bin/env bash\n[ "$1" = presence ] || exit 9\ncat "%s"\n' "$box/presence.json" >"$box/presence"
+    chmod +x "$box/presence"
+    printf '%s' "$gen" >"$box/gen"
+    printf '%s' "$box"
+  }
+
+  sb="$(reaped_sandbox '{"gone": true, "run_id": "ad-19700101-0000-stub", "aws": {"state": "verified_missing", "sealed": 13, "absent": 13, "reason": ""}, "lakebase": {"expected": 7, "absent": 7, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
+  gen="$(cat "$sb/gen")"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  status=$?
+  check "says a ready-looking installation is gone" "says 'ready', but it is gone"
+  check "quotes what was read" "AWS: 13 of 13 sealed resources absent"
+  check "moves the dead records aside" "moved the reaped installation's records to"
+  check "and carries on as a first install" "this will be a first provision"
+  check "re-adopts the app this directory made" "the app $gen/bootstrap.json recorded"
+  archived="$(find "$gen" -maxdepth 2 -path '*/reaped-*/manifest.json' | head -1)"
+  if ((status == 0)) && [[ -n "$archived" && -f "$gen/bootstrap.json" && -f "$gen/manifest.json" ]]; then
+    printf '  %sok%s   old manifest archived, provenance kept, fresh manifest written\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s status=%s archived=%s\n' "$RED" "$RESET" "$status" "${archived:-none}"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # Some of it still there: never started over, and told what is left.
+  sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "verified_missing", "sealed": 13, "absent": 3, "reason": ""}, "lakebase": {"expected": 7, "absent": 0, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
+  gen="$(cat "$sb/gen")"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  status=$?
+  check "a partial reap is refused" "already 'ready', and --apply is not a resume"
+  check "with what is left of it" "AWS: 3 of 13 sealed resources absent"
+  check "and the way to start over" "./antidemo cleanup --yes   then   ./bootstrap.sh --apply --deploy-app"
+  if ((status != 0)) && [[ -z "$(find "$gen" -maxdepth 1 -name 'reaped-*')" ]]; then
+    printf '  %sok%s   nothing was moved aside\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a partial reap was started over (status %s)\n' "$RED" "$RESET" "$status"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # The fortnightly AWS sweep: AWS all gone, workspace intact. The recovery for
+  # that already exists (setup on a ready install), so it is offered in place.
+  sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "verified_missing", "sealed": 13, "absent": 13, "reason": ""}, "lakebase": {"expected": 7, "absent": 0, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
+  gen="$(cat "$sb/gen")"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  status=$?
+  check "a swept installation is recognised" "That is what the AWS sandbox sweep leaves behind"
+  check "and rebuilt in place" "rebuilding in place: 'antidemo setup' re-applies Terraform"
+  check_absent "not refused as ready" "--apply is not a resume"
+  if ((status == 0)) && [[ -z "$(find "$gen" -maxdepth 1 -name 'reaped-*')" ]]; then
+    printf '  %sok%s   rebuilt without moving its records aside\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s the swept rebuild exited %s or moved records aside\n' "$RED" "$RESET" "$status"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # AWS unreadable -- the sweep takes the IAM users too: never "gone".
+  sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "unverified", "sealed": 13, "absent": 0, "reason": "InvalidClientTokenId"}, "lakebase": {"expected": 7, "absent": 0, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  check "an unreadable account is refused" "already 'ready', and --apply is not a resume"
+  check "names why" "unverified: InvalidClientTokenId"
+  check "and says to replace the key pair" "put a new key pair in"
+
+  # All of it there: the refusal it always was, plus the reading.
+  sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "verified_present", "sealed": 13, "absent": 0, "reason": ""}, "lakebase": {"expected": 7, "absent": 0, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  check "a healthy installation is still refused" "./bootstrap.sh --deploy-only   republish the seal"
+  check_absent "without start-over advice" "remove what is left"
+
+  # No reading at all: exactly the old refusal.
+  sb="$(reaped_sandbox '')"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  check "no reading is still a refusal" "already 'ready', and --apply is not a resume"
+  check_absent "that quotes nothing" "What is left of it"
+}
+
 case_multiple_warehouses_are_derived() {
   printf '\n%s== multiple warehouses need no sixth input ==%s\n' "$BOLD" "$RESET"
   local sb gen status
@@ -2239,6 +2344,7 @@ CASES=(
   case_operator_ip_fallback
   case_foreign_app_is_not_adopted
   case_first_deploy_is_not_called_broken
+  case_reaped_installation_starts_over
   case_multiple_warehouses_are_derived
   case_five_input_full_acceptance
   case_fresh_app_creation_provenance

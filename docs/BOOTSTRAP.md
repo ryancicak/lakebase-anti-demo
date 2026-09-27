@@ -335,6 +335,30 @@ If the app under the name is left over from an installation whose directory is
 gone, delete it instead (`databricks apps delete <name> -p <profile>`) and run
 again; the new installation creates a fresh one.
 
+### If a sandbox reaper deleted your installation
+
+Run the same command again: `./bootstrap.sh --apply --deploy-app`. Before it
+refuses to re-provision an installation whose manifest says `ready`, it asks
+`./antidemo presence` — read-only, and it writes nothing — what is really left:
+
+- **All of it is gone** (every sealed AWS resource and every Lakebase project was
+  read and none exists): it says so, asks once (`--yes` answers for you), moves
+  the dead installation's records into `.anti-demo-v7/reaped-<time>/`, and
+  installs afresh in the same directory. `bootstrap.json` stays behind, because
+  it is how the new installation recognises — and can re-adopt — the app and
+  secret scope this directory created. If a sweep also deleted the installation's
+  runtime role, the check reads AWS with your own keys instead, only once IAM
+  itself says the role no longer exists.
+- **Some of it is still there**: it refuses, lists what is left, and names the
+  way to start over — `./antidemo cleanup --yes`, then run the installer again.
+  Nothing is moved aside while anything could still be billing.
+- **All of it is there**: the ordinary refusal above; nothing was reaped.
+
+If the reaper took your credentials too — the IAM user behind
+`AWS_ACCESS_KEY_ID`, the workspace behind `DATABRICKS_HOST` or its service
+principal — the preflight says which of the five inputs no longer works, and
+nothing starts until you replace it in `.env.bootstrap`.
+
 "Highest" is now numeric rather than lexical. The previous last-wins loop over
 `.anti-demo-v*/` would have adopted `.anti-demo-v9` while `.anti-demo-v10` was
 the live installation, because `v10` sorts before `v7` as a string — and then

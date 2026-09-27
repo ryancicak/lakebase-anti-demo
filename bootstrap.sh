@@ -677,7 +677,15 @@ apply_targets_complete_ready_install() { # <manifest path, possibly empty>
 # Refused rather than confirmed, because the overwhelmingly common reason to be
 # here on a ready install is wanting the app redeployed -- which is
 # --deploy-only, touches no database and runs no Terraform.
-refuse_ready_install() { # <run id, possibly empty>
+refuse_ready_install() { # <run id, possibly empty> [what is left of it] [what to do about it]
+  local left=""
+  if [[ -n "${2:-}" ]]; then
+    left="
+       What is left of it, read just now:
+$2
+${3:-}
+"
+  fi
   die "installation ${1:-} is already 'ready', and --apply is not a resume of it.
 
        './antidemo setup' would reconcile it: 'terraform plan' and 'terraform apply'
@@ -695,13 +703,111 @@ refuse_ready_install() { # <run id, possibly empty>
        return to a known state -- say so explicitly:
 
          ./bootstrap.sh --apply --reset-ready
-
+$left
        Nothing was changed."
+}
+
+# The lines `antidemo presence` (server/lifecycle.py:installation_remnants)
+# reports, as a refusal quotes them. Empty when there is no report to quote.
+remnants_summary() { # <presence JSON>
+  printf '%s' "$1" | jq -r '
+    select(type == "object" and has("aws")) |
+    "         AWS: \(.aws.absent) of \(.aws.sealed) sealed resources absent (\(.aws.state)" +
+      (if (.aws.reason // "") != "" then ": \(.aws.reason)" else "" end) + ")",
+    "         Lakebase: \(.lakebase.absent) of \(.lakebase.expected) projects absent" +
+      (if .lakebase.unreadable > 0 then ", \(.lakebase.unreadable) could not be read" else "" end),
+    "         Databricks App \(.app.name): \(.app.state)"' 2>/dev/null || true
+}
+
+# A `ready` manifest whose installation a sandbox reaper has deleted is not an
+# installation to protect from a re-provision: it is a directory to start again
+# in (asked for on 2026-09-27). Asked here, before anything is written, by the
+# read-only `antidemo presence`, which uses only what this directory already
+# has -- its venv, its manifest's own Databricks profile and the AWS pair
+# ./antidemo carries from the env file. Anything short of "every sealed AWS
+# resource and every Lakebase project was read and is gone" keeps the refusal,
+# which then says what is left.
+recover_if_reaped() { # <manifest path>
+  local manifest="$1" run dir report summary verdict answer archive entry
+  run="$(jq -r '.run_id // empty' "$manifest" 2>/dev/null || true)"
+  dir="$(dirname "$manifest")"
+  report=""
+  if [[ -n "${ANTI_DEMO_PRESENCE_EXECUTABLE:-}" || -x "$ROOT/.venv/bin/python" ]]; then
+    report="$(ANTI_DEMO_MANIFEST="$manifest" ANTI_DEMO_ENV_FILE="$ENV_FILE_ABS" \
+      "${ANTI_DEMO_PRESENCE_EXECUTABLE:-$ROOT/antidemo}" presence 2>/dev/null | tail -1 || true)"
+  fi
+  summary="$(remnants_summary "$report")"
+  verdict="$(printf '%s' "$report" | jq -r '
+    if (.gone // false) then "gone"
+    elif .aws.state == "verified_missing" and (.aws.sealed // 0) > 0
+         and .aws.absent == .aws.sealed and (.lakebase.expected // 0) > 0
+         and .lakebase.absent == 0 and .lakebase.unreadable == 0 then "swept"
+    elif .aws.state == "unverified" then "unreadable"
+    elif (.aws.absent // 0) > 0 or (.lakebase.absent // 0) > 0 then "partial"
+    else "whole" end' 2>/dev/null || true)"
+  case "$verdict" in
+    gone) ;;
+    swept)
+      # The account's fortnightly sweep takes the AWS side and leaves the
+      # workspace alone, and the recovery for exactly that already exists:
+      # `antidemo setup` on a ready install re-applies Terraform and reseeds
+      # (tests/test_reaper_recovery.py). So this is --reset-ready, offered.
+      say ""
+      warn "installation $run says 'ready', but its AWS side is gone: every sealed AWS resource
+        was read just now and none of them exists, while its Lakebase projects are intact.
+        That is what the AWS sandbox sweep leaves behind.
+$summary"
+      if ((ASSUME_YES == 0)); then
+        [[ -t 0 ]] || die "rebuilding a swept installation needs a terminal to confirm on, or --yes"
+        printf '  Rebuild the AWS side in place (terraform apply, then a reseed)? [y/N] '
+        read -r answer </dev/tty || answer=""
+        [[ "$answer" == [yY]* ]] || die "not confirmed; nothing was changed"
+      fi
+      RESET_READY=1
+      info "rebuilding in place: 'antidemo setup' re-applies Terraform and reseeds both lanes"
+      return 0 ;;
+    unreadable)
+      refuse_ready_install "$run" "$summary" "
+       Its AWS side could not be read with these keys. The AWS sandbox sweep deletes
+       IAM users along with the databases; if that happened, put a new key pair in
+       $ENV_FILE and run this again -- it checks again before anything starts." ;;
+    partial)
+      refuse_ready_install "$run" "$summary" "
+       Part of it was deleted -- by a sandbox reaper, say -- and part of it is still
+       there, so it is not rebuilt or replaced automatically. To start over, remove
+       what is left, then install:
+         ./antidemo cleanup --yes   then   ./bootstrap.sh --apply --deploy-app" ;;
+    *) refuse_ready_install "$run" "$summary" ;;
+  esac
+  say ""
+  warn "installation $run says 'ready', but it is gone: every sealed AWS resource and every
+        Lakebase project was read just now, and none of them exists. That is what a
+        sandbox reaper leaves behind.
+$summary"
+  if ((ASSUME_YES == 0)); then
+    [[ -t 0 ]] || die "starting over on a reaped installation needs a terminal to confirm on, or --yes"
+    printf '  Install afresh in this directory? Its old records are moved aside first. [y/N] '
+    read -r answer </dev/tty || answer=""
+    [[ "$answer" == [yY]* ]] || die "not confirmed; nothing was changed"
+  fi
+  archive="$dir/reaped-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -m 700 "$archive" || die "could not create $archive"
+  for entry in "$dir"/* "$dir"/.[!.]*; do
+    [[ -e "$entry" ]] || continue
+    case "$(basename "$entry")" in
+      # bootstrap.json says which app and secret scope this directory made, which
+      # is what lets the fresh install re-adopt them and cleanup delete them.
+      bootstrap.json | mutation.lock | reaped-*) continue ;;
+    esac
+    mv "$entry" "$archive/" || die "could not move $(basename "$entry") into $archive"
+  done
+  ok "moved the reaped installation's records to $archive"
+  info "continuing as a first install; every input is validated below"
 }
 
 EARLY_MANIFEST="$(manifest_this_run_would_adopt)"
 if ((RESET_READY == 0)) && apply_targets_complete_ready_install "$EARLY_MANIFEST"; then
-  refuse_ready_install "$(jq -r '.run_id // empty' "$EARLY_MANIFEST" 2>/dev/null || true)"
+  recover_if_reaped "$EARLY_MANIFEST"
 fi
 unset EARLY_MANIFEST
 

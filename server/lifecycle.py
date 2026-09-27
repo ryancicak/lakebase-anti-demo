@@ -1081,6 +1081,103 @@ def installation_presence_check(manifest: DemoManifest | None = None) -> Check:
     return Check("installation_presence", True, presence.detail)
 
 
+def _presence_session(manifest: DemoManifest) -> boto3.Session:
+    """`_aws_session`, except where an account sweep has deleted the runtime role.
+
+    Read-only callers only. A reaped installation is exactly the one whose sealed
+    role is gone, and without this its remnants could not even be counted: every
+    AWS read would fail on the AssumeRole. The source principal is used only on
+    IAM's own word that the role does not exist; any other refusal is re-raised.
+    """
+
+    try:
+        return _aws_session(manifest)
+    except ClientError:
+        role_arn = manifest.aws.runtime_role_arn
+        if role_arn is None:
+            raise
+        source = _aws_source_session(manifest)
+        try:
+            source.client("iam").get_role(RoleName=role_arn.rsplit("/", 1)[-1])
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                return source
+        raise
+
+
+def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any]:
+    """What is left of this installation in AWS and in its workspace. Read-only.
+
+    For a re-run of bootstrap.sh on a manifest that says `ready`: whether the
+    installation is really there, or whether a sandbox reaper has taken it. Each
+    part says `unverified` rather than guess when it cannot be read. `gone` is
+    true only when every sealed AWS resource and every sealed Lakebase project
+    was read and found absent -- the one state in which nothing is left to bill,
+    so installing afresh cannot orphan anything. The app is reported, not
+    counted: a directory that created it re-adopts it on the strength of its
+    bootstrap.json, and cleanup deletes it on the same proof.
+
+    Never raises.
+    """
+
+    try:
+        manifest = manifest or load_manifest()
+    except Exception as exc:
+        return {"gone": False, "error": f"the manifest could not be read ({type(exc).__name__})"}
+
+    aws: dict[str, Any]
+    try:
+        presence = presence_from_report(reconcile_live(manifest, _presence_session))
+        aws = {
+            "state": presence.state,
+            "sealed": presence.sealed,
+            "absent": presence.absent,
+            "reason": presence.reason,
+        }
+    except Exception as exc:
+        aws = {"state": PRESENCE_UNVERIFIED, "sealed": 0, "absent": 0, "reason": type(exc).__name__}
+
+    expected = absent = unreadable = 0
+    if manifest.round_environments is not None and manifest.coordination_lakebase is not None:
+        sealed_projects = [
+            environment.lakebase for environment in manifest.round_environments.values()
+        ]
+        sealed_projects.append(manifest.coordination_lakebase)
+        for sealed in sealed_projects:
+            expected += 1
+            try:
+                project = _get_lakebase_project_or_none(manifest, project_id=sealed.project_id)
+            except Exception:
+                unreadable += 1
+                continue
+            if project is None:
+                absent += 1
+    else:
+        # Only a v7 seal lists every project it owns; anything older is never
+        # declared gone on a count that could be incomplete.
+        unreadable = 1
+    lakebase = {"expected": expected, "absent": absent, "unreadable": unreadable}
+
+    app = _owned_app(manifest)
+    app_state = "unreadable" if app.unreadable else ("present" if app.present else "absent")
+
+    gone = (
+        aws["state"] == PRESENCE_MISSING
+        and aws["sealed"] > 0
+        and aws["absent"] == aws["sealed"]
+        and expected > 0
+        and absent == expected
+        and unreadable == 0
+    )
+    return {
+        "run_id": manifest.run_id,
+        "aws": aws,
+        "lakebase": lakebase,
+        "app": {"name": app.name, "state": app_state, "owned": app.owned},
+        "gone": gone,
+    }
+
+
 def _terraform_environment(manifest: DemoManifest) -> dict[str, str]:
     selection = validate_runtime_auth(
         manifest.aws.auth_mode,

@@ -29,6 +29,7 @@ from .lifecycle import (
     doctor,
     ensure_coordination,
     installation_presence_check,
+    installation_remnants,
     operator_ingress_check,
     provision,
     refresh_round5_runner,
@@ -741,6 +742,13 @@ def _parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--port", default=8000, type=int)
     status_parser.add_argument("--json", action="store_true", dest="as_json")
 
+    # Read-only, and what bootstrap.sh asks before it refuses to re-provision a
+    # `ready` installation: is it really there, or did a sandbox reaper take it?
+    subparsers.add_parser(
+        "presence",
+        help="Report, as JSON, what is left of this installation in AWS and the workspace",
+    )
+
     # The one standing cost in this installation that a session can switch off.
     # Deliberately three explicit verbs rather than a toggle: "stop" and "start"
     # must be typed, so neither can be reached by a repeated command recalled
@@ -1159,6 +1167,9 @@ def main() -> int:
             checks = _status_checks(args.host, args.port)
             print_checks(checks, args.as_json)
             return 0 if checks_passed(checks) else 1
+        if args.command == "presence":
+            print(json.dumps(installation_remnants(), sort_keys=True))
+            return 0
         if args.command == "serve":
             return _serve(
                 args.host,
