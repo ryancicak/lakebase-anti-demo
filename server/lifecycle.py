@@ -9458,19 +9458,27 @@ async def reset_safe_change_only_artifacts(manifest: DemoManifest) -> None:
     await engine.reset_all()
 
 
-async def reset_recovery_artifacts(manifest: DemoManifest) -> None:
-    """Remove deterministic recovery children while their sources are available."""
+async def reset_recovery_artifacts(
+    manifest: DemoManifest, *, skip_source_rows: bool = False
+) -> None:
+    """Remove deterministic recovery children, and their synthetic source rows.
+
+    `skip_source_rows` for a teardown that destroys the sources next; see
+    `RecoveryEngine.reset_all`.
+    """
     apply_manifest_environment(manifest)
     from .recovery_live import build_recovery_engine
 
     recovery = build_recovery_engine(manifest, cleanup_only=True)
-    await recovery.reset_all()
+    await recovery.reset_all(skip_source_rows=skip_source_rows)
 
 
-async def reset_safe_change_artifacts(manifest: DemoManifest) -> None:
+async def reset_safe_change_artifacts(
+    manifest: DemoManifest, *, skip_source_rows: bool = False
+) -> None:
     """Remove all deterministic, ownership-verified Round 2 and 3 children."""
     await reset_safe_change_only_artifacts(manifest)
-    await reset_recovery_artifacts(manifest)
+    await reset_recovery_artifacts(manifest, skip_source_rows=skip_source_rows)
 
 
 async def _reconcile_round5_failed_cleanups(
@@ -12983,7 +12991,12 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         _delete_round4_resources(manifest, round4_inventory)
         if destroy_plan is not None:
             if complete_baseline:
-                asyncio.run(reset_safe_change_artifacts(manifest))
+                # The destroy below takes the sources with it, so Round 3's
+                # synthetic rows on them are left to it. Reaching them needs this
+                # host inside the database ingress, and on 2026-09-27 a network
+                # that had moved it since setup stopped an uninstall right here,
+                # on a refused connection, before Terraform ran.
+                asyncio.run(reset_safe_change_artifacts(manifest, skip_source_rows=True))
             elif manifest.aws.resources.aurora_cluster_id:
                 # A legacy partial seal can have per-bout artifacts even when
                 # its Terraform baseline is incomplete. The initial v7

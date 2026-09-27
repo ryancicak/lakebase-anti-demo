@@ -904,22 +904,39 @@ class RecoveryEngine:
     async def reset_all(
         self,
         on_progress: ProgressCallback | None = None,
+        *,
+        skip_source_rows: bool = False,
     ) -> SafeChangeResetResult:
+        """Remove every lane's recovery environment and its synthetic source row.
+
+        `skip_source_rows` is for a teardown that destroys the sources next:
+        their synthetic rows go with them, so they are not reached for. Reaching
+        them needs this host inside the database ingress, and a network that has
+        moved it since setup made that the step an uninstall stopped on.
+        """
+
         plans = [self._plan("lakebase", self.lakebase)]
         plans.extend(
             self._plan(f"competitor-{competitor.value}", adapter)
             for competitor, adapter in self.competitors.items()
         )
-        return await self._reset_plans(tuple(plans), None, on_progress)
+        return await self._reset_plans(
+            tuple(plans), None, on_progress, skip_source_rows=skip_source_rows
+        )
 
     async def _reset_plans(
         self,
         plans: tuple[RecoveryPlan, ...],
         competitor: CompetitorId | None,
         on_progress: ProgressCallback | None,
+        *,
+        skip_source_rows: bool = False,
     ) -> SafeChangeResetResult:
         lanes = await asyncio.gather(
-            *(self._reset_lane(plan, on_progress) for plan in plans)
+            *(
+                self._reset_lane(plan, on_progress, skip_source_rows=skip_source_rows)
+                for plan in plans
+            )
         )
         result = SafeChangeResetResult(
             competitor=competitor,
@@ -933,6 +950,8 @@ class RecoveryEngine:
         self,
         plan: RecoveryPlan,
         on_progress: ProgressCallback | None,
+        *,
+        skip_source_rows: bool = False,
     ) -> SafeChangeResetLaneResult:
         adapter = self._adapter(plan)
         try:
@@ -948,25 +967,26 @@ class RecoveryEngine:
                         wire_call=wire_call,
                     )
 
-                source = await adapter.connect_source(plan)
-                try:
-                    row = await source.fetch_one(
-                        self.contract.select_sql,
-                        (self.contract.order_id,),
-                    )
-                    if row is not None and tuple(row) != self.contract.row:
-                        raise RecoveryError("Recovery row cleanup refused: payload mismatch")
-                    if row is not None:
-                        await self._delete_exact_row(source)
-                        if await source.fetch_one(
+                if not skip_source_rows:
+                    source = await adapter.connect_source(plan)
+                    try:
+                        row = await source.fetch_one(
                             self.contract.select_sql,
                             (self.contract.order_id,),
-                        ):
-                            raise RecoveryError(
-                                "Owned synthetic recovery row is still present"
-                            )
-                finally:
-                    await self._close(source)
+                        )
+                        if row is not None and tuple(row) != self.contract.row:
+                            raise RecoveryError("Recovery row cleanup refused: payload mismatch")
+                        if row is not None:
+                            await self._delete_exact_row(source)
+                            if await source.fetch_one(
+                                self.contract.select_sql,
+                                (self.contract.order_id,),
+                            ):
+                                raise RecoveryError(
+                                    "Owned synthetic recovery row is still present"
+                                )
+                    finally:
+                        await self._close(source)
                 if artifact is not None:
                     await adapter.delete_recovery(plan, artifact, report)
                 await self._emit(

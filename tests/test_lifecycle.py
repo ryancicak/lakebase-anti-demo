@@ -6884,3 +6884,27 @@ def test_doctor_still_calls_a_genuinely_unhealthy_round4_synced_table_unhealthy(
 
     assert not check.ok
     assert check.detail == "Round 4 synced table is not healthy: SYNCED_TABLE_OFFLINE_FAILED"
+
+
+def test_an_uninstall_leaves_the_sources_it_destroys_to_the_destroy() -> None:
+    """2026-09-27: cleanup reached a source it was about to destroy, to delete a
+    Round 3 synthetic row, and a network that had moved this host since setup made
+    that a refused connection that stopped the uninstall before Terraform ran."""
+
+    tree = ast.parse(Path(lifecycle.__file__).read_text(encoding="utf-8"))
+    cleanup = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "cleanup"
+    )
+    calls = [
+        node
+        for node in ast.walk(cleanup)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "reset_safe_change_artifacts"
+    ]
+    assert calls, "cleanup no longer resets the Round 2 and 3 environments"
+    for call in calls:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        assert isinstance(keywords.get("skip_source_rows"), ast.Constant)
+        assert keywords["skip_source_rows"].value is True

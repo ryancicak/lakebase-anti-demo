@@ -630,6 +630,34 @@ async def test_reset_refuses_mismatched_row_before_deleting_artifact() -> None:
     assert lakebase.artifact is not None
 
 
+async def test_a_teardown_reset_leaves_the_sources_and_removes_every_environment() -> None:
+    """2026-09-27: an uninstall stopped on a refused connection to a source it
+    was about to destroy, because the network had moved this host since setup."""
+
+    engine, lakebase, aurora, rds, timeline = build_engine()
+    for adapter in (lakebase, aurora, rds):
+        plan = next(
+            p
+            for competitor in (CompetitorId.AURORA_SERVERLESS_V2, CompetitorId.RDS_POSTGRES)
+            for p in engine.plans_for(competitor)
+            if p.provider == adapter.provider
+        )
+        adapter.artifact = ArtifactInspection(
+            artifact_id=plan.artifact_id,
+            provider=plan.provider,
+            source_id=plan.source_id,
+            run_id=engine.scope.run_id,
+            owner=engine.scope.owner,
+            state="READY",
+        )
+
+    result = await engine.reset_all(skip_source_rows=True)
+
+    assert result.ok
+    assert [adapter.delete_calls for adapter in (lakebase, aurora, rds)] == [1, 1, 1]
+    assert not any(step == "connect_source" for _, step in timeline)
+
+
 # ---------------------------------------------------------------------------
 # Cancellation.
 #
