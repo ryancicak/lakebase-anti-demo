@@ -100,9 +100,11 @@ def _stub_reseal_preconditions(monkeypatch: pytest.MonkeyPatch, manifest) -> lis
     outputs = {field: getattr(sealed, field) for field in _COMPARED_OUTPUT_FIELDS}
     # Terraform derives this from the same variables as the control role's
     # `ec2:CreateTags` condition, so it tracks `manifest.expires_at` rather than
-    # whatever the previous seal happened to record.
+    # whatever the previous seal happened to record. Added explicitly: the
+    # ownership set for Terraform's own resources no longer carries the lease.
     outputs["ownership_tags"] = {
         **lifecycle._required_round_tags(manifest, "r5"),
+        "expires-at": lifecycle._utc_tag(manifest.expires_at),
         "managed-by": "round5-lifecycle",
     }
     saved: list[tuple[str, str, str]] = []

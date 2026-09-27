@@ -29,6 +29,10 @@ resource "aws_rds_cluster" "aurora" {
   skip_final_snapshot     = true
 
   tags = local.required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_rds_cluster_instance" "aurora_writer" {
@@ -48,6 +52,10 @@ resource "aws_rds_cluster_instance" "aurora_writer" {
   apply_immediately          = true
 
   tags = local.required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_rds_cluster" "aurora_by_round" {
@@ -81,6 +89,10 @@ resource "aws_rds_cluster" "aurora_by_round" {
   skip_final_snapshot     = true
 
   tags = local.v7_round_tags[each.key]
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_rds_cluster_instance" "aurora_writer_by_round" {
@@ -100,4 +112,8 @@ resource "aws_rds_cluster_instance" "aurora_writer_by_round" {
   apply_immediately          = true
 
   tags = local.v7_round_tags[each.key]
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }

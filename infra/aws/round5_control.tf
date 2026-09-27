@@ -17,6 +17,10 @@ resource "aws_iam_role" "round5_execution" {
   assume_role_policy = data.aws_iam_policy_document.round5_execution_assume.json
 
   tags = local.round5_iam_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 data "aws_iam_policy_document" "round5_execution" {
@@ -708,6 +712,10 @@ resource "aws_iam_policy" "round5_execution_proxy" {
   policy      = data.aws_iam_policy_document.round5_execution_proxy.json
 
   tags = local.round5_policy_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "round5_execution_proxy" {

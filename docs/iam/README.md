@@ -102,17 +102,19 @@ blocked.
 
 `anti-demo-app-runtime.json` is a fifth document, and it is not part of the
 operator set. It is what the app runtime IAM user holds: enough to arm and run
-Rounds 1, 2, 3 and 5, and to delete what they create, and nothing more. It packs
-to 2933 characters, so it needs no split.
+Rounds 1, 2, 3 and 5, to delete what they create, and to keep the installation's
+`expires-at` lease current, and nothing more. It packs to 4411 characters, so it
+needs no split.
 
 | Grants | Withholds |
 |---|---|
 | RDS catalog reads across the region | every write outside the per-bout `adsc-*` and `adrc-*` prefixes |
-| PITR restores and the instances they need into those prefixes | any change to the sealed Aurora and RDS residents themselves |
-| deletes, so a finished bout stops costing money | `iam:*`, `ec2:RunInstances`, `ssm:*` |
+| PITR restores and the instances they need into those prefixes | any change to the sealed Aurora and RDS residents themselves, beyond their lease tag |
+| deletes, so a finished bout stops costing money | every IAM write but the lease tag, `ec2:RunInstances`, `ssm:*` |
 | `sts:AssumeRole` on `role/*-r5-exec-*` and nothing else | assuming any other role in the account |
 | `secretsmanager:GetSecretValue` on `secret:rds!*` only | every other secret in the account |
 | KMS use gated on `kms:ViaService` for RDS and Secrets Manager | KMS used directly, for anything |
+| the `expires-at` tag, and only that key, on resources tagged `managed-by = terraform` that carry an `anti-demo-run-id` | every other tag key, and any tag on a resource no installation's Terraform made |
 
 Two consequences worth stating rather than discovering:
 
@@ -129,6 +131,16 @@ Two consequences worth stating rather than discovering:
   then cannot delete its artifact leaks a running database. The delete
   statements are scoped to the two per-bout prefixes, which is what makes
   granting them safe.
+- **The lease statements move one tag and read what they need to find it.**
+  The app moves `expires-at` forward while the installation is in use
+  (`server/lease.py`, and [docs/BOOTSTRAP.md](../BOOTSTRAP.md#the-expires-at-lease)).
+  The write is conditioned on `aws:TagKeys` being exactly `expires-at` and on the
+  resource already carrying `managed-by = terraform` and an `anti-demo-run-id`,
+  so it cannot add a tag, change an ownership tag, or touch a per-bout artifact,
+  whose `managed-by` names its round. The IAM and SQS reads are scoped to the
+  installation's own role, policy, instance-profile and queue name patterns.
+  An installation sealed to the runtime role gets the same reach from the
+  operator policies it carries.
 
 Render and attach it the same way as the others:
 

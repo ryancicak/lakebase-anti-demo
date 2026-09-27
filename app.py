@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from server.api import router
+from server.api import caller_email, router
 from server.aws_auth import AwsAuthConfigurationError, validate_app_aws_environment
 from server.aws_credential_probe import (
     CredentialSentry,
@@ -41,6 +41,7 @@ from server.generation_lock import (
     lock_is_held,
     transitional_status_recovery,
 )
+from server.lease import LeaseKeeper
 from server.lifecycle import (
     OperatorIngressDrift,
     cached_installation_report,
@@ -200,14 +201,11 @@ def _load_ready_manifest(*, require_v2: bool = False) -> DemoManifest:
         manifest = load_manifest()
     except Exception as exc:
         raise InvalidStateError("Demo setup is not ready: owned manifest is unavailable") from exc
-    # External account governance may reap AWS resources at `expires_at`, but the
-    # timestamp alone cannot say which resources remain. Refusing solely on the
-    # clock bricked intact long-lived installs; ignoring the deadline hid the
-    # teardown signal. Warn here, then let the live per-round checks selectively
-    # remove capabilities that are actually gone.
-    expiry_warning = manifest.expiry_warning()
-    if expiry_warning is not None:
-        LOGGER.warning("%s", expiry_warning)
+    # The sealed `expires_at` is not consulted here. Refusing on it bricked intact
+    # long-lived installs, and it is no longer even the resources' lease: this
+    # process moves that forward while the installation is in use
+    # (`server/lease.py`). The live per-round checks remove only the capabilities
+    # that are actually gone.
     if manifest.status != "ready":
         # The status alone used to be the whole message, and a `seeding` manifest
         # with no process behind it was then a dead end: nothing said whether to
@@ -965,6 +963,7 @@ class _Runtime:
     round4_stop_recovery_task: asyncio.Task[None] | None = None
     round5_warm_coordinator: Any | None = None
     round5_resident_transport_closer: Any | None = None
+    lease_task: asyncio.Task[None] | None = None
 
 
 async def _open_receipt_store(lease_store: Any) -> DurableReceiptStore | None:
@@ -1225,6 +1224,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
     readiness_task: asyncio.Task[None] | None = None
     posted_usage_task: asyncio.Task[None] | None = None
     credential_task: asyncio.Task[None] | None = None
+    lease_task: asyncio.Task[None] | None = None
     round4_stop_recovery_task: asyncio.Task[None] | None = None
     receipt_store: DurableReceiptStore | None = None
     pipeline_power_store: DurablePipelinePowerStore | None = None
@@ -1521,6 +1521,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         # an unremarkable `unprobed` forever.
         app.state.startup_credential_verdict = startup_credential_verdict
         credential_task = _start_credential_sentry(app, manifest)
+        lease_task = _start_lease_keeper(app, manifest)
         app.state.restart_history = _restart_history()
         # Claimed only now, so the pidfile means "a server that finished startup is
         # serving this port" and a process that dies during startup never claims it.
@@ -1549,6 +1550,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round4_stop_recovery_task=round4_stop_recovery_task,
             round5_warm_coordinator=round5_warm_coordinator,
             round5_resident_transport_closer=round5_resident_transport_closer,
+            lease_task=lease_task,
         )
     except BaseException:
         # Uninstalled before the stores below are closed: the write hooks are
@@ -1564,10 +1566,12 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             readiness_task,
             posted_usage_task,
             credential_task,
+            lease_task,
         ):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+        app.state.lease_keeper = None
         if round5_warm_coordinator is not None:
             await round5_warm_coordinator.close()
         if callable(round5_resident_transport_closer):
@@ -1637,6 +1641,38 @@ def _start_credential_sentry(
     return task
 
 
+def _start_lease_keeper(
+    app: FastAPI,
+    manifest: DemoManifest | None,
+) -> asyncio.Task[None] | None:
+    """Keep the AWS resources' `expires-at` lease moving while people use the app.
+
+    Started beside the credential sentry and for the same reason last: it is an
+    observer that must never delay or break startup, and its failures are
+    reported on `/readyz` rather than raised. It needs a manifest to know whose
+    resources to retag, so a local in-memory start has no keeper at all.
+    """
+
+    app.state.lease_keeper = None
+    if manifest is None:
+        return None
+    try:
+        keeper = LeaseKeeper(manifest, _lease_session)
+    except Exception:  # noqa: BLE001 - an observer may never break startup
+        LOGGER.warning("Could not start the installation lease keeper", exc_info=True)
+        return None
+    app.state.lease_keeper = keeper
+    task = asyncio.create_task(keeper.run(), name="installation-lease-keeper")
+    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return task
+
+
+def _lease_session(manifest: DemoManifest) -> Any:
+    from server.lifecycle import _aws_session
+
+    return _aws_session(manifest)
+
+
 async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
     try:
         unregister_serving_process(runtime.process_record)
@@ -1668,6 +1704,10 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         runtime.credential_task.cancel()
         await asyncio.gather(runtime.credential_task, return_exceptions=True)
     app.state.credential_sentry = None
+    if runtime.lease_task is not None:
+        runtime.lease_task.cancel()
+        await asyncio.gather(runtime.lease_task, return_exceptions=True)
+    app.state.lease_keeper = None
     app.state.restart_history = None
     if runtime.readiness_task is not None:
         runtime.readiness_task.cancel()
@@ -1785,6 +1825,9 @@ def _install_mutation_wait(
     # before the credential check was reached, so there is no answer to report.
     app.state.credential_sentry = None
     app.state.startup_credential_verdict = None
+    # No lease keeper either: whoever holds the mutation is the one using the
+    # installation right now, and setup renews the lease when it finishes.
+    app.state.lease_keeper = None
     # Read here too: a restart landing in the middle of somebody else's mutation
     # is exactly when it matters most that this process says it is a replacement.
     app.state.restart_history = _restart_history()
@@ -1949,6 +1992,35 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Last-Event-ID"],
 )
+
+
+#: Paths a monitor or the platform polls. A request to one of them is not a person
+#: using the installation, so it must not keep the installation's lease alive.
+_PROBE_PATHS = frozenset({"/healthz", "/readyz", "/api/ready"})
+
+
+def _is_a_use(request: Any) -> bool:
+    """Whether this request is a person using the demo, for the lease keeper.
+
+    Deployed, only a request the Apps proxy vouched for with a signed-in user
+    counts, so nothing automated keeps an abandoned installation declared alive.
+    Locally the operator is the only one who can reach the server at all.
+    """
+    if request.url.path in _PROBE_PATHS:
+        return False
+    deployed = os.environ.get("ANTI_DEMO_ENV") == "databricks-app" or bool(
+        os.environ.get("DATABRICKS_APP_NAME")
+    )
+    return bool(caller_email(request)) if deployed else True
+
+
+@app.middleware("http")
+async def note_installation_use(request: Any, call_next: Callable[..., Any]) -> Response:
+    keeper = getattr(app.state, "lease_keeper", None)
+    if keeper is not None and _is_a_use(request):
+        # Records a timestamp and at most sets an event: no I/O on this path.
+        keeper.note_activity()
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -2312,6 +2384,7 @@ def _readiness_response(
     _apply_credential_verdict(payload)
     _apply_restart_history(payload)
     _apply_startup_reap(payload)
+    _apply_installation_lease(payload)
     _apply_round4_stop_recovery(payload)
     _apply_owed_pipeline_stop(payload)
     _apply_owed_round5_cleanup(payload)
@@ -2719,6 +2792,22 @@ def _apply_restart_history(payload: dict[str, Any]) -> None:
         payload["degraded_detail"] = detail
     if payload["status"] == "ready":
         payload["status"] = "degraded"
+
+
+def _apply_installation_lease(payload: dict[str, Any]) -> None:
+    """Say what the lease keeper last did. Informational: never degrades.
+
+    A lease the keeper could not move is not an outage -- every resource is still
+    there, and the next use retries -- so it is reported and nothing else.
+    Reads the keeper's own state; issues no AWS call.
+    """
+    keeper = getattr(app.state, "lease_keeper", None)
+    if keeper is None:
+        payload["lease_state"] = "unkept"
+        payload["lease_expires_at"] = None
+        payload["lease_detail"] = None
+        return
+    payload.update(keeper.snapshot())
 
 
 def _apply_credential_verdict(payload: dict[str, Any]) -> None:

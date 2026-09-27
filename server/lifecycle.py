@@ -351,30 +351,97 @@ def _utc_tag(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _expiry_check(manifest: DemoManifest) -> Check:
-    """Report approaching/exceeded external expiry without replacing live checks."""
+def _expiry_check(manifest: DemoManifest, *, inventory: Any = None) -> Check:
+    """The lease the AWS resources really carry, advisory, never a gate.
 
-    warning = manifest.expiry_warning()
-    return Check(
-        "expiry",
-        warning is None,
-        manifest.expires_at.isoformat() if warning is None else warning,
-        advisory=True,
-    )
-
-
-def _warn_if_expired(manifest: DemoManifest) -> None:
-    """Report a passed TTL on a control path instead of refusing to run.
-
-    Every caller here is doing setup, repair, or reconciliation. External account
-    automation may reap tagged AWS resources at the deadline, but the timestamp
-    alone cannot say which resources remain. Refusing solely on it turned a stale
-    timestamp into an outage; ignoring it concealed a real teardown signal. The
-    checks after each call site ask the resources themselves.
+    Read from the resources rather than the seal. The app moves `expires-at`
+    forward while the installation is in use (`server/lease.py`), so the sealed
+    `expires_at` is only when it would have lapsed had nobody used it, and
+    warning on that told the operator of an installation in daily use to renew
+    it. What is worth saying is the lease itself, and a warning only once nobody
+    has used the installation for long enough to bring it close.
     """
-    warning = manifest.expiry_warning()
-    if warning is not None:
-        print(f"WARN  {warning}", flush=True)
+    from .lease import discover_lease_targets, format_lease
+
+    if inventory is None:
+        try:
+            inventory = discover_lease_targets(_aws_session(manifest), manifest)
+        except AssertionError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - advisory: report, never fail doctor
+            return Check(
+                "expiry",
+                True,
+                f"the expires-at lease could not be read ({type(exc).__name__}); "
+                "the app renews it while the installation is in use",
+                advisory=True,
+            )
+    if not inventory.targets:
+        detail = "no Terraform-made resource carries a lease to read"
+        if inventory.unreadable:
+            detail += f" (not listed: {', '.join(inventory.unreadable)})"
+        return Check("expiry", True, detail, advisory=True)
+    earliest = inventory.earliest
+    if earliest is None:
+        return Check(
+            "expiry",
+            True,
+            f"{len(inventory.targets)} resources carry a lease, and at least one has no "
+            "readable expires-at; the app retags it the next time the installation is used",
+            advisory=True,
+        )
+    warning = manifest.expiry_warning(lease=earliest)
+    detail = warning or (
+        f"{format_lease(earliest)} across {len(inventory.targets)} resources, "
+        "and the app moves it forward while the installation is in use"
+    )
+    if inventory.unreadable:
+        detail += f" (not listed: {', '.join(inventory.unreadable)})"
+    return Check("expiry", warning is None, detail, advisory=True)
+
+
+def _move_installation_lease(manifest: DemoManifest, target: datetime) -> Any:
+    """Retag the lease on every Terraform-made resource to `target`, never backwards."""
+    from .lease import renew_lease
+
+    return renew_lease(_aws_session(manifest), manifest, target)
+
+
+def _keep_lease_current(manifest: DemoManifest) -> None:
+    """Start the lease from this run, and date anything Terraform just recreated.
+
+    A setup is itself a use of the installation. It is also the one moment a
+    resource can be born with a stale lease: Terraform tags whatever it creates
+    with the sealed `expires_at`, so a database rebuilt after a sweep would come
+    back already past it. Never fatal -- the app renews the lease on its next
+    use either way -- so a failure here is one warning line, not a failed setup.
+    """
+    from .lease import RENEW_HYSTERESIS, format_lease, lease_window, renew_lease
+
+    target = datetime.now(UTC) + lease_window(manifest)
+    try:
+        renewal = renew_lease(
+            _aws_session(manifest), manifest, target, minimum_gain=RENEW_HYSTERESIS
+        )
+    except AssertionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - the app renews on its next use anyway
+        print(
+            f"WARN  the expires-at lease could not be checked ({type(exc).__name__}); "
+            "the app renews it once the installation is in use",
+            flush=True,
+        )
+        return
+    if not renewal.complete:
+        print(f"WARN  lease: {renewal.summary()}", flush=True)
+    elif renewal.renewed:
+        print(f"LEASE {renewal.summary()}", flush=True)
+    elif renewal.earliest is not None:
+        print(
+            f"OK    lease: all {renewal.resources} resources current until at least "
+            f"{format_lease(renewal.earliest)}",
+            flush=True,
+        )
 
 
 def _schema_sha256() -> str:
@@ -5790,6 +5857,10 @@ def _round5_ownership_tags(
     """
 
     expected = _required_round_tags(manifest, "r5")
+    # Per-bout resources still carry the sealed expiry, and the control role's
+    # IAM conditions require exactly it, so this comparison keeps it even though
+    # the ownership set for Terraform's own resources no longer does.
+    expected["expires-at"] = _utc_tag(manifest.expires_at)
     expected["managed-by"] = "round5-lifecycle"
     if outputs["ownership_tags"] != expected:
         raise RuntimeError("Terraform Round 5 per-bout ownership tags are not exact")
@@ -10023,11 +10094,9 @@ def provision(
 
 def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
     manifest = load_manifest()
-    # Resuming an interrupted provision is repair work. Refusing it because the
-    # declared TTL passed while the provision was interrupted is exactly
-    # backwards: it strands a half-built install that `antidemo setup` reaches
-    # through this path whenever status is not yet ready.
-    _warn_if_expired(manifest)
+    # Resuming an interrupted provision is repair work, and the sealed expiry says
+    # nothing about it: the lease on the resources is kept by `server/lease.py`,
+    # and `setup` renews it once this returns.
     if manifest.status == "cleanup_failed":
         raise RuntimeError("Cleanup previously failed; inspect it before changing resources")
 
@@ -10106,8 +10175,8 @@ def reset(timeout_seconds: float = 900) -> DemoManifest:
     # "set up once, use anytime" workflow fail 24 hours in, with no supported
     # recovery short of a full teardown and re-provision. Reset verifies real
     # state (operator CIDR, ownership tags, Round 5 residue) immediately below;
-    # a provision-time wall-clock value adds nothing to that.
-    _warn_if_expired(manifest)
+    # a provision-time wall-clock value adds nothing to that, and the lease on
+    # the resources is no longer that value (`server/lease.py`).
     recovery_bout_ids: tuple[str, ...] = ()
     if manifest.round5_ready:
         journaled = _round5_active_journal_addons(manifest)
@@ -10314,7 +10383,6 @@ def reconcile_infrastructure(manifest: DemoManifest) -> DemoManifest:
     # Reconciliation is how an install is repaired, so an expired timestamp must
     # not be the thing that prevents repair. Identity, account, and ownership are
     # verified below and are the checks that actually protect this apply.
-    _warn_if_expired(manifest)
     actual_user = _verify_databricks_identity(manifest.databricks.profile)
     if actual_user != manifest.databricks.user:
         raise RuntimeError(
@@ -10504,6 +10572,18 @@ def _renew_inconsistency_report(
             f"  TO FINISH: re-run 'antidemo renew'. It resumes to {target_tag} from the "
             f"journal at {_renew_journal_path()} and converges the manifest onto the "
             f"tags already applied. Do this before anything else."
+        )
+    if stage == "lease":
+        return (
+            f"Renew moved the sealed expiry to {target_tag}, but not the lease on every "
+            f"AWS resource. {reason}\n"
+            f"  PARTIAL: the manifest, the Round 5 seal and its IAM conditions say "
+            f"{target_tag}; some resources still carry an earlier expires-at.\n"
+            f"  CONSEQUENCE: nothing is stranded and cleanup is unaffected, because "
+            f"ownership no longer includes the lease. Account automation that honors "
+            f"the tag may treat the resources still behind as expiring sooner.\n"
+            f"  TO FINISH: re-run 'antidemo renew'. It resumes to {target_tag} from the "
+            f"journal at {_renew_journal_path()}."
         )
     return (
         f"Renew applied the new expiry to AWS and to the manifest, but the Round 5 "
@@ -10962,17 +11042,40 @@ def _renew_locked(
             _renew_inconsistency_report(previous_tag, target_tag, "reseal", str(exc))
         ) from exc
 
+    # Terraform no longer moves `expires-at` on what it made -- it ignores the
+    # tag after creation, because the app moves it -- so the resources are
+    # retagged here, to the same target, by the same path the app uses.
+    try:
+        renewal = _move_installation_lease(manifest, target)
+    except AssertionError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            _renew_inconsistency_report(previous_tag, target_tag, "lease", str(exc))
+        ) from exc
+    if not renewal.complete:
+        raise RuntimeError(
+            _renew_inconsistency_report(previous_tag, target_tag, "lease", renewal.summary())
+        )
+    print(f"RENEW  lease: {renewal.summary()}", flush=True)
+
     _renew_journal_path().unlink(missing_ok=True)
     print(f"RENEW  every owned copy of expires-at now says {target_tag}", flush=True)
     return manifest
 
 
 def _required_tags(manifest: DemoManifest) -> dict[str, str]:
+    """The tags that prove a Terraform-made resource belongs to this installation.
+
+    `expires-at` is deliberately not among them. It is a lease the serving app
+    moves forward while people use the installation (`server/lease.py`), so a
+    resource carrying a later value than the seal is ours and current, not
+    drift, and every ownership check built on this set ignores it.
+    """
     return {
         "anti-demo-run-id": manifest.run_id,
         "Owner": manifest.owner,
         "owner": manifest.owner,
-        "expires-at": _utc_tag(manifest.expires_at),
         "managed-by": "terraform",
     }
 
@@ -11008,8 +11111,9 @@ def _required_tags_for_address(manifest: DemoManifest, address: str) -> dict[str
     the capital one back from an IAM address asks for a tag AWS would not store.
 
     Only that key is excused, and only for IAM. Ownership is still proven by the
-    lowercase ``owner``, alongside the run ID, the expiry and ``managed-by`` --
-    so a resource belonging to somebody else is refused here exactly as before.
+    lowercase ``owner``, alongside the run ID and ``managed-by`` -- so a resource
+    belonging to somebody else is refused here exactly as before. The expiry is
+    a lease, not proof of ownership; see `_required_tags`.
     """
 
     tags = _required_tags(manifest)
@@ -11886,6 +11990,7 @@ def setup(
         # Once more for the checks below. A ready install rebinds in
         # `reconcile_infrastructure` and a resume in `resume_provision`.
         _follow_operator_address(manifest)
+    _keep_lease_current(manifest)
     failures: list[str] = []
     # Why, and not only which: a real install stopped on "Setup checks failed:
     # aurora:resource_reconciliation, rds:resource_reconciliation" and nothing

@@ -4,6 +4,10 @@ resource "aws_secretsmanager_secret" "round5_aurora_proxy_credentials" {
   recovery_window_in_days = 0
 
   tags = local.round5_required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_secretsmanager_secret" "round5_rds_proxy_credentials" {
@@ -12,6 +16,10 @@ resource "aws_secretsmanager_secret" "round5_rds_proxy_credentials" {
   recovery_window_in_days = 0
 
   tags = local.round5_required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 data "aws_iam_policy_document" "round5_proxy_assume" {
@@ -31,6 +39,10 @@ resource "aws_iam_role" "round5_proxy_service" {
   assume_role_policy = data.aws_iam_policy_document.round5_proxy_assume.json
 
   tags = local.round5_iam_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 data "aws_iam_policy_document" "round5_proxy_secrets" {

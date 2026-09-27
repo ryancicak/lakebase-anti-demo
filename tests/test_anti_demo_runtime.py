@@ -407,6 +407,16 @@ def _stub_renew_terraform(monkeypatch, tmp_path) -> list[str]:
         lifecycle, "_terraform_apply", lambda manifest, plan: applied.append(plan)
     )
     monkeypatch.setattr(lifecycle, "save_manifest", lambda manifest: None)
+
+    def moved_lease(manifest, target):
+        from server.lease import LeaseRenewal
+
+        return LeaseRenewal(
+            target=target, resources=1, renewed=1, vanished=0, failed=(), unreadable=(),
+            earliest=target,
+        )
+
+    monkeypatch.setattr(lifecycle, "_move_installation_lease", moved_lease)
     return applied
 
 

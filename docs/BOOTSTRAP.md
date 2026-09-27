@@ -866,19 +866,40 @@ is this host's own, detected the same way as at the start.
 ./antidemo cleanup --yes        # destroy manifest-owned resources
 ```
 
-The `expires-at` tag is consumed by external account cleanup automation. The
-default TTL is 72 hours (`server/lifecycle.py:DEFAULT_TTL_HOURS`, and
-`ANTI_DEMO_TTL_HOURS` overrides it). The app warns during the final 24 hours;
-the clock alone does not disable every round because only live checks can say
-which resources were reaped. Run `antidemo renew --ttl-hours N` before expiry,
-or clean up deliberately.
+### The `expires-at` lease
 
-That default describes a *new* provision only. The TTL is written once, at
-`created_at + ttl_hours`, and is never re-based, so an existing installation
-carries whatever value it was provisioned with — a live manifest showing a 24-hour
-window is not a disagreement with this default, it is an installation that was
-provisioned with `--ttl-hours 24`. Read `expires_at` from the manifest, never
-`created_at + DEFAULT_TTL_HOURS`.
+Every AWS resource carries an `expires-at` tag for account cleanup automation
+that reaps by it. It is a lease, and nobody has to renew it:
+
+- **It starts at `created_at + ttl_hours`.** The default TTL is 72 hours
+  (`server/lifecycle.py:DEFAULT_TTL_HOURS`; `ANTI_DEMO_TTL_HOURS` overrides it
+  for a first provision). That TTL is also the lease window from then on.
+- **The app moves it while the installation is in use.** A signed-in person
+  using the deployed app, or anyone using `antidemo serve`, is a use. Health
+  probes are not. When the lease has fallen six hours behind `last use +
+  window`, the app retags every resource Terraform made for this installation
+  (`server/lease.py`). Every `antidemo setup` does the same when it finishes, and
+  gives anything Terraform just recreated a current lease.
+- **Unused, it lapses on schedule.** That is the tag's purpose: an abandoned
+  installation is what account cleanup exists for. `antidemo doctor` reads the
+  lease from the resources themselves and warns only in the final 24 hours
+  before it lapses.
+- **It proves nothing about ownership.** Ownership is the run ID, the owner and
+  `managed-by`, which never change. So a moved lease is not drift to cleanup or
+  to any other ownership check. Terraform writes the tag at creation and then
+  ignores it (`ignore_changes = [tags["expires-at"]]` on every tagged resource,
+  enforced by `tests/test_installation_lease.py`).
+- **Per-bout resources keep the sealed value.** The short-lived resources
+  Rounds 2, 3 and 5 create are tagged with the expiry sealed into the manifest,
+  because Round 5's IAM conditions require exactly that value. They live for
+  minutes, and their own cleanup is what removes them.
+
+`/readyz` reports what the app last did as `lease_state`, `lease_expires_at` and
+`lease_detail`. A lease the app could not move is reported and retried; it never
+degrades readiness. `antidemo renew --ttl-hours N` still exists, and moves the
+sealed expiry, the Round 5 IAM conditions and every lease together. You need it
+only to repair the runtime role's trust after an account sweep
+([docs/iam/README.md](iam/README.md#the-sweep-ran-bring-it-back)).
 
 Nothing enforces it either way. There is no code path that refuses on a passed
 `expires_at`: the method that once did (`DemoManifest.assert_not_expired`) raised

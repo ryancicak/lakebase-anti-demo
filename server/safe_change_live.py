@@ -2381,14 +2381,13 @@ def build_safe_change_engine(
     if round_number not in (2, 3):
         raise SafeChangeLiveConfigurationError("Safe-change source round must be 2 or 3")
     if not cleanup_only:
-        # A passed TTL is reported, not enforced: it is a provision-time wall-clock
-        # value that says nothing about whether the Round 2/3 sources are healthy.
-        # Refusing here left Rounds 2 and 3 dead while the rest of the app served
-        # traffic. `status` below is a real readiness signal and still refuses.
-        # The cleanup_only path never consulted expiry and still must not.
-        expiry_warning = owned.expiry_warning()
-        if expiry_warning is not None:
-            print(f"WARN  {expiry_warning}", flush=True)
+        # A passed TTL is neither enforced nor reported here: it is a provision-time
+        # wall-clock value that says nothing about whether the Round 2/3 sources are
+        # healthy, and the serving app keeps the resources' own lease current
+        # (`server/lease.py`). Refusing here left Rounds 2 and 3 dead while the rest
+        # of the app served traffic. `status` below is a real readiness signal and
+        # still refuses. The cleanup_only path never consulted expiry and still
+        # must not.
         if owned.status != "ready":
             raise SafeChangeLiveConfigurationError(
                 f"Owned demo manifest is {owned.status.upper()}, not READY"

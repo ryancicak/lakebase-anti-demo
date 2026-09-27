@@ -114,6 +114,10 @@ resource "aws_iam_role" "anti_demo_runtime" {
   max_session_duration = var.anti_demo_runtime_max_session_seconds
 
   tags = local.iam_role_required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_policy" "anti_demo_runtime" {
@@ -124,6 +128,10 @@ resource "aws_iam_policy" "anti_demo_runtime" {
   policy      = local.anti_demo_runtime_policies[each.key]
 
   tags = local.iam_role_required_tags
+
+  lifecycle {
+    ignore_changes = [tags["expires-at"]]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "anti_demo_runtime" {

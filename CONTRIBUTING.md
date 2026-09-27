@@ -211,12 +211,14 @@ Consequences worth internalising before you run anything:
   [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md#the-databases-are-reachable-from-the-internet)
   have the rules and the reasoning. Keep nothing in these databases you would mind
   losing or exposing.
-- **The clock alone does not prove health after `expires-at`.** The app keeps
-  serving so live inventory can selectively withhold rounds whose dependencies
-  were reaped; intact rounds may continue, and missing ones do not. `doctor`
-  reports the deadline as a `WARN` and the live checks report what remains. Use
-  `antidemo renew --ttl-hours N` before expiry on an intact installation;
-  `antidemo setup --ttl-hours` applies only to a first provision.
+- **`expires-at` is a lease the app keeps current while the installation is in
+  use.** Nobody renews it by hand. Left unused for its TTL (72 hours by default)
+  it lapses, and account automation that honors the tag may reap it. The clock
+  alone does not prove health either way: the app keeps serving, so live
+  inventory can selectively withhold rounds whose dependencies were reaped, and
+  `doctor` reads the lease from the resources and warns in its final 24 hours.
+  `antidemo setup --ttl-hours` applies only to a first provision. See
+  [docs/BOOTSTRAP.md](docs/BOOTSTRAP.md#the-expires-at-lease).
 - **Always finish with cleanup.** Inspect first, then destroy:
 
   ```bash
