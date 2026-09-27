@@ -71,6 +71,13 @@ case "$args" in
     exit 254 ;;
   *"sts get-caller-identity"*)
     [[ "${STUB_STS_FAILS:-0}" == "1" ]] && { echo "Unable to locate credentials" >&2; exit 255; }
+    # STUB_STS_ERROR_CODE is STS itself refusing, worded as the AWS CLI words it:
+    # InvalidClientTokenId for a key ID it does not know (a deleted IAM user),
+    # SignatureDoesNotMatch for a secret that is not that key's.
+    if [[ -n "${STUB_STS_ERROR_CODE:-}" ]]; then
+      echo "An error occurred (${STUB_STS_ERROR_CODE}) when calling the GetCallerIdentity operation: refused" >&2
+      exit 254
+    fi
     account="${STUB_ACCOUNT:-111122223333}"
     if [[ -n "${STUB_ARN:-}" ]]; then
       arn="$STUB_ARN"
@@ -139,6 +146,29 @@ case "$args" in
   *"/oidc/v1/token"*)
     [[ "${STUB_TOKEN_FAILS:-0}" == "1" ]] && exit 22
     echo '{"access_token":"stub-token","expires_in":3600}' ;;
+  *"/oidc/.well-known/oauth-authorization-server"*)
+    # The workspace's own word on whether it exists (bootstrap.sh:
+    # databricks_host_verdict): the body goes to -o, the status code to stdout.
+    # STUB_WORKSPACE_PROBE: live (the default); deleted, answered as a deleted
+    # workspace answered on 2026-09-27; nxdomain, a name no longer in DNS; offline,
+    # nothing resolves at all.
+    body_file=""; prev=""
+    for w in "$@"; do
+      [[ "$prev" == "-o" ]] && body_file="$w"
+      prev="$w"
+    done
+    case "${STUB_WORKSPACE_PROBE:-live}" in
+      nxdomain | offline) exit 6 ;;
+      deleted)
+        printf '%s' '{"error_description":"Invalid request: Unable to determine workspace context for stub","error":"invalid_request"}' >"${body_file:-/dev/null}"
+        printf '400' ;;
+      *)
+        printf '%s' '{"issuer":"stub","token_endpoint":"https://stub/oidc/v1/token"}' >"${body_file:-/dev/null}"
+        printf '200' ;;
+    esac ;;
+  *"accounts.cloud.databricks.com"*)
+    [[ "${STUB_WORKSPACE_PROBE:-live}" == "offline" ]] && exit 6
+    exit 0 ;;
   *"/api/health"*)
     # Two different probes hit this. The pre-flight one asks only for a status
     # code (-w '%{http_code}') so it can tell "already broken" from "working,
@@ -813,6 +843,41 @@ PY
   check "an unreadable account is refused" "already 'ready', and --apply is not a resume"
   check "names why" "unverified: InvalidClientTokenId"
   check "and says to replace the key pair" "put a new key pair in"
+
+  # The workspace itself deleted, and the AWS side with it: gone. The record of
+  # the app and secret scope went with that workspace, so it is moved aside too,
+  # and the fresh install meets a workspace with no app in it.
+  sb="$(reaped_sandbox '{"gone": true, "run_id": "ad-19700101-0000-stub", "aws": {"state": "verified_missing", "sealed": 13, "absent": 13, "reason": ""}, "workspace": {"host": "dbc-gone-0000.cloud.databricks.com", "state": "gone", "reason": "dbc-gone-0000.cloud.databricks.com answered HTTP 400: Unable to determine workspace context"}, "lakebase": {"expected": 7, "absent": 7, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "absent", "owned": false}}')"
+  gen="$(cat "$sb/gen")"
+  STUB_APP_MISSING=1 ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  status=$?
+  check "a deleted workspace is named as what went" "the workspace it lived in,"
+  check "with the workspace's own answer" "Workspace dbc-gone-0000.cloud.databricks.com: gone (dbc-gone-0000.cloud.databricks.com answered HTTP 400"
+  check "and its projects as gone with it" "Lakebase: 7 of 7 projects absent, with the workspace"
+  check "says the Databricks inputs must now name a live workspace" "must name a live workspace now"
+  archived="$(find "$gen" -maxdepth 2 -path '*/reaped-*/bootstrap.json' | head -1)"
+  if ((status == 0)) && [[ -n "$archived" && -f "$gen/manifest.json" ]]; then
+    printf '  %sok%s   the dead workspace'"'"'s app record was archived with the rest\n' "$GREEN" "$RESET"
+    PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s status=%s archived bootstrap.json=%s\n' "$RED" "$RESET" "$status" "${archived:-none}"
+    FAIL=$((FAIL + 1))
+  fi
+
+  # Keys and workspace both dead: refused, and both named at once, so one edit
+  # of the env file fixes everything the next run will check.
+  sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "unverified", "sealed": 13, "absent": 0, "reason": "InvalidClientTokenId"}, "workspace": {"host": "dbc-gone-0000.cloud.databricks.com", "state": "gone", "reason": "dbc-gone-0000.cloud.databricks.com no longer resolves"}, "lakebase": {"expected": 7, "absent": 7, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "absent", "owned": false}}')"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  check "dead keys and a dead workspace are still refused" "already 'ready', and --apply is not a resume"
+  check "and the workspace is named beside the keys" "no longer exists either: point DATABRICKS_HOST"
+
+  # The workspace deleted, the AWS side still billing: refused, and not sent to a
+  # cleanup that proves the workspace identity first and so cannot run.
+  sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "verified_present", "sealed": 13, "absent": 0, "reason": ""}, "workspace": {"host": "dbc-gone-0000.cloud.databricks.com", "state": "gone", "reason": "dbc-gone-0000.cloud.databricks.com no longer resolves"}, "lakebase": {"expected": 7, "absent": 7, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "absent", "owned": false}}')"
+  ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
+  check "a billing AWS side under a deleted workspace is refused" "part of its AWS side is still"
+  check "with the tag that finds what is left" "tagged anti-demo-run-id=ad-19700101-0000-stub"
+  check_absent "and no cleanup that cannot reach the workspace" "./antidemo cleanup --yes   then"
 
   # All of it there: the refusal it always was, plus the reading.
   sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "verified_present", "sealed": 13, "absent": 0, "reason": ""}, "lakebase": {"expected": 7, "absent": 0, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
@@ -1624,6 +1689,81 @@ case_databricks_identity_failures() {
   _id_nonzero "lakebase-unusable" "$status"
 }
 
+# 2026-09-27: the inputs a sandbox reaper leaves behind, as a re-run meets them.
+# The CLI words a deleted workspace exactly as it words a wrong secret, so the
+# workspace is asked itself; and each dead input is one finding, not a finding
+# and its consequences.
+case_dead_inputs_are_named() {
+  printf '\n%s== the inputs a reaper leaves behind are named, once each ==%s\n' "$BOLD" "$RESET"
+  local sb gen status
+  # The words the CLI printed on 2026-09-27 against a deleted workspace: a
+  # notice that reads as advice, a warning, and the error itself.
+  local cli_words="Databricks skills are not installed. To work with Databricks reliably, first run: databricks aitools install
+Warn: [hostmetadata] failed to fetch host metadata for https://dbc-stub-0000.cloud.databricks.com, will skip for 1m0s
+Error: default auth: cannot configure default credentials, please check the docs. Config: host=https://dbc-stub-0000.cloud.databricks.com, client_id=stub-client, client_secret=stub-secret"
+
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="$cli_words" STUB_WORKSPACE_PROBE=deleted run "$sb" --apply --yes
+  status=$?
+  check "a deleted workspace is called deleted" "no longer exists: dbc-stub-0000.cloud.databricks.com answered HTTP 400: Unable to determine workspace context"
+  check "and the way out names all three Databricks inputs" "Put a live workspace's URL in DATABRICKS_HOST"
+  check_absent "and it is not blamed on the credentials" "rejected these credentials"
+  check_absent "the CLI's notice is not quoted as advice" "aitools install"
+  check "the CLI's error is quoted" "Error: default auth: cannot configure default credentials"
+  check_absent "and the secret it echoed is not" "stub-secret"
+  check "a deleted workspace stops at the gate" "Nothing was provisioned and nothing was written"
+  if ((status != 0)); then
+    printf '  %sok%s   a deleted workspace exits non-zero\n' "$GREEN" "$RESET"; PASS=$((PASS + 1))
+  else
+    printf '  %sFAIL%s a deleted workspace exited zero\n' "$RED" "$RESET"; FAIL=$((FAIL + 1))
+  fi
+
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="$cli_words" STUB_WORKSPACE_PROBE=nxdomain run "$sb" --apply --yes
+  check "a workspace whose name is gone from DNS is called deleted" "no longer exists: dbc-stub-0000.cloud.databricks.com no longer resolves"
+  check_absent "and that is not blamed on the credentials" "rejected these credentials"
+
+  # The same words from a workspace that answers: then it is the credentials.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="$cli_words" run "$sb" --apply --yes
+  check "a live workspace's refusal is the credentials, said with certainty" "is live -- it answered just now -- and"
+  check "and names them" "rejected these credentials"
+  check_absent "without doubting the host" "DATABRICKS_HOST may also be stale"
+
+  # Offline: nothing settles it, and that is said rather than guessed around.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_DB_IDENTITY_ERROR="$cli_words" STUB_WORKSPACE_PROBE=offline run "$sb" --apply --yes
+  check "offline is never called deleted" "Asking the workspace itself did not settle it: dbc-stub-0000.cloud.databricks.com could not be looked up, nor could Databricks"
+  check_absent "not even by DNS" "no longer exists:"
+
+  # AWS keys the sweep deleted: one finding naming the cause, and no second one
+  # about the empty account a refusal has.
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STS_ERROR_CODE=InvalidClientTokenId run "$sb" --apply --yes
+  check "an unknown key ID is named as deleted or mistyped" "AWS does not know the persistent app access key ID (InvalidClientTokenId)"
+  check_absent "with no finding about an empty account" "which is not 12 digits"
+  check_absent "nor about an account boundary" "resolves to account unknown"
+  check_absent "and neither key value is printed" "$DEFAULT_STUB_ACCESS_KEY"
+  check "one finding, not three" "1 preflight check failed"
+
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STS_ERROR_CODE=SignatureDoesNotMatch run "$sb" --apply --yes
+  check "a secret that is not the key's is named" "AWS_SECRET_ACCESS_KEY is not its"
+
+  gen="$(mktemp -d)/gen"
+  sb="$(EXTRA_ENV="ANTI_DEMO_MANIFEST=$gen/manifest.json" sandbox)"
+  STUB_STS_FAILS=1 run "$sb" --apply --yes
+  check "a call that never reached STS says so" "sts:GetCallerIdentity could not be called"
+  check "and quotes the AWS CLI" "Unable to locate credentials"
+  check_absent "with no finding about an empty account either" "which is not 12 digits"
+}
+
 case_runtime_identity_refusals() {
   printf '\n%s== runtime identity is derived and refused safely when ineligible ==%s\n' "$BOLD" "$RESET"
   local sb gen status
@@ -2363,6 +2503,7 @@ CASES=(
   case_incomplete_aws_pair_refused
   case_exact_five_inputs_required
   case_databricks_identity_failures
+  case_dead_inputs_are_named
   case_runtime_identity_refusals
   case_deploy_seal_only
   case_deploy_record_merge

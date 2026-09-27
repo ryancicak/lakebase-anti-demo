@@ -12,17 +12,19 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import tarfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 from uuid import uuid4
 
 import boto3
@@ -1081,13 +1083,18 @@ def installation_presence_check(manifest: DemoManifest | None = None) -> Check:
     return Check("installation_presence", True, presence.detail)
 
 
+class _ForeignAccountKeys(RuntimeError):
+    """The AWS keys in hand belong to an account other than the sealed one."""
+
+
 def _presence_session(manifest: DemoManifest) -> boto3.Session:
     """`_aws_session`, except where an account sweep has deleted the runtime role.
 
     Read-only callers only. A reaped installation is exactly the one whose sealed
     role is gone, and without this its remnants could not even be counted: every
     AWS read would fail on the AssumeRole. The source principal is used only on
-    IAM's own word that the role does not exist; any other refusal is re-raised.
+    IAM's own word that the role does not exist, and only when it is in the sealed
+    account; any other refusal is re-raised.
     """
 
     try:
@@ -1097,6 +1104,16 @@ def _presence_session(manifest: DemoManifest) -> boto3.Session:
         if role_arn is None:
             raise
         source = _aws_source_session(manifest)
+        # Keys from another account find no such role there either, and would
+        # then read every sealed resource as absent: a whole installation
+        # declared gone by looking for it in the wrong account.
+        identity = source.client("sts", region_name=manifest.aws.region).get_caller_identity()
+        account = str(identity.get("Account") or "")
+        if account != manifest.aws.account_id:
+            raise _ForeignAccountKeys(
+                f"the AWS keys are for account {account or 'unknown'}, "
+                f"not the sealed {manifest.aws.account_id}"
+            ) from None
         try:
             source.client("iam").get_role(RoleName=role_arn.rsplit("/", 1)[-1])
         except ClientError as error:
@@ -1117,6 +1134,11 @@ def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any
     counted: a directory that created it re-adopts it on the strength of its
     bootstrap.json, and cleanup deletes it on the same proof.
 
+    A workspace that has itself been deleted cannot be asked about its projects,
+    so on the platform's own word that it is gone (`databricks_workspace_liveness`)
+    a project it cannot be asked about is counted absent -- still asked, so a
+    project that does answer is never hidden by that verdict.
+
     Never raises.
     """
 
@@ -1135,7 +1157,12 @@ def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any
             "reason": presence.reason,
         }
     except Exception as exc:
-        aws = {"state": PRESENCE_UNVERIFIED, "sealed": 0, "absent": 0, "reason": type(exc).__name__}
+        reason = str(exc) if isinstance(exc, _ForeignAccountKeys) else type(exc).__name__
+        aws = {"state": PRESENCE_UNVERIFIED, "sealed": 0, "absent": 0, "reason": reason}
+
+    host = _databricks_profile_host(manifest.databricks.profile)
+    workspace_state, workspace_reason = databricks_workspace_liveness(host)
+    workspace_gone = workspace_state == WORKSPACE_GONE
 
     expected = absent = unreadable = 0
     if manifest.round_environments is not None and manifest.coordination_lakebase is not None:
@@ -1148,7 +1175,10 @@ def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any
             try:
                 project = _get_lakebase_project_or_none(manifest, project_id=sealed.project_id)
             except Exception:
-                unreadable += 1
+                if workspace_gone:
+                    absent += 1
+                else:
+                    unreadable += 1
                 continue
             if project is None:
                 absent += 1
@@ -1159,7 +1189,10 @@ def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any
     lakebase = {"expected": expected, "absent": absent, "unreadable": unreadable}
 
     app = _owned_app(manifest)
-    app_state = "unreadable" if app.unreadable else ("present" if app.present else "absent")
+    if app.unreadable and workspace_gone:
+        app_state = "absent"
+    else:
+        app_state = "unreadable" if app.unreadable else ("present" if app.present else "absent")
 
     gone = (
         aws["state"] == PRESENCE_MISSING
@@ -1172,6 +1205,7 @@ def installation_remnants(manifest: DemoManifest | None = None) -> dict[str, Any
     return {
         "run_id": manifest.run_id,
         "aws": aws,
+        "workspace": {"host": host, "state": workspace_state, "reason": workspace_reason},
         "lakebase": lakebase,
         "app": {"name": app.name, "state": app_state, "owned": app.owned},
         "gone": gone,
@@ -3305,6 +3339,63 @@ def _databricks_profile_host(profile: str) -> str:
     return ""
 
 
+WORKSPACE_LIVE = "live"
+WORKSPACE_GONE = "gone"
+WORKSPACE_UNVERIFIED = "unverified"
+_WORKSPACE_DISCOVERY_PATH = "/oidc/.well-known/oauth-authorization-server"
+_WORKSPACE_UNKNOWN_MARKER = "unable to determine workspace context"
+#: Resolves whenever Databricks' own DNS answers, so a workspace name that does
+#: not resolve beside it has been removed, rather than this host being offline.
+_DATABRICKS_DNS_WITNESS = "accounts.cloud.databricks.com"
+
+
+def databricks_workspace_liveness(host: str, *, timeout: float = 15.0) -> tuple[str, str]:
+    """Whether `host` is a live Databricks workspace: ``(state, why)``.
+
+    Asked of the workspace's own front door, because the CLI cannot tell: it
+    words a deleted workspace exactly as it words a wrong secret ("cannot
+    configure default credentials"). A workspace deleted in September 2026 still
+    resolved, and its OAuth discovery answered HTTP 400 "Unable to determine
+    workspace context"; a name whose DNS record is gone does not resolve at all.
+    `gone` is returned on those two answers only, the second only while
+    Databricks' own DNS answers. Everything else is `unverified`, never `gone`.
+    Mirrored in bootstrap.sh:databricks_host_verdict.
+    """
+
+    hostname = urlsplit(host if "://" in host else f"https://{host}").hostname or ""
+    if not hostname:
+        return WORKSPACE_UNVERIFIED, "no workspace host is recorded for the sealed profile"
+    try:
+        socket.getaddrinfo(hostname, 443)
+    except socket.gaierror as error:
+        try:
+            socket.getaddrinfo(_DATABRICKS_DNS_WITNESS, 443)
+        except OSError:
+            return WORKSPACE_UNVERIFIED, f"{hostname} could not be looked up, nor could Databricks"
+        if error.errno != socket.EAI_NONAME:
+            return WORKSPACE_UNVERIFIED, f"{hostname} could not be looked up ({error.strerror})"
+        return WORKSPACE_GONE, f"{hostname} no longer resolves"
+    request = urllib.request.Request(
+        f"https://{hostname}{_WORKSPACE_DISCOVERY_PATH}", headers={"Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read(65536) or b"{}")
+    except urllib.error.HTTPError as error:
+        body = error.read(4096).decode("utf-8", "replace").casefold()
+        if _WORKSPACE_UNKNOWN_MARKER in body:
+            return (
+                WORKSPACE_GONE,
+                f"{hostname} answered HTTP {error.code}: Unable to determine workspace context",
+            )
+        return WORKSPACE_UNVERIFIED, f"{hostname} answered HTTP {error.code}"
+    except (OSError, ValueError) as error:
+        return WORKSPACE_UNVERIFIED, f"{hostname} could not be asked ({type(error).__name__})"
+    if isinstance(payload, dict) and payload.get("token_endpoint"):
+        return WORKSPACE_LIVE, f"{hostname} answered as a workspace"
+    return WORKSPACE_UNVERIFIED, f"{hostname} answered, but not as a workspace"
+
+
 def _databricks_identity_failure_message(*, host: str, profile: str, raw: str) -> str:
     """Operator-facing identity-failure text: names the cause and host, not a secret.
 
@@ -3350,10 +3441,17 @@ def _verify_databricks_identity(profile: str) -> str:
         # bootstrap.sh preflight classifies the full multi-line capture, and the
         # shared behavioral corpus keeps the two in step on the single-line
         # errors the CLI actually produces.
+        host = _databricks_profile_host(profile)
+        # The workspace's own word first, as bootstrap.sh asks it: the CLI words a
+        # deleted workspace exactly as it words a wrong secret.
+        state, why = databricks_workspace_liveness(host) if host else (WORKSPACE_UNVERIFIED, "")
+        if state == WORKSPACE_GONE:
+            raise RuntimeError(
+                f"The Databricks workspace at {host} no longer exists: {why}. A reaper or an "
+                "admin deleted it, so no credential can work there."
+            ) from exc
         raise RuntimeError(
-            _databricks_identity_failure_message(
-                host=_databricks_profile_host(profile), profile=profile, raw=str(exc)
-            )
+            _databricks_identity_failure_message(host=host, profile=profile, raw=str(exc))
         ) from exc
     user = str(current_user.get("userName") or "")
     if not user:

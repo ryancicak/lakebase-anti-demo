@@ -348,16 +348,37 @@ refuses to re-provision an installation whose manifest says `ready`, it asks
   it is how the new installation recognises — and can re-adopt — the app and
   secret scope this directory created. If a sweep also deleted the installation's
   runtime role, the check reads AWS with your own keys instead, only once IAM
-  itself says the role no longer exists.
+  itself says the role no longer exists, and only when those keys are in the
+  installation's own account.
+- **The workspace itself was deleted, and the AWS side with it**: the same, except
+  that `bootstrap.json` is moved aside too — the app and secret scope it records
+  went with the workspace. A deleted workspace cannot be asked about its
+  projects, so the check asks the workspace's own front door instead, and counts
+  them gone only on its answer: a name that no longer resolves, or Databricks
+  answering "Unable to determine workspace context". Offline, or any other
+  answer, is never taken as gone.
+- **Only the AWS side is gone** (the account's fortnightly sweep; the workspace
+  and its Lakebase projects are intact): it offers to rebuild the AWS side in
+  place — `terraform apply`, then a reseed of both lanes, as `--reset-ready`
+  would.
 - **Some of it is still there**: it refuses, lists what is left, and names the
   way to start over — `./antidemo cleanup --yes`, then run the installer again.
   Nothing is moved aside while anything could still be billing.
 - **All of it is there**: the ordinary refusal above; nothing was reaped.
 
-If the reaper took your credentials too — the IAM user behind
-`AWS_ACCESS_KEY_ID`, the workspace behind `DATABRICKS_HOST` or its service
-principal — the preflight says which of the five inputs no longer works, and
-nothing starts until you replace it in `.env.bootstrap`.
+If the reaper took your credentials too, the preflight says which of the five
+inputs no longer works, once each, and nothing starts until you replace it in
+`.env.bootstrap`:
+
+- a deleted IAM user or key: *AWS does not know the persistent app access key ID
+  (InvalidClientTokenId)*;
+- a secret that is not the key's: *AWS_SECRET_ACCESS_KEY is not its secret
+  (SignatureDoesNotMatch)*;
+- a deleted workspace: *The Databricks workspace at … no longer exists*, with the
+  workspace's own answer. Point `DATABRICKS_HOST` at a live workspace, and the
+  client ID and secret at a service principal that can use it;
+- a live workspace that refuses the service principal: *is live — it answered
+  just now — and it rejected these credentials*.
 
 "Highest" is now numeric rather than lexical. The previous last-wins loop over
 `.anti-demo-v*/` would have adopted `.anti-demo-v9` while `.anti-demo-v10` was

@@ -34,6 +34,7 @@ EXPECTED_CASES = {
     "case_incomplete_aws_pair_refused",
     "case_exact_five_inputs_required",
     "case_databricks_identity_failures",
+    "case_dead_inputs_are_named",
     "case_runtime_identity_refusals",
     "case_five_input_full_acceptance",
     "case_fresh_app_creation_provenance",
