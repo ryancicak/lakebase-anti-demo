@@ -2842,7 +2842,17 @@ async def _execute_setup(request: Mapping[str, object]) -> dict[str, object]:
             expected_port=int(request["port"]),
             expected_database=str(request["dbname"]),
         )
-        await _configure_ordinary_role(admin, ordinary, create_if_missing=False)
+        await _configure_ordinary_role(
+            admin,
+            ordinary,
+            create_if_missing=False,
+            # The restart race `prepare_rds_baseline` already retries. A re-seal
+            # (`setup` on a ready installation, a resume, `renew`) finds an idle
+            # installation at Aurora scale zero, so its first connection lands in
+            # the automatic-resume window: single-attempt, every re-run on an
+            # idle install failed here (2026-09-27). RDS remains single-attempt.
+            retry_transient_restart=request["lane_id"] == "aurora",
+        )
         secret_payload = {
             "host": request["credential_host"],
             "port": ordinary["port"],
