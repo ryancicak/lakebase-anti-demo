@@ -11,7 +11,7 @@ presenter would:
     full-proof         let the bout finish
     finish-linger      let it finish and leave the result on screen; nothing may change
 
-A scenario passes when the bout ends verified or towelled (a cancelled check for
+A scenario passes when the bout ends verified or toweled (a canceled check for
 `pre-bell-cancel`) and its round comes back READY. The run also fails if a round
 not in play is ever anything but READY: one round must never disturb another.
 Every `/api/bout/all` answer is kept in `events.jsonl`, so a failure can be placed

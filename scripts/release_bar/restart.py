@@ -49,7 +49,9 @@ def main() -> int:
     parser.add_argument("rounds", nargs="*", default=list(DEFAULT_ROUNDS))
     parser.add_argument("--after-bell", type=float, default=90.0, metavar="SECS")
     parser.add_argument("--competitor", default="aurora_serverless_v2")
-    args = parser.parse_args()
+    # Intermixed, so an option between EVIDENCE_DIR and the rounds parses: plain
+    # `parse_args` refuses that order on early Python 3.12 releases (3.12.3 does).
+    args = parser.parse_intermixed_args()
     evidence: Path = args.evidence
     evidence.mkdir(parents=True, exist_ok=False)
     client = AppClient()

@@ -149,7 +149,7 @@ restart() {
     return 1
   fi
   say "restart: bouts on ${RESTART_ROUNDS[*]}, redeploy ${RESTART_AFTER_BELL}s after the bell"
-  "$PYTHON" -u "$HERE/restart.py" "$dir" --after-bell "$RESTART_AFTER_BELL" "${RESTART_ROUNDS[@]}" \
+  "$PYTHON" -u "$HERE/restart.py" --after-bell "$RESTART_AFTER_BELL" "$dir" "${RESTART_ROUNDS[@]}" \
     >"$EVIDENCE/logs/restart.log" 2>&1 &
   pid=$!
   until [[ -f "$dir/READY_FOR_RESTART" ]] || ! kill -0 "$pid" 2>/dev/null; do sleep 2; done

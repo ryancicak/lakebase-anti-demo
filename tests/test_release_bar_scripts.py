@@ -154,7 +154,7 @@ def test_all_ready_needs_every_one_of_the_six_rounds():
     assert not common.all_ready(missing)
 
 
-def test_only_round_1_is_cancelled_before_the_bell():
+def test_only_round_1_is_canceled_before_the_bell():
     chaos = _load("chaos")
     every = chaos.ALL_ROUNDS
     assert chaos.wave_rounds("pre-bell-cancel", every, set()) == ("wake_idle_app",)
@@ -213,7 +213,7 @@ class FakeApp:
     """Just enough of the app's session API for the drivers to run a bout against.
 
     Every round is always READY on the board. A session goes armed on ARM,
-    running on RUN, verified a second after the bell, and towelled on TOWEL.
+    running on RUN, verified a second after the bell, and toweled on TOWEL.
     Once `restarted` is set, every session from before is gone, as after a real
     restart.
     """
