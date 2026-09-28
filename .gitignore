@@ -33,6 +33,11 @@
 *.pid
 *.launch.json
 
+# What scripts/release_bar/run.sh records about one real test installation: every
+# request and answer, session IDs, the app URL, per-bout Round 5 status. Evidence
+# for the release it gated, and never for a commit.
+release-bar-evidence/
+
 # ---------------------------------------------------------------------------
 # Working artifacts (not source)
 #

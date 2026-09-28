@@ -124,7 +124,8 @@ deployed it:
 
 `dirty` is `true` when the deployed tree had uncommitted changes. Every release
 bumps the version in `pyproject.toml` and `frontend/package.json` together — a
-test holds them equal — and is tagged `v<version>`.
+test holds them equal — and is tagged `v<version>` once it has passed
+[the release bar](docs/RELEASING.md).
 
 ## Run it locally instead
 
@@ -311,6 +312,7 @@ deployment record and known gaps are in
   cleanup
 - [docs/DEPLOY.md](docs/DEPLOY.md): Databricks App deployment and known gaps
 - [docs/PRICING.md](docs/PRICING.md): how the cost figures are produced
+- [docs/RELEASING.md](docs/RELEASING.md): the release bar every tag has to pass
 - [PRICING_DISCOVERY.md](PRICING_DISCOVERY.md): archived 2026-08-20 rate audit
 - [CONTRIBUTING.md](CONTRIBUTING.md): development setup and tests
 - [brand/](brand/): source artwork
