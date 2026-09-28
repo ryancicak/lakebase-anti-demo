@@ -2701,6 +2701,34 @@ async def test_a_recent_storage_check_is_reused_and_a_failed_prepare_forgets_it(
     assert adapter.preflights == 2  # checked again after the failure
 
 
+async def test_a_storage_check_is_reused_for_as_long_as_a_warm_proof() -> None:
+    """One window for what a Prepare reuses, so neither half ages out before the other."""
+
+    contract = model_score_contract()
+    adapter = CheckedStorage(contract)
+    activation = StorageRecordingActivation(adapter, age=WARM_PROOF_REUSE_SECONDS - 1)
+    activation.storage_age = WARM_PROOF_REUSE_SECONDS - 1
+
+    await activated_engine(adapter, activation).arm()
+
+    assert adapter.preflights == 0
+    assert activation.proven == 0
+
+
+async def test_a_prewarm_checks_storage_again_even_while_a_check_is_fresh() -> None:
+    """A refresh renews both halves of what a Prepare reuses, not only the proof."""
+
+    contract = model_score_contract()
+    adapter = CheckedStorage(contract)
+    activation = StorageRecordingActivation(adapter, age=5.0)
+    activation.storage_age = 5.0
+
+    await activated_engine(adapter, activation).prewarm()
+
+    assert (adapter.preflights, activation.storage_notes) == (1, 1)
+    assert activation.proven == 1
+
+
 async def test_the_engine_hands_the_adapter_the_head_it_inspected() -> None:
     contract = model_score_contract()
 

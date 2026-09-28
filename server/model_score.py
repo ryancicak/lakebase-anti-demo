@@ -251,8 +251,10 @@ WARM_PROOF_REUSE_SECONDS = 900.0
 #: How recently the Delta source storage must have been checked for Prepare to
 #: skip the check. The storage preflight finds access denials and a missing Delta
 #: path, neither of which comes and goes in minutes, and any failed preparation
-#: forgets the check so the next one makes it again.
-STORAGE_CHECK_REUSE_SECONDS = 600.0
+#: forgets the check so the next one makes it again. It shares the warm proof's
+#: window: the warm keeper refreshes the two together, so a second, shorter
+#: window would only let the check age out while the proof beside it is good.
+STORAGE_CHECK_REUSE_SECONDS = WARM_PROOF_REUSE_SECONDS
 
 
 class PipelineActivation(Protocol):
@@ -489,11 +491,13 @@ class ModelScoreEngine:
     async def prewarm(self) -> None:
         """Do an arm's whole preparation between bouts, so the next Prepare can reuse it.
 
-        The same checks an arm makes, including the warm-up round trip, which is
-        forced here rather than reused: the point is to leave a fresh proof and a
-        fresh storage check behind for the presenter's Prepare. It writes only the
-        sealed baseline, exactly as an arm's warm-up does, and returns nothing a
-        bout could use. The manager runs it only while Round 4 is idle.
+        The same checks an arm makes, including the storage check and the warm-up
+        round trip, both forced here rather than reused: the point is to leave a
+        fresh proof and a fresh storage check behind for the presenter's Prepare.
+        A reused storage check could age out before the next refresh and land
+        back in a Prepare. It writes only the sealed baseline, exactly as an
+        arm's warm-up does, and returns nothing a bout could use. The manager
+        runs it only while Round 4 is idle.
         """
 
         await self._prepare(None, allow_reuse=False)
@@ -520,7 +524,7 @@ class ModelScoreEngine:
         *,
         allow_reuse: bool,
     ) -> ManagedSyncStatus:
-        if not self._storage_check_is_fresh():
+        if not allow_reuse or not self._storage_check_is_fresh():
             await self._check_source_storage(on_progress)
         await self._ensure_pipeline_running(on_progress)
         await self._emit(on_progress, ModelScorePhase.PREFLIGHT, "Inspecting Managed Sync")

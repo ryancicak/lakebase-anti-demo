@@ -525,6 +525,29 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         await self._source_head()
 
     async def inspect_sync(self) -> ManagedSyncStatus:
+        # The source head and the CDF property are read beside the control plane
+        # rather than after it. Run in turn, those two statements were over half
+        # of an inspection (measured live on 2026-09-28), and a Prepare makes two
+        # inspections and every sync poll is one. The head's order matters only to
+        # the cursor check below, which reads it again before refusing on it.
+        head_read = asyncio.ensure_future(self._source_head())
+        cdf_read = asyncio.ensure_future(self._cdf_enabled())
+        try:
+            return await self._inspect_sync_beside(head_read, cdf_read)
+        finally:
+            for read in (head_read, cdf_read):
+                if not read.done():
+                    read.cancel()
+                elif not read.cancelled():
+                    # If something else was refused on first, this read's failure
+                    # is not the news, but asyncio would still report it as lost.
+                    read.exception()
+
+    async def _inspect_sync_beside(
+        self,
+        head_read: Awaitable[tuple[int, datetime]],
+        cdf_read: Awaitable[bool],
+    ) -> ManagedSyncStatus:
         (
             postgres_synced,
             database_synced,
@@ -600,25 +623,34 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
             raise ModelScoreLiveConfigurationError(
                 "Round 4 auxiliary storage schema is not exactly empty"
             )
-        source_version, _ = await self._source_head()
-        cdf_enabled = await self._cdf_enabled()
+        source_version, _ = await head_read
+        cdf_enabled = await cdf_read
         delta_info = _required_mapping(
             database_last_sync.get("delta_table_sync_info"),
             "Database Synced Table last-sync Delta position",
         )
         _timestamp(database_last_sync.get("sync_start_timestamp"))
         database_delta_version = _integer(delta_info.get("delta_commit_version"))
-        if (
-            processed > source_version
-            or database_delta_version > source_version
-            or (
-                postgres_last_sync_version is not None
-                and postgres_last_sync_version > source_version
+
+        def cursor_ahead_of(head: int) -> bool:
+            return (
+                processed > head
+                or database_delta_version > head
+                or (
+                    postgres_last_sync_version is not None
+                    and postgres_last_sync_version > head
+                )
             )
-        ):
-            raise ModelScoreLiveOperationError(
-                "Managed Sync cursor advanced beyond the authoritative Delta source head"
-            )
+
+        if cursor_ahead_of(source_version):
+            # Read beside the cursors, the head can predate a commit whose sync
+            # they already show. Read after them it cannot, so only a cursor still
+            # ahead of this second read is refused.
+            source_version, _ = await self._source_head()
+            if cursor_ahead_of(source_version):
+                raise ModelScoreLiveOperationError(
+                    "Managed Sync cursor advanced beyond the authoritative Delta source head"
+                )
         states = {postgres_state, database_state}
         state = classify_managed_sync_state(states, pipeline_state, pipeline_update_state)
         database_status = _required_mapping(
@@ -1467,6 +1499,19 @@ class Round4PipelineActivation:
     def forget_storage_check(self) -> None:
         self._storage_checked_at = None
 
+    def preparation_age(self) -> float | None:
+        """The age of the older of the warm proof and the storage check.
+
+        What a background refresh is timed from: a Prepare reuses both, and a
+        bout's own proof renews only one of them. ``None`` when a Prepare now
+        would have to make either itself.
+        """
+
+        proof, storage = self.warm_proof_age(), self.storage_check_age()
+        if proof is None or storage is None:
+            return None
+        return max(proof, storage)
+
     async def _start_and_wait(
         self,
         signals: PipelineSignals,
@@ -2160,14 +2205,24 @@ class Round4WarmKeeper:
         self._wake.set()
 
     async def _next_wake(self) -> None:
-        """Wait for a use, or, while the app is in use, until the proof wants refreshing."""
+        """Wait for a use, or, while the app is in use, until a refresh is due.
+
+        The refresh is timed from the preparation a Prepare would reuse, not from
+        this keeper's last wake, and from the older of its two parts: a bout's own
+        proof renews the proof but not the storage check. Timed from the wake, a
+        Prepare met a storage check old enough to be made again (live, 2026-09-28).
+        """
 
         activation = self._activation
         if activation is None or self._prewarm is None or activation._in_use_remaining() <= 0:
             await self._wake.wait()
         else:
+            age = activation.preparation_age()
+            timeout = (
+                self._refresh if age is None else max(self._min_interval, self._refresh - age)
+            )
             with suppress(TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=self._refresh)
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
         self._wake.clear()
 
     async def run(self) -> None:

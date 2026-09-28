@@ -40,6 +40,7 @@ from server.manager import (
 )
 from server.manifest import DemoManifest
 from server.model_score import (
+    WARM_PROOF_REUSE_SECONDS,
     ModelScoreArm,
     ModelScoreContract,
     ModelScoreEngine,
@@ -4882,6 +4883,29 @@ async def test_a_background_warm_up_runs_only_while_round_four_is_idle() -> None
     await manager.create(round_four_request())
     await manager.prewarm_round4()
     assert engine.prewarms == 1
+
+
+async def test_a_background_warm_up_leaves_a_fresh_preparation_alone() -> None:
+    """Refreshed once the older of its proof and storage check is half a window old."""
+
+    engine = PrewarmingModelScoreEngine()
+    engine.allow_prewarm.set()
+    manager = RunManager(model_score_factory=lambda: engine)
+
+    engine.activation = SimpleNamespace(preparation_age=lambda: WARM_PROOF_REUSE_SECONDS / 2)
+    await manager.prewarm_round4()
+    assert engine.prewarms == 0
+
+    engine.activation = SimpleNamespace(
+        preparation_age=lambda: WARM_PROOF_REUSE_SECONDS / 2 + 1
+    )
+    await manager.prewarm_round4()
+    assert engine.prewarms == 1
+
+    # None: a Prepare now would have to make one of the two itself.
+    engine.activation = SimpleNamespace(preparation_age=lambda: None)
+    await manager.prewarm_round4()
+    assert engine.prewarms == 2
 
 
 async def test_an_arm_waits_for_a_background_warm_up_already_running() -> None:

@@ -6140,8 +6140,8 @@ class RunManager:
         warm-up round trip an arm would make happens before anyone presses
         Prepare, and that Prepare reuses it. Nothing here runs while any Round 4
         bout is in flight (``_round4_busy``), and an arm or a re-do that arrives
-        meanwhile waits on the same lock rather than racing it. A proof that is
-        still fresh is left alone.
+        meanwhile waits on the same lock rather than racing it. A preparation
+        that is still fresh is left alone.
         """
 
         factory = self._model_score_factory
@@ -6154,7 +6154,8 @@ class RunManager:
                 return
             # Built off the loop: a live engine constructs a workspace client.
             engine = await asyncio.to_thread(factory)
-            age_of = getattr(getattr(engine, "activation", None), "warm_proof_age", None)
+            # The older of the proof and the storage check: a Prepare reuses both.
+            age_of = getattr(getattr(engine, "activation", None), "preparation_age", None)
             age = age_of() if callable(age_of) else None
             if age is not None and 0 <= age <= WARM_PROOF_REUSE_SECONDS / 2:
                 return

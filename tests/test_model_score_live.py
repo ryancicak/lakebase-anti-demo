@@ -542,18 +542,97 @@ async def test_database_cursor_is_authoritative_and_ahead_of_source_fails_closed
     ahead_api.responses["/api/2.0/database/synced_tables/storage.round4.model_scores"] = (
         database_synced_table_payload(processed_version=13, delta_version=13)
     )
+    ahead_statements = FakeStatements(
+        [
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+            [{"key": "delta.enableChangeDataFeed", "value": "true"}],
+            # Read again after the cursors, the head is still behind them.
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+        ]
+    )
     ahead = LiveModelScoreAdapter(
         live_config(),
         workspace_client=control_plane_workspace(ahead_api),
-        statement_runner=FakeStatements(
-            [
-                [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
-                [{"key": "delta.enableChangeDataFeed", "value": "true"}],
-            ]
-        ),
+        statement_runner=ahead_statements,
     )
     with pytest.raises(ModelScoreLiveOperationError, match="source head"):
         await ahead.inspect_sync()
+    assert [call[0].split()[0] for call in ahead_statements.calls] == [
+        "DESCRIBE",
+        "SHOW",
+        "DESCRIBE",
+    ]
+
+
+async def test_a_head_read_beside_the_cursors_is_read_again_before_refusing() -> None:
+    """A commit that lands and syncs between the two reads is not a cursor ahead."""
+
+    api = FakeApiClient()
+    api.responses["/api/2.0/database/synced_tables/storage.round4.model_scores"] = (
+        database_synced_table_payload(processed_version=13, delta_version=13)
+    )
+    statements = FakeStatements(
+        [
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+            [{"key": "delta.enableChangeDataFeed", "value": "true"}],
+            [{"version": "13", "timestamp": "2026-08-18T12:00:00Z"}],
+        ]
+    )
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(api),
+        statement_runner=statements,
+        now=lambda: NOW,
+    )
+
+    status = await adapter.inspect_sync()
+
+    assert status.source_version == status.last_processed_version == 13
+    assert len(statements.calls) == 3
+
+
+async def test_the_head_and_cdf_reads_run_beside_the_control_plane() -> None:
+    """The two statements no longer wait for the control-plane reads to finish."""
+
+    both_started = threading.Event()
+
+    class HeldStatusApi(FakeApiClient):
+        overlapped: bool | None = None
+
+        def do(self, method, path):
+            if path.startswith("/api/2.0/database/synced_tables/"):
+                # Released only once both statements are in flight, which happens
+                # only if they were issued beside this read rather than after it.
+                self.overlapped = both_started.wait(timeout=2)
+            return super().do(method, path)
+
+    class CountingStatements(FakeStatements):
+        async def execute(self, statement, parameters=()):
+            rows = await super().execute(statement, parameters)
+            if len(self.calls) == 2:
+                both_started.set()
+            return rows
+
+    api = HeldStatusApi()
+    statements = CountingStatements(
+        [
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+            [{"key": "delta.enableChangeDataFeed", "value": "true"}],
+        ]
+    )
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(api),
+        statement_runner=statements,
+        now=lambda: NOW,
+    )
+
+    status = await adapter.inspect_sync()
+
+    assert api.overlapped is True
+    assert status.cdf_enabled is True
+    assert status.source_version == 12
+    assert [call[0].split()[0] for call in statements.calls] == ["DESCRIBE", "SHOW"]
 
 
 async def test_pipeline_requires_exact_single_managed_sync_sink() -> None:
@@ -1826,6 +1905,29 @@ async def test_a_warm_proof_counts_only_on_the_update_it_ran_on() -> None:
     assert activation.warm_proof_age() is None
 
 
+async def test_a_preparation_is_as_old_as_the_older_of_its_proof_and_storage_check() -> None:
+    api = FakePipelineApi(running=True)
+    clock = ManualClock()
+    activation = _activation(api, clock=clock)
+    await activation.ensure_running(lambda status: _record([], status))
+
+    activation.note_proven_sync()
+    assert activation.preparation_age() is None  # no storage check yet
+
+    clock.now = 10.0
+    activation.note_storage_check()
+    clock.now = 40.0
+    assert activation.preparation_age() == 40.0  # the proof is the older
+
+    # A bout's own proof renews the proof alone, so the storage check is now older.
+    activation.note_proven_sync()
+    clock.now = 50.0
+    assert activation.preparation_age() == 40.0
+
+    activation.forget_storage_check()
+    assert activation.preparation_age() is None
+
+
 async def test_the_warm_keeper_brings_the_pipeline_up_on_use_and_survives_a_failure() -> None:
     class Activation:
         def __init__(self) -> None:
@@ -2168,6 +2270,9 @@ async def test_the_keeper_prewarms_after_a_bring_up_and_refreshes_while_in_use()
         def _in_use_remaining(self) -> float:
             return self.in_use
 
+        def preparation_age(self) -> float | None:
+            return None
+
         async def bring_up_for_use(self) -> None:
             self.bring_ups += 1
 
@@ -2201,6 +2306,55 @@ async def test_the_keeper_prewarms_after_a_bring_up_and_refreshes_while_in_use()
         settled = prewarms
         await asyncio.sleep(0.1)
         assert prewarms <= settled + 1  # quiet once the app is no longer in use
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_the_keeper_times_its_refresh_from_the_preparation_not_its_last_wake() -> None:
+    class Activation:
+        age: float | None = None
+
+        def note_use(self) -> None:
+            pass
+
+        def _in_use_remaining(self) -> float:
+            return 100.0
+
+        def preparation_age(self) -> float | None:
+            return self.age
+
+        async def bring_up_for_use(self) -> None:
+            pass
+
+    activation = Activation()
+    prewarms = 0
+    refreshed = asyncio.Event()
+
+    async def prewarm() -> None:
+        nonlocal prewarms
+        prewarms += 1
+        # Leaves a preparation a hundredth of a second short of a refresh.
+        activation.age = 9.99
+        if prewarms >= 2:
+            refreshed.set()
+
+    async def no_wait(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    keeper = model_score_live.Round4WarmKeeper(
+        lambda: activation,  # type: ignore[arg-type,return-value]
+        prewarm=prewarm,
+        min_interval_seconds=0.0,
+        refresh_seconds=10.0,
+        sleep=no_wait,
+    )
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        # Due when the preparation is ten seconds old, not ten seconds after
+        # this keeper last woke.
+        await asyncio.wait_for(refreshed.wait(), timeout=2)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
