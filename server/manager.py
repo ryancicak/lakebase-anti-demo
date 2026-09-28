@@ -486,9 +486,10 @@ class RoundStorageReadinessError(RuntimeError):
 
 _ROUND_ONE_TRANSACTION_WIRE_CALL = "PostgreSQL TLS connect → INSERT → COMMIT → SELECT"
 
-#: How long a Round 4 re-do waits for the first proof's row to be put back
-#: before refusing. The restore normally finishes in about fifteen seconds.
-_REDO_SETTLEMENT_WAIT_SECONDS = 120.0
+#: How long a Round 4 re-do, or the next Round 4 arm, waits for a proof's row to
+#: be put back before refusing. The restore normally finishes in about fifteen
+#: seconds.
+_ROUND4_SETTLEMENT_WAIT_SECONDS = 120.0
 
 _ROUND_FOUR_UNSUPPORTED_REASON = (
     "No AWS-native equivalent lane was configured or timed in this scoped proof."
@@ -1023,6 +1024,9 @@ class RunManager:
         self._settlement_attempts = max(
             1, int(os.environ.get("ANTI_DEMO_SETTLEMENT_ATTEMPTS", "4"))
         )
+        # The newest Round 4 background settlement. The ring is released before
+        # it runs, so the next arm must wait for it rather than race it.
+        self._round4_settlement: asyncio.Task[None] | None = None
         # Session retention. A session is created per bout attempt, abandoned ones
         # included, and each one holds a snapshot, up to five engines and an event
         # log -- about a megabyte. Nothing used to release them, so an installation
@@ -5231,6 +5235,8 @@ class RunManager:
             self._settle_with_retry(record, settle, label=label),
             name=f"round-settlement-{record.snapshot.id}",
         )
+        if record.snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
+            self._round4_settlement = record.settlement_task
 
     async def _settle_with_retry(
         self,
@@ -6023,6 +6029,7 @@ class RunManager:
                     },
                 )
 
+            await self._await_prior_round4_settlement(record, on_progress)
             arm = await engine.arm(on_progress)
             loop = asyncio.get_running_loop()
             async with record.lock:
@@ -6081,6 +6088,40 @@ class RunManager:
                 exc,
                 round_number=4,
             )
+
+    async def _await_prior_round4_settlement(
+        self,
+        record: SessionRecord,
+        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+    ) -> None:
+        """Let the previous Round 4 bout's row be put back before this arm touches it.
+
+        A verified or failed bout releases the ring and then restores the source
+        row in the background, for ten to fifteen seconds. An arm inside that
+        window (a quick Ring Again) wrote its warm-up MERGE into the same row the
+        restore was writing, which is the race the re-do had. Waiting here orders
+        them; the restore's own round trip then usually lets the arm reuse it as
+        its warm proof.
+        """
+
+        prior = self._round4_settlement
+        if prior is None or prior.done() or prior is record.settlement_task:
+            return
+        await on_progress(
+            ModelScoreProgress(
+                phase=ModelScorePhase.PREFLIGHT,
+                status="Putting the previous bout's row back first",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        try:
+            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
+                await asyncio.shield(prior)
+        except TimeoutError as exc:
+            raise InvalidStateError(
+                "The previous Round 4 bout was still putting its row back. Prepare again "
+                "in a moment."
+            ) from exc
 
     @staticmethod
     def _round5_arm_has_started_mutation(engine: object | None) -> bool:
@@ -9651,13 +9692,13 @@ class RunManager:
             )
         )
         try:
-            async with asyncio.timeout(_REDO_SETTLEMENT_WAIT_SECONDS):
+            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
                 await asyncio.shield(settlement)
         except TimeoutError:
             logger.error(
                 "Round 4 re-do refused: the first proof's settlement did not finish within "
                 "%.0fs session=%s",
-                _REDO_SETTLEMENT_WAIT_SECONDS,
+                _ROUND4_SETTLEMENT_WAIT_SECONDS,
                 record.snapshot.id,
             )
             return False

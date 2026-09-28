@@ -4913,27 +4913,30 @@ async def test_concurrent_and_terminal_redo_posts_are_idempotent() -> None:
     assert len(events) == event_count
 
 
+class SettlingModelScoreEngine(FakeModelScoreEngine):
+    """A Round 4 engine whose post-bout restore of the source row can be held open."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.settle_started = asyncio.Event()
+        self.allow_settle = asyncio.Event()
+        self.settled = False
+        self.redo_saw_settled: bool | None = None
+
+    async def settle_and_restore_baseline(self) -> None:
+        self.settle_started.set()
+        await self.allow_settle.wait()
+        self.settled = True
+
+    async def redo(self, arm, result, update, on_progress=None):
+        self.redo_saw_settled = self.settled
+        return await super().redo(arm, result, update, on_progress)
+
+
 async def test_round_four_redo_waits_for_the_first_proofs_row_to_be_put_back() -> None:
     """Two of three live re-dos on 2026-09-28 raced this restore and lost (2D521)."""
 
-    class SettlingEngine(FakeModelScoreEngine):
-        def __init__(self) -> None:
-            super().__init__()
-            self.settle_started = asyncio.Event()
-            self.allow_settle = asyncio.Event()
-            self.settled = False
-            self.redo_saw_settled: bool | None = None
-
-        async def settle_and_restore_baseline(self) -> None:
-            self.settle_started.set()
-            await self.allow_settle.wait()
-            self.settled = True
-
-        async def redo(self, arm, result, update, on_progress=None):
-            self.redo_saw_settled = self.settled
-            return await super().redo(arm, result, update, on_progress)
-
-    engine = SettlingEngine()
+    engine = SettlingModelScoreEngine()
     manager = RunManager(model_score_factory=lambda: engine)
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-settle")
     created, _ = await verified_round_four(manager, operator)
@@ -4947,6 +4950,56 @@ async def test_round_four_redo_waits_for_the_first_proofs_row_to_be_put_back() -
     await wait_for_redo(manager, created.id, RedoState.VERIFIED)
     assert engine.redo_calls == 1
     assert engine.redo_saw_settled is True
+
+
+async def test_the_next_round_four_arm_waits_for_the_last_bouts_row_to_be_put_back() -> None:
+    """A quick Ring Again raced the previous bout's restore the same way the re-do did."""
+
+    engine = SettlingModelScoreEngine()
+    manager = RunManager(model_score_factory=lambda: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-ring-again")
+    await verified_round_four(manager, operator)
+    await asyncio.wait_for(engine.settle_started.wait(), timeout=1)
+    arms_before = engine.arm_calls
+
+    second = await manager.create(round_four_request())
+    await manager.start_arm(second.id, operator)
+    await asyncio.sleep(0.05)
+    assert engine.arm_calls == arms_before
+
+    engine.allow_settle.set()
+    await wait_for_state(manager, second.id, SessionState.ARMED)
+    assert engine.arm_calls == arms_before + 1
+
+
+async def test_round_four_schedules_its_restore_before_it_publishes_the_result() -> None:
+    """A re-do can be requested the moment READY is visible; the restore must exist by then."""
+
+    engine = SettlingModelScoreEngine()
+    manager = RunManager(model_score_factory=lambda: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-ordering")
+    created = await manager.create(round_four_request())
+    record = manager._records[created.id]
+    seen: list[bool] = []
+    publish = record.event_log.publish
+
+    async def watching_publish(event, payload):
+        if event == "run_finished":
+            seen.append(record.settlement_task is not None)
+        return await publish(event, payload)
+
+    record.event_log.publish = watching_publish
+    try:
+        await manager.start_arm(created.id, operator)
+        await wait_for_state(manager, created.id, SessionState.ARMED)
+        await manager.start_run(created.id, operator)
+        await wait_for_state(manager, created.id, SessionState.VERIFIED)
+        task = record.task
+        if task is not None and not task.done():
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        assert seen == [True]
+    finally:
+        engine.allow_settle.set()
 
 
 async def test_redo_idempotent_refresh_bypasses_disappeared_readiness() -> None:

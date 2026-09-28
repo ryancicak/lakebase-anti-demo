@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
@@ -1206,6 +1207,7 @@ START_POLL_SECONDS = 3.0
 #: Sharing one activation is what makes "an arm cancels the pending release" true
 #: across bouts rather than only within one.
 _ACTIVATIONS: dict[str, Round4PipelineActivation] = {}
+_ACTIVATIONS_LOCK = threading.Lock()
 
 
 class Round4PipelineActivation:
@@ -1304,6 +1306,13 @@ class Round4PipelineActivation:
         self._last_seen_update_id = ""
         self._proven_update_id = ""
         self._proven_at: float | None = None
+        # The latest progress line of a start the warm keeper is making, relayed
+        # to an arm that queues behind it so the card never goes silent.
+        self._keeper_status = ""
+        # When the owed-stop record last written says the stop is due. Refreshed
+        # well ahead of that moment while the app is in use, so startup recovery
+        # never reads a lapsed promise for a pipeline somebody is using.
+        self._owed_due_at: datetime | None = None
 
     async def ensure_running(self, notify: Callable[[str], Awaitable[None]]) -> None:
         """Bring the pipeline to a healthy continuous sync, however long that takes.
@@ -1315,6 +1324,16 @@ class Round4PipelineActivation:
 
         self._generation += 1
         self._cancel_release()
+        if self._start_lock.locked():
+            # The warm keeper is starting it already. Say so, and relay its own
+            # progress, rather than leaving the card silent until it finishes.
+            await notify("The Managed Sync pipeline is already starting. Waiting for it.")
+            relayed = ""
+            while self._start_lock.locked():
+                if self._keeper_status and self._keeper_status != relayed:
+                    relayed = self._keeper_status
+                    await notify(relayed)
+                await self._sleep(max(self._poll_seconds, 0.01))
         async with self._start_lock:
             signals = await self._read_signals()
             if self._healthy(signals) and not self._full_refresh_required:
@@ -1340,23 +1359,51 @@ class Round4PipelineActivation:
 
         It also makes sure a release is pending, so a pipeline this brought up
         is always owed its stop, and the owed-stop record it writes supersedes
-        one a previous process left behind.
+        one a previous process left behind. That holds even when the start is
+        cancelled or fails part-way: a start that was requested may already be
+        coming up, and shutdown only stops a pipeline that has a release pending.
         """
 
-        async with self._start_lock:
-            signals = await self._read_signals()
-            if self._healthy(signals) and not self._full_refresh_required:
-                self._last_seen_update_id = signals.update_id
+        try:
+            async with self._start_lock:
+                signals = await self._read_signals()
+                if self._healthy(signals) and not self._full_refresh_required:
+                    self._last_seen_update_id = signals.update_id
+                else:
+                    self._generation += 1
+                    self._cancel_release()
+
+                    async def notify(status: str) -> None:
+                        self._keeper_status = status
+                        LOGGER.info("Round 4 warm keeper: %s", status)
+
+                    try:
+                        await self._start_and_wait(signals, notify, by_arm=False)
+                    finally:
+                        self._keeper_status = ""
+        finally:
+            if self._release is None:
+                self.release_when_idle()
             else:
-                self._generation += 1
-                self._cancel_release()
+                self._refresh_owed_stop()
 
-                async def notify(status: str) -> None:
-                    LOGGER.info("Round 4 warm keeper: %s", status)
+    def _refresh_owed_stop(self) -> None:
+        """Move the owed-stop record ahead of time while the app is in use.
 
-                await self._start_and_wait(signals, notify, by_arm=False)
-        if self._release is None:
-            self.release_when_idle()
+        The idle release extends itself when its deadline arrives, which is the
+        same moment startup recovery wakes on that deadline; a record written
+        then can lose the race. Rewriting it once it is within half a window of
+        its due time keeps the durable promise comfortably in the future.
+        """
+
+        remaining = self._in_use_remaining()
+        if remaining <= 0:
+            return
+        due = self._owed_due_at
+        now = self._now()
+        if due is not None and (due - now).total_seconds() > self._idle_seconds / 2:
+            return
+        self._record_stop_owed(now + timedelta(seconds=remaining))
 
     def note_use(self) -> None:
         """Record that a person used the app now. No I/O; safe on the request path."""
@@ -1647,6 +1694,7 @@ class Round4PipelineActivation:
                 exc_info=True,
             )
             return
+        self._owed_due_at = due_at
         self._persist(record)
 
     async def _release_after_idle(self, generation: int) -> None:
@@ -1659,14 +1707,17 @@ class Round4PipelineActivation:
                     # scheduled its own release.
                     return
                 remaining = self._in_use_remaining()
-                if remaining <= 0:
+                if remaining > 0:
+                    # Someone used the app inside the window: stay up until the
+                    # app has been quiet for a whole window. The owed record
+                    # moves with it, so it never reads as a stop that is overdue.
+                    self._record_stop_owed(self._now() + timedelta(seconds=remaining))
+                    await self._sleep(remaining)
+                    continue
+                signals = await self._read_signals()
+                # A use that landed during that read wins over the stop.
+                if self._in_use_remaining() <= 0:
                     break
-                # Someone used the app inside the window: stay up until the
-                # app has been quiet for a whole window. The owed record moves
-                # with it, so it never reads as a stop that is overdue.
-                self._record_stop_owed(self._now() + timedelta(seconds=remaining))
-                await self._sleep(remaining)
-            signals = await self._read_signals()
             if not self._healthy(signals):
                 # Already down, or down for a reason that is not ours. Stopping a
                 # pipeline that is failing would overwrite a genuine failure with
@@ -2008,16 +2059,19 @@ def _pipeline_activation(manifest: DemoManifest, workspace: Any) -> Round4Pipeli
     pipeline_id = str(getattr(sealed, "pipeline_id", "") or "")
     if not pipeline_id:
         return None
-    existing = _ACTIVATIONS.get(pipeline_id)
-    if existing is not None:
-        return existing
-    activation = Round4PipelineActivation(
-        manifest,
-        pipeline_power.workspace_api(workspace),
-        pipeline_id=pipeline_id,
-    )
-    _ACTIVATIONS[pipeline_id] = activation
-    return activation
+    # The warm keeper builds from a worker thread while an arm may build on the
+    # loop. Two activations for one pipeline would mean two start locks.
+    with _ACTIVATIONS_LOCK:
+        existing = _ACTIVATIONS.get(pipeline_id)
+        if existing is not None:
+            return existing
+        activation = Round4PipelineActivation(
+            manifest,
+            pipeline_power.workspace_api(workspace),
+            pipeline_id=pipeline_id,
+        )
+        _ACTIVATIONS[pipeline_id] = activation
+        return activation
 
 
 #: The warm keeper acts on use at most this often. Use is recorded at once; the
@@ -2041,30 +2095,60 @@ class Round4WarmKeeper:
 
     A failure here is logged and retried, never raised: the arm still starts the
     pipeline itself if it has to, exactly as it did before this existed.
+
+    The activation is built on the first use, in a worker thread: building it
+    constructs a workspace client, which may make a network call, and neither
+    startup nor the request path may wait on that.
     """
 
     def __init__(
         self,
-        activation: Round4PipelineActivation,
+        build_activation: Callable[[], Round4PipelineActivation | None],
         *,
         min_interval_seconds: float = WARM_KEEPER_MIN_INTERVAL_SECONDS,
         retry_seconds: float = WARM_KEEPER_RETRY_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        self._activation = activation
+        self._build_activation = build_activation
+        self._activation: Round4PipelineActivation | None = None
         self._min_interval = min_interval_seconds
         self._retry = retry_seconds
         self._sleep = sleep
         self._wake = asyncio.Event()
 
     def note_use(self) -> None:
-        self._activation.note_use()
+        if self._activation is not None:
+            self._activation.note_use()
         self._wake.set()
 
     async def run(self) -> None:
         while True:
             await self._wake.wait()
             self._wake.clear()
+            if self._activation is None:
+                try:
+                    activation = await asyncio.to_thread(self._build_activation)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.warning(
+                        "The Round 4 warm keeper could not reach the Managed Sync pipeline; "
+                        "the next Prepare will start it",
+                        exc_info=True,
+                    )
+                    await self._sleep(self._retry)
+                    continue
+                if activation is None:
+                    return
+                self._activation = activation
+                # The use that woke this keeper happened before the activation
+                # existed to record it.
+                activation.note_use()
+                LOGGER.info(
+                    "Round 4 warm keeper: a person is using the app; keeping the Managed "
+                    "Sync pipeline up until the app has been quiet for %.0fs",
+                    getattr(activation, "_idle_seconds", IDLE_STOP_SECONDS),
+                )
             try:
                 await self._activation.bring_up_for_use()
             except asyncio.CancelledError:
@@ -2080,18 +2164,20 @@ class Round4WarmKeeper:
             await self._sleep(self._min_interval)
 
 
-def build_round4_warm_keeper(manifest: DemoManifest) -> Round4WarmKeeper | None:
-    """The warm keeper for this manifest's sealed pipeline, without any network call.
+def build_round4_warm_keeper(manifest: DemoManifest) -> Round4WarmKeeper:
+    """The warm keeper for this manifest's sealed pipeline. Performs no work now.
 
-    Built through the same engine an arm builds, so the pipeline is powered by
-    exactly the identity that inspects it, and through the same keyed activation,
-    so the keeper and every arm share one start lock and one idle release.
+    Its activation is built later, through the same engine an arm builds, so the
+    pipeline is powered by exactly the identity that inspects it, and through the
+    same keyed activation, so the keeper and every arm share one start lock and
+    one idle release.
     """
 
-    activation = build_model_score_engine(manifest).activation
-    if not isinstance(activation, Round4PipelineActivation):
-        return None
-    return Round4WarmKeeper(activation)
+    def build_activation() -> Round4PipelineActivation | None:
+        activation = build_model_score_engine(manifest).activation
+        return activation if isinstance(activation, Round4PipelineActivation) else None
+
+    return Round4WarmKeeper(build_activation)
 
 
 async def aclose_activations() -> None:

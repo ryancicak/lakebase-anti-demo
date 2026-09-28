@@ -1693,11 +1693,11 @@ def _start_round4_warm_keeper(
     try:
         from server.model_score_live import build_round4_warm_keeper
 
+        # Performs no work now: the keeper builds its client on the first use,
+        # off the loop.
         keeper = build_round4_warm_keeper(owned)
     except Exception:  # noqa: BLE001 - an observer may never break startup
         LOGGER.warning("Could not start the Round 4 warm keeper", exc_info=True)
-        return None
-    if keeper is None:
         return None
     app.state.round4_warm_keeper = keeper
     task = asyncio.create_task(keeper.run(), name="round4-warm-keeper")
@@ -2064,14 +2064,23 @@ def _is_a_warm_use(request: Any) -> bool:
     Narrower than :func:`_is_a_use` on purpose, because warmth costs money and a
     lease does not. An open tab polls the catalog every thirty seconds and the
     board every few, so counting polls would keep the pipeline billing all night
-    behind a laptop left open. A page load (the browser marks it
-    ``Sec-Fetch-Dest: document``) or any action (anything but a read) counts.
+    behind a laptop left open. Any action (anything but a read) counts, and so
+    does a page load: the browser marks one ``Sec-Fetch-Dest: document``, and in
+    case a proxy drops that header, a GET of an app page (not under ``/api/``,
+    and not a file such as ``/assets/app.js``) counts too.
     """
     if not _is_a_use(request):
         return False
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         return True
-    return request.headers.get("sec-fetch-dest", "") == "document"
+    if request.headers.get("sec-fetch-dest", "") == "document":
+        return True
+    path = request.url.path
+    return (
+        request.method == "GET"
+        and not path.startswith("/api/")
+        and "." not in path.rsplit("/", 1)[-1]
+    )
 
 
 @app.middleware("http")

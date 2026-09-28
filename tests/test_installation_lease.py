@@ -694,6 +694,27 @@ def test_only_an_action_or_a_page_load_keeps_round_four_warm(monkeypatch) -> Non
     assert not app_module._is_a_warm_use(_method_request("GET", "/readyz", page_load))
 
 
+def test_a_page_load_counts_even_if_the_proxy_drops_sec_fetch_dest(monkeypatch) -> None:
+    """The main win cannot hang on one header surviving the Apps proxy."""
+
+    monkeypatch.setenv("DATABRICKS_APP_NAME", "lakebase-anti-demo")
+    signed_in = (("x-forwarded-email", "someone@databricks.com"),)
+
+    assert app_module._is_a_warm_use(_method_request("GET", "/", signed_in))
+    assert app_module._is_a_warm_use(_method_request("GET", "/fight-card", signed_in))
+    assert not app_module._is_a_warm_use(
+        _method_request("GET", "/assets/index-abc123.js", signed_in)
+    )
+    assert not app_module._is_a_warm_use(_method_request("GET", "/favicon.ico", signed_in))
+    assert not app_module._is_a_warm_use(_method_request("GET", "/api/catalog", signed_in))
+
+
+def test_no_warm_keeper_starts_without_a_round_four_seal(monkeypatch) -> None:
+    started = app_module._start_round4_warm_keeper(app_module.app, None)
+    assert started is None
+    assert app_module.app.state.round4_warm_keeper is None
+
+
 def test_the_middleware_feeds_the_warm_keeper_only_warm_uses(monkeypatch) -> None:
     monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
     monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)

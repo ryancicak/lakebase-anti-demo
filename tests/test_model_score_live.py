@@ -1851,7 +1851,7 @@ async def test_the_warm_keeper_brings_the_pipeline_up_on_use_and_survives_a_fail
         sleeps.append(seconds)
 
     keeper = model_score_live.Round4WarmKeeper(
-        activation,  # type: ignore[arg-type]
+        lambda: activation,  # type: ignore[arg-type,return-value]
         min_interval_seconds=30.0,
         retry_seconds=60.0,
         sleep=sleep,
@@ -1867,6 +1867,139 @@ async def test_the_warm_keeper_brings_the_pipeline_up_on_use_and_survives_a_fail
         assert activation.uses == 2
         assert activation.bring_ups == 2
         assert sleeps[0] == 60.0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+class SlowStart(FakePipelineApi):
+    """A parked pipeline that reads unhealthy for a few reads after its start."""
+
+    def __init__(self, *, reads_until_healthy: int) -> None:
+        super().__init__(running=False)
+        self.reads_until_healthy = reads_until_healthy
+        self.started = asyncio.Event()
+
+    def __call__(self, profile, method, path, *, body=None, timeout=600):
+        if method == "post" and path.endswith("/updates"):
+            self.calls.append((method, path))
+            self.update_bodies.append(body)
+            self.started.set()
+            return {"update_id": "update-1"}
+        if method == "get" and "/database/synced_tables/" in path and self.started.is_set():
+            if self.reads_until_healthy > 0:
+                self.reads_until_healthy -= 1
+            else:
+                self.running = True
+        return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+
+def _slow_activation(api: FakePipelineApi, **kwargs) -> model_score_live.Round4PipelineActivation:
+    return model_score_live.Round4PipelineActivation(
+        _activation_manifest(),
+        api,
+        pipeline_id="pipeline-1",
+        poll_seconds=0.01,
+        **kwargs,
+    )
+
+
+async def test_a_keeper_start_that_is_cancelled_part_way_is_still_owed_its_stop() -> None:
+    """A redeploy mid-start used to leave a running pipeline nobody would stop."""
+
+    api = SlowStart(reads_until_healthy=10_000)
+    activation = _slow_activation(api)
+    bring_up = asyncio.create_task(activation.bring_up_for_use())
+    try:
+        await asyncio.wait_for(api.started.wait(), timeout=1)
+        bring_up.cancel()
+        await asyncio.gather(bring_up, return_exceptions=True)
+
+        assert activation._started_by_process is True
+        assert activation._release is not None
+    finally:
+        activation._cancel_release()
+
+
+async def test_an_arm_queued_behind_the_keeper_says_what_it_is_waiting_for() -> None:
+    api = SlowStart(reads_until_healthy=6)
+    activation = _slow_activation(api)
+    notices: list[str] = []
+    bring_up = asyncio.create_task(activation.bring_up_for_use())
+    try:
+        await asyncio.wait_for(api.started.wait(), timeout=1)
+        await asyncio.wait_for(
+            activation.ensure_running(lambda status: _record(notices, status)),
+            timeout=5,
+        )
+        await asyncio.wait_for(bring_up, timeout=5)
+
+        assert notices[0] == "The Managed Sync pipeline is already starting. Waiting for it."
+        assert any("Waiting for the Managed Sync pipeline" in notice for notice in notices[1:])
+        starts = [call for call in api.calls if call[1].endswith("/updates")]
+        assert len(starts) == 1
+    finally:
+        activation._cancel_release()
+
+
+async def test_the_owed_stop_moves_ahead_of_its_deadline_while_the_app_is_in_use() -> None:
+    """Startup recovery wakes on the deadline; the promise must already be later."""
+
+    clock = ManualClock()
+    base = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
+    activation = _activation(
+        FakePipelineApi(running=True),
+        idle_seconds=100.0,
+        clock=clock,
+        now=lambda: base + timedelta(seconds=clock.now),
+    )
+    try:
+        activation.note_use()
+        await activation.bring_up_for_use()
+        first_due = activation._owed_due_at
+        assert first_due == base + timedelta(seconds=100)
+
+        clock.now = 30.0
+        activation.note_use()
+        await activation.bring_up_for_use()
+        assert activation._owed_due_at == first_due  # still more than half a window away
+
+        clock.now = 60.0
+        activation.note_use()
+        await activation.bring_up_for_use()
+        assert activation._owed_due_at == base + timedelta(seconds=160)
+    finally:
+        activation._cancel_release()
+
+
+async def test_the_warm_keeper_builds_its_client_on_first_use_and_off_the_loop(
+    monkeypatch,
+) -> None:
+    """Building it performs no work, so neither startup nor a request waits on it."""
+
+    built: list[str] = []
+
+    def failing_build(manifest):
+        built.append(threading.current_thread().name)
+        raise RuntimeError("workspace unreachable")
+
+    monkeypatch.setattr(model_score_live, "build_model_score_engine", failing_build)
+    keeper = model_score_live.build_round4_warm_keeper(_activation_manifest())  # type: ignore[arg-type]
+    assert built == []
+
+    slept = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        slept.set()
+        await asyncio.sleep(3600)
+
+    keeper._sleep = sleep
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        await asyncio.wait_for(slept.wait(), timeout=1)
+        assert len(built) == 1
+        assert built[0] != threading.current_thread().name
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
