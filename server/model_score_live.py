@@ -1413,6 +1413,17 @@ class Round4PipelineActivation:
         """
 
         try:
+            # A running pipeline is the common case, and checking one needs no
+            # lock. Held for the check, the lock made an arm pressed that second
+            # wait behind it, saying the pipeline was "already starting" while it
+            # was up (live, 2026-09-28). Only a start takes the lock, and it reads
+            # again under it, so two starts still cannot overlap. Nor does this
+            # check record the update it saw: a read that straddled another
+            # caller's restart would name the old update, and a warm proof made on
+            # that one must not count for the new.
+            signals = await self._read_signals()
+            if self._healthy(signals) and not self._full_refresh_required:
+                return
             async with self._start_lock:
                 signals = await self._read_signals()
                 if self._healthy(signals) and not self._full_refresh_required:
@@ -2043,14 +2054,9 @@ async def read_pipeline_signals(
         raise ModelScoreLiveConfigurationError(
             "Round 4 pipeline signal read does not name the sealed pipeline"
         )
-    pipeline = await asyncio.to_thread(
-        api,
-        manifest.databricks.profile,
-        "get",
-        pipeline_power._require_pipeline_path(
-            pipeline_id,
-            f"/api/2.0/pipelines/{pipeline_id}",
-        ),
+    pipeline_path = pipeline_power._require_pipeline_path(
+        pipeline_id,
+        f"/api/2.0/pipelines/{pipeline_id}",
     )
     sealed = manifest.round4
     synced_table_id = str(getattr(sealed, "synced_table_id", "") or "")
@@ -2058,11 +2064,16 @@ async def read_pipeline_signals(
         raise ModelScoreLiveConfigurationError(
             "Round 4 pipeline signal read has no sealed synced-table identity"
         )
-    synced = await asyncio.to_thread(
-        api,
-        manifest.databricks.profile,
-        "get",
-        f"/api/2.0/database/synced_tables/{quote(synced_table_id, safe='')}",
+    # Two independent reads, so the synced-table one, the slow one (measured live
+    # on 2026-09-28), no longer waits for the pipeline's. Every arm makes this read.
+    pipeline, synced = await asyncio.gather(
+        asyncio.to_thread(api, manifest.databricks.profile, "get", pipeline_path),
+        asyncio.to_thread(
+            api,
+            manifest.databricks.profile,
+            "get",
+            f"/api/2.0/database/synced_tables/{quote(synced_table_id, safe='')}",
+        ),
     )
     status = _mapping(synced.get("data_synchronization_status"))
     updates = pipeline.get("latest_updates")

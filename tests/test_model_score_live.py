@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -1862,6 +1863,81 @@ async def test_the_warm_keeper_costs_a_running_pipeline_one_read_and_owes_its_st
         assert activation._release is not None
     finally:
         activation._cancel_release()
+
+
+async def test_an_arm_never_waits_behind_the_keeper_checking_a_running_pipeline() -> None:
+    """Live, the arm's own click woke the keeper and then waited 4 s behind its check."""
+
+    keeper_inside = threading.Event()
+    release_keeper = threading.Event()
+    # asyncio.to_thread carries the caller's context into the worker thread, so
+    # this marks exactly the keeper's GETs, whichever order they arrive in.
+    keepers = contextvars.ContextVar("keepers", default=False)
+
+    class HeldKeeperRead(FakePipelineApi):
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if not keepers.get():
+                return super().__call__(profile, method, path, body=body, timeout=timeout)
+            keeper_inside.set()
+            release_keeper.wait(timeout=5)
+            result = super().__call__(profile, method, path, body=body, timeout=timeout)
+            if "/pipelines/" in path:
+                # What a check that straddled another caller's restart would see.
+                result["latest_updates"][0]["update_id"] = "u-stale"
+            return result
+
+    api = HeldKeeperRead(running=True)
+    activation = _activation(api)
+    activation._last_seen_update_id = "an-earlier-update"
+    notices: list[str] = []
+
+    async def keeper_check() -> None:
+        keepers.set(True)
+        await activation.bring_up_for_use()
+
+    check = asyncio.create_task(keeper_check())
+    try:
+        assert await asyncio.to_thread(keeper_inside.wait, 5)
+        await asyncio.wait_for(
+            activation.ensure_running(lambda status: _record(notices, status)),
+            timeout=2,
+        )
+        assert notices == []  # never "already starting" for a pipeline that is up
+        assert activation._last_seen_update_id == "u1"
+        release_keeper.set()
+        await asyncio.wait_for(check, timeout=5)
+        # The keeper's unlocked check records nothing an arm could be misled by.
+        assert activation._last_seen_update_id == "u1"
+        assert not any(path.endswith("/updates") for _, path in api.calls)
+    finally:
+        release_keeper.set()
+        activation._cancel_release()
+
+
+async def test_the_pipeline_and_synced_table_reads_run_side_by_side() -> None:
+    both_started = threading.Event()
+
+    class Overlap(FakePipelineApi):
+        overlapped: bool | None = None
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if method == "get" and "/pipelines/" in path:
+                # Released only if the synced-table read began before this one ended.
+                self.overlapped = both_started.wait(timeout=2)
+            elif method == "get":
+                both_started.set()
+            return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+    api = Overlap(running=True)
+    signals = await model_score_live.read_pipeline_signals(
+        _activation_manifest(),  # type: ignore[arg-type]
+        api,
+        pipeline_id="pipeline-1",
+    )
+
+    assert api.overlapped is True
+    assert model_score_live.pipeline_signals_are_healthy(signals)
+    assert signals.update_id == "u1"
 
 
 async def test_a_pipeline_the_warm_keeper_started_is_the_process_s_not_an_arm_s() -> None:
