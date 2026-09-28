@@ -964,6 +964,7 @@ class _Runtime:
     round5_warm_coordinator: Any | None = None
     round5_resident_transport_closer: Any | None = None
     lease_task: asyncio.Task[None] | None = None
+    round4_warm_task: asyncio.Task[None] | None = None
 
 
 async def _open_receipt_store(lease_store: Any) -> DurableReceiptStore | None:
@@ -1225,6 +1226,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
     posted_usage_task: asyncio.Task[None] | None = None
     credential_task: asyncio.Task[None] | None = None
     lease_task: asyncio.Task[None] | None = None
+    round4_warm_task: asyncio.Task[None] | None = None
     round4_stop_recovery_task: asyncio.Task[None] | None = None
     receipt_store: DurableReceiptStore | None = None
     pipeline_power_store: DurablePipelinePowerStore | None = None
@@ -1522,6 +1524,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         app.state.startup_credential_verdict = startup_credential_verdict
         credential_task = _start_credential_sentry(app, manifest)
         lease_task = _start_lease_keeper(app, manifest)
+        round4_warm_task = _start_round4_warm_keeper(app, manifest)
         app.state.restart_history = _restart_history()
         # Claimed only now, so the pidfile means "a server that finished startup is
         # serving this port" and a process that dies during startup never claims it.
@@ -1551,6 +1554,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round5_warm_coordinator=round5_warm_coordinator,
             round5_resident_transport_closer=round5_resident_transport_closer,
             lease_task=lease_task,
+            round4_warm_task=round4_warm_task,
         )
     except BaseException:
         # Uninstalled before the stores below are closed: the write hooks are
@@ -1567,11 +1571,13 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             posted_usage_task,
             credential_task,
             lease_task,
+            round4_warm_task,
         ):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         app.state.lease_keeper = None
+        app.state.round4_warm_keeper = None
         if round5_warm_coordinator is not None:
             await round5_warm_coordinator.close()
         if callable(round5_resident_transport_closer):
@@ -1667,6 +1673,38 @@ def _start_lease_keeper(
     return task
 
 
+def _start_round4_warm_keeper(
+    app: FastAPI,
+    manifest: DemoManifest | None,
+) -> asyncio.Task[None] | None:
+    """Keep Round 4's Managed Sync pipeline up while a person is using the app.
+
+    A parked pipeline takes about half a minute to start, and until this existed
+    that start happened after the presenter pressed Prepare. The keeper starts it
+    when the app is loaded or acted on, so Prepare meets a running pipeline. Like
+    the lease keeper it is an observer: building it performs no network call, and
+    a failure to build it only means Prepare starts the pipeline, as before.
+    """
+
+    app.state.round4_warm_keeper = None
+    owned = _owned_manifest_or_none(manifest)
+    if owned is None or owned.manifest_version < 2 or owned.round4 is None:
+        return None
+    try:
+        from server.model_score_live import build_round4_warm_keeper
+
+        keeper = build_round4_warm_keeper(owned)
+    except Exception:  # noqa: BLE001 - an observer may never break startup
+        LOGGER.warning("Could not start the Round 4 warm keeper", exc_info=True)
+        return None
+    if keeper is None:
+        return None
+    app.state.round4_warm_keeper = keeper
+    task = asyncio.create_task(keeper.run(), name="round4-warm-keeper")
+    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+    return task
+
+
 def _lease_session(manifest: DemoManifest) -> Any:
     from server.lifecycle import _aws_session
 
@@ -1708,6 +1746,12 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         runtime.lease_task.cancel()
         await asyncio.gather(runtime.lease_task, return_exceptions=True)
     app.state.lease_keeper = None
+    # Before the manager closes and the activations discharge their owed stops,
+    # so the keeper cannot start the pipeline again on the way out.
+    if runtime.round4_warm_task is not None:
+        runtime.round4_warm_task.cancel()
+        await asyncio.gather(runtime.round4_warm_task, return_exceptions=True)
+    app.state.round4_warm_keeper = None
     app.state.restart_history = None
     if runtime.readiness_task is not None:
         runtime.readiness_task.cancel()
@@ -2014,12 +2058,32 @@ def _is_a_use(request: Any) -> bool:
     return bool(caller_email(request)) if deployed else True
 
 
+def _is_a_warm_use(request: Any) -> bool:
+    """Whether this request is a person *doing* something, for the Round 4 warm keeper.
+
+    Narrower than :func:`_is_a_use` on purpose, because warmth costs money and a
+    lease does not. An open tab polls the catalog every thirty seconds and the
+    board every few, so counting polls would keep the pipeline billing all night
+    behind a laptop left open. A page load (the browser marks it
+    ``Sec-Fetch-Dest: document``) or any action (anything but a read) counts.
+    """
+    if not _is_a_use(request):
+        return False
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    return request.headers.get("sec-fetch-dest", "") == "document"
+
+
 @app.middleware("http")
 async def note_installation_use(request: Any, call_next: Callable[..., Any]) -> Response:
     keeper = getattr(app.state, "lease_keeper", None)
     if keeper is not None and _is_a_use(request):
         # Records a timestamp and at most sets an event: no I/O on this path.
         keeper.note_activity()
+    warm_keeper = getattr(app.state, "round4_warm_keeper", None)
+    if warm_keeper is not None and _is_a_warm_use(request):
+        # The same contract: a timestamp and an event, nothing else.
+        warm_keeper.note_use()
     return await call_next(request)
 
 

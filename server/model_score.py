@@ -235,6 +235,13 @@ class ModelScoreAdapter(Protocol):
 ProgressCallback = Callable[[ModelScoreProgress], Awaitable[None]]
 
 
+#: How recently a change must have gone end to end on the running pipeline update
+#: for Prepare to reuse that as its warm proof. Short on purpose: it covers a
+#: Ring Again or a re-arm after a towel, not a pipeline left idle between talks,
+#: whose compute may have parked again.
+WARM_PROOF_REUSE_SECONDS = 120.0
+
+
 class PipelineActivation(Protocol):
     """Whatever can turn this round's pipeline on before a bout and off after it.
 
@@ -314,6 +321,12 @@ class ModelScoreEngine:
         self._pending_adapter_tasks: set[asyncio.Task[object]] = set()
         self._settlement_task: asyncio.Task[None] | None = None
 
+    @property
+    def activation(self) -> PipelineActivation | None:
+        """The pipeline activation this engine powers its sync through, if any."""
+
+        return self._activation
+
     async def settle_and_restore_baseline(self) -> None:
         """Settle issued I/O, then restore and verify the exact owned baseline.
 
@@ -342,6 +355,7 @@ class ModelScoreEngine:
             "settlement source read",
         )
         baseline = self.contract.baseline
+        restored = False
 
         if source != baseline:
             if source is None or self._owned_update_rows.get(source.proof_nonce) != source:
@@ -376,6 +390,7 @@ class ModelScoreEngine:
                 raise ModelScoreVerificationError(
                     "Baseline sync timestamp does not match the exact restoration commit"
                 )
+            restored = True
         else:
             await self._wait_for_settlement_version(status.source_version, status)
 
@@ -391,6 +406,10 @@ class ModelScoreEngine:
             raise ModelScoreVerificationError(
                 "Round 4 settlement did not verify the exact baseline in source and application"
             )
+        if restored:
+            # The restore was itself a change carried end to end, so a Ring Again
+            # soon after can reuse it as the warm proof.
+            self._note_proven_sync()
         # Last, and only on the path that proved the baseline is back. A release
         # scheduled before this point, or on the failure path, would stop a
         # pipeline that settlement still needs -- and a retry of a settlement
@@ -496,7 +515,16 @@ class ModelScoreEngine:
                     "The exact baseline is absent and the current row is not one matching "
                     "demo-owned Round 4 proof"
                 )
-        status = await self._prove_pipeline_warm(status, on_progress)
+        reuse_age = self._reusable_warm_proof_age(source, application)
+        if reuse_age is None:
+            status = await self._prove_pipeline_warm(status, on_progress)
+        else:
+            await self._emit(
+                on_progress,
+                ModelScorePhase.PREFLIGHT,
+                f"Managed Sync carried a change end to end {reuse_age:.0f}s ago on this "
+                "same run; reusing that proof",
+            )
         confirmed = await self._inspect_sync()
         self._validate_contract_status(confirmed, arming=True)
         if (
@@ -584,6 +612,38 @@ class ModelScoreEngine:
             activation.release_when_idle()
             return
         await activation.release_now()
+
+    def _reusable_warm_proof_age(
+        self,
+        source: ModelScoreRow | None,
+        application: ModelScoreRow | None,
+    ) -> float | None:
+        """Seconds since a change last went end to end on the running update, if reusable.
+
+        The warm-up commit below exists so a cold pipeline's start-up never lands
+        inside the measurement. A change that went through this same pipeline
+        update end to end within :data:`WARM_PROOF_REUSE_SECONDS` proves the same
+        thing, so a quick Ring Again does not have to prove it a second time.
+        Only the exact baseline in both source and application qualifies: a row
+        left by an earlier proof still needs the commit that restores it.
+        """
+
+        if source != self.contract.baseline or application != self.contract.baseline:
+            return None
+        age_of = getattr(self._activation, "warm_proof_age", None)
+        if not callable(age_of):
+            return None
+        age = age_of()
+        if age is None or age < 0 or age > WARM_PROOF_REUSE_SECONDS:
+            return None
+        return float(age)
+
+    def _note_proven_sync(self) -> None:
+        """Tell the activation a change just went end to end, for a later Prepare."""
+
+        note = getattr(self._activation, "note_proven_sync", None)
+        if callable(note):
+            note()
 
     async def _prove_pipeline_warm(
         self,
@@ -674,6 +734,7 @@ class ModelScoreEngine:
             raise ModelScoreNotArmedError(
                 "Baseline repair did not reach the exact fresh application row"
             )
+        self._note_proven_sync()
         return repaired_status
 
     @staticmethod
@@ -791,6 +852,7 @@ class ModelScoreEngine:
             after_version=arm.source_version,
             on_progress=on_progress,
         )
+        self._note_proven_sync()
         result = ModelScoreRunResult(
             arm_id=arm.arm_id,
             contract_sha256=self.contract.sha256,
@@ -842,6 +904,7 @@ class ModelScoreEngine:
             after_version=result.initial.source_version,
             on_progress=on_progress,
         )
+        self._note_proven_sync()
         redone = replace(result, redo=proof)
         self._issued_results[arm.arm_id] = redone
         return redone

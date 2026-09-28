@@ -657,6 +657,64 @@ def test_only_a_person_using_the_app_counts_as_a_use(monkeypatch) -> None:
         assert not app_module._is_a_use(_request(probe, signed_in))
 
 
+def _method_request(
+    method: str,
+    path: str,
+    headers: tuple[tuple[str, str], ...] = (),
+) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "query_string": b"",
+            "headers": [(key.encode(), value.encode()) for key, value in headers],
+        }
+    )
+
+
+def test_only_an_action_or_a_page_load_keeps_round_four_warm(monkeypatch) -> None:
+    """Warmth bills by the hour, so a tab left open must not keep it forever.
+
+    The catalog is polled every thirty seconds and the board every few, on every
+    screen. Counting those would keep the pipeline up all night behind a laptop
+    left open; a page load or an action is a person actually there.
+    """
+
+    monkeypatch.setenv("DATABRICKS_APP_NAME", "lakebase-anti-demo")
+    signed_in = (("x-forwarded-email", "someone@databricks.com"),)
+    page_load = signed_in + (("sec-fetch-dest", "document"),)
+
+    assert app_module._is_a_warm_use(_method_request("GET", "/", page_load))
+    assert app_module._is_a_warm_use(_method_request("POST", "/api/sessions", signed_in))
+    assert not app_module._is_a_warm_use(_method_request("GET", "/api/catalog", signed_in))
+    assert not app_module._is_a_warm_use(_method_request("GET", "/api/bout/all", signed_in))
+    # Still nobody's use unless the proxy vouched for a person.
+    assert not app_module._is_a_warm_use(_method_request("POST", "/api/sessions"))
+    assert not app_module._is_a_warm_use(_method_request("GET", "/readyz", page_load))
+
+
+def test_the_middleware_feeds_the_warm_keeper_only_warm_uses(monkeypatch) -> None:
+    monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
+    monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)
+    warmed: list[str] = []
+    monkeypatch.setattr(app_module.app.state, "lease_keeper", None, raising=False)
+    monkeypatch.setattr(
+        app_module.app.state,
+        "round4_warm_keeper",
+        SimpleNamespace(note_use=lambda: warmed.append("use")),
+        raising=False,
+    )
+    client = TestClient(app_module.app)
+
+    client.get("/api/warm-test-no-such-route")
+    assert warmed == []
+    client.post("/api/warm-test-no-such-route")
+    assert warmed == ["use"]
+    client.get("/", headers={"sec-fetch-dest": "document"})
+    assert warmed == ["use", "use"]
+
+
 def test_the_middleware_notes_a_use_and_ignores_a_probe(monkeypatch) -> None:
     monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
     monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)

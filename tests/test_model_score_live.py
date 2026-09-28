@@ -1688,3 +1688,289 @@ async def test_a_power_record_produced_off_the_loop_is_reported_rather_than_drop
 
 async def _record(sink: list[str], status: str) -> None:
     sink.append(status)
+
+
+# --------------------------------------------------------------------------
+# Warm while the app is in use (2026-09-28). A cold Prepare measured 63 s live:
+# 26 s of it starting the pipeline, 22 s re-proving it warm.
+# --------------------------------------------------------------------------
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_the_idle_release_waits_until_the_app_has_been_quiet_for_a_window() -> None:
+    """Twenty idle minutes after the last use, not after the last bout."""
+
+    clock = ManualClock()
+    stops_at: list[float] = []
+    holder: list[model_score_live.Round4PipelineActivation] = []
+    uses_at = [60.0]
+
+    class TimedApi(FakePipelineApi):
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if method == "post" and path.endswith("/stop"):
+                stops_at.append(clock.now)
+            return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+    async def sleep(seconds: float) -> None:
+        target = clock.now + seconds
+        for moment in list(uses_at):
+            if clock.now < moment <= target:
+                clock.now = moment
+                holder[0].note_use()
+                uses_at.remove(moment)
+        clock.now = target
+
+    activation = _activation(TimedApi(running=True), idle_seconds=100.0, sleep=sleep, clock=clock)
+    holder.append(activation)
+    owed: list[datetime] = []
+    activation._record_stop_owed = owed.append  # type: ignore[method-assign]
+    activation.note_use()
+
+    await activation._release_after_idle(activation._generation)
+
+    assert stops_at == [160.0]
+    # The owed record moved with the extension, so it never read as overdue.
+    assert len(owed) == 1
+
+
+async def test_a_towel_leaves_up_a_pipeline_the_app_is_using() -> None:
+    """The next Prepare would otherwise pay the whole start again."""
+
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    await activation.ensure_running(lambda status: _record([], status))
+    activation.note_use()
+    try:
+        await activation.release_now()
+
+        assert ("post", "/api/2.0/pipelines/pipeline-1/stop") not in api.calls
+        assert activation._release is not None
+    finally:
+        activation._cancel_release()
+
+
+async def test_an_arm_and_the_warm_keeper_start_a_parked_pipeline_once() -> None:
+    """Two starts would restart the update the first is still bringing up."""
+
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    try:
+        await asyncio.gather(
+            activation.ensure_running(lambda status: _record([], status)),
+            activation.bring_up_for_use(),
+        )
+
+        starts = [call for call in api.calls if call[1].endswith("/updates")]
+        assert starts == [("post", "/api/2.0/pipelines/pipeline-1/updates")]
+    finally:
+        activation._cancel_release()
+
+
+async def test_the_warm_keeper_costs_a_running_pipeline_one_read_and_owes_its_stop() -> None:
+    api = FakePipelineApi(running=True)
+    activation = _activation(api)
+    try:
+        await activation.bring_up_for_use()
+
+        assert [method for method, _ in api.calls] == ["get", "get"]
+        assert activation._release is not None
+    finally:
+        activation._cancel_release()
+
+
+async def test_a_pipeline_the_warm_keeper_started_is_the_process_s_not_an_arm_s() -> None:
+    """Shutdown stops it; a towel's immediate release does not."""
+
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    try:
+        await activation.bring_up_for_use()
+
+        assert ("post", "/api/2.0/pipelines/pipeline-1/updates") in api.calls
+        assert activation._started_by_process is True
+        assert activation._started_by_arm is False
+    finally:
+        activation._cancel_release()
+
+
+async def test_a_warm_proof_counts_only_on_the_update_it_ran_on() -> None:
+    class RestartableApi(FakePipelineApi):
+        update_id = "u1"
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            result = super().__call__(profile, method, path, body=body, timeout=timeout)
+            if method == "get" and "/pipelines/" in path:
+                result["latest_updates"][0]["update_id"] = self.update_id
+            return result
+
+    api = RestartableApi(running=True)
+    clock = ManualClock()
+    activation = _activation(api, clock=clock)
+    await activation.ensure_running(lambda status: _record([], status))
+    assert activation.warm_proof_age() is None
+
+    clock.now = 10.0
+    activation.note_proven_sync()
+    clock.now = 40.0
+    assert activation.warm_proof_age() == 30.0
+
+    api.update_id = "u2"
+    await activation.ensure_running(lambda status: _record([], status))
+    assert activation.warm_proof_age() is None
+
+
+async def test_the_warm_keeper_brings_the_pipeline_up_on_use_and_survives_a_failure() -> None:
+    class Activation:
+        def __init__(self) -> None:
+            self.uses = 0
+            self.bring_ups = 0
+            self.fail_next = True
+            self.called = asyncio.Event()
+
+        def note_use(self) -> None:
+            self.uses += 1
+
+        async def bring_up_for_use(self) -> None:
+            self.bring_ups += 1
+            self.called.set()
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("control plane blip")
+
+    activation = Activation()
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    keeper = model_score_live.Round4WarmKeeper(
+        activation,  # type: ignore[arg-type]
+        min_interval_seconds=30.0,
+        retry_seconds=60.0,
+        sleep=sleep,
+    )
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        await asyncio.wait_for(activation.called.wait(), timeout=1)
+        activation.called.clear()
+        keeper.note_use()
+        await asyncio.wait_for(activation.called.wait(), timeout=1)
+
+        assert activation.uses == 2
+        assert activation.bring_ups == 2
+        assert sleeps[0] == 60.0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _statement_error(sql_state: str) -> model_score_live.WorkspaceStatementExecutionError:
+    return model_score_live.WorkspaceStatementExecutionError(
+        state="FAILED",
+        error_code="BAD_REQUEST",
+        sql_state=sql_state,
+        provider_category="",
+        provider_message="[DELTA_CONCURRENT_APPEND] a concurrent transaction won",
+    )
+
+
+class MergeFailing(FakeStatements):
+    def __init__(self, responses, *, failures: int, sql_state: str = "2D521") -> None:
+        super().__init__(responses)
+        self.failures = failures
+        self.sql_state = sql_state
+
+    async def execute(self, statement, parameters=()):
+        if statement.startswith("MERGE INTO") and self.failures > 0:
+            self.calls.append((statement, tuple(parameters)))
+            self.failures -= 1
+            raise _statement_error(self.sql_state)
+        return await super().execute(statement, parameters)
+
+
+def _head(version: int) -> list[dict[str, str]]:
+    return [{"version": str(version), "timestamp": "2026-08-18T11:59:58Z"}]
+
+
+async def test_a_source_merge_that_loses_a_concurrent_delta_transaction_is_issued_again(
+    monkeypatch,
+) -> None:
+    """Delta aborted the loser, so issuing it again is safe, and searched after the winner."""
+
+    monkeypatch.setattr(model_score_live, "DELTA_CONFLICT_RETRY_SECONDS", 0)
+    expected = ModelScoreRow("customer-1", 0.81, "risk-v1", "nonce-1")
+    statements = MergeFailing(
+        [
+            _head(12),
+            _head(13),
+            [],
+            [
+                {
+                    "entity_id": expected.entity_id,
+                    "score": str(expected.score),
+                    "model_version": expected.model_version,
+                    "proof_nonce": expected.proof_nonce,
+                    "_commit_version": "14",
+                    "_commit_timestamp": "2026-08-18T11:59:59Z",
+                    "_change_type": "update_postimage",
+                }
+            ],
+        ],
+        failures=1,
+    )
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=statements,
+    )
+
+    commit = await adapter.commit_source_update(
+        ModelScoreUpdate(
+            expected.entity_id,
+            expected.score,
+            expected.model_version,
+            expected.proof_nonce,
+        )
+    )
+
+    assert commit.version == 14
+    assert sum(call[0].startswith("MERGE INTO") for call in statements.calls) == 2
+    cdf, parameters = statements.calls[-1]
+    assert "table_changes" in cdf
+    assert {parameter.name: parameter.value for parameter in parameters}["start_version"] == "14"
+
+
+async def test_only_a_concurrent_transaction_is_retried_and_only_so_many_times(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(model_score_live, "DELTA_CONFLICT_RETRY_SECONDS", 0)
+    update = ModelScoreUpdate("customer-1", 0.81, "risk-v1", "nonce-1")
+    attempts = model_score_live.DELTA_CONFLICT_ATTEMPTS
+
+    persistent = MergeFailing([_head(12 + n) for n in range(attempts)], failures=attempts + 5)
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=persistent,
+    )
+    with pytest.raises(model_score_live.WorkspaceStatementExecutionError):
+        await adapter.commit_source_update(update)
+    assert sum(call[0].startswith("MERGE INTO") for call in persistent.calls) == attempts
+
+    denied = MergeFailing([_head(12)], failures=1, sql_state="42501")
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=denied,
+    )
+    with pytest.raises(model_score_live.WorkspaceStatementExecutionError):
+        await adapter.commit_source_update(update)
+    assert sum(call[0].startswith("MERGE INTO") for call in denied.calls) == 1

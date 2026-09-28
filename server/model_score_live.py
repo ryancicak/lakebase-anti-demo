@@ -200,6 +200,16 @@ class ModelScoreLiveOperationError(ModelScoreError):
     """A live Statement Execution or PostgreSQL operation was not exact."""
 
 
+#: SQLSTATE of Delta's concurrent-transaction conflicts (for example
+#: DELTA_CONCURRENT_APPEND). The losing transaction is aborted, not committed.
+DELTA_CONCURRENT_TRANSACTION_SQLSTATE = "2D521"
+
+#: How many times a source MERGE is issued before a conflict is reported, and the
+#: base of the linear backoff between attempts.
+DELTA_CONFLICT_ATTEMPTS = 4
+DELTA_CONFLICT_RETRY_SECONDS = 0.5
+
+
 class WorkspaceStatementExecutionError(ModelScoreLiveOperationError):
     """A failed SQL statement with Databricks' bounded, structured diagnosis.
 
@@ -817,7 +827,33 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         return _exact_model_row(rows, allow_missing=True)
 
     async def commit_source_update(self, update: ModelScoreUpdate) -> DeltaCommit:
-        before_version, _ = await self._source_head()
+        attempt = 1
+        while True:
+            before_version, _ = await self._source_head()
+            try:
+                await self._merge_source_update(update)
+                break
+            except WorkspaceStatementExecutionError as exc:
+                # Delta aborts a transaction that loses a concurrent-write
+                # conflict, so nothing committed and the MERGE is safe to issue
+                # again. The head is re-read first, so the change feed below is
+                # searched only after whatever commit won.
+                if (
+                    exc.sql_state != DELTA_CONCURRENT_TRANSACTION_SQLSTATE
+                    or attempt >= DELTA_CONFLICT_ATTEMPTS
+                ):
+                    raise
+                LOGGER.warning(
+                    "Round 4 source MERGE met a concurrent Delta transaction "
+                    "(attempt %d of %d); issuing it again",
+                    attempt,
+                    DELTA_CONFLICT_ATTEMPTS,
+                )
+                await asyncio.sleep(DELTA_CONFLICT_RETRY_SECONDS * attempt)
+                attempt += 1
+        return await self._committed_change(update, before_version)
+
+    async def _merge_source_update(self, update: ModelScoreUpdate) -> None:
         source = _source_identifier(self.config.source_table_full_name)
         await self._statements.execute(
             f"""MERGE INTO {source} AS target
@@ -841,6 +877,12 @@ VALUES (incoming.entity_id, incoming.score, incoming.model_version, incoming.pro
                 SqlParameter("proof_nonce", update.proof_nonce, "STRING"),
             ],
         )
+
+    async def _committed_change(
+        self,
+        update: ModelScoreUpdate,
+        before_version: int,
+    ) -> DeltaCommit:
         escaped_source = self.config.source_table_full_name.replace("'", "''")
         rows = await self._statements.execute(
             "SELECT entity_id, score, model_version, proof_nonce, "
@@ -1248,6 +1290,20 @@ class Round4PipelineActivation:
         # carried into any owed-stop record so scheduling a stop does not cost
         # the accrued figure its origin. See `pipeline_power.owed_stop_record`.
         self._resumed_at = ""
+        # One start at a time. An arm and the warm keeper can both find the
+        # pipeline parked in the same second; two starts would restart the
+        # update the first one is still bringing up.
+        self._start_lock = asyncio.Lock()
+        # When a person last did something in the app (a page load or an
+        # action, never a background poll). While that is inside the idle
+        # window the pipeline stays up, so Prepare never waits on a start.
+        self._last_use: float | None = None
+        # The update the most recent healthy read saw, and the update and time
+        # of the most recent change this pipeline carried end to end. Prepare
+        # reuses that proof only while it is recent and on the same update.
+        self._last_seen_update_id = ""
+        self._proven_update_id = ""
+        self._proven_at: float | None = None
 
     async def ensure_running(self, notify: Callable[[str], Awaitable[None]]) -> None:
         """Bring the pipeline to a healthy continuous sync, however long that takes.
@@ -1259,15 +1315,94 @@ class Round4PipelineActivation:
 
         self._generation += 1
         self._cancel_release()
-        signals = await self._read_signals()
-        if self._healthy(signals) and not self._full_refresh_required:
-            self._started_by_arm = False
-            return
+        async with self._start_lock:
+            signals = await self._read_signals()
+            if self._healthy(signals) and not self._full_refresh_required:
+                self._last_seen_update_id = signals.update_id
+                self._started_by_arm = False
+                return
 
-        await notify(
-            "The Managed Sync pipeline is not running. Starting it before the bell — "
-            f"this usually takes about {RESTART_SECONDS_ESTIMATE}s."
-        )
+            await notify(
+                "The Managed Sync pipeline is not running. Starting it before the bell — "
+                f"this usually takes about {RESTART_SECONDS_ESTIMATE}s."
+            )
+            await self._start_and_wait(signals, notify, by_arm=True)
+
+    async def bring_up_for_use(self) -> None:
+        """Have the pipeline up before anyone presses Prepare, while the app is in use.
+
+        Called by :class:`Round4WarmKeeper` when a person loads the app or acts in
+        it. A running pipeline costs one read; a parked one is started here,
+        under the same lock an arm starts it under, so the two can never both
+        start it. Nothing here touches the synced table or the Delta source: the
+        arm still proves the pipeline warm before any bell, so this only moves
+        the start-up off the presenter's path.
+
+        It also makes sure a release is pending, so a pipeline this brought up
+        is always owed its stop, and the owed-stop record it writes supersedes
+        one a previous process left behind.
+        """
+
+        async with self._start_lock:
+            signals = await self._read_signals()
+            if self._healthy(signals) and not self._full_refresh_required:
+                self._last_seen_update_id = signals.update_id
+            else:
+                self._generation += 1
+                self._cancel_release()
+
+                async def notify(status: str) -> None:
+                    LOGGER.info("Round 4 warm keeper: %s", status)
+
+                await self._start_and_wait(signals, notify, by_arm=False)
+        if self._release is None:
+            self.release_when_idle()
+
+    def note_use(self) -> None:
+        """Record that a person used the app now. No I/O; safe on the request path."""
+
+        self._last_use = self._clock()
+
+    def _in_use_remaining(self) -> float:
+        """Seconds left in the idle window since the last use, zero if none."""
+
+        if self._last_use is None:
+            return 0.0
+        return max(0.0, self._idle_seconds - (self._clock() - self._last_use))
+
+    def note_proven_sync(self) -> None:
+        """Record that a change just went through this pipeline end to end."""
+
+        if self._last_seen_update_id:
+            self._proven_update_id = self._last_seen_update_id
+            self._proven_at = self._clock()
+
+    def warm_proof_age(self) -> float | None:
+        """How long ago a change last went end to end on the update now running.
+
+        ``None`` when there is no such proof, or when the update the latest
+        healthy read saw is not the one the proof ran on: a restarted update has
+        to be proven again.
+        """
+
+        if not self._proven_update_id or self._proven_at is None:
+            return None
+        if self._proven_update_id != self._last_seen_update_id:
+            return None
+        return self._clock() - self._proven_at
+
+    async def _start_and_wait(
+        self,
+        signals: PipelineSignals,
+        notify: Callable[[str], Awaitable[None]],
+        *,
+        by_arm: bool,
+    ) -> None:
+        """Start the parked pipeline and wait for a healthy continuous sync.
+
+        Held under ``_start_lock`` by both callers.
+        """
+
         def remember(record: dict[str, Any]) -> None:
             self._resumed_at = str(record.get("resumed_at") or "")
             self._persist(record)
@@ -1302,8 +1437,9 @@ class Round4PipelineActivation:
         # Set on the request rather than on the successful wait. The claim this
         # records is "this arm asked for the pipeline that is now up", and that
         # is true the moment the verb is issued -- an arm that then times out
-        # still left a resuming pipeline behind it.
-        self._started_by_arm = True
+        # still left a resuming pipeline behind it. A start the warm keeper made
+        # is this process's, but no arm's.
+        self._started_by_arm = by_arm
         self._started_by_process = True
         deadline = self._clock() + self._wait_timeout_seconds
         healthy_observations = 0
@@ -1313,6 +1449,7 @@ class Round4PipelineActivation:
             if self._healthy(signals):
                 healthy_observations += 1
                 if healthy_observations >= 2:
+                    self._last_seen_update_id = signals.update_id
                     await notify("The Managed Sync pipeline is running. Verifying the baseline.")
                     return
             else:
@@ -1402,7 +1539,10 @@ class Round4PipelineActivation:
         throw away the fallback that would have caught it.
         """
 
-        if not self._started_by_arm:
+        # While a person is using the app the pipeline is kept up for the next
+        # Prepare, towel or not; the idle release stops it once the app goes
+        # quiet. Stopping it here would hand the very next arm a cold start.
+        if not self._started_by_arm or self._in_use_remaining() > 0:
             self.release_when_idle()
             return
 
@@ -1512,11 +1652,20 @@ class Round4PipelineActivation:
     async def _release_after_idle(self, generation: int) -> None:
         try:
             await self._sleep(self._idle_seconds)
-            if generation != self._generation:
-                # An arm happened while this slept, so the bout this was
-                # scheduled for is not the current one. The newer arm scheduled
-                # its own release.
-                return
+            while True:
+                if generation != self._generation:
+                    # An arm happened while this slept, so the bout this was
+                    # scheduled for is not the current one. The newer arm
+                    # scheduled its own release.
+                    return
+                remaining = self._in_use_remaining()
+                if remaining <= 0:
+                    break
+                # Someone used the app inside the window: stay up until the
+                # app has been quiet for a whole window. The owed record moves
+                # with it, so it never reads as a stop that is overdue.
+                self._record_stop_owed(self._now() + timedelta(seconds=remaining))
+                await self._sleep(remaining)
             signals = await self._read_signals()
             if not self._healthy(signals):
                 # Already down, or down for a reason that is not ours. Stopping a
@@ -1869,6 +2018,80 @@ def _pipeline_activation(manifest: DemoManifest, workspace: Any) -> Round4Pipeli
     )
     _ACTIVATIONS[pipeline_id] = activation
     return activation
+
+
+#: The warm keeper acts on use at most this often. Use is recorded at once; the
+#: bring-up it prompts costs one read when the pipeline is already running.
+WARM_KEEPER_MIN_INTERVAL_SECONDS = 30.0
+
+#: How long the warm keeper waits after a failed bring-up before trying again.
+WARM_KEEPER_RETRY_SECONDS = 60.0
+
+
+class Round4WarmKeeper:
+    """Keep Round 4's pipeline up while a person is using the app.
+
+    Started once per serving process, beside the lease keeper. ``note_use`` sits
+    on the request path and does no I/O: it records the moment on the activation
+    and wakes this keeper, which brings the pipeline up at most once per
+    ``min_interval_seconds``. Parking stays with the activation's idle release,
+    which waits until the app has been quiet for a whole window. So the start-up
+    a parked pipeline needs happens while the presenter is still choosing a
+    matchup, never after they press Prepare.
+
+    A failure here is logged and retried, never raised: the arm still starts the
+    pipeline itself if it has to, exactly as it did before this existed.
+    """
+
+    def __init__(
+        self,
+        activation: Round4PipelineActivation,
+        *,
+        min_interval_seconds: float = WARM_KEEPER_MIN_INTERVAL_SECONDS,
+        retry_seconds: float = WARM_KEEPER_RETRY_SECONDS,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._activation = activation
+        self._min_interval = min_interval_seconds
+        self._retry = retry_seconds
+        self._sleep = sleep
+        self._wake = asyncio.Event()
+
+    def note_use(self) -> None:
+        self._activation.note_use()
+        self._wake.set()
+
+    async def run(self) -> None:
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+            try:
+                await self._activation.bring_up_for_use()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.warning(
+                    "The Round 4 warm keeper could not bring the Managed Sync pipeline up; "
+                    "the next Prepare will start it",
+                    exc_info=True,
+                )
+                await self._sleep(self._retry)
+                continue
+            await self._sleep(self._min_interval)
+
+
+def build_round4_warm_keeper(manifest: DemoManifest) -> Round4WarmKeeper | None:
+    """The warm keeper for this manifest's sealed pipeline, without any network call.
+
+    Built through the same engine an arm builds, so the pipeline is powered by
+    exactly the identity that inspects it, and through the same keyed activation,
+    so the keeper and every arm share one start lock and one idle release.
+    """
+
+    activation = build_model_score_engine(manifest).activation
+    if not isinstance(activation, Round4PipelineActivation):
+        return None
+    return Round4WarmKeeper(activation)
 
 
 async def aclose_activations() -> None:

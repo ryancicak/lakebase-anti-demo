@@ -4913,6 +4913,42 @@ async def test_concurrent_and_terminal_redo_posts_are_idempotent() -> None:
     assert len(events) == event_count
 
 
+async def test_round_four_redo_waits_for_the_first_proofs_row_to_be_put_back() -> None:
+    """Two of three live re-dos on 2026-09-28 raced this restore and lost (2D521)."""
+
+    class SettlingEngine(FakeModelScoreEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.settle_started = asyncio.Event()
+            self.allow_settle = asyncio.Event()
+            self.settled = False
+            self.redo_saw_settled: bool | None = None
+
+        async def settle_and_restore_baseline(self) -> None:
+            self.settle_started.set()
+            await self.allow_settle.wait()
+            self.settled = True
+
+        async def redo(self, arm, result, update, on_progress=None):
+            self.redo_saw_settled = self.settled
+            return await super().redo(arm, result, update, on_progress)
+
+    engine = SettlingEngine()
+    manager = RunManager(model_score_factory=lambda: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-settle")
+    created, _ = await verified_round_four(manager, operator)
+    await asyncio.wait_for(engine.settle_started.wait(), timeout=1)
+
+    await manager.start_redo(created.id, operator)
+    await asyncio.sleep(0.05)
+    assert engine.redo_calls == 0
+
+    engine.allow_settle.set()
+    await wait_for_redo(manager, created.id, RedoState.VERIFIED)
+    assert engine.redo_calls == 1
+    assert engine.redo_saw_settled is True
+
+
 async def test_redo_idempotent_refresh_bypasses_disappeared_readiness() -> None:
     engine = FakeModelScoreEngine()
     engine.allow_redo.clear()

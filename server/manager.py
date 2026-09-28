@@ -486,6 +486,10 @@ class RoundStorageReadinessError(RuntimeError):
 
 _ROUND_ONE_TRANSACTION_WIRE_CALL = "PostgreSQL TLS connect → INSERT → COMMIT → SELECT"
 
+#: How long a Round 4 re-do waits for the first proof's row to be put back
+#: before refusing. The restore normally finishes in about fifteen seconds.
+_REDO_SETTLEMENT_WAIT_SECONDS = 120.0
+
 _ROUND_FOUR_UNSUPPORTED_REASON = (
     "No AWS-native equivalent lane was configured or timed in this scoped proof."
 )
@@ -9501,14 +9505,17 @@ class RunManager:
             record.model_score_terminal_published = True
             engine = record.model_score_engine
             snapshot = record.snapshot.model_copy(deep=True)
+            # Scheduled before the result is published, not after: a re-do can be
+            # requested the moment READY is visible, and it must find the restore
+            # already scheduled so it can wait for it (_await_settlement_before_redo).
+            self._schedule_round_settlement(
+                record,
+                getattr(engine, "settle_and_restore_baseline", None),
+                label="Round 4",
+            )
         await record.event_log.publish(
             "run_finished",
             {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
-        )
-        self._schedule_round_settlement(
-            record,
-            getattr(engine, "settle_and_restore_baseline", None),
-            label="Round 4",
         )
 
     async def _finish_model_score_failure(
@@ -9571,6 +9578,16 @@ class RunManager:
         async def on_progress(progress: ModelScoreProgress) -> None:
             await self._apply_model_score_progress(record, progress, redo=True)
 
+        if not await self._await_settlement_before_redo(record, on_progress):
+            await self._await_model_score_terminal(
+                record,
+                self._fail_model_score_redo(
+                    record,
+                    "The first proof's row was still being put back, so the re-do did not "
+                    "run. Ring Round 4 again for a new proof.",
+                ),
+            )
+            return
         try:
             result = await engine.redo(arm, initial, update, on_progress)
         except asyncio.CancelledError:
@@ -9606,6 +9623,45 @@ class RunManager:
             record,
             self._finish_model_score_redo(record, result),
         )
+
+    async def _await_settlement_before_redo(
+        self,
+        record: SessionRecord,
+        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+    ) -> bool:
+        """Let the first proof's row be put back before the re-do writes its own.
+
+        A verified result offers Re-do the moment it is published, and the same
+        moment schedules the restore of the source row. A re-do taken inside that
+        window sent its MERGE into the same row while the restore's was in
+        flight, and Delta refused whichever committed second: SQLSTATE 2D521, two
+        of three live re-dos on 2026-09-28. When the re-do won, the restore then
+        put the baseline back on top of its new score. Waiting here orders the
+        two, and the restore the re-do's own finish schedules runs after it.
+        """
+
+        settlement = record.settlement_task
+        if settlement is None or settlement.done():
+            return True
+        await on_progress(
+            ModelScoreProgress(
+                phase=ModelScorePhase.PREFLIGHT,
+                status="Putting the first proof's row back before the re-do",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        try:
+            async with asyncio.timeout(_REDO_SETTLEMENT_WAIT_SECONDS):
+                await asyncio.shield(settlement)
+        except TimeoutError:
+            logger.error(
+                "Round 4 re-do refused: the first proof's settlement did not finish within "
+                "%.0fs session=%s",
+                _REDO_SETTLEMENT_WAIT_SECONDS,
+                record.snapshot.id,
+            )
+            return False
+        return True
 
     async def _finish_model_score_redo(
         self,
