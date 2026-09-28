@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -542,18 +543,97 @@ async def test_database_cursor_is_authoritative_and_ahead_of_source_fails_closed
     ahead_api.responses["/api/2.0/database/synced_tables/storage.round4.model_scores"] = (
         database_synced_table_payload(processed_version=13, delta_version=13)
     )
+    ahead_statements = FakeStatements(
+        [
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+            [{"key": "delta.enableChangeDataFeed", "value": "true"}],
+            # Read again after the cursors, the head is still behind them.
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+        ]
+    )
     ahead = LiveModelScoreAdapter(
         live_config(),
         workspace_client=control_plane_workspace(ahead_api),
-        statement_runner=FakeStatements(
-            [
-                [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
-                [{"key": "delta.enableChangeDataFeed", "value": "true"}],
-            ]
-        ),
+        statement_runner=ahead_statements,
     )
     with pytest.raises(ModelScoreLiveOperationError, match="source head"):
         await ahead.inspect_sync()
+    assert [call[0].split()[0] for call in ahead_statements.calls] == [
+        "DESCRIBE",
+        "SHOW",
+        "DESCRIBE",
+    ]
+
+
+async def test_a_head_read_beside_the_cursors_is_read_again_before_refusing() -> None:
+    """A commit that lands and syncs between the two reads is not a cursor ahead."""
+
+    api = FakeApiClient()
+    api.responses["/api/2.0/database/synced_tables/storage.round4.model_scores"] = (
+        database_synced_table_payload(processed_version=13, delta_version=13)
+    )
+    statements = FakeStatements(
+        [
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+            [{"key": "delta.enableChangeDataFeed", "value": "true"}],
+            [{"version": "13", "timestamp": "2026-08-18T12:00:00Z"}],
+        ]
+    )
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(api),
+        statement_runner=statements,
+        now=lambda: NOW,
+    )
+
+    status = await adapter.inspect_sync()
+
+    assert status.source_version == status.last_processed_version == 13
+    assert len(statements.calls) == 3
+
+
+async def test_the_head_and_cdf_reads_run_beside_the_control_plane() -> None:
+    """The two statements no longer wait for the control-plane reads to finish."""
+
+    both_started = threading.Event()
+
+    class HeldStatusApi(FakeApiClient):
+        overlapped: bool | None = None
+
+        def do(self, method, path):
+            if path.startswith("/api/2.0/database/synced_tables/"):
+                # Released only once both statements are in flight, which happens
+                # only if they were issued beside this read rather than after it.
+                self.overlapped = both_started.wait(timeout=2)
+            return super().do(method, path)
+
+    class CountingStatements(FakeStatements):
+        async def execute(self, statement, parameters=()):
+            rows = await super().execute(statement, parameters)
+            if len(self.calls) == 2:
+                both_started.set()
+            return rows
+
+    api = HeldStatusApi()
+    statements = CountingStatements(
+        [
+            [{"version": "12", "timestamp": "2026-08-18T11:59:59Z"}],
+            [{"key": "delta.enableChangeDataFeed", "value": "true"}],
+        ]
+    )
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(api),
+        statement_runner=statements,
+        now=lambda: NOW,
+    )
+
+    status = await adapter.inspect_sync()
+
+    assert api.overlapped is True
+    assert status.cdf_enabled is True
+    assert status.source_version == 12
+    assert [call[0].split()[0] for call in statements.calls] == ["DESCRIBE", "SHOW"]
 
 
 async def test_pipeline_requires_exact_single_managed_sync_sink() -> None:
@@ -1688,3 +1768,669 @@ async def test_a_power_record_produced_off_the_loop_is_reported_rather_than_drop
 
 async def _record(sink: list[str], status: str) -> None:
     sink.append(status)
+
+
+# --------------------------------------------------------------------------
+# Warm while the app is in use (2026-09-28). A cold Prepare measured 63 s live:
+# 26 s of it starting the pipeline, 22 s re-proving it warm.
+# --------------------------------------------------------------------------
+
+
+class ManualClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_the_idle_release_waits_until_the_app_has_been_quiet_for_a_window() -> None:
+    """Twenty idle minutes after the last use, not after the last bout."""
+
+    clock = ManualClock()
+    stops_at: list[float] = []
+    holder: list[model_score_live.Round4PipelineActivation] = []
+    uses_at = [60.0]
+
+    class TimedApi(FakePipelineApi):
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if method == "post" and path.endswith("/stop"):
+                stops_at.append(clock.now)
+            return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+    async def sleep(seconds: float) -> None:
+        target = clock.now + seconds
+        for moment in list(uses_at):
+            if clock.now < moment <= target:
+                clock.now = moment
+                holder[0].note_use()
+                uses_at.remove(moment)
+        clock.now = target
+
+    activation = _activation(TimedApi(running=True), idle_seconds=100.0, sleep=sleep, clock=clock)
+    holder.append(activation)
+    owed: list[datetime] = []
+    activation._record_stop_owed = owed.append  # type: ignore[method-assign]
+    activation.note_use()
+
+    await activation._release_after_idle(activation._generation)
+
+    assert stops_at == [160.0]
+    # The owed record moved with the extension, so it never read as overdue.
+    assert len(owed) == 1
+
+
+async def test_a_towel_leaves_up_a_pipeline_the_app_is_using() -> None:
+    """The next Prepare would otherwise pay the whole start again."""
+
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    await activation.ensure_running(lambda status: _record([], status))
+    activation.note_use()
+    try:
+        await activation.release_now()
+
+        assert ("post", "/api/2.0/pipelines/pipeline-1/stop") not in api.calls
+        assert activation._release is not None
+    finally:
+        activation._cancel_release()
+
+
+async def test_an_arm_and_the_warm_keeper_start_a_parked_pipeline_once() -> None:
+    """Two starts would restart the update the first is still bringing up."""
+
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    try:
+        await asyncio.gather(
+            activation.ensure_running(lambda status: _record([], status)),
+            activation.bring_up_for_use(),
+        )
+
+        starts = [call for call in api.calls if call[1].endswith("/updates")]
+        assert starts == [("post", "/api/2.0/pipelines/pipeline-1/updates")]
+    finally:
+        activation._cancel_release()
+
+
+async def test_the_warm_keeper_costs_a_running_pipeline_one_read_and_owes_its_stop() -> None:
+    api = FakePipelineApi(running=True)
+    activation = _activation(api)
+    try:
+        await activation.bring_up_for_use()
+
+        assert [method for method, _ in api.calls] == ["get", "get"]
+        assert activation._release is not None
+    finally:
+        activation._cancel_release()
+
+
+async def test_an_arm_never_waits_behind_the_keeper_checking_a_running_pipeline() -> None:
+    """Live, the arm's own click woke the keeper and then waited 4 s behind its check."""
+
+    keeper_inside = threading.Event()
+    release_keeper = threading.Event()
+    # asyncio.to_thread carries the caller's context into the worker thread, so
+    # this marks exactly the keeper's GETs, whichever order they arrive in.
+    keepers = contextvars.ContextVar("keepers", default=False)
+
+    class HeldKeeperRead(FakePipelineApi):
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if not keepers.get():
+                return super().__call__(profile, method, path, body=body, timeout=timeout)
+            keeper_inside.set()
+            release_keeper.wait(timeout=5)
+            result = super().__call__(profile, method, path, body=body, timeout=timeout)
+            if "/pipelines/" in path:
+                # What a check that straddled another caller's restart would see.
+                result["latest_updates"][0]["update_id"] = "u-stale"
+            return result
+
+    api = HeldKeeperRead(running=True)
+    activation = _activation(api)
+    activation._last_seen_update_id = "an-earlier-update"
+    notices: list[str] = []
+
+    async def keeper_check() -> None:
+        keepers.set(True)
+        await activation.bring_up_for_use()
+
+    check = asyncio.create_task(keeper_check())
+    try:
+        assert await asyncio.to_thread(keeper_inside.wait, 5)
+        await asyncio.wait_for(
+            activation.ensure_running(lambda status: _record(notices, status)),
+            timeout=2,
+        )
+        assert notices == []  # never "already starting" for a pipeline that is up
+        assert activation._last_seen_update_id == "u1"
+        release_keeper.set()
+        await asyncio.wait_for(check, timeout=5)
+        # The keeper's unlocked check records nothing an arm could be misled by.
+        assert activation._last_seen_update_id == "u1"
+        assert not any(path.endswith("/updates") for _, path in api.calls)
+    finally:
+        release_keeper.set()
+        activation._cancel_release()
+
+
+async def test_the_pipeline_and_synced_table_reads_run_side_by_side() -> None:
+    both_started = threading.Event()
+
+    class Overlap(FakePipelineApi):
+        overlapped: bool | None = None
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            if method == "get" and "/pipelines/" in path:
+                # Released only if the synced-table read began before this one ended.
+                self.overlapped = both_started.wait(timeout=2)
+            elif method == "get":
+                both_started.set()
+            return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+    api = Overlap(running=True)
+    signals = await model_score_live.read_pipeline_signals(
+        _activation_manifest(),  # type: ignore[arg-type]
+        api,
+        pipeline_id="pipeline-1",
+    )
+
+    assert api.overlapped is True
+    assert model_score_live.pipeline_signals_are_healthy(signals)
+    assert signals.update_id == "u1"
+
+
+async def test_a_pipeline_the_warm_keeper_started_is_the_process_s_not_an_arm_s() -> None:
+    """Shutdown stops it; a towel's immediate release does not."""
+
+    api = FakePipelineApi(running=False)
+    activation = _activation(api)
+    try:
+        await activation.bring_up_for_use()
+
+        assert ("post", "/api/2.0/pipelines/pipeline-1/updates") in api.calls
+        assert activation._started_by_process is True
+        assert activation._started_by_arm is False
+    finally:
+        activation._cancel_release()
+
+
+async def test_a_warm_proof_counts_only_on_the_update_it_ran_on() -> None:
+    class RestartableApi(FakePipelineApi):
+        update_id = "u1"
+
+        def __call__(self, profile, method, path, *, body=None, timeout=600):
+            result = super().__call__(profile, method, path, body=body, timeout=timeout)
+            if method == "get" and "/pipelines/" in path:
+                result["latest_updates"][0]["update_id"] = self.update_id
+            return result
+
+    api = RestartableApi(running=True)
+    clock = ManualClock()
+    activation = _activation(api, clock=clock)
+    await activation.ensure_running(lambda status: _record([], status))
+    assert activation.warm_proof_age() is None
+
+    clock.now = 10.0
+    activation.note_proven_sync()
+    clock.now = 40.0
+    assert activation.warm_proof_age() == 30.0
+
+    api.update_id = "u2"
+    await activation.ensure_running(lambda status: _record([], status))
+    assert activation.warm_proof_age() is None
+
+
+async def test_a_preparation_is_as_old_as_the_older_of_its_proof_and_storage_check() -> None:
+    api = FakePipelineApi(running=True)
+    clock = ManualClock()
+    activation = _activation(api, clock=clock)
+    await activation.ensure_running(lambda status: _record([], status))
+
+    activation.note_proven_sync()
+    assert activation.preparation_age() is None  # no storage check yet
+
+    clock.now = 10.0
+    activation.note_storage_check()
+    clock.now = 40.0
+    assert activation.preparation_age() == 40.0  # the proof is the older
+
+    # A bout's own proof renews the proof alone, so the storage check is now older.
+    activation.note_proven_sync()
+    clock.now = 50.0
+    assert activation.preparation_age() == 40.0
+
+    activation.forget_storage_check()
+    assert activation.preparation_age() is None
+
+
+async def test_the_warm_keeper_brings_the_pipeline_up_on_use_and_survives_a_failure() -> None:
+    class Activation:
+        def __init__(self) -> None:
+            self.uses = 0
+            self.bring_ups = 0
+            self.fail_next = True
+            self.called = asyncio.Event()
+
+        def note_use(self) -> None:
+            self.uses += 1
+
+        async def bring_up_for_use(self) -> None:
+            self.bring_ups += 1
+            self.called.set()
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("control plane blip")
+
+    activation = Activation()
+    sleeps: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    keeper = model_score_live.Round4WarmKeeper(
+        lambda: activation,  # type: ignore[arg-type,return-value]
+        min_interval_seconds=30.0,
+        retry_seconds=60.0,
+        sleep=sleep,
+    )
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        await asyncio.wait_for(activation.called.wait(), timeout=1)
+        activation.called.clear()
+        keeper.note_use()
+        await asyncio.wait_for(activation.called.wait(), timeout=1)
+
+        assert activation.uses == 2
+        assert activation.bring_ups == 2
+        assert sleeps[0] == 60.0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+class SlowStart(FakePipelineApi):
+    """A parked pipeline that reads unhealthy for a few reads after its start."""
+
+    def __init__(self, *, reads_until_healthy: int) -> None:
+        super().__init__(running=False)
+        self.reads_until_healthy = reads_until_healthy
+        self.started = asyncio.Event()
+
+    def __call__(self, profile, method, path, *, body=None, timeout=600):
+        if method == "post" and path.endswith("/updates"):
+            self.calls.append((method, path))
+            self.update_bodies.append(body)
+            self.started.set()
+            return {"update_id": "update-1"}
+        if method == "get" and "/database/synced_tables/" in path and self.started.is_set():
+            if self.reads_until_healthy > 0:
+                self.reads_until_healthy -= 1
+            else:
+                self.running = True
+        return super().__call__(profile, method, path, body=body, timeout=timeout)
+
+
+def _slow_activation(api: FakePipelineApi, **kwargs) -> model_score_live.Round4PipelineActivation:
+    return model_score_live.Round4PipelineActivation(
+        _activation_manifest(),
+        api,
+        pipeline_id="pipeline-1",
+        poll_seconds=0.01,
+        **kwargs,
+    )
+
+
+async def test_a_keeper_start_that_is_cancelled_part_way_is_still_owed_its_stop() -> None:
+    """A redeploy mid-start used to leave a running pipeline nobody would stop."""
+
+    api = SlowStart(reads_until_healthy=10_000)
+    activation = _slow_activation(api)
+    bring_up = asyncio.create_task(activation.bring_up_for_use())
+    try:
+        await asyncio.wait_for(api.started.wait(), timeout=1)
+        bring_up.cancel()
+        await asyncio.gather(bring_up, return_exceptions=True)
+
+        assert activation._started_by_process is True
+        assert activation._release is not None
+    finally:
+        activation._cancel_release()
+
+
+async def test_an_arm_queued_behind_the_keeper_says_what_it_is_waiting_for() -> None:
+    api = SlowStart(reads_until_healthy=6)
+    activation = _slow_activation(api)
+    notices: list[str] = []
+    bring_up = asyncio.create_task(activation.bring_up_for_use())
+    try:
+        await asyncio.wait_for(api.started.wait(), timeout=1)
+        await asyncio.wait_for(
+            activation.ensure_running(lambda status: _record(notices, status)),
+            timeout=5,
+        )
+        await asyncio.wait_for(bring_up, timeout=5)
+
+        assert notices[0] == "The Managed Sync pipeline is already starting. Waiting for it."
+        assert any("Waiting for the Managed Sync pipeline" in notice for notice in notices[1:])
+        starts = [call for call in api.calls if call[1].endswith("/updates")]
+        assert len(starts) == 1
+    finally:
+        activation._cancel_release()
+
+
+async def test_the_owed_stop_moves_ahead_of_its_deadline_while_the_app_is_in_use() -> None:
+    """Startup recovery wakes on the deadline; the promise must already be later."""
+
+    clock = ManualClock()
+    base = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
+    activation = _activation(
+        FakePipelineApi(running=True),
+        idle_seconds=100.0,
+        clock=clock,
+        now=lambda: base + timedelta(seconds=clock.now),
+    )
+    try:
+        activation.note_use()
+        await activation.bring_up_for_use()
+        first_due = activation._owed_due_at
+        assert first_due == base + timedelta(seconds=100)
+
+        clock.now = 30.0
+        activation.note_use()
+        await activation.bring_up_for_use()
+        assert activation._owed_due_at == first_due  # still more than half a window away
+
+        clock.now = 60.0
+        activation.note_use()
+        await activation.bring_up_for_use()
+        assert activation._owed_due_at == base + timedelta(seconds=160)
+    finally:
+        activation._cancel_release()
+
+
+async def test_the_warm_keeper_builds_its_client_on_first_use_and_off_the_loop(
+    monkeypatch,
+) -> None:
+    """Building it performs no work, so neither startup nor a request waits on it."""
+
+    built: list[str] = []
+
+    def failing_build(manifest):
+        built.append(threading.current_thread().name)
+        raise RuntimeError("workspace unreachable")
+
+    monkeypatch.setattr(model_score_live, "build_model_score_engine", failing_build)
+    keeper = model_score_live.build_round4_warm_keeper(_activation_manifest())  # type: ignore[arg-type]
+    assert built == []
+
+    slept = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        slept.set()
+        await asyncio.sleep(3600)
+
+    keeper._sleep = sleep
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        await asyncio.wait_for(slept.wait(), timeout=1)
+        assert len(built) == 1
+        assert built[0] != threading.current_thread().name
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def _statement_error(sql_state: str) -> model_score_live.WorkspaceStatementExecutionError:
+    return model_score_live.WorkspaceStatementExecutionError(
+        state="FAILED",
+        error_code="BAD_REQUEST",
+        sql_state=sql_state,
+        provider_category="",
+        provider_message="[DELTA_CONCURRENT_APPEND] a concurrent transaction won",
+    )
+
+
+class MergeFailing(FakeStatements):
+    def __init__(self, responses, *, failures: int, sql_state: str = "2D521") -> None:
+        super().__init__(responses)
+        self.failures = failures
+        self.sql_state = sql_state
+
+    async def execute(self, statement, parameters=()):
+        if statement.startswith("MERGE INTO") and self.failures > 0:
+            self.calls.append((statement, tuple(parameters)))
+            self.failures -= 1
+            raise _statement_error(self.sql_state)
+        return await super().execute(statement, parameters)
+
+
+def _head(version: int) -> list[dict[str, str]]:
+    return [{"version": str(version), "timestamp": "2026-08-18T11:59:58Z"}]
+
+
+async def test_a_source_merge_that_loses_a_concurrent_delta_transaction_is_issued_again(
+    monkeypatch,
+) -> None:
+    """Delta aborted the loser, so issuing it again is safe, and searched after the winner."""
+
+    monkeypatch.setattr(model_score_live, "DELTA_CONFLICT_RETRY_SECONDS", 0)
+    expected = ModelScoreRow("customer-1", 0.81, "risk-v1", "nonce-1")
+    statements = MergeFailing(
+        [
+            _head(12),
+            _head(13),
+            [],
+            [
+                {
+                    "entity_id": expected.entity_id,
+                    "score": str(expected.score),
+                    "model_version": expected.model_version,
+                    "proof_nonce": expected.proof_nonce,
+                    "_commit_version": "14",
+                    "_commit_timestamp": "2026-08-18T11:59:59Z",
+                    "_change_type": "update_postimage",
+                }
+            ],
+        ],
+        failures=1,
+    )
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=statements,
+    )
+
+    commit = await adapter.commit_source_update(
+        ModelScoreUpdate(
+            expected.entity_id,
+            expected.score,
+            expected.model_version,
+            expected.proof_nonce,
+        )
+    )
+
+    assert commit.version == 14
+    assert sum(call[0].startswith("MERGE INTO") for call in statements.calls) == 2
+    cdf, parameters = statements.calls[-1]
+    assert "table_changes" in cdf
+    assert {parameter.name: parameter.value for parameter in parameters}["start_version"] == "14"
+
+
+async def test_only_a_concurrent_transaction_is_retried_and_only_so_many_times(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(model_score_live, "DELTA_CONFLICT_RETRY_SECONDS", 0)
+    update = ModelScoreUpdate("customer-1", 0.81, "risk-v1", "nonce-1")
+    attempts = model_score_live.DELTA_CONFLICT_ATTEMPTS
+
+    persistent = MergeFailing([_head(12 + n) for n in range(attempts)], failures=attempts + 5)
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=persistent,
+    )
+    with pytest.raises(model_score_live.WorkspaceStatementExecutionError):
+        await adapter.commit_source_update(update)
+    assert sum(call[0].startswith("MERGE INTO") for call in persistent.calls) == attempts
+
+    denied = MergeFailing([_head(12)], failures=1, sql_state="42501")
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=denied,
+    )
+    with pytest.raises(model_score_live.WorkspaceStatementExecutionError):
+        await adapter.commit_source_update(update)
+    assert sum(call[0].startswith("MERGE INTO") for call in denied.calls) == 1
+
+
+def _cdf_row(row: ModelScoreRow, version: int) -> list[dict[str, str]]:
+    return [
+        {
+            "entity_id": row.entity_id,
+            "score": str(row.score),
+            "model_version": row.model_version,
+            "proof_nonce": row.proof_nonce,
+            "_commit_version": str(version),
+            "_commit_timestamp": "2026-08-18T11:59:59Z",
+            "_change_type": "update_postimage",
+        }
+    ]
+
+
+async def test_a_known_head_saves_the_head_read_but_a_conflict_still_rereads_it(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(model_score_live, "DELTA_CONFLICT_RETRY_SECONDS", 0)
+    expected = ModelScoreRow("customer-1", 0.81, "risk-v1", "nonce-1")
+    update = ModelScoreUpdate(
+        expected.entity_id, expected.score, expected.model_version, expected.proof_nonce
+    )
+
+    quick = FakeStatements([[], _cdf_row(expected, 13)])
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=quick,
+    )
+    assert adapter.accepts_known_head is True
+    commit = await adapter.commit_source_update(update, after_version=12)
+    assert commit.version == 13
+    assert quick.calls[0][0].startswith("MERGE INTO")  # no head read first
+    assert {p.name: p.value for p in quick.calls[1][1]}["start_version"] == "13"
+
+    contested = MergeFailing([_head(13), [], _cdf_row(expected, 14)], failures=1)
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=contested,
+    )
+    commit = await adapter.commit_source_update(update, after_version=12)
+    assert commit.version == 14
+    assert contested.calls[1][0].startswith("DESCRIBE HISTORY")  # re-read after the conflict
+    assert {p.name: p.value for p in contested.calls[-1][1]}["start_version"] == "14"
+
+
+async def test_the_keeper_prewarms_after_a_bring_up_and_refreshes_while_in_use() -> None:
+    class Activation:
+        def __init__(self) -> None:
+            self.in_use = 100.0
+            self.bring_ups = 0
+
+        def note_use(self) -> None:
+            pass
+
+        def _in_use_remaining(self) -> float:
+            return self.in_use
+
+        def preparation_age(self) -> float | None:
+            return None
+
+        async def bring_up_for_use(self) -> None:
+            self.bring_ups += 1
+
+    activation = Activation()
+    prewarms = 0
+    refreshed = asyncio.Event()
+
+    async def prewarm() -> None:
+        nonlocal prewarms
+        prewarms += 1
+        if prewarms >= 3:
+            refreshed.set()
+
+    async def no_wait(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    keeper = model_score_live.Round4WarmKeeper(
+        lambda: activation,  # type: ignore[arg-type,return-value]
+        prewarm=prewarm,
+        refresh_seconds=0.01,
+        sleep=no_wait,
+    )
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        # One use, then refreshes on their own while the app is still in use.
+        await asyncio.wait_for(refreshed.wait(), timeout=2)
+        assert activation.bring_ups >= 3
+
+        activation.in_use = 0.0
+        settled = prewarms
+        await asyncio.sleep(0.1)
+        assert prewarms <= settled + 1  # quiet once the app is no longer in use
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_the_keeper_times_its_refresh_from_the_preparation_not_its_last_wake() -> None:
+    class Activation:
+        age: float | None = None
+
+        def note_use(self) -> None:
+            pass
+
+        def _in_use_remaining(self) -> float:
+            return 100.0
+
+        def preparation_age(self) -> float | None:
+            return self.age
+
+        async def bring_up_for_use(self) -> None:
+            pass
+
+    activation = Activation()
+    prewarms = 0
+    refreshed = asyncio.Event()
+
+    async def prewarm() -> None:
+        nonlocal prewarms
+        prewarms += 1
+        # Leaves a preparation a hundredth of a second short of a refresh.
+        activation.age = 9.99
+        if prewarms >= 2:
+            refreshed.set()
+
+    async def no_wait(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    keeper = model_score_live.Round4WarmKeeper(
+        lambda: activation,  # type: ignore[arg-type,return-value]
+        prewarm=prewarm,
+        min_interval_seconds=0.0,
+        refresh_seconds=10.0,
+        sleep=no_wait,
+    )
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        # Due when the preparation is ten seconds old, not ten seconds after
+        # this keeper last woke.
+        await asyncio.wait_for(refreshed.wait(), timeout=2)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

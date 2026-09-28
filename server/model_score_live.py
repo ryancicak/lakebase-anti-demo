@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import suppress
@@ -23,6 +24,7 @@ from databricks.sdk.service.sql import (
 from . import pipeline_power
 from .manifest import DemoManifest
 from .model_score import (
+    WARM_PROOF_REUSE_SECONDS,
     DeltaCommit,
     ManagedSyncState,
     ManagedSyncStatus,
@@ -198,6 +200,16 @@ class ModelScoreLiveConfigurationError(ModelScoreError):
 
 class ModelScoreLiveOperationError(ModelScoreError):
     """A live Statement Execution or PostgreSQL operation was not exact."""
+
+
+#: SQLSTATE of Delta's concurrent-transaction conflicts (for example
+#: DELTA_CONCURRENT_APPEND). The losing transaction is aborted, not committed.
+DELTA_CONCURRENT_TRANSACTION_SQLSTATE = "2D521"
+
+#: How many times a source MERGE is issued before a conflict is reported, and the
+#: base of the linear backoff between attempts.
+DELTA_CONFLICT_ATTEMPTS = 4
+DELTA_CONFLICT_RETRY_SECONDS = 0.5
 
 
 class WorkspaceStatementExecutionError(ModelScoreLiveOperationError):
@@ -513,6 +525,29 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         await self._source_head()
 
     async def inspect_sync(self) -> ManagedSyncStatus:
+        # The source head and the CDF property are read beside the control plane
+        # rather than after it. Run in turn, those two statements were over half
+        # of an inspection (measured live on 2026-09-28), and a Prepare makes two
+        # inspections and every sync poll is one. The head's order matters only to
+        # the cursor check below, which reads it again before refusing on it.
+        head_read = asyncio.ensure_future(self._source_head())
+        cdf_read = asyncio.ensure_future(self._cdf_enabled())
+        try:
+            return await self._inspect_sync_beside(head_read, cdf_read)
+        finally:
+            for read in (head_read, cdf_read):
+                if not read.done():
+                    read.cancel()
+                elif not read.cancelled():
+                    # If something else was refused on first, this read's failure
+                    # is not the news, but asyncio would still report it as lost.
+                    read.exception()
+
+    async def _inspect_sync_beside(
+        self,
+        head_read: Awaitable[tuple[int, datetime]],
+        cdf_read: Awaitable[bool],
+    ) -> ManagedSyncStatus:
         (
             postgres_synced,
             database_synced,
@@ -588,25 +623,34 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
             raise ModelScoreLiveConfigurationError(
                 "Round 4 auxiliary storage schema is not exactly empty"
             )
-        source_version, _ = await self._source_head()
-        cdf_enabled = await self._cdf_enabled()
+        source_version, _ = await head_read
+        cdf_enabled = await cdf_read
         delta_info = _required_mapping(
             database_last_sync.get("delta_table_sync_info"),
             "Database Synced Table last-sync Delta position",
         )
         _timestamp(database_last_sync.get("sync_start_timestamp"))
         database_delta_version = _integer(delta_info.get("delta_commit_version"))
-        if (
-            processed > source_version
-            or database_delta_version > source_version
-            or (
-                postgres_last_sync_version is not None
-                and postgres_last_sync_version > source_version
+
+        def cursor_ahead_of(head: int) -> bool:
+            return (
+                processed > head
+                or database_delta_version > head
+                or (
+                    postgres_last_sync_version is not None
+                    and postgres_last_sync_version > head
+                )
             )
-        ):
-            raise ModelScoreLiveOperationError(
-                "Managed Sync cursor advanced beyond the authoritative Delta source head"
-            )
+
+        if cursor_ahead_of(source_version):
+            # Read beside the cursors, the head can predate a commit whose sync
+            # they already show. Read after them it cannot, so only a cursor still
+            # ahead of this second read is refused.
+            source_version, _ = await self._source_head()
+            if cursor_ahead_of(source_version):
+                raise ModelScoreLiveOperationError(
+                    "Managed Sync cursor advanced beyond the authoritative Delta source head"
+                )
         states = {postgres_state, database_state}
         state = classify_managed_sync_state(states, pipeline_state, pipeline_update_state)
         database_status = _required_mapping(
@@ -816,8 +860,46 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         )
         return _exact_model_row(rows, allow_missing=True)
 
-    async def commit_source_update(self, update: ModelScoreUpdate) -> DeltaCommit:
-        before_version, _ = await self._source_head()
+    #: The engine may pass the head it has just inspected, which saves a statement
+    #: on the path the room watches after the bell.
+    accepts_known_head = True
+
+    async def commit_source_update(
+        self,
+        update: ModelScoreUpdate,
+        *,
+        after_version: int | None = None,
+    ) -> DeltaCommit:
+        attempt = 1
+        while True:
+            if attempt == 1 and after_version is not None:
+                before_version = after_version
+            else:
+                before_version, _ = await self._source_head()
+            try:
+                await self._merge_source_update(update)
+                break
+            except WorkspaceStatementExecutionError as exc:
+                # Delta aborts a transaction that loses a concurrent-write
+                # conflict, so nothing committed and the MERGE is safe to issue
+                # again. The head is re-read first, so the change feed below is
+                # searched only after whatever commit won.
+                if (
+                    exc.sql_state != DELTA_CONCURRENT_TRANSACTION_SQLSTATE
+                    or attempt >= DELTA_CONFLICT_ATTEMPTS
+                ):
+                    raise
+                LOGGER.warning(
+                    "Round 4 source MERGE met a concurrent Delta transaction "
+                    "(attempt %d of %d); issuing it again",
+                    attempt,
+                    DELTA_CONFLICT_ATTEMPTS,
+                )
+                await asyncio.sleep(DELTA_CONFLICT_RETRY_SECONDS * attempt)
+                attempt += 1
+        return await self._committed_change(update, before_version)
+
+    async def _merge_source_update(self, update: ModelScoreUpdate) -> None:
         source = _source_identifier(self.config.source_table_full_name)
         await self._statements.execute(
             f"""MERGE INTO {source} AS target
@@ -841,6 +923,12 @@ VALUES (incoming.entity_id, incoming.score, incoming.model_version, incoming.pro
                 SqlParameter("proof_nonce", update.proof_nonce, "STRING"),
             ],
         )
+
+    async def _committed_change(
+        self,
+        update: ModelScoreUpdate,
+        before_version: int,
+    ) -> DeltaCommit:
         escaped_source = self.config.source_table_full_name.replace("'", "''")
         rows = await self._statements.execute(
             "SELECT entity_id, score, model_version, proof_nonce, "
@@ -1164,6 +1252,7 @@ START_POLL_SECONDS = 3.0
 #: Sharing one activation is what makes "an arm cancels the pending release" true
 #: across bouts rather than only within one.
 _ACTIVATIONS: dict[str, Round4PipelineActivation] = {}
+_ACTIVATIONS_LOCK = threading.Lock()
 
 
 class Round4PipelineActivation:
@@ -1248,6 +1337,30 @@ class Round4PipelineActivation:
         # carried into any owed-stop record so scheduling a stop does not cost
         # the accrued figure its origin. See `pipeline_power.owed_stop_record`.
         self._resumed_at = ""
+        # One start at a time. An arm and the warm keeper can both find the
+        # pipeline parked in the same second; two starts would restart the
+        # update the first one is still bringing up.
+        self._start_lock = asyncio.Lock()
+        # When a person last did something in the app (a page load or an
+        # action, never a background poll). While that is inside the idle
+        # window the pipeline stays up, so Prepare never waits on a start.
+        self._last_use: float | None = None
+        # The update the most recent healthy read saw, and the update and time
+        # of the most recent change this pipeline carried end to end. Prepare
+        # reuses that proof only while it is recent and on the same update.
+        self._last_seen_update_id = ""
+        self._proven_update_id = ""
+        self._proven_at: float | None = None
+        # The latest progress line of a start the warm keeper is making, relayed
+        # to an arm that queues behind it so the card never goes silent.
+        self._keeper_status = ""
+        # When the owed-stop record last written says the stop is due. Refreshed
+        # well ahead of that moment while the app is in use, so startup recovery
+        # never reads a lapsed promise for a pipeline somebody is using.
+        self._owed_due_at: datetime | None = None
+        # When a preparation last found the Delta source storage readable, so a
+        # Prepare soon after can skip that check. See STORAGE_CHECK_REUSE_SECONDS.
+        self._storage_checked_at: float | None = None
 
     async def ensure_running(self, notify: Callable[[str], Awaitable[None]]) -> None:
         """Bring the pipeline to a healthy continuous sync, however long that takes.
@@ -1259,15 +1372,169 @@ class Round4PipelineActivation:
 
         self._generation += 1
         self._cancel_release()
-        signals = await self._read_signals()
-        if self._healthy(signals) and not self._full_refresh_required:
-            self._started_by_arm = False
-            return
+        if self._start_lock.locked():
+            # The warm keeper is starting it already. Say so, and relay its own
+            # progress, rather than leaving the card silent until it finishes.
+            await notify("The Managed Sync pipeline is already starting. Waiting for it.")
+            relayed = ""
+            while self._start_lock.locked():
+                if self._keeper_status and self._keeper_status != relayed:
+                    relayed = self._keeper_status
+                    await notify(relayed)
+                await self._sleep(max(self._poll_seconds, 0.01))
+        async with self._start_lock:
+            signals = await self._read_signals()
+            if self._healthy(signals) and not self._full_refresh_required:
+                self._last_seen_update_id = signals.update_id
+                self._started_by_arm = False
+                return
 
-        await notify(
-            "The Managed Sync pipeline is not running. Starting it before the bell — "
-            f"this usually takes about {RESTART_SECONDS_ESTIMATE}s."
-        )
+            await notify(
+                "The Managed Sync pipeline is not running. Starting it before the bell — "
+                f"this usually takes about {RESTART_SECONDS_ESTIMATE}s."
+            )
+            await self._start_and_wait(signals, notify, by_arm=True)
+
+    async def bring_up_for_use(self) -> None:
+        """Have the pipeline up before anyone presses Prepare, while the app is in use.
+
+        Called by :class:`Round4WarmKeeper` when a person loads the app or acts in
+        it. A running pipeline costs one read; a parked one is started here,
+        under the same lock an arm starts it under, so the two can never both
+        start it. Nothing here touches the synced table or the Delta source: the
+        arm still proves the pipeline warm before any bell, so this only moves
+        the start-up off the presenter's path.
+
+        It also makes sure a release is pending, so a pipeline this brought up
+        is always owed its stop, and the owed-stop record it writes supersedes
+        one a previous process left behind. That holds even when the start is
+        cancelled or fails part-way: a start that was requested may already be
+        coming up, and shutdown only stops a pipeline that has a release pending.
+        """
+
+        try:
+            # A running pipeline is the common case, and checking one needs no
+            # lock. Held for the check, the lock made an arm pressed that second
+            # wait behind it, saying the pipeline was "already starting" while it
+            # was up (live, 2026-09-28). Only a start takes the lock, and it reads
+            # again under it, so two starts still cannot overlap. Nor does this
+            # check record the update it saw: a read that straddled another
+            # caller's restart would name the old update, and a warm proof made on
+            # that one must not count for the new.
+            signals = await self._read_signals()
+            if self._healthy(signals) and not self._full_refresh_required:
+                return
+            async with self._start_lock:
+                signals = await self._read_signals()
+                if self._healthy(signals) and not self._full_refresh_required:
+                    self._last_seen_update_id = signals.update_id
+                else:
+                    self._generation += 1
+                    self._cancel_release()
+
+                    async def notify(status: str) -> None:
+                        self._keeper_status = status
+                        LOGGER.info("Round 4 warm keeper: %s", status)
+
+                    try:
+                        await self._start_and_wait(signals, notify, by_arm=False)
+                    finally:
+                        self._keeper_status = ""
+        finally:
+            if self._release is None:
+                self.release_when_idle()
+            else:
+                self._refresh_owed_stop()
+
+    def _refresh_owed_stop(self) -> None:
+        """Move the owed-stop record ahead of time while the app is in use.
+
+        The idle release extends itself when its deadline arrives, which is the
+        same moment startup recovery wakes on that deadline; a record written
+        then can lose the race. Rewriting it once it is within half a window of
+        its due time keeps the durable promise comfortably in the future.
+        """
+
+        remaining = self._in_use_remaining()
+        if remaining <= 0:
+            return
+        due = self._owed_due_at
+        now = self._now()
+        if due is not None and (due - now).total_seconds() > self._idle_seconds / 2:
+            return
+        self._record_stop_owed(now + timedelta(seconds=remaining))
+
+    def note_use(self) -> None:
+        """Record that a person used the app now. No I/O; safe on the request path."""
+
+        self._last_use = self._clock()
+
+    def _in_use_remaining(self) -> float:
+        """Seconds left in the idle window since the last use, zero if none."""
+
+        if self._last_use is None:
+            return 0.0
+        return max(0.0, self._idle_seconds - (self._clock() - self._last_use))
+
+    def note_proven_sync(self) -> None:
+        """Record that a change just went through this pipeline end to end."""
+
+        if self._last_seen_update_id:
+            self._proven_update_id = self._last_seen_update_id
+            self._proven_at = self._clock()
+
+    def warm_proof_age(self) -> float | None:
+        """How long ago a change last went end to end on the update now running.
+
+        ``None`` when there is no such proof, or when the update the latest
+        healthy read saw is not the one the proof ran on: a restarted update has
+        to be proven again.
+        """
+
+        if not self._proven_update_id or self._proven_at is None:
+            return None
+        if self._proven_update_id != self._last_seen_update_id:
+            return None
+        return self._clock() - self._proven_at
+
+    def note_storage_check(self) -> None:
+        """Record that a preparation just found the Delta source storage readable."""
+
+        self._storage_checked_at = self._clock()
+
+    def storage_check_age(self) -> float | None:
+        if self._storage_checked_at is None:
+            return None
+        return self._clock() - self._storage_checked_at
+
+    def forget_storage_check(self) -> None:
+        self._storage_checked_at = None
+
+    def preparation_age(self) -> float | None:
+        """The age of the older of the warm proof and the storage check.
+
+        What a background refresh is timed from: a Prepare reuses both, and a
+        bout's own proof renews only one of them. ``None`` when a Prepare now
+        would have to make either itself.
+        """
+
+        proof, storage = self.warm_proof_age(), self.storage_check_age()
+        if proof is None or storage is None:
+            return None
+        return max(proof, storage)
+
+    async def _start_and_wait(
+        self,
+        signals: PipelineSignals,
+        notify: Callable[[str], Awaitable[None]],
+        *,
+        by_arm: bool,
+    ) -> None:
+        """Start the parked pipeline and wait for a healthy continuous sync.
+
+        Held under ``_start_lock`` by both callers.
+        """
+
         def remember(record: dict[str, Any]) -> None:
             self._resumed_at = str(record.get("resumed_at") or "")
             self._persist(record)
@@ -1302,8 +1569,9 @@ class Round4PipelineActivation:
         # Set on the request rather than on the successful wait. The claim this
         # records is "this arm asked for the pipeline that is now up", and that
         # is true the moment the verb is issued -- an arm that then times out
-        # still left a resuming pipeline behind it.
-        self._started_by_arm = True
+        # still left a resuming pipeline behind it. A start the warm keeper made
+        # is this process's, but no arm's.
+        self._started_by_arm = by_arm
         self._started_by_process = True
         deadline = self._clock() + self._wait_timeout_seconds
         healthy_observations = 0
@@ -1313,6 +1581,7 @@ class Round4PipelineActivation:
             if self._healthy(signals):
                 healthy_observations += 1
                 if healthy_observations >= 2:
+                    self._last_seen_update_id = signals.update_id
                     await notify("The Managed Sync pipeline is running. Verifying the baseline.")
                     return
             else:
@@ -1402,7 +1671,10 @@ class Round4PipelineActivation:
         throw away the fallback that would have caught it.
         """
 
-        if not self._started_by_arm:
+        # While a person is using the app the pipeline is kept up for the next
+        # Prepare, towel or not; the idle release stops it once the app goes
+        # quiet. Stopping it here would hand the very next arm a cold start.
+        if not self._started_by_arm or self._in_use_remaining() > 0:
             self.release_when_idle()
             return
 
@@ -1507,17 +1779,30 @@ class Round4PipelineActivation:
                 exc_info=True,
             )
             return
+        self._owed_due_at = due_at
         self._persist(record)
 
     async def _release_after_idle(self, generation: int) -> None:
         try:
             await self._sleep(self._idle_seconds)
-            if generation != self._generation:
-                # An arm happened while this slept, so the bout this was
-                # scheduled for is not the current one. The newer arm scheduled
-                # its own release.
-                return
-            signals = await self._read_signals()
+            while True:
+                if generation != self._generation:
+                    # An arm happened while this slept, so the bout this was
+                    # scheduled for is not the current one. The newer arm
+                    # scheduled its own release.
+                    return
+                remaining = self._in_use_remaining()
+                if remaining > 0:
+                    # Someone used the app inside the window: stay up until the
+                    # app has been quiet for a whole window. The owed record
+                    # moves with it, so it never reads as a stop that is overdue.
+                    self._record_stop_owed(self._now() + timedelta(seconds=remaining))
+                    await self._sleep(remaining)
+                    continue
+                signals = await self._read_signals()
+                # A use that landed during that read wins over the stop.
+                if self._in_use_remaining() <= 0:
+                    break
             if not self._healthy(signals):
                 # Already down, or down for a reason that is not ours. Stopping a
                 # pipeline that is failing would overwrite a genuine failure with
@@ -1769,14 +2054,9 @@ async def read_pipeline_signals(
         raise ModelScoreLiveConfigurationError(
             "Round 4 pipeline signal read does not name the sealed pipeline"
         )
-    pipeline = await asyncio.to_thread(
-        api,
-        manifest.databricks.profile,
-        "get",
-        pipeline_power._require_pipeline_path(
-            pipeline_id,
-            f"/api/2.0/pipelines/{pipeline_id}",
-        ),
+    pipeline_path = pipeline_power._require_pipeline_path(
+        pipeline_id,
+        f"/api/2.0/pipelines/{pipeline_id}",
     )
     sealed = manifest.round4
     synced_table_id = str(getattr(sealed, "synced_table_id", "") or "")
@@ -1784,11 +2064,16 @@ async def read_pipeline_signals(
         raise ModelScoreLiveConfigurationError(
             "Round 4 pipeline signal read has no sealed synced-table identity"
         )
-    synced = await asyncio.to_thread(
-        api,
-        manifest.databricks.profile,
-        "get",
-        f"/api/2.0/database/synced_tables/{quote(synced_table_id, safe='')}",
+    # Two independent reads, so the synced-table one, the slow one (measured live
+    # on 2026-09-28), no longer waits for the pipeline's. Every arm makes this read.
+    pipeline, synced = await asyncio.gather(
+        asyncio.to_thread(api, manifest.databricks.profile, "get", pipeline_path),
+        asyncio.to_thread(
+            api,
+            manifest.databricks.profile,
+            "get",
+            f"/api/2.0/database/synced_tables/{quote(synced_table_id, safe='')}",
+        ),
     )
     status = _mapping(synced.get("data_synchronization_status"))
     updates = pipeline.get("latest_updates")
@@ -1859,16 +2144,160 @@ def _pipeline_activation(manifest: DemoManifest, workspace: Any) -> Round4Pipeli
     pipeline_id = str(getattr(sealed, "pipeline_id", "") or "")
     if not pipeline_id:
         return None
-    existing = _ACTIVATIONS.get(pipeline_id)
-    if existing is not None:
-        return existing
-    activation = Round4PipelineActivation(
-        manifest,
-        pipeline_power.workspace_api(workspace),
-        pipeline_id=pipeline_id,
-    )
-    _ACTIVATIONS[pipeline_id] = activation
-    return activation
+    # The warm keeper builds from a worker thread while an arm may build on the
+    # loop. Two activations for one pipeline would mean two start locks.
+    with _ACTIVATIONS_LOCK:
+        existing = _ACTIVATIONS.get(pipeline_id)
+        if existing is not None:
+            return existing
+        activation = Round4PipelineActivation(
+            manifest,
+            pipeline_power.workspace_api(workspace),
+            pipeline_id=pipeline_id,
+        )
+        _ACTIVATIONS[pipeline_id] = activation
+        return activation
+
+
+#: The warm keeper acts on use at most this often. Use is recorded at once; the
+#: bring-up it prompts costs one read when the pipeline is already running.
+WARM_KEEPER_MIN_INTERVAL_SECONDS = 30.0
+
+#: How long the warm keeper waits after a failed bring-up before trying again.
+WARM_KEEPER_RETRY_SECONDS = 60.0
+
+
+class Round4WarmKeeper:
+    """Keep Round 4's pipeline up while a person is using the app.
+
+    Started once per serving process, beside the lease keeper. ``note_use`` sits
+    on the request path and does no I/O: it records the moment on the activation
+    and wakes this keeper, which brings the pipeline up at most once per
+    ``min_interval_seconds``. Parking stays with the activation's idle release,
+    which waits until the app has been quiet for a whole window. So the start-up
+    a parked pipeline needs happens while the presenter is still choosing a
+    matchup, never after they press Prepare.
+
+    A failure here is logged and retried, never raised: the arm still starts the
+    pipeline itself if it has to, exactly as it did before this existed.
+
+    The activation is built on the first use, in a worker thread: building it
+    constructs a workspace client, which may make a network call, and neither
+    startup nor the request path may wait on that.
+
+    With a ``prewarm`` (the manager's), the keeper also leaves a fresh warm proof
+    behind after each bring-up, and refreshes it while the app is still in use,
+    so the presenter's Prepare reuses it instead of making its own round trip.
+    The manager decides whether a prewarm is safe and whether it is needed.
+    """
+
+    def __init__(
+        self,
+        build_activation: Callable[[], Round4PipelineActivation | None],
+        *,
+        prewarm: Callable[[], Awaitable[None]] | None = None,
+        min_interval_seconds: float = WARM_KEEPER_MIN_INTERVAL_SECONDS,
+        retry_seconds: float = WARM_KEEPER_RETRY_SECONDS,
+        refresh_seconds: float = WARM_PROOF_REUSE_SECONDS / 2,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._build_activation = build_activation
+        self._activation: Round4PipelineActivation | None = None
+        self._prewarm = prewarm
+        self._min_interval = min_interval_seconds
+        self._retry = retry_seconds
+        self._refresh = refresh_seconds
+        self._sleep = sleep
+        self._wake = asyncio.Event()
+
+    def note_use(self) -> None:
+        if self._activation is not None:
+            self._activation.note_use()
+        self._wake.set()
+
+    async def _next_wake(self) -> None:
+        """Wait for a use, or, while the app is in use, until a refresh is due.
+
+        The refresh is timed from the preparation a Prepare would reuse, not from
+        this keeper's last wake, and from the older of its two parts: a bout's own
+        proof renews the proof but not the storage check. Timed from the wake, a
+        Prepare met a storage check old enough to be made again (live, 2026-09-28).
+        """
+
+        activation = self._activation
+        if activation is None or self._prewarm is None or activation._in_use_remaining() <= 0:
+            await self._wake.wait()
+        else:
+            age = activation.preparation_age()
+            timeout = (
+                self._refresh if age is None else max(self._min_interval, self._refresh - age)
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+        self._wake.clear()
+
+    async def run(self) -> None:
+        while True:
+            await self._next_wake()
+            if self._activation is None:
+                try:
+                    activation = await asyncio.to_thread(self._build_activation)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.warning(
+                        "The Round 4 warm keeper could not reach the Managed Sync pipeline; "
+                        "the next Prepare will start it",
+                        exc_info=True,
+                    )
+                    await self._sleep(self._retry)
+                    continue
+                if activation is None:
+                    return
+                self._activation = activation
+                # The use that woke this keeper happened before the activation
+                # existed to record it.
+                activation.note_use()
+                LOGGER.info(
+                    "Round 4 warm keeper: a person is using the app; keeping the Managed "
+                    "Sync pipeline up until the app has been quiet for %.0fs",
+                    getattr(activation, "_idle_seconds", IDLE_STOP_SECONDS),
+                )
+            try:
+                await self._activation.bring_up_for_use()
+                if self._prewarm is not None:
+                    await self._prewarm()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                LOGGER.warning(
+                    "The Round 4 warm keeper could not have the Managed Sync pipeline ready; "
+                    "the next Prepare will do it",
+                    exc_info=True,
+                )
+                await self._sleep(self._retry)
+                continue
+            await self._sleep(self._min_interval)
+
+
+def build_round4_warm_keeper(
+    manifest: DemoManifest,
+    *,
+    prewarm: Callable[[], Awaitable[None]] | None = None,
+) -> Round4WarmKeeper:
+    """The warm keeper for this manifest's sealed pipeline. Performs no work now.
+
+    Its activation is built later, through the same engine an arm builds, so the
+    pipeline is powered by exactly the identity that inspects it, and through the
+    same keyed activation, so the keeper and every arm share one start lock and
+    one idle release.
+    """
+
+    def build_activation() -> Round4PipelineActivation | None:
+        activation = build_model_score_engine(manifest).activation
+        return activation if isinstance(activation, Round4PipelineActivation) else None
+
+    return Round4WarmKeeper(build_activation, prewarm=prewarm)
 
 
 async def aclose_activations() -> None:

@@ -60,6 +60,7 @@ from .live_orders import (
 )
 from .manifest import DemoManifest
 from .model_score import (
+    WARM_PROOF_REUSE_SECONDS,
     ModelScoreArm,
     ModelScoreEngine,
     ModelScoreError,
@@ -485,6 +486,15 @@ class RoundStorageReadinessError(RuntimeError):
 
 
 _ROUND_ONE_TRANSACTION_WIRE_CALL = "PostgreSQL TLS connect → INSERT → COMMIT → SELECT"
+
+#: How long a Round 4 re-do, or the next Round 4 arm, waits for a proof's row to
+#: be put back before refusing. The restore normally finishes in about fifteen
+#: seconds.
+_ROUND4_SETTLEMENT_WAIT_SECONDS = 120.0
+
+#: How long after a Round 4 card is created a background warm-up keeps off its
+#: source row. The UI arms a new card about a second after creating it.
+_ROUND4_CARD_GRACE_SECONDS = 30.0
 
 _ROUND_FOUR_UNSUPPORTED_REASON = (
     "No AWS-native equivalent lane was configured or timed in this scoped proof."
@@ -1019,6 +1029,12 @@ class RunManager:
         self._settlement_attempts = max(
             1, int(os.environ.get("ANTI_DEMO_SETTLEMENT_ATTEMPTS", "4"))
         )
+        # The newest Round 4 background settlement. The ring is released before
+        # it runs, so the next arm must wait for it rather than race it.
+        self._round4_settlement: asyncio.Task[None] | None = None
+        # Held by a background warm-up (prewarm_round4). An arm or a re-do that
+        # arrives meanwhile waits for it, then reuses the proof it leaves.
+        self._round4_prewarm_lock = asyncio.Lock()
         # Session retention. A session is created per bout attempt, abandoned ones
         # included, and each one holds a snapshot, up to five engines and an event
         # log -- about a megabyte. Nothing used to release them, so an installation
@@ -5227,6 +5243,8 @@ class RunManager:
             self._settle_with_retry(record, settle, label=label),
             name=f"round-settlement-{record.snapshot.id}",
         )
+        if record.snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
+            self._round4_settlement = record.settlement_task
 
     async def _settle_with_retry(
         self,
@@ -6019,6 +6037,11 @@ class RunManager:
                     },
                 )
 
+            await self._await_round4_prewarm(
+                on_progress,
+                "Finishing the warm-up that started when the app was opened",
+            )
+            await self._await_prior_round4_settlement(record, on_progress)
             arm = await engine.arm(on_progress)
             loop = asyncio.get_running_loop()
             async with record.lock:
@@ -6077,6 +6100,128 @@ class RunManager:
                 exc,
                 round_number=4,
             )
+
+    def _round4_busy(self) -> bool:
+        """Whether anything is using Round 4's source row now, or is about to.
+
+        A background warm-up writes the sealed baseline into that row, so it may
+        run only when no Round 4 bout is preparing, armed, running, re-doing or
+        settling, and no card was created in the last few seconds: the UI arms a
+        new card about a second after creating it.
+        """
+
+        settlement = self._round4_settlement
+        if settlement is not None and not settlement.done():
+            return True
+        now = datetime.now(UTC)
+        for record in self._records.values():
+            snapshot = record.snapshot
+            if snapshot.round.id != RoundId.PUT_MODEL_SCORE_IN_APP:
+                continue
+            if snapshot.state in {SessionState.CHECKING, SessionState.ARMED, SessionState.RUNNING}:
+                return True
+            if record.task is not None and not record.task.done():
+                return True
+            if record.settlement_task is not None and not record.settlement_task.done():
+                return True
+            if snapshot.redo is not None and snapshot.redo.state == RedoState.RUNNING:
+                return True
+            if (
+                snapshot.state == SessionState.DRAFT
+                and (now - snapshot.created_at).total_seconds() < _ROUND4_CARD_GRACE_SECONDS
+            ):
+                return True
+        return False
+
+    async def prewarm_round4(self) -> None:
+        """Leave a fresh Round 4 warm proof behind while Round 4 is idle.
+
+        Called by the Round 4 warm keeper when a person is using the app, so the
+        warm-up round trip an arm would make happens before anyone presses
+        Prepare, and that Prepare reuses it. Nothing here runs while any Round 4
+        bout is in flight (``_round4_busy``), and an arm or a re-do that arrives
+        meanwhile waits on the same lock rather than racing it. A preparation
+        that is still fresh is left alone.
+        """
+
+        factory = self._model_score_factory
+        if factory is None or self._closed or self._round4_busy():
+            return
+        if self._round4_prewarm_lock.locked():
+            return
+        async with self._round4_prewarm_lock:
+            if self._closed or self._round4_busy():
+                return
+            # Built off the loop: a live engine constructs a workspace client.
+            engine = await asyncio.to_thread(factory)
+            # The older of the proof and the storage check: a Prepare reuses both.
+            age_of = getattr(getattr(engine, "activation", None), "preparation_age", None)
+            age = age_of() if callable(age_of) else None
+            if age is not None and 0 <= age <= WARM_PROOF_REUSE_SECONDS / 2:
+                return
+            prewarm = getattr(engine, "prewarm", None)
+            if callable(prewarm):
+                await prewarm()
+
+    async def _await_round4_prewarm(
+        self,
+        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+        status: str,
+    ) -> None:
+        """Let a background warm-up already under way finish, so its proof is reused."""
+
+        lock = self._round4_prewarm_lock
+        if not lock.locked():
+            return
+        await on_progress(
+            ModelScoreProgress(
+                phase=ModelScorePhase.PREFLIGHT,
+                status=status,
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        try:
+            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
+                async with lock:
+                    pass
+        except TimeoutError as exc:
+            raise InvalidStateError(
+                "Round 4 was still finishing its warm-up. Try again in a moment."
+            ) from exc
+
+    async def _await_prior_round4_settlement(
+        self,
+        record: SessionRecord,
+        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+    ) -> None:
+        """Let the previous Round 4 bout's row be put back before this arm touches it.
+
+        A verified or failed bout releases the ring and then restores the source
+        row in the background, for ten to fifteen seconds. An arm inside that
+        window (a quick Ring Again) wrote its warm-up MERGE into the same row the
+        restore was writing, which is the race the re-do had. Waiting here orders
+        them; the restore's own round trip then usually lets the arm reuse it as
+        its warm proof.
+        """
+
+        prior = self._round4_settlement
+        if prior is None or prior.done() or prior is record.settlement_task:
+            return
+        await on_progress(
+            ModelScoreProgress(
+                phase=ModelScorePhase.PREFLIGHT,
+                status="Putting the previous bout's row back first",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        try:
+            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
+                await asyncio.shield(prior)
+        except TimeoutError as exc:
+            raise InvalidStateError(
+                "The previous Round 4 bout was still putting its row back. Prepare again "
+                "in a moment."
+            ) from exc
 
     @staticmethod
     def _round5_arm_has_started_mutation(engine: object | None) -> bool:
@@ -9501,14 +9646,17 @@ class RunManager:
             record.model_score_terminal_published = True
             engine = record.model_score_engine
             snapshot = record.snapshot.model_copy(deep=True)
+            # Scheduled before the result is published, not after: a re-do can be
+            # requested the moment READY is visible, and it must find the restore
+            # already scheduled so it can wait for it (_await_settlement_before_redo).
+            self._schedule_round_settlement(
+                record,
+                getattr(engine, "settle_and_restore_baseline", None),
+                label="Round 4",
+            )
         await record.event_log.publish(
             "run_finished",
             {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
-        )
-        self._schedule_round_settlement(
-            record,
-            getattr(engine, "settle_and_restore_baseline", None),
-            label="Round 4",
         )
 
     async def _finish_model_score_failure(
@@ -9571,6 +9719,16 @@ class RunManager:
         async def on_progress(progress: ModelScoreProgress) -> None:
             await self._apply_model_score_progress(record, progress, redo=True)
 
+        if not await self._await_settlement_before_redo(record, on_progress):
+            await self._await_model_score_terminal(
+                record,
+                self._fail_model_score_redo(
+                    record,
+                    "The first proof's row was still being put back, so the re-do did not "
+                    "run. Ring Round 4 again for a new proof.",
+                ),
+            )
+            return
         try:
             result = await engine.redo(arm, initial, update, on_progress)
         except asyncio.CancelledError:
@@ -9606,6 +9764,58 @@ class RunManager:
             record,
             self._finish_model_score_redo(record, result),
         )
+
+    async def _await_settlement_before_redo(
+        self,
+        record: SessionRecord,
+        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+    ) -> bool:
+        """Let the first proof's row be put back before the re-do writes its own.
+
+        A verified result offers Re-do the moment it is published, and the same
+        moment schedules the restore of the source row. A re-do taken inside that
+        window sent its MERGE into the same row while the restore's was in
+        flight, and Delta refused whichever committed second: SQLSTATE 2D521, two
+        of three live re-dos on 2026-09-28. When the re-do won, the restore then
+        put the baseline back on top of its new score. Waiting here orders the
+        two, and the restore the re-do's own finish schedules runs after it.
+        """
+
+        try:
+            await self._await_round4_prewarm(
+                on_progress,
+                "Finishing a warm-up before the re-do",
+            )
+        except InvalidStateError:
+            logger.error(
+                "Round 4 re-do refused: a background warm-up did not finish within %.0fs "
+                "session=%s",
+                _ROUND4_SETTLEMENT_WAIT_SECONDS,
+                record.snapshot.id,
+            )
+            return False
+        settlement = record.settlement_task
+        if settlement is None or settlement.done():
+            return True
+        await on_progress(
+            ModelScoreProgress(
+                phase=ModelScorePhase.PREFLIGHT,
+                status="Putting the first proof's row back before the re-do",
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        try:
+            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
+                await asyncio.shield(settlement)
+        except TimeoutError:
+            logger.error(
+                "Round 4 re-do refused: the first proof's settlement did not finish within "
+                "%.0fs session=%s",
+                _ROUND4_SETTLEMENT_WAIT_SECONDS,
+                record.snapshot.id,
+            )
+            return False
+        return True
 
     async def _finish_model_score_redo(
         self,

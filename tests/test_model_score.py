@@ -10,6 +10,7 @@ import pytest
 
 from server.model_score import (
     OWNED_PROOF_SHAPES,
+    WARM_PROOF_REUSE_SECONDS,
     DeltaCommit,
     ManagedSyncState,
     ManagedSyncStatus,
@@ -2497,3 +2498,285 @@ async def test_the_redo_is_warmed_too_because_it_is_measured_the_same_way() -> N
     assert redone.redo is not None
     assert redone.redo.application_read_elapsed_ms == pytest.approx(1.0)
     assert redone.redo.managed_availability_ms == pytest.approx(SYNC_LAG_MS)
+
+
+# --------------------------------------------------------------------------
+# Reusing a fresh warm proof (2026-09-28): a quick Ring Again no longer
+# re-proves a pipeline that carried a change end to end moments ago.
+# --------------------------------------------------------------------------
+
+
+class ProofRecordingActivation(RecordingActivation):
+    def __init__(self, adapter: StoppedUntilStarted, *, age: float | None) -> None:
+        super().__init__(adapter)
+        self.age = age
+        self.proven = 0
+        self.full_refreshes = 0
+
+    def warm_proof_age(self) -> float | None:
+        return self.age
+
+    def note_proven_sync(self) -> None:
+        self.proven += 1
+
+    def require_full_refresh(self) -> None:
+        self.full_refreshes += 1
+
+
+def activated_engine(
+    adapter: StoppedUntilStarted,
+    activation: RecordingActivation,
+) -> ModelScoreEngine:
+    return ModelScoreEngine(
+        adapter,
+        contract=adapter.contract,
+        poll_interval_seconds=0,
+        now=lambda: NOW,
+        clock_ns=ticking_clock(),
+        activation=activation,
+    )
+
+
+def running_adapter(contract: ModelScoreContract) -> StoppedUntilStarted:
+    adapter = StoppedUntilStarted(contract)
+    adapter.running = True
+    return adapter
+
+
+async def test_a_quick_ring_again_reuses_a_fresh_warm_proof() -> None:
+    contract = model_score_contract()
+    adapter = running_adapter(contract)
+    activation = ProofRecordingActivation(adapter, age=30.0)
+    notices: list[str] = []
+
+    arm = await activated_engine(adapter, activation).arm(
+        lambda event: notices.append(event.status)
+    )
+
+    assert adapter.committed_updates == []
+    assert arm.source_version == adapter.version
+    assert any("reusing that proof" in notice for notice in notices)
+
+
+@pytest.mark.parametrize("age", [None, WARM_PROOF_REUSE_SECONDS + 1.0, -1.0])
+async def test_a_stale_absent_or_impossible_warm_proof_is_proven_again(age) -> None:
+    contract = model_score_contract()
+    adapter = running_adapter(contract)
+    activation = ProofRecordingActivation(adapter, age=age)
+
+    await activated_engine(adapter, activation).arm()
+
+    assert adapter.committed_updates == [baseline_update(contract)]
+    # The new proof is recorded for the next Prepare.
+    assert activation.proven == 1
+
+
+async def test_a_left_behind_proof_row_is_restored_even_with_a_fresh_warm_proof() -> None:
+    """Only the exact baseline qualifies; an earlier bout's row needs the commit."""
+
+    contract = model_score_contract()
+    adapter = running_adapter(contract)
+    left_behind = run_owned_update(contract).row
+    adapter.source = left_behind
+    adapter.application = left_behind
+    activation = ProofRecordingActivation(adapter, age=5.0)
+
+    await activated_engine(adapter, activation).arm()
+
+    assert adapter.committed_updates == [baseline_update(contract)]
+    assert adapter.source == contract.baseline
+
+
+async def test_every_change_carried_end_to_end_is_recorded_as_a_warm_proof() -> None:
+    contract = model_score_contract()
+    adapter = running_adapter(contract)
+    activation = ProofRecordingActivation(adapter, age=None)
+    engine = activated_engine(adapter, activation)
+
+    arm = await engine.arm()
+    assert activation.proven == 1
+    result = await engine.run(arm, run_owned_update(contract))
+    assert activation.proven == 2
+    await engine.redo(
+        arm,
+        result,
+        ModelScoreUpdate(
+            entity_id=contract.entity_id,
+            score=0.33,
+            model_version="risk-v2",
+            proof_nonce=f"round4-v2-{uuid4().hex}",
+        ),
+    )
+    assert activation.proven == 3
+    await engine.settle_and_restore_baseline()
+    assert activation.proven == 4
+
+
+async def test_a_repaired_source_asks_the_activation_for_a_full_refresh() -> None:
+    """This path used to raise AttributeError: the engine had no `activation`."""
+
+    contract = model_score_contract()
+
+    class Repaired(StoppedUntilStarted):
+        source_repaired = True
+
+        async def preflight_source(self, entity_id, on_progress=None):
+            return self.source
+
+    adapter = Repaired(contract)
+    activation = ProofRecordingActivation(adapter, age=None)
+
+    await activated_engine(adapter, activation).arm()
+
+    assert activation.full_refreshes == 1
+
+
+# --------------------------------------------------------------------------
+# A crisp Prepare (2026-09-28): the proof is made in the background, a recent
+# storage check is reused, and the bell's commit path does less in front of the room.
+# --------------------------------------------------------------------------
+
+
+class StorageRecordingActivation(ProofRecordingActivation):
+    def __init__(self, adapter: StoppedUntilStarted, *, age: float | None) -> None:
+        super().__init__(adapter, age=age)
+        self.storage_age: float | None = None
+        self.storage_notes = 0
+        self.storage_forgets = 0
+
+    def storage_check_age(self) -> float | None:
+        return self.storage_age
+
+    def note_storage_check(self) -> None:
+        self.storage_notes += 1
+        self.storage_age = 0.0
+
+    def forget_storage_check(self) -> None:
+        self.storage_forgets += 1
+        self.storage_age = None
+
+
+class CheckedStorage(StoppedUntilStarted):
+    def __init__(self, contract: ModelScoreContract) -> None:
+        super().__init__(contract)
+        self.running = True
+        self.preflights = 0
+
+    async def preflight_source(self, entity_id, on_progress=None):
+        self.preflights += 1
+        return self.source
+
+
+async def test_a_prewarm_proves_warm_even_while_a_proof_is_fresh() -> None:
+    """Its whole job is to leave a new proof behind for the presenter's Prepare."""
+
+    contract = model_score_contract()
+    adapter = running_adapter(contract)
+    activation = ProofRecordingActivation(adapter, age=5.0)
+
+    await activated_engine(adapter, activation).prewarm()
+
+    assert adapter.committed_updates == [baseline_update(contract)]
+    assert activation.proven == 1
+
+
+async def test_a_recent_storage_check_is_reused_and_a_failed_prepare_forgets_it() -> None:
+    contract = model_score_contract()
+    adapter = CheckedStorage(contract)
+    activation = StorageRecordingActivation(adapter, age=None)
+
+    await activated_engine(adapter, activation).arm()
+    assert (adapter.preflights, activation.storage_notes) == (1, 1)
+
+    await activated_engine(adapter, activation).arm()
+    assert adapter.preflights == 1  # reused
+
+    adapter.application = ModelScoreRow(contract.entity_id, 0.99, "someone-else", "foreign")
+    with pytest.raises(ModelScoreNotArmedError):
+        await activated_engine(adapter, activation).arm()
+    assert activation.storage_forgets == 1
+
+    adapter.application = adapter.source
+    await activated_engine(adapter, activation).arm()
+    assert adapter.preflights == 2  # checked again after the failure
+
+
+async def test_a_storage_check_is_reused_for_as_long_as_a_warm_proof() -> None:
+    """One window for what a Prepare reuses, so neither half ages out before the other."""
+
+    contract = model_score_contract()
+    adapter = CheckedStorage(contract)
+    activation = StorageRecordingActivation(adapter, age=WARM_PROOF_REUSE_SECONDS - 1)
+    activation.storage_age = WARM_PROOF_REUSE_SECONDS - 1
+
+    await activated_engine(adapter, activation).arm()
+
+    assert adapter.preflights == 0
+    assert activation.proven == 0
+
+
+async def test_a_prewarm_checks_storage_again_even_while_a_check_is_fresh() -> None:
+    """A refresh renews both halves of what a Prepare reuses, not only the proof."""
+
+    contract = model_score_contract()
+    adapter = CheckedStorage(contract)
+    activation = StorageRecordingActivation(adapter, age=5.0)
+    activation.storage_age = 5.0
+
+    await activated_engine(adapter, activation).prewarm()
+
+    assert (adapter.preflights, activation.storage_notes) == (1, 1)
+    assert activation.proven == 1
+
+
+async def test_the_engine_hands_the_adapter_the_head_it_inspected() -> None:
+    contract = model_score_contract()
+
+    class KnownHead(StoppedUntilStarted):
+        accepts_known_head = True
+
+        def __init__(self, contract: ModelScoreContract) -> None:
+            super().__init__(contract)
+            self.running = True
+            self.heads: list[int | None] = []
+
+        async def commit_source_update(self, update, *, after_version=None):
+            self.heads.append(after_version)
+            return await super().commit_source_update(update)
+
+    adapter = KnownHead(contract)
+    engine = activated_engine(adapter, ProofRecordingActivation(adapter, age=None))
+    start = adapter.version
+
+    arm = await engine.arm()
+    await engine.run(arm, run_owned_update(contract))
+
+    # The warm-up passed the head its own inspection read; the bout passed the
+    # arm's version, a lower bound its unique nonce makes exact.
+    assert adapter.heads == [start, arm.source_version]
+
+
+async def test_a_committed_row_that_does_not_read_back_still_fails_the_proof() -> None:
+    """The read-back now runs beside the sync wait; it must still be able to fail."""
+
+    contract = model_score_contract()
+
+    class ReadsBackWrong(StoppedUntilStarted):
+        def __init__(self, contract: ModelScoreContract) -> None:
+            super().__init__(contract)
+            self.running = True
+            self.corrupt = False
+
+        async def commit_source_update(self, update):
+            commit = await super().commit_source_update(update)
+            if self.corrupt:
+                self.source = ModelScoreRow(update.entity_id, 0.0, "tampered", "tampered")
+            return commit
+
+    adapter = ReadsBackWrong(contract)
+    engine = activated_engine(adapter, ProofRecordingActivation(adapter, age=None))
+    arm = await engine.arm()
+    adapter.corrupt = True
+
+    with pytest.raises(ModelScoreVerificationError, match="does not match the committed update"):
+        await engine.run(arm, run_owned_update(contract))
