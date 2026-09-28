@@ -60,6 +60,7 @@ from .live_orders import (
 )
 from .manifest import DemoManifest
 from .model_score import (
+    WARM_PROOF_REUSE_SECONDS,
     ModelScoreArm,
     ModelScoreEngine,
     ModelScoreError,
@@ -490,6 +491,10 @@ _ROUND_ONE_TRANSACTION_WIRE_CALL = "PostgreSQL TLS connect → INSERT → COMMIT
 #: be put back before refusing. The restore normally finishes in about fifteen
 #: seconds.
 _ROUND4_SETTLEMENT_WAIT_SECONDS = 120.0
+
+#: How long after a Round 4 card is created a background warm-up keeps off its
+#: source row. The UI arms a new card about a second after creating it.
+_ROUND4_CARD_GRACE_SECONDS = 30.0
 
 _ROUND_FOUR_UNSUPPORTED_REASON = (
     "No AWS-native equivalent lane was configured or timed in this scoped proof."
@@ -1027,6 +1032,9 @@ class RunManager:
         # The newest Round 4 background settlement. The ring is released before
         # it runs, so the next arm must wait for it rather than race it.
         self._round4_settlement: asyncio.Task[None] | None = None
+        # Held by a background warm-up (prewarm_round4). An arm or a re-do that
+        # arrives meanwhile waits for it, then reuses the proof it leaves.
+        self._round4_prewarm_lock = asyncio.Lock()
         # Session retention. A session is created per bout attempt, abandoned ones
         # included, and each one holds a snapshot, up to five engines and an event
         # log -- about a megabyte. Nothing used to release them, so an installation
@@ -6029,6 +6037,10 @@ class RunManager:
                     },
                 )
 
+            await self._await_round4_prewarm(
+                on_progress,
+                "Finishing the warm-up that started when the app was opened",
+            )
             await self._await_prior_round4_settlement(record, on_progress)
             arm = await engine.arm(on_progress)
             loop = asyncio.get_running_loop()
@@ -6088,6 +6100,93 @@ class RunManager:
                 exc,
                 round_number=4,
             )
+
+    def _round4_busy(self) -> bool:
+        """Whether anything is using Round 4's source row now, or is about to.
+
+        A background warm-up writes the sealed baseline into that row, so it may
+        run only when no Round 4 bout is preparing, armed, running, re-doing or
+        settling, and no card was created in the last few seconds: the UI arms a
+        new card about a second after creating it.
+        """
+
+        settlement = self._round4_settlement
+        if settlement is not None and not settlement.done():
+            return True
+        now = datetime.now(UTC)
+        for record in self._records.values():
+            snapshot = record.snapshot
+            if snapshot.round.id != RoundId.PUT_MODEL_SCORE_IN_APP:
+                continue
+            if snapshot.state in {SessionState.CHECKING, SessionState.ARMED, SessionState.RUNNING}:
+                return True
+            if record.task is not None and not record.task.done():
+                return True
+            if record.settlement_task is not None and not record.settlement_task.done():
+                return True
+            if snapshot.redo is not None and snapshot.redo.state == RedoState.RUNNING:
+                return True
+            if (
+                snapshot.state == SessionState.DRAFT
+                and (now - snapshot.created_at).total_seconds() < _ROUND4_CARD_GRACE_SECONDS
+            ):
+                return True
+        return False
+
+    async def prewarm_round4(self) -> None:
+        """Leave a fresh Round 4 warm proof behind while Round 4 is idle.
+
+        Called by the Round 4 warm keeper when a person is using the app, so the
+        warm-up round trip an arm would make happens before anyone presses
+        Prepare, and that Prepare reuses it. Nothing here runs while any Round 4
+        bout is in flight (``_round4_busy``), and an arm or a re-do that arrives
+        meanwhile waits on the same lock rather than racing it. A proof that is
+        still fresh is left alone.
+        """
+
+        factory = self._model_score_factory
+        if factory is None or self._closed or self._round4_busy():
+            return
+        if self._round4_prewarm_lock.locked():
+            return
+        async with self._round4_prewarm_lock:
+            if self._closed or self._round4_busy():
+                return
+            # Built off the loop: a live engine constructs a workspace client.
+            engine = await asyncio.to_thread(factory)
+            age_of = getattr(getattr(engine, "activation", None), "warm_proof_age", None)
+            age = age_of() if callable(age_of) else None
+            if age is not None and 0 <= age <= WARM_PROOF_REUSE_SECONDS / 2:
+                return
+            prewarm = getattr(engine, "prewarm", None)
+            if callable(prewarm):
+                await prewarm()
+
+    async def _await_round4_prewarm(
+        self,
+        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+        status: str,
+    ) -> None:
+        """Let a background warm-up already under way finish, so its proof is reused."""
+
+        lock = self._round4_prewarm_lock
+        if not lock.locked():
+            return
+        await on_progress(
+            ModelScoreProgress(
+                phase=ModelScorePhase.PREFLIGHT,
+                status=status,
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        try:
+            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
+                async with lock:
+                    pass
+        except TimeoutError as exc:
+            raise InvalidStateError(
+                "Round 4 was still finishing its warm-up. Try again in a moment."
+            ) from exc
 
     async def _await_prior_round4_settlement(
         self,
@@ -9681,6 +9780,19 @@ class RunManager:
         two, and the restore the re-do's own finish schedules runs after it.
         """
 
+        try:
+            await self._await_round4_prewarm(
+                on_progress,
+                "Finishing a warm-up before the re-do",
+            )
+        except InvalidStateError:
+            logger.error(
+                "Round 4 re-do refused: a background warm-up did not finish within %.0fs "
+                "session=%s",
+                _ROUND4_SETTLEMENT_WAIT_SECONDS,
+                record.snapshot.id,
+            )
+            return False
         settlement = record.settlement_task
         if settlement is None or settlement.done():
             return True

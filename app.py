@@ -1694,8 +1694,13 @@ def _start_round4_warm_keeper(
         from server.model_score_live import build_round4_warm_keeper
 
         # Performs no work now: the keeper builds its client on the first use,
-        # off the loop.
-        keeper = build_round4_warm_keeper(owned)
+        # off the loop. The manager's prewarm lets it leave a fresh warm proof
+        # behind too, only ever while no Round 4 bout is in flight.
+        manager = getattr(app.state, "run_manager", None)
+        keeper = build_round4_warm_keeper(
+            owned,
+            prewarm=getattr(manager, "prewarm_round4", None),
+        )
     except Exception:  # noqa: BLE001 - an observer may never break startup
         LOGGER.warning("Could not start the Round 4 warm keeper", exc_info=True)
         return None

@@ -24,6 +24,7 @@ from databricks.sdk.service.sql import (
 from . import pipeline_power
 from .manifest import DemoManifest
 from .model_score import (
+    WARM_PROOF_REUSE_SECONDS,
     DeltaCommit,
     ManagedSyncState,
     ManagedSyncStatus,
@@ -827,10 +828,22 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         )
         return _exact_model_row(rows, allow_missing=True)
 
-    async def commit_source_update(self, update: ModelScoreUpdate) -> DeltaCommit:
+    #: The engine may pass the head it has just inspected, which saves a statement
+    #: on the path the room watches after the bell.
+    accepts_known_head = True
+
+    async def commit_source_update(
+        self,
+        update: ModelScoreUpdate,
+        *,
+        after_version: int | None = None,
+    ) -> DeltaCommit:
         attempt = 1
         while True:
-            before_version, _ = await self._source_head()
+            if attempt == 1 and after_version is not None:
+                before_version = after_version
+            else:
+                before_version, _ = await self._source_head()
             try:
                 await self._merge_source_update(update)
                 break
@@ -1313,6 +1326,9 @@ class Round4PipelineActivation:
         # well ahead of that moment while the app is in use, so startup recovery
         # never reads a lapsed promise for a pipeline somebody is using.
         self._owed_due_at: datetime | None = None
+        # When a preparation last found the Delta source storage readable, so a
+        # Prepare soon after can skip that check. See STORAGE_CHECK_REUSE_SECONDS.
+        self._storage_checked_at: float | None = None
 
     async def ensure_running(self, notify: Callable[[str], Awaitable[None]]) -> None:
         """Bring the pipeline to a healthy continuous sync, however long that takes.
@@ -1437,6 +1453,19 @@ class Round4PipelineActivation:
         if self._proven_update_id != self._last_seen_update_id:
             return None
         return self._clock() - self._proven_at
+
+    def note_storage_check(self) -> None:
+        """Record that a preparation just found the Delta source storage readable."""
+
+        self._storage_checked_at = self._clock()
+
+    def storage_check_age(self) -> float | None:
+        if self._storage_checked_at is None:
+            return None
+        return self._clock() - self._storage_checked_at
+
+    def forget_storage_check(self) -> None:
+        self._storage_checked_at = None
 
     async def _start_and_wait(
         self,
@@ -2099,20 +2128,29 @@ class Round4WarmKeeper:
     The activation is built on the first use, in a worker thread: building it
     constructs a workspace client, which may make a network call, and neither
     startup nor the request path may wait on that.
+
+    With a ``prewarm`` (the manager's), the keeper also leaves a fresh warm proof
+    behind after each bring-up, and refreshes it while the app is still in use,
+    so the presenter's Prepare reuses it instead of making its own round trip.
+    The manager decides whether a prewarm is safe and whether it is needed.
     """
 
     def __init__(
         self,
         build_activation: Callable[[], Round4PipelineActivation | None],
         *,
+        prewarm: Callable[[], Awaitable[None]] | None = None,
         min_interval_seconds: float = WARM_KEEPER_MIN_INTERVAL_SECONDS,
         retry_seconds: float = WARM_KEEPER_RETRY_SECONDS,
+        refresh_seconds: float = WARM_PROOF_REUSE_SECONDS / 2,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._build_activation = build_activation
         self._activation: Round4PipelineActivation | None = None
+        self._prewarm = prewarm
         self._min_interval = min_interval_seconds
         self._retry = retry_seconds
+        self._refresh = refresh_seconds
         self._sleep = sleep
         self._wake = asyncio.Event()
 
@@ -2121,10 +2159,20 @@ class Round4WarmKeeper:
             self._activation.note_use()
         self._wake.set()
 
+    async def _next_wake(self) -> None:
+        """Wait for a use, or, while the app is in use, until the proof wants refreshing."""
+
+        activation = self._activation
+        if activation is None or self._prewarm is None or activation._in_use_remaining() <= 0:
+            await self._wake.wait()
+        else:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), timeout=self._refresh)
+        self._wake.clear()
+
     async def run(self) -> None:
         while True:
-            await self._wake.wait()
-            self._wake.clear()
+            await self._next_wake()
             if self._activation is None:
                 try:
                     activation = await asyncio.to_thread(self._build_activation)
@@ -2151,12 +2199,14 @@ class Round4WarmKeeper:
                 )
             try:
                 await self._activation.bring_up_for_use()
+                if self._prewarm is not None:
+                    await self._prewarm()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 LOGGER.warning(
-                    "The Round 4 warm keeper could not bring the Managed Sync pipeline up; "
-                    "the next Prepare will start it",
+                    "The Round 4 warm keeper could not have the Managed Sync pipeline ready; "
+                    "the next Prepare will do it",
                     exc_info=True,
                 )
                 await self._sleep(self._retry)
@@ -2164,7 +2214,11 @@ class Round4WarmKeeper:
             await self._sleep(self._min_interval)
 
 
-def build_round4_warm_keeper(manifest: DemoManifest) -> Round4WarmKeeper:
+def build_round4_warm_keeper(
+    manifest: DemoManifest,
+    *,
+    prewarm: Callable[[], Awaitable[None]] | None = None,
+) -> Round4WarmKeeper:
     """The warm keeper for this manifest's sealed pipeline. Performs no work now.
 
     Its activation is built later, through the same engine an arm builds, so the
@@ -2177,7 +2231,7 @@ def build_round4_warm_keeper(manifest: DemoManifest) -> Round4WarmKeeper:
         activation = build_model_score_engine(manifest).activation
         return activation if isinstance(activation, Round4PipelineActivation) else None
 
-    return Round4WarmKeeper(build_activation)
+    return Round4WarmKeeper(build_activation, prewarm=prewarm)
 
 
 async def aclose_activations() -> None:

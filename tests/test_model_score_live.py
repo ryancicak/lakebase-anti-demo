@@ -2107,3 +2107,100 @@ async def test_only_a_concurrent_transaction_is_retried_and_only_so_many_times(
     with pytest.raises(model_score_live.WorkspaceStatementExecutionError):
         await adapter.commit_source_update(update)
     assert sum(call[0].startswith("MERGE INTO") for call in denied.calls) == 1
+
+
+def _cdf_row(row: ModelScoreRow, version: int) -> list[dict[str, str]]:
+    return [
+        {
+            "entity_id": row.entity_id,
+            "score": str(row.score),
+            "model_version": row.model_version,
+            "proof_nonce": row.proof_nonce,
+            "_commit_version": str(version),
+            "_commit_timestamp": "2026-08-18T11:59:59Z",
+            "_change_type": "update_postimage",
+        }
+    ]
+
+
+async def test_a_known_head_saves_the_head_read_but_a_conflict_still_rereads_it(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(model_score_live, "DELTA_CONFLICT_RETRY_SECONDS", 0)
+    expected = ModelScoreRow("customer-1", 0.81, "risk-v1", "nonce-1")
+    update = ModelScoreUpdate(
+        expected.entity_id, expected.score, expected.model_version, expected.proof_nonce
+    )
+
+    quick = FakeStatements([[], _cdf_row(expected, 13)])
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=quick,
+    )
+    assert adapter.accepts_known_head is True
+    commit = await adapter.commit_source_update(update, after_version=12)
+    assert commit.version == 13
+    assert quick.calls[0][0].startswith("MERGE INTO")  # no head read first
+    assert {p.name: p.value for p in quick.calls[1][1]}["start_version"] == "13"
+
+    contested = MergeFailing([_head(13), [], _cdf_row(expected, 14)], failures=1)
+    adapter = LiveModelScoreAdapter(
+        live_config(),
+        workspace_client=control_plane_workspace(),
+        statement_runner=contested,
+    )
+    commit = await adapter.commit_source_update(update, after_version=12)
+    assert commit.version == 14
+    assert contested.calls[1][0].startswith("DESCRIBE HISTORY")  # re-read after the conflict
+    assert {p.name: p.value for p in contested.calls[-1][1]}["start_version"] == "14"
+
+
+async def test_the_keeper_prewarms_after_a_bring_up_and_refreshes_while_in_use() -> None:
+    class Activation:
+        def __init__(self) -> None:
+            self.in_use = 100.0
+            self.bring_ups = 0
+
+        def note_use(self) -> None:
+            pass
+
+        def _in_use_remaining(self) -> float:
+            return self.in_use
+
+        async def bring_up_for_use(self) -> None:
+            self.bring_ups += 1
+
+    activation = Activation()
+    prewarms = 0
+    refreshed = asyncio.Event()
+
+    async def prewarm() -> None:
+        nonlocal prewarms
+        prewarms += 1
+        if prewarms >= 3:
+            refreshed.set()
+
+    async def no_wait(seconds: float) -> None:
+        await asyncio.sleep(0)
+
+    keeper = model_score_live.Round4WarmKeeper(
+        lambda: activation,  # type: ignore[arg-type,return-value]
+        prewarm=prewarm,
+        refresh_seconds=0.01,
+        sleep=no_wait,
+    )
+    task = asyncio.create_task(keeper.run())
+    try:
+        keeper.note_use()
+        # One use, then refreshes on their own while the app is still in use.
+        await asyncio.wait_for(refreshed.wait(), timeout=2)
+        assert activation.bring_ups >= 3
+
+        activation.in_use = 0.0
+        settled = prewarms
+        await asyncio.sleep(0.1)
+        assert prewarms <= settled + 1  # quiet once the app is no longer in use
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

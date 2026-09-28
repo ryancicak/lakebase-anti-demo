@@ -4851,6 +4851,78 @@ async def test_the_abandoned_terminal_settlement_leaves_the_durable_lease_to_its
     assert record.lease_heartbeat_task is None
 
 
+class PrewarmingModelScoreEngine(FakeModelScoreEngine):
+    """A Round 4 engine whose background warm-up can be held open."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.activation = None
+        self.prewarms = 0
+        self.prewarm_started = asyncio.Event()
+        self.allow_prewarm = asyncio.Event()
+
+    async def settle_and_restore_baseline(self) -> None:
+        return None
+
+    async def prewarm(self) -> None:
+        self.prewarms += 1
+        self.prewarm_started.set()
+        await self.allow_prewarm.wait()
+
+
+async def test_a_background_warm_up_runs_only_while_round_four_is_idle() -> None:
+    engine = PrewarmingModelScoreEngine()
+    engine.allow_prewarm.set()
+    manager = RunManager(model_score_factory=lambda: engine)
+
+    await manager.prewarm_round4()
+    assert engine.prewarms == 1
+
+    # A card the UI is about to arm is left alone.
+    await manager.create(round_four_request())
+    await manager.prewarm_round4()
+    assert engine.prewarms == 1
+
+
+async def test_an_arm_waits_for_a_background_warm_up_already_running() -> None:
+    engine = PrewarmingModelScoreEngine()
+    manager = RunManager(model_score_factory=lambda: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-prewarm-arm")
+    warm = asyncio.create_task(manager.prewarm_round4())
+    await asyncio.wait_for(engine.prewarm_started.wait(), timeout=1)
+
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await asyncio.sleep(0.05)
+    assert engine.arm_calls == 0
+
+    engine.allow_prewarm.set()
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    assert engine.arm_calls == 1
+    await asyncio.wait_for(warm, timeout=1)
+
+
+async def test_a_redo_waits_for_a_background_warm_up_already_running() -> None:
+    engine = PrewarmingModelScoreEngine()
+    manager = RunManager(model_score_factory=lambda: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-prewarm-redo")
+    created, _ = await verified_round_four(manager, operator)
+    settlement = manager._round4_settlement
+    if settlement is not None:
+        await asyncio.wait_for(asyncio.shield(settlement), timeout=1)
+
+    warm = asyncio.create_task(manager.prewarm_round4())
+    await asyncio.wait_for(engine.prewarm_started.wait(), timeout=1)
+    await manager.start_redo(created.id, operator)
+    await asyncio.sleep(0.05)
+    assert engine.redo_calls == 0
+
+    engine.allow_prewarm.set()
+    await wait_for_redo(manager, created.id, RedoState.VERIFIED)
+    assert engine.redo_calls == 1
+    await asyncio.wait_for(warm, timeout=1)
+
+
 async def test_round_four_redo_retains_identity_and_preserves_initial_evidence() -> None:
     engine = FakeModelScoreEngine()
     manager = RunManager(model_score_factory=lambda: engine)

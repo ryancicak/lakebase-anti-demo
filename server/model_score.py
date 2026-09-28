@@ -236,10 +236,23 @@ ProgressCallback = Callable[[ModelScoreProgress], Awaitable[None]]
 
 
 #: How recently a change must have gone end to end on the running pipeline update
-#: for Prepare to reuse that as its warm proof. Short on purpose: it covers a
-#: Ring Again or a re-arm after a towel, not a pipeline left idle between talks,
-#: whose compute may have parked again.
-WARM_PROOF_REUSE_SECONDS = 120.0
+#: for Prepare to reuse that as its warm proof.
+#:
+#: **Measured, not assumed.** The worry behind proving warm before every bell was
+#: that a continuous pipeline left idle might park the compute its next change
+#: needs. Measured live on 2026-09-28, the first change after an idle spell on
+#: the same running update synced (commit to sync end, the pipeline's own
+#: timestamps) in 5.96 s right after a start, 5.46 s after 5 minutes idle,
+#: 4.20 s after 10 and 3.14 s after 15: no slower than a warm one. Fifteen
+#: minutes is the longest idle measured, so it is the longest reuse allowed; a
+#: restarted update, with a new ID, is always proven again.
+WARM_PROOF_REUSE_SECONDS = 900.0
+
+#: How recently the Delta source storage must have been checked for Prepare to
+#: skip the check. The storage preflight finds access denials and a missing Delta
+#: path, neither of which comes and goes in minutes, and any failed preparation
+#: forgets the check so the next one makes it again.
+STORAGE_CHECK_REUSE_SECONDS = 600.0
 
 
 class PipelineActivation(Protocol):
@@ -368,7 +381,8 @@ class ModelScoreEngine:
                     score=baseline.score,
                     model_version=baseline.model_version,
                     proof_nonce=baseline.proof_nonce,
-                )
+                ),
+                after_version=status.source_version,
             )
             if commit.version <= status.source_version:
                 raise ModelScoreVerificationError(
@@ -461,6 +475,113 @@ class ModelScoreEngine:
             )
 
     async def arm(self, on_progress: ProgressCallback | None = None) -> ModelScoreArm:
+        status = await self._prepare(on_progress, allow_reuse=True)
+        arm = ModelScoreArm(
+            arm_id=uuid4().hex,
+            armed_at=self._aware(self._now(), "armed_at"),
+            contract_sha256=self.contract.sha256,
+            source_version=status.source_version,
+            baseline=self.contract.baseline,
+        )
+        await self._emit(on_progress, ModelScorePhase.ARMED, "Managed Sync baseline verified")
+        return arm
+
+    async def prewarm(self) -> None:
+        """Do an arm's whole preparation between bouts, so the next Prepare can reuse it.
+
+        The same checks an arm makes, including the warm-up round trip, which is
+        forced here rather than reused: the point is to leave a fresh proof and a
+        fresh storage check behind for the presenter's Prepare. It writes only the
+        sealed baseline, exactly as an arm's warm-up does, and returns nothing a
+        bout could use. The manager runs it only while Round 4 is idle.
+        """
+
+        await self._prepare(None, allow_reuse=False)
+
+    async def _prepare(
+        self,
+        on_progress: ProgressCallback | None,
+        *,
+        allow_reuse: bool,
+    ) -> ManagedSyncStatus:
+        try:
+            return await self._prepare_once(on_progress, allow_reuse=allow_reuse)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # A failed preparation proves nothing about the storage it read, so
+            # the next one checks it again rather than trusting an old answer.
+            self._forget_storage_check()
+            raise
+
+    async def _prepare_once(
+        self,
+        on_progress: ProgressCallback | None,
+        *,
+        allow_reuse: bool,
+    ) -> ManagedSyncStatus:
+        if not self._storage_check_is_fresh():
+            await self._check_source_storage(on_progress)
+        await self._ensure_pipeline_running(on_progress)
+        await self._emit(on_progress, ModelScorePhase.PREFLIGHT, "Inspecting Managed Sync")
+        status = await self._await_arm_status(on_progress)
+
+        # Independent reads of two different systems, so neither waits on the other.
+        source, application = await asyncio.gather(
+            self._read_source(
+                self.contract.entity_id,
+                "baseline source read",
+            ),
+            self._read_application(
+                self.contract.entity_id,
+                "baseline fresh application Postgres read",
+            ),
+        )
+        if source != self.contract.baseline or application != self.contract.baseline:
+            if source != application or not self._is_owned_prior_proof(source):
+                raise ModelScoreNotArmedError(
+                    "The exact baseline is absent and the current row is not one matching "
+                    "demo-owned Round 4 proof"
+                )
+        reuse_age = self._reusable_warm_proof_age(source, application) if allow_reuse else None
+        if reuse_age is None:
+            status = await self._prove_pipeline_warm(status, on_progress)
+        else:
+            await self._emit(
+                on_progress,
+                ModelScorePhase.PREFLIGHT,
+                f"Managed Sync carried a change end to end {reuse_age:.0f}s ago on this "
+                "same run; reusing that proof",
+            )
+        confirmed = await self._inspect_sync()
+        self._validate_contract_status(confirmed, arming=True)
+        if (
+            confirmed.source_version != status.source_version
+            or confirmed.last_processed_version != status.last_processed_version
+            or confirmed.last_sync_delta_version != status.last_sync_delta_version
+            or confirmed.last_sync_delta_commit_time
+            != status.last_sync_delta_commit_time
+            or confirmed.sync_end_time != status.sync_end_time
+        ):
+            raise ModelScoreNotArmedError(
+                "Managed Sync advanced while the exact baseline was being verified"
+            )
+        self._validate_caught_up_baseline(confirmed)
+        return status
+
+    def _storage_check_is_fresh(self) -> bool:
+        age_of = getattr(self._activation, "storage_check_age", None)
+        if not callable(age_of):
+            return False
+        age = age_of()
+        return age is not None and 0 <= age <= STORAGE_CHECK_REUSE_SECONDS
+
+    def _forget_storage_check(self) -> None:
+        forget = getattr(self._activation, "forget_storage_check", None)
+        if callable(forget):
+            forget()
+
+    async def _check_source_storage(self, on_progress: ProgressCallback | None) -> None:
         await self._emit(
             on_progress,
             ModelScorePhase.PREFLIGHT,
@@ -497,57 +618,9 @@ class ModelScoreEngine:
                     ModelScorePhase.PREFLIGHT,
                     "Rebasing the preserved Managed Sync pipeline onto the repaired source",
                 )
-        await self._ensure_pipeline_running(on_progress)
-        await self._emit(on_progress, ModelScorePhase.PREFLIGHT, "Inspecting Managed Sync")
-        status = await self._await_arm_status(on_progress)
-
-        source = await self._read_source(
-            self.contract.entity_id,
-            "baseline source read",
-        )
-        application = await self._read_application(
-            self.contract.entity_id,
-            "baseline fresh application Postgres read",
-        )
-        if source != self.contract.baseline or application != self.contract.baseline:
-            if source != application or not self._is_owned_prior_proof(source):
-                raise ModelScoreNotArmedError(
-                    "The exact baseline is absent and the current row is not one matching "
-                    "demo-owned Round 4 proof"
-                )
-        reuse_age = self._reusable_warm_proof_age(source, application)
-        if reuse_age is None:
-            status = await self._prove_pipeline_warm(status, on_progress)
-        else:
-            await self._emit(
-                on_progress,
-                ModelScorePhase.PREFLIGHT,
-                f"Managed Sync carried a change end to end {reuse_age:.0f}s ago on this "
-                "same run; reusing that proof",
-            )
-        confirmed = await self._inspect_sync()
-        self._validate_contract_status(confirmed, arming=True)
-        if (
-            confirmed.source_version != status.source_version
-            or confirmed.last_processed_version != status.last_processed_version
-            or confirmed.last_sync_delta_version != status.last_sync_delta_version
-            or confirmed.last_sync_delta_commit_time
-            != status.last_sync_delta_commit_time
-            or confirmed.sync_end_time != status.sync_end_time
-        ):
-            raise ModelScoreNotArmedError(
-                "Managed Sync advanced while the exact baseline was being verified"
-            )
-        self._validate_caught_up_baseline(confirmed)
-        arm = ModelScoreArm(
-            arm_id=uuid4().hex,
-            armed_at=self._aware(self._now(), "armed_at"),
-            contract_sha256=self.contract.sha256,
-            source_version=status.source_version,
-            baseline=self.contract.baseline,
-        )
-        await self._emit(on_progress, ModelScorePhase.ARMED, "Managed Sync baseline verified")
-        return arm
+            note = getattr(self._activation, "note_storage_check", None)
+            if callable(note):
+                note()
 
     async def _ensure_pipeline_running(self, on_progress: ProgressCallback | None) -> None:
         """Give the pipeline back before anything tries to inspect it.
@@ -688,7 +761,8 @@ class ModelScoreEngine:
                 score=baseline.score,
                 model_version=baseline.model_version,
                 proof_nonce=baseline.proof_nonce,
-            )
+            ),
+            after_version=status.source_version,
         )
         if commit.version <= status.source_version:
             raise ModelScoreNotArmedError(
@@ -917,7 +991,7 @@ class ModelScoreEngine:
         after_version: int,
         on_progress: ProgressCallback | None,
     ) -> ModelScoreProofResult:
-        commit = await self._commit_source_update(update)
+        commit = await self._commit_source_update(update, after_version=after_version)
         committed_at = self._aware(
             commit.committed_at,
             "CDF delta commit timestamp",
@@ -931,11 +1005,20 @@ class ModelScoreEngine:
             raise ModelScoreStaleStatusError(
                 "Delta commit version did not advance beyond the prior source version"
             )
-        source = await self._read_source(update.entity_id, "committed source verification read")
+        # Checked alongside the sync wait rather than before it: the check still
+        # has to pass for the proof to stand, but the room no longer watches it.
+        # The clock is the commit and sync timestamps, so this moves no number.
+        verification = asyncio.ensure_future(
+            self._read_source(update.entity_id, "committed source verification read")
+        )
+        try:
+            status, attempts = await self._wait_for_version(commit, on_progress)
+        except BaseException:
+            verification.cancel()
+            raise
+        source = await verification
         if source != update.row:
             raise ModelScoreVerificationError("The source row does not match the committed update")
-
-        status, attempts = await self._wait_for_version(commit, on_progress)
         assert status.sync_end_time is not None
         status_committed_at = self._aware(
             status.last_sync_delta_commit_time,
@@ -1141,10 +1224,23 @@ class ModelScoreEngine:
         assert last_error is not None
         raise last_error
 
-    async def _commit_source_update(self, update: ModelScoreUpdate) -> DeltaCommit:
+    async def _commit_source_update(
+        self,
+        update: ModelScoreUpdate,
+        *,
+        after_version: int | None = None,
+    ) -> DeltaCommit:
+        # An adapter that can take the head it would otherwise read skips one
+        # statement on the path the room is watching. The caller's version is the
+        # head it just inspected, or a lower bound for a commit whose nonce is
+        # unique, and a conflict makes the adapter read the head again anyway.
+        if after_version is not None and getattr(self.adapter, "accepts_known_head", False):
+            operation = self.adapter.commit_source_update(update, after_version=after_version)
+        else:
+            operation = self.adapter.commit_source_update(update)
         try:
             return await self._await_adapter_operation(
-                self.adapter.commit_source_update(update),
+                operation,
                 wall_clock_seconds=self.commit_timeout_seconds,
             )
         except TimeoutError as exc:
