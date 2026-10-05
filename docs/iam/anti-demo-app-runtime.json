@@ -8,6 +8,41 @@
       "Resource": "*"
     },
     {
+      "Sid": "StartAndParkTheRoundFourAndSixGlueWritersOnly",
+      "Effect": "Allow",
+      "Action": [
+        "glue:BatchStopJobRun",
+        "glue:GetJobRun",
+        "glue:GetJobRuns",
+        "glue:StartJobRun"
+      ],
+      "Resource": [
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:job/lakebase-ant*-r4-writer-*",
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:job/lakebase-ant*-r6-writer-*"
+      ]
+    },
+    {
+      "Sid": "StartAndParkTheRoundSixDmsTasksOnly",
+      "Effect": "Allow",
+      "Action": [
+        "dms:StartReplicationTask",
+        "dms:StopReplicationTask"
+      ],
+      "Resource": "arn:aws:dms:<AWS_REGION>:<AWS_ACCOUNT_ID>:task:*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/anti-demo-round": "r6",
+          "aws:ResourceTag/managed-by": "terraform"
+        }
+      }
+    },
+    {
+      "Sid": "ReadTheRoundFourGlueRunMarkers",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::lakebase-ant*-r4-glue/markers/*"
+    },
+    {
       "Sid": "ReadRdsCatalogUnfiltered",
       "Effect": "Allow",
       "Action": [
@@ -127,12 +162,18 @@
       ]
     },
     {
-      "Sid": "ListWhatCarriesTheInstallationLease",
+      "Sid": "ListWhatCarriesTheLeaseAndTheRoundSixDmsLane",
       "Effect": "Allow",
       "Action": [
+        "dms:DescribeReplicationInstances",
+        "dms:DescribeReplicationTasks",
+        "dms:ListTagsForResource",
+        "ec2:DescribeRouteTables",
         "ec2:DescribeSecurityGroupRules",
         "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSubnets",
         "ec2:DescribeVolumes",
+        "ec2:DescribeVpcEndpoints",
         "secretsmanager:ListSecrets"
       ],
       "Resource": "*",
@@ -157,6 +198,7 @@
       ],
       "Resource": [
         "arn:aws:iam::<AWS_ACCOUNT_ID>:role/anti-demo-runtime*",
+        "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r4-*",
         "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r5-*",
         "arn:aws:iam::<AWS_ACCOUNT_ID>:role/r5-*",
         "arn:aws:iam::<AWS_ACCOUNT_ID>:policy/anti-demo-runtime-*",
@@ -172,6 +214,7 @@
       "Sid": "MoveOnlyTheExpiresAtLeaseOnTerraformMadeResources",
       "Effect": "Allow",
       "Action": [
+        "dms:AddTagsToResource",
         "ec2:CreateTags",
         "iam:TagInstanceProfile",
         "iam:TagPolicy",
@@ -194,6 +237,38 @@
           "aws:ResourceTag/anti-demo-run-id": "false"
         }
       }
+    },
+    {
+      "Sid": "MoveTheLeaseOnTheRoundFourAndSixGlueLanes",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetTags",
+        "glue:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:connection/lakebase-ant*-r4-*",
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:job/lakebase-ant*-r4-writer-*",
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:job/lakebase-ant*-r6-writer-*"
+      ],
+      "Condition": {
+        "ForAllValues:StringEquals": {
+          "aws:TagKeys": [
+            "expires-at"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "MoveTheLeaseOnTheRoundFourAndSixBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetBucketTagging",
+        "s3:PutBucketTagging"
+      ],
+      "Resource": [
+        "arn:aws:s3:::lakebase-ant*-r4-glue",
+        "arn:aws:s3:::lakebase-ant*-r6-cdc"
+      ]
     }
   ]
 }

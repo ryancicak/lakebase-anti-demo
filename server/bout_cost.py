@@ -16,28 +16,37 @@ renders the result with the measurement's own basis string attached.  So the
 model stays honest by default and the screen still shows a measured figure with
 its provenance beside it rather than a gap.
 
-Three distinctions are load-bearing and a flatter rendering would lose all
-three:
+Four distinctions are load-bearing and a flatter rendering would lose all
+four:
 
-1. **Rounds 4 and 6 are an exact zero, not an unavailable.**
-   ``infra/aws/locals.tf`` provisions no Aurora cluster for them, so there is
-   nothing to measure and nothing missing.  Their derivation sits on the same
-   element as their ``$0.00``, which is the only condition under which a zero
-   may be printed here at all.
-2. **Round 5's band is a spread; Rounds 2 and 3's band is a question.** R5's two
+1. **A structural zero is exact, not an unavailable.**  A round whose bout
+   touches no Aurora cluster has nothing to measure and nothing missing, and its
+   derivation sits on the same element as its ``$0.00``, which is the only
+   condition under which a zero may be printed here at all.  No round is one from
+   v1.1: Round 6 was the last, until its DMS and Glue lane raced its cluster.
+2. **Rounds 4 and 6 are unknown, not zero.**  Each was a structural zero while it
+   raced Lakebase alone.  From v1.1 Round 4's AWS Glue lane writes into its own
+   Aurora cluster and the app reads it back, so a bout wakes the cluster and bills
+   its descent; Round 6's DMS task reads its own cluster, which logical
+   replication keeps awake, so a bout bills whatever it adds above that floor.
+   Each lane's Glue run bills besides, and no bout of either has been measured yet
+   (``cost_model.AURORA_LANES_NOT_YET_MEASURED``).  Their rows say so, and the
+   total says it leaves them out, until one is.
+3. **Round 5's band is a spread; Rounds 2 and 3's band is a question.** R5's two
    bouts measured 714.91 and 1017.48 ACU-seconds, 42% apart, for reasons that
    were not established -- that is an observed range.  R2 and R3 each reported a
    dead-flat 2.0 ACU for several minutes *after* ``DeleteDBInstance``, and
    whether AWS bills that is undocumented while ``ce:GetCostAndUsage`` is denied
    to this principal -- that is an unresolved question with both ends observed.
    They render as different ``band_kind`` values and neither collapses.
-3. **The dearest round is a lane-specific claim.** Round 5 is the dearest single
+4. **The dearest round is a lane-specific claim.** Round 5 is the dearest measured
    round on the Aurora lane and simultaneously the cheapest on the Lakebase lane.
    Both are measured and both are true, so every superlative here names its lane.
 
 What is in the figure, and what is not.  Each row is the round's AWS *compute*
 on the Aurora lane: the ACU integral, plus Round 5's RDS Proxy because that
-proxy exists only for the duration of that bout.  Transient restore storage and
+proxy exists only for the duration of that bout, and Rounds 4 and 6's Glue runs
+once they are measured, for the same reason.  Transient restore storage and
 public IPv4 are real and are excluded, because they are not what CloudWatch
 measured and the published figure this supersedes excluded them too -- so the
 before and after compare like with like.  Every bout priced here has already
@@ -51,6 +60,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .cost_model import (
+    AURORA_LANES_NOT_YET_MEASURED,
+    PROVISIONED_NOT_YET_RACED_ROUNDS,
     AuroraAcuMeasurement,
     BoutCostEstimate,
     BoutTelemetry,
@@ -78,11 +89,12 @@ ROUND_ORDER: tuple[tuple[RoundId, int, str], ...] = (
     (RoundId.ANALYZE_LIVE_ORDERS, 6, "Live app data into the lakehouse"),
 )
 
-# The rounds `infra/aws/locals.tf` stands no Aurora cluster up for.  Asserted
-# against the estimator's own `_ROUNDS_WITHOUT_AWS` by test rather than trusted.
-ROUNDS_WITHOUT_AURORA = frozenset({RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS})
+# The rounds whose bouts touch no Aurora cluster.  Asserted against the
+# estimator's own `_ROUNDS_WITHOUT_AWS` by test rather than trusted.  Empty from
+# v1.1: Rounds 4 and 6 left when their lanes started racing their clusters.
+ROUNDS_WITHOUT_AURORA: frozenset[RoundId] = frozenset()
 
-# How many RDS instances actually stand, spelled into the Rounds 4 and 6 rows.
+# How many RDS instances actually stand, spelled into the structural-zero rows.
 # Read off the sealed shape rather than written as a word: this sentence said
 # "four" for as long as Round 1 had an instance and kept saying it after the
 # instance was deleted, which is exactly the failure the derivation prevents.
@@ -321,13 +333,27 @@ def _connection_spike_round(
 def _structural_zero_round(round_id: RoundId, number: int, label: str) -> _PricedRound:
     """A zero whose derivation sits on the same element as the zero.
 
-    Rounds 4 and 6 stand no competitor database up at all, which is exactly what
-    their acceptance contract measures.  The estimator emits no AWS line for them
-    on purpose -- a zero line there would claim the AWS *alternative* is free --
-    but the panel does have to say the Aurora lane cost nothing, because leaving
-    the row blank would read as an unmeasured gap instead of an exact result.
+    For a round whose bout touches no competitor database (none from v1.1).  The
+    estimator emits no AWS line for it on purpose -- a zero line there would claim
+    the AWS *alternative* is free -- but the panel does have to say the Aurora lane
+    cost nothing, because leaving the row blank would read as an unmeasured gap
+    instead of an exact result.  Which reason the row gives is read off the cost
+    model rather than assumed, so a round with no cluster at all says that instead.
     """
 
+    if round_id in PROVISIONED_NOT_YET_RACED_ROUNDS:
+        derivation = (
+            "This round's Aurora cluster stands ahead of an AWS lane that does not race "
+            "yet, so no bout touches it"
+        )
+        why = (
+            "No bout touches this round's Aurora cluster until its AWS lane races, so "
+            "a bout adds no capacity to bill. The cluster's own standing compute is "
+            "carrying cost, priced with the installation and not per bout."
+        )
+    else:
+        derivation = "infra/aws/locals.tf stands up no Aurora cluster for this round"
+        why = "There is no Aurora cluster to wake, so there is no capacity to bill."
     return _PricedRound(
         row=BoutCostRound(
             round_id=round_id,
@@ -338,13 +364,60 @@ def _structural_zero_round(round_id: RoundId, number: int, label: str) -> _Price
             usd_display="$0.00",
             usd_low=0.0,
             usd_high=0.0,
-            derivation="infra/aws/locals.tf stands up no Aurora cluster for this round",
+            derivation=derivation,
             band_reason=(
-                "Exact, not unavailable and not rounded down. There is no Aurora cluster "
-                "to wake, so there is no capacity to bill. Marginal Aurora cost only — "
-                f"the {_STANDING_RDS_INSTANCES} standing RDS instances bill straight "
-                "through this round."
+                f"Exact, not unavailable and not rounded down. {why} Marginal Aurora "
+                f"cost only — the {_STANDING_RDS_INSTANCES} standing RDS instances bill "
+                "straight through this round."
             ),
+            bouts=[],
+        ),
+        low=Decimal(0),
+        high=Decimal(0),
+    )
+
+
+#: Why each raced-but-unmeasured round's Aurora lane has a cost nobody knows yet.
+_UNMEASURED_REASONS: dict[RoundId, str] = {
+    RoundId.PUT_MODEL_SCORE_IN_APP: (
+        "This round's AWS Glue lane writes into its own Aurora cluster and the app reads "
+        "it back, so a bout wakes the cluster and bills its descent, and the Glue run "
+        "bills for the seconds it consumed. Neither has been measured for a bout yet, so "
+        "the cost is unknown. Not zero — unknown."
+    ),
+    RoundId.ANALYZE_LIVE_ORDERS: (
+        "This round's AWS DMS task reads its own Aurora cluster, which logical "
+        "replication keeps awake at its running floor, so a bout's checkout and capture "
+        "bill whatever they add above that floor, and the Glue run bills for the seconds "
+        "it consumed. Neither has been measured for a bout yet, so the cost is unknown. "
+        "Not zero — unknown."
+    ),
+}
+
+
+def _unmeasured_round(round_id: RoundId, number: int, label: str) -> _PricedRound:
+    """A raced Aurora lane that no bout has measured yet: unknown, and said to be.
+
+    Rounds 4 and 6, from v1.1.  Neither is the structural zero it was while it
+    raced Lakebase alone, and neither lost a measurement it had: each lane is new,
+    and the row says what would price it.
+    """
+
+    return _PricedRound(
+        row=BoutCostRound(
+            round_id=round_id,
+            round_number=number,
+            label=label,
+            provenance="unavailable",
+            band_kind="single_bout",
+            usd_display="Unavailable",
+            usd_low=None,
+            usd_high=None,
+            derivation=(
+                "Raced from v1.1; no bout's CloudWatch integral or Glue run has been "
+                "recorded for this round yet"
+            ),
+            band_reason=_UNMEASURED_REASONS[round_id],
             bouts=[],
         ),
         low=Decimal(0),
@@ -383,13 +456,13 @@ def _unavailable_round(round_id: RoundId, number: int, label: str) -> _PricedRou
 
 
 def build_bout_cost_disclosure() -> BoutCostDisclosure:
-    """The whole six-round Aurora table, measured.
+    """The six-round Aurora table: measured where a bout was, unknown where none was.
 
     It takes no round argument on purpose.  The claim the panel exists to carry
-    is a comparison *between* rounds -- Round 5 is the dearest on this lane and
-    still less than Rounds 2 and 3 combined -- and a per-round version would
-    either repeat the table six times or state a superlative with nothing on
-    screen to check it against.
+    is a comparison *between* rounds -- Round 5 is the dearest measured round on
+    this lane and still less than Rounds 2 and 3 combined -- and a per-round
+    version would either repeat the table six times or state a superlative with
+    nothing on screen to check it against.
     """
 
     priced: list[_PricedRound] = []
@@ -399,8 +472,25 @@ def build_bout_cost_disclosure() -> BoutCostDisclosure:
             priced.append(_measured_round(round_id, number, label, measurement))
         elif round_id in ROUNDS_WITHOUT_AURORA:
             priced.append(_structural_zero_round(round_id, number, label))
+        elif round_id in AURORA_LANES_NOT_YET_MEASURED:
+            priced.append(_unmeasured_round(round_id, number, label))
         else:
             priced.append(_unavailable_round(round_id, number, label))
+    # Derived from the rows rather than written, so the sentence goes the moment
+    # the round is measured.
+    unmeasured = [item.row.round_number for item in priced if item.row.provenance == "unavailable"]
+    left_out = (
+        f" Round {unmeasured[0]}'s lane is raced but not measured yet, so the total "
+        "leaves it out rather than counting it as zero."
+        if len(unmeasured) == 1
+        else (
+            f" Rounds {', '.join(map(str, unmeasured[:-1]))} and {unmeasured[-1]} are "
+            "raced but not measured yet, so the total leaves them out rather than "
+            "counting them as zero."
+            if unmeasured
+            else ""
+        )
+    )
 
     total_low = sum((item.total_low for item in priced), Decimal(0))
     total_high = sum((item.high for item in priced), Decimal(0))
@@ -424,7 +514,7 @@ def build_bout_cost_disclosure() -> BoutCostDisclosure:
             SUPERSEDED_SIX_ROUND_LOW_USD, SUPERSEDED_SIX_ROUND_HIGH_USD
         ),
         dearest_claim=(
-            f"On the Aurora lane, Round {dearest.row.round_number} is the dearest single "
+            f"On the Aurora lane, Round {dearest.row.round_number} is the dearest measured "
             f"round at {_usd(dearest.high)} — and still less than Rounds 2 and 3 "
             f"combined, {_usd(pair_total)}. That comparison is the stronger claim and it "
             "is the one to make: the dearest round on this lane is still cheaper than two "
@@ -447,7 +537,7 @@ def build_bout_cost_disclosure() -> BoutCostDisclosure:
             "and the superseded figure excluded them too — so the two compare like with "
             "like. The total takes Rounds 2 and 3 at the drain-billed reading; if AWS "
             "does not bill a deleting instance it falls to "
-            f"{_usd_band(total_low - drain, total_high - drain)}."
+            f"{_usd_band(total_low - drain, total_high - drain)}.{left_out}"
         ),
         note=(
             "The quantity is measured; the rate is not. ce:GetCostAndUsage and "
@@ -463,7 +553,7 @@ def build_bout_cost_disclosure() -> BoutCostDisclosure:
 
 
 def aurora_lane_total_usd() -> tuple[Decimal, Decimal]:
-    """The six-round Aurora marginal as a pair of numbers, for tests and callers.
+    """The measured rounds' Aurora marginal as a pair of numbers, for tests and callers.
 
     Derived by re-pricing the table rather than restated, so a figure quoted in
     copy cannot drift from the one the estimator produces.

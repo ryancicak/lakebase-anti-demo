@@ -84,29 +84,39 @@ TF_S3_BACKEND_MIN="1.11.0"
 # Region-scoped list prices, copied from server/cost_model.py so the summary
 # below cannot drift from the model the app itself bills against.
 RATE_RDS_T4G_MEDIUM_HOUR="0.065"
-RATE_EC2_C7I_2XLARGE_HOUR="0.4284"
+RATE_EC2_C7I_2XLARGE_HOUR="0.357"
 RATE_PUBLIC_IPV4_HOUR="0.005"
 RATE_RDS_GP3_GB_MONTH="0.115"
 RATE_EBS_GP3_GB_MONTH="0.08"
 RATE_SECRET_MONTH="0.40"
 RATE_AURORA_ACU_HOUR="0.12"
+RATE_DMS_T3_SMALL_HOUR="0.036"
 RATE_LAKEBASE_DBU="0.26"
 RATE_LAKEBASE_DBU_PER_CU_HOUR="0.213"
 
 # Terraform declares these counts for a fresh v7 installation. See
 # infra/aws/locals.tf (v7_round_keys, v7_rds_round_keys), aurora.tf, rds.tf,
 # round5_runner.tf and round5_secrets.tf.
-COUNT_AURORA_CLUSTERS=4
-COUNT_RDS_INSTANCES=3
+COUNT_AURORA_CLUSTERS=6
+COUNT_RDS_INSTANCES=5
+# Of the Aurora clusters, the ones with logical replication on for AWS change
+# capture (locals.tf v7_lakeflow_round_keys: Round 6's). AWS never auto-pauses
+# their writers, so each bills its 0.5 ACU floor around the clock.
+COUNT_AURORA_ALWAYS_AWAKE=1
 # Two resident runners now: the original Lakebase runner and a dedicated
 # competitor runner, each c7i.2xlarge with its own IPv4, IAM identity and lane.
 COUNT_RUNNERS=2
+# Every database writer is publicly reachable, so each holds a billed IPv4 address.
+COUNT_DATABASE_ADDRESSES=$((COUNT_AURORA_CLUSTERS + COUNT_RDS_INSTANCES))
+# Round 6's AWS lane runs both competitors' change capture on one DMS replication
+# instance (round6_aws.tf), which bills whether or not its tasks run.
+COUNT_DMS_INSTANCES=1
 # Terraform-created Secrets Manager secrets: the two static Proxy credential
 # secrets plus the two lane-scoped resident control DSN secrets (Lakebase and
 # competitor). The RDS-managed cluster/instance master secrets are counted
-# separately by COUNT_MANAGED_MASTER_SECRETS.
+# separately by COUNT_MANAGED_MASTER_SECRETS: one per cluster and per instance.
 COUNT_TF_SECRETS=4
-COUNT_MANAGED_MASTER_SECRETS=7
+COUNT_MANAGED_MASTER_SECRETS=$((COUNT_AURORA_CLUSTERS + COUNT_RDS_INSTANCES))
 COUNT_LAKEBASE_PROJECTS=7
 
 RED=''
@@ -709,7 +719,11 @@ manifest_this_run_would_adopt() {
 # --reset-ready permits that reset is a separate decision: the confirmation
 # prompt still has to describe the destructive action after permission is given.
 # Setup uses `ready` for its progressive v2 Round 4 seal before Round 5 and
-# Round 6 exist; that state is still an interrupted provision.
+# Round 6 exist; that state is still an interrupted provision. So is a ready
+# install whose Round 4 or Round 6 AWS lane is not sealed yet, because setup seals
+# them last (server/manifest.py `round4_aws_pending` and `round6_aws_pending` are
+# the same conditions). A Round 6 lane this identity may not build is sealed as
+# unsupported, and that install is finished.
 apply_targets_complete_ready_install() { # <manifest path, possibly empty>
   [[ "$MODE" == "apply" ]] || return 1
   [[ -n "$1" && -f "$1" ]] || return 1
@@ -717,6 +731,12 @@ apply_targets_complete_ready_install() { # <manifest path, possibly empty>
     .status == "ready"
     and ((.manifest_version // 0) >= 6)
     and (.round6 != null)
+    and ((.round_environments.put_model_score_in_app // {}) as $r4
+      | (.round4_aws != null) or (.installation_id == null) or (.round4 == null)
+        or ($r4.aurora == null) or ($r4.rds == null))
+    and ((.round_environments.analyze_live_orders_without_slowing_checkout // {}) as $r6
+      | (.round6_aws != null) or (.round6_aws_unsupported != null)
+        or (.installation_id == null) or ($r6.aurora == null) or ($r6.rds == null))
   ' "$1" >/dev/null 2>&1
 }
 
@@ -1573,13 +1593,14 @@ if ((${#PERMISSION_FAILURES[@]} > 0)); then
     DENIED_LIST="${DENIED_LIST}
         - ${denied}"
   done
-  # Named rather than counted. docs/iam/ holds five documents -- four operator
-  # policies and the app runtime's own -- so "the three policies in docs/iam/"
-  # asked a reader who is already blocked to guess which three. File 4 covers
-  # only the opt-in S3 state backend, so it is listed when, and only when, this
-  # run asked for it.
+  # Named rather than counted. docs/iam/ holds six documents -- five operator
+  # policies and the app runtime's own -- so "the policies in docs/iam/" asked a
+  # reader who is already blocked to guess which. File 4 covers only the opt-in S3
+  # state backend, so it is listed when, and only when, this run asked for it.
+  # File 5 is Round 4's AWS Glue lane, and file 6 is Round 6's AWS DMS and Glue lane.
   ATTACH_FILES=(anti-demo-operator-1-network.json anti-demo-operator-2-databases.json
-    anti-demo-operator-3-identity.json)
+    anti-demo-operator-3-identity.json anti-demo-operator-5-round4.json
+    anti-demo-operator-6-round6.json)
   if [[ "$STATE_BACKEND" == "s3" ]]; then
     ATTACH_FILES+=(anti-demo-operator-4-state.json)
   fi
@@ -1628,7 +1649,7 @@ fi
 #
 # The partition is read off the caller so GovCloud/China (arn:aws-us-gov, arn:aws-cn)
 # evaluate against their own ARNs rather than falsely denying against arn:aws.
-CREATE_ACTIONS_SUMMARY="rds:CreateDB{Cluster,Instance,SubnetGroup}, iam:Create{Role,Policy,InstanceProfile}, iam:PutRolePolicy, secretsmanager:CreateSecret and sqs:CreateQueue"
+CREATE_ACTIONS_SUMMARY="rds:CreateDB{Cluster,Instance,SubnetGroup,ParameterGroup,ClusterParameterGroup}, iam:Create{Role,Policy,InstanceProfile}, iam:PutRolePolicy, secretsmanager:CreateSecret, sqs:CreateQueue, glue:Create{Job,Connection} and s3:CreateBucket"
 if printf '%s' "$CALLER_ARN" | grep -qE '^arn:aws[a-z-]*:iam::[0-9]+:(user|role)/'; then
   SIM_PARTITION="$(printf '%s' "$CALLER_ARN" | cut -d: -f2)"
   # action|representative-resource, one per line. Every resource matches a pattern
@@ -1642,7 +1663,17 @@ secretsmanager:CreateSecret|arn:$SIM_PARTITION:secretsmanager:$AWS_REGION:$AWS_A
 sqs:CreateQueue|arn:$SIM_PARTITION:sqs:$AWS_REGION:$AWS_ACCOUNT_ID:r5-preflight
 rds:CreateDBCluster|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:cluster:lakebase-ant-preflight
 rds:CreateDBInstance|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:db:lakebase-ant-preflight
-rds:CreateDBSubnetGroup|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:subgrp:lakebase-ant-preflight"
+rds:CreateDBSubnetGroup|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:subgrp:lakebase-ant-preflight
+rds:CreateDBParameterGroup|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:pg:lakebase-ant-preflight-r6-rds-lakeflow
+rds:CreateDBClusterParameterGroup|arn:$SIM_PARTITION:rds:$AWS_REGION:$AWS_ACCOUNT_ID:cluster-pg:lakebase-ant-preflight-r6-aurora-lakeflow
+iam:CreateRole|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:role/ipreflight-r4-glue-x
+glue:CreateJob|arn:$SIM_PARTITION:glue:$AWS_REGION:$AWS_ACCOUNT_ID:job/lakebase-ant-preflight-r4-writer-rds
+glue:CreateConnection|arn:$SIM_PARTITION:glue:$AWS_REGION:$AWS_ACCOUNT_ID:connection/lakebase-ant-preflight-r4-rds
+s3:CreateBucket|arn:$SIM_PARTITION:s3:::lakebase-ant-preflight-r4-glue
+iam:CreateRole|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:role/ipreflight-r6-glue-x
+glue:CreateJob|arn:$SIM_PARTITION:glue:$AWS_REGION:$AWS_ACCOUNT_ID:job/lakebase-ant-preflight-r6-writer-rds
+s3:CreateBucket|arn:$SIM_PARTITION:s3:::lakebase-ant-preflight-r6-cdc
+iam:CreateRole|arn:$SIM_PARTITION:iam::$AWS_ACCOUNT_ID:role/dms-vpc-role"
   SIMULATE_DENIED=""
   SIMULATE_UNAVAILABLE=0
   SIMULATE_UNAVAILABLE_DETAIL=""
@@ -1687,8 +1718,8 @@ SIMEOF
     PREFLIGHT_FAILURES+=("iam:SimulatePrincipalPolicy shows this principal cannot perform create
       actions that Terraform runs with no dry run to fall back on:${SIMULATE_DENIED}
       A denied/implicitDeny means the attached policy does not grant the action on the resource
-      Terraform will create, or a permissions boundary blocks it. Attach the three docs/iam/
-      operator policies (rendered with your account and region) and re-run; docs/iam/README.md
+      Terraform will create, or a permissions boundary blocks it. Attach docs/iam/ operator
+      policies 1, 2, 3 and 5 (rendered with your account and region) and re-run; docs/iam/README.md
       has the loop. If you JUST attached them, IAM is eventually consistent -- wait ~1 minute and
       re-run before changing anything. Proven before PROVISION precisely so it is not discovered
       thirty minutes into a real apply, after the fleet is already billing.")
@@ -2652,17 +2683,19 @@ step "What this will cost"
 fixed_daily() {
   awk -v rds="$RATE_RDS_T4G_MEDIUM_HOUR" -v n_rds="$COUNT_RDS_INSTANCES" \
     -v ec2="$RATE_EC2_C7I_2XLARGE_HOUR" -v n_ec2="$COUNT_RUNNERS" \
-    -v ip="$RATE_PUBLIC_IPV4_HOUR" \
-    'BEGIN { printf "%.2f", 24 * (rds * n_rds + ec2 * n_ec2 + ip * n_ec2) }'
+    -v ip="$RATE_PUBLIC_IPV4_HOUR" -v n_db="$COUNT_DATABASE_ADDRESSES" \
+    -v acu="$RATE_AURORA_ACU_HOUR" -v n_awake="$COUNT_AURORA_ALWAYS_AWAKE" \
+    -v dms="$RATE_DMS_T3_SMALL_HOUR" -v n_dms="$COUNT_DMS_INSTANCES" \
+    'BEGIN { printf "%.2f", 24 * (rds * n_rds + ec2 * n_ec2 + ip * (n_ec2 + n_db) + acu * 0.5 * n_awake + dms * n_dms) }'
 }
 metered_daily() {
   awk -v rdsgb="$RATE_RDS_GP3_GB_MONTH" -v n_rds="$COUNT_RDS_INSTANCES" \
-    -v ebsgb="$RATE_EBS_GP3_GB_MONTH" -v sec="$RATE_SECRET_MONTH" \
+    -v ebsgb="$RATE_EBS_GP3_GB_MONTH" -v n_ec2="$COUNT_RUNNERS" -v sec="$RATE_SECRET_MONTH" \
     -v n_sec="$((COUNT_TF_SECRETS + COUNT_MANAGED_MASTER_SECRETS))" \
-    'BEGIN { printf "%.2f", (rdsgb * 20 * n_rds + ebsgb * 20 + sec * n_sec) / 30.0 }'
+    'BEGIN { printf "%.2f", (rdsgb * 20 * n_rds + ebsgb * 20 * n_ec2 + sec * n_sec) / 30.0 }'
 }
 aurora_floor_daily() {
-  awk -v acu="$RATE_AURORA_ACU_HOUR" -v n="$COUNT_AURORA_CLUSTERS" \
+  awk -v acu="$RATE_AURORA_ACU_HOUR" -v n="$((COUNT_AURORA_CLUSTERS - COUNT_AURORA_ALWAYS_AWAKE))" \
     'BEGIN { printf "%.2f", 24 * acu * 0.5 * n }'
 }
 
@@ -2680,13 +2713,16 @@ cat <<SUMMARY
     ${COUNT_RDS_INSTANCES} x RDS PostgreSQL db.t4g.medium, 20 GiB gp3   \$${RATE_RDS_T4G_MEDIUM_HOUR}/h each
     ${COUNT_RUNNERS} x EC2 c7i.2xlarge Round 5 runner (Lakebase + competitor lanes), 20 GiB gp3   \$${RATE_EC2_C7I_2XLARGE_HOUR}/h each
     ${COUNT_RUNNERS} x public IPv4 address, one per runner            \$${RATE_PUBLIC_IPV4_HOUR}/h each
+    ${COUNT_DATABASE_ADDRESSES} x public IPv4 address, one per database writer   \$${RATE_PUBLIC_IPV4_HOUR}/h each
+    ${COUNT_AURORA_ALWAYS_AWAKE} x Aurora Serverless v2 held awake by logical replication (Round 6), 0.5 ACU   \$${RATE_AURORA_ACU_HOUR}/ACU-hour
+    ${COUNT_DMS_INSTANCES} x AWS DMS replication instance dms.t3.small (Round 6's AWS lane)   \$${RATE_DMS_T3_SMALL_HOUR}/h
                                                      -> ~\$$(fixed_daily)/day fixed
     storage and $((COUNT_TF_SECRETS + COUNT_MANAGED_MASTER_SECRETS)) Secrets Manager secrets       -> ~\$$(metered_daily)/day
 
   AWS, usage-shaped and not estimated here
-    ${COUNT_AURORA_CLUSTERS} x Aurora Serverless v2 PostgreSQL 17, 0-2 ACU, 300 s auto-pause.
+    $((COUNT_AURORA_CLUSTERS - COUNT_AURORA_ALWAYS_AWAKE)) more Aurora Serverless v2 PostgreSQL 17 clusters, 0-2 ACU, 300 s auto-pause.
       \$${RATE_AURORA_ACU_HOUR}/ACU-hour. A cluster that never pauses costs \$$(awk -v a="$RATE_AURORA_ACU_HOUR" 'BEGIN{printf "%.2f", a*0.5*24}')/day at its
-      0.5 ACU floor, so all four idling awake is ~\$$(aurora_floor_daily)/day on top of the above.
+      0.5 ACU floor, so all $((COUNT_AURORA_CLUSTERS - COUNT_AURORA_ALWAYS_AWAKE)) idling awake is ~\$$(aurora_floor_daily)/day on top of the above.
     Aurora cluster storage, both engines' automated backups, and the per-bout
       PITR restores and copy-on-write clones that Rounds 2 and 3 create.
     RDS Proxy while a Round 5 bout runs, \$0.015/capacity-hour.
@@ -2706,7 +2742,8 @@ cat <<SUMMARY
   the two lane-scoped resident control secrets above, the two-runner control
   plane. Networking reuses the default VPC and its subnets; it creates the two
   runner security groups, the two static Proxy network groups, the per-runner
-  egress rules, and 4 DB subnet groups.
+  egress rules, ${COUNT_AURORA_CLUSTERS} DB subnet groups (one per Aurora round), and
+  the two parameter groups that turn on logical replication for Round 6.
 
   Expect the standing total in the tens of dollars per day. The app's own
   standing-cost panel is the number to trust once it is running.

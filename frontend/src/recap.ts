@@ -184,6 +184,39 @@ export interface BoutView {
   sealedAt: number
 }
 
+/**
+ * Rounds 4 and 6 race an AWS integration against Lakebase, and their verdict is the
+ * engine's evidence rule, not the two clocks: arrivals that overlap within the
+ * verifiers' reads are a tie even when one clock reads lower.
+ */
+const RACED_AWS_ROUNDS: ReadonlySet<RoundId> = new Set<RoundId>([
+  'put_model_score_in_app',
+  'analyze_live_orders_without_slowing_checkout',
+])
+
+/**
+ * Whether this round races an AWS lane wherever that lane is installed. Such a round
+ * with only Lakebase on record ran on an installation without the lane, which is a
+ * fact about the installation, not a missing AWS path.
+ */
+export function racesAwsLane(roundId: RoundId): boolean {
+  return RACED_AWS_ROUNDS.has(roundId)
+}
+
+/**
+ * Whether the server declared this raced bout a tie within the verifiers' resolution.
+ *
+ * The receipt carries no comparison kind. The server now records no margin for a
+ * declared tie (`server/receipts.py`), but a receipt sealed before that still carries
+ * the clock difference as its margin, and would read here as a win for the lower
+ * clock. The server's own one-line verdict is where the tie survives in both.
+ */
+function declaredRacedTie(receipt: BoutReceipt): boolean {
+  return RACED_AWS_ROUNDS.has(receipt.round_id)
+    && receipt.outcome === 'declared'
+    && /^TIE\b/.test(receipt.remembered_result?.trim() ?? '')
+}
+
 /** Reduce one receipt to the facts a row needs. */
 export function boutView(receipt: BoutReceipt): BoutView {
   const lakebaseExact = receipt.lakebase.state === 'verified' && !receipt.lakebase.lower_bound
@@ -208,17 +241,12 @@ export function boutView(receipt: BoutReceipt): BoutView {
       lakebaseExact !== null
       && receipt.opponent_lane.state === 'not_supported'
       && receipt.outcome === 'declared',
-    guardrailFailure:
-      (receipt.round_id === 'put_model_score_in_app'
-        || receipt.round_id === 'analyze_live_orders_without_slowing_checkout')
-      && lakebaseExact !== null
-      && receipt.outcome !== 'declared',
     cleanupFailure: Boolean(receipt.cleanup_failure),
   })
 
   let comparison: ContractComparison | null = null
   if (lakebaseExact !== null && opponentExact !== null) {
-    if (lakebaseExact === opponentExact) {
+    if (lakebaseExact === opponentExact || declaredRacedTie(receipt)) {
       comparison = { kind: 'tie', winnerLaneId: null, marginMs: null }
     } else {
       comparison = {
@@ -228,13 +256,23 @@ export function boutView(receipt: BoutReceipt): BoutView {
       }
     }
   }
+  // Rounds 4 and 6 declare a one-sided result only when the other lane ran out its
+  // whole frozen bound, and the receipt keeps that lane as failed with no time. A
+  // declared receipt with one exact lane is therefore that stoppage; an undeclared one
+  // is a lane that errored, which measured nothing.
+  const racedStoppage = RACED_AWS_ROUNDS.has(receipt.round_id)
+    && comparison === null
+    && receipt.outcome === 'declared'
+    && evidence.exactLane !== null
+    && receipt.opponent_lane.state !== 'not_supported'
+  if (racedStoppage) {
+    comparison = { kind: 'adjudicated_stoppage', winnerLaneId: evidence.exactLane, marginMs: null }
+  }
   const contract = resolveRoundContract({
     roundId: receipt.round_id,
     evidence,
     comparison,
     roundContractVerified: receipt.round_id === 'survive_connection_spike'
-      || receipt.round_id === 'put_model_score_in_app'
-      || receipt.round_id === 'analyze_live_orders_without_slowing_checkout'
       ? receipt.outcome === 'declared'
       : comparison !== null || evidence.exactLane !== null,
     terminal: receipt.outcome !== 'pending',
@@ -247,7 +285,7 @@ export function boutView(receipt: BoutReceipt): BoutView {
       : contract.resultStatus === 'adjudicated_stoppage'
         ? contract.formalWinner !== 'lakebase'
           ? 'unproven'
-          : evidence.laneShape === 'exact_and_censored_lower_bound'
+          : evidence.laneShape === 'exact_and_censored_lower_bound' || racedStoppage
             ? 'bounded'
             : 'capability'
         : 'unproven'
@@ -389,8 +427,19 @@ export interface RoundResult {
   status: RoundStatus
   /** Null for `unrun` and `running`, and for a round with no opponent lane. */
   opponent: string | null
+  /**
+   * Who that opponent was, so a row wears its own corner's chip. The ledger keeps each
+   * round's latest bout whoever it was against; the finale once labelled every row with
+   * the bout just finished, so Aurora's rounds read "RDS" after an RDS Round 6.
+   */
+  opponentId: CompetitorId | null
   lakebaseMs: number | null
   opponentMs: number | null
+  /**
+   * True when `lakebaseMs` is where its clock stood at the towel, not a finish time.
+   * Without it a towel's floor printed bare, as "NO RESULT DECLARED 0.48s".
+   */
+  lakebaseIsLowerBound: boolean
   /** True when `opponentMs` is where their clock stood, not a finish time. */
   opponentIsLowerBound: boolean
   /** Present only when both lanes verified. */
@@ -480,8 +529,10 @@ export function summariseRounds(
         ...base,
         status: 'running' as const,
         opponent: null,
+        opponentId: null,
         lakebaseMs: null,
         opponentMs: null,
+        lakebaseIsLowerBound: false,
         opponentIsLowerBound: false,
         marginMs: null,
         source: 'live' as const,
@@ -496,8 +547,10 @@ export function summariseRounds(
         // of a round somebody stopped would erase the decision to stop it.
         status: group.abandonedOnRecord > 0 ? 'abandoned' as const : 'unrun' as const,
         opponent: null,
+        opponentId: null,
         lakebaseMs: null,
         opponentMs: null,
+        lakebaseIsLowerBound: false,
         opponentIsLowerBound: false,
         marginMs: null,
         source: null,
@@ -512,8 +565,10 @@ export function summariseRounds(
       // A round with no opponent lane has no opponent to name. Printing one would
       // imply somebody lost.
       opponent: status === 'uncontested' ? null : bout.opponent,
+      opponentId: status === 'uncontested' ? null : bout.receipt.opponent_id,
       lakebaseMs: bout.receipt.lakebase.ms,
       opponentMs: status === 'uncontested' ? null : bout.receipt.opponent_lane.ms,
+      lakebaseIsLowerBound: bout.lakebaseIsLowerBound,
       opponentIsLowerBound: bout.opponentIsLowerBound,
       marginMs: bout.marginMs,
       source: 'receipt' as const,
@@ -524,16 +579,17 @@ export function summariseRounds(
 }
 
 /**
- * Seconds under a minute, m:ss above it.
+ * Seconds under a minute, minutes and seconds above it, each with its unit.
  *
  * An opponent lane that ran for eight minutes is unreadable as `480707.66ms` and
- * only slightly better as `480.71s`.
+ * only slightly better as `480.71s`. It was once `8:00`, which beside a `14.00s`
+ * lane read as eight seconds: a two-minute AWS lane looked like two.
  */
 export function summaryDuration(milliseconds: number): string {
   const safe = Math.max(0, milliseconds)
   if (safe < 60_000) return `${(safe / 1000).toFixed(2)}s`
   const totalSeconds = Math.floor(safe / 1000)
-  return `${Math.floor(totalSeconds / 60)}:${String(totalSeconds % 60).padStart(2, '0')}`
+  return `${Math.floor(totalSeconds / 60)}m ${String(totalSeconds % 60).padStart(2, '0')}s`
 }
 
 /**
@@ -682,7 +738,11 @@ export function ledgerVerdict(result: RoundResult): LedgerVerdict {
         outcome: null,
         figure,
         qualifier: 'UNCONTESTED',
-        laneNote: `BLUE CORNER · ${NO_EQUIVALENT_NATIVE_PATH}`,
+        // Rounds 4 and 6 race AWS wherever the lane is installed, so theirs was not
+        // installed; the others have no equivalent native path at all.
+        laneNote: racesAwsLane(result.roundId)
+          ? 'BLUE CORNER · AWS LANE NOT INSTALLED'
+          : `BLUE CORNER · ${NO_EQUIVALENT_NATIVE_PATH}`,
       }
 
     case 'running':

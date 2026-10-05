@@ -20,8 +20,9 @@ That framing constrains contributions more than it might look:
 - **No simulation in production code.** Deterministic fakes exist only inside
   automated tests. A UI preview state never displays an invented measurement.
 - **A claim needs a receipt.** Every round names what it measured, and equally
-  names what it did *not* measure. Rounds 4 and 6 deliberately claim no speed
-  margin against AWS, because the competing stack was never built or timed.
+  names what it did *not* measure. A Round 4 or Round 6 bout on an installation
+  without that round's AWS lane claims no speed margin against AWS, because
+  nothing on the AWS side was timed.
 - **Fairness is mechanical, not rhetorical.** One monotonic start barrier,
   recorded launch skew, identical TLS posture, fresh connections, same region.
 
@@ -43,29 +44,35 @@ account and a real Databricks workspace.** This is not a sandbox simulation and
 there is no dry-run mode for the rounds themselves.
 
 What a checkout costs you for merely existing is the AWS half — about
-**$8.36/day**, from `--apply` until `cleanup`. Deploy the App as well and it is
-about **$19.29/day**, because a running App bills for provisioned capacity until
-someone stops it. The Round 4 pipeline is **not** a daily line: it is up for the
-minutes a bout needs and released afterwards.
+**$29.50/day**, from `--apply` until `cleanup`. Deploy the App as well and it is
+about **$40.43/day**, because a running App bills for provisioned capacity until
+someone stops it, plus about $1.06/day for the Lakebase coordination database the
+running app keeps awake. The Round 4 pipeline is **not** a daily line: it is up
+for the minutes a bout needs and released afterwards. Nor is the SQL warehouse:
+about $8.40 for each hour it runs, and the app sends it nothing while nobody is
+using the app.
 
-Left up for a full day, that pipeline is the largest line here. A full
-installation in that state costs **about $22.93/day with the Round 4 pipeline running,
-and about $8.36/day with that pipeline stopped**. Add the Databricks App's own compute, about
-$10.93/day, and the all-in figure is about $33.86/day, or about $19.29/day with
+Left up for a full day, that pipeline would be the largest line after AWS. A full
+installation in that state costs **about $44.07/day with the Round 4 pipeline running,
+and about $29.50/day with that pipeline stopped**. Add the Databricks App's own compute, about
+$10.93/day, and the all-in figure is about $55.00/day, or about $40.43/day with
 the pipeline stopped; that lane is excluded from the first figure because it
 bills whether or not this project exists, so which pair is yours depends on
-whether the workspace was already running an App. `$22.93` and `$19.29` are two
+whether the workspace was already running an App. `$44.07` and `$40.43` are two
 different quantities `$3.64` apart: the subtotal with the pipeline
-**running** against the all-in with it **stopped**. Every standing figure here traces to
+**running** against the all-in with it **stopped**. The AWS figure is the cost
+model's arithmetic for v1.1's fleet, with every rate read back from the AWS Price
+List API and every count from a running installation on 2026-10-02. The App
+compute figure traces to
 one sealed receipt — the standing-cost disclosure in receipt `EECDD4D6`, as of
-`2026-08-25T02:10Z` — and was priced throughout in `us-west-2`. The pipeline rate
-is the one exception and no longer reconciles to that receipt: the receipt
+`2026-08-25T02:10Z` — and everything was priced in `us-west-2`. The pipeline rate
+does not reconcile to that receipt: the receipt
 divided that line's posted DBU by the span between its first and last posted
 interval, idle hours included, which blends a 62.5% duty cycle into what it calls
 a rate. Dividing the same meter by uptime gives $0.61/hour, and that is what is
 published here.
 
-The split matters more than either figure. Roughly $8.36 is AWS and roughly
+The split matters more than either figure. Roughly $29.50 is AWS and roughly
 $14.57 is the Round 4 reverse-ETL pipeline. The Databricks lines are posted usage
 times a posted price and the disclosure checks itself against its own projection,
 coming in 1.7% above it over the shared window. The AWS line is rate-card
@@ -73,22 +80,26 @@ arithmetic that **no invoice has ever confirmed** — `ce:GetCostAndUsage` is
 denied to this installation, so there is no posted counterpart at all. **That is
 where the error bar runs upward**, and it is worth being explicit that this
 changed: earlier revisions of this file said the Databricks side was the
-unevidenced half, and the disclosure now prices all of it. The `m6i.large` Round 5
-runner alone is $2.48/day. Half these figures are a live meter that moves between
+unevidenced half, and the disclosure now prices all of it. Round 5's two
+`c7i.2xlarge` runners alone are about $17.48/day with their disks and addresses.
+Half these figures are a live meter that moves between
 seals, so read them as one dated observation on one installation.
 [README.md](README.md) carries the itemised figures; read them before you
 provision anything.
 
-Round 4 starts the pipeline at arm and schedules its stop 20 minutes after the
-bout settles, leaving a redo window. A graceful server shutdown stops it sooner
-when that process started it. A stop that fires costs cents: one bout costs about
-`$0.32` end to end, and a longer 32.85-minute warm window came to `$0.50`. Read a
-window before its posted usage has settled and it reads low, sometimes by a
-factor of several, so let a window complete before quoting it. The
-pipeline bills for as long as it is up, though, and it does not stop itself if
-the server process dies. If the serving process died, or the pipeline remains
-running after the cost-control observation budget below, capture its events and
-stop it:
+Neither of Round 4's integrations stays resident. Both are parked at rest: the
+bell starts the synced-table pipeline and the AWS Glue job, and the bout's own
+settle parks both again once it has restored the row, 3–5 minutes after the bell
+on the test installation. There is no re-do window. At the pipeline's
+`$0.61/hour` a bout's pipeline time is cents, an estimate from the bout's length
+that has not been reconciled to posted usage yet. Read a window before its posted
+usage has settled and it reads low, sometimes by a factor of several, so let a
+window complete before quoting it. The pipeline bills for as long as it is up,
+though, and it does not stop itself if the server process dies: the stop each
+bell owes is repaid by the next serving process 30 minutes after that bell, and
+the Glue job stops itself at its 30-minute run timeout. If the serving process
+died, or the pipeline remains running after the cost-control observation budget
+below, capture its events and stop it:
 
 ```bash
 ./antidemo pipeline status
@@ -106,22 +117,21 @@ repository before that manual cleanup when it is available. Missing or
 incomplete events mean the automatic release is **unobserved**; they must not
 delay stopping a billable pipeline after the process is dead or the test-owned
 observation budget expires. Never use the cleanup command during an active bout
-or its redo window. Confirmed death of the process that owned the bout overrides
-both restrictions: no process remains that can finish the bout or serve its
-redo, so stop immediately.
+or its settle. Confirmed death of the process that owned the bout overrides that
+restriction: no process remains that can finish the bout or its settle, so stop
+immediately.
 
 For automated post-bout checks, a terminal session or a `ready` Round 4 ring is
 not evidence that the pipeline should already be `IDLE`. The terminal path
-releases the ring before background settlement schedules the stop, then
-deliberately keeps the pipeline running for the 20-minute redo window. Likewise,
-`/readyz`'s `round4_stop_recovery_state` describes startup reconciliation of
-debt inherited from an older process and defaults to `settled` when no recovery
-is active; it never reports the current bout's delayed stop. Internally, the
-exact end of the redo window is the current bout's durable
-`stop_owed.owed_at`, written after settlement, but the deployed current-bout
-health surface does not expose that timestamp. A timeout measured from terminal
-publication is therefore only a cost-control observation budget, not proof that
-a stop request failed.
+publishes the result first, and the settle that restores the row and parks both
+integrations runs in the background after it, waiting out Glue's release of its
+run slot as it goes. Likewise, `/readyz`'s `round4_stop_recovery_state` describes
+startup reconciliation of debt inherited from an older process and defaults to
+`settled` when no recovery is active; it never reports the current bout's settle.
+The stop a bout owes is recorded durably at its bell, due 30 minutes later, but
+the deployed current-bout health surface does not expose that timestamp. A timeout
+measured from terminal publication is therefore only a cost-control observation
+budget, not proof that a stop request failed.
 
 Poll the Databricks control plane until it shows the full deliberate-stop shape:
 pipeline `IDLE`, newest update `CANCELED`, no continuous update, and synced table
@@ -134,9 +144,9 @@ recovery use the same principal. Use timing and app lifecycle logs to distinguis
 those mechanisms. An operator's manual stop produces the same state pair and
 never counts.
 
-In an automated test that owns the bout and will issue no redo, use a
-conservative observation budget that allows for settlement plus the 20-minute
-window. At expiry, branch on the live state:
+In an automated test that owns the bout, use a conservative observation budget
+that allows for the settle: from the result to both lanes parked took 77–103 s on
+the test installation, so allow five minutes. At expiry, branch on the live state:
 
 - the full deliberate-stop shape above: stopped; use pre-cleanup events, not the
   state shape, for actor attribution.

@@ -54,12 +54,16 @@ resource "aws_db_instance" "rds_by_round" {
   identifier = "${local.v7_round_resource_names[each.key]}-rds"
 
   # See rds_control_plane_only above: 4 GiB matches both competitors' ceilings.
-  engine               = "postgres"
-  engine_version       = "17.10"
-  instance_class       = "db.t4g.medium"
-  db_name              = local.database_name
-  port                 = 5432
-  parameter_group_name = "default.postgres17"
+  engine         = "postgres"
+  engine_version = "17.10"
+  instance_class = "db.t4g.medium"
+  db_name        = local.database_name
+  port           = 5432
+  # Round 6 (r6) gets a DB parameter group that turns on logical replication
+  # for AWS DMS; every other round keeps default.postgres17, so their instances
+  # see no parameter-group change. The group is attached at creation, so the
+  # parameter is in force from first boot (parameter_groups.tf).
+  parameter_group_name = lookup(local.v7_rds_parameter_group_names, each.key, "default.postgres17")
 
   username                    = local.master_username
   manage_master_user_password = true

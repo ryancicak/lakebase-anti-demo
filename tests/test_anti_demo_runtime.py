@@ -321,8 +321,9 @@ def test_state_addresses_expand_only_for_a_sealed_installation():
     sealed = lifecycle._expected_aws_state_addresses(sealed_manifest())
     assert lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES & unsealed == set()
     assert lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES <= sealed
-    # Seven free resources: the role, three policies, three attachments.
-    assert len(sealed - unsealed) == 7
+    # Eleven free resources: the role, five policies, five attachments. The fifth
+    # pair is Round 6's AWS lane, attached from the first apply as Round 4's is.
+    assert len(sealed - unsealed) == 11
 
 
 def test_renew_may_rewrite_the_trust_policy_but_not_the_role():

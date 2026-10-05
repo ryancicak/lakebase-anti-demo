@@ -1012,6 +1012,343 @@ def test_the_ingress_plan_check_admits_only_an_ingress_update() -> None:
     ]
 
 
+def _plan_change(address: str, kind: str, actions: list[str], before=None, after=None) -> dict:
+    return {
+        "address": address,
+        "type": kind,
+        "change": {"actions": actions, "before": before or {}, "after": after or {}},
+    }
+
+
+def test_only_a_true_leaf_makes_a_plan_value_unknown() -> None:
+    assert lifecycle._plan_value_unknown(True)
+    assert not lifecycle._plan_value_unknown(False)
+    # Terraform's way of saying a nested block is known: booleans, every one false.
+    assert not lifecycle._plan_value_unknown(
+        [{"cidr_blocks": [False], "ipv6_cidr_blocks": [], "security_groups": []}]
+    )
+    assert lifecycle._plan_value_unknown([{"cidr_blocks": [], "security_groups": True}])
+    assert lifecycle._plan_value_unknown({"tags": {"expires-at": True}})
+
+
+def test_the_glue_lane_s_first_apply_is_admitted_with_every_r4_group_rerendered() -> None:
+    """The v1.1 virgin install (2026-09-29): the lane's first apply adds an ingress rule naming
+    the Glue group it creates, and Terraform marked each r4 group's unchanged egress with a
+    structure of false flags. The guard read that as a change and refused the whole lane."""
+
+    manifest = make_manifest(status="seeding")
+    group = _security_group_address(manifest)
+    egress = [{"cidr_blocks": ["0.0.0.0/0"], "from_port": 0, "protocol": "-1", "to_port": 0}]
+    rerendered = {
+        "address": group,
+        "type": "aws_security_group",
+        "change": {
+            "actions": ["update"],
+            "before": {"ingress": [{"cidr_blocks": ["203.0.113.10/32"]}], "egress": egress},
+            "after": {
+                "ingress": [{"cidr_blocks": ["203.0.113.10/32"]}, {"cidr_blocks": []}],
+                "egress": egress,
+            },
+            "after_unknown": {
+                "ingress": [
+                    {"cidr_blocks": [False], "security_groups": []},
+                    {"cidr_blocks": [], "security_groups": True},
+                ],
+                "egress": [{"cidr_blocks": [False], "ipv6_cidr_blocks": [], "security_groups": []}],
+            },
+        },
+    }
+
+    plan = {"resource_changes": [rerendered]}
+    assert lifecycle._round4_glue_plan_violations(manifest, plan) == []
+
+    changed = {
+        **rerendered,
+        "change": {
+            **rerendered["change"],
+            "after": {**rerendered["change"]["after"], "egress": []},
+        },
+    }
+    assert lifecycle._round4_glue_plan_violations(manifest, {"resource_changes": [changed]}) == [
+        f"{group}: changes egress"
+    ]
+
+
+def test_the_glue_lane_apply_admits_the_lane_its_ingress_and_tags_and_nothing_else() -> None:
+    """2026-09-29: a Glue-only run on the test installation applied a new AMI with the lane,
+    and replaced both of Round 5's runners behind Round 5's seal."""
+
+    manifest = make_manifest(status="seeding")
+    group = _security_group_address(manifest)
+    other = next(
+        address
+        for address in sorted(lifecycle._expected_aws_state_addresses(manifest))
+        if not address.startswith("aws_security_group.")
+    )
+
+    admitted = [
+        _plan_change(
+            'aws_glue_job.round4_writer["rds"]',
+            "aws_glue_job",
+            ["update"],
+            {"default_arguments": {}},
+            {"default_arguments": {"--starting_version": "snapshot"}},
+        ),
+        _plan_change("aws_subnet.round4_glue[0]", "aws_subnet", ["delete", "create"]),
+        _ingress_update(group),
+        _plan_change(
+            other, "aws_instance", ["update"], {"tags": {"a": "1"}}, {"tags": {"a": "2"}}
+        ),
+    ]
+    assert lifecycle._round4_glue_plan_violations(manifest, {"resource_changes": admitted}) == []
+
+    refused = lifecycle._round4_glue_plan_violations(
+        manifest,
+        {
+            "resource_changes": [
+                _plan_change(other, "aws_instance", ["delete", "create"]),
+                _plan_change(other, "aws_instance", ["update"], {"ami": "a"}, {"ami": "b"}),
+                _ingress_update(group, extra={"name": "renamed"}),
+                {**_ingress_update(group), "address": "aws_security_group.stranger"},
+            ]
+        },
+    )
+    assert refused == [
+        f"{other}: plans delete+create",
+        f"{other}: changes ami",
+        f"{group}: changes name",
+        "aws_security_group.stranger: not a manifest-owned address",
+    ]
+
+
+class _RunnerEc2:
+    """EC2 as `_round5_runners_replaced_by_terraform` reads it: instances by ID, or unknown."""
+
+    def __init__(self, instances: dict[str, dict], unknown: tuple[str, ...] = ()) -> None:
+        self.instances = instances
+        self.unknown = set(unknown)
+
+    def describe_instances(self, InstanceIds):  # noqa: N803 - boto3's keyword
+        if self.unknown & set(InstanceIds):
+            raise ClientError(
+                {"Error": {"Code": "InvalidInstanceID.NotFound", "Message": "unknown"}},
+                "DescribeInstances",
+            )
+        found = [
+            {"InstanceId": instance_id, **self.instances[instance_id]}
+            for instance_id in InstanceIds
+            if instance_id in self.instances
+        ]
+        return {"Reservations": [{"Instances": found}]}
+
+
+_OURS = [
+    {"Key": "anti-demo-run-id", "Value": "ad-test-001"},
+    {"Key": "managed-by", "Value": "terraform"},
+]
+
+
+def _drifted_runners(monkeypatch, ec2: _RunnerEc2, *, outputs=None):
+    sealed = ready_round5_stub()
+    manifest = SimpleNamespace(
+        round5_ready=True, run_id="ad-test-001", require_round5_resources=lambda: sealed
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_terraform_outputs",
+        lambda _manifest: outputs
+        if outputs is not None
+        else {
+            "round5_runner_instance_id": "i-1123456789abcdef0",
+            "round5_competitor_runner_instance_id": "i-1fedcba9876543210",
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle, "_aws_session", lambda _manifest: SimpleNamespace(client=lambda _name: ec2)
+    )
+    return lifecycle._round5_runners_replaced_by_terraform(manifest)
+
+
+def _running(tags=_OURS) -> dict:
+    return {"State": {"Name": "running"}, "Tags": tags}
+
+
+def test_runners_terraform_replaced_are_what_cleanup_verifies_in_their_place(monkeypatch) -> None:
+    """2026-09-29: the v1.1 test installation's apply replaced both runners on a new AMI, and
+    cleanup refused it for ever ("Round 5 ownership topology differs from the manifest")."""
+
+    ec2 = _RunnerEc2(
+        {
+            "i-0123456789abcdef0": {"State": {"Name": "terminated"}},
+            "i-1123456789abcdef0": _running(),
+            "i-1fedcba9876543210": _running(),
+        },
+        unknown=("i-0fedcba9876543210",),
+    )
+
+    replaced = _drifted_runners(monkeypatch, ec2)
+
+    assert replaced is not None
+    assert replaced.runner_instance_id == "i-1123456789abcdef0"
+    assert replaced.competitor_runner_instance_id == "i-1fedcba9876543210"
+    # Nothing else in the seal moves: the caller verifies the rest of it unchanged.
+    assert replaced.runner_security_group_id == ready_round5_stub().runner_security_group_id
+
+
+@pytest.mark.parametrize(
+    ("instances", "unknown", "outputs"),
+    [
+        # A sealed runner still running is not a replacement: the seal is simply wrong.
+        (
+            {
+                "i-0123456789abcdef0": _running(),
+                "i-1123456789abcdef0": _running(),
+                "i-1fedcba9876543210": _running(),
+            },
+            ("i-0fedcba9876543210",),
+            None,
+        ),
+        # One still shutting down is not gone yet.
+        (
+            {
+                "i-0123456789abcdef0": {"State": {"Name": "shutting-down"}},
+                "i-1123456789abcdef0": _running(),
+                "i-1fedcba9876543210": _running(),
+            },
+            ("i-0fedcba9876543210",),
+            None,
+        ),
+        # A replacement that does not carry this run's tags is somebody else's.
+        (
+            {
+                "i-1123456789abcdef0": _running(),
+                "i-1fedcba9876543210": _running(
+                    [{"Key": "anti-demo-run-id", "Value": "ad-other"},
+                     {"Key": "managed-by", "Value": "terraform"}]
+                ),
+            },
+            ("i-0123456789abcdef0", "i-0fedcba9876543210"),
+            None,
+        ),
+        # A replacement that is not running cannot be proven idle and in place.
+        (
+            {
+                "i-1123456789abcdef0": _running(),
+                "i-1fedcba9876543210": {"State": {"Name": "stopped"}, "Tags": _OURS},
+            },
+            ("i-0123456789abcdef0", "i-0fedcba9876543210"),
+            None,
+        ),
+        # No runner in Terraform's state: nothing to verify in the seal's place.
+        ({}, ("i-0123456789abcdef0", "i-0fedcba9876543210"), {}),
+    ],
+)
+def test_anything_but_runners_terraform_replaced_keeps_cleanup_refusing(
+    monkeypatch, instances, unknown, outputs
+) -> None:
+    assert _drifted_runners(monkeypatch, _RunnerEc2(instances, unknown), outputs=outputs) is None
+
+
+class _RunnerSsm:
+    def __init__(self, online: set[str]) -> None:
+        self.online = online
+
+    def describe_instance_information(self, Filters):  # noqa: N803 - boto3's keyword
+        (instance_id,) = Filters[0]["Values"]
+        if instance_id not in self.online:
+            return {"InstanceInformationList": []}
+        return {"InstanceInformationList": [{"InstanceId": instance_id, "PingStatus": "Online"}]}
+
+
+def _runner_session(online: set[str]) -> SimpleNamespace:
+    ssm = _RunnerSsm(online)
+    return SimpleNamespace(client=lambda _name: ssm)
+
+
+def test_runners_never_configured_are_checked_for_whose_they_are_not_what_they_hold(
+    monkeypatch,
+) -> None:
+    """Replacement runners were never configured, so the seal's harness and credentials cannot
+    be on them; cleanup still requires each to be online, and asks nothing else of them."""
+
+    def never(*_arguments, **_keywords):
+        raise AssertionError("a replacement runner was asked for what it holds")
+
+    monkeypatch.setattr(lifecycle, "_round5_runner_checksums", never)
+    monkeypatch.setattr(lifecycle, "_round5_runner_credential_digests", never)
+    runners = ("i-1123456789abcdef0", "i-1fedcba9876543210")
+
+    lifecycle._verify_round5_runners(
+        _runner_session(set(runners)), ready_round5_stub(), runners, contents=False
+    )
+    with pytest.raises(RuntimeError, match="not online in SSM"):
+        lifecycle._verify_round5_runners(
+            _runner_session({runners[0]}), ready_round5_stub(), runners, contents=False
+        )
+
+
+def test_a_sealed_runner_is_still_held_to_what_the_seal_says_it_holds(monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle, "_round5_runner_checksums", lambda *_a, **_k: ("other-harness", "other-trust")
+    )
+    runners = ("i-0123456789abcdef0", "i-0fedcba9876543210")
+
+    with pytest.raises(RuntimeError, match="checksum differs from the seal"):
+        lifecycle._verify_round5_runners(
+            _runner_session(set(runners)),
+            ready_round5_stub(harness_sha256="a" * 64, trust_bundle_sha256="b" * 64),
+            runners,
+            contents=True,
+        )
+
+
+def test_the_glue_lane_apply_refuses_other_drift_before_applying_anything(monkeypatch) -> None:
+    environment = SimpleNamespace(aurora=object(), rds=object())
+    manifest = SimpleNamespace(
+        installation_id="installation-1",
+        round_environments={"r4": environment},
+        round_environment=lambda _number: environment,
+        round4=SimpleNamespace(source_table_full_name="main.anti_demo.scores", warehouse_id="w"),
+        databricks=SimpleNamespace(profile="profile"),
+        round4_aws_source_location="s3://root/tables/scores",
+        round4_aws=None,
+    )
+    calls: list[str] = []
+    runner = "aws_instance.round5_runner"
+    monkeypatch.setattr(lifecycle, "_follow_operator_address", lambda _manifest: None)
+    monkeypatch.setattr(
+        "server.round4_aws_lifecycle.source_location",
+        lambda *_arguments: "s3://root/tables/scores",
+    )
+    monkeypatch.setattr(lifecycle, "_expected_aws_state_addresses", lambda _manifest: {runner})
+    monkeypatch.setattr(lifecycle, "_terraform_init", lambda _manifest: calls.append("init"))
+    # The lane's /24 is chosen before its plan (tests/test_lane_subnets.py); not this test's.
+    monkeypatch.setattr(
+        lifecycle, "_choose_lane_subnet", lambda _manifest, **_: calls.append("subnet")
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_terraform_plan",
+        lambda _manifest, **_: calls.append("plan") or Path("aws-create.tfplan"),
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "_terraform_plan_json",
+        lambda _manifest, _path: {
+            "resource_changes": [_plan_change(runner, "aws_instance", ["delete", "create"])]
+        },
+    )
+    monkeypatch.setattr(
+        lifecycle, "_terraform_apply", lambda _manifest, _path: calls.append("apply")
+    )
+
+    with pytest.raises(RuntimeError, match="would change more than the lane.*round5_runner"):
+        lifecycle._prepare_and_reseal_round4_aws(manifest, timeout=60.0)
+
+    # The lane's /24 is chosen before the plan, and nothing is applied.
+    assert calls == ["init", "subnet", "plan"]
+
+
 def test_operator_cidr_refresh_fails_closed_when_ownership_is_not_verified(
     monkeypatch,
 ) -> None:
@@ -1641,6 +1978,72 @@ def test_round5_aurora_seal_resolves_exact_owned_writer_resource() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("cluster_status", "writer_status", "sealed"),
+    [
+        ("backing-up", "available", True),
+        ("available", "backing-up", True),
+        ("modifying", "available", False),
+        ("available", "stopped", False),
+    ],
+)
+def test_round5_aurora_seal_holds_through_its_daily_backup(
+    cluster_status, writer_status, sealed
+) -> None:
+    """A setup or re-run can land in the minute of a daily automated backup, which reads
+    `backing-up` and changes nothing the seal records. Any other state still refuses."""
+
+    manifest = make_manifest()
+
+    class FakeRds:
+        def describe_db_clusters(self, **kwargs):
+            return {
+                "DBClusters": [
+                    {
+                        "DBClusterIdentifier": "anti-demo-aurora",
+                        "DbClusterResourceId": "cluster-RESOURCE",
+                        "Status": cluster_status,
+                        "Endpoint": "aurora.example.com",
+                        "MasterUserSecret": {"SecretArn": manifest.aws.resources.aurora_secret_arn},
+                        "DBClusterMembers": [
+                            {
+                                "DBInstanceIdentifier": "anti-demo-aurora-writer",
+                                "IsClusterWriter": True,
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        def describe_db_instances(self, **kwargs):
+            return {
+                "DBInstances": [
+                    {
+                        "DBInstanceIdentifier": "anti-demo-aurora-writer",
+                        "DBClusterIdentifier": "anti-demo-aurora",
+                        "DBInstanceStatus": writer_status,
+                    }
+                ]
+            }
+
+    def resolve() -> str:
+        return _round5_aurora_cluster_resource_id(
+            manifest,
+            FakeRds(),
+            direct_host="aurora.example.com",
+            cluster_id="anti-demo-aurora",
+            writer_instance_id="anti-demo-aurora-writer",
+            master_secret_arn=manifest.aws.resources.aurora_secret_arn,
+            expected_resource_id="cluster-RESOURCE",
+        )
+
+    if sealed:
+        assert resolve() == "cluster-RESOURCE"
+    else:
+        with pytest.raises(RuntimeError, match="identity differs from the seal"):
+            resolve()
+
+
 def test_terraform_uses_only_manifest_selected_environment_credentials(monkeypatch) -> None:
     manifest = make_manifest()
     manifest.aws.auth_mode = "environment"
@@ -1748,15 +2151,17 @@ def test_cleanup_detaches_the_runtime_role_from_the_destroy_graph(monkeypatch) -
         lambda command, **kwargs: commands.append(list(command)) or SimpleNamespace(stdout=""),
     )
 
-    assert lifecycle._detach_runtime_role_from_destroy_state(
-        manifest,
-        set(lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES),
-    )
+    managed = {*lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES, 'aws_glue_job.round4_writer["rds"]'}
+
+    assert lifecycle._detach_runtime_role_from_destroy_state(manifest, managed)
 
     assert commands
     assert commands[0][-len(lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES) :] == sorted(
         lifecycle._ANTI_DEMO_RUNTIME_STATE_ADDRESSES
     )
+    # The caller's list is what the state now is: the Glue writers' park compares the two, and
+    # refused the test installation's first uninstall while the list still named the role.
+    assert managed == {'aws_glue_job.round4_writer["rds"]'}
 
 
 def test_cleanup_deletes_the_tag_verified_runtime_role_last(monkeypatch) -> None:
@@ -2865,6 +3270,139 @@ def test_one_command_setup_resets_and_checks_both_opponents(monkeypatch, tmp_pat
         "doctor:aurora:321",
         "doctor:rds:321",
     ]
+
+
+def test_setup_finishes_an_unsealed_round4_aws_lane_without_a_reset(monkeypatch, tmp_path) -> None:
+    """The v1.1 virgin install (2026-09-29) stopped in the Glue lane stage, after the
+    manifest already said `ready`. A re-run took the finished-install path, a reconcile
+    and then a RESET of both lanes, which bootstrap.sh refuses without --reset-ready.
+    It is an interrupted provision: converge, finish the lane, and reset nothing."""
+
+    manifest = SimpleNamespace(
+        status="ready", round6_ready=True, round5_ready=True, round4_aws_pending=True
+    )
+    owned_manifest = tmp_path / "manifest.json"
+    owned_manifest.touch()
+    calls: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle.reconcile_infrastructure",
+        lambda candidate: calls.append("reconcile") or candidate,
+    )
+    for name in ("reset", "resume_provision"):
+        monkeypatch.setattr(
+            f"server.lifecycle.{name}",
+            lambda timeout, name=name: pytest.fail(f"an unsealed Glue lane must not {name}"),
+        )
+    for stage in (
+        "_prepare_and_reseal_round4",
+        "_prepare_and_reseal_round5",
+        "_prepare_and_reseal_round6",
+    ):
+        monkeypatch.setattr(
+            f"server.lifecycle.{stage}",
+            lambda candidate, *, timeout, stage=stage: pytest.fail(f"{stage} is sealed"),
+        )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round4_aws",
+        lambda candidate, *, timeout: calls.append(f"round4_aws:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._prepare_and_reseal_round6_aws",
+        lambda candidate, *, timeout: calls.append(f"round6_aws:{timeout}") or candidate,
+    )
+    monkeypatch.setattr(
+        "server.lifecycle.doctor",
+        lambda competitor, *, timeout_seconds: (
+            calls.append(f"doctor:{competitor}") or [Check("ready", True, "ready")]
+        ),
+    )
+    monkeypatch.setattr(
+        "server.lifecycle._keep_lease_current", lambda candidate: calls.append("lease")
+    )
+
+    prepared = setup(
+        databricks_profile="",
+        aws_profile="",
+        aws_region="",
+        expected_account="",
+        owner="",
+        operator_cidr=None,
+        ttl_hours=None,
+        timeout_seconds=321,
+    )
+
+    assert prepared is manifest
+    # Round 6's lane stage runs on every path too, after Round 4's; sealed, it is a no-op.
+    assert calls == [
+        "reconcile",
+        "round4_aws:321",
+        "round6_aws:321",
+        "lease",
+        "doctor:aurora",
+        "doctor:rds",
+    ]
+
+
+def test_setup_finishes_an_unsealed_round6_aws_lane_without_a_reset(monkeypatch, tmp_path) -> None:
+    """Round 6's lane is sealed last too, so its interrupted stage is also no finished install."""
+
+    manifest = SimpleNamespace(
+        status="ready",
+        round6_ready=True,
+        round5_ready=True,
+        round4_aws_pending=False,
+        round6_aws_pending=True,
+    )
+    owned_manifest = tmp_path / "manifest.json"
+    owned_manifest.touch()
+    calls: list[str] = []
+
+    monkeypatch.setattr("server.lifecycle.manifest_path", lambda: owned_manifest)
+    monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "server.lifecycle.reconcile_infrastructure",
+        lambda candidate: calls.append("reconcile") or candidate,
+    )
+    for name in ("reset", "resume_provision"):
+        monkeypatch.setattr(
+            f"server.lifecycle.{name}",
+            lambda timeout, name=name: pytest.fail(f"an unsealed DMS lane must not {name}"),
+        )
+    for stage in (
+        "_prepare_and_reseal_round4",
+        "_prepare_and_reseal_round5",
+        "_prepare_and_reseal_round6",
+    ):
+        monkeypatch.setattr(
+            f"server.lifecycle.{stage}",
+            lambda candidate, *, timeout, stage=stage: pytest.fail(f"{stage} is sealed"),
+        )
+    for lane in ("round4_aws", "round6_aws"):
+        monkeypatch.setattr(
+            f"server.lifecycle._prepare_and_reseal_{lane}",
+            lambda candidate, *, timeout, lane=lane: calls.append(lane) or candidate,
+        )
+    monkeypatch.setattr(
+        "server.lifecycle.doctor",
+        lambda competitor, *, timeout_seconds: [Check("ready", True, "ready")],
+    )
+    monkeypatch.setattr("server.lifecycle._keep_lease_current", lambda candidate: None)
+
+    setup(
+        databricks_profile="",
+        aws_profile="",
+        aws_region="",
+        expected_account="",
+        owner="",
+        operator_cidr=None,
+        ttl_hours=None,
+        timeout_seconds=321,
+    )
+
+    assert calls == ["reconcile", "round4_aws", "round6_aws"]
 
 
 def test_setup_resumes_an_incomplete_ready_seal_without_reset(monkeypatch, tmp_path) -> None:
@@ -4324,6 +4862,8 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
         ("_validate_round4_uc_contract", None),
         ("_repair_round4_baseline", 1),
         ("_wait_round4_baseline", ({"name": names["resource_name"]}, {})),
+        # v1.1 parks the pipeline again once the baseline is carried.
+        ("_park_round4_pipeline", None),
         ("_grant_lakebase_app_projects", ()),
         ("_ensure_round4_app_roles", None),
         ("_grant_round4_uc_and_warehouse", None),
@@ -4399,23 +4939,28 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
     }
     assert not any(COORDINATION_SCHEMA in statement for statement in issued["round4.test"])
 
-    # The one hop above `_prepare_and_reseal_round4` that cannot be executed here,
+    # The hops above `_prepare_and_reseal_round4` that cannot be executed here,
     # because `setup`'s from-scratch path runs Terraform. Asserted structurally so
-    # that dropping the call -- the same mutation the behavioural half catches one
+    # that dropping a call -- the same mutation the behavioural half catches one
     # level down -- is still a red test. See the docstring for what this cannot see.
+    # `setup` runs `_setup_once` again each time a database drops it.
     lifecycle_source = Path(lifecycle.__file__).resolve().read_text(encoding="utf-8")
-    setup_definition = next(
-        node
+    definitions = {
+        node.name: node
         for node in ast.walk(ast.parse(lifecycle_source))
-        if isinstance(node, ast.FunctionDef) and node.name == "setup"
-    )
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_prepare_and_reseal_round4"
-        for node in ast.walk(setup_definition)
-    ), (
-        "`setup` no longer calls `_prepare_and_reseal_round4`, so nothing on the "
+        if isinstance(node, ast.FunctionDef) and node.name in {"setup", "_setup_once"}
+    }
+
+    def calls(caller: str, callee: str) -> bool:
+        return any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == callee
+            for node in ast.walk(definitions[caller])
+        )
+
+    assert calls("setup", "_setup_once") and calls("_setup_once", "_prepare_and_reseal_round4"), (
+        "`setup` no longer reaches `_prepare_and_reseal_round4`, so nothing on the "
         "from-scratch install path reaches the coordination grants at all and every "
         "assertion above is testing a function no installer runs."
     )
@@ -4619,6 +5164,10 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(
     manifest.manifest_version = 1
     owned_manifest = tmp_path / "manifest.json"
     owned_manifest.write_text("{}")
+    # A previous install's deploy record, as rc20's reinstall (2026-10-05) found it: the cleanup
+    # removes it with the manifest, so the next install's cleanup reads that install's own.
+    stale_deploy_record = tmp_path / "app-deploy.json"
+    stale_deploy_record.write_text(json.dumps({"app_client_id": "a-deleted-app"}))
     calls: list[str] = []
 
     monkeypatch.setattr("server.lifecycle.load_manifest", lambda: manifest)
@@ -4674,11 +5223,16 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(
     )
     monkeypatch.setattr(
         "server.lifecycle._databricks_api_optional",
-        lambda profile, path: {
-            "full_name": unquote(path.rsplit("/", 1)[-1]),
-            "owner": manifest.databricks.user,
-            "created_by": manifest.databricks.user,
-        },
+        lambda profile, path: (
+            # This installation built no Round 6 AWS lane, so its catalog objects are absent.
+            None
+            if "/external-locations/" in path or "/storage-credentials/" in path
+            else {
+                "full_name": unquote(path.rsplit("/", 1)[-1]),
+                "owner": manifest.databricks.user,
+                "created_by": manifest.databricks.user,
+            }
+        ),
     )
     monkeypatch.setattr(
         "server.lifecycle._round4_list_uc_tables",
@@ -4714,6 +5268,8 @@ def test_cleanup_deletes_synced_table_then_schemas_before_project(
     cleaned = cleanup(dry_run=False)
 
     assert cleaned is manifest
+    assert not owned_manifest.exists()
+    assert not stale_deploy_record.exists()
     assert calls == (
         [
             f"schema:{names['online_schema']}",
@@ -5317,7 +5873,7 @@ def test_cleanup_deletes_the_scope_after_everything_that_bills() -> None:
     source = inspect.getsource(lifecycle.cleanup)
     scope = source.index("_delete_secret_scope(manifest)")
     assert source.index("_delete_databricks_app(manifest)") < scope
-    assert source.index("_terraform_apply(manifest, destroy_plan)") < scope
+    assert source.index("_destroy_after_releasing_interfaces(manifest, destroy_plan)") < scope
     assert source.index('"delete-project"') < scope
     assert "_secret_scope_survivor_lines(manifest)" in source
 
@@ -6193,6 +6749,10 @@ def test_cleanup_retries_an_exact_owned_partial_terraform_destroy(
         },
     )
     monkeypatch.setattr("server.lifecycle._aws_session", lambda candidate: FakeSession())
+    # Nothing AWS left behind; `test_cleanup_interfaces_left_behind.py` covers that step.
+    monkeypatch.setattr(
+        "server.lifecycle._release_interfaces_left_on_security_groups", lambda candidate: []
+    )
     monkeypatch.setattr(
         "server.lifecycle._hydrate_aws_resources",
         lambda candidate: pytest.fail("partial retry must not require deleted outputs"),
@@ -6889,21 +7449,16 @@ def test_an_unreadable_pipeline_cannot_exonerate_a_failed_synced_table(monkeypat
     assert reads == ["pipeline-1"], reads
 
 
-def test_doctor_names_a_switched_off_round4_pipeline_rather_than_a_broken_one(
+def test_doctor_reads_a_parked_round4_pipeline_as_its_resting_state(
     monkeypatch, tmp_path
 ) -> None:
-    """The third site: `doctor`'s own health gate, reached with no stop recorded.
+    """`doctor`'s own health gate, reached with no stop recorded where it can read one.
 
-    `_round4_check` already answers a *recorded* stop before it asks the account
-    anything, so this is the case that slips past it: a stop whose record lives
-    somewhere this process cannot read. On a laptop that is any stop the deployed
-    app made, because `pipeline_power`'s file marker resolves through
-    `manifest_path()`, which raises inside a Databricks App.
-
-    It stays red, deliberately. A pipeline that is down with nothing recorded is
-    `PipelinePower.summary`'s "a failure rather than a choice", and this check has
-    no basis to call it healthy. What it must not do is blame a pipeline failure
-    that never happened, so the verdict is unchanged and the sentence is not.
+    v1.1 parks Round 4's pipeline between bouts, because both lanes are cold at
+    the bell, and the deployed app records each park where a laptop cannot read
+    it. So the parked shape -- the pipeline IDLE, its newest update cancelled, the
+    synced table online with only that update failed -- is Round 4 at rest and
+    reads green on its own, with no marker needed and nothing started.
     """
 
     manifest = make_manifest()
@@ -6930,14 +7485,9 @@ def test_doctor_names_a_switched_off_round4_pipeline_rather_than_a_broken_one(
 
     check = _round4_check(manifest, timeout_seconds=5)
 
-    assert not check.ok
-    assert "is not healthy" not in check.detail, check.detail
-    assert "switched off, not broken" in check.detail, check.detail
-    assert "cancelled rather than failed" in check.detail, check.detail
-    # Both commands, because either one settles it: put the pipeline back up, or
-    # record the stop so the next check reads it as the choice it was.
-    assert lifecycle.ROUND4_PIPELINE_START_COMMAND in check.detail, check.detail
-    assert lifecycle.ROUND4_PIPELINE_STOP_COMMAND in check.detail, check.detail
+    assert check.ok, check.detail
+    assert "parked between bouts" in check.detail, check.detail
+    assert not check.advisory
 
 
 def test_doctor_still_calls_a_genuinely_unhealthy_round4_synced_table_unhealthy(
@@ -6990,3 +7540,31 @@ def test_an_uninstall_leaves_the_sources_it_destroys_to_the_destroy() -> None:
         keywords = {keyword.arg: keyword.value for keyword in call.keywords}
         assert isinstance(keywords.get("skip_source_rows"), ast.Constant)
         assert keywords["skip_source_rows"].value is True
+
+
+def test_round5_seal_reads_subnet_and_rule_ids_as_sets() -> None:
+    """2026-09-30, the release run's re-run on an idle installation: Terraform listed the
+    VPC's same four subnets in another order than the seal recorded, and setup refused with
+    "Round 5 Terraform output proxy_subnet_ids differs from the v5 seal"."""
+
+    sealed = ("subnet-d", "subnet-a", "subnet-b", "subnet-c")
+    reordered = (sealed[1], sealed[2], sealed[3], sealed[0])
+    for field in (
+        "proxy_subnet_ids",
+        "lakebase_runner_egress_rule_ids",
+        "competitor_runner_egress_rule_ids",
+    ):
+        assert lifecycle._round5_output_matches_seal(field, reordered, sealed)
+        # A different member is still drift.
+        assert not lifecycle._round5_output_matches_seal(
+            field, (*reordered[:3], "subnet-x"), sealed
+        )
+    # Everything else still compares exactly.
+    assert lifecycle._round5_output_matches_seal("vpc_id", "vpc-1", "vpc-1")
+    assert not lifecycle._round5_output_matches_seal("vpc_id", "vpc-2", "vpc-1")
+    # And the seal check itself goes through the helper, not a bare `!=`.
+    source = Path(lifecycle.__file__).read_text(encoding="utf-8")
+    reseal = source[source.index("def _prepare_and_reseal_round5("):]
+    reseal = reseal[: reseal.index("\ndef ")]
+    assert "_round5_output_matches_seal(field, outputs[field], getattr(sealed, field))" in reseal
+    assert "if outputs[field] != getattr(sealed, field)" not in reseal

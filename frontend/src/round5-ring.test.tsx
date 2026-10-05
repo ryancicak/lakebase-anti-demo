@@ -279,6 +279,41 @@ describe('Round 5 fight-card ring', () => {
     },
   )
 
+  describe('the Round 5 tile after a bout', () => {
+    function resetting(detail: string, stage: 'rewarming' | 'cleaning' = 'rewarming') {
+      const board = statuses('temporarily_unavailable')
+      board[ROUND_FIVE] = {
+        ...board[ROUND_FIVE],
+        detail,
+        round5_start: { stage, generation: 5, recovery_scheduled: null, cleanup_scope: null },
+      }
+      render(<FightRing {...props({ roundStatuses: board, statusRequired: true })} />)
+      return screen.getByRole('button', { name: /^Round 5 · / }).querySelector('.ring-key-a')
+    }
+
+    it('reads RESETTING in the cleanup colour while it warms again after a normal cleanup', () => {
+      // Ryan: "it went to cleanup but then Temporarily Unavailable" -- in red, after
+      // every bout, for a reset that was the round working.
+      const badge = resetting(
+        'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 5 · CAN_START FALSE · '
+        + 'wait for READY / RING_READY TRUE · attempt 1',
+      )
+      expect(badge).toHaveTextContent('RESETTING')
+      expect(badge).toHaveAttribute('data-state', 'cleanup')
+    })
+
+    it.each([
+      'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 5 · CAN_START FALSE · error warm_provider_retryable',
+      'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 5 · CAN_START FALSE · retry 2026-09-30T03:10:00Z',
+      'ROUND 5 NOT STARTABLE · STAGE REWARMING · GENERATION 5 · CAN_START FALSE · attempt 3',
+      'ROUND 5 NOT STARTABLE · STAGE CLEANING · GENERATION 5 · CAN_START FALSE · cleanup worker not confirmed; operator attention required',
+    ])('keeps the alarm for a reset that has gone wrong: %s', (detail) => {
+      const badge = resetting(detail, detail.includes('CLEANING') ? 'cleaning' : 'rewarming')
+      expect(badge).toHaveTextContent('TEMPORARILY UNAVAILABLE')
+      expect(badge).toHaveAttribute('data-state', 'unavailable')
+    })
+  })
+
   it('animates one punch-and-swing beat without timers and cleans up observation', () => {
     const setIntervalSpy = vi.spyOn(window, 'setInterval')
     const setTimeoutSpy = vi.spyOn(window, 'setTimeout')

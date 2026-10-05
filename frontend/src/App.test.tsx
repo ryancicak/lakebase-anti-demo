@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import App from './App'
 import { ApiError, api } from './api/client'
 import { APP_VERSION_LABEL } from './version'
@@ -173,9 +173,9 @@ function isFillRect(
  *   Round 1  declared, both lanes verified          a clean win with a margin
  *   Round 2  stopped short, their lane censored     a win, no margin, lower bound
  *   Round 3  attempted, nothing measured            abandoned, not "never run"
- *   Round 4  declared, their lane not supported     uncontested, no opponent
+ *   Round 4  declared, their lane not supported     uncontested: no AWS lane installed
  *   Round 5  absent                                 never run
- *   Round 6  declared, their lane not supported     uncontested, the live round
+ *   Round 6  declared, both lanes verified          a raced win, the live round
  */
 function ledgerReceipts(): BoutReceipt[] {
   const now = Date.now()
@@ -197,7 +197,10 @@ function ledgerReceipts(): BoutReceipt[] {
   }
   return [
     {
+      // Against RDS while the session on screen is Aurora: the row keeps its own corner.
       ...base,
+      opponent: 'RDS PostgreSQL',
+      opponent_id: 'rds_postgres' as const,
       receipt: 'LEDGER-01',
       round_id: 'wake_idle_app',
       round_title: 'WAKE THIS IDLE APP',
@@ -255,10 +258,11 @@ function ledgerReceipts(): BoutReceipt[] {
       round_title: 'ANALYZE LIVE ORDERS',
       outcome: 'declared',
       has_measurements: true,
-      lakebase: lane(1_234, 'verified'),
-      opponent_lane: lane(null, 'not_supported'),
-      margin_ms: null,
+      lakebase: lane(11_520, 'verified'),
+      opponent_lane: lane(74_100, 'verified'),
+      margin_ms: 62_580,
       start_skew_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN 62.6s',
       sealed_at: new Date(now).toISOString(),
     },
   ]
@@ -439,101 +443,226 @@ function safeChangeTowelCleanupSession(): DemoSession {
   }
 }
 
+/**
+ * A Round 4 bout on the two-lane protocol: both integrations parked until the bell,
+ * each lane timed to its own first exact read of the row.
+ *
+ * `race` is Lakebase against AWS Glue → Aurora; `aws_errored` is the same bout with
+ * the AWS lane failing (it measured nothing, so nobody wins); `without_aws_lane` is
+ * an installation whose AWS lane is not installed, where Lakebase races alone.
+ */
 function modelScoreSession(
   state: DemoSession['state'],
-  redoState?: 'ready' | 'running' | 'verified' | 'failed',
+  variant: 'race' | 'aws_errored' | 'without_aws_lane' = 'race',
 ): DemoSession {
   const base = session(state)
   const round = {
     ...FALLBACK_CATALOG.rounds.find((candidate) => candidate.id === 'put_model_score_in_app')!,
     availability: 'ready' as const,
   }
-  const verified = state === 'verified' || Boolean(redoState)
-  const v1Nonce = 'round4-v1-full-proof-nonce-aaaaaaaaaaaaaaaa'
-  const v2Nonce = 'round4-v2-full-proof-nonce-bbbbbbbbbbbbbbbb'
-  const evidence = (v2: boolean) => ({
-    primary_key: 'customer-42', score: v2 ? 0.33 : 0.81,
-    model_version: v2 ? 'risk-v2' : 'risk-v1', proof_nonce: v2 ? v2Nonce : v1Nonce,
-    delta_version: v2 ? 12 : 11,
-    verified_row: {
-      primary_key: 'customer-42', score: v2 ? 0.33 : 0.81,
-      model_version: v2 ? 'risk-v2' : 'risk-v1', proof_nonce: v2 ? v2Nonce : v1Nonce,
-    },
-  })
-  const metrics = (v2: boolean) => [
-    { spec_id: 'managed_availability_ms', lane_id: 'lakebase', value: v2 ? 510 : 640, display_value: v2 ? '510.00 ms' : '640.00 ms' },
-    { spec_id: 'application_proof_elapsed_ms', lane_id: 'lakebase', value: v2 ? 720 : 840, display_value: v2 ? '720.00 ms' : '840.00 ms' },
-    { spec_id: 'delta_commit_version', lane_id: 'lakebase', value: v2 ? 12 : 11, display_value: v2 ? '12' : '11' },
-    { spec_id: 'exact_row_verified', lane_id: 'lakebase', value: true, display_value: 'Verified' },
-  ]
-  const initialLane = {
-    ...base.lanes.lakebase,
-    state: verified ? 'verified' as const : state === 'running' ? 'verifying' as const : 'sealed' as const,
-    elapsed_ms: verified ? 840 : null,
-    status: verified ? 'Exact committed version and fresh Postgres row verified' : state === 'running' ? 'Waiting for Managed Sync' : 'Sealed',
-    activity: { phase: verified ? 'verified' : state === 'running' ? 'committing_source' : 'armed', wire_call: null },
-    evidence: verified ? evidence(false) : {},
+  const terminal = state === 'verified' || state === 'failed'
+  const row = {
+    primary_key: 'customer-42', score: 0.81, model_version: 'risk-v1',
+    proof_nonce: 'round4-v1-full-proof-nonce-aaaaaaaaaaaaaaaa', delta_version: 11,
   }
-  const redoLane = {
-    ...base.lanes.lakebase,
-    state: redoState === 'verified' ? 'verified' as const : redoState === 'failed' ? 'failed' as const : redoState === 'running' ? 'verifying' as const : 'sealed' as const,
-    elapsed_ms: redoState === 'verified' ? 720 : null,
-    status: redoState === 'verified' ? 'Exact committed version and fresh Postgres row verified' : redoState === 'failed' ? 'Managed Sync re-do could not be verified' : redoState === 'running' ? 'Reading the exact v2 row' : 'Ready',
-    error: redoState === 'failed' ? 'The v2 exact row did not verify.' : null,
-    activity: { phase: redoState === 'verified' ? 'verified' : redoState === 'failed' ? 'failed' : redoState === 'running' ? 'reading_application' : 'armed', wire_call: null },
-    evidence: redoState === 'verified' ? evidence(true) : {},
+  const lane = (laneId: 'lakebase' | 'competitor', elapsedMs: number, evidence: Record<string, unknown>) => {
+    const failed = laneId === 'competitor' && variant === 'aws_errored' && terminal
+    return {
+      ...base.lanes[laneId],
+      state: failed ? 'failed' as const : terminal ? 'verified' as const : 'sealed' as const,
+      elapsed_ms: terminal && !failed ? elapsedMs : null,
+      status: failed
+        ? 'Could not be measured'
+        : terminal
+          ? 'The exact row is in the application'
+          : state === 'running'
+            ? "Opening the verifier's connection before the bell"
+            : 'Parked, with the baseline verified in its destination',
+      error: failed ? 'The Glue run ended FAILED: AccessDenied' : null,
+      activity: { phase: failed ? 'failed' : terminal ? 'verified' : 'armed', wire_call: null },
+      evidence: terminal ? { ...row, max_read_gap_ms: 251, ...evidence } : {},
+    }
   }
+  const competitor = variant === 'without_aws_lane'
+    ? {
+        ...base.lanes.competitor,
+        state: 'not_supported' as const,
+        elapsed_ms: null,
+        status: 'AWS lane not installed on this installation',
+        error: null,
+        activity: { phase: 'not_supported', wire_call: null },
+        evidence: { unsupported_reason: "Round 4's AWS lane is not installed on this installation, so only Lakebase ran." },
+      }
+    : lane('competitor', 77_800, { reads: 311, glue_run: 'jr_fixture', glue_starting_version: '11', glue_stream_started_at: '2026-08-18T00:01:20Z', glue_first_batch_applied_at: '2026-08-18T00:01:35Z' })
+  const comparison = !terminal
+    ? null
+    : variant === 'without_aws_lane'
+      ? {
+          kind: 'capability_gap' as const,
+          winner_lane_id: 'lakebase' as const,
+          margin: null,
+          detail: "Round 4's AWS lane is not installed on this installation, so only Lakebase ran.",
+        }
+      : variant === 'aws_errored'
+        ? {
+            kind: 'not_comparable' as const,
+            winner_lane_id: null,
+            margin: null,
+            detail: 'No verdict: the other lane failed rather than finished: The Glue run ended FAILED: AccessDenied.',
+          }
+        : {
+            kind: 'measured' as const,
+            winner_lane_id: 'lakebase' as const,
+            margin: { spec_id: 'bell_to_exact_read_ms', lane_id: 'lakebase', value: 46_300, display_value: '46.30 s' },
+            detail: 'Lakebase put the exact row in the application 46.30 s sooner; both integrations cold start at the bell.',
+          }
   return {
     ...base,
     state,
-    updated_at: redoState ? '2026-08-18T00:00:02Z' : '2026-08-18T00:00:01Z',
+    updated_at: terminal ? '2026-08-18T00:00:02Z' : '2026-08-18T00:00:01Z',
     round,
     lanes: {
-      lakebase: initialLane,
-      competitor: {
-        id: 'competitor', name: 'AWS', state: 'not_supported', elapsed_ms: null,
-        attempts: 0, status: 'AWS lane not timed', error: null,
-        evidence: { unsupported_reason: 'No AWS-native equivalent lane was configured or timed in this scoped proof.' },
-      },
+      lakebase: lane('lakebase', 31_500, { reads: 126, pipeline_update: 'update-1', managed_availability_ms: 27_550 }),
+      competitor,
     },
-    metrics: verified ? metrics(false) : [],
-    comparison: verified ? {
-      kind: 'capability_gap',
-      winner_lane_id: 'lakebase',
-      margin: null,
-      detail: 'Lakebase verified the scoped native Synced Tables capability; no AWS-native equivalent lane was timed. This is not a speed comparison.',
-    } : null,
-    remembered_result: verified ? 'LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A' : null,
-    failure: state === 'failed' ? 'The exact row proof did not verify.' : null,
-    redo: redoState ? {
-      state: redoState,
-      lanes: {
-        lakebase: redoLane,
-        competitor: {
-          id: 'competitor', name: 'AWS', state: 'not_supported', elapsed_ms: null,
-          attempts: 0, status: 'AWS lane not timed', error: null,
-          evidence: { unsupported_reason: 'No AWS-native equivalent lane was configured or timed in this scoped proof.' },
-        },
-      },
-      metrics: redoState === 'verified' ? metrics(true) : [],
-      comparison: redoState === 'verified' ? {
-        kind: 'capability_gap',
-        winner_lane_id: 'lakebase',
-        margin: null,
-        detail: 'Lakebase verified the scoped native Synced Tables capability; no AWS-native equivalent lane was timed. This is not a speed comparison.',
-      } : null,
-      failure: redoState === 'failed' ? 'The v2 exact row did not verify.' : null,
-    } : verified ? {
-      state: 'ready',
-      lanes: {
-        lakebase: redoLane,
-        competitor: {
-          id: 'competitor', name: 'AWS', state: 'not_supported', elapsed_ms: null,
-          attempts: 0, status: 'AWS lane not timed', error: null,
-          evidence: { unsupported_reason: 'No AWS-native equivalent lane was configured or timed in this scoped proof.' },
-        },
-      },
-    } : null,
+    metrics: terminal ? [
+      { spec_id: 'bell_to_exact_read_ms', lane_id: 'lakebase', value: 31_500, display_value: '31.50 s' },
+      ...(variant === 'race'
+        ? [{ spec_id: 'bell_to_exact_read_ms', lane_id: 'competitor', value: 77_800, display_value: '77.80 s' }]
+        : []),
+      { spec_id: 'managed_availability_ms', lane_id: 'lakebase', value: 27_550, display_value: '27.55 s' },
+      { spec_id: 'delta_commit_version', value: 11, display_value: '11' },
+    ] : [],
+    comparison,
+    remembered_result: state !== 'verified'
+      ? null
+      : variant === 'without_aws_lane'
+        ? 'LAKEBASE 31.5s · AWS LANE NOT INSTALLED'
+        : 'LAKEBASE WINS · MARGIN 46.3s',
+    failure: state === 'failed' ? comparison?.detail ?? 'Round 4 could not be verified.' : null,
+    redo: null,
+  }
+}
+
+/**
+ * A Round 6 bout on the two-lane protocol: AWS DMS and Glue parked until the bell,
+ * Lakebase's change feed built in and streaming, and each lane timed to its own first
+ * exact read of the order in its own Delta history.
+ *
+ * `race` is Lakebase against AWS DMS + Glue from Aurora; `aws_errored` is the same bout
+ * with the AWS lane failing (it measured nothing, so nobody wins); `without_aws_lane` is
+ * an installation whose AWS lane is not installed, where Lakebase races alone.
+ */
+function liveOrdersSession(
+  state: DemoSession['state'],
+  variant: 'race' | 'aws_errored' | 'without_aws_lane' = 'race',
+): DemoSession {
+  const base = session(state)
+  const round = {
+    ...FALLBACK_CATALOG.rounds.find((candidate) => candidate.id === 'analyze_live_orders_without_slowing_checkout')!,
+    availability: 'ready' as const,
+  }
+  const terminal = state === 'verified' || state === 'failed'
+  const order = {
+    order_id: '00000000-0000-4000-8000-00000000009a',
+    total_cents: 8_450,
+    total_display: '$84.50',
+    proof_nonce: 'r6-bout-0123456789abcdef',
+    checkout_guardrail_order_id: '00000000-0000-4000-8000-00000000009b',
+    checkout_guardrail_commit_ms: 38.25,
+    checkout_guardrail_read_ms: 12.75,
+    max_read_gap_ms: 1_004,
+    protocol: 'round6-two-lane-v1',
+  }
+  const lane = (laneId: 'lakebase' | 'competitor', elapsedMs: number, evidence: Record<string, unknown>) => {
+    const failed = laneId === 'competitor' && variant === 'aws_errored' && terminal
+    return {
+      ...base.lanes[laneId],
+      state: failed ? 'failed' as const : terminal ? 'verified' as const : 'sealed' as const,
+      elapsed_ms: terminal && !failed ? elapsedMs : null,
+      status: failed
+        ? 'Could not be measured'
+        : terminal
+          ? 'The exact order is in the lakehouse · separate checkout committed'
+          : state === 'running'
+            ? "Reading the source's baseline before the bell"
+            : laneId === 'lakebase'
+              ? 'Change feed streaming, with the baseline in its source'
+              : 'Parked, with the baseline in its source',
+      error: failed ? 'The Glue run ended FAILED: no error message' : null,
+      activity: { phase: failed ? 'failed' : terminal ? 'verified' : 'armed', wire_call: null },
+      evidence: terminal ? { ...order, ...evidence } : {},
+    }
+  }
+  const competitor = variant === 'without_aws_lane'
+    ? {
+        ...base.lanes.competitor,
+        state: 'not_supported' as const,
+        elapsed_ms: null,
+        status: 'AWS lane not installed on this installation',
+        error: null,
+        activity: { phase: 'not_supported', wire_call: null },
+        evidence: { unsupported_reason: "Round 6's AWS lane is not installed on this installation, so only Lakebase ran." },
+      }
+    : lane('competitor', 74_100, {
+        reads: 75,
+        commit_ack_ms: 15.2,
+        competitor: 'aurora',
+        glue_run: 'jr_fixture',
+        dms_commit_ts: '2026-08-18 00:00:01',
+        glue_applied_at: '2026-08-18 00:01:14',
+        glue_run_started_on: '2026-08-18T00:00:02+00:00',
+      })
+  const comparison = !terminal
+    ? null
+    : variant === 'without_aws_lane'
+      ? {
+          kind: 'capability_gap' as const,
+          winner_lane_id: 'lakebase' as const,
+          margin: null,
+          detail: "Round 6's AWS lane is not installed on this installation, so only Lakebase ran.",
+        }
+      : variant === 'aws_errored'
+        ? {
+            kind: 'not_comparable' as const,
+            winner_lane_id: null,
+            margin: null,
+            detail: 'No verdict: the other lane failed rather than finished: The Glue run ended FAILED: no error message.',
+          }
+        : {
+            kind: 'measured' as const,
+            winner_lane_id: 'lakebase' as const,
+            margin: { spec_id: 'bell_to_exact_history_ms', lane_id: 'lakebase', value: 62_580, display_value: '62.58 s' },
+            detail: 'Lakebase put the exact order in the lakehouse 62.58 s sooner; AWS DMS and Glue start cold at the bell; Lakebase’s change feed is built in and always on.',
+          }
+  return {
+    ...base,
+    state,
+    updated_at: terminal ? '2026-08-18T00:00:02Z' : '2026-08-18T00:00:01Z',
+    round,
+    lanes: {
+      lakebase: lane('lakebase', 11_520, { reads: 12, commit_ack_ms: 12.4, history_lsn: 42 }),
+      competitor,
+    },
+    metrics: terminal ? [
+      { spec_id: 'bell_to_exact_history_ms', lane_id: 'lakebase', value: 11_520, display_value: '11.52 s' },
+      ...(variant === 'race'
+        ? [{ spec_id: 'bell_to_exact_history_ms', lane_id: 'competitor', value: 74_100, display_value: '74.10 s' }]
+        : []),
+      { spec_id: 'exact_order_verified', lane_id: 'lakebase', value: true, display_value: 'Verified' },
+      { spec_id: 'checkout_verified', lane_id: 'lakebase', value: true, display_value: 'SEPARATE CHECKOUT COMMITTED ✓' },
+      ...(variant !== 'without_aws_lane'
+        ? [{ spec_id: 'commit_skew_ms', value: 2.8, display_value: '3 ms' }]
+        : []),
+    ] : [],
+    comparison,
+    remembered_result: state !== 'verified'
+      ? null
+      : variant === 'without_aws_lane'
+        ? 'LAKEBASE 11.5s · AWS LANE NOT INSTALLED'
+        : 'LAKEBASE WINS · MARGIN 62.6s',
+    failure: state === 'failed' ? comparison?.detail ?? 'Round 6 could not be verified.' : null,
+    redo: null,
   }
 }
 
@@ -611,7 +740,7 @@ function recoveryTowelSession(towelState: TowelFixtureState): DemoSession {
       },
     },
     remembered_result: hasTowel
-      ? 'TOWEL THROWN AT 90.00s · LAKEBASE VERIFIED 14.38s · AURORA STILL RECOVERING'
+      ? 'LAKEBASE WINS · TOWEL THROWN AT 90.00s · MARGIN IS A LOWER BOUND'
       : null,
     failure: null,
   }
@@ -773,6 +902,68 @@ describe('backstage setup', () => {
     window.sessionStorage.clear()
     FakeEventSource.instances = []
     window.history.replaceState({}, '', '/')
+  })
+
+  it('keeps Round 4’s databases awake while the app is on screen, and never from a hidden tab', async () => {
+    vi.useFakeTimers()
+    const wake = vi.spyOn(api, 'wakeRoundFour').mockResolvedValue({ waking: true })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(FALLBACK_CATALOG)))
+    let visibility: DocumentVisibilityState = 'visible'
+    // jsdom defines this on Document.prototype, so the instance gets its own for the test.
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibility,
+    })
+    onTestFinished(() => {
+      Reflect.deleteProperty(document, 'visibilityState')
+    })
+    window.localStorage.setItem('lakebase-anti-demo:setup:v1', JSON.stringify({
+      stage: 'setup',
+      setupScene: 'card',
+      competitor: 'aurora_serverless_v2',
+      corners: ['performance'],
+      primary: 'sre',
+      secondary: [],
+      // Any round: a Prepare straight after "Next round" into Round 4 has no time to wake it.
+      roundOverride: 'wake_idle_app',
+      sound: false,
+    }))
+    window.history.replaceState({}, '', '/#setup/card')
+    const { unmount } = render(<App />)
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // Only ever Round 4's own databases: the call names no round but Round 4's endpoint.
+    expect(wake).toHaveBeenCalledTimes(1)
+    expect(wake).toHaveBeenLastCalledWith('aurora_serverless_v2')
+    // Again every minute, inside Aurora's five idle minutes.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+    expect(wake).toHaveBeenCalledTimes(2)
+
+    // A hidden tab keeps nothing awake. The change is committed before time moves on.
+    visibility = 'hidden'
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(180_000)
+    })
+    expect(wake).toHaveBeenCalledTimes(2)
+    visibility = 'visible'
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+      await Promise.resolve()
+    })
+    expect(wake).toHaveBeenCalledTimes(3)
+
+    unmount()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(120_000)
+    })
+    expect(wake).toHaveBeenCalledTimes(3)
   })
 
   it('uses one-tab-stop radio groups with complete arrow navigation', async () => {
@@ -1245,7 +1436,9 @@ describe('backstage setup', () => {
     expect(JSON.stringify(towelled)).toBe(snapshotBeforeNavigation)
     expect(towelled.towel?.state).toBe('cleaning')
     expect(towelled.cooldown?.state).toBe('watching')
-    expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
+    // No bout is mutated. Round 4's database wake is a POST that changes no bout.
+    expect(fetchMock.mock.calls.some(([input, init]) => init?.method && init.method !== 'GET'
+      && input !== '/api/rounds/put_model_score_in_app/wake')).toBe(false)
   })
 
   it('returns from a Round 5 towel result immediately while its cleanup lease stays active', async () => {
@@ -1282,12 +1475,14 @@ describe('backstage setup', () => {
     expect(JSON.stringify(towelled)).toBe(snapshotBeforeNavigation)
     expect(towelled.towel?.state).toBe('cleaning')
     expect(towelled.round5_setup?.cleanup_retryable).toBe(true)
-    expect(fetchMock.mock.calls.some(([, init]) => init?.method && init.method !== 'GET')).toBe(false)
+    // No bout is mutated. Round 4's database wake is a POST that changes no bout.
+    expect(fetchMock.mock.calls.some(([input, init]) => init?.method && init.method !== 'GET'
+      && input !== '/api/rounds/put_model_score_in_app/wake')).toBe(false)
   })
 
   it('navigates when a failed Round 4 result renders an enabled Fight card action', async () => {
     const failed: DemoSession = {
-      ...modelScoreSession('failed'),
+      ...modelScoreSession('failed', 'aws_errored'),
       failure: 'The model score could not be verified.',
       updated_at: '2026-08-26T00:00:30Z',
     }
@@ -1890,10 +2085,6 @@ describe('backstage setup', () => {
       expect(arena).toMatch(new RegExp(`${selector.replace('.', '\\.')}[^,{]*[,{][^}]*height:\\s*100dvh[^}]*overflow-y:\\s*auto`))
     }
 
-    const roundSix = readFileSync(join(import.meta.dirname, 'round6.css'), 'utf8')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-    const roundSixNarrow = roundSix.slice(roundSix.indexOf('@media (max-width: 760px)'))
-    expect(roundSixNarrow).toMatch(/\.round6-screen\s*\{[^}]*height:\s*100dvh[^}]*overflow-y:\s*auto/)
   })
 
   it('docks terminal proof actions before scrollable detail at every viewport height', () => {
@@ -2475,10 +2666,12 @@ describe('backstage setup', () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/run'))).toBe(false)
   })
 
-  it('offers no matchup release on an armed Round 1 card', async () => {
+  it('lets the owner change the matchup on an armed card in every round, Round 1 too', async () => {
+    // It was Round 5's alone; Ryan asked for it on every round's Ring the bell page.
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
       if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/cancel-arm')) return Promise.resolve(jsonResponse(session('failed')))
       if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
       throw new Error(`Unexpected request: ${input}`)
     })
@@ -2494,7 +2687,14 @@ describe('backstage setup', () => {
     await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
     await screen.findByRole('button', { name: /ring the bell/i })
 
-    expect(screen.queryByRole('button', { name: /change the matchup/i })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /change the matchup/i }))
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/sessions/session-1/cancel-arm',
+      expect.objectContaining({ method: 'POST' }),
+    )
+    expect(await screen.findByRole('button', { name: /prepare fight card/i })).toBeInTheDocument()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/run'))).toBe(false)
   })
 
   it('uses newer WARMING state when a 409 refresh returns stale READY', async () => {
@@ -3301,9 +3501,9 @@ describe('backstage setup', () => {
     expect(ringsideTake.querySelector('details')).toBeNull()
     expect(ringsideTake.querySelector('.ringside-priority-grid')).toBeNull()
     expect(ringsideTake).toHaveTextContent(
-      /what this means.*database woke and completed a transaction automatically.*SLO risk.*mitigation effort.*warm-capacity cost/i,
+      /what this means.*database woke and finished a transaction on its own.*SLO risk.*mitigation effort.*always-on cost/i,
     )
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which services should stay warm after SLO risk and mitigation effort are considered/i)
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which services should never wait on a wake/i)
     expect(ringsideTake).toHaveTextContent(
       /what we proved.*first committed transaction after idle.*lakebase 0\.84s.*aurora serverless v2 1\.29s.*only the database transaction was tested/i,
     )
@@ -3318,13 +3518,13 @@ describe('backstage setup', () => {
     await user.click(within(ringsideTake).getByRole('tab', { name: /^data analyst$/i }))
     expect(ringsideTake).toHaveAccessibleName(/for the data analyst/i)
     expect(ringsideTake).toHaveTextContent(
-      /what this means.*first answer arrived without a manual database start.*usefulness depends on timing.*access steps.*cost of staying warm/i,
+      /what this means.*first answer arrived without anyone starting the database.*how useful that is depends on timing.*access steps.*always-on cost/i,
     )
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which decision is worth paying to avoid wake delay and access handoffs/i)
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which decision is worth paying to skip wake delay and access handoffs/i)
     await user.click(within(ringsideTake).getByRole('tab', { name: /^executive$/i }))
     expect(ringsideTake).toHaveAccessibleName(/for the executive/i)
-    expect(ringsideTake).toHaveTextContent(/what this means.*first transaction returned automatically.*avoiding that delay and support handoffs.*paying to keep capacity warm/i)
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which business deadline makes this delay unacceptable.*who decides whether to keep capacity warm/i)
+    expect(ringsideTake).toHaveTextContent(/what this means.*first transaction came back on its own.*skipping that delay and the support handoffs.*worth always-on cost/i)
+    expect(ringsideTake).toHaveTextContent(/question for the room.*which deadline makes this delay unacceptable.*who decides on always-on capacity/i)
     expect(ringsideTake).not.toHaveTextContent(
       /proof scope|success measure|point to the proof|they care about|pricing receipt|configured compute/i,
     )
@@ -3798,7 +3998,7 @@ describe('backstage setup', () => {
     expect(document.querySelector('.game-lock-note')).toHaveTextContent(/bout in progress/i)
   })
 
-  it('renders the scoped Round 4 v1 and v2 proof without legacy or race claims', async () => {
+  it('races Round 4 lane against lane with stack labels, both clocks and no re-do', async () => {
     const catalog = {
       ...FALLBACK_CATALOG,
       rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app'
@@ -3810,7 +4010,6 @@ describe('backstage setup', () => {
       if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
       if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
       if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('running')))
-      if (input.endsWith('/redo')) return Promise.resolve(jsonResponse(modelScoreSession('running', 'running')))
       throw new Error(`Unexpected request: ${input}`)
     })
     vi.stubGlobal('fetch', fetchMock)
@@ -3823,155 +4022,83 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
     await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
     await pickRound(user, 'put_model_score_in_app')
-    // The Round 4 legend explained a star used only in the removed round
-    // dropdown. It still rides the proof screen, which is asserted below.
     await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
     await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
 
-    expect(await screen.findByLabelText(/lakebase v1 result/i)).toHaveTextContent('0.00s')
+    // The same two-lane arena as Rounds 1-3, each lane named by the integration it races.
+    const lakebaseLane = await screen.findByLabelText('Lakebase result')
+    const awsLane = screen.getByLabelText('Aurora Serverless v2 result')
+    expect(document.querySelector('.proof-screen')).not.toBeNull()
+    expect(document.querySelector('.round4-screen')).toBeNull()
     expect(screen.getByRole('heading', { name: 'Move lakehouse data into live applications' })).toBeInTheDocument()
-    expect(screen.getByText(/Round 4 · Reverse ETL · OLAP → OLTP/i)).toBeInTheDocument()
-    expect(screen.getByLabelText(/lakehouse to live app data flow/i)).toHaveTextContent('Analytics Delta')
-    expect(screen.getByLabelText(/lakehouse to live app data flow/i)).toHaveTextContent('Managed Reverse ETL')
-    expect(screen.getByLabelText(/lakehouse to live app data flow/i)).toHaveTextContent('Operational Postgres / Live App')
-    expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent('Why Lakebase wins this round')
-    expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent('Built-in OLAP → OLTP')
-    expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent('Separate reverse-ETL stack required')
-    expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent('Add product + connectors + security + network + operations')
-    expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent('Not built or timed')
-    expect(screen.queryByText('SCOPE')).not.toBeInTheDocument()
-    expect(screen.getByText(/Syncing the lakehouse score and watching the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
-    expect(screen.getByText(/Ringside commentator/i)).toBeInTheDocument()
-    expect(screen.getByText('Ryan')).toBeInTheDocument()
-    expect(screen.getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
-    expect(screen.getByLabelText(/ringside commentator/i).querySelector('.ringside-announcer-mic')).toBeNull()
-    expect(screen.getByLabelText(/ringside commentator/i)).not.toHaveTextContent(/Server events only · No ETA/i)
-    expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/Lakehouse row committed · Bell starts now/i)
-    const hidePlayByPlay = screen.getByRole('button', { name: /hide play-by-play/i })
-    expect(hidePlayByPlay).toHaveAttribute('aria-controls', 'ringside-commentator-status')
-    await user.click(hidePlayByPlay)
-    const collapsedCommentator = screen.getByLabelText(/ringside commentator/i)
-    expect(within(collapsedCommentator).queryByRole('img', { name: 'Ryan' })).not.toBeInTheDocument()
-    expect(collapsedCommentator.querySelector('header')).toBeNull()
-    const showPlayByPlay = within(collapsedCommentator).getByRole('button', { name: /show commentator/i })
-    expect(showPlayByPlay).toHaveAttribute('aria-pressed', 'false')
-    expect(showPlayByPlay).toHaveAttribute('aria-controls', 'ringside-commentator-status')
-    await user.click(showPlayByPlay)
-    expect(screen.getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
+    expect(screen.getByText(/Round 4 · Live competitive proof/i)).toBeInTheDocument()
+    expect(within(lakebaseLane).getByText('Lakebase synced table (cold start)')).toBeInTheDocument()
+    expect(within(awsLane).getByText('AWS Glue → Aurora Serverless v2 (cold start)')).toBeInTheDocument()
+    // Before the bell the verifier is still opening its connections, and nothing is timed.
+    expect(lakebaseLane).toHaveTextContent('0.00s')
+    expect(awsLane).toHaveTextContent("Opening the verifier's connection before the bell")
+    expect(screen.getByText(/Both integrations cold start at the bell · One Delta change · Each clock stops at its own first exact app read/)).toBeInTheDocument()
 
     const source = FakeEventSource.instances.at(-1)!
     source.emit({
-      sequence: 6, event: 'lane_update', occurred_at: '2026-08-18T00:00:00.400Z',
-      payload: { lane_id: 'lakebase', state: 'verifying', elapsed_ms: 400, status: 'Waiting for Managed Sync', activity: { phase: 'waiting_sync', wire_call: null } },
+      sequence: 6, event: 'lane_update', occurred_at: '2026-08-18T00:00:01Z',
+      payload: { lane_id: 'lakebase', state: 'connecting', elapsed_ms: 0, status: 'Starting Lakebase', activity: { phase: 'starting', wire_call: null } },
     })
-    await waitFor(() => expect(screen.getByLabelText(/lakehouse to live app data flow/i)).toHaveTextContent('0.40s'))
-    expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/Managed reverse ETL is moving the exact Delta row into Lakebase/i)
     source.emit({
-      sequence: 7, event: 'lane_update', occurred_at: '2026-08-18T00:00:00.840Z',
-      payload: { lane_id: 'lakebase', state: 'verifying', elapsed_ms: 840, status: 'Reading exact application row', activity: { phase: 'reading_application', wire_call: null } },
+      sequence: 7, event: 'lane_update', occurred_at: '2026-08-18T00:00:01Z',
+      payload: { lane_id: 'competitor', state: 'connecting', elapsed_ms: 0, status: 'Starting AWS Glue → Aurora Serverless v2', activity: { phase: 'starting', wire_call: null } },
     })
-    await waitFor(() => expect(screen.getByLabelText(/lakehouse to live app data flow/i)).toHaveTextContent('0.84s'))
-    expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/Reverse ETL is complete · A fresh app connection is reading that exact row/i)
+    const commentator = () => screen.getByLabelText(/ringside commentator/i)
+    await waitFor(() => expect(commentator()).toHaveTextContent(/Lakebase synced table · Cold start at the bell/))
+    expect(commentator()).toHaveTextContent(/AWS Glue → Aurora Serverless v2 · Cold start at the bell/)
+    expect(commentator()).toHaveTextContent(/Both clocks run from the bell to each lane’s own first exact read · No verdict yet/)
     source.emit({
-      sequence: 8, event: 'run_finished', occurred_at: '2026-08-18T00:00:01Z',
+      sequence: 8, event: 'lane_update', occurred_at: '2026-08-18T00:00:32Z',
+      payload: { lane_id: 'lakebase', state: 'verified', elapsed_ms: 31_500, status: 'The exact row is in the application', activity: { phase: 'verified', wire_call: null } },
+    })
+    await waitFor(() => expect(lakebaseLane).toHaveTextContent('31.50s'))
+    expect(commentator()).toHaveTextContent(/Lakebase has read the exact row · Other lane still running · No verdict yet/)
+
+    source.emit({
+      sequence: 9, event: 'run_finished', occurred_at: '2026-08-18T00:01:18Z',
       payload: { state: 'verified', session: modelScoreSession('verified') },
     })
-
-    await waitFor(() => expect(screen.getByLabelText(/lakehouse to live app data flow/i)).toHaveTextContent('0.84s'))
-    const verifiedFlow = screen.getByLabelText(/lakehouse to live app data flow/i)
-    const timingBreakdown = within(verifiedFlow).getByLabelText(/completed reverse etl timing breakdown/i)
-    expect(timingBreakdown).toHaveTextContent('Reverse ETL sync0.64s')
-    expect(timingBreakdown).toHaveTextContent('Full proof time0.84sSync check + fresh app connection + exact row read')
-    expect(timingBreakdown).not.toHaveTextContent(/subsecond|row available.*app verified/i)
-    expect(within(verifiedFlow).getByText('0.84s')).toBeInTheDocument()
-    expect(screen.queryByLabelText(/integrity proof receipt/i)).not.toBeInTheDocument()
-    expect(screen.queryByText(/Reverse ETL sync 640\.00 ms/)).not.toBeInTheDocument()
-    expect(screen.queryByText('round4-v1-full-proof-nonce-aaaaaaaaaaaaaaaa')).not.toBeInTheDocument()
-    expect(screen.getByText(/Verified: customer-42 risk score 0\.81 reached the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
-    expect(screen.getByLabelText('AWS disclosure')).toHaveTextContent(/Managed reverse ETL · live app verified in 0\.84s/i)
-    const commentator = screen.getByLabelText(/ringside commentator/i)
-    expect(commentator).toHaveTextContent(/The exact row reached Lakebase in 0\.64s.*0\.84s full proof adds a sync check, fresh app connection, and exact row read; it is not SQL query time/i)
-    expect(commentator).toHaveTextContent(/Aurora \/ RDS alone do not move the row.*Add and operate a reverse-ETL stack/i)
-    const redoButton = screen.getByRole('button', { name: 'B · RE-DO' })
-    expect(redoButton).toBeInTheDocument()
-    expect(redoButton.parentElement).not.toHaveTextContent('Change this demo’s customer risk score from v1 to v2 in the lakehouse')
+    await waitFor(() => expect(screen.getByLabelText('Aurora Serverless v2 result')).toHaveTextContent('77.80s'))
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('31.50s')
+    expect(document.querySelector('.remembered')).toHaveTextContent(
+      'LAKEBASE WINS · MARGIN 46.3s',
+    )
+    // No re-do: a second change could not start both integrations cold.
+    expect(screen.queryByRole('button', { name: /re-do|change score/i })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /explain to the room/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/not built or timed|separate reverse-ETL stack|capability win/i)
 
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
     const ringsideTake = screen.getByRole('dialog', { name: /for the sre/i })
-    const selectedPriorities = within(ringsideTake).getByLabelText('Room priorities')
-    expect(selectedPriorities.children).toHaveLength(1)
-    expect(selectedPriorities).toHaveTextContent(/^performance$/i)
     expect(ringsideTake).toHaveTextContent(
-      /what this means.*clock measured Delta commit through app read.*not service SLOs or availability/i,
+      /what we proved.*Bell to exact app read, both integrations from a cold start: Lakebase 31\.50s\. AWS Glue → Aurora Serverless v2 77\.80s\. Model execution was not tested\./i,
     )
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which SLO threshold defines healthy score delivery/i)
-    expect(ringsideTake).toHaveTextContent(
-      /what we proved.*Delta commit to exact app read: 0\.84s.*score for customer-42 matched 0\.81.*model execution and an AWS delivery stack were not tested/i,
-    )
-    expect(ringsideTake.querySelector('details')).toBeNull()
-    expect(ringsideTake).not.toHaveTextContent(/non-executable|RDS\/Aurora alone are OLTP sinks/i)
     await user.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
 
     stubReceiptCanvas()
     await user.click(screen.getByRole('button', { name: /share the receipt/i }))
     const shareReceipt = await screen.findByRole('dialog', { name: /share the proof/i })
-    // One clean card: the generated PNG is the single visible preview (the full
-    // Fable layout). The poster stays mounted only as a visually-hidden text
-    // mirror -- never a second stacked box beside the bitmap.
-    const shareCardImage = await within(shareReceipt).findByRole('img', { name: /result card exactly as it will post/i })
-    expect(shareCardImage).toHaveAttribute('width', '1200')
-    expect(shareCardImage).toHaveAttribute('height', '627')
     const poster = within(shareReceipt).getByLabelText(/verified result poster preview/i)
-    expect(poster).toHaveClass('receipt-poster--mirror')
-    expect(within(poster).getByLabelText(/lakebase receipt result/i)).toHaveTextContent(/0\.84s.*LIVE APP VERIFIED.*BUILT-IN MANAGED REVERSE ETL/i)
-    expect(within(poster).getByLabelText(/lakebase receipt result/i)).not.toHaveTextContent(/SCORE 0\.81/i)
-    expect(within(poster).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/SEPARATE REVERSE-ETL STACK REQUIRED.*NOT BUILT OR TIMED/i)
-    expect(poster).toHaveTextContent(/ANALYTICS CHANGE → LIVE APP · 0\.84s/i)
+    expect(within(poster).getByLabelText(/lakebase receipt result/i)).toHaveTextContent(/Lakebase synced table.*31\.50s/)
+    expect(within(poster).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/AWS Glue → Aurora Serverless v2.*77\.80s/)
     expect(poster).toHaveTextContent(/INTEGRITY.*CUSTOMER customer-42.*RISK 0\.81.*MODEL risk-v1.*NONCE round4-v1-full-proof-nonce/i)
-    expect(shareReceipt).not.toHaveTextContent(/no auto scale-to-zero|two live PostgreSQL databases/i)
+    expect(shareReceipt).not.toHaveTextContent(/not built or timed|no auto scale-to-zero/i)
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
     await user.click(within(shareReceipt).getByRole('button', { name: /copy caption/i }))
     expect(writeText).toHaveBeenCalledWith(expect.stringMatching(
-      /^Lakebase moved an analytics change into the live app in 0\.84s[\s\S]*Lakebase · Live app verified in 0\.84s · built-in managed reverse ETL[\s\S]*separate reverse-ETL stack required · not built or timed[\s\S]*Integrity · customer-42[\s\S]*One live managed reverse-ETL proof, not a benchmark\./,
+      /^Lakebase put one Delta change into the live app 46\.30s before AWS Glue → Aurora Serverless v2, with both integrations starting cold at the bell\.[\s\S]*🔴 Lakebase synced table \(cold start\) · 31\.50s[\s\S]*🔵 AWS Glue → Aurora Serverless v2 \(cold start\) · 77\.80s[\s\S]*Both integrations cold start at the bell[\s\S]*Integrity · customer-42/,
     ))
-    expect(await within(shareReceipt).findByRole('button', { name: /prepare linkedin post/i })).toBeInTheDocument()
-    await user.click(within(shareReceipt).getByRole('button', { name: /^b · back$/i }))
-
-    await user.click(screen.getByRole('button', { name: /^B · RE-DO$/i }))
-    const redoRequest = fetchMock.mock.calls.find((call) => String(call[0]).endsWith('/redo'))
-    expect(redoRequest![1]).not.toHaveProperty('body')
-    const v1Ribbon = await screen.findByLabelText(/immutable v1 verified proof/i)
-    expect(v1Ribbon).toHaveTextContent(/Previous live app state · V1 verified.*Customer customer-42.*Risk score 0\.81.*Model risk-v1.*Exact row/i)
-    expect(v1Ribbon).not.toHaveTextContent(/nonce/i)
-    expect(screen.getByLabelText(/lakebase v2 result/i)).toHaveTextContent('Reading the exact v2 row')
-    expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/Reverse ETL is complete · A fresh app connection is reading that exact row/i)
-    expect(screen.getByText(/Changing the score in the lakehouse and watching the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /next round/i })).not.toBeInTheDocument()
-
-    source.emit({
-      sequence: 9, event: 'redo_lane_update', occurred_at: '2026-08-18T00:00:02Z',
-      payload: { lane_id: 'lakebase', state: 'verifying', status: 'V2 ONLY STATUS' },
-    })
-    expect(await screen.findByText(/Clock stops after exact app row read-back · V2 ONLY STATUS/)).toBeInTheDocument()
-    expect(screen.getByLabelText(/immutable v1 verified proof/i)).not.toHaveTextContent('V2 ONLY STATUS')
-    expect(screen.getByText(/Changing the score in the lakehouse and watching the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
-    source.emit({
-      sequence: 10, event: 'redo_finished', occurred_at: '2026-08-18T00:00:03Z',
-      payload: { session: modelScoreSession('verified', 'verified') },
-    })
-    expect(await screen.findByText('LIVE APP UPDATED AGAIN · CUSTOMER customer-42 · RISK SCORE 0.81 → 0.33 · MODEL risk-v1 → risk-v2')).toBeInTheDocument()
-    expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/The exact row reached Lakebase in 0\.51s.*0\.72s full proof adds a sync check, fresh app connection, and exact row read; it is not SQL query time/i)
-    expect(screen.queryByText('round4-v2-full-proof-nonce-bbbbbbbbbbbbbbbb')).not.toBeInTheDocument()
-    expect(screen.getByText(/Verified again: customer-42 risk score changed 0\.81 → 0\.33 in the lakehouse and reached the live app/i, { selector: '.round4-footer > p' })).toBeInTheDocument()
-    expect(screen.queryByText(/faster|sooner|speedup/i)).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
   })
 
-  it('offers an instant replay on a verified Round 4 built from the managed sync evidence', async () => {
+  it('offers an instant replay on a verified two-lane Round 4', async () => {
     const catalog = {
       ...FALLBACK_CATALOG,
       rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app'
@@ -4003,94 +4130,314 @@ describe('backstage setup', () => {
     expect(replay).toHaveTextContent(/instant replay · round 4/i)
 
     const replayStory = within(replay).getByLabelText('Three-beat replay story')
-    expect(replayStory).toHaveTextContent(/score 0\.81.*Delta version 11/i)
-    expect(replayStory).toHaveTextContent(/Managed Reverse ETL.*fresh app connection/i)
-    expect(within(replayStory).getAllByText('0.84s')).toHaveLength(1)
-    expect(replayStory).toHaveTextContent(/no AWS reverse-ETL path was built or timed.*no AWS race or margin/i)
-    expect(replay).not.toHaveTextContent(/Provider-specific calls will appear/i)
+    expect(replayStory).toHaveTextContent(/Both integrations were parked before the bell/i)
+    expect(replayStory).toHaveTextContent(/bell started both integrations and committed score 0\.81 to the Delta table at Delta version 11/i)
+    expect(within(replayStory).getAllByText('31.50s')).toHaveLength(1)
+    expect(within(replayStory).getAllByText('77.80s')).toHaveLength(1)
+    expect(replayStory).not.toHaveTextContent(/not built or timed|no AWS race/i)
 
     await user.click(within(replay).getByText(/view full evidence/i))
-    expect(replay).toHaveTextContent(/Opponent lane/i)
-    expect(replay).toHaveTextContent(/No AWS-native equivalent lane was configured or timed in this scoped proof/i)
-    expect(replay).not.toHaveTextContent(/Start gap/i)
-
-    // The commit step carries the real Delta version the round advanced to.
-    const commitStep = within(replay).getByText(/One exact row was committed/i).closest('.replay-evidence-step')!
-    expect(commitStep).toHaveTextContent(/delta commit version = 11/)
-
-    // Step 3 must carry the primary sync metric, not the end-to-end metric.
-    const syncStep = within(replay).getByText(/Managed Sync was then polled/i).closest('.replay-evidence-step')!
-    expect(syncStep).toHaveTextContent(/Reverse ETL sync \(primary\)640\.00 ms/)
-    expect(syncStep).toHaveTextContent(/reports Delta version 11/)
-    expect(syncStep).not.toHaveTextContent(/840\.00 ms/)
-
-    // Step 4 keeps the exact row and clock boundary without repeating 0.84s.
-    const readStep = within(replay).getByText(/fresh application Postgres connection returning the exact row/i).closest('.replay-evidence-step')!
-    expect(readStep).toHaveTextContent(/End-to-end clock boundary.*Delta commit → successful fresh application read/i)
-    expect(readStep).not.toHaveTextContent(/840\.00 ms/)
+    // Both lanes started from one bell, so the start gap is a claim this replay makes.
+    expect(replay).toHaveTextContent(/Start gap/i)
+    expect(replay).not.toHaveTextContent(/Opponent lane/i)
+    const bellStep = within(replay).getByText(/One bell cold started both integrations/i).closest('.replay-evidence-step')!
+    expect(bellStep).toHaveTextContent(/delta commit version = 11/)
+    expect(bellStep).toHaveTextContent(/Cold start the synced-table pipeline/)
+    expect(bellStep).toHaveTextContent(/Glue\.StartJobRun.*--starting_version/)
+    expect(bellStep).toHaveTextContent(/Run jr_fixture reads the change feed from version 11 on a fresh checkpoint/)
+    const readStep = within(replay).getByText(/One verifier read both applications every 250 ms/i).closest('.replay-evidence-step')!
     expect(readStep).toHaveTextContent(/customer-42 · score 0\.81 · model risk-v1/)
-    expect(readStep).toHaveTextContent(/Exact row verified/i)
+    expect(readStep).toHaveTextContent(/126 reads/)
+    expect(readStep).toHaveTextContent(/311 reads/)
+    const verdictStep = within(replay).getByText(/A lane wins only if its first exact read completed/i).closest('.replay-evidence-step')!
+    expect(verdictStep).toHaveTextContent(/Reverse ETL sync \(Lakebase’s own timestamps\)27\.55 s/)
+    expect(verdictStep).toHaveTextContent(/Shown, never compared/)
   })
 
-  it('offers an instant replay on a verified Round 6 built from the native CDF evidence', async () => {
-    const selectedRound = {
-      ...FALLBACK_CATALOG.rounds.find((round) => round.id === 'analyze_live_orders_without_slowing_checkout')!,
-      availability: 'ready' as const,
-    }
-    const catalog = {
-      ...FALLBACK_CATALOG,
-      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === selectedRound.id ? selectedRound : round),
-    }
-    const liveOrdersSession = (state: DemoSession['state']): DemoSession => {
-      const base = session(state)
-      const verified = state === 'verified'
-      return {
-        ...base,
-        state,
-        round: selectedRound,
-        lanes: {
-          lakebase: {
-            ...base.lanes.lakebase,
-            state: verified ? 'verified' : base.lanes.lakebase.state,
-            elapsed_ms: verified ? 1_234 : null,
-            status: verified ? 'Exact Delta answer · Separate checkout committed' : base.lanes.lakebase.status,
-            activity: verified ? { phase: 'verified', wire_call: null } : null,
-            evidence: verified ? {
-              order_id: '00000000-0000-4000-8000-00000000009a',
-              sku: 'RED-GLOVE',
-              store: 'CHICAGO',
-              quantity: 1,
-              total_cents: 8450,
-              total_display: '$84.50',
-              status: 'committed',
-              proof_nonce: 'round6-live-order-nonce',
-              history_lsn: '0/1A2B3C4D',
-              checkout_commit_ms: 41.5,
-              checkout_guardrail_order_id: '00000000-0000-4000-8000-00000000009b',
-              checkout_guardrail_proof_nonce: 'round6-guardrail-nonce',
-              checkout_guardrail_commit_ms: 38.25,
-              checkout_guardrail_read_ms: 12.75,
-            } : {},
-          },
-          competitor: {
-            ...base.lanes.competitor,
-            state: verified ? 'not_supported' : base.lanes.competitor.state,
-            status: verified ? 'AWS CDC pipeline not built or timed' : base.lanes.competitor.status,
-            evidence: { unsupported_reason: 'Aurora/RDS require a separately configured CDC pipeline into Delta.' },
+  it('declares no result and offers no re-do when Round 4’s AWS lane errors', async () => {
+    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('failed', 'aws_errored')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'put_model_score_in_app')
+    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    // A lane that errored measured nothing, so Lakebase's read wins nothing over it.
+    expect(await screen.findByText('NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A')).toBeInTheDocument()
+    expect(screen.getByText('Outcome incomplete')).toBeInTheDocument()
+    const awsLane = screen.getByLabelText('Aurora Serverless v2 result')
+    expect(awsLane).toHaveTextContent('Could not verify')
+    expect(awsLane).toHaveTextContent('The Glue run ended FAILED: AccessDenied')
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('31.50s')
+    expect(screen.queryByRole('button', { name: /re-do|change score/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /share the receipt/i })).not.toBeInTheDocument()
+  })
+
+  it('shows a Round 4 AWS lane stopped at its bound as a floor, not as a lane that broke', async () => {
+    // Ryan (2026-10-03): without the floor "it looks like the app crapped out and that's not
+    // the case".
+    const verified = modelScoreSession('verified')
+    const stopped: DemoSession = {
+      ...verified,
+      lanes: {
+        lakebase: verified.lanes.lakebase,
+        competitor: {
+          ...verified.lanes.competitor,
+          state: 'failed',
+          elapsed_ms: null,
+          status: 'Did not deliver the row within its bound',
+          error: null,
+          activity: { phase: 'failed', wire_call: null },
+          evidence: {
+            ...verified.lanes.competitor.evidence,
+            reads: 1680,
+            censored: true,
+            lower_bound_ms: 420_000,
+            display_value: '>420.00s',
           },
         },
-        metrics: verified ? [
-          { spec_id: 'analytics_available_ms', lane_id: 'lakebase', value: 1_234, display_value: '1234.00 ms' },
-          { spec_id: 'matching_live_orders', lane_id: 'lakebase', value: 1, display_value: '1 exact order' },
-          { spec_id: 'checkout_verified', lane_id: 'lakebase', value: true, display_value: 'SEPARATE CHECKOUT COMMITTED ✓' },
-        ] : [],
-        comparison: verified ? {
-          kind: 'capability_gap',
-          winner_lane_id: 'lakebase',
-          margin: null,
-          detail: 'Lakebase native CDF produced the exact Delta answer; the selected AWS database requires a separately configured CDC pipeline and was not timed.',
-        } : null,
-      }
+      },
+      metrics: verified.metrics?.filter((metric) => metric.lane_id !== 'competitor'),
+      comparison: {
+        kind: 'adjudicated_stoppage',
+        winner_lane_id: 'lakebase',
+        margin: null,
+        detail: 'Lakebase put the exact row in the application; AWS Glue did not within 420 s of the bell, so the margin is at least that and is not a measurement; both integrations cold start at the bell.',
+      },
+      remembered_result: 'LAKEBASE WINS · MARGIN IS A LOWER BOUND',
+    }
+    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(stopped))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'put_model_score_in_app')
+    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    expect(await screen.findByText('LAKEBASE WINS · MARGIN IS A LOWER BOUND')).toBeInTheDocument()
+    expect(screen.getByText('Verified outcome')).toBeInTheDocument()
+    const awsLane = screen.getByLabelText('Aurora Serverless v2 result')
+    expect(awsLane.querySelector('.lane-time')).toHaveTextContent('>420.00s')
+    expect(awsLane).not.toHaveTextContent('Could not verify')
+    expect(awsLane).toHaveTextContent(/unverified when stopped.*lower bound/i)
+    expect(awsLane.querySelector('.lane-error')).toBeNull()
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('31.50s')
+  })
+
+  it('shows Round 4 without its AWS lane as Lakebase alone, never as Round 1’s RDS gap', async () => {
+    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft', 'without_aws_lane')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed', 'without_aws_lane')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('verified', 'without_aws_lane')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'put_model_score_in_app')
+    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    const awsLane = await screen.findByLabelText('Aurora Serverless v2 result')
+    expect(awsLane).toHaveTextContent('Not installed')
+    expect(awsLane).not.toHaveTextContent(/scale-to-zero/i)
+    expect(screen.getAllByText(/Round 4’s AWS lane is not installed here/).length).toBeGreaterThan(0)
+    expect(document.body).not.toHaveTextContent(/RDS has no automatic scale-to-zero wake/)
+    expect(document.querySelector('.remembered')).toHaveTextContent(
+      'LAKEBASE 31.5s · AWS LANE NOT INSTALLED',
+    )
+  })
+
+  it('shows Round 4 lanes toweled before the bell as not timed, never as zero', async () => {
+    const base = modelScoreSession('towelled')
+    const stoppedLane = (lane: DemoSession['lanes']['lakebase']) => ({
+      ...lane,
+      state: 'towelled' as const,
+      elapsed_ms: null,
+      status: 'Toweled before the bell · not timed',
+      activity: { phase: 'towelled', wire_call: null },
+    })
+    const towelled: DemoSession = {
+      ...base,
+      lanes: { lakebase: stoppedLane(base.lanes.lakebase), competitor: stoppedLane(base.lanes.competitor) },
+      towel: {
+        state: 'ready',
+        requested_at: '2026-08-18T00:00:01Z',
+        cutoff_ms: 0,
+        censored_lower_bounds_ms: {},
+        restore_started: false,
+        cleanup_failure: null,
+      },
+      comparison: { kind: 'not_comparable', winner_lane_id: null, margin: null, detail: 'No lane had an exact verified result at the towel cutoff.' },
+      remembered_result: 'Toweled at >0.00s · No exact result verified · No winner · Margin N/A',
+    }
+    window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+      id: towelled.id,
+      stage: 'proof',
+      resumeStage: 'proof',
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === `/api/sessions/${towelled.id}`) return Promise.resolve(jsonResponse(towelled))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    render(<App />)
+
+    const lakebaseLane = await screen.findByLabelText('Lakebase result')
+    for (const lane of [lakebaseLane, screen.getByLabelText('Aurora Serverless v2 result')]) {
+      expect(lane).toHaveTextContent('Not timed')
+      expect(lane).toHaveTextContent('UNFINISHED · NOT TIMED')
+      expect(lane).not.toHaveTextContent('0.00s')
+    }
+  })
+
+  it('races Round 6 lane against lane: AWS cold at the bell, Lakebase’s feed built in', async () => {
+    const catalog = {
+      ...FALLBACK_CATALOG,
+      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'analyze_live_orders_without_slowing_checkout'
+        ? { ...round, availability: 'ready' as const }
+        : round),
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(liveOrdersSession('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(liveOrdersSession('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(liveOrdersSession('running')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'analyze_live_orders_without_slowing_checkout')
+    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    // The same two-lane arena as Rounds 1-4, each lane named by what carries its checkout.
+    const lakebaseLane = await screen.findByLabelText('Lakebase result')
+    const awsLane = screen.getByLabelText('Aurora Serverless v2 result')
+    expect(document.querySelector('.proof-screen')).not.toBeNull()
+    expect(document.querySelector('.round6-screen')).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Move live application data into the lakehouse' })).toBeInTheDocument()
+    expect(screen.getByText(/Round 6 · Live competitive proof/i)).toBeInTheDocument()
+    expect(within(lakebaseLane).getByText('Lakebase built-in change feed')).toBeInTheDocument()
+    expect(within(awsLane).getByText('AWS DMS + Glue from Aurora Serverless v2 (cold start)')).toBeInTheDocument()
+    // Only AWS cold starts: Lakebase's feed is built in and always on.
+    expect(lakebaseLane).not.toHaveTextContent(/cold start/i)
+    expect(awsLane).toHaveTextContent("Reading the source's baseline before the bell")
+    expect(screen.getByText(/Lakebase: built-in change feed · AWS: DMS \+ Glue \(cold start\) · One checkout on both sources · Each clock stops at its own first exact Delta read/)).toBeInTheDocument()
+
+    const source = FakeEventSource.instances.at(-1)!
+    source.emit({
+      sequence: 6, event: 'lane_update', occurred_at: '2026-08-18T00:00:01Z',
+      payload: { lane_id: 'lakebase', state: 'connecting', elapsed_ms: 0, status: 'Committing the checkout', activity: { phase: 'starting', wire_call: null } },
+    })
+    source.emit({
+      sequence: 7, event: 'lane_update', occurred_at: '2026-08-18T00:00:01Z',
+      payload: { lane_id: 'competitor', state: 'connecting', elapsed_ms: 0, status: 'Committing the checkout', activity: { phase: 'starting', wire_call: null } },
+    })
+    const commentator = () => screen.getByLabelText(/ringside commentator/i)
+    await waitFor(() => expect(commentator()).toHaveTextContent(/Lakebase built-in change feed · Committing the checkout · The feed is already streaming/))
+    expect(commentator()).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2 · Committing the checkout · DMS and Glue cold start at the bell/)
+    expect(commentator()).toHaveTextContent(/Both clocks run from the bell to each lane’s own first exact Delta read · No verdict yet/)
+    source.emit({
+      sequence: 8, event: 'lane_update', occurred_at: '2026-08-18T00:00:12Z',
+      payload: { lane_id: 'competitor', state: 'verifying', elapsed_ms: 1_050, status: 'AWS DMS + Glue from Aurora Serverless v2 is carrying the order', activity: { phase: 'waiting', wire_call: null } },
+    })
+    await waitFor(() => expect(commentator()).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2 · Carrying the order · The verifier reads its Delta history every second/))
+    source.emit({
+      sequence: 9, event: 'lane_update', occurred_at: '2026-08-18T00:00:12Z',
+      payload: { lane_id: 'lakebase', state: 'verified', elapsed_ms: 11_520, status: 'The exact order is in the lakehouse', activity: { phase: 'verified', wire_call: null } },
+    })
+    await waitFor(() => expect(lakebaseLane).toHaveTextContent('11.52s'))
+    expect(commentator()).toHaveTextContent(/Lakebase has put the exact order in Delta · Other lane still running · No verdict yet/)
+
+    source.emit({
+      sequence: 10, event: 'run_finished', occurred_at: '2026-08-18T00:01:15Z',
+      payload: { state: 'verified', session: liveOrdersSession('verified') },
+    })
+    await waitFor(() => expect(screen.getByLabelText('Aurora Serverless v2 result')).toHaveTextContent('74.10s'))
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('11.52s')
+    expect(document.querySelector('.remembered')).toHaveTextContent('LAKEBASE WINS · MARGIN 62.6s')
+    // No re-do: the bout's AWS pipeline is running afterward, so it could not start cold.
+    expect(screen.queryByRole('button', { name: /re-do/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /explain to the room/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
+    // Round 6 is the last round, so a verified bout continues to the six-round recap.
+    expect(screen.getByRole('button', { name: /next · final recap/i })).toBeInTheDocument()
+    expect(document.body).not.toHaveTextContent(/not built or timed|separate CDC stack|capability win|warm/i)
+
+    await user.click(screen.getByRole('button', { name: /explain to the room/i }))
+    const ringsideTake = screen.getByRole('dialog', { name: /for the sre/i })
+    expect(ringsideTake).toHaveTextContent(
+      /what we proved.*Bell to exact Delta read, with AWS DMS and Glue cold starting at the bell and Lakebase's change feed built in: Lakebase 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2 74\.10s\. A separate checkout committed on each source\./i,
+    )
+    await user.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
+
+    stubReceiptCanvas()
+    await user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    const shareReceipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    const poster = within(shareReceipt).getByLabelText(/verified result poster preview/i)
+    expect(within(poster).getByLabelText(/lakebase receipt result/i)).toHaveTextContent(/Lakebase built-in change feed.*11\.52s/)
+    expect(within(poster).getByLabelText(/aurora serverless v2 receipt result/i)).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2 \(cold start\).*74\.10s/)
+    expect(poster).toHaveTextContent(/INTEGRITY · ORDER 00000000-0000-4000-8000-00000000009a · \$84\.50 · NONCE r6-bout-0123456789abcdef · SEPARATE CHECKOUT 00000000-0000-4000-8000-00000000009b COMMITTED/)
+    expect(shareReceipt).not.toHaveTextContent(/not built or timed|separate CDC stack|no auto scale-to-zero/i)
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    await user.click(within(shareReceipt).getByRole('button', { name: /copy caption/i }))
+    expect(writeText).toHaveBeenCalledWith(expect.stringMatching(
+      /^Lakebase's built-in change feed put one live checkout into Delta 62\.58s before AWS DMS \+ Glue from Aurora Serverless v2, which cold started at the bell\.[\s\S]*🔴 Lakebase built-in change feed · 11\.52s[\s\S]*🔵 AWS DMS \+ Glue from Aurora Serverless v2 \(cold start\) · 74\.10s[\s\S]*Lakebase: built-in change feed · AWS: DMS \+ Glue \(cold start\)[\s\S]*Integrity · order 00000000-0000-4000-8000-00000000009a · \$84\.50/,
+    ))
+  })
+
+  it('offers an instant replay on a verified two-lane Round 6', async () => {
+    const catalog = {
+      ...FALLBACK_CATALOG,
+      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'analyze_live_orders_without_slowing_checkout'
+        ? { ...round, availability: 'ready' as const }
+        : round),
     }
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
@@ -4117,184 +4464,109 @@ describe('backstage setup', () => {
     expect(replay).toHaveTextContent(/instant replay · round 6/i)
 
     const replayStory = within(replay).getByLabelText('Three-beat replay story')
-    expect(replayStory).toHaveTextContent(/checkout committed.*RED-GLOVE.*CHICAGO.*\$84\.50/i)
-    expect(within(replayStory).getAllByText('1.23s')).toHaveLength(1)
-    expect(replayStory).toHaveTextContent(/separate checkout.*guardrail/i)
-    expect(replayStory).toHaveTextContent(/no AWS CDC stack was built or timed.*no AWS race or margin/i)
+    expect(replayStory).toHaveTextContent(/AWS DMS and Glue were parked before the bell, Lakebase’s change feed was streaming/i)
+    expect(replayStory).toHaveTextContent(/committed one \$84\.50 checkout on both sources and started AWS DMS and Glue cold/i)
+    expect(within(replayStory).getAllByText('11.52s')).toHaveLength(1)
+    expect(within(replayStory).getAllByText('74.10s')).toHaveLength(1)
+    expect(replayStory).not.toHaveTextContent(/not built or timed|no AWS race|CDC stack/i)
 
     await user.click(within(replay).getByText(/view full evidence/i))
-    expect(replay).toHaveTextContent(/Opponent lane/i)
-    expect(replay).toHaveTextContent(/Aurora\/RDS require a separately configured CDC pipeline into Delta/i)
-    expect(replay).not.toHaveTextContent(/Start gap/i)
-    expect(replay).not.toHaveTextContent(/Provider-specific calls will appear/i)
-
-    // The checkout commit is evidence, not the scored clock.
-    const checkoutStep = within(replay).getByText(/One checkout order was committed/i).closest('.replay-evidence-step')!
-    expect(checkoutStep).toHaveTextContent(/RED-GLOVE · CHICAGO · \$84\.50 · committed/)
-    expect(checkoutStep).toHaveTextContent(/Checkout commit0\.04s/)
-    expect(checkoutStep).toHaveTextContent(/round6-live-order-nonce/)
-
-    // The exact insert and clock boundary stay in evidence without repeating 1.23s.
-    const cdfStep = within(replay).getByText(/Delta history was then polled/i).closest('.replay-evidence-step')!
-    expect(cdfStep).toHaveTextContent(/Analytics clock boundary.*checkout commit → exact Delta answer read/i)
-    expect(cdfStep).not.toHaveTextContent(/1234\.00 ms/)
-    expect(cdfStep).toHaveTextContent(/matching live orders = 1 exact order/)
-    expect(cdfStep).toHaveTextContent(/0\/1A2B3C4D/)
-
-    // The separate checkout is what backs the "without slowing checkout" claim.
-    const guardrailStep = within(replay).getByText(/separate checkout order then had to commit/i).closest('.replay-evidence-step')!
-    expect(guardrailStep).toHaveTextContent(/round6-guardrail-nonce/)
-    expect(guardrailStep).toHaveTextContent(/SEPARATE CHECKOUT COMMITTED/)
-    expect(guardrailStep).toHaveTextContent(/differ from the measured order in both order id and proof nonce/i)
+    expect(replay).not.toHaveTextContent(/Opponent lane/i)
+    const prepareStep = within(replay).getByText(/Before the bell AWS’s pipeline was confirmed parked/i).closest('.replay-evidence-step')!
+    expect(prepareStep).toHaveTextContent(/CDF_STATE_STREAMING/)
+    expect(prepareStep).toHaveTextContent(/Built into the database and always on/)
+    expect(prepareStep).toHaveTextContent(/DMS\.DescribeReplicationTasks → stopped · Glue\.GetJobRuns → no active run/)
+    const bellStep = within(replay).getByText(/One bell committed the same checkout on both sources/i).closest('.replay-evidence-step')!
+    expect(bellStep).toHaveTextContent(/Commit skew3 ms/)
+    expect(bellStep).toHaveTextContent(/Recorded, never scored/)
+    expect(bellStep).toHaveTextContent(/DMS\.StartReplicationTask\(StartReplicationTaskType=resume-processing\) \+ Glue\.StartJobRun/)
+    expect(bellStep).toHaveTextContent(/Run jr_fixture appends DMS’s change files/)
+    const readStep = within(replay).getByText(/One verifier read both Delta histories every second/i).closest('.replay-evidence-step')!
+    expect(readStep).toHaveTextContent(/00000000-0000-4000-8000-00000000009a · \$84\.50 · nonce r6-bout-0123456789abcdef/)
+    expect(readStep).toHaveTextContent(/12 reads of its change-feed history/)
+    expect(readStep).toHaveTextContent(/75 reads of its DMS history/)
+    expect(readStep).toHaveTextContent(/Order 00000000-0000-4000-8000-00000000009b, a second order/)
+    const verdictStep = within(replay).getByText(/A lane wins only if its first exact read completed/i).closest('.replay-evidence-step')!
+    expect(verdictStep).toHaveTextContent(/still running 900 s after the bell leaves a lower bound, never a margin/)
+    expect(verdictStep).toHaveTextContent(/Change feed LSN42/)
+    expect(verdictStep).toHaveTextContent(/DMS commit time2026-08-18 00:00:01/)
+    // The blue corner's calls are headed by its stack, not the database alone.
+    expect(within(replay).getAllByText('AWS DMS + Glue from Aurora Serverless v2').length).toBeGreaterThan(0)
   })
 
-  it('shows Round 4 v2 failure separately while preserving the v1 proof', async () => {
-    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
-    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
-      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
-      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
-      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
-      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('verified')))
-      if (input.endsWith('/redo')) return Promise.resolve(jsonResponse(modelScoreSession('running', 'running')))
-      throw new Error(`Unexpected request: ${input}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, 'put_model_score_in_app')
-    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
-    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    await user.click(await screen.findByRole('button', { name: /^B · RE-DO$/i }))
-    FakeEventSource.instances.at(-1)!.emit({
-      sequence: 12, event: 'redo_failed', occurred_at: '2026-08-18T00:00:03Z',
-      payload: { message: 'The v2 exact row did not verify.', session: modelScoreSession('verified', 'failed') },
-    })
-
-    expect(await screen.findByText('V2 RESULT NOT VERIFIED')).toBeInTheDocument()
-    expect(screen.getByLabelText(/immutable v1 verified proof/i)).toHaveTextContent(/Previous live app state · V1 verified/i)
-    expect(screen.getByText('V1 remains verified and unchanged.')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /change the score|retry/i })).not.toBeInTheDocument()
-    expect(screen.getByText('No new live app update was verified.', { selector: '.round4-footer > p' })).toBeInTheDocument()
-  })
-
-  it('declares no verified result and offers no redo when Round 4 v1 fails', async () => {
-    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
-    const failedSession = modelScoreSession('failed')
-    expect(failedSession.comparison).toBeNull()
-    expect(failedSession.remembered_result).toBeNull()
-    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
-      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
-      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
-      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
-      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(failedSession))
-      throw new Error(`Unexpected request: ${input}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, 'put_model_score_in_app')
-    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
-    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-
-    expect(await screen.findByText('NO RESULT VERIFIED')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /change the score|re-do/i })).not.toBeInTheDocument()
-    expect(screen.queryByText(/verified outcome/i)).not.toBeInTheDocument()
-    expect(screen.getByText('No new live app update was verified.', { selector: '.round4-footer > p' })).toBeInTheDocument()
-  })
-
-  it('reconciles an ambiguous redo POST with GET and enters v2 running', async () => {
-    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
-    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
-      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
-      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
-      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
-      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('verified')))
-      if (input.endsWith('/redo')) return Promise.reject(new TypeError('connection reset after send'))
-      if (input === '/api/sessions/session-1') return Promise.resolve(jsonResponse(modelScoreSession('running', 'running')))
-      throw new Error(`Unexpected request: ${input}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, 'put_model_score_in_app')
-    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
-    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    await user.click(await screen.findByRole('button', { name: /^B · RE-DO$/i }))
-
-    expect(await screen.findByLabelText(/lakebase v2 result/i)).toHaveTextContent('Reading the exact v2 row')
-    expect(fetchMock).toHaveBeenCalledWith('/api/sessions/session-1', expect.any(Object))
-  })
-
-  it('keeps a newer terminal v2 proof when delayed GET and SSE candidates regress', async () => {
-    const catalog = { ...FALLBACK_CATALOG, rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app' ? { ...round, availability: 'ready' as const } : round) }
-    const refresh = deferred<ReturnType<typeof jsonResponse>>()
-    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
-      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
-      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
-      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
-      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('verified')))
-      if (input.endsWith('/redo')) return Promise.reject(new TypeError('connection reset after send'))
-      if (input === '/api/sessions/session-1') return refresh.promise
-      throw new Error(`Unexpected request: ${input}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, 'put_model_score_in_app')
-    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
-    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    await user.click(await screen.findByRole('button', { name: /^B · RE-DO$/i }))
-    await waitFor(() => expect(fetchMock.mock.calls.some((call) => call[0] === '/api/sessions/session-1')).toBe(true))
-
-    const terminal = { ...modelScoreSession('verified', 'verified'), updated_at: '2026-08-18T00:00:03Z' }
-    FakeEventSource.instances.at(-1)!.emit({
-      sequence: 12, event: 'redo_finished', occurred_at: terminal.updated_at,
-      payload: { session: terminal },
-    })
-    expect(await screen.findByText(/live app updated again.*risk-v1.*risk-v2/i)).toBeInTheDocument()
-
-    refresh.resolve(jsonResponse(modelScoreSession('verified')))
-    await waitFor(() => expect(screen.getByText('V2 VERIFIED', { selector: '.round4-live-region' })).toBeInTheDocument())
-    expect(screen.getByLabelText(/lakebase v2 result/i)).toHaveAttribute('data-verified', 'true')
-    expect(screen.getByText('V2 VERIFIED', { selector: '.round4-live-region' })).not.toHaveTextContent(/v1 proof is unchanged|stale refresh/i)
-
-    const staleRedoStarted = {
-      ...modelScoreSession('running', 'running'),
-      updated_at: '2026-08-18T00:00:02Z',
+  it('declares no result and offers no share when Round 6’s AWS lane errors', async () => {
+    const catalog = {
+      ...FALLBACK_CATALOG,
+      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'analyze_live_orders_without_slowing_checkout'
+        ? { ...round, availability: 'ready' as const }
+        : round),
     }
-    FakeEventSource.instances.at(-1)!.emit({
-      sequence: 13,
-      event: 'redo_started',
-      occurred_at: staleRedoStarted.updated_at,
-      payload: { session: staleRedoStarted },
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(liveOrdersSession('draft', 'aws_errored')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(liveOrdersSession('armed', 'aws_errored')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(liveOrdersSession('failed', 'aws_errored')))
+      throw new Error(`Unexpected request: ${input}`)
     })
-    expect(screen.getByText('V2 VERIFIED', { selector: '.round4-live-region' })).toBeInTheDocument()
-    expect(screen.getByLabelText(/lakebase v2 result/i)).toHaveAttribute('data-verified', 'true')
-    expect(screen.queryByText('V2 SYNC RUNNING')).not.toBeInTheDocument()
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'analyze_live_orders_without_slowing_checkout')
+    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    // A lane that errored measured nothing, so Lakebase's read wins nothing over it.
+    expect(await screen.findByText('NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A')).toBeInTheDocument()
+    expect(screen.getByText('Outcome incomplete')).toBeInTheDocument()
+    const awsLane = screen.getByLabelText('Aurora Serverless v2 result')
+    expect(awsLane).toHaveTextContent('Could not verify')
+    expect(awsLane).toHaveTextContent('The Glue run ended FAILED: no error message')
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('11.52s')
+    expect(screen.queryByRole('button', { name: /re-do/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /share the receipt/i })).not.toBeInTheDocument()
+    // A failed bout is not a verified Round 6, so it does not open the six-round recap.
+    expect(screen.queryByRole('button', { name: /final recap/i })).not.toBeInTheDocument()
+  })
+
+  it('shows Round 6 without its AWS lane as Lakebase alone, never as a missing AWS stack', async () => {
+    const catalog = {
+      ...FALLBACK_CATALOG,
+      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'analyze_live_orders_without_slowing_checkout'
+        ? { ...round, availability: 'ready' as const }
+        : round),
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(liveOrdersSession('draft', 'without_aws_lane')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(liveOrdersSession('armed', 'without_aws_lane')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(liveOrdersSession('verified', 'without_aws_lane')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'analyze_live_orders_without_slowing_checkout')
+    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    const awsLane = await screen.findByLabelText('Aurora Serverless v2 result')
+    expect(awsLane).toHaveTextContent('Not installed')
+    expect(awsLane).not.toHaveTextContent(/scale-to-zero/i)
+    expect(screen.getAllByText(/Round 6’s AWS lane is not installed here/).length).toBeGreaterThan(0)
+    expect(document.body).not.toHaveTextContent(/separate CDC stack|not built or timed|RDS has no automatic scale-to-zero wake/)
+    expect(document.querySelector('.remembered')).toHaveTextContent('LAKEBASE 11.5s · AWS LANE NOT INSTALLED')
   })
 
   it('coalesces SSE error refreshes, replaces the failed stream, and recovers a missed terminal event', async () => {
@@ -4463,102 +4735,6 @@ describe('backstage setup', () => {
     expect(audioMocks.stopOriginalRoundTheme).toHaveBeenCalled()
   })
 
-  it('does not let an older successful redo POST reset SSE progress or overwrite its terminal result', async () => {
-    const catalog = {
-      ...FALLBACK_CATALOG,
-      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === 'put_model_score_in_app'
-        ? { ...round, availability: 'ready' as const }
-        : round),
-    }
-    const redoResponse = deferred<ReturnType<typeof jsonResponse>>()
-    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
-      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
-      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(modelScoreSession('draft')))
-      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(modelScoreSession('armed')))
-      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(modelScoreSession('verified')))
-      if (input.endsWith('/redo')) return redoResponse.promise
-      throw new Error(`Unexpected request: ${input}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, 'put_model_score_in_app')
-    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
-    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    await user.click(await screen.findByRole('button', { name: /^B · RE-DO$/i }))
-    await waitFor(() => expect(fetchMock.mock.calls.some((call) => String(call[0]).endsWith('/redo'))).toBe(true))
-
-    const source = FakeEventSource.instances.at(-1)!
-    const started = modelScoreSession('running', 'running')
-    source.emit({
-      sequence: 10,
-      event: 'redo_started',
-      occurred_at: started.updated_at,
-      payload: { session: started },
-    })
-    const lakebaseV2Result = await screen.findByLabelText(/lakebase v2 result/i)
-    const displayedSeconds = () => Number(
-      lakebaseV2Result.querySelector('.timer-readout')?.textContent?.replace('s', ''),
-    )
-    await waitFor(() => expect(lakebaseV2Result).toHaveTextContent('0.00s'))
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 80))
-    })
-    expect(lakebaseV2Result).toHaveTextContent('0.00s')
-    source.emit({
-      sequence: 11,
-      event: 'redo_lane_update',
-      occurred_at: '2026-08-18T00:00:02Z',
-      payload: { lane_id: 'lakebase', state: 'verifying', elapsed_ms: 400, status: 'Reading exact v2 row' },
-    })
-    await waitFor(() => expect(lakebaseV2Result).toHaveTextContent('0.40s'))
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 80))
-    })
-    expect(displayedSeconds()).toBeGreaterThan(0.40)
-    expect(displayedSeconds()).toBeLessThan(0.72)
-    source.emit({
-      sequence: 12,
-      event: 'redo_lane_update',
-      occurred_at: '2026-08-18T00:00:02.720Z',
-      payload: { lane_id: 'lakebase', state: 'verified', elapsed_ms: 720, status: 'Exact v2 application row verified' },
-    })
-    await waitFor(() => expect(lakebaseV2Result).toHaveTextContent('0.72s'))
-    await act(async () => {
-      await new Promise((resolve) => window.setTimeout(resolve, 80))
-    })
-    expect(lakebaseV2Result).toHaveTextContent('0.72s')
-    await act(async () => {
-      redoResponse.resolve(jsonResponse(started))
-      await redoResponse.promise
-    })
-    expect(lakebaseV2Result).toHaveTextContent('0.72s')
-
-    const terminal = {
-      ...modelScoreSession('verified', 'verified'),
-      updated_at: '2026-08-18T00:00:03Z',
-    }
-    source.emit({
-      sequence: 13,
-      event: 'redo_finished',
-      occurred_at: terminal.updated_at,
-      payload: { session: terminal },
-    })
-    expect(await screen.findByText(/live app updated again.*risk-v1.*risk-v2/i)).toBeInTheDocument()
-
-    await waitFor(() => expect(screen.getByText(/live app updated again.*risk-v1.*risk-v2/i)).toBeInTheDocument())
-    const terminalV2Result = screen.getByLabelText(/lakebase v2 result/i)
-    expect(terminalV2Result).toHaveTextContent('0.72s')
-    expect(terminalV2Result).toHaveAttribute('data-verified', 'true')
-    expect(screen.queryByText('V2 SYNC RUNNING')).not.toBeInTheDocument()
-  })
-
   it.each([
     'survive_connection_spike',
     'analyze_live_orders_without_slowing_checkout',
@@ -4573,38 +4749,14 @@ describe('backstage setup', () => {
       rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === roundId ? selectedRound : round),
     }
     const withRound = (state: DemoSession['state']): DemoSession => {
+      if (roundId === 'analyze_live_orders_without_slowing_checkout') {
+        return { ...liveOrdersSession(state), round: selectedRound }
+      }
       const base = session(state)
-      const roundSix = roundId === 'analyze_live_orders_without_slowing_checkout'
-      const verified = state === 'verified'
       return {
         ...base,
         round: selectedRound,
-        lanes: roundSix ? {
-          lakebase: {
-            ...base.lanes.lakebase,
-            state: verified ? 'verified' : base.lanes.lakebase.state,
-            elapsed_ms: verified ? 1_234 : null,
-            status: verified ? 'Exact Delta answer · Separate checkout committed' : base.lanes.lakebase.status,
-            activity: verified ? { phase: 'verified', wire_call: null } : null,
-          },
-          competitor: {
-            ...base.lanes.competitor,
-            state: verified ? 'not_supported' : base.lanes.competitor.state,
-            status: verified ? 'Separate CDC stack required · not built or timed' : base.lanes.competitor.status,
-          },
-        } : base.lanes,
-        metrics: roundSix && verified ? [
-          { spec_id: 'analytics_available_ms', lane_id: 'lakebase', value: 1_234, display_value: '1234.00 ms' },
-          { spec_id: 'matching_live_orders', lane_id: 'lakebase', value: 1, display_value: '1 exact order' },
-          { spec_id: 'checkout_verified', lane_id: 'lakebase', value: true, display_value: 'SEPARATE CHECKOUT COMMITTED ✓' },
-        ] : undefined,
-        comparison: roundSix && verified ? {
-          kind: 'capability_gap',
-          winner_lane_id: 'lakebase',
-          margin: null,
-          detail: 'Lakebase native CDF produced the exact Delta answer; the AWS database requires a separate CDC stack.',
-        } : null,
-        remembered_result: verified ? 'ROUND VERIFIED' : null,
+        remembered_result: state === 'verified' ? 'ROUND VERIFIED' : null,
       }
     }
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
@@ -4635,28 +4787,27 @@ describe('backstage setup', () => {
     expect(screen.queryByRole('button', { name: /re-do round/i })).not.toBeInTheDocument()
     expect(fetchMock.mock.calls.some((call) => String(call[0]).endsWith('/cooldown'))).toBe(false)
     if (roundId === 'analyze_live_orders_without_slowing_checkout') {
-      expect(screen.getByLabelText('Round 6 live analytical proof')).toHaveTextContent(
-        /1 × RED-GLOVE.*1\.23s.*1 ORDER.*SEPARATE CHECKOUT COMMITTED.*ORDER INCLUDED/i,
-      )
-      const commentator = screen.getByLabelText(/ringside commentator/i)
-      expect(within(commentator).getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
-      expect(commentator).toHaveTextContent(
-        /Exact Delta answer verified in 1\.23s.*Separate checkout committed.*Public Preview freshness proof only/i,
-      )
-      await user.click(within(commentator).getByRole('button', { name: /hide play-by-play/i }))
-      expect(within(commentator).getByText(/play-by-play hidden/i)).toBeInTheDocument()
-      expect(within(commentator).queryByRole('img', { name: 'Ryan' })).not.toBeInTheDocument()
-      await user.click(within(commentator).getByRole('button', { name: /show commentator/i }))
-      expect(within(commentator).getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
-      expect(screen.queryByText(/Server events only · No ETA/i)).not.toBeInTheDocument()
+      // Round 6 races in the same arena as Rounds 1-4 now, and its verified bout
+      // is still the one that opens the six-round recap.
+      expect(document.querySelector('.proof-screen')).not.toBeNull()
+      expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('11.52s')
+      expect(screen.getByLabelText('Aurora Serverless v2 result')).toHaveTextContent('74.10s')
+      expect(document.querySelector('.remembered')).toHaveTextContent('LAKEBASE WINS · MARGIN 62.6s')
       expect(screen.getByRole('button', { name: /explain to the room/i })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
       const finalRecap = screen.getByRole('button', { name: /next.*final recap/i })
       expect(finalRecap).toBeInTheDocument()
+      // Share and Next end the bout together, on their own row, as in every round:
+      // the layout Ryan liked on Round 1, where it once fell out of wrapping.
+      const endRow = document.querySelector('.proof-actions > .proof-actions-primary')
+      expect(Array.from(endRow?.children ?? []).map((button) => button.textContent)).toEqual([
+        'Start · Share the receipt',
+        'A · Next · Final recap',
+      ])
 
       await user.click(screen.getByRole('button', { name: /explain to the room/i }))
       expect(screen.getByRole('dialog', { name: /for the sre/i })).toHaveTextContent(
-        /what we proved.*exact Delta answer arrived 1\.23s after checkout committed.*another checkout committed.*throughput, p99, and an AWS CDC stack were not tested/i,
+        /what we proved.*Bell to exact Delta read.*Lakebase 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2 74\.10s\. A separate checkout committed on each source\./i,
       )
       await user.click(within(screen.getByRole('dialog', { name: /for the sre/i })).getByRole('button', { name: /back to the ring/i }))
       stubReceiptCanvas()
@@ -4668,7 +4819,7 @@ describe('backstage setup', () => {
       // Round 5 is the fan-in protocol now: the summary row names the held-client
       // target and the hold, not the bounded protocol's attempt count.
       expect(finale).toHaveTextContent(
-        /ready a pooled application path.*10,000 clients held \/ lane.*multiplexing proved/i,
+        /ready a pooled path.*10,000 clients held \/ lane.*multiplexing proved/i,
       )
 
       // The fight card's own fighters, named once with their own chips.
@@ -4686,25 +4837,32 @@ describe('backstage setup', () => {
       // one compact lane summary that includes the losing clock as well, while
       // the painted bars themselves stay out of the accessibility tree.
       const cleanLaneFacts = within(clean as HTMLElement).getByRole('group', {
-        name: /lane facts.*lakebase: 2\.32s.*aurora serverless v2: 13\.42s/i,
+        name: /lane facts.*lakebase: 2\.32s.*rds postgresql: 13\.42s/i,
       })
       expect(cleanLaneFacts).not.toHaveAttribute('aria-hidden')
       expect(cleanLaneFacts.querySelectorAll('.finale-lane[aria-hidden="true"]')).toHaveLength(2)
+      // Each row wears the chip of the corner it was against, not the session's: this
+      // Round 1 ran against RDS while the Round 6 just finished ran against Aurora.
+      expect(clean.querySelector('.finale-lane[data-corner="blue"] > b')).toHaveTextContent('RDS')
+      expect(stopped.querySelector('.finale-lane[data-corner="blue"] > b')).toHaveTextContent('AUR')
 
       // A stopped round keeps both figures, dates itself, and refuses a margin.
       expect(stopped).toHaveAttribute('data-status', 'lakebase_finished')
       expect(stopped).toHaveTextContent(/LAKEBASE.*10\.00s.*STOPPED SHORT/)
-      // Their figure is a floor, printed m:ss because a minute-and-a-half lane
-      // is clearer as 1:30 than 90.00s.
+      // Their figure is a floor, printed in minutes because a minute-and-a-half
+      // lane is clearer as 1m 30s than 90.00s, and with its units, because a bare
+      // 1:30 beside 10.00s read as the faster lane.
       expect(stopped).toHaveTextContent(
-        /AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1:30 · MARGIN N\/A/,
+        /AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1m 30s · MARGIN N\/A/,
       )
       // 10s versus >90s is censored evidence, not an exact 1:9 ratio. Neither
       // track gets a proportional fill, and the opponent track carries explicit
       // lower-bound semantics instead.
       expect(stopped.querySelectorAll('.finale-track > i')).toHaveLength(0)
+      // The track says it with ">", which fits: "LOWER BOUND 1m 30s" was cut to
+      // "LOWER BOUND…" on a tile's narrow track and hid the number.
       expect(stopped.querySelector('.finale-track[data-lower-bound="true"]')).toHaveTextContent(
-        'LOWER BOUND 1:30',
+        '>1m 30s',
       )
       // A result sealed on an earlier day says so, or the ledger reads as one
       // sitting.
@@ -4716,20 +4874,26 @@ describe('backstage setup', () => {
       expect(abandoned).toHaveTextContent(/NO RESULT DECLARED.*ABANDONED/)
 
       /* No opponent lane at all: a real Lakebase figure, a winner, and the
-         absence attributed to the blue corner in the fight card's own words.
-         No margin and no opponent name, because neither exists. */
+         absence attributed to the blue corner. Round 4 races AWS wherever its lane
+         is installed, so the blue corner says the lane was not installed here, not
+         that AWS has no path. No margin and no opponent name, because neither
+         exists. */
       expect(uncontested).toHaveAttribute('data-status', 'uncontested')
       expect(uncontested).toHaveTextContent(/LB.*LAKEBASE.*8\.63s.*UNCONTESTED/)
-      expect(uncontested).toHaveTextContent(/BLUE CORNER · NO EQUIVALENT NATIVE PATH/)
-      expect(uncontested).not.toHaveTextContent(/MARGIN/)
+      expect(uncontested).toHaveTextContent(/BLUE CORNER · AWS LANE NOT INSTALLED/)
+      expect(uncontested).not.toHaveTextContent(/NO EQUIVALENT NATIVE PATH|MARGIN/)
 
+      // Said once, in the tile's foot; its bars stay empty rather than repeat it.
       expect(unrun).toHaveAttribute('data-status', 'unrun')
-      expect(unrun).toHaveTextContent(/NOT RUN YET/)
+      expect(unrun.textContent?.match(/NOT RUN YET/g)).toHaveLength(1)
+      expect(unrun.querySelectorAll('.finale-track > em')).toHaveLength(0)
 
-      // The round just run, with the figure this room watched being produced.
-      expect(live).toHaveAttribute('data-status', 'uncontested')
+      // The round just run: a raced Round 6, with the figure this room watched,
+      // and the AWS lane's minutes named as minutes.
+      expect(live).toHaveAttribute('data-status', 'lakebase_faster')
       expect(live).toHaveAttribute('data-latest', 'true')
-      expect(live).toHaveTextContent(/LAKEBASE.*1\.23s.*UNCONTESTED/)
+      expect(live).toHaveTextContent(/LAKEBASE.*11\.52s/)
+      expect(live).toHaveTextContent(/AUR1m 14s/)
 
       // The claims strip is gone; the ledger shows results and nothing else.
       expect(finale).not.toHaveTextContent(/proof contracts name exact stop gates/i)
@@ -4779,86 +4943,13 @@ describe('backstage setup', () => {
       )
       expect(downloadClick).toHaveBeenCalledTimes(1)
       expect(writeText).toHaveBeenCalledWith(expect.stringMatching(
-        /Six proof contracts.*01 · Wake from zero.*05 · Both pooled paths.*06 · Live checkout.*1\.23s.*not a benchmark/is,
+        /Six proof contracts.*01 · Wake from zero.*05 · Both pooled paths.*06 · Live checkout → exact Delta read.*Latest live proof, Round 6: Lakebase 11\.52s · AWS DMS \+ Glue from Aurora Serverless v2 \(cold start\) 74\.10s · LAKEBASE WINS · MARGIN 62\.6s\..*not a benchmark/is,
       ))
+      const caption = writeText.mock.calls[0][0] as string
+      expect(caption).not.toMatch(/capability proofs|not built or timed/i)
       expect(finale).toHaveTextContent(/ready.*downloaded png.*copied caption/i)
       expect(fetchMock.mock.calls.some((call) => String(call[0]).endsWith('/cooldown'))).toBe(false)
     }
-  })
-
-  it('reopens Ryan play-by-play when a running Round 6 reaches its terminal result', async () => {
-    const selectedRound = {
-      ...FALLBACK_CATALOG.rounds.find((round) => round.id === 'analyze_live_orders_without_slowing_checkout')!,
-      availability: 'ready' as const,
-    }
-    const catalog = {
-      ...FALLBACK_CATALOG,
-      rounds: FALLBACK_CATALOG.rounds.map((round) => round.id === selectedRound.id ? selectedRound : round),
-    }
-    const withState = (state: DemoSession['state']): DemoSession => {
-      const base = session(state)
-      const verified = state === 'verified'
-      return {
-        ...base,
-        state,
-        round: selectedRound,
-        lanes: {
-          lakebase: {
-            ...base.lanes.lakebase,
-            state: verified ? 'verified' : state === 'running' ? 'verifying' : base.lanes.lakebase.state,
-            elapsed_ms: verified ? 1_234 : state === 'running' ? 700 : null,
-            status: verified ? 'Exact Delta answer · Separate checkout committed' : 'Waiting for exact Delta answer',
-            activity: { phase: verified ? 'verified' : 'waiting_cdf', wire_call: null },
-          },
-          competitor: {
-            ...base.lanes.competitor,
-            state: verified ? 'not_supported' : base.lanes.competitor.state,
-            status: verified ? 'Separate CDC stack required · not built or timed' : base.lanes.competitor.status,
-          },
-        },
-        metrics: verified ? [
-          { spec_id: 'analytics_available_ms', lane_id: 'lakebase', value: 1_234, display_value: '1234.00 ms' },
-          { spec_id: 'matching_live_orders', lane_id: 'lakebase', value: 1, display_value: '1 exact order' },
-          { spec_id: 'checkout_verified', lane_id: 'lakebase', value: true, display_value: 'SEPARATE CHECKOUT COMMITTED ✓' },
-        ] : undefined,
-        remembered_result: verified ? 'LAKEBASE NATIVE CDF WIN · AWS PIPELINE NOT BUILT · MARGIN N/A' : null,
-      }
-    }
-    const running = withState('running')
-    const verified = withState('verified')
-    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
-      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
-      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(withState('draft')))
-      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(withState('armed')))
-      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(running))
-      throw new Error(`Unexpected request: ${input}`)
-    })
-    vi.stubGlobal('fetch', fetchMock)
-    vi.stubGlobal('EventSource', FakeEventSource)
-    const user = userEvent.setup()
-    render(<App />)
-
-    await user.click(screen.getByRole('button', { name: /press start/i }))
-    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
-    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
-    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
-    await pickRound(user, selectedRound.id)
-    await user.click(screen.getByRole('button', { name: /prepare fight card/i }))
-    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-
-    await user.click(await screen.findByRole('button', { name: /hide play-by-play/i }))
-    expect(screen.getByText(/play-by-play hidden/i)).toBeInTheDocument()
-    const source = FakeEventSource.instances.at(-1)!
-    source.emit({
-      sequence: 9,
-      event: 'run_finished',
-      occurred_at: verified.updated_at,
-      payload: { state: 'verified', session: verified },
-    })
-
-    expect(await screen.findByRole('button', { name: /hide play-by-play/i })).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
-    expect(screen.getByLabelText(/ringside commentator/i)).toHaveTextContent(/exact Delta answer verified in 1\.23s/i)
   })
 
   it('turns Analyst, DBA, and Architect tabs into materially different room talk tracks', async () => {
@@ -4927,8 +5018,8 @@ describe('backstage setup', () => {
       ask: fieldText(/^question for the room$/i),
       show: fieldText(/^what we proved$/i),
     }
-    expect(analystFields.say).toMatch(/ship only when compatibility checks can prevent expensive report rework.*decision deadline/i)
-    expect(analystFields.ask).toMatch(/which report deadline should decide whether this change ships/i)
+    expect(analystFields.say).toMatch(/ship only when compatibility checks can head off expensive report rework.*decision deadline/i)
+    expect(analystFields.ask).toMatch(/which report deadline should decide whether this ships/i)
     expect(analystFields.show).toMatch(/migration, tested transaction, and source check.*lakebase 1\.80s.*aurora serverless v2 9\.80s.*no customer traffic was tested/i)
     expect(take).not.toHaveTextContent(
       /success measure|proof scope|point to the proof|they care about|shared exact proof|pricing receipt/i,
@@ -4949,7 +5040,7 @@ describe('backstage setup', () => {
       show: fieldText(/^what we proved$/i),
     }
     expect(dbaFields.say).toMatch(/source stayed intact.*promotion.*restore labor.*runbook effort.*database deadline/i)
-    expect(dbaFields.ask).toMatch(/which database changes require this isolation before promotion/i)
+    expect(dbaFields.ask).toMatch(/which database changes should need this isolation before promotion/i)
     expect(dbaFields.say).not.toBe(analystFields.say)
     expect(dbaFields.ask).not.toBe(analystFields.ask)
     expect(dbaFields.show).toBe(analystFields.show)
@@ -4960,8 +5051,8 @@ describe('backstage setup', () => {
     expect(architectTab).toHaveAttribute('aria-selected', 'true')
     expect(take).toHaveAccessibleName(/for the architect \/ it/i)
     expect(identity).toHaveTextContent(`AKA ${architect.nickname}`)
-    expect(fieldText(/^what this means$/i)).toMatch(/standardize this workflow.*delivery deadlines.*exception or setup cost/i)
-    expect(fieldText(/^question for the room$/i)).toMatch(/which teams adopt first.*what rule excludes the rest/i)
+    expect(fieldText(/^what this means$/i)).toMatch(/standardize this where teams can hit delivery deadlines.*exception or setup cost/i)
+    expect(fieldText(/^question for the room$/i)).toMatch(/which teams adopt first.*what rule leaves out the rest/i)
     expect(fieldText(/^what we proved$/i)).toBe(analystFields.show)
     await user.keyboard('{Home}')
     expect(analystTab).toHaveFocus()
@@ -5549,6 +5640,66 @@ describe('backstage setup', () => {
     expect(screen.getByText(/return → confirmed zero/i).parentElement).toHaveTextContent('5:01 LB · 6:41 OPP')
   })
 
+  it('shows a Round 2 lane stopped at its bound as a floor, and the finished lane winning', async () => {
+    // Ryan's rule (2026-10-03): a lane still running at its bound from the bell loses to
+    // the lane that finished, and its clock is the floor it ran to, as a towel's is.
+    const verified = safeChangeSession('verified')
+    const stopped: DemoSession = {
+      ...verified,
+      lanes: {
+        lakebase: verified.lanes.lakebase,
+        competitor: {
+          ...verified.lanes.competitor,
+          state: 'failed',
+          elapsed_ms: 720_004,
+          status: 'Still running at its bound from the bell · stopped there',
+          error: null,
+          evidence: { censored: true, lower_bound_ms: 720_004, display_value: '>720.00s' },
+        },
+      },
+      comparison: {
+        kind: 'adjudicated_stoppage',
+        winner_lane_id: 'lakebase',
+        margin: null,
+        detail: 'Lakebase verified the isolated schema change; Aurora Serverless v2 was still running 720.00s after the bell, so the margin is a lower bound and not a measurement.',
+      },
+      remembered_result: 'LAKEBASE WINS · MARGIN IS A LOWER BOUND',
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(safeChangeSession('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(safeChangeSession('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(safeChangeSession('running')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('radio', { name: /stacktrace jack/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    FakeEventSource.instances.at(-1)!.emit({
+      sequence: 9,
+      event: 'run_finished',
+      occurred_at: '2026-08-17T00:12:10Z',
+      payload: { state: 'verified', session: stopped },
+    })
+
+    expect(await screen.findByText('LAKEBASE WINS · MARGIN IS A LOWER BOUND')).toBeInTheDocument()
+    expect(screen.getByText('Verified outcome')).toBeInTheDocument()
+    const awsLane = screen.getByLabelText('Aurora Serverless v2 result')
+    expect(awsLane.querySelector('.lane-time')).toHaveTextContent('>720.00s')
+    expect(awsLane).not.toHaveTextContent('Could not verify')
+    expect(awsLane).toHaveTextContent(/unverified when stopped.*lower bound/i)
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('1.80s')
+  })
+
   it('uses deletion rather than idle as the round two re-do contract', async () => {
     const startedAt = new Date().toISOString()
     const verified = safeChangeSession('verified')
@@ -6015,9 +6166,11 @@ describe('backstage setup', () => {
       occurred_at: '2026-08-18T15:11:34Z',
       payload: { session: towelled },
     })
+    // Lakebase finished and the towel stopped Aurora, so Lakebase wins (Ryan, 2026-10-03).
     expect(await screen.findByText(
-      'TOWEL THROWN AT 90.00s · LAKEBASE VERIFIED 14.38s · AURORA SERVERLESS V2 UNVERIFIED WHEN STOPPED · LOWER BOUND',
+      'LAKEBASE WINS · TOWEL THROWN AT 90.00s · MARGIN IS A LOWER BOUND',
     )).toBeInTheDocument()
+    expect(screen.getByLabelText('Lakebase result')).toHaveTextContent('14.38s')
     expect(screen.getByRole('button', { name: /next round/i })).toBeInTheDocument()
     expect(opponentLane.querySelector('.lane-time')).toHaveTextContent('>90.00s')
     expect(opponentLane).toHaveTextContent(/unverified when stopped.*lower bound/i)
@@ -6030,7 +6183,7 @@ describe('backstage setup', () => {
     )
     expect(towelProof).not.toMatch(/stopped at >/i)
     await user.click(within(towelTake).getByRole('tab', { name: /^executive$/i }))
-    expect(towelTake).toHaveTextContent(/what this means.*order became readable on a clock.*business process recovered/i)
+    expect(towelTake).toHaveTextContent(/what this means.*order became readable on the clock.*business process recovered/i)
     expect(within(towelTake).getByRole('heading', { name: /^what we proved$/i }).closest('section')!.textContent).toBe(towelProof)
     await user.click(within(towelTake).getByRole('button', { name: /back to the ring/i }))
 

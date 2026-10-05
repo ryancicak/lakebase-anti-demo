@@ -39,10 +39,12 @@ function RoundRow({ result }: { result: RoundResult }) {
 
       <div className="summary-result">
         <span className="summary-winner">{winnerLabel(result)}</span>
-        {lakebase && <span className="summary-time">{lakebase}</span>}
+        {/* A lane that never finished gets a floor, never a finish time: either lane. */}
+        {lakebase && (
+          <span className="summary-time">{result.lakebaseIsLowerBound ? '>' : ''}{lakebase}</span>
+        )}
         {opponent && result.opponent && (
           <span className="summary-against">
-            {/* A lane that never finished gets a floor, never a finish time. */}
             vs {result.opponentIsLowerBound ? '>' : ''}{opponent} {result.opponent}
           </span>
         )}
@@ -50,6 +52,9 @@ function RoundRow({ result }: { result: RoundResult }) {
 
       {result.status === 'uncontested' && (
         <p className="summary-note">One lane only — a time, not a race.</p>
+      )}
+      {(result.lakebaseIsLowerBound || result.opponentIsLowerBound) && (
+        <p className="summary-note">Towel thrown · &gt; marks where an unfinished clock stood.</p>
       )}
       {result.boutsOnRecord > 1 && (
         <p className="summary-note">
@@ -94,7 +99,7 @@ export function Summary({ live = null, onBack }: SummaryProps) {
   const withResult = roundsWithResult(results)
 
   return (
-    <main className="summary-screen" aria-label="The rounds you ran">
+    <main className="retro-screen summary-screen" aria-label="The rounds you ran">
       <header className="summary-header">
         <p>Final bell</p>
         <h1>The rounds you ran</h1>
@@ -116,9 +121,13 @@ export function Summary({ live = null, onBack }: SummaryProps) {
           One honest result per round · the latest run, not the best one · this
           installation only.
         </p>
-        <div className="summary-actions">
-          <button type="button" onClick={onBack}>B · Fight card</button>
-          <button type="button" onClick={() => setAttempt((count) => count + 1)}>
+        <div className="finale-actions summary-actions">
+          <button type="button" className="game-back" onClick={onBack}>B · Fight card</button>
+          <button
+            type="button"
+            className="finale-summary"
+            onClick={() => setAttempt((count) => count + 1)}
+          >
             Select · Refresh
           </button>
         </div>

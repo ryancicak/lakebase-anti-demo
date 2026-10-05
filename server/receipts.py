@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, time
@@ -57,7 +58,15 @@ from .coordination import (
     read_coordination_objects,
 )
 from .manifest import load_manifest
-from .models import LaneState, RoundId, SessionSnapshot, SessionState, TowelState
+from .models import (
+    ComparisonKind,
+    LaneSnapshot,
+    LaneState,
+    RoundId,
+    SessionSnapshot,
+    SessionState,
+    TowelState,
+)
 from .process_registry import state_dir_from_environ
 
 logger = logging.getLogger(__name__)
@@ -304,6 +313,22 @@ def _cleanup_failure(snapshot: SessionSnapshot) -> str | None:
     return setup.cleanup_failure if setup is not None else None
 
 
+def _stopped_floor_ms(lane: LaneSnapshot) -> float | None:
+    """The floor a lane stopped short of its proof carries in its evidence, if any."""
+
+    evidence = lane.evidence or {}
+    value = evidence.get("lower_bound_ms")
+    if (
+        evidence.get("censored") is True
+        and isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
+    ):
+        return float(value)
+    return None
+
+
 def _lane_state(state: LaneState) -> LaneOutcome:
     if state == LaneState.VERIFIED:
         return "verified"
@@ -355,7 +380,11 @@ def derive_receipt(
     def lane_receipt(lane_id: str, elapsed: float | None) -> LaneReceipt:
         lane = snapshot.lanes.get(lane_id)
         state = _lane_state(lane.state) if lane else "incomplete"
+        # A lane stopped at its bound (Rounds 4 and 6) carries its floor the way a towel's
+        # censored lane does, in its evidence.
         bound = censored.get(lane_id)
+        if bound is None and lane is not None:
+            bound = _stopped_floor_ms(lane)
         if elapsed is None and bound is not None:
             return LaneReceipt(
                 ms=bound,
@@ -399,6 +428,9 @@ def derive_receipt(
     if (
         margin_ms is None
         and outcome == "declared"
+        # A declared tie has no margin: the two clocks are within what the verifiers
+        # can resolve, so their difference is not a lead (Rounds 4 and 6).
+        and (comparison is None or comparison.kind != ComparisonKind.TIE)
         and lakebase.state == "verified"
         and opponent.state == "verified"
         and lb_ms is not None

@@ -12,7 +12,7 @@ stays failed on screen.
 
 ![The six-round fight card](docs/screenshots/fight-card.png)
 
-![The Round 2 verdict screen, with both lanes verified](docs/screenshots/round-2-verdict.jpg)
+![The Round 2 verdict screen, with both lanes verified](docs/screenshots/round-2-verdict.png)
 
 ## Install
 
@@ -113,13 +113,13 @@ read [Cost and safety](#cost-and-safety) for what bills until then.
 
 ## Which version is running
 
-The app shows its release — `v1.0.0` — in the bottom-right corner of the title
+The app shows its release — `v1.1.0` — in the bottom-right corner of the title
 screen, on the staff roll's title card and on the card it holds at the end.
 `GET /api/version` says the same, plus the exact commit when `bootstrap.sh`
 deployed it:
 
 ```json
-{"version": "1.0.0", "commit": "0123456789ab", "dirty": false}
+{"version": "1.1.0", "commit": "0123456789ab", "dirty": false}
 ```
 
 `dirty` is `true` when the deployed tree had uncommitted changes. Every release
@@ -159,13 +159,13 @@ For setup options and troubleshooting, see
 | 1 | Wake an idle app | Lakebase and Aurora are verified at scale zero. RDS cannot pause, so it is not timed. |
 | 2 | Change a schema safely | Lakebase branches, Aurora clones, and RDS restores to a point in time. |
 | 3 | Recover a deleted order | Each lane restores and reads the same row. |
-| 4 | Move lakehouse data into an app | Delta data moves through managed reverse ETL into Lakebase. |
+| 4 | Move lakehouse data into an app | One Delta change moves into Lakebase through its synced table, and into Aurora or RDS through an AWS Glue job. Both integrations cold start at the bell. |
 | 5 | Ready a pooled application path | Lakebase verifies its included pool. The selected AWS reference path provisions RDS Proxy. Both run 128 attempts, maximum 64 concurrent, plus a separate witness. |
-| 6 | Move app data into the lakehouse | A committed Lakebase row moves through change data capture into Delta. |
+| 6 | Move app data into the lakehouse | One checkout moves into Delta through Lakebase's built-in change feed, and from Aurora or RDS through AWS DMS and a Glue job. AWS cold starts at the bell; Lakebase's feed is always on. |
 
-Rounds 1, 2, 3, and 5 compare 2 lanes. Rounds 4 and 6 run only on Lakebase
-because the matching AWS integration stacks are not built or timed. They make no
-AWS performance claim.
+Every round compares 2 lanes. Rounds 4 and 6 race AWS wherever the installation
+has built their AWS lanes, which setup does. Without its lane, either round races
+Lakebase alone, says so, and makes no AWS performance claim.
 
 Round 5 scores pooled-path setup from a database-only declared start. Its recurring
 validation runs 128 attempts, maximum 64 concurrent, plus separate multiplexing
@@ -186,36 +186,49 @@ the installation unused for 72 hours and the lease lapses, and automation that
 honors the tag may then reap it, possibly leaving a partial installation. Nothing
 in this project deletes anything on that clock, and Databricks resources are not
 covered by the tag. Deliberate cleanup is still the only path that verifies the
-whole installation is gone. Three separate things bill, they stop at three different times, and only
+whole installation is gone. Several things bill, they stop at different times, and only
 the first is a cost you pay simply for having this installed. Read the middle
-column before the number. These rates came from one installation in `us-west-2`:
+column before the number. These rates are for `us-west-2`:
 
 | What bills | When it bills | Approximate rate |
 | --- | --- | ---: |
-| AWS databases, runner, storage, addresses, and secrets | From `--apply` until `cleanup`, whether or not anyone runs a round | **~$8.36/day** |
+| AWS databases, runners, storage, addresses, secrets, and Round 6's DMS instance | From `--apply` until `cleanup`, whether or not anyone runs a round | **~$29.50/day** |
 | Databricks App compute | Only if you deployed the App, and then until you stop it — a running App bills for its provisioned capacity even with nobody on it | **~$10.93/day** |
-| Round 4 reverse-ETL pipeline | Only while it is actually up. Round 4 starts it at arm and stops it 20 minutes after the bout settles. Both figures beside this are measured, not projected | **~$0.61/hour**, and **~$0.32** for one bout |
+| The Lakebase coordination database | While the app is running: it and Round 5's warm runners write to it every few seconds, so it does not scale to zero | **~$1.06/day** at the posted `$0.26` per DBU, measured on the test installation |
+| The SQL warehouse Rounds 4 and 6 read through | Only while it runs: while a person is using the app or a bout reads through it, and then until its own auto-stop. The installer uses one your workspace already has | **~$8.40/hour** while it runs, for a Small serverless warehouse (12 DBU an hour at `$0.70`) |
+| Round 4's two integrations | Only during a bout. Both are parked at rest. The bell starts Lakebase's synced-table pipeline and the AWS Glue job, and both are parked again once the bout settles, 3–5 minutes later on the test installation | pipeline **~$0.61/hour** while up; Glue **$0.44 per DPU-hour** at 2 DPU for the seconds a run consumes, **~$0.02–$0.04** a bout |
+| Round 6's AWS lane | Only during a bout. Its DMS task and Glue job are parked at rest and started at the bell; the task adds nothing beyond the DMS instance above | Glue **$0.44 per DPU-hour** at 2 DPU for the seconds a run consumes |
 
-**What you pay by default.** A local install is about `$8.36/day`. Deploy the App
-as well and it is about `$19.29/day`. Round 4 adds cents rather than dollars when
-its stop fires: one bout costs about `$0.32` end to end, and a longer
-32.85-minute warm window came to `$0.50` once its posted usage had settled. Clone
-it on Friday and forget it until Monday and that is about `$25`, or about `$58`
-with the App deployed.
+**What you pay by default.** A local install is about `$29.50/day`. Deploy the App
+as well and it is about `$40.43/day`, plus about `$1.06/day` for the coordination
+database the running app keeps awake. Round 4 adds cents rather than dollars: a
+bout runs each integration for its few minutes and then parks it. At the
+pipeline's measured `$0.61/hour` that is about `$0.03`–`$0.05` a bout, an
+estimate from the bout's measured length that has not yet been reconciled to
+posted usage. Glue bills a run for the seconds it consumed resources, which
+measured 78–152 s a bout. Clone it on Friday and forget it until Monday and that
+is about `$89`, or about `$124` with the App deployed. The app sends the SQL
+warehouse nothing while nobody is using it: it reads billing only while a person
+is on it, at most once an hour.
 
 Left up for a full day the pipeline would take the installation subtotal to about
-`$22.93/day`, of which `$14.57` is the Round 4 pipeline's rate while it is up;
-the subtotal drops to about `$8.36/day` with that pipeline stopped. Databricks
+`$44.07/day`, of which `$14.57` is the Round 4 pipeline's rate while it is up;
+the subtotal drops to about `$29.50/day` with that pipeline stopped. Databricks
 App compute, about `$10.93/day`, is disclosed on its own line because it bills
-whether or not this project exists. The all-in figure is about `$33.86/day` while
-the pipeline runs, or `$19.29/day` with the pipeline stopped. `$22.93` and
-`$19.29` are two different quantities `$3.64` apart: the first is the
+whether or not this project exists. The all-in figure is about `$55.00/day` while
+the pipeline runs, or `$40.43/day` with the pipeline stopped. `$44.07` and
+`$40.43` are two different quantities `$3.64` apart: the first is the
 installation subtotal with the pipeline running; the second includes App compute
 with the pipeline stopped.
 
-Every standing figure here traces to one sealed receipt: receipt `EECDD4D6`,
-captured on 2026-08-25. **The Round 4 pipeline rate is the one exception, and it
-no longer reconciles to that receipt.** The receipt reached `$11.07/day` for that
+The AWS figure is the cost model's arithmetic for v1.1's fleet: eleven databases,
+two Round 5 runners and Round 6's DMS instance. On 2026-10-02 every rate in it was
+read back from the AWS Price List API and every count from a running
+installation. The coordination database and SQL warehouse rows are that
+installation's posted usage and the workspace's posted prices on the same day.
+The App compute figure traces to one sealed receipt: receipt `EECDD4D6`, captured
+on 2026-08-25. **The Round 4 pipeline rate does not reconcile to that receipt.**
+The receipt reached `$11.07/day` for that
 line by dividing its posted DBU by the span from its first posted interval to its
 last, and that span contained every hour the pipeline was stopped — it sampled a
 62.5% duty cycle, so idle time sat in the denominator. That yields a
@@ -233,13 +246,16 @@ databases. Read
 [the network warning](docs/BOOTSTRAP.md#the-databases-are-reachable-from-the-internet)
 before provisioning.
 
-The Round 4 pipeline bills for as long as it is up, and it does not stop itself
-if the server process dies. A terminal session or `ready` ring does not mean it
-should already be `IDLE`: `RUNNING` is expected during the 20-minute redo
-window, which begins after settlement. A terminal-timed wait is an observation
-budget, not proof that a stop request failed. After confirmed process death, or
-after a no-redo test's conservative budget allowing for settlement plus the
-window, preserve available events and stop it:
+Round 4's integrations bill for as long as they are up, and neither stops the
+moment the server process dies. Neither runs unattended for long, though. The stop
+each bell owes the pipeline is recorded durably, and the next serving process
+repays it 30 minutes after that bell. The Glue job stops itself at its 30-minute
+run timeout. The next Prepare parks both and puts Round 4's row back. A terminal
+session does not mean both are already parked: they keep running until the bout's
+settle restores the row, which takes a minute or two after the result. A
+terminal-timed wait is an observation budget, not proof that a stop request
+failed. After confirmed process death, preserve available events and stop the
+pipeline yourself:
 
 ```bash
 ./antidemo pipeline status
@@ -294,7 +310,7 @@ The author's live runs as of 2026-08-25:
 | Round 1 | 11 verified current-generation cold-wake bouts against Aurora |
 | Round 2 | 10 verified schema-change bouts — 7 against Aurora, 3 against RDS |
 | Round 3 | 8 verified recovery bouts — 3 against Aurora, 5 against RDS |
-| Round 4 | 2 verified Lakebase bouts; no AWS lane was timed |
+| Round 4 | Re-measured for v1.1 on 2026-09-29, on a test installation: 20 two-lane bouts, 10 against Aurora and 10 against RDS, both integrations parked at every bell. Lakebase won all 20, bell to exact app read p50 31–33 s against AWS Glue's 80–89 s |
 | Round 5 | 6 verified setup and bounded-check bouts across Aurora and RDS. The exact 10,000-client fan-in protocol is implemented and sealed but has never completed a scored run, so no 10,000-connection timing is claimed anywhere |
 | Round 6 | 7 receipt-backed bouts and 1 earlier log-derived bout; no AWS lane was timed |
 | Deployed app | All 6 rounds have run. The 2026-09-14 install above exposed all six from a single command, with no separate Round 5 IAM step |

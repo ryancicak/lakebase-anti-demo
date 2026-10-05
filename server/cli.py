@@ -35,7 +35,7 @@ from .lifecycle import (
     refresh_round5_runner,
     renew,
     reset,
-    resume_provision,
+    resume,
     setup,
 )
 from .manifest import apply_manifest_environment, load_manifest, manifest_path
@@ -1001,12 +1001,14 @@ def _aws_refusal(args: argparse.Namespace, error: BaseException) -> str:
 #: expensive one, but the sentence has to hold on `setup`, `reset` and `renew`
 #: too, which reach Postgres for schema and grant work rather than for an
 #: inventory. Hence "a question this command needed answered" and not a claim
-#: about which read it was.
+#: about which read it was. It used to name the coordination database, and
+#: rc22's setup (2026-10-05), whose seed lost a round database's connection,
+#: sent its reader there.
 _POSTGRES_REPORT_IS_PARTIAL = (
     "WHATEVER THIS COMMAND ALREADY PRINTED IS A PARTIAL REPORT AND NOT AN "
-    "ALL-CLEAR. The read that failed asked the coordination database a question "
-    "this command needed answered — on cleanup that is which per-bout Round 5 "
-    "add-ons are still unresolved, the resources Terraform never created and "
+    "ALL-CLEAR. The read that failed asked a database a question this command "
+    "needed answered — on cleanup, the coordination database's list of per-bout "
+    "Round 5 add-ons still unresolved, the resources Terraform never created and "
     "cannot destroy — so whatever is still alive and billing under this run is "
     "INCOMPLETE in the lines above."
 )
@@ -1123,7 +1125,7 @@ def main() -> int:
             return 0
         if args.command == "resume":
             with _mutating("antidemo resume"):
-                manifest = resume_provision(args.timeout)
+                manifest = resume(args.timeout)
             print(f"READY {manifest.run_id} — interrupted provision recovered safely")
             return 0
         if args.command == "renew":

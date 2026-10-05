@@ -152,6 +152,12 @@ SELF_VERIFIABLE_BLOCK_CODES = frozenset(
         # self-recovers the instant a rewarm's capsule belongs, so it is surfaced
         # (never a silent churn) but is NOT a permanent latch a human must clear.
         "warm_capsule_unrecoverable",
+        # A runner whose job cleanup and flock release stayed unconfirmed past the
+        # transient escalation count -- a resident that kept restarting under the
+        # warm, as while setup reconfigures the runners. Each recheck is a fresh
+        # fenced warm, and the runner's resident lock refuses a second resident while
+        # an old one lives, so this re-verifies itself and is never a human's latch.
+        "warm_runner_settlement_unconfirmed_persistent",
     }
 )
 

@@ -89,33 +89,45 @@ function verifiedSession(roundId: RoundId): DemoSession {
   }
 
   if (roundId === 'put_model_score_in_app') {
-    session.lanes.lakebase.elapsed_ms = 840
-    session.lanes.lakebase.evidence = {
+    // Both lanes cold at the bell, each timed to its own first exact read.
+    const row = {
       primary_key: 'customer-42',
       score: 0.81,
       model_version: 'risk-v1',
       proof_nonce: 'replay-round-four-nonce',
       delta_version: 11,
-      verified_row: {
-        primary_key: 'customer-42',
-        score: 0.81,
-        model_version: 'risk-v1',
-        proof_nonce: 'replay-round-four-nonce',
-      },
+      reads: 126,
+      max_read_gap_ms: 251,
+    }
+    session.lanes.lakebase.elapsed_ms = 31_500
+    session.lanes.lakebase.status = 'The exact row is in the application'
+    session.lanes.lakebase.evidence = {
+      ...row,
+      pipeline_update: 'update-1',
+      managed_availability_ms: 27_550,
+    }
+    session.lanes.competitor.elapsed_ms = 77_800
+    session.lanes.competitor.status = 'The exact row is in the application'
+    session.lanes.competitor.evidence = {
+      ...row,
+      reads: 311,
+      glue_run: 'jr_replay',
+      glue_starting_version: '11',
     }
     session.metrics = [
-      { spec_id: 'managed_availability_ms', lane_id: 'lakebase', value: 640 },
-      { spec_id: 'application_proof_elapsed_ms', lane_id: 'lakebase', value: 840 },
+      { spec_id: 'bell_to_exact_read_ms', lane_id: 'lakebase', value: 31_500 },
+      { spec_id: 'bell_to_exact_read_ms', lane_id: 'competitor', value: 77_800 },
+      { spec_id: 'managed_availability_ms', lane_id: 'lakebase', value: 27_550 },
       { spec_id: 'exact_row_verified', lane_id: 'lakebase', value: true },
+      { spec_id: 'exact_row_verified', lane_id: 'competitor', value: true },
+      { spec_id: 'delta_commit_version', value: 11 },
     ]
-    session.lanes.competitor.state = 'not_supported'
-    session.lanes.competitor.elapsed_ms = null
-    session.lanes.competitor.status = 'No AWS reverse-ETL path was built or timed'
     session.comparison = {
-      kind: 'capability_gap',
+      kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: null,
+      margin: { spec_id: 'bell_to_exact_read_ms', lane_id: 'lakebase', value: 46_300 },
     }
+    session.remembered_result = 'LAKEBASE WINS · MARGIN 46.3s'
   }
 
   if (roundId === 'survive_connection_spike') {
@@ -232,32 +244,48 @@ function verifiedSession(roundId: RoundId): DemoSession {
   }
 
   if (roundId === 'analyze_live_orders_without_slowing_checkout') {
-    session.lanes.lakebase.elapsed_ms = 1_230
-    session.lanes.lakebase.evidence = {
-      sku: 'RED-GLOVE',
-      store: 'CHICAGO',
-      total_display: '$84.50',
-      status: 'COMMITTED',
+    // AWS DMS and Glue cold at the bell, Lakebase's feed built in; each lane timed to
+    // its own first exact read of the order in its own Delta history.
+    const order = {
       order_id: 'order-42',
-      proof_nonce: 'replay-round-six-nonce',
-      history_lsn: '0/42',
-      checkout_commit_ms: 12,
+      total_cents: 8_450,
+      total_display: '$84.50',
+      proof_nonce: 'r6-bout-replay-nonce',
+      checkout_guardrail_order_id: 'order-43',
       checkout_guardrail_commit_ms: 10,
       checkout_guardrail_read_ms: 4,
+      max_read_gap_ms: 1_004,
+    }
+    session.lanes.lakebase.elapsed_ms = 1_230
+    session.lanes.lakebase.status = 'The exact order is in the lakehouse · separate checkout committed'
+    session.lanes.lakebase.evidence = { ...order, reads: 2, commit_ack_ms: 12, history_lsn: 42 }
+    session.lanes.competitor.elapsed_ms = 74_100
+    session.lanes.competitor.status = 'The exact order is in the lakehouse · separate checkout committed'
+    session.lanes.competitor.evidence = {
+      ...order,
+      reads: 75,
+      commit_ack_ms: 15,
+      competitor: 'aurora',
+      glue_run: 'jr_replay',
+      dms_commit_ts: '2026-09-02 20:00:01',
+      glue_applied_at: '2026-09-02 20:01:14',
+      glue_run_started_on: '2026-09-02T20:00:02+00:00',
     }
     session.metrics = [
-      { spec_id: 'analytics_available_ms', lane_id: 'lakebase', value: 1_230 },
-      { spec_id: 'matching_live_orders', lane_id: 'lakebase', value: 1 },
+      { spec_id: 'bell_to_exact_history_ms', lane_id: 'lakebase', value: 1_230 },
+      { spec_id: 'bell_to_exact_history_ms', lane_id: 'competitor', value: 74_100 },
+      { spec_id: 'exact_order_verified', lane_id: 'lakebase', value: true },
+      { spec_id: 'exact_order_verified', lane_id: 'competitor', value: true },
       { spec_id: 'checkout_verified', lane_id: 'lakebase', value: true },
+      { spec_id: 'checkout_verified', lane_id: 'competitor', value: true },
+      { spec_id: 'commit_skew_ms', value: 3, display_value: '3 ms' },
     ]
-    session.lanes.competitor.state = 'not_supported'
-    session.lanes.competitor.elapsed_ms = null
-    session.lanes.competitor.status = 'No AWS CDC stack was built or timed'
     session.comparison = {
-      kind: 'capability_gap',
+      kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: null,
+      margin: { spec_id: 'bell_to_exact_history_ms', lane_id: 'lakebase', value: 72_870 },
     }
+    session.remembered_result = 'LAKEBASE WINS · MARGIN 72.9s'
   }
   return session
 }
@@ -326,25 +354,66 @@ function partialRoundFive(): DemoSession {
   return session
 }
 
-function guardrailFailure(roundId: 'put_model_score_in_app' | 'analyze_live_orders_without_slowing_checkout'): DemoSession {
-  const session = verifiedSession(roundId)
+/** Round 6 when the AWS lane errored: Lakebase read its order, and nothing was measured. */
+function roundSixErroredLane(): DemoSession {
+  const session = verifiedSession('analyze_live_orders_without_slowing_checkout')
   session.state = 'failed'
-  session.comparison = null
-  if (roundId === 'put_model_score_in_app') {
-    session.lanes.lakebase.evidence = {
-      ...session.lanes.lakebase.evidence,
-      verified_row: {
-        primary_key: 'customer-42',
-        score: 0.33,
-        model_version: 'wrong',
-        proof_nonce: 'wrong',
-      },
-    }
-  } else {
-    session.metrics = session.metrics!.map((metric) => (
-      metric.spec_id === 'checkout_verified' ? { ...metric, value: false } : metric
-    ))
+  session.lanes.competitor = {
+    ...session.lanes.competitor,
+    state: 'failed',
+    elapsed_ms: null,
+    status: 'Could not be measured',
+    error: 'The Glue run ended FAILED: no error message',
   }
+  session.comparison = { kind: 'not_comparable', winner_lane_id: null, margin: null }
+  session.remembered_result = null
+  return session
+}
+
+/** Round 6 on an installation without its AWS lane: Lakebase races alone. */
+function roundSixWithoutAwsLane(): DemoSession {
+  const session = verifiedSession('analyze_live_orders_without_slowing_checkout')
+  session.lanes.competitor = {
+    ...session.lanes.competitor,
+    state: 'not_supported',
+    elapsed_ms: null,
+    status: 'AWS lane not installed on this installation',
+    evidence: { unsupported_reason: "Round 6's AWS lane is not installed on this installation, so only Lakebase ran." },
+  }
+  session.metrics = session.metrics!.filter((metric) => metric.lane_id === 'lakebase')
+  session.comparison = { kind: 'capability_gap', winner_lane_id: 'lakebase', margin: null }
+  session.remembered_result = 'LAKEBASE 1.2s · AWS LANE NOT INSTALLED'
+  return session
+}
+
+/** Round 4 when the AWS lane errored: Lakebase read its row, and nothing was measured. */
+function roundFourErroredLane(): DemoSession {
+  const session = verifiedSession('put_model_score_in_app')
+  session.state = 'failed'
+  session.lanes.competitor = {
+    ...session.lanes.competitor,
+    state: 'failed',
+    elapsed_ms: null,
+    status: 'Could not be measured',
+    error: 'The Glue run ended FAILED: AccessDenied',
+  }
+  session.comparison = { kind: 'not_comparable', winner_lane_id: null, margin: null }
+  session.remembered_result = null
+  return session
+}
+
+/** Round 4 on an installation without its AWS lane: Lakebase races alone. */
+function roundFourWithoutAwsLane(): DemoSession {
+  const session = verifiedSession('put_model_score_in_app')
+  session.lanes.competitor = {
+    ...session.lanes.competitor,
+    state: 'not_supported',
+    elapsed_ms: null,
+    status: 'AWS lane not installed on this installation',
+    evidence: { unsupported_reason: "Round 4's AWS lane is not installed on this installation, so only Lakebase ran." },
+  }
+  session.comparison = { kind: 'capability_gap', winner_lane_id: 'lakebase', margin: null }
+  session.remembered_result = 'LAKEBASE 31.5s · AWS LANE NOT INSTALLED'
   return session
 }
 
@@ -353,11 +422,11 @@ describe('replayStory', () => {
     ['wake_idle_app', /genuine scale zero/i, /exact run-owned transaction/i, /does not measure the rest of the application/i],
     ['make_schema_change_safely', /isolated environment/i, /same migration.*source was unchanged/i, /production cleanup was not tested/i],
     ['recover_deleted_order', /aged to a recovery point.*deleted/i, /exact deleted order.*source read still proved it absent/i, /not a production failover/i],
-    ['put_model_score_in_app', /score 0\.81.*Delta version 11/i, /Managed Reverse ETL.*fresh app connection/i, /no AWS race or margin/i],
+    ['put_model_score_in_app', /both integrations were parked.*both applications read the baseline row/i, /bell started both integrations.*score 0\.81.*Delta version 11.*own first exact read.*250 ms/i, /contains its own cold start.*own timestamps and is never compared/i],
     // Fan-in: setup is supporting evidence and the shared-T0 time to 10,000 held
     // clients is the primary result.
     ['survive_connection_spike', /included pool.*selected RDS Proxy separately/i, /exactly 10,000 authenticated held clients per lane.*own clock.*held 30s.*multiplexing/i, /fan-in time is primary.*setup supports it.*client count is not backend count/i],
-    ['analyze_live_orders_without_slowing_checkout', /checkout committed.*RED-GLOVE.*CHICAGO.*\$84\.50/i, /exact order once.*separate checkout/i, /no AWS race or margin/i],
+    ['analyze_live_orders_without_slowing_checkout', /AWS DMS and Glue were parked.*change feed was streaming.*both sources read the baseline order/i, /committed one \$84\.50 checkout on both sources.*AWS DMS and Glue cold.*own first exact Delta read.*every second/i, /AWS’s clock contains its cold start.*built in and always on.*separate checkout committed on each source/i],
   ] as const)(
     'maps %s to Setup, Same test, and Takeaway',
     (roundId, setup, sameTest, takeaway) => {
@@ -393,24 +462,51 @@ describe('replayStory', () => {
     expect(story.beats[2].body).toMatch(/fan-in time is primary.*setup supports it/i)
   })
 
-  it('keeps Rounds 4 and 6 as capability proofs without an AWS race', () => {
-    for (const roundId of [
-      'put_model_score_in_app',
-      'analyze_live_orders_without_slowing_checkout',
-    ] as const) {
-      const story = replayStory(verifiedSession(roundId))
-      expect(story.status).toBe('Capability proved')
-      expect(story.beats[2].body).toMatch(/proves the Lakebase.*capability/i)
-      expect(story.beats[2].body).toMatch(/no AWS race or margin/i)
-    }
+  it('races Round 6 lane against lane, only the AWS clock labeled a cold start', () => {
+    const story = replayStory(verifiedSession('analyze_live_orders_without_slowing_checkout'))
+    expect(story.status).toBe('Result verified')
+    expect(story.metricBeat).toBe('takeaway')
+    expect(story.metrics).toEqual([
+      { laneId: 'lakebase', label: 'Lakebase built-in change feed', value: '1.23s', note: 'Bell to exact Delta read' },
+      { laneId: 'competitor', label: 'AWS DMS + Glue from Aurora Serverless v2 (cold start)', value: '74.10s', note: 'Bell to exact Delta read' },
+    ])
+    const copy = story.beats.map((beat) => beat.body).join(' ')
+    expect(copy).not.toMatch(/not built or timed|capability|CDC stack|warm/i)
+  })
+
+  it('tells Round 6 without its AWS lane as Lakebase alone, with no race or margin', () => {
+    const story = replayStory(roundSixWithoutAwsLane())
+    expect(story.status).toBe('Capability proved')
+    expect(story.metrics.map((metric) => metric.laneId)).toEqual(['lakebase'])
+    expect(story.beats[0].body).toMatch(/no AWS lane, so no AWS clock started/i)
+    expect(story.beats[2].body).toMatch(/Without the AWS lane there is no race or margin/i)
+  })
+
+  it('races Round 4 lane against lane, each clock named by its integration', () => {
+    const story = replayStory(verifiedSession('put_model_score_in_app'))
+    expect(story.status).toBe('Result verified')
+    expect(story.metricBeat).toBe('takeaway')
+    expect(story.metrics).toEqual([
+      { laneId: 'lakebase', label: 'Lakebase synced table (cold start)', value: '31.50s', note: 'Bell to exact app read' },
+      { laneId: 'competitor', label: 'AWS Glue → Aurora Serverless v2 (cold start)', value: '77.80s', note: 'Bell to exact app read' },
+    ])
+    expect(story.beats.map((beat) => beat.body).join(' ')).not.toMatch(/not built or timed|capability/i)
+  })
+
+  it('tells Round 4 without its AWS lane as Lakebase alone, with no race or margin', () => {
+    const story = replayStory(roundFourWithoutAwsLane())
+    expect(story.status).toBe('Capability proved')
+    expect(story.metrics.map((metric) => metric.laneId)).toEqual(['lakebase'])
+    expect(story.beats[0].body).toMatch(/no AWS lane, so no AWS clock started/i)
+    expect(story.beats[2].body).toMatch(/Without the AWS lane there is no race or margin/i)
   })
 
   it.each([
     ['one exact recovery', partialRecovery(), 'partial', /did not.*no completed comparison or margin/i],
     ['no-result recovery', noResultRecovery(), 'no-result', /without an exact verified result/i],
     ['one exact Round 5 setup', partialRoundFive(), 'partial', /per-lane 10,000-client fan-in did not run/i],
-    ['Round 4 identity failure', guardrailFailure('put_model_score_in_app'), 'partial', /exact row identity did not verify/i],
-    ['Round 6 checkout failure', guardrailFailure('analyze_live_orders_without_slowing_checkout'), 'partial', /checkout guardrail did not verify/i],
+    ['Round 4 errored lane', roundFourErroredLane(), 'partial', /Lakebase produced exact proof.*did not, so there is no completed comparison or margin/i],
+    ['Round 6 errored lane', roundSixErroredLane(), 'partial', /Lakebase produced exact proof.*did not, so there is no completed comparison or margin/i],
   ] as const)('adapts %s without claiming completed proof', (_name, session, state, copy) => {
     const story = replayStory(session)
     expect(story.state).toBe(state)
@@ -517,7 +613,7 @@ describe('InstantReplay', () => {
   it.each([
     ['partial', partialRecovery(), /stopped · partial proof/i],
     ['no result', noResultRecovery(), /stopped · no result/i],
-    ['guardrail failure', guardrailFailure('analyze_live_orders_without_slowing_checkout'), /partial proof · no result/i],
+    ['Round 6 errored lane', roundSixErroredLane(), /partial proof · no result/i],
   ] as const)('renders the %s state without a completed-proof badge', (_name, session, status) => {
     render(
       <InstantReplay
@@ -529,12 +625,12 @@ describe('InstantReplay', () => {
     expect(screen.getByText(status)).toBeVisible()
     expect(screen.queryByText(/^Result verified$|^Capability proved$/i)).not.toBeInTheDocument()
     expect(screen.getByLabelText('Three-beat replay story')).toHaveTextContent(
-      /did not|without an exact|guardrail did not verify/i,
+      /did not|without an exact/i,
     )
   })
 
   it.each([
-    ['put_model_score_in_app', '0.84s'],
+    ['put_model_score_in_app', '31.50s'],
     ['survive_connection_spike', '24.00s'],
     ['analyze_live_orders_without_slowing_checkout', '1.23s'],
   ] as const)('renders %s proof values from its session', (roundId, expected) => {

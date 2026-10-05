@@ -20,8 +20,8 @@
 # server/lifecycle.py is what notices; `antidemo renew` is what repairs it. Neither
 # is optional -- see docs/iam/README.md, "the sweep ran, bring it back".
 #
-# Everything here costs $0. An IAM role, three customer-managed policies and
-# three attachments are all free; only the databases and the runner cost money.
+# Everything here costs $0. An IAM role, four customer-managed policies and
+# four attachments are all free; only the databases and the runner cost money.
 
 locals {
   anti_demo_runtime_enabled = length(var.anti_demo_runtime_principal_arns) > 0
@@ -38,10 +38,20 @@ locals {
   # `<STATE_BUCKET>` placeholder that nothing here could substitute -- rendering
   # it would attach a policy naming a bucket that does not exist. Attach it to
   # this role by hand if you opt into `--state-backend s3`.
+  #
+  # `5-round4` is Round 4's AWS Glue lane: its network, bucket, role, jobs and connections, and the
+  # run verbs the app uses at the bell. It is attached here from the first apply, although the
+  # lane itself is built by a later one, because every apply after the first runs *as* this role:
+  # the lane's own apply could not grant itself the permissions it needs.
+  #
+  # `6-round6` is Round 6's AWS DMS and Glue lane, attached from the first apply for the same
+  # reason.
   anti_demo_runtime_policy_files = local.anti_demo_runtime_enabled ? {
     "1-network"   = "anti-demo-operator-1-network.json"
     "2-databases" = "anti-demo-operator-2-databases.json"
     "3-identity"  = "anti-demo-operator-3-identity.json"
+    "5-round4"    = "anti-demo-operator-5-round4.json"
+    "6-round6"    = "anti-demo-operator-6-round6.json"
   } : {}
 
   # `jsonencode(jsondecode(...))` is what makes the 6144 cap comfortable: the

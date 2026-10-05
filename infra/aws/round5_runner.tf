@@ -474,7 +474,10 @@ resource "aws_instance" "round5_runner" {
   tags = local.round5_required_tags
 
   lifecycle {
-    ignore_changes = [tags["expires-at"], root_block_device[0].tags["expires-at"]]
+    # The AMI is the newest Amazon Linux 2023 when the runner is created. A newer image never
+    # replaces a sealed runner: Round 5's seal holds this instance, its key and its trust bundle,
+    # and a replacement has none of them, so every later plan would otherwise break Round 5.
+    ignore_changes = [ami, tags["expires-at"], root_block_device[0].tags["expires-at"]]
 
     precondition {
       condition     = contains(local.selected_subnet_ids, local.selected_runner_subnet_id)
@@ -532,7 +535,8 @@ resource "aws_instance" "round5_competitor_runner" {
   })
 
   lifecycle {
-    ignore_changes = [tags["expires-at"], root_block_device[0].tags["expires-at"]]
+    # As the Lakebase runner: a newer image never replaces a sealed runner.
+    ignore_changes = [ami, tags["expires-at"], root_block_device[0].tags["expires-at"]]
 
     precondition {
       condition     = contains(local.selected_subnet_ids, local.selected_runner_subnet_id)

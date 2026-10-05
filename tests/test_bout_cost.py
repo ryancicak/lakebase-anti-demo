@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+import server.bout_cost as bout_cost_module
+import server.cost_model as cost_model_module
 from server.bout_cost import (
     ROUND_FIVE_BOUTS,
     ROUND_ORDER,
@@ -31,6 +33,7 @@ from server.bout_cost import (
     build_bout_cost_disclosure,
 )
 from server.cost_model import (
+    AURORA_LANES_NOT_YET_MEASURED,
     V7_MEASURED_AURORA_ACU_SECONDS,
     BoutTelemetry,
     Cloud,
@@ -63,11 +66,18 @@ def _row(number: int) -> BoutCostRound:
 
 
 class TestTheRegressionThisFixes:
-    """No Aurora row may render `unavailable`, and none may render a bare `$0.00`."""
+    """No measured Aurora row may render `unavailable`, and none may render a bare `$0.00`.
+
+    The rows allowed to say `Unavailable` are lanes declared raced and not yet
+    measured (Rounds 4 and 6, from v1.1), which is the opposite failure: a row that
+    printed a number it had no measurement for.
+    """
 
     def test_every_round_renders_a_figure(self):
         for row in _disclosure().rounds:
             assert row.usd_display
+            if row.round_id in AURORA_LANES_NOT_YET_MEASURED:
+                continue
             assert row.usd_display.lower() != "unavailable", (
                 f"Round {row.round_number} lost its measurement; the samples exist in "
                 "V7_MEASURED_AURORA_ACU_SECONDS and this panel is what passes them in"
@@ -75,7 +85,12 @@ class TestTheRegressionThisFixes:
 
     def test_no_round_is_unavailable_provenance(self):
         for row in _disclosure().rounds:
-            assert row.provenance in {"measured", "structural_zero"}
+            expected = (
+                {"unavailable"}
+                if row.round_id in AURORA_LANES_NOT_YET_MEASURED
+                else {"measured", "structural_zero"}
+            )
+            assert row.provenance in expected, row.round_number
 
     def test_the_four_provisioned_rounds_are_measured(self):
         """R1, R2, R3, R5 have CloudWatch integrals, so they are measured, not modelled."""
@@ -97,34 +112,85 @@ class TestTheRegressionThisFixes:
 
 
 class TestTheStructuralZeros:
-    """Rounds 4 and 6 are an exact $0.00. That is a different fact from `unavailable`."""
+    """An exact $0.00 is a different fact from `unavailable`. No round is one from v1.1,
+    so the rendering is pinned on the row builder itself, for the next round that is."""
 
-    def test_rounds_four_and_six_are_exactly_zero(self):
-        for number in (4, 6):
-            row = _row(number)
-            assert row.usd_display == "$0.00"
-            assert row.usd_low == 0.0
-            assert row.usd_high == 0.0
-            assert row.provenance == "structural_zero"
-            assert row.band_kind == "exact_zero"
+    def test_no_round_is_a_structural_zero_from_v1_1(self):
+        assert ROUNDS_WITHOUT_AURORA == frozenset()
+        assert not [row for row in _disclosure().rounds if row.band_kind == "exact_zero"]
 
-    def test_the_zero_carries_its_reason_on_the_same_row(self):
+    def test_the_zero_carries_its_reason_on_the_same_row(self, monkeypatch):
         """A bare $0.00 is indistinguishable from a failed lookup, so it never ships bare."""
 
-        for number in (4, 6):
-            row = _row(number)
-            assert "no Aurora cluster" in row.derivation
-            assert "not unavailable" in row.band_reason.lower()
+        monkeypatch.setattr(
+            bout_cost_module,
+            "PROVISIONED_NOT_YET_RACED_ROUNDS",
+            frozenset({RoundId.ANALYZE_LIVE_ORDERS}),
+        )
+        row = bout_cost_module._structural_zero_round(RoundId.ANALYZE_LIVE_ORDERS, 6, "x").row
+        assert row.usd_display == "$0.00"
+        assert row.usd_low == 0.0 and row.usd_high == 0.0
+        assert row.provenance == "structural_zero"
+        assert row.band_kind == "exact_zero"
+        # A cluster that stands ahead of its lane: no bout touches it, never "no cluster".
+        assert "stands ahead of an AWS lane that does not race yet" in row.derivation
+        assert "no bout touches it" in row.derivation
+        assert "not unavailable" in row.band_reason.lower()
+        # Its standing compute is named as carrying cost, not left to read as free.
+        assert "carrying cost, priced with the installation and not per bout" in (row.band_reason)
+        assert "unavailable" not in row.usd_display.lower()
+
+    def test_a_round_with_no_cluster_at_all_would_still_say_so(self, monkeypatch):
+        # The reason is read off the cost model, so a round that stood nothing up
+        # would not borrow the other sentence.
+        monkeypatch.setattr(bout_cost_module, "PROVISIONED_NOT_YET_RACED_ROUNDS", frozenset())
+        row = bout_cost_module._structural_zero_round(RoundId.ANALYZE_LIVE_ORDERS, 6, "x").row
+        assert row.derivation == "infra/aws/locals.tf stands up no Aurora cluster for this round"
+        assert "There is no Aurora cluster to wake" in row.band_reason
 
     def test_the_zero_rounds_are_the_ones_terraform_stands_nothing_up_for(self):
         """Pinned against the estimator's own view rather than trusted as a literal."""
 
         zero_ids = {row.round_id for row in _disclosure().rounds if row.band_kind == "exact_zero"}
         assert zero_ids == set(ROUNDS_WITHOUT_AURORA)
+        assert ROUNDS_WITHOUT_AURORA == cost_model_module._ROUNDS_WITHOUT_AWS
 
-    def test_a_structural_zero_never_borrows_the_unavailable_rendering(self):
-        for number in (4, 6):
-            assert "unavailable" not in _row(number).usd_display.lower()
+
+class TestTheUnmeasuredRound:
+    """Rounds 4 and 6 from v1.1: raced, not yet measured, so unknown and never zero."""
+
+    def test_round_six_is_unknown_rather_than_the_zero_it_was(self):
+        # Its DMS task reads its own Aurora cluster, which logical replication keeps awake.
+        row = _row(6)
+        assert row.provenance == "unavailable"
+        assert row.usd_display == "Unavailable"
+        assert row.usd_low is None and row.usd_high is None
+        assert row.band_kind != "exact_zero"
+        assert "Not zero — unknown." in row.band_reason
+        assert "DMS" in row.band_reason and "logical replication" in row.band_reason
+        assert "Glue" in row.band_reason
+        assert not row.bouts
+
+    def test_round_four_is_unknown_rather_than_the_zero_it_was(self):
+        # Its Glue lane writes into its own Aurora cluster, which a bout wakes.
+        row = _row(4)
+        assert row.provenance == "unavailable"
+        assert row.usd_display == "Unavailable"
+        assert row.usd_low is None and row.usd_high is None
+        assert row.band_kind != "exact_zero"
+        assert "no Aurora cluster" not in row.derivation
+        assert "Not zero — unknown." in row.band_reason
+        assert "Glue" in row.band_reason
+        assert not row.bouts
+
+    def test_the_total_says_it_leaves_rounds_four_and_six_out(self):
+        disclosure = _disclosure()
+        assert (
+            "Rounds 4 and 6 are raced but not measured yet, so the total leaves them out "
+            "rather than counting them as zero."
+        ) in disclosure.scope_note
+        # And the superlative is the measured rounds', not a claim about Round 4.
+        assert "dearest measured round" in disclosure.dearest_claim
 
 
 class TestBandsThatMustNotCollapse:
@@ -417,11 +483,11 @@ class TestCopyContract:
         """
 
         expected = number_word(InstallationShape().rds_instances)
-        assert expected == "three"
-        for number in (4, 6):
-            reason = _row(number).band_reason
-            assert f"the {expected} standing RDS instances" in reason
-            assert "four standing RDS instances" not in reason
+        # Five from v1.1: the instances for Rounds 4 and 6 stand.
+        assert expected == "five"
+        reason = _zero_row_reason()
+        assert f"the {expected} standing RDS instances" in reason
+        assert "four standing RDS instances" not in reason
 
     def test_the_row_count_and_the_fleet_count_are_the_same_number(self):
         """Belt and braces: the word tracks the shape, not a literal.
@@ -432,4 +498,12 @@ class TestCopyContract:
 
         for size in (0, 1, 2, 3, 4):
             assert number_word(size) == ("no", "one", "two", "three", "four")[size]
-        assert number_word(InstallationShape().rds_instances) in _row(4).band_reason
+        assert number_word(InstallationShape().rds_instances) in _zero_row_reason()
+
+
+def _zero_row_reason() -> str:
+    """A structural-zero row's reason. No round renders one from v1.1, so the builder is
+    asked directly, as it would be for the next round that stands nothing up."""
+
+    row = bout_cost_module._structural_zero_round(RoundId.ANALYZE_LIVE_ORDERS, 6, "x").row
+    return row.band_reason

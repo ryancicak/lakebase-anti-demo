@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 from uuid import uuid4
 
 from databricks.sdk.errors.base import DatabricksError
@@ -51,23 +52,11 @@ from .cost_ledger import CalibrationKey, CostEstimate, CostLedgerStore
 from .descent_cost import build_descent_cost_disclosure
 from .live_orders import (
     LiveOrder,
-    LiveOrdersArm,
-    LiveOrdersEngine,
     LiveOrdersError,
-    LiveOrdersPhase,
-    LiveOrdersProgress,
-    LiveOrdersResult,
 )
 from .manifest import DemoManifest
 from .model_score import (
-    WARM_PROOF_REUSE_SECONDS,
-    ModelScoreArm,
-    ModelScoreEngine,
     ModelScoreError,
-    ModelScorePhase,
-    ModelScoreProgress,
-    ModelScoreProofResult,
-    ModelScoreRunResult,
     ModelScoreUpdate,
 )
 from .model_score_live import (
@@ -91,8 +80,6 @@ from .models import (
     LaneSnapshot,
     LaneState,
     MetricValue,
-    RedoSnapshot,
-    RedoState,
     ResetMode,
     RoundFiveClockProjectionSnapshot,
     RoundFiveRuntimeLaneSnapshot,
@@ -127,6 +114,17 @@ from .recovery import (
     RecoveryStopControl,
     RecoveryStoppedResult,
 )
+from .round4_race import (
+    COMPETITOR_LANE,
+    LAKEBASE_LANE,
+    LANE_TIMEOUT_SECONDS,
+    Round4Arm,
+    Round4Phase,
+    Round4RaceEngine,
+    Round4RaceError,
+    Round4RaceResult,
+    Verdict,
+)
 from .round5_cleanup_owed import (
     Round5CleanupOwed,
     clear_round5_cleanup_owed,
@@ -141,6 +139,15 @@ from .round5_warm import (
     Round5WarmState,
     WarmClaimUnavailableError,
     WarmStoreConflictError,
+)
+from .round6_race import LANE_TIMEOUT_SECONDS as ROUND6_LANE_TIMEOUT_SECONDS
+from .round6_race import (
+    Round6Arm,
+    Round6Phase,
+    Round6RaceEngine,
+    Round6RaceError,
+    Round6RaceResult,
+    new_bout_orders,
 )
 from .round_availability import (
     GRANT_REFUSAL_HEADLINE,
@@ -487,34 +494,328 @@ class RoundStorageReadinessError(RuntimeError):
 
 _ROUND_ONE_TRANSACTION_WIRE_CALL = "PostgreSQL TLS connect → INSERT → COMMIT → SELECT"
 
-#: How long a Round 4 re-do, or the next Round 4 arm, waits for a proof's row to
-#: be put back before refusing. The restore normally finishes in about fifteen
-#: seconds.
-_ROUND4_SETTLEMENT_WAIT_SECONDS = 120.0
-
-#: How long after a Round 4 card is created a background warm-up keeps off its
-#: source row. The UI arms a new card about a second after creating it.
-_ROUND4_CARD_GRACE_SECONDS = 30.0
+#: How long the next Round 4 Prepare waits for the previous bout to finish
+#: settling (restore the row, let both lanes carry it, park both) before
+#: refusing. Settling carries a row through both running lanes and then parks
+#: a Glue run, which waits out its slot release, so it takes a minute or two.
+_ROUND4_SETTLEMENT_WAIT_SECONDS = 480.0
 
 _ROUND_FOUR_UNSUPPORTED_REASON = (
-    "No AWS-native equivalent lane was configured or timed in this scoped proof."
+    "Round 4's AWS lane is not installed on this installation, so only Lakebase ran. "
+    "It needs Round 4's Delta table to be readable from the installation's AWS account."
 )
-_ROUND_FOUR_COMPARISON_DETAIL = (
-    "Lakebase verified the scoped native Synced Tables capability; no AWS-native "
-    "equivalent lane was timed. This is not a speed comparison."
-)
-def _round_four_remembered_result(elapsed_ms: float) -> str:
+_ROUND_FOUR_CONDITION = "both integrations cold start at the bell"
+
+#: The least time between two fight-card wakes of one matchup's destinations. Aurora pauses
+#: after five idle minutes, so a fight card left open and asking every minute keeps it awake.
+ROUND4_WAKE_INTERVAL_SECONDS = 60.0
+
+
+def _round_four_comparison(
+    result: Round4RaceResult,
+    competitor_name: str,
+    *,
+    has_competitor: bool,
+) -> tuple[ComparisonSnapshot, bool]:
+    """The card's verdict, taken from the engine's resolution and never recomputed.
+
+    Returns the comparison and whether the bout measured anything. A lane that
+    errored measures nothing, so its bout is not a result.
+    """
+
+    resolution = result.resolution
+    names = {LAKEBASE_LANE: "Lakebase", COMPETITOR_LANE: competitor_name}
+    lakebase = result.outcomes[LAKEBASE_LANE]
+    if not has_competitor:
+        if not lakebase.verified:
+            return (
+                ComparisonSnapshot(
+                    kind=ComparisonKind.NOT_COMPARABLE,
+                    detail=lakebase.failure or "Lakebase did not deliver the row.",
+                ),
+                False,
+            )
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.CAPABILITY_GAP,
+                winner_lane_id=LAKEBASE_LANE,
+                detail=_ROUND_FOUR_UNSUPPORTED_REASON,
+            ),
+            True,
+        )
+    if resolution.verdict is Verdict.WIN and resolution.winner and resolution.margin_ms:
+        winner = resolution.winner
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.MEASURED,
+                winner_lane_id=winner,
+                margin=MetricValue(
+                    spec_id="bell_to_exact_read_ms",
+                    lane_id=winner,
+                    value=resolution.margin_ms,
+                    display_value=f"{resolution.margin_ms / 1000:.2f} s",
+                ),
+                detail=(
+                    f"{names[winner]} put the exact row in the application "
+                    f"{resolution.margin_ms / 1000:.2f} s sooner; {_ROUND_FOUR_CONDITION}."
+                ),
+            ),
+            True,
+        )
+    if resolution.verdict is Verdict.WITHIN_RESOLUTION:
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.TIE,
+                detail=(
+                    "Both rows arrived within the verifiers' measurement resolution; "
+                    f"{_ROUND_FOUR_CONDITION}."
+                ),
+            ),
+            True,
+        )
+    if resolution.verdict is Verdict.LOWER_BOUND and resolution.winner:
+        winner = resolution.winner
+        loser = COMPETITOR_LANE if winner == LAKEBASE_LANE else LAKEBASE_LANE
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.ADJUDICATED_STOPPAGE,
+                winner_lane_id=winner,
+                detail=(
+                    f"{names[winner]} put the exact row in the application; {names[loser]} "
+                    f"did not within {LANE_TIMEOUT_SECONDS:.0f} s of the bell, so the margin "
+                    f"is at least that and is not a measurement; {_ROUND_FOUR_CONDITION}."
+                ),
+            ),
+            True,
+        )
     return (
-        f"ANALYTICS CHANGE → LIVE APP · {elapsed_ms / 1000:.2f}s · "
-        "AWS NOT TIMED · MARGIN N/A"
+        ComparisonSnapshot(
+            kind=ComparisonKind.NOT_COMPARABLE,
+            detail=f"No verdict: {resolution.detail}.",
+        ),
+        False,
     )
 
 
-def _round_six_remembered_result(elapsed_ms: float) -> str:
+def _round_four_remembered_result(snapshot: SessionSnapshot) -> str:
+    """The one line the room remembers: who won and by how much, or why nobody did.
+
+    Each lane's own clock is on screen above it, so as in Rounds 1 to 3 the line is
+    the verdict alone. With both clocks and the round's name in it, it wrapped onto
+    three lines of the ring (2026-09-29).
+    """
+
+    lakebase = snapshot.lanes[LAKEBASE_LANE]
+    competitor = snapshot.lanes[COMPETITOR_LANE]
+    comparison = snapshot.comparison
+
+    if competitor.state == LaneState.NOT_SUPPORTED:
+        elapsed = lakebase.elapsed_ms
+        clock = f"{elapsed / 1000:.1f}s" if elapsed is not None else "NO ROW"
+        return f"LAKEBASE {clock} · AWS LANE NOT INSTALLED"
+    winner = None
+    if comparison is not None and comparison.winner_lane_id is not None:
+        winner = "LAKEBASE" if comparison.winner_lane_id == LAKEBASE_LANE else "AWS"
+    if comparison is not None and comparison.kind == ComparisonKind.MEASURED and winner:
+        margin = comparison.margin.value if comparison.margin is not None else 0.0
+        return f"{winner} WINS · MARGIN {float(margin) / 1000:.1f}s"
+    if comparison is not None and comparison.kind == ComparisonKind.TIE:
+        return "TIE · WITHIN MEASUREMENT RESOLUTION"
+    if winner:
+        return f"{winner} WINS · MARGIN IS A LOWER BOUND"
+    return "NO DECLARED WINNER · MARGIN N/A"
+
+
+_ROUND_SIX_UNSUPPORTED_REASON = (
+    "Round 6's AWS lane is not installed on this installation, so only Lakebase ran. It needs "
+    "this installation's identity to create a Unity Catalog storage credential and external "
+    "location."
+)
+#: Round 6's cold rule, as Ryan chose it (the v1.1 design, section 2): AWS starts cold at the bell,
+#: and Lakebase's feed is part of the database and never stops.
+_ROUND_SIX_CONDITION = (
+    "AWS DMS and Glue start cold at the bell; Lakebase's change feed is built in and always on"
+)
+
+#: How long the next Round 6 Prepare waits for the previous bout to finish settling (remove its
+#: orders, park DMS and Glue, and wait out Glue's slot release) before refusing.
+_ROUND6_SETTLEMENT_WAIT_SECONDS = 480.0
+
+
+def _round_six_comparison(
+    result: Round6RaceResult,
+    competitor_name: str,
+    *,
+    has_competitor: bool,
+) -> tuple[ComparisonSnapshot, bool]:
+    """The card's verdict, taken from the engine's resolution and never recomputed.
+
+    Returns the comparison and whether the bout measured anything. A lane that errored measures
+    nothing, so its bout is not a result.
+    """
+
+    resolution = result.resolution
+    names = {LAKEBASE_LANE: "Lakebase", COMPETITOR_LANE: competitor_name}
+    lakebase = result.outcomes[LAKEBASE_LANE]
+    if not has_competitor:
+        if not lakebase.verified:
+            return (
+                ComparisonSnapshot(
+                    kind=ComparisonKind.NOT_COMPARABLE,
+                    detail=lakebase.failure or "Lakebase did not deliver the order.",
+                ),
+                False,
+            )
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.CAPABILITY_GAP,
+                winner_lane_id=LAKEBASE_LANE,
+                detail=_ROUND_SIX_UNSUPPORTED_REASON,
+            ),
+            True,
+        )
+    if resolution.verdict is Verdict.WIN and resolution.winner and resolution.margin_ms:
+        winner = resolution.winner
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.MEASURED,
+                winner_lane_id=winner,
+                margin=MetricValue(
+                    spec_id="bell_to_exact_history_ms",
+                    lane_id=winner,
+                    value=resolution.margin_ms,
+                    display_value=f"{resolution.margin_ms / 1000:.2f} s",
+                ),
+                detail=(
+                    f"{names[winner]} put the exact order in the lakehouse "
+                    f"{resolution.margin_ms / 1000:.2f} s sooner; {_ROUND_SIX_CONDITION}."
+                ),
+            ),
+            True,
+        )
+    if resolution.verdict is Verdict.WITHIN_RESOLUTION:
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.TIE,
+                detail=(
+                    "Both orders arrived within the verifiers' measurement resolution; "
+                    f"{_ROUND_SIX_CONDITION}."
+                ),
+            ),
+            True,
+        )
+    if resolution.verdict is Verdict.LOWER_BOUND and resolution.winner:
+        winner = resolution.winner
+        loser = COMPETITOR_LANE if winner == LAKEBASE_LANE else LAKEBASE_LANE
+        return (
+            ComparisonSnapshot(
+                kind=ComparisonKind.ADJUDICATED_STOPPAGE,
+                winner_lane_id=winner,
+                detail=(
+                    f"{names[winner]} put the exact order in the lakehouse; {names[loser]} did "
+                    f"not within {ROUND6_LANE_TIMEOUT_SECONDS:.0f} s of the bell, so the margin "
+                    f"is at least that and is not a measurement; {_ROUND_SIX_CONDITION}."
+                ),
+            ),
+            True,
+        )
     return (
-        f"EXACT DELTA ANSWER · {elapsed_ms / 1000:.2f}s · "
-        "AWS PIPELINE NOT BUILT · MARGIN N/A"
+        ComparisonSnapshot(
+            kind=ComparisonKind.NOT_COMPARABLE,
+            detail=f"No verdict: {resolution.detail}.",
+        ),
+        False,
     )
+
+
+def _round_six_remembered_result(snapshot: SessionSnapshot) -> str:
+    """The one line the room remembers, in Round 4's shape: each lane's own clock is on screen
+    above it, so the line is the verdict alone."""
+
+    lakebase = snapshot.lanes[LAKEBASE_LANE]
+    competitor = snapshot.lanes[COMPETITOR_LANE]
+    comparison = snapshot.comparison
+    if competitor.state == LaneState.NOT_SUPPORTED:
+        elapsed = lakebase.elapsed_ms
+        clock = f"{elapsed / 1000:.1f}s" if elapsed is not None else "NO ORDER"
+        return f"LAKEBASE {clock} · AWS LANE NOT INSTALLED"
+    winner = None
+    if comparison is not None and comparison.winner_lane_id is not None:
+        winner = "LAKEBASE" if comparison.winner_lane_id == LAKEBASE_LANE else "AWS"
+    if comparison is not None and comparison.kind == ComparisonKind.MEASURED and winner:
+        margin = comparison.margin.value if comparison.margin is not None else 0.0
+        return f"{winner} WINS · MARGIN {float(margin) / 1000:.1f}s"
+    if comparison is not None and comparison.kind == ComparisonKind.TIE:
+        return "TIE · WITHIN MEASUREMENT RESOLUTION"
+    if winner:
+        return f"{winner} WINS · MARGIN IS A LOWER BOUND"
+    return "NO DECLARED WINNER · MARGIN N/A"
+
+
+def _finished_over_a_bound(
+    finished: Mapping[str, bool],
+    timed_out: Mapping[str, bool],
+) -> tuple[str, str] | None:
+    """Rounds 2 and 3, decided as Rounds 4 and 6 are: ``(winner, stopped)`` when exactly one
+    lane finished and the other was still running at its bound from the bell.
+
+    A lane that errored measured nothing, so nobody wins over it, and a lane still running
+    is never handed a win.
+    """
+
+    if set(finished) != {LAKEBASE_LANE, COMPETITOR_LANE}:
+        return None
+    winners = [lane_id for lane_id, ok in finished.items() if ok]
+    if len(winners) != 1:
+        return None
+    (winner,) = winners
+    stopped = COMPETITOR_LANE if winner == LAKEBASE_LANE else LAKEBASE_LANE
+    return (winner, stopped) if timed_out.get(stopped) else None
+
+
+def _floor_evidence(floor_ms: float) -> dict[str, Any]:
+    """A lane stopped at its bound, with its clock as a floor, in the shape a towel gives a
+    lane it stops: the lane's clock, the receipt and the recap all read it as a lower bound.
+
+    Ryan (2026-10-03): without the floor, a lane AWS could not finish "looks like the app
+    crapped out and that's not the case".
+    """
+
+    return {
+        "censored": True,
+        "lower_bound_ms": floor_ms,
+        "display_value": f">{floor_ms / 1000:.2f}s",
+    }
+
+
+def _adjudicate_bound(
+    snapshot: SessionSnapshot,
+    winner: str,
+    stopped: str,
+    *,
+    finished_task: str,
+) -> None:
+    """Put a Round 2 or 3 bout decided at a lane's bound on the card.
+
+    The stopped lane keeps the time it ran as its floor.
+    """
+
+    lane = snapshot.lanes[stopped]
+    floor_ms = lane.elapsed_ms or 0.0
+    lane.status = "Still running at its bound from the bell · stopped there"
+    lane.error = None
+    lane.evidence = _floor_evidence(floor_ms)
+    display = lane.evidence["display_value"]
+    snapshot.comparison = ComparisonSnapshot(
+        kind=ComparisonKind.ADJUDICATED_STOPPAGE,
+        winner_lane_id=winner,
+        detail=(
+            f"{snapshot.lanes[winner].name} {finished_task}; {lane.name} was still running "
+            f"{display.removeprefix('>')} after the bell, so the margin is a lower bound "
+            "and not a measurement."
+        ),
+    )
+
 
 #: The fan-in target, read from the contract so this file cannot disagree with the runner
 #: about what 10,000 means.
@@ -527,6 +828,10 @@ _ROUND_FIVE_CONCURRENCY = 10_000
 _ROUND_FIVE_WITNESS_CLIENTS = 64
 _ROUND_FIVE_RUNNER = "Python 3.12 event-driven TLS/native-password"
 _ROUND_FIVE_CLEANUP_PENDING = "Round 5 cleanup is settling automatically · Ring remains protected"
+_ARMED_CARD_CANCELLED = (
+    "Fight card released by the ring owner before the bell. "
+    "No run started and no result was recorded."
+)
 
 #: Rounds whose towel cleanup deletes isolated AWS environments and so can race an
 #: in-flight create; their cleanup retries automatically before it reports FAILED.
@@ -732,9 +1037,9 @@ class SessionRecord:
     recovery_arm: RecoveryArm | None = None
     recovery_stop_control: RecoveryStopControl | None = None
     recovery_outcome: RecoveryRunResult | RecoveryStoppedResult | None = None
-    model_score_engine: ModelScoreEngine | None = None
-    model_score_arm: ModelScoreArm | None = None
-    model_score_result: ModelScoreRunResult | None = None
+    model_score_engine: Round4RaceEngine | None = None
+    model_score_arm: Round4Arm | None = None
+    model_score_result: Round4RaceResult | None = None
     model_score_pending_update: ModelScoreUpdate | None = None
     model_score_terminal_published: bool = False
     model_score_terminal_task: asyncio.Task[None] | None = None
@@ -750,9 +1055,9 @@ class SessionRecord:
     #: instead of surfacing a human "Retry Cleanup". No end-user action ever
     #: depends on it.
     connection_spike_cleanup_retry_task: asyncio.Task[None] | None = None
-    live_orders_engine: LiveOrdersEngine | None = None
-    live_orders_arm: LiveOrdersArm | None = None
-    live_orders_result: LiveOrdersResult | None = None
+    live_orders_engine: Round6RaceEngine | None = None
+    live_orders_arm: Round6Arm | None = None
+    live_orders_result: Round6RaceResult | None = None
     live_orders_pending_order: LiveOrder | None = None
     live_orders_guardrail_order: LiveOrder | None = None
     settlement_task: asyncio.Task[None] | None = None
@@ -825,9 +1130,9 @@ class RunManager:
         verifier: NeutralVerifier | None = None,
         safe_change_factory: Callable[[], SafeChangeEngine] | None = None,
         recovery_factory: Callable[[], RecoveryEngine] | None = None,
-        model_score_factory: Callable[[], ModelScoreEngine] | None = None,
+        model_score_factory: Callable[[CompetitorId], Round4RaceEngine] | None = None,
         connection_spike_factory: Callable[[CompetitorId], object] | None = None,
-        live_orders_factory: Callable[[], LiveOrdersEngine] | None = None,
+        live_orders_factory: Callable[[CompetitorId], Round6RaceEngine] | None = None,
         lease_store: BoutLeaseStore | None = None,
         round5_lease_store: BoutLeaseStore | None = None,
         readiness_check: Callable[[], None] | None = None,
@@ -844,6 +1149,7 @@ class RunManager:
         clock_ns: Callable[[], int] = time.monotonic_ns,
         delta_storage_probe: Callable[[], Awaitable[None]] | None = None,
         delta_storage_probe_interval_seconds: float = 60.0,
+        delta_storage_probe_watched: Callable[[], bool] | None = None,
         round5_protocol: str = ROUND5_BELL_PROTOCOL,
         round5_warm_coordinator: Round5WarmCoordinator | None = None,
     ) -> None:
@@ -912,6 +1218,12 @@ class RunManager:
         )
         self._delta_storage_probe_finished_ns: int | None = None
         self._delta_storage_probe_task: asyncio.Task[None] | None = None
+        # Whether a person is on the app. None counts as always, for a caller with no
+        # such signal; the app passes one so an open tab cannot keep a warehouse up.
+        self._delta_storage_probe_watched = delta_storage_probe_watched
+        # Round 4's fight-card wake, one per competitor: the task, and when it last started.
+        self._round4_wake_tasks: dict[CompetitorId, asyncio.Task[None]] = {}
+        self._round4_woken_at: dict[CompetitorId, float] = {}
         self._clock_ns = clock_ns
         self._close_lock = asyncio.Lock()
         self._closed = False
@@ -1032,9 +1344,7 @@ class RunManager:
         # The newest Round 4 background settlement. The ring is released before
         # it runs, so the next arm must wait for it rather than race it.
         self._round4_settlement: asyncio.Task[None] | None = None
-        # Held by a background warm-up (prewarm_round4). An arm or a re-do that
-        # arrives meanwhile waits for it, then reuses the proof it leaves.
-        self._round4_prewarm_lock = asyncio.Lock()
+        self._round6_settlement: asyncio.Task[None] | None = None
         # Session retention. A session is created per bout attempt, abandoned ones
         # included, and each one holds a snapshot, up to five engines and an event
         # log -- about a megabyte. Nothing used to release them, so an installation
@@ -1090,6 +1400,43 @@ class RunManager:
     @property
     def model_score_available(self) -> bool:
         return self._model_score_factory is not None
+
+    def wake_round4(self, competitor: CompetitorId) -> bool:
+        """Wake Round 4's destinations for this matchup ahead of Prepare. True if it began one.
+
+        The fight card asks when it opens and again while it stays open, so a paused Aurora
+        is awake before anyone presses Prepare. At most one wake per competitor per
+        `ROUND4_WAKE_INTERVAL_SECONDS`, well inside Aurora's five idle minutes. Nothing is
+        started: the integrations stay parked, so the race is as cold as ever.
+        """
+
+        factory = self._model_score_factory
+        if factory is None or self._closed:
+            return False
+        now = time.monotonic()
+        last = self._round4_woken_at.get(competitor)
+        running = self._round4_wake_tasks.get(competitor)
+        if (running is not None and not running.done()) or (
+            last is not None and now - last < ROUND4_WAKE_INTERVAL_SECONDS
+        ):
+            return False
+        self._round4_woken_at[competitor] = now
+
+        async def wake() -> None:
+            try:
+                # Off the loop, as at arm: the live engine builds a workspace client and an AWS
+                # session.
+                engine = await asyncio.to_thread(factory, competitor)
+                await engine.wake()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a wake is only a head start for Prepare
+                logger.info("Round 4 fight-card wake for %s failed", competitor, exc_info=True)
+
+        self._round4_wake_tasks[competitor] = asyncio.create_task(
+            wake(), name=f"round4-wake-{competitor.value}"
+        )
+        return True
 
     @property
     def connection_spike_available(self) -> bool:
@@ -1424,6 +1771,12 @@ class RunManager:
         or Round 6. The probe is read-only and cached so the polling fight card
         cannot turn into a SQL warehouse keepalive. Concurrent browser polls join
         the same task rather than issuing duplicate Statement Execution calls.
+
+        The cache alone did not do that: it lasts a minute, the warehouse stops
+        only after ten quiet minutes, and an open tab polls the catalog every
+        thirty seconds, so a tab left open kept the warehouse up all night
+        (2026-10-02). Once a verdict exists, it is re-read only while a person is
+        on the app (``delta_storage_probe_watched``).
         """
 
         if self._closed or self._delta_storage_probe is None:
@@ -1434,12 +1787,11 @@ class RunManager:
             return
         now = time.monotonic_ns()
         last = self._delta_storage_probe_finished_ns
-        if (
-            not force
-            and last is not None
-            and now - last < self._delta_storage_probe_interval_ns
-        ):
-            return
+        if not force and last is not None:
+            fresh = now - last < self._delta_storage_probe_interval_ns
+            watched = self._delta_storage_probe_watched
+            if fresh or (watched is not None and not watched()):
+                return
         task = asyncio.create_task(
             self._probe_delta_storage(),
             name="round4-round6-storage-readiness",
@@ -1848,6 +2200,11 @@ class RunManager:
                 storage_probe.cancel()
                 await asyncio.gather(storage_probe, return_exceptions=True)
             self._delta_storage_probe_task = None
+            wakes = [task for task in self._round4_wake_tasks.values() if not task.done()]
+            for wake in wakes:
+                wake.cancel()
+            await asyncio.gather(*wakes, return_exceptions=True)
+            self._round4_wake_tasks.clear()
             async with self._records_lock:
                 records = tuple(self._records.values())
 
@@ -2354,15 +2711,20 @@ class RunManager:
     ) -> SessionSnapshot:
         """Cancel a fight card before its bell.
 
-        Round 1 cancels a start-state check that is still running. Round 5 cancels an
-        ARMED card that has not rung, through the same no-bell cleanup the armed-window
-        expiry uses, so changing the matchup costs one reset rather than the rest of
-        the three-minute window.
+        Round 1 cancels a start-state check that is still running. Every round cancels an
+        ARMED card that has not rung, through the same no-bell release the armed-window
+        expiry uses, so changing the matchup costs one release rather than the rest of the
+        window. Round 5's goes through its own warm-pool cleanup.
         """
         self._require_open()
         record = await self._record(session_id)
         if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
             return await self._cancel_armed_round5(record, operator)
+        if record.snapshot.state == SessionState.ARMED or (
+            record.snapshot.state == SessionState.FAILED
+            and record.snapshot.failure == _ARMED_CARD_CANCELLED
+        ):
+            return await self._cancel_armed_card(record, operator)
         async with record.lock:
             if (
                 record.snapshot.state == SessionState.FAILED
@@ -2432,6 +2794,47 @@ class RunManager:
             },
         )
         return snapshot
+
+    async def _cancel_armed_card(
+        self,
+        record: SessionRecord,
+        operator: BoutOperator,
+    ) -> SessionSnapshot:
+        """Release an armed card that has not rung, for any round but Round 5.
+
+        The armed-window expiry's release, worded as the owner's choice and published as
+        a cancellation, as Round 1's pre-arm cancel is: the browser goes back to the card
+        without reporting an error, and the record keeps an abandoned attempt that never
+        reaches the scoreboard. A second press returns the released card.
+        """
+
+        async with record.lock:
+            self._assert_operator(record.operator, operator)
+            if (
+                record.snapshot.state == SessionState.FAILED
+                and record.snapshot.run_started_at is None
+                and record.snapshot.failure == _ARMED_CARD_CANCELLED
+            ):
+                return self._revalidated_snapshot(record.snapshot)
+            if (
+                record.snapshot.state != SessionState.ARMED
+                or record.snapshot.run_started_at is not None
+                or record.armed_at_monotonic is None
+            ):
+                raise InvalidStateError(
+                    "Only an armed fight card that has not rung can be cancelled"
+                )
+            armed_at = record.armed_at_monotonic
+            self._cancel_armed_expiry(record)
+        if not await self._abandon_armed_bout(
+            record,
+            armed_at,
+            message=_ARMED_CARD_CANCELLED,
+            event="session_cancelled",
+        ):
+            raise InvalidStateError("The fight card changed before it could be cancelled")
+        async with record.lock:
+            return self._revalidated_snapshot(record.snapshot)
 
     async def _cancel_armed_round5(
         self,
@@ -2633,22 +3036,10 @@ class RunManager:
                             round_number=5,
                         )
                     ) from exc
-            if is_model_score or is_live_orders:
-                competitor = record.snapshot.lanes["competitor"]
-                competitor.state = LaneState.NOT_SUPPORTED
-                competitor.status = (
-                    "AWS lane not timed for this native CDF proof"
-                    if is_live_orders
-                    else "AWS lane not timed for this Managed Sync proof"
-                )
-                competitor.activity = LaneActivity(phase="not_supported")
-                competitor.evidence = {
-                    "unsupported_reason": (
-                        "Aurora/RDS require a separately configured CDC pipeline into Delta."
-                        if is_live_orders
-                        else _ROUND_FOUR_UNSUPPORTED_REASON
-                    )
-                }
+            # Rounds 4 and 6 leave their competitor lane to their own Prepare, which
+            # knows whether this installation's AWS lane is sealed. A lane marked not
+            # supported here reads "not installed" through Prepare, and the browser
+            # held it past the bell.
             record.snapshot.state = SessionState.CHECKING
             record.snapshot.updated_at = datetime.now(UTC)
             try:
@@ -2752,7 +3143,7 @@ class RunManager:
             if is_live_orders and (
                 record.live_orders_engine is None or record.live_orders_arm is None
             ):
-                raise InvalidStateError("The native CDF proof must be armed again")
+                raise InvalidStateError("Round 6 must be prepared again")
             if (
                 not is_safe_change
                 and not is_recovery
@@ -3029,15 +3420,11 @@ class RunManager:
                     proof_nonce=f"round4-v1-{uuid4().hex}",
                 )
             if is_live_orders:
-                record.live_orders_pending_order = LiveOrder(
-                    order_id=str(uuid4()),
-                    sku="RED-GLOVE",
-                    store="CHICAGO",
-                    quantity=1,
-                    total_cents=8450,
-                    status="paid",
-                    proof_nonce=f"round6-{uuid4().hex}",
-                )
+                # One checkout for every source and a separate guardrail, each with a bout
+                # nonce, so residue a crash leaves is recognizably this demo's.
+                order, guardrail = new_bout_orders(record.live_orders_engine.baseline)
+                record.live_orders_pending_order = order
+                record.live_orders_guardrail_order = guardrail
             operation = (
                 self._run_safe_change(record)
                 if is_safe_change
@@ -3089,96 +3476,26 @@ class RunManager:
         session_id: str,
         operator: BoutOperator | None = None,
     ) -> SessionSnapshot:
+        """Refuse: v1.1 has no re-do in any round that offered one here.
+
+        Round 4 dropped its re-do (Ryan, 2026-09-28). After a bout both of its
+        integrations are running, so a re-do could not start cold, and the
+        both-cold rule allows no other kind. Racing again is a new bout, which
+        meets both lanes parked. The endpoint stays so an older client gets a
+        reason instead of a 404.
+        """
+
         self._require_open()
         record = await self._record(session_id)
         async with record.lock:
-            if record.snapshot.round.id != RoundId.PUT_MODEL_SCORE_IN_APP:
-                raise InvalidStateError("The score-change re-do is available only in Round 4")
             effective_operator = operator or record.operator
             if effective_operator is None:
                 raise InvalidStateError("ONLY THE RING OWNER CAN CONTROL THIS BOUT")
             self._assert_operator(record.operator, effective_operator)
-            redo = record.snapshot.redo
-            if redo is not None and redo.state in {
-                RedoState.RUNNING,
-                RedoState.VERIFIED,
-                RedoState.FAILED,
-            }:
-                return record.snapshot.model_copy(deep=True)
-            if self._model_score_factory is None:
-                raise InvalidStateError("Round 4 live adapter is not configured.")
-            self._readiness_check()
-            if record.snapshot.state != SessionState.VERIFIED or redo is None:
-                raise InvalidStateError("Round 4 must verify before changing the score again")
-            if redo.state != RedoState.READY:
-                raise InvalidStateError("The Round 4 re-do is not ready")
-            if record.task and not record.task.done():
-                raise InvalidStateError("A session operation is already running")
-            engine = record.model_score_engine
-            arm = record.model_score_arm
-            result = record.model_score_result
-            if engine is None or arm is None or result is None:
-                raise InvalidStateError("The exact issued Managed Sync proof is unavailable")
-
-            await self._claim_bout(
-                record,
-                effective_operator,
-                phase="redo_committed",
-            )
-            started_at = datetime.now(UTC)
-            try:
-                cost_bout_id = await self._open_cost_bout(
-                    record,
-                    kind="redo",
-                    started_at=started_at,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Redo cost window open failed session=%s round=%s diagnosis=%s",
-                    record.snapshot.id,
-                    record.snapshot.round.id.value,
-                    operator_diagnosis(exc),
-                    exc_info=True,
-                )
-                await self._release_bout(record)
-                raise InvalidStateError(
-                    cost_window_refusal(
-                        "The re-do cost window could not be opened.",
-                        exc,
-                    )
-                ) from exc
-            update = ModelScoreUpdate(
-                entity_id=engine.contract.entity_id,
-                score=0.33,
-                model_version="risk-v2",
-                proof_nonce=f"round4-v2-{uuid4().hex}",
-            )
-            record.model_score_pending_update = update
-            record.model_score_terminal_published = False
-            record.snapshot.state = SessionState.RUNNING
-            record.snapshot.updated_at = started_at
-            redo.state = RedoState.RUNNING
-            redo.started_at = started_at
-            redo.completed_at = None
-            redo.failure = None
-            lane = redo.lanes["lakebase"]
-            lane.state = LaneState.CONNECTING
-            lane.status = "Committing the distinct v2 model score update"
-            lane.activity = LaneActivity(phase=ModelScorePhase.COMMITTING_SOURCE)
-            snapshot = self._revalidated_snapshot(record.snapshot)
-            await record.event_log.publish(
-                "redo_started",
-                {"session": snapshot.model_dump(mode="json")},
-            )
-            record.task = asyncio.create_task(
-                self._run_cost_bout(
-                    record,
-                    cost_bout_id,
-                    self._redo_model_score(record, engine, arm, result, update),
-                ),
-                name=f"redo-{session_id}",
-            )
-            return snapshot
+        raise InvalidStateError(
+            "Round 4 has no re-do: both lanes start cold at the bell, and after a bout they "
+            "are running. Prepare a new bout to race again."
+        )
 
     async def retry_connection_spike_cleanup(
         self,
@@ -3347,10 +3664,19 @@ class RunManager:
                 started_ns = record.run_started_monotonic_ns
                 if stop_control is not None and stop_control.started_ns is not None:
                     started_ns = stop_control.started_ns
-                if started_ns is None:
-                    raise InvalidStateError("The live bout clock has not started")
                 cutoff_ns = self._clock_ns()
-                cutoff_ms = max(0.0, (cutoff_ns - started_ns) / 1_000_000)
+                if started_ns is not None:
+                    cutoff_ms = max(0.0, (cutoff_ns - started_ns) / 1_000_000)
+                elif record.snapshot.round.id in {
+                    RoundId.PUT_MODEL_SCORE_IN_APP,
+                    RoundId.ANALYZE_LIVE_ORDERS,
+                }:
+                    # Round 4 or 6 before its bell: the engine was still reading each
+                    # source's baseline, so every lane is sealed, nothing was timed and
+                    # nothing is censored. The towel stops the bout all the same.
+                    cutoff_ms = 0.0
+                else:
+                    raise InvalidStateError("The live bout clock has not started")
 
             # Fence every callback before changing durable lease phase. Any callback
             # already waiting on this lock will observe the new generation and no-op.
@@ -3396,9 +3722,18 @@ class RunManager:
                     # `derive_receipt`, summary, and finale all read the exact
                     # bell_to_10000 observation and its reached/verified
                     # distinction instead of a promoted setup stop.
+                    # Both clocks run from the bell's T0, and the towel freezes each
+                    # at the elapsed the room watched (the live projection's
+                    # arithmetic), not at its last published milestone.
+                    bell_ns = record.run_started_monotonic_ns
                     adjudication = adjudicate_round_five_bell_towel(
                         lanes=record.snapshot.lanes,
                         runtime_lanes=runtime.lanes,
+                        cutoff_ms=(
+                            max(0.0, (round_five_cutoff_ns - bell_ns) / 1_000_000)
+                            if bell_ns is not None
+                            else None
+                        ),
                     )
                 else:
                     adjudication = adjudicate_round_five_towel(
@@ -4658,35 +4993,15 @@ class RunManager:
                 return
             if is_model_score and record.model_score_terminal_published:
                 return
-            redo_lost = (
-                lease.phase == "redo_committed"
-                and is_model_score
-                and record.snapshot.redo is not None
-                and record.snapshot.redo.state == RedoState.RUNNING
-            )
-            if redo_lost:
-                message = "Managed Sync re-do lease was lost"
-                redo = record.snapshot.redo
-                assert redo is not None
-                redo.state = RedoState.FAILED
-                redo.failure = message
-                redo.completed_at = datetime.now(UTC)
-                lane = redo.lanes["lakebase"]
-                lane.state = LaneState.FAILED
-                lane.error = message
-                lane.status = "Managed Sync re-do lease was lost"
-                lane.activity = LaneActivity(phase=ModelScorePhase.FAILED)
-                record.snapshot.state = SessionState.VERIFIED
-                record.snapshot.failure = None
-                record.model_score_pending_update = None
-                record.model_score_terminal_published = True
-            elif is_model_score and lease.phase == "run_committed":
-                message = "Managed Sync proof lease was lost before terminal verification."
-                lane = record.snapshot.lanes["lakebase"]
-                lane.state = LaneState.FAILED
-                lane.error = message
-                lane.status = message
-                lane.activity = LaneActivity(phase=ModelScorePhase.FAILED)
+            if is_model_score and lease.phase == "run_committed":
+                message = "Round 4's ring lease was lost before the result could be published."
+                for lane in record.snapshot.lanes.values():
+                    if lane.state == LaneState.NOT_SUPPORTED:
+                        continue
+                    lane.state = LaneState.FAILED
+                    lane.error = message
+                    lane.status = message
+                    lane.activity = LaneActivity(phase=Round4Phase.FAILED)
                 record.model_score_result = None
                 record.model_score_pending_update = None
                 record.snapshot.state = SessionState.FAILED
@@ -4782,7 +5097,7 @@ class RunManager:
                 continue
             if operation and operation is not asyncio.current_task() and not operation.done():
                 operation.cancel()
-        event = "redo_failed" if redo_lost else "session_failed"
+        event = "session_failed"
         if not round5_terminal_event_published:
             await record.event_log.publish(
                 event,
@@ -5245,6 +5560,8 @@ class RunManager:
         )
         if record.snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
             self._round4_settlement = record.settlement_task
+        elif record.snapshot.round.id == RoundId.ANALYZE_LIVE_ORDERS:
+            self._round6_settlement = record.settlement_task
 
     async def _settle_with_retry(
         self,
@@ -5455,16 +5772,22 @@ class RunManager:
         self,
         record: SessionRecord,
         armed_at_monotonic: float,
+        *,
+        message: str | None = None,
+        event: str = "session_failed",
     ) -> bool:
         """Release an armed fight card that never rang.
 
-        Reached when the armed window expires, and for Round 5 also when its owner
-        cancels the card, so that "prepare, then change the matchup" converges through
-        the same no-bell cleanup the expiry already uses instead of holding the ring
-        for the rest of the window. Returns False, changing nothing, when the session
-        already moved on (rang, cancelled, or re-armed).
+        Reached when the armed window expires, and when its owner cancels the card, so
+        that "prepare, then change the matchup" converges through the same no-bell
+        cleanup the expiry already uses instead of holding the ring for the rest of the
+        window. An owner's cancel of any round but Round 5 carries its own ``message``
+        and publishes ``session_cancelled``, which the browser takes back to the card
+        without an error. Returns False,
+        changing nothing, when the session already moved on (rang, cancelled, or
+        re-armed).
         """
-        message = (
+        message = message or (
             "Fight card expired before the bell. The ring was released automatically; "
             "prepare it again."
         )
@@ -5548,7 +5871,8 @@ class RunManager:
                 record.armed_expiry_task = None
                 snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
-            "session_failed",
+            # Round 5's no-bell release keeps its cleanup record, whoever asked for it.
+            "session_failed" if cleanup_pending else event,
             {
                 "state": SessionState.FAILED,
                 "message": message,
@@ -5760,6 +6084,24 @@ class RunManager:
             record.snapshot.id,
             record.snapshot.round.id.value,
             record.snapshot.failure or "no failure was recorded",
+        )
+
+    @staticmethod
+    def _log_bound_stoppage(
+        record: SessionRecord, winner: str, stopped: str, *, round_number: int
+    ) -> None:
+        """A bout decided at a lane's bound is a result, but the operator needs to see why."""
+
+        lane = record.snapshot.lanes[stopped]
+        logger.warning(
+            "Round %d lane was still running at its bound session=%s round=%s lane=%s "
+            "ran=%.0fs winner=%s",
+            round_number,
+            record.snapshot.id,
+            record.snapshot.round.id.value,
+            stopped,
+            (lane.elapsed_ms or 0.0) / 1000,
+            winner,
         )
 
     async def _arm(self, record: SessionRecord) -> None:
@@ -6013,36 +6355,40 @@ class RunManager:
             )
 
     async def _arm_model_score(self, record: SessionRecord) -> None:
+        """Round 4's Prepare: both lanes parked and every destination at its baseline.
+
+        Starts nothing. Both integrations stay parked until the bell, because
+        each lane's clock contains its own start from parked (the v1.1 design,
+        section 2). A park still in progress is waited out, visibly.
+        """
+
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         factory = self._model_score_factory
         if factory is None:
             await self._fail(record, "Round 4 live adapter is not configured.")
             return
         try:
-            engine = factory()
+            # Off the loop: the live engine builds a workspace client and an AWS session.
+            engine = await asyncio.to_thread(factory, record.snapshot.competitor.id)
             record.model_score_engine = engine
 
-            async def on_progress(progress: ModelScoreProgress) -> None:
+            async def notify(status: str) -> None:
                 async with record.lock:
-                    lane = record.snapshot.lanes["lakebase"]
-                    lane.status = progress.status
-                    lane.attempts = progress.attempt or lane.attempts
-                    lane.activity = LaneActivity(phase=progress.phase)
+                    for lane in record.snapshot.lanes.values():
+                        if lane.state != LaneState.NOT_SUPPORTED:
+                            lane.status = status
+                            lane.activity = LaneActivity(phase=Round4Phase.PREPARING)
                     record.snapshot.updated_at = datetime.now(UTC)
                 await record.event_log.publish(
                     "arm_waiting",
                     {
                         "state": SessionState.CHECKING,
-                        "status": progress.status,
+                        "status": status,
                     },
                 )
 
-            await self._await_round4_prewarm(
-                on_progress,
-                "Finishing the warm-up that started when the app was opened",
-            )
-            await self._await_prior_round4_settlement(record, on_progress)
-            arm = await engine.arm(on_progress)
+            await self._await_prior_round4_settlement(record, notify)
+            arm = await engine.prepare(notify)
             loop = asyncio.get_running_loop()
             async with record.lock:
                 armed_at = datetime.now(UTC)
@@ -6052,24 +6398,33 @@ class RunManager:
                 record.snapshot.armed_expires_at = armed_at + timedelta(seconds=self._armed_ttl)
                 record.snapshot.updated_at = armed_at
                 record.armed_at_monotonic = loop.time()
-                lakebase = record.snapshot.lanes["lakebase"]
-                lakebase.state = LaneState.SEALED
-                lakebase.status = "Managed Sync baseline verified"
-                lakebase.error = None
-                lakebase.activity = LaneActivity(phase=ModelScorePhase.ARMED)
-                lakebase.evidence = {
+                baseline_evidence = {
                     "primary_key": arm.baseline.entity_id,
                     "score": arm.baseline.score,
                     "model_version": arm.baseline.model_version,
                     "proof_nonce": arm.baseline.proof_nonce,
                     "delta_version": arm.source_version,
                 }
-                competitor = record.snapshot.lanes["competitor"]
-                competitor.state = LaneState.NOT_SUPPORTED
-                competitor.status = "AWS lane not timed for this Managed Sync proof"
-                competitor.error = None
-                competitor.activity = LaneActivity(phase="not_supported")
-                competitor.evidence = {"unsupported_reason": _ROUND_FOUR_UNSUPPORTED_REASON}
+                for lane_id, lane in record.snapshot.lanes.items():
+                    if lane_id in arm.lanes:
+                        lane.state = LaneState.SEALED
+                        lane.status = "Parked, with the baseline verified in its destination"
+                        lane.error = None
+                        lane.activity = LaneActivity(phase=Round4Phase.ARMED)
+                        lane.evidence = dict(baseline_evidence)
+                    else:
+                        lane.state = LaneState.NOT_SUPPORTED
+                        lane.status = "AWS lane not installed on this installation"
+                        lane.error = None
+                        lane.activity = LaneActivity(phase="not_supported")
+                        lane.evidence = {"unsupported_reason": _ROUND_FOUR_UNSUPPORTED_REASON}
+                # The receipt built at create could not know whether this installation
+                # races Round 4's AWS lane; the engine just said.
+                record.snapshot.cost_receipt = build_cost_receipt(
+                    record.snapshot.round.id,
+                    record.snapshot.competitor.id,
+                    round4_aws_lane=COMPETITOR_LANE in arm.lanes,
+                )
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
@@ -6086,134 +6441,38 @@ class RunManager:
                     "session": snapshot.model_dump(mode="json"),
                 },
             )
-        except ModelScoreError as exc:
+        except (ModelScoreError, Round4RaceError) as exc:
             await self._fail_arm(
                 record,
-                "The Managed Sync baseline could not be verified.",
+                "Round 4 could not confirm both lanes parked at their baseline.",
                 exc,
                 round_number=4,
             )
         except Exception as exc:
             await self._fail_arm(
                 record,
-                "The Managed Sync baseline could not be verified.",
+                "Round 4 could not confirm both lanes parked at their baseline.",
                 exc,
                 round_number=4,
             )
 
-    def _round4_busy(self) -> bool:
-        """Whether anything is using Round 4's source row now, or is about to.
-
-        A background warm-up writes the sealed baseline into that row, so it may
-        run only when no Round 4 bout is preparing, armed, running, re-doing or
-        settling, and no card was created in the last few seconds: the UI arms a
-        new card about a second after creating it.
-        """
-
-        settlement = self._round4_settlement
-        if settlement is not None and not settlement.done():
-            return True
-        now = datetime.now(UTC)
-        for record in self._records.values():
-            snapshot = record.snapshot
-            if snapshot.round.id != RoundId.PUT_MODEL_SCORE_IN_APP:
-                continue
-            if snapshot.state in {SessionState.CHECKING, SessionState.ARMED, SessionState.RUNNING}:
-                return True
-            if record.task is not None and not record.task.done():
-                return True
-            if record.settlement_task is not None and not record.settlement_task.done():
-                return True
-            if snapshot.redo is not None and snapshot.redo.state == RedoState.RUNNING:
-                return True
-            if (
-                snapshot.state == SessionState.DRAFT
-                and (now - snapshot.created_at).total_seconds() < _ROUND4_CARD_GRACE_SECONDS
-            ):
-                return True
-        return False
-
-    async def prewarm_round4(self) -> None:
-        """Leave a fresh Round 4 warm proof behind while Round 4 is idle.
-
-        Called by the Round 4 warm keeper when a person is using the app, so the
-        warm-up round trip an arm would make happens before anyone presses
-        Prepare, and that Prepare reuses it. Nothing here runs while any Round 4
-        bout is in flight (``_round4_busy``), and an arm or a re-do that arrives
-        meanwhile waits on the same lock rather than racing it. A preparation
-        that is still fresh is left alone.
-        """
-
-        factory = self._model_score_factory
-        if factory is None or self._closed or self._round4_busy():
-            return
-        if self._round4_prewarm_lock.locked():
-            return
-        async with self._round4_prewarm_lock:
-            if self._closed or self._round4_busy():
-                return
-            # Built off the loop: a live engine constructs a workspace client.
-            engine = await asyncio.to_thread(factory)
-            # The older of the proof and the storage check: a Prepare reuses both.
-            age_of = getattr(getattr(engine, "activation", None), "preparation_age", None)
-            age = age_of() if callable(age_of) else None
-            if age is not None and 0 <= age <= WARM_PROOF_REUSE_SECONDS / 2:
-                return
-            prewarm = getattr(engine, "prewarm", None)
-            if callable(prewarm):
-                await prewarm()
-
-    async def _await_round4_prewarm(
-        self,
-        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
-        status: str,
-    ) -> None:
-        """Let a background warm-up already under way finish, so its proof is reused."""
-
-        lock = self._round4_prewarm_lock
-        if not lock.locked():
-            return
-        await on_progress(
-            ModelScoreProgress(
-                phase=ModelScorePhase.PREFLIGHT,
-                status=status,
-                occurred_at=datetime.now(UTC),
-            )
-        )
-        try:
-            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
-                async with lock:
-                    pass
-        except TimeoutError as exc:
-            raise InvalidStateError(
-                "Round 4 was still finishing its warm-up. Try again in a moment."
-            ) from exc
-
     async def _await_prior_round4_settlement(
         self,
         record: SessionRecord,
-        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
+        notify: Callable[[str], Awaitable[None]],
     ) -> None:
-        """Let the previous Round 4 bout's row be put back before this arm touches it.
+        """Let the previous Round 4 bout finish settling before this Prepare looks.
 
-        A verified or failed bout releases the ring and then restores the source
-        row in the background, for ten to fifteen seconds. An arm inside that
-        window (a quick Ring Again) wrote its warm-up MERGE into the same row the
-        restore was writing, which is the race the re-do had. Waiting here orders
-        them; the restore's own round trip then usually lets the arm reuse it as
-        its warm proof.
+        A finished bout releases the ring and then, in the background, restores
+        the source row, waits for both lanes to carry it, and parks both. A
+        Prepare pressed inside that window (a quick Ring Again) waits for it here
+        rather than meeting a lane half-parked.
         """
 
         prior = self._round4_settlement
         if prior is None or prior.done() or prior is record.settlement_task:
             return
-        await on_progress(
-            ModelScoreProgress(
-                phase=ModelScorePhase.PREFLIGHT,
-                status="Putting the previous bout's row back first",
-                occurred_at=datetime.now(UTC),
-            )
-        )
+        await notify("Putting the previous bout's row back and parking both lanes first")
         try:
             async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
                 await asyncio.shield(prior)
@@ -6458,28 +6717,37 @@ class RunManager:
                     )
 
     async def _arm_live_orders(self, record: SessionRecord) -> None:
+        """Round 6's Prepare: the AWS pipeline parked and every source at its baseline.
+
+        Starts nothing. DMS and Glue stay parked until the bell, because the AWS lane's
+        clock contains its own start from parked; Lakebase's feed is built in and always
+        on (the v1.1 design, section 2). A park still in progress is waited out, visibly.
+        """
+
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         factory = self._live_orders_factory
         if factory is None:
-            await self._fail(record, "Round 6 native CDF adapter is not configured.")
+            await self._fail(record, "Round 6 live adapter is not configured.")
             return
         try:
-            engine = factory()
+            # Off the loop: the live engine builds a workspace client and an AWS session.
+            engine = await asyncio.to_thread(factory, record.snapshot.competitor.id)
             record.live_orders_engine = engine
 
-            async def on_progress(progress: LiveOrdersProgress) -> None:
+            async def notify(status: str) -> None:
                 async with record.lock:
-                    lane = record.snapshot.lanes["lakebase"]
-                    lane.status = progress.status
-                    lane.attempts = progress.attempt or lane.attempts
-                    lane.activity = LaneActivity(phase=progress.phase)
+                    for lane in record.snapshot.lanes.values():
+                        if lane.state != LaneState.NOT_SUPPORTED:
+                            lane.status = status
+                            lane.activity = LaneActivity(phase=Round6Phase.PREPARING)
                     record.snapshot.updated_at = datetime.now(UTC)
                 await record.event_log.publish(
                     "arm_waiting",
-                    {"state": SessionState.CHECKING, "status": progress.status},
+                    {"state": SessionState.CHECKING, "status": status},
                 )
 
-            arm = await engine.arm(on_progress)
+            await self._await_prior_round6_settlement(record, notify)
+            arm = await engine.prepare(notify)
             loop = asyncio.get_running_loop()
             async with record.lock:
                 armed_at = datetime.now(UTC)
@@ -6489,22 +6757,35 @@ class RunManager:
                 record.snapshot.armed_expires_at = armed_at + timedelta(seconds=self._armed_ttl)
                 record.snapshot.updated_at = armed_at
                 record.armed_at_monotonic = loop.time()
-                lakebase = record.snapshot.lanes["lakebase"]
-                lakebase.state = LaneState.SEALED
-                lakebase.status = "Native CDF is streaming"
-                lakebase.error = None
-                lakebase.activity = LaneActivity(phase=LiveOrdersPhase.ARMED)
-                lakebase.evidence = {"cdf_committed_lsn": arm.committed_lsn}
-                competitor = record.snapshot.lanes["competitor"]
-                competitor.state = LaneState.NOT_SUPPORTED
-                competitor.status = "AWS CDC pipeline not built or timed"
-                competitor.error = None
-                competitor.activity = LaneActivity(phase="not_supported")
-                competitor.evidence = {
-                    "unsupported_reason": (
-                        "Aurora/RDS require a separately configured CDC pipeline into Delta."
-                    )
+                baseline = {
+                    "order_id": arm.baseline.order_id,
+                    "total_cents": arm.baseline.total_cents,
+                    "proof_nonce": arm.baseline.proof_nonce,
                 }
+                for lane_id, lane in record.snapshot.lanes.items():
+                    if lane_id in arm.lanes:
+                        lane.state = LaneState.SEALED
+                        lane.status = (
+                            "Change feed streaming, with the baseline in its source"
+                            if lane_id == LAKEBASE_LANE
+                            else "Parked, with the baseline in its source"
+                        )
+                        lane.error = None
+                        lane.activity = LaneActivity(phase=Round6Phase.ARMED)
+                        lane.evidence = dict(baseline)
+                    else:
+                        lane.state = LaneState.NOT_SUPPORTED
+                        lane.status = "AWS lane not installed on this installation"
+                        lane.error = None
+                        lane.activity = LaneActivity(phase="not_supported")
+                        lane.evidence = {"unsupported_reason": _ROUND_SIX_UNSUPPORTED_REASON}
+                # As in Round 4: the receipt built at create could not know whether this
+                # installation races Round 6's AWS lane; the engine just said.
+                record.snapshot.cost_receipt = build_cost_receipt(
+                    record.snapshot.round.id,
+                    record.snapshot.competitor.id,
+                    round6_aws_lane=COMPETITOR_LANE in arm.lanes,
+                )
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
@@ -6515,20 +6796,37 @@ class RunManager:
                 "armed",
                 {"state": SessionState.ARMED, "session": snapshot.model_dump(mode="json")},
             )
-        except LiveOrdersError as exc:
-            await self._fail_arm(
-                record,
-                "The native CDF start state could not be verified.",
-                exc,
-                round_number=6,
-            )
         except Exception as exc:
             await self._fail_arm(
                 record,
-                "The native CDF start state could not be verified.",
+                "Round 6 could not confirm its pipelines at rest and its sources at baseline.",
                 exc,
                 round_number=6,
             )
+
+    async def _await_prior_round6_settlement(
+        self,
+        record: SessionRecord,
+        notify: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Let the previous Round 6 bout finish settling before this Prepare looks.
+
+        A finished bout releases the ring and then, in the background, removes its orders and
+        parks DMS and Glue. A Prepare pressed inside that window waits for it here rather than
+        meeting a pipeline half-parked.
+        """
+
+        prior = self._round6_settlement
+        if prior is None or prior.done() or prior is record.settlement_task:
+            return
+        await notify("Removing the previous bout's orders and parking its pipeline first")
+        try:
+            async with asyncio.timeout(_ROUND6_SETTLEMENT_WAIT_SECONDS):
+                await asyncio.shield(prior)
+        except TimeoutError as exc:
+            raise InvalidStateError(
+                "The previous Round 6 bout was still settling. Prepare again in a moment."
+            ) from exc
 
     async def _run_connection_spike(self, record: SessionRecord) -> None:
         engine = record.connection_spike_engine
@@ -7174,188 +7472,249 @@ class RunManager:
         await self._finish_connection_spike(record, result)
 
     async def _run_live_orders(self, record: SessionRecord) -> None:
+        """Round 6's bell: the checkout commits everywhere at once, and AWS's pipeline starts.
+
+        Every lane's clock runs from this one bell to its own first exact history read, on the
+        controller's clock (``server/round6_race.py``). Nothing here waits on a status API; the
+        verdict comes from the lanes' reads alone.
+        """
+
         engine = record.live_orders_engine
         arm = record.live_orders_arm
         order = record.live_orders_pending_order
-        if engine is None or arm is None or order is None:
-            await self._fail(record, "The native CDF proof must be armed again.")
+        guardrail = record.live_orders_guardrail_order
+        if engine is None or arm is None or order is None or guardrail is None:
+            await self._fail(record, "Round 6 must be prepared again.")
             return
         async with record.lock:
             started_at = datetime.now(UTC)
             record.snapshot.state = SessionState.RUNNING
             record.snapshot.run_started_at = started_at
-            record.run_started_monotonic_ns = self._clock_ns()
+            # As in Round 4, the clock starts at the engine's bell, which it rings only once each
+            # source has answered a pre-bell read; its first report stamps the origin.
+            record.run_started_monotonic_ns = None
             record.snapshot.updated_at = started_at
-            lane = record.snapshot.lanes["lakebase"]
-            lane.state = LaneState.CONNECTING
-            lane.status = "Committing one checkout order"
-            lane.activity = LaneActivity(phase=LiveOrdersPhase.CHECKOUT)
+            for lane_id in arm.lanes:
+                lane = record.snapshot.lanes[lane_id]
+                lane.state = LaneState.SEALED
+                lane.status = "Reading the source's baseline before the bell"
+                lane.attempts = 0
+                lane.elapsed_ms = None
+                lane.activity = LaneActivity(phase=Round6Phase.ARMED)
             snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
             "run_started",
             {
                 "state": SessionState.RUNNING,
-                "lanes": ["lakebase"],
+                "lanes": list(arm.lanes),
                 "session": snapshot.model_dump(mode="json"),
             },
         )
 
-        phase_states = {
-            LiveOrdersPhase.PREFLIGHT: LaneState.SEALED,
-            LiveOrdersPhase.ARMED: LaneState.SEALED,
-            LiveOrdersPhase.CHECKOUT: LaneState.CONNECTING,
-            LiveOrdersPhase.WAITING_CDF: LaneState.VERIFYING,
-            LiveOrdersPhase.READING_CHECKOUT: LaneState.VERIFYING,
-            LiveOrdersPhase.VERIFIED: LaneState.VERIFIED,
-            LiveOrdersPhase.FAILED: LaneState.FAILED,
-        }
-
-        async def on_progress(progress: LiveOrdersProgress) -> None:
-            async with record.lock:
-                if record.snapshot.towel is not None:
-                    return
-                lane = record.snapshot.lanes["lakebase"]
-                lane.state = phase_states[progress.phase]
-                lane.status = progress.status
-                lane.attempts = progress.attempt or lane.attempts
-                if progress.elapsed_ms is not None:
-                    lane.elapsed_ms = progress.elapsed_ms
-                lane.activity = LaneActivity(phase=progress.phase)
-                record.snapshot.updated_at = datetime.now(UTC)
-                activity = lane.activity.model_dump(mode="json")
-            await record.event_log.publish(
-                "lane_update",
-                {
-                    "lane_id": "lakebase",
-                    "state": phase_states[progress.phase],
-                    "attempts": progress.attempt or lane.attempts,
-                    "elapsed_ms": lane.elapsed_ms,
-                    "status": progress.status,
-                    "activity": activity,
-                },
-            )
+        async def on_progress(
+            lane_id: str,
+            phase: Round6Phase,
+            status: str,
+            elapsed_ms: float | None,
+        ) -> None:
+            await self._apply_live_orders_progress(record, lane_id, phase, status, elapsed_ms)
 
         try:
-            checkout_guardrail_order = LiveOrder(
-                order_id=str(uuid4()),
-                sku="RED-GLOVE",
-                store="CHICAGO",
-                quantity=1,
-                total_cents=8450,
-                status="paid",
-                proof_nonce=f"round6-checkout-{uuid4().hex}",
-            )
-            async with record.lock:
-                record.live_orders_guardrail_order = checkout_guardrail_order
-            result = await engine.run(
-                arm,
-                order,
-                checkout_guardrail_order,
-                on_progress,
-            )
+            result = await engine.run(arm, order, guardrail, on_progress)
         except asyncio.CancelledError:
             raise
-        except LiveOrdersError as exc:
+        except (LiveOrdersError, Round6RaceError) as exc:
             await self._finish_live_orders_failure(record, str(exc))
             return
         except Exception as exc:
             self._log_bout_refusal(record, exc, round_number=6)
-            await self._finish_live_orders_failure(
-                record, "The live native CDF proof failed unexpectedly."
-            )
+            await self._finish_live_orders_failure(record, "Round 6 failed unexpectedly.")
             return
         await self._finish_live_orders(record, result)
+
+    async def _apply_live_orders_progress(
+        self,
+        record: SessionRecord,
+        lane_id: str,
+        phase: Round6Phase,
+        status: str,
+        elapsed_ms: float | None,
+    ) -> None:
+        phase_states = {
+            Round6Phase.STARTING: LaneState.CONNECTING,
+            Round6Phase.WAITING: LaneState.VERIFYING,
+            Round6Phase.VERIFIED: LaneState.VERIFIED,
+            Round6Phase.FAILED: LaneState.FAILED,
+        }
+        async with record.lock:
+            if record.snapshot.towel is not None or lane_id not in record.snapshot.lanes:
+                return
+            if phase == Round6Phase.STARTING and record.run_started_monotonic_ns is None:
+                # The bell: the engine reports every lane STARTING at elapsed zero.
+                record.run_started_monotonic_ns = self._clock_ns()
+            lane = record.snapshot.lanes[lane_id]
+            lane.state = phase_states.get(phase, lane.state)
+            lane.status = status
+            lane.activity = LaneActivity(phase=phase)
+            if elapsed_ms is not None:
+                lane.elapsed_ms = (
+                    elapsed_ms
+                    if phase == Round6Phase.VERIFIED
+                    else max(lane.elapsed_ms or 0.0, elapsed_ms)
+                )
+            if lane.state == LaneState.VERIFIED and lane.verified_at is None:
+                lane.verified_at = datetime.now(UTC)
+            record.snapshot.updated_at = datetime.now(UTC)
+            activity = lane.activity.model_dump(mode="json")
+            state = lane.state
+            elapsed = lane.elapsed_ms
+        await record.event_log.publish(
+            "lane_update",
+            {
+                "lane_id": lane_id,
+                "state": state,
+                "elapsed_ms": elapsed,
+                "status": status,
+                "activity": activity,
+            },
+        )
 
     async def _finish_live_orders(
         self,
         record: SessionRecord,
-        result: LiveOrdersResult,
+        result: Round6RaceResult,
     ) -> None:
         async with record.lock:
-            if (
-                record.snapshot.towel is not None
-                or record.round5_terminal_published
-            ):
+            if record.snapshot.towel is not None or record.round5_terminal_published:
                 return
             if not await self._confirm_terminal_release(record):
                 return
-            lane = record.snapshot.lanes["lakebase"]
-            lane.state = LaneState.VERIFIED
-            lane.elapsed_ms = result.analytics_available_ms
-            lane.attempts = result.poll_attempts
-            lane.successes = 1
-            lane.errors = 0
-            lane.status = "Exact Delta answer · Separate checkout committed"
-            lane.error = None
-            lane.verified_at = datetime.now(UTC)
-            lane.activity = LaneActivity(phase=LiveOrdersPhase.VERIFIED)
-            lane.evidence = {
-                "order_id": result.order.order_id,
-                "sku": result.order.sku,
-                "store": result.order.store,
-                "quantity": result.order.quantity,
-                "total_cents": result.order.total_cents,
-                "total_display": "$84.50",
-                "status": result.order.status,
-                "proof_nonce": result.order.proof_nonce,
-                "history_lsn": result.history_lsn,
-                "checkout_commit_ms": result.checkout_commit_ms,
-                "checkout_guardrail_order_id": result.checkout_guardrail_order.order_id,
-                "checkout_guardrail_proof_nonce": (result.checkout_guardrail_order.proof_nonce),
-                "checkout_guardrail_commit_ms": result.checkout_guardrail_commit_ms,
-                "checkout_guardrail_read_ms": result.checkout_guardrail_read_ms,
-            }
-            record.snapshot.metrics = [
-                MetricValue(
-                    spec_id="analytics_available_ms",
-                    lane_id="lakebase",
-                    value=result.analytics_available_ms,
-                    display_value=f"{result.analytics_available_ms:.2f} ms",
-                ),
-                MetricValue(
-                    spec_id="matching_live_orders",
-                    lane_id="lakebase",
-                    value=result.matching_orders,
-                    display_value="1 exact order",
-                ),
-                MetricValue(
-                    spec_id="checkout_verified",
-                    lane_id="lakebase",
-                    value=result.checkout_verified,
-                    display_value="SEPARATE CHECKOUT COMMITTED ✓",
-                ),
-            ]
-            record.snapshot.comparison = ComparisonSnapshot(
-                kind=ComparisonKind.CAPABILITY_GAP,
-                winner_lane_id="lakebase",
-                detail=(
-                    "Lakebase native CDF produced the exact Delta answer; the selected AWS "
-                    "database requires a separately configured CDC pipeline and was not timed."
-                ),
-            )
-            record.snapshot.state = SessionState.VERIFIED
-            record.snapshot.failure = None
-            record.snapshot.remembered_result = _round_six_remembered_result(
-                result.analytics_available_ms
+            measured = self._apply_live_orders_result(record.snapshot, result)
+            record.snapshot.state = SessionState.VERIFIED if measured else SessionState.FAILED
+            record.snapshot.failure = None if measured else record.snapshot.comparison.detail
+            record.snapshot.remembered_result = (
+                _round_six_remembered_result(record.snapshot) if measured else None
             )
             record.snapshot.updated_at = datetime.now(UTC)
             record.armed_at_monotonic = None
             record.live_orders_result = result
             record.live_orders_pending_order = None
+            record.live_orders_guardrail_order = None
             engine = record.live_orders_engine
             snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            "run_finished",
-            {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
-        )
-        settle = getattr(engine, "settle_and_cleanup_owned", None)
+        if measured:
+            await record.event_log.publish(
+                "run_finished",
+                {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
+            )
+        else:
+            self._log_lane_refusals(record, round_number=6)
+            await record.event_log.publish(
+                "session_failed",
+                {
+                    "state": SessionState.FAILED,
+                    "message": snapshot.failure,
+                    "session": snapshot.model_dump(mode="json"),
+                },
+            )
         self._schedule_round_settlement(
             record,
-            None
-            if settle is None
-            else lambda: settle(result.order, result.checkout_guardrail_order),
+            getattr(engine, "settle_and_cleanup_owned", None),
             label="Round 6",
         )
+
+    @staticmethod
+    def _apply_live_orders_result(snapshot: SessionSnapshot, result: Round6RaceResult) -> bool:
+        """Put a bout's lanes, metrics and verdict on the card. True when it measured something.
+
+        The verdict is the engine's, from the lanes' own reads (``round4_race.resolve``);
+        nothing here recomputes it.
+        """
+
+        order = result.order
+        metrics: list[MetricValue] = []
+        for lane_id, outcome in result.outcomes.items():
+            lane = snapshot.lanes[lane_id]
+            guardrail = result.guardrails.get(lane_id)
+            lane.evidence = {
+                "order_id": order.order_id,
+                "total_cents": order.total_cents,
+                "total_display": f"${order.total_cents / 100:.2f}",
+                "proof_nonce": order.proof_nonce,
+                "commit_ack_ms": result.commit_ack_ms.get(lane_id),
+                "commit_skew_ms": result.commit_skew_ms,
+                "checkout_guardrail_order_id": result.guardrail_order.order_id,
+                "checkout_guardrail_commit_ms": guardrail.commit_ms if guardrail else None,
+                "checkout_guardrail_read_ms": guardrail.read_ms if guardrail else None,
+                "reads": outcome.reads,
+                "max_read_gap_ms": outcome.max_read_gap_ms,
+                "last_negative_ms": outcome.last_negative_ms,
+                "bell_at": result.rung_at,
+                "protocol": result.protocol,
+                **dict(outcome.evidence),
+            }
+            lane.attempts = outcome.reads
+            if outcome.verified and outcome.elapsed_ms is not None:
+                lane.state = LaneState.VERIFIED
+                lane.elapsed_ms = outcome.elapsed_ms
+                lane.status = "The exact order is in the lakehouse · separate checkout committed"
+                lane.error = None
+                lane.verified_at = lane.verified_at or datetime.now(UTC)
+                lane.activity = LaneActivity(phase=Round6Phase.VERIFIED)
+                metrics.append(
+                    MetricValue(
+                        spec_id="bell_to_exact_history_ms",
+                        lane_id=lane_id,
+                        value=outcome.elapsed_ms,
+                        display_value=f"{outcome.elapsed_ms / 1000:.2f} s",
+                    )
+                )
+            else:
+                lane.state = LaneState.FAILED
+                lane.elapsed_ms = None
+                lane.status = (
+                    "Did not deliver the order within its bound"
+                    if outcome.timed_out
+                    else "Could not be measured"
+                )
+                lane.error = outcome.failure
+                if outcome.timed_out and outcome.bound_ms is not None:
+                    # Still running at its bound, which is a result, not an error.
+                    lane.error = None
+                    lane.evidence.update(_floor_evidence(outcome.bound_ms))
+                lane.activity = LaneActivity(phase=Round6Phase.FAILED)
+            metrics.append(
+                MetricValue(
+                    spec_id="exact_order_verified",
+                    lane_id=lane_id,
+                    value=bool(outcome.verified),
+                    display_value="Verified" if outcome.verified else "Not verified",
+                )
+            )
+            if guardrail is not None:
+                metrics.append(
+                    MetricValue(
+                        spec_id="checkout_verified",
+                        lane_id=lane_id,
+                        value=True,
+                        display_value="SEPARATE CHECKOUT COMMITTED ✓",
+                    )
+                )
+        if result.commit_skew_ms is not None:
+            metrics.append(
+                MetricValue(
+                    spec_id="commit_skew_ms",
+                    value=result.commit_skew_ms,
+                    display_value=f"{result.commit_skew_ms:.0f} ms",
+                )
+            )
+        snapshot.metrics = metrics
+        snapshot.comparison, measured = _round_six_comparison(
+            result,
+            snapshot.lanes[COMPETITOR_LANE].name,
+            has_competitor=COMPETITOR_LANE in result.outcomes,
+        )
+        return measured
 
     async def _finish_live_orders_failure(
         self,
@@ -7367,31 +7726,28 @@ class RunManager:
                 return
             if not await self._confirm_terminal_release(record):
                 return
-            lane = record.snapshot.lanes["lakebase"]
-            lane.state = LaneState.FAILED
-            lane.status = "Native CDF proof could not be verified"
-            lane.error = message
-            lane.activity = LaneActivity(phase=LiveOrdersPhase.FAILED)
+            for lane in record.snapshot.lanes.values():
+                if lane.state in {LaneState.NOT_SUPPORTED, LaneState.VERIFIED}:
+                    continue
+                lane.state = LaneState.FAILED
+                lane.error = message
+                lane.status = "Round 6 could not be verified"
+                lane.activity = LaneActivity(phase=Round6Phase.FAILED)
             record.snapshot.state = SessionState.FAILED
             record.snapshot.failure = message
-            # Here rather than at each `except` above, because this is the one
-            # funnel every Round 6 failure passes through: the typed
-            # `LiveOrdersError` path carries the real reason in `message` and had
-            # no log of its own either.
+            # The one funnel every Round 6 bout failure passes through, including the typed
+            # errors that carry the real reason and have no log of their own.
             self._log_lane_refusals(record, round_number=6)
             record.snapshot.remembered_result = None
             record.snapshot.metrics = []
             record.snapshot.comparison = None
             record.snapshot.updated_at = datetime.now(UTC)
             record.armed_at_monotonic = None
-            # Captured before the identity is cleared: a failed run can have
-            # committed its checkout row before failing verification, and
-            # dropping the identity here is what used to make that row
-            # permanently unattributable.
+            # The engine keeps every order it rang until settling has removed it, so a failure
+            # after a commit still owes and finds its rows.
             engine = record.live_orders_engine
-            settling_order = record.live_orders_pending_order
-            guardrail_order = record.live_orders_guardrail_order
             record.live_orders_pending_order = None
+            record.live_orders_guardrail_order = None
             snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
             "session_failed",
@@ -7401,12 +7757,9 @@ class RunManager:
                 "session": snapshot.model_dump(mode="json"),
             },
         )
-        settle = getattr(engine, "settle_and_cleanup_owned", None)
         self._schedule_round_settlement(
             record,
-            None
-            if settle is None or settling_order is None
-            else lambda: settle(settling_order, guardrail_order),
+            getattr(engine, "settle_and_cleanup_owned", None),
             label="Round 6",
         )
 
@@ -9494,42 +9847,60 @@ class RunManager:
         return metrics
 
     async def _run_model_score(self, record: SessionRecord) -> None:
+        """Round 4's bell: both integrations start from parked and one change is committed.
+
+        Every lane's clock runs from this one bell to its own first exact read, on
+        the controller's clock (``server/round4_race.py``). Nothing here waits on
+        a status API; the verdict comes from the lanes' reads alone.
+        """
+
         engine = record.model_score_engine
         arm = record.model_score_arm
         update = record.model_score_pending_update
         if engine is None or arm is None or update is None:
-            await self._fail(record, "The Managed Sync proof must be armed again.")
+            await self._fail(record, "Round 4 must be prepared again.")
             return
 
         async with record.lock:
             started_at = datetime.now(UTC)
             record.snapshot.state = SessionState.RUNNING
             record.snapshot.run_started_at = started_at
-            record.run_started_monotonic_ns = self._clock_ns()
+            # Every clock starts at the bell, which the engine rings only once the verifier's
+            # connections are open and awake (3 s live, more for a paused Aurora). Until then the
+            # lanes stay sealed and nothing is timed; the bell's own report stamps the origin
+            # the snapshot floors and the towel read from.
+            record.run_started_monotonic_ns = None
             record.snapshot.updated_at = started_at
-            lakebase = record.snapshot.lanes["lakebase"]
-            lakebase.state = LaneState.CONNECTING
-            lakebase.status = "Committing the run-owned model score update"
-            lakebase.attempts = 0
-            lakebase.activity = LaneActivity(phase=ModelScorePhase.COMMITTING_SOURCE)
+            for lane_id in arm.lanes:
+                lane = record.snapshot.lanes[lane_id]
+                lane.state = LaneState.SEALED
+                lane.status = "Opening the verifier's connection before the bell"
+                lane.attempts = 0
+                lane.elapsed_ms = None
+                lane.activity = LaneActivity(phase=Round4Phase.ARMED)
             running_snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
             "run_started",
             {
                 "state": SessionState.RUNNING,
-                "lanes": ["lakebase"],
+                "lanes": list(arm.lanes),
                 "session": running_snapshot.model_dump(mode="json"),
             },
         )
 
-        async def on_progress(progress: ModelScoreProgress) -> None:
-            await self._apply_model_score_progress(record, progress, redo=False)
+        async def on_progress(
+            lane_id: str,
+            phase: Round4Phase,
+            status: str,
+            elapsed_ms: float | None,
+        ) -> None:
+            await self._apply_model_score_progress(record, lane_id, phase, status, elapsed_ms)
 
         try:
             result = await engine.run(arm, update, on_progress)
         except asyncio.CancelledError:
             raise
-        except ModelScoreError as exc:
+        except (ModelScoreError, Round4RaceError) as exc:
             statement_failure = statement_execution_failure(exc)
             if statement_failure is not None:
                 self._log_bout_refusal(record, exc, round_number=4)
@@ -9538,8 +9909,8 @@ class RunManager:
                 self._finish_model_score_failure(
                     record,
                     (
-                        "The live Managed Sync proof failed a backstage data check. "
-                        "The operator log has the provider diagnosis."
+                        "Round 4 failed a backstage data check. The operator log has the "
+                        "provider diagnosis."
                         if statement_failure is not None
                         else str(exc)
                     ),
@@ -9552,7 +9923,7 @@ class RunManager:
                 record,
                 self._finish_model_score_failure(
                     record,
-                    "The live Managed Sync proof failed unexpectedly.",
+                    "Round 4 failed unexpectedly.",
                 ),
             )
             return
@@ -9564,51 +9935,46 @@ class RunManager:
     async def _apply_model_score_progress(
         self,
         record: SessionRecord,
-        progress: ModelScoreProgress,
-        *,
-        redo: bool,
+        lane_id: str,
+        phase: Round4Phase,
+        status: str,
+        elapsed_ms: float | None,
     ) -> None:
         phase_states = {
-            ModelScorePhase.PREFLIGHT: LaneState.SEALED,
-            ModelScorePhase.ARMED: LaneState.SEALED,
-            ModelScorePhase.COMMITTING_SOURCE: LaneState.CONNECTING,
-            ModelScorePhase.WAITING_SYNC: LaneState.VERIFYING,
-            ModelScorePhase.READING_APPLICATION: LaneState.VERIFYING,
-            ModelScorePhase.VERIFIED: LaneState.VERIFIED,
-            ModelScorePhase.FAILED: LaneState.FAILED,
+            Round4Phase.STARTING: LaneState.CONNECTING,
+            Round4Phase.WAITING: LaneState.VERIFYING,
+            Round4Phase.VERIFIED: LaneState.VERIFIED,
+            Round4Phase.FAILED: LaneState.FAILED,
         }
         async with record.lock:
-            if not redo and record.snapshot.towel is not None:
+            if record.snapshot.towel is not None or lane_id not in record.snapshot.lanes:
                 return
-            target = record.snapshot.redo if redo else record.snapshot
-            if redo:
-                if not isinstance(target, RedoSnapshot):
-                    return
-                lane = target.lanes["lakebase"]
-            else:
-                lane = record.snapshot.lanes["lakebase"]
-            lane.state = phase_states[progress.phase]
-            lane.status = progress.status
-            lane.attempts = progress.attempt or lane.attempts
-            lane.activity = LaneActivity(phase=progress.phase)
-            if progress.elapsed_ms is not None:
+            if phase == Round4Phase.STARTING and record.run_started_monotonic_ns is None:
+                # The bell: the engine reports every lane STARTING at elapsed zero.
+                record.run_started_monotonic_ns = self._clock_ns()
+            lane = record.snapshot.lanes[lane_id]
+            lane.state = phase_states.get(phase, lane.state)
+            lane.status = status
+            lane.activity = LaneActivity(phase=phase)
+            if elapsed_ms is not None:
                 lane.elapsed_ms = (
-                    progress.elapsed_ms
-                    if progress.phase == ModelScorePhase.VERIFIED
-                    else max(lane.elapsed_ms or 0.0, progress.elapsed_ms)
+                    elapsed_ms
+                    if phase == Round4Phase.VERIFIED
+                    else max(lane.elapsed_ms or 0.0, elapsed_ms)
                 )
             if lane.state == LaneState.VERIFIED and lane.verified_at is None:
                 lane.verified_at = datetime.now(UTC)
             record.snapshot.updated_at = datetime.now(UTC)
             activity = lane.activity.model_dump(mode="json")
+            state = lane.state
+            elapsed = lane.elapsed_ms
         await record.event_log.publish(
-            "redo_lane_update" if redo else "lane_update",
+            "lane_update",
             {
-                "lane_id": "lakebase",
-                "state": phase_states[progress.phase],
-                "attempts": progress.attempt or lane.attempts,
-                "elapsed_ms": lane.elapsed_ms,
-                "status": progress.status,
+                "lane_id": lane_id,
+                "state": state,
+                "elapsed_ms": elapsed,
+                "status": status,
                 "activity": activity,
             },
         )
@@ -9616,47 +9982,53 @@ class RunManager:
     async def _finish_model_score(
         self,
         record: SessionRecord,
-        result: ModelScoreRunResult,
+        result: Round4RaceResult,
     ) -> None:
         async with record.lock:
             if record.snapshot.towel is not None:
                 return
         lease_outcome = await self._settle_model_score_terminal_lease(record)
         if lease_outcome == "lost":
-            await self._finish_model_score_lease_loss(record, redo=False)
+            await self._finish_model_score_lease_loss(record)
             return
         async with record.lock:
             if record.model_score_terminal_published or record.snapshot.towel is not None:
                 return
             record.model_score_result = result
             record.model_score_pending_update = None
-            self._apply_model_score_result(record.snapshot, result.initial)
-            record.snapshot.state = SessionState.VERIFIED
-            record.snapshot.failure = None
-            record.snapshot.remembered_result = _round_four_remembered_result(
-                result.initial.application_read_elapsed_ms
+            measured = self._apply_model_score_result(record.snapshot, result)
+            record.snapshot.state = SessionState.VERIFIED if measured else SessionState.FAILED
+            record.snapshot.failure = None if measured else record.snapshot.comparison.detail
+            record.snapshot.remembered_result = (
+                _round_four_remembered_result(record.snapshot) if measured else None
             )
-            record.snapshot.redo = RedoSnapshot(
-                state=RedoState.READY,
-                lanes=self._new_model_score_lanes(record.snapshot),
-                metric_specs=[item.model_copy(deep=True) for item in record.snapshot.metric_specs],
-            )
+            # Round 4 has no re-do in v1.1: a re-do could not start cold. Racing again
+            # is a new bout, which meets both lanes parked.
+            record.snapshot.redo = None
             record.snapshot.updated_at = datetime.now(UTC)
             record.armed_at_monotonic = None
             record.model_score_terminal_published = True
             engine = record.model_score_engine
             snapshot = record.snapshot.model_copy(deep=True)
-            # Scheduled before the result is published, not after: a re-do can be
-            # requested the moment READY is visible, and it must find the restore
-            # already scheduled so it can wait for it (_await_settlement_before_redo).
             self._schedule_round_settlement(
                 record,
                 getattr(engine, "settle_and_restore_baseline", None),
                 label="Round 4",
             )
+        if measured:
+            await record.event_log.publish(
+                "run_finished",
+                {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
+            )
+            return
+        self._log_lane_refusals(record, round_number=4)
         await record.event_log.publish(
-            "run_finished",
-            {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
+            "session_failed",
+            {
+                "state": SessionState.FAILED,
+                "message": snapshot.failure,
+                "session": snapshot.model_dump(mode="json"),
+            },
         )
 
     async def _finish_model_score_failure(
@@ -9669,26 +10041,28 @@ class RunManager:
                 return
         lease_outcome = await self._settle_model_score_terminal_lease(record)
         if lease_outcome == "lost":
-            await self._finish_model_score_lease_loss(record, redo=False)
+            await self._finish_model_score_lease_loss(record)
             return
         async with record.lock:
             if record.model_score_terminal_published or record.snapshot.towel is not None:
                 return
             failed_at = datetime.now(UTC)
-            lane = record.snapshot.lanes["lakebase"]
-            lane.state = LaneState.FAILED
-            lane.error = message
-            lane.status = "Managed Sync proof could not be verified"
-            lane.activity = LaneActivity(phase=ModelScorePhase.FAILED)
+            for lane in record.snapshot.lanes.values():
+                if lane.state in {LaneState.NOT_SUPPORTED, LaneState.VERIFIED}:
+                    continue
+                lane.state = LaneState.FAILED
+                lane.error = message
+                lane.status = "Round 4 could not be verified"
+                lane.activity = LaneActivity(phase=Round4Phase.FAILED)
             record.model_score_pending_update = None
             record.model_score_result = None
             record.snapshot.state = SessionState.FAILED
             record.snapshot.failure = message
-            # The one funnel every Round 4 initial-proof failure passes through,
-            # including the typed `ModelScoreError` path that carries the real
-            # reason and had no log of its own.
+            # The one funnel every Round 4 bout failure passes through, including the
+            # typed errors that carry the real reason and have no log of their own.
             self._log_lane_refusals(record, round_number=4)
             record.snapshot.remembered_result = None
+            record.snapshot.redo = None
             record.snapshot.updated_at = failed_at
             record.armed_at_monotonic = None
             record.model_score_terminal_published = True
@@ -9708,327 +10082,136 @@ class RunManager:
             label="Round 4",
         )
 
-    async def _redo_model_score(
-        self,
-        record: SessionRecord,
-        engine: ModelScoreEngine,
-        arm: ModelScoreArm,
-        initial: ModelScoreRunResult,
-        update: ModelScoreUpdate,
-    ) -> None:
-        async def on_progress(progress: ModelScoreProgress) -> None:
-            await self._apply_model_score_progress(record, progress, redo=True)
-
-        if not await self._await_settlement_before_redo(record, on_progress):
-            await self._await_model_score_terminal(
-                record,
-                self._fail_model_score_redo(
-                    record,
-                    "The first proof's row was still being put back, so the re-do did not "
-                    "run. Ring Round 4 again for a new proof.",
-                ),
-            )
-            return
-        try:
-            result = await engine.redo(arm, initial, update, on_progress)
-        except asyncio.CancelledError:
-            raise
-        except ModelScoreError as exc:
-            statement_failure = statement_execution_failure(exc)
-            if statement_failure is not None:
-                self._log_bout_refusal(record, exc, round_number=4)
-            await self._await_model_score_terminal(
-                record,
-                self._fail_model_score_redo(
-                    record,
-                    (
-                        "The live Managed Sync re-do failed a backstage data check. "
-                        "The operator log has the provider diagnosis."
-                        if statement_failure is not None
-                        else str(exc)
-                    ),
-                ),
-            )
-            return
-        except Exception as exc:
-            self._log_bout_refusal(record, exc, round_number=4)
-            await self._await_model_score_terminal(
-                record,
-                self._fail_model_score_redo(
-                    record,
-                    "The live Managed Sync re-do failed unexpectedly.",
-                ),
-            )
-            return
-        await self._await_model_score_terminal(
-            record,
-            self._finish_model_score_redo(record, result),
-        )
-
-    async def _await_settlement_before_redo(
-        self,
-        record: SessionRecord,
-        on_progress: Callable[[ModelScoreProgress], Awaitable[None]],
-    ) -> bool:
-        """Let the first proof's row be put back before the re-do writes its own.
-
-        A verified result offers Re-do the moment it is published, and the same
-        moment schedules the restore of the source row. A re-do taken inside that
-        window sent its MERGE into the same row while the restore's was in
-        flight, and Delta refused whichever committed second: SQLSTATE 2D521, two
-        of three live re-dos on 2026-09-28. When the re-do won, the restore then
-        put the baseline back on top of its new score. Waiting here orders the
-        two, and the restore the re-do's own finish schedules runs after it.
-        """
-
-        try:
-            await self._await_round4_prewarm(
-                on_progress,
-                "Finishing a warm-up before the re-do",
-            )
-        except InvalidStateError:
-            logger.error(
-                "Round 4 re-do refused: a background warm-up did not finish within %.0fs "
-                "session=%s",
-                _ROUND4_SETTLEMENT_WAIT_SECONDS,
-                record.snapshot.id,
-            )
-            return False
-        settlement = record.settlement_task
-        if settlement is None or settlement.done():
-            return True
-        await on_progress(
-            ModelScoreProgress(
-                phase=ModelScorePhase.PREFLIGHT,
-                status="Putting the first proof's row back before the re-do",
-                occurred_at=datetime.now(UTC),
-            )
-        )
-        try:
-            async with asyncio.timeout(_ROUND4_SETTLEMENT_WAIT_SECONDS):
-                await asyncio.shield(settlement)
-        except TimeoutError:
-            logger.error(
-                "Round 4 re-do refused: the first proof's settlement did not finish within "
-                "%.0fs session=%s",
-                _ROUND4_SETTLEMENT_WAIT_SECONDS,
-                record.snapshot.id,
-            )
-            return False
-        return True
-
-    async def _finish_model_score_redo(
-        self,
-        record: SessionRecord,
-        result: ModelScoreRunResult,
-    ) -> None:
-        proof = result.redo
-        if proof is None:
-            await self._fail_model_score_redo(
-                record,
-                "The Managed Sync engine returned no re-do proof.",
-            )
-            return
-        lease_outcome = await self._settle_model_score_terminal_lease(record)
-        if lease_outcome == "lost":
-            await self._finish_model_score_lease_loss(record, redo=True)
-            return
+    async def _finish_model_score_lease_loss(self, record: SessionRecord) -> None:
         async with record.lock:
-            redo = record.snapshot.redo
-            if (
-                record.model_score_terminal_published
-                or redo is None
-                or redo.state != RedoState.RUNNING
-            ):
-                return
-            self._apply_model_score_result(redo, proof)
-            redo.state = RedoState.VERIFIED
-            redo.failure = None
-            redo.completed_at = datetime.now(UTC)
-            record.model_score_result = result
-            record.model_score_pending_update = None
-            record.snapshot.state = SessionState.VERIFIED
-            record.snapshot.failure = None
-            record.snapshot.updated_at = redo.completed_at
-            record.model_score_terminal_published = True
-            engine = record.model_score_engine
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            "redo_finished",
-            {"session": snapshot.model_dump(mode="json")},
-        )
-        self._schedule_round_settlement(
-            record,
-            getattr(engine, "settle_and_restore_baseline", None),
-            label="Round 4",
-        )
-
-    async def _fail_model_score_redo(
-        self,
-        record: SessionRecord,
-        message: str,
-    ) -> None:
-        lease_outcome = await self._settle_model_score_terminal_lease(record)
-        if lease_outcome == "lost":
-            await self._finish_model_score_lease_loss(record, redo=True)
-            return
-        async with record.lock:
-            redo = record.snapshot.redo
-            if (
-                record.model_score_terminal_published
-                or redo is None
-                or redo.state != RedoState.RUNNING
-            ):
+            if record.model_score_terminal_published or record.snapshot.towel is not None:
                 return
             failed_at = datetime.now(UTC)
-            redo.state = RedoState.FAILED
-            redo.failure = message
-            redo.completed_at = failed_at
-            lane = redo.lanes["lakebase"]
-            lane.state = LaneState.FAILED
-            lane.error = message
-            lane.status = "Managed Sync re-do could not be verified"
-            lane.activity = LaneActivity(phase=ModelScorePhase.FAILED)
-            record.model_score_pending_update = None
-            record.snapshot.state = SessionState.VERIFIED
-            record.snapshot.failure = None
-            record.snapshot.updated_at = failed_at
-            record.model_score_terminal_published = True
-            snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            "redo_failed",
-            {"message": message, "session": snapshot.model_dump(mode="json")},
-        )
-
-    async def _finish_model_score_lease_loss(
-        self,
-        record: SessionRecord,
-        *,
-        redo: bool,
-    ) -> None:
-        async with record.lock:
-            if record.model_score_terminal_published or (
-                not redo and record.snapshot.towel is not None
-            ):
-                return
-            failed_at = datetime.now(UTC)
-            if redo:
-                redo_snapshot = record.snapshot.redo
-                if redo_snapshot is None or redo_snapshot.state != RedoState.RUNNING:
-                    return
-                message = "Managed Sync re-do lease was lost"
-                redo_snapshot.state = RedoState.FAILED
-                redo_snapshot.failure = message
-                redo_snapshot.completed_at = failed_at
-                lane = redo_snapshot.lanes["lakebase"]
+            message = "Round 4's ring lease was lost before the result could be published."
+            for lane in record.snapshot.lanes.values():
+                if lane.state == LaneState.NOT_SUPPORTED:
+                    continue
                 lane.state = LaneState.FAILED
                 lane.error = message
                 lane.status = message
-                lane.activity = LaneActivity(phase=ModelScorePhase.FAILED)
-                record.snapshot.state = SessionState.VERIFIED
-                record.snapshot.failure = None
-                event = "redo_failed"
-            else:
-                message = "Managed Sync proof lease was lost before terminal verification."
-                lane = record.snapshot.lanes["lakebase"]
-                lane.state = LaneState.FAILED
-                lane.error = message
-                lane.status = message
-                lane.activity = LaneActivity(phase=ModelScorePhase.FAILED)
-                record.model_score_result = None
-                record.snapshot.state = SessionState.FAILED
-                record.snapshot.failure = message
-                record.snapshot.remembered_result = None
-                event = "session_failed"
+                lane.activity = LaneActivity(phase=Round4Phase.FAILED)
+            record.model_score_result = None
+            record.snapshot.state = SessionState.FAILED
+            record.snapshot.failure = message
+            record.snapshot.remembered_result = None
             record.model_score_pending_update = None
             record.snapshot.updated_at = failed_at
             record.armed_at_monotonic = None
             record.model_score_terminal_published = True
+            engine = record.model_score_engine
             snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
-            event,
+            "session_failed",
             {
                 "state": snapshot.state,
                 "message": message,
                 "session": snapshot.model_dump(mode="json"),
             },
         )
-
-    @staticmethod
-    def _new_model_score_lanes(snapshot: SessionSnapshot) -> dict[str, LaneSnapshot]:
-        competitor = snapshot.lanes["competitor"]
-        return {
-            "lakebase": LaneSnapshot(id="lakebase", name="Lakebase"),
-            "competitor": LaneSnapshot(
-                id="competitor",
-                name=competitor.name,
-                state=LaneState.NOT_SUPPORTED,
-                status=competitor.status,
-                activity=LaneActivity(phase="not_supported"),
-                evidence=dict(competitor.evidence),
-            ),
-        }
+        # The bout's row and running lanes are still owed their settlement.
+        self._schedule_round_settlement(
+            record,
+            getattr(engine, "settle_and_restore_baseline", None),
+            label="Round 4",
+        )
 
     @staticmethod
     def _apply_model_score_result(
-        snapshot: SessionSnapshot | RedoSnapshot,
-        proof: ModelScoreProofResult,
-    ) -> None:
-        lane = snapshot.lanes["lakebase"]
-        lane.state = LaneState.VERIFIED
-        lane.elapsed_ms = proof.application_read_elapsed_ms
-        lane.attempts = proof.poll_attempts
-        lane.status = "Exact committed version and fresh Postgres row verified"
-        lane.error = None
-        lane.verified_at = datetime.now(UTC)
-        lane.activity = LaneActivity(phase=ModelScorePhase.VERIFIED)
-        lane.evidence = {
-            "primary_key": proof.update.entity_id,
-            "score": proof.update.score,
-            "model_version": proof.update.model_version,
-            "proof_nonce": proof.update.proof_nonce,
-            "delta_version": proof.source_version,
-            "status_delta_commit_time": proof.delta_commit_time,
-            "sync_end_time": proof.sync_end_time,
-            "verified_row": {
-                "primary_key": proof.verified_row.entity_id,
-                "score": proof.verified_row.score,
-                "model_version": proof.verified_row.model_version,
-                "proof_nonce": proof.verified_row.proof_nonce,
-            },
-        }
-        snapshot.metrics = [
-            MetricValue(
-                spec_id="managed_availability_ms",
-                lane_id="lakebase",
-                value=proof.managed_availability_ms,
-                display_value=f"{proof.managed_availability_ms:.2f} ms",
-            ),
-            MetricValue(
-                spec_id="application_proof_elapsed_ms",
-                lane_id="lakebase",
-                value=proof.application_read_elapsed_ms,
-                display_value=f"{proof.application_read_elapsed_ms:.2f} ms",
-            ),
+        snapshot: SessionSnapshot,
+        result: Round4RaceResult,
+    ) -> bool:
+        """Put a bout's lanes, metrics and verdict on the card. True when it measured something.
+
+        The verdict is the engine's, from the lanes' own reads (``round4_race.resolve``);
+        nothing here recomputes it.
+        """
+
+        update = result.update
+        metrics: list[MetricValue] = []
+        for lane_id, outcome in result.outcomes.items():
+            lane = snapshot.lanes[lane_id]
+            evidence: dict[str, Any] = {
+                "primary_key": update.entity_id,
+                "score": update.score,
+                "model_version": update.model_version,
+                "proof_nonce": update.proof_nonce,
+                "delta_version": result.commit.version,
+                "delta_commit_time": result.commit.committed_at,
+                "reads": outcome.reads,
+                "max_read_gap_ms": outcome.max_read_gap_ms,
+                "last_negative_ms": outcome.last_negative_ms,
+                "bell_at": result.bell.rung_at,
+                "protocol": result.protocol,
+                **dict(outcome.evidence),
+            }
+            lane.evidence = evidence
+            lane.attempts = outcome.reads
+            if outcome.verified and outcome.elapsed_ms is not None:
+                lane.state = LaneState.VERIFIED
+                lane.elapsed_ms = outcome.elapsed_ms
+                lane.status = "The exact row is in the application"
+                lane.error = None
+                lane.verified_at = lane.verified_at or datetime.now(UTC)
+                lane.activity = LaneActivity(phase=Round4Phase.VERIFIED)
+                metrics.append(
+                    MetricValue(
+                        spec_id="bell_to_exact_read_ms",
+                        lane_id=lane_id,
+                        value=outcome.elapsed_ms,
+                        display_value=f"{outcome.elapsed_ms / 1000:.2f} s",
+                    )
+                )
+            else:
+                lane.state = LaneState.FAILED
+                lane.elapsed_ms = None
+                lane.status = (
+                    "Did not deliver the row within its bound"
+                    if outcome.timed_out
+                    else "Could not be measured"
+                )
+                lane.error = outcome.failure
+                if outcome.timed_out and outcome.bound_ms is not None:
+                    # Still running at its bound, which is a result, not an error.
+                    lane.error = None
+                    lane.evidence.update(_floor_evidence(outcome.bound_ms))
+                lane.activity = LaneActivity(phase=Round4Phase.FAILED)
+            metrics.append(
+                MetricValue(
+                    spec_id="exact_row_verified",
+                    lane_id=lane_id,
+                    value=bool(outcome.verified),
+                    display_value="Verified" if outcome.verified else "Not verified",
+                )
+            )
+        sync_ms = result.outcomes[LAKEBASE_LANE].evidence.get("managed_availability_ms")
+        if isinstance(sync_ms, int | float):
+            metrics.append(
+                MetricValue(
+                    spec_id="managed_availability_ms",
+                    lane_id=LAKEBASE_LANE,
+                    value=float(sync_ms),
+                    display_value=f"{float(sync_ms) / 1000:.2f} s",
+                )
+            )
+        metrics.append(
             MetricValue(
                 spec_id="delta_commit_version",
-                lane_id="lakebase",
-                value=proof.source_version,
-                display_value=str(proof.source_version),
-            ),
-            MetricValue(
-                spec_id="exact_row_verified",
-                lane_id="lakebase",
-                value=True,
-                display_value="Verified",
-            ),
-        ]
-        snapshot.comparison = ComparisonSnapshot(
-            kind=ComparisonKind.CAPABILITY_GAP,
-            winner_lane_id="lakebase",
-            margin=None,
-            detail=_ROUND_FOUR_COMPARISON_DETAIL,
+                value=result.commit.version,
+                display_value=str(result.commit.version),
+            )
         )
+        snapshot.metrics = metrics
+        snapshot.comparison, measured = _round_four_comparison(
+            result,
+            snapshot.lanes[COMPETITOR_LANE].name,
+            has_competitor=COMPETITOR_LANE in result.outcomes,
+        )
+        return measured
 
     async def _run(self, record: SessionRecord) -> None:
         assert record.live_targets is not None
@@ -10388,6 +10571,10 @@ class RunManager:
         result: RecoveryRunResult,
     ) -> None:
         cleanup_owned = False
+        stoppage = _finished_over_a_bound(
+            {lane_id: lane.ok for lane_id, lane in result.lanes.items()},
+            {lane_id: lane.timed_out for lane_id, lane in result.lanes.items()},
+        )
         async with record.lock:
             record.snapshot.fairness = FairnessSnapshot(launch_skew_ms=result.launch_skew_ms)
             for lane_id, lane_result in result.lanes.items():
@@ -10408,7 +10595,12 @@ class RunManager:
                 )
                 if lane_result.ok:
                     lane.verified_at = datetime.now(UTC)
-            if result.all_verified:
+            if stoppage is not None:
+                _adjudicate_bound(
+                    record.snapshot, *stoppage, finished_task="recovered the exact order"
+                )
+                self._log_bound_stoppage(record, *stoppage, round_number=3)
+            if result.all_verified or stoppage is not None:
                 record.snapshot.state = SessionState.VERIFIED
                 record.snapshot.remembered_result = self._remembered_result(record.snapshot)
                 record.snapshot.failure = None
@@ -10454,6 +10646,13 @@ class RunManager:
         result: SafeChangeRunResult,
     ) -> None:
         cleanup_owned = False
+        stoppage = _finished_over_a_bound(
+            {
+                lane_id: lane.state == SafeChangeLaneState.VERIFIED
+                for lane_id, lane in result.lanes.items()
+            },
+            {lane_id: lane.timed_out for lane_id, lane in result.lanes.items()},
+        )
         async with record.lock:
             if record.snapshot.towel is not None:
                 return
@@ -10479,7 +10678,12 @@ class RunManager:
                 )
                 if lane.state == LaneState.VERIFIED:
                     lane.verified_at = datetime.now(UTC)
-            if result.all_verified:
+            if stoppage is not None:
+                _adjudicate_bound(
+                    record.snapshot, *stoppage, finished_task="verified the isolated schema change"
+                )
+                self._log_bound_stoppage(record, *stoppage, round_number=2)
+            if result.all_verified or stoppage is not None:
                 record.snapshot.state = SessionState.VERIFIED
                 record.snapshot.remembered_result = self._remembered_result(record.snapshot)
                 record.snapshot.failure = None
@@ -10893,13 +11097,11 @@ class RunManager:
                 await engine.settle_and_restore_baseline()
             elif round_id == RoundId.ANALYZE_LIVE_ORDERS:
                 engine = record.live_orders_engine
-                order = record.live_orders_pending_order
-                if engine is None or order is None:
-                    raise InvalidStateError("The live-order cleanup identity is unavailable")
-                await engine.settle_and_cleanup_owned(
-                    order,
-                    record.live_orders_guardrail_order,
-                )
+                if engine is None:
+                    raise InvalidStateError("The live-order cleanup engine is unavailable")
+                # The engine keeps every order it rang until settling removes it from every
+                # source, and parks the AWS pipeline whether or not the bell was rung.
+                await engine.settle_and_cleanup_owned()
 
             async with record.lock:
                 cooldown = record.snapshot.cooldown
@@ -11640,13 +11842,28 @@ class RunManager:
     @staticmethod
     def _remembered_result(snapshot: SessionSnapshot) -> str:
         if snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
-            elapsed_ms = snapshot.lanes["lakebase"].elapsed_ms
-            if elapsed_ms is None:
-                raise RuntimeError("Round 4 verified without a capability elapsed time")
-            return _round_four_remembered_result(elapsed_ms)
+            if snapshot.lanes[LAKEBASE_LANE].elapsed_ms is None and (
+                snapshot.lanes[COMPETITOR_LANE].elapsed_ms is None
+            ):
+                raise RuntimeError("Round 4 verified without either lane's elapsed time")
+            return _round_four_remembered_result(snapshot)
         if snapshot.lanes["competitor"].state == LaneState.NOT_SUPPORTED:
             assert snapshot.lanes["lakebase"].state == LaneState.VERIFIED
             return "LAKEBASE WINS — RDS CANNOT ENTER THE ROUND"
+        stoppage = snapshot.comparison
+        if (
+            stoppage is not None
+            and stoppage.kind == ComparisonKind.ADJUDICATED_STOPPAGE
+            and stoppage.winner_lane_id is not None
+        ):
+            # A lane stopped at its bound (Rounds 2 and 3): its clock is a floor, so the
+            # difference between the two clocks is not a margin. Rounds 4 and 6's words.
+            winner = (
+                "LAKEBASE"
+                if stoppage.winner_lane_id == LAKEBASE_LANE
+                else snapshot.competitor.short_name.upper()
+            )
+            return f"{winner} WINS · MARGIN IS A LOWER BOUND"
 
         lakebase_ms = snapshot.lanes["lakebase"].elapsed_ms
         competitor_ms = snapshot.lanes["competitor"].elapsed_ms

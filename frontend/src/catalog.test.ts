@@ -33,13 +33,33 @@ describe('deterministic fight-card recommendation', () => {
   })
 
   it('describes the executable Round 4, Round 5, and Round 6 stop gates', () => {
-    expect(stopCondition('put_model_score_in_app')).toContain('fresh application connection')
+    expect(stopCondition('put_model_score_in_app')).toMatch(
+      /bell cold starts both integrations.*one Delta change.*first application read of the exact row.*250 ms on both lanes/i,
+    )
     expect(stopCondition('survive_connection_spike')).toMatch(
       /each pooled-path setup clock stops at an exact application transaction.*included pool.*selected AWS managed pooling path.*new RDS Proxy.*128-attempt, maximum-64-concurrent check.*64-client witness/i,
     )
     expect(stopCondition('analyze_live_orders_without_slowing_checkout')).toMatch(
-      /exact committed order.*Delta.*separate checkout/i,
+      /same checkout on both sources.*cold starts AWS DMS and Glue.*first read of the exact order.*own Delta history.*every second on both lanes.*separate checkout/i,
     )
+  })
+
+  it('mirrors server/catalog.py for Round 6: a measured race, AWS cold at the bell', () => {
+    const round = FALLBACK_CATALOG.rounds.find((item) => item.id === 'analyze_live_orders_without_slowing_checkout')!
+    expect(round.comparison_kind).toBe('measured')
+    expect(round.metric_specs?.map((spec) => spec.id)).toEqual([
+      'bell_to_exact_history_ms',
+      'commit_skew_ms',
+      'exact_order_verified',
+      'checkout_verified',
+    ])
+    expect(round.scorecard_by_corner.performance).toBe(
+      'Bell to the exact order in the lakehouse, with AWS DMS and Glue cold starting at the bell',
+    )
+    const claims = round.non_claims?.join(' ') ?? ''
+    expect(claims).toMatch(/AWS DMS and Glue cold start at the bell.*change feed is built into the database and always on/i)
+    // Only AWS cold starts; nothing calls Lakebase's feed warm, and no AWS stack is "not built".
+    expect(claims).not.toMatch(/warm|not built|remains unpriced/i)
   })
 
   it('keeps the bundled Round 5 catalog aligned to the static-IAM clock boundary', () => {

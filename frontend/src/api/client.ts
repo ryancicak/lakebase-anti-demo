@@ -1,5 +1,5 @@
 import type { BoutReceipt } from '../recap'
-import type { AllBoutStatus, BoutStatus, CatalogResponse, CreateSessionRequest, DemoSession, EventName, InstallationStatus, RecoveryAttempt, RecoverySpawned, RoundId, RunEvent } from './types'
+import type { AllBoutStatus, BoutStatus, CatalogResponse, CompetitorId, CreateSessionRequest, DemoSession, EventName, InstallationStatus, RecoveryAttempt, RecoverySpawned, RoundId, RunEvent } from './types'
 
 export interface ReceiptsResponse {
   receipts: BoutReceipt[]
@@ -113,6 +113,14 @@ export const api = {
    */
   receipts: () => request<ReceiptsResponse>('/api/receipts'),
   armSession: (id: string) => request<DemoSession>(`/api/sessions/${encodeURIComponent(id)}/arm`, { method: 'POST' }),
+  /**
+   * Round 4's fight card is open: wake that matchup's destinations, so Prepare need not.
+   * Only a head start, so nothing waits on it and a refusal is not an error to show.
+   */
+  wakeRoundFour: (competitor: CompetitorId) => request<{ waking: boolean }>(
+    '/api/rounds/put_model_score_in_app/wake',
+    { method: 'POST', body: JSON.stringify({ competitor }) },
+  ),
   cancelArm: (id: string) => request<DemoSession>(`/api/sessions/${encodeURIComponent(id)}/cancel-arm`, { method: 'POST' }),
   runSession: (id: string) => request<DemoSession>(
     `/api/sessions/${encodeURIComponent(id)}/run`,

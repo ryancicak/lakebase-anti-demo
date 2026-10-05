@@ -214,15 +214,21 @@ ownership, and the next useful question.
    DBAs, and Infosec discussing isolation, compatibility, promotion, and rollback.
 3. **Recover this deleted order** — Best for DBAs, SREs, Application Owners, and
    Infosec discussing exact recovery, RTO, integrity, and service resumption.
-4. **Move lakehouse data into an app** — Best for Data Engineers, Data Scientists,
-   Analysts, and Application Owners discussing governed score delivery and
-   freshness.
+4. **Move lakehouse data into live applications** — Best for Data Engineers, Data
+   Scientists, Analysts, and Application Owners discussing governed score delivery
+   and freshness. Lakebase's managed reverse ETL races an AWS Glue job writing the
+   same Delta change into Aurora or RDS. Both integrations start cold at the bell,
+   and each clock stops at the exact row in its application.
 5. **Ready a pooled application path** — Best for Software Engineers, SREs,
    DBAs, and Architects discussing pooled-path setup, client fan-in, protected
-   backend slots, credentials, observability, and ownership.
-6. **Move app data into the lakehouse** — Best for Data Engineers, Analysts, SREs,
-   and Application Owners discussing order-to-answer freshness and checkout
-   protection.
+   backend slots, credentials, observability, and ownership. Lakebase's included
+   pooled endpoint races the AWS lane building an RDS Proxy at the bell, and each
+   lane must hold exactly 10,000 clients.
+6. **Move live application data into the lakehouse** — Best for Data Engineers,
+   Analysts, SREs, and Application Owners discussing order-to-answer freshness and
+   checkout protection. Lakebase's built-in change feed races AWS DMS and an AWS
+   Glue job carrying the same checkout into Delta. AWS starts cold at the bell
+   against a feed that is always on, and the round says so.
 
 ## Corner Priorities
 
@@ -244,7 +250,10 @@ Ringside follows the same evidence rules as the arena:
 - one-sided evidence names the verified lane and the lane that did not verify;
 - a towel preserves verified measurements and reports unfinished work only as a
   lower bound;
-- Rounds 4 and 6 make capability claims, not an unexecuted AWS speed comparison;
+- Rounds 4 and 6 race a real AWS lane, timed from the same bell. Round 4 starts
+  both integrations cold. Round 6 starts AWS cold against Lakebase's always-on
+  change feed and discloses that. An installation without the AWS lane makes the
+  round's capability claim instead of a comparison;
 - Round 5 declares a result only after setup, spike, fairness, and cleanup gates
   pass; and
 - missing evidence never inherits success language.
@@ -270,14 +279,16 @@ to expose handoffs. The proof line should remain visibly identical as you switch
 ## Content provenance and architecture
 
 The audience copy is a reviewed static corpus: six rounds × ten personas × seven
-non-empty priority selections. Separate reviewed outcome records cover verified,
-one-sided, capability-gap, partial, towel, and no-result states. The frontend
-loads those canonical JSONL sources into typed lookups and uses one
-round-specific evidence classifier for meaning, question, and proof.
+non-empty priority selections. Separate reviewed outcome records cover verified
+comparisons, capability gaps, one-sided results, towels, failed cleanup, Round 5's
+setup and bounded-check gates, and no-result states. The frontend loads those
+canonical JSONL sources into typed lookups and uses one round-specific evidence
+classifier for meaning, question, and proof.
 
 The public sources are
-[`verified-corpus.jsonl`](frontend/src/ringside-cues/verified-corpus.jsonl) and
-[`outcome-copy.jsonl`](frontend/src/ringside-cues/outcome-copy.jsonl). Source
+[`verified-corpus.jsonl`](frontend/src/ringside-cues/verified-corpus.jsonl),
+[`outcome-copy.jsonl`](frontend/src/ringside-cues/outcome-copy.jsonl), and
+[`round5-persona-outcomes.jsonl`](frontend/src/ringside-cues/round5-persona-outcomes.jsonl). Source
 presentation materials are not linked because they are not publication-safe;
 the methodology and approved public copy are fully represented here and in the
 repository.

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .manifest import DemoManifest, load_manifest
@@ -41,13 +41,33 @@ from .safe_change_live import (
     _lakebase_endpoint_type,
     _lakebase_owner_endpoint_id,
     build_safe_change_engine,
+    create_lakebase_resource,
     lakebase_resource_path,
+    wait_lakebase_branch_gone,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 _CONTRACT_TAG = "anti-demo-contract"
 _CONTRACT_VALUE = "recovery-v1"
+
+
+def lakebase_source_branch_time(recovery_at: datetime) -> str:
+    """The point in time asked of Lakebase for a recovery branch, as the request carries it.
+
+    The recovery point itself, except on a whole minute. Lakebase answers a create-branch
+    whose `source_branch_time` has no seconds and no fraction with INTERNAL_ERROR "Please
+    try again later", every time, and accepts the same call one millisecond later. The
+    boundary is the full second before the delete, so about one Round 3 bout in 60 lands on
+    a minute. Each of the four that did in the release runs lost its Lakebase lane (rc10,
+    rc13, rc14 and rc17; a towel hid rc13's), and no other Round 3 Lakebase lane failed. One
+    millisecond later is still most of a second before the delete, so the branch holds
+    exactly what the recovery point does.
+    """
+
+    if recovery_at.second == 0 and recovery_at.microsecond == 0:
+        recovery_at += timedelta(milliseconds=1)
+    return recovery_at.isoformat()
 
 
 class _RecoveryAdapterBase(RecoveryAdapter):
@@ -193,7 +213,7 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
             ),
         )
         await self.adapter.preflight(self._source_plan(plan))
-        return {"source_branch_time": recovery_at.isoformat()}
+        return {"source_branch_time": lakebase_source_branch_time(recovery_at)}
 
     async def create_recovery(
         self,
@@ -206,25 +226,28 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
         branch_path = _lakebase_create_path(
             self.adapter._project, "branches", "branch_id", plan.artifact_id
         )
-        branch_wire_call = (
-            f"POST {branch_path} source_branch_time={recovery_at.isoformat()}"
-        )
+        source_branch_time = lakebase_source_branch_time(recovery_at)
+        branch_wire_call = f"POST {branch_path} source_branch_time={source_branch_time}"
         await report(
             "Requesting the Lakebase point-in-time recovery branch",
             branch_wire_call,
         )
         await self._run_mutation(
-            self.adapter._runner.json(
-                "POST",
+            create_lakebase_resource(
+                self.adapter._runner,
                 branch_path,
                 body={
                     "spec": {
                         "source_branch": self.adapter._source_branch,
-                        "source_branch_time": recovery_at.isoformat(),
+                        "source_branch_time": source_branch_time,
                         "no_expiry": True,
                     }
                 },
                 timeout_seconds=self.adapter.config.control_timeout_seconds,
+                created=lambda: self.adapter._branch_made(
+                    branch_name, source_branch_time=source_branch_time
+                ),
+                sleep=self.adapter._sleep,
             )
         )
         await report(
@@ -249,8 +272,8 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
                 endpoint_wire_call,
             )
             await self._run_mutation(
-                self.adapter._runner.json(
-                    "POST",
+                create_lakebase_resource(
+                    self.adapter._runner,
                     _lakebase_create_path(
                         branch_name, "endpoints", "endpoint_id", endpoint_id
                     ),
@@ -262,6 +285,8 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
                         }
                     },
                     timeout_seconds=self.adapter.config.control_timeout_seconds,
+                    created=lambda: self.adapter._endpoint_made(endpoint_name),
+                    sleep=self.adapter._sleep,
                 )
             )
             await report(
@@ -319,11 +344,19 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
             "Waiting for the owned Lakebase recovery branch deletion",
             f"GET {LAKEBASE_API_ROOT}/<branch>",
         )
-        deadline = self.adapter._clock() + self.adapter.config.poll_timeout_seconds
-        while await self.inspect_recovery(plan) is not None:
-            if self.adapter._clock() >= deadline:
-                raise SafeChangeControlPlaneError("Lakebase recovery branch still exists")
-            await self.adapter._sleep(self.adapter.config.poll_interval_seconds)
+
+        async def still_present() -> bool:
+            return await self.inspect_recovery(plan) is not None
+
+        await wait_lakebase_branch_gone(
+            self.adapter._runner,
+            branch_name,
+            still_present,
+            clock=self.adapter._clock,
+            sleep=self.adapter._sleep,
+            config=self.adapter.config,
+            still_exists="Lakebase recovery branch still exists",
+        )
 
     async def abandon_recovery(self, plan: RecoveryPlan) -> None:
         """Issue branch deletion for a cancelled lane without waiting for it.
@@ -790,6 +823,13 @@ class AuroraRecoveryAdapter(_AwsRecoveryAdapter):
             )
 
 
+#: Reads of RDS's two-call restore window before a disagreement between them is believed,
+#: and the pause before each re-read. RDS moves the window minutes apart, so one re-read
+#: settles a pair that straddled a move; the third covers a describe call that lags.
+_RDS_RESTORE_WINDOW_READS = 3
+_RDS_RESTORE_WINDOW_REREAD_SECONDS = 1.0
+
+
 class RdsRecoveryAdapter(_AwsRecoveryAdapter):
     provider = SafeChangeProvider.RDS
 
@@ -817,6 +857,25 @@ class RdsRecoveryAdapter(_AwsRecoveryAdapter):
         report: RecoveryReporter | None = None,
     ) -> tuple[datetime, datetime]:
         self._assert_plan(plan)
+        # The window takes two reads, the instance and then its automated backup, and
+        # RDS moves LatestRestorableTime on its own clock, every few minutes as it
+        # ships the transaction log. A pair of reads that straddles one of those moves
+        # disagrees for that moment only. Refusing on it failed a bout as if AWS had
+        # no window at all (release bar, 2026-10-01 04:17:10Z). So the pair is read
+        # again; a disagreement that survives every read is not that race.
+        for attempt in range(_RDS_RESTORE_WINDOW_READS):
+            if attempt:
+                await self.adapter._sleep(_RDS_RESTORE_WINDOW_REREAD_SECONDS)
+            window = await self._read_restorable_window(report)
+            if window is not None:
+                return window
+        raise SafeChangeLiveConfigurationError("AWS restorable window is unavailable")
+
+    async def _read_restorable_window(
+        self, report: RecoveryReporter | None
+    ) -> tuple[datetime, datetime] | None:
+        """One read of the window, or None when only its latest bound moved between reads."""
+
         source = await self._source_control()
         earliest = source.get("EarliestRestorableTime")
         latest = source.get("LatestRestorableTime")
@@ -874,9 +933,10 @@ class RdsRecoveryAdapter(_AwsRecoveryAdapter):
             or not aware(backup_earliest)
             or not aware(backup_latest)
             or backup_earliest > backup_latest
-            or backup_latest != latest
         ):
             raise SafeChangeLiveConfigurationError("AWS restorable window is unavailable")
+        if backup_latest != latest:
+            return None
         return backup_earliest, backup_latest
 
     async def inspect_recovery(self, plan: RecoveryPlan) -> ArtifactInspection | None:

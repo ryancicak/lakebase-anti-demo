@@ -55,15 +55,19 @@ COMPETITORS = [
 
 MODEL_SCORE_METRICS = [
     MetricSpec(
-        id="managed_availability_ms",
-        label="Reverse ETL sync",
+        # The scored clock, on both lanes: the bell, which starts both integrations from
+        # parked and commits the change, to that lane's first read of the exact row.
+        id="bell_to_exact_read_ms",
+        label="Bell to the exact row in the app",
         role=MetricRole.PRIMARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
     ),
     MetricSpec(
-        id="application_proof_elapsed_ms",
-        label="End-to-end proof",
+        # Lakebase's own figure, from the synced table's timestamps. Shown, never compared:
+        # the AWS lane has no service timestamp like it.
+        id="managed_availability_ms",
+        label="Reverse ETL sync (Lakebase's own timestamps)",
         role=MetricRole.SECONDARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
@@ -134,17 +138,29 @@ CONNECTION_SPIKE_METRICS = [
 
 LIVE_ORDERS_METRICS = [
     MetricSpec(
-        id="analytics_available_ms",
-        label="Live answer available",
+        # The scored clock, on both lanes: the bell, which commits the same checkout on both
+        # sources and starts AWS's DMS task and Glue job from parked, to that lane's first read
+        # of the exact order in its own Delta history.
+        id="bell_to_exact_history_ms",
+        label="Bell to the exact order in the lakehouse",
         role=MetricRole.PRIMARY,
         unit=MetricUnit.MILLISECONDS,
         direction=MetricDirection.LOWER_IS_BETTER,
     ),
     MetricSpec(
-        id="matching_live_orders",
-        label="Exact live orders",
-        role=MetricRole.SECONDARY,
-        unit=MetricUnit.COUNT,
+        # How far apart the two sources acknowledged the bell's checkout. Recorded, never
+        # scored: each lane's clock already contains its own commit.
+        id="commit_skew_ms",
+        label="Checkout commit skew between the lanes",
+        role=MetricRole.GUARDRAIL,
+        unit=MetricUnit.MILLISECONDS,
+        direction=MetricDirection.LOWER_IS_BETTER,
+    ),
+    MetricSpec(
+        id="exact_order_verified",
+        label="Exact order verified",
+        role=MetricRole.GUARDRAIL,
+        unit=MetricUnit.BOOLEAN,
         direction=MetricDirection.EXACT,
     ),
     MetricSpec(
@@ -219,42 +235,47 @@ ROUNDS = [
         id=RoundId.PUT_MODEL_SCORE_IN_APP,
         title="Move lakehouse data into live applications",
         capability=(
-            "Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres"
+            "Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres, "
+            "raced against an AWS Glue job writing the same change into Aurora or RDS"
         ),
         scorecard_by_corner={
-            Corner.COST: "Database list rates captured; required reverse ETL remains unpriced",
+            Corner.COST: (
+                "Published rates: the synced-table pipeline and the Glue job each bill only "
+                "while a bout runs"
+            ),
             Corner.SIMPLICITY: (
-                "Analytics Delta to exact operational Postgres application row"
+                "One synced table against a Glue job, its role, network, connection, ledger "
+                "and checkpoint"
             ),
             Corner.PERFORMANCE: (
-                "Reverse ETL sync and end-to-end proof time"
+                "Bell to the exact row in the app, with both integrations cold starting at "
+                "the bell"
             ),
         },
         competitors=[CompetitorId.RDS_POSTGRES, CompetitorId.AURORA_SERVERLESS_V2],
         availability=Availability.PLANNED,
         metric_specs=MODEL_SCORE_METRICS,
-        comparison_kind=ComparisonKind.CAPABILITY_GAP,
+        comparison_kind=ComparisonKind.MEASURED,
         non_claims=[
             (
-                "RDS/Aurora are destination databases only; the same outcome requires a "
-                "separate reverse-ETL stack that must be selected or built, secured, "
-                "networked, configured, monitored, and operated."
+                "Both integrations cold start at the bell, and each lane's clock "
+                "contains its own start. Neither is warmed for the audience."
             ),
-            "The AWS lane was not executed or timed.",
-            "No cross-platform speed comparison or margin is claimed.",
+            (
+                "AWS moves the AWS lane's data: an AWS Glue 5.0 job reads the Delta table's "
+                "files straight from S3, around Unity Catalog's permissions, lineage and audit, "
+                "and writes over JDBC. The supported routes for an outside engine (credential "
+                "vending, Iceberg REST, Delta Sharing) would each put Databricks back in the lane."
+            ),
+            (
+                "One change, one verifier: one Delta commit feeds both lanes, and each lane is "
+                "read by the same query on the same client every 250 ms."
+            ),
+            "The Glue job, its role, network and connection are installed once and standing.",
+            "This is one live proof session, not a benchmark.",
             "No dollar savings are claimed.",
-            "No eliminated system is claimed.",
             "No full model-serving capability is claimed.",
         ],
-        redo=RedoPresentation(
-            policy="show",
-            badge="★ SHOW",
-            label="CHANGE SCORE IN LAKEHOUSE → WATCH APP UPDATE",
-            description=(
-                "Change this demo's customer risk score from v1 to v2 in the lakehouse, "
-                "then watch the same live app record update."
-            ),
-        ),
     ),
     RoundDefinition(
         id=RoundId.SURVIVE_CONNECTION_SPIKE,
@@ -320,18 +341,57 @@ ROUNDS = [
     RoundDefinition(
         id=RoundId.ANALYZE_LIVE_ORDERS,
         title="Move live application data into the lakehouse",
-        capability="Built-in change feed (CDF) to separate Delta history",
+        capability=(
+            "Lakebase's built-in change feed into Delta, raced against AWS DMS capturing the "
+            "same checkout from Aurora or RDS and an AWS Glue job appending it to Delta"
+        ),
         scorecard_by_corner={
-            Corner.COST: "Database list rates captured; required AWS CDC stack remains unpriced",
-            Corner.SIMPLICITY: "Built-in change feed: one checkout to one exact Delta answer",
+            Corner.COST: (
+                "Published rates: the DMS instance stands, and the Glue job bills only while a "
+                "bout runs"
+            ),
+            Corner.SIMPLICITY: (
+                "One built-in change feed against a DMS instance, task and endpoints, a Glue "
+                "job, its role, network, bucket and checkpoint"
+            ),
             Corner.PERFORMANCE: (
-                "Commit-to-answer freshness; a separate checkout is the correctness guardrail"
+                "Bell to the exact order in the lakehouse, with AWS DMS and Glue cold starting "
+                "at the bell"
             ),
         },
         competitors=[CompetitorId.RDS_POSTGRES, CompetitorId.AURORA_SERVERLESS_V2],
         availability=Availability.PREVIEW,
         metric_specs=LIVE_ORDERS_METRICS,
-        comparison_kind=ComparisonKind.CAPABILITY_GAP,
+        comparison_kind=ComparisonKind.MEASURED,
+        non_claims=[
+            (
+                "AWS DMS and Glue cold start at the bell, and the AWS lane's clock contains "
+                "their start. Lakebase's change feed is built into the database and always on, "
+                "so its side has nothing to start. What It Cost shows what keeping AWS's "
+                "pipeline running all day would cost."
+            ),
+            (
+                "AWS moves the AWS lane's data: DMS captures the checkout from the database's "
+                "write-ahead log into S3, and an AWS Glue 5.0 job appends it to a Delta table "
+                "that Unity Catalog reads as an external table."
+            ),
+            (
+                "One checkout, one verifier: the bell commits the same order on both sources, "
+                "and each lane's Delta history is read by the same query on the same SQL "
+                "warehouse every second."
+            ),
+            (
+                "Each history keeps its own shape: Lakebase's feed writes a change type and "
+                "LSN, and DMS writes an operation and commit timestamp. The claim is the "
+                "order's delivery, not identical tables."
+            ),
+            (
+                "The DMS instance, task and endpoints, the Glue job, its role, network and "
+                "bucket are installed once and standing."
+            ),
+            "This is one live proof session, not a benchmark.",
+            "No dollar savings are claimed.",
+        ],
     ),
 ]
 
@@ -503,7 +563,10 @@ def build_presenter_pack(
         )
         remembered_metric = f"{metric_list.capitalize()} to the same verified outcome"
     if selected_round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
-        remembered_metric = "Managed Sync exact-version proof and fresh Postgres exact-row read"
+        remembered_metric = (
+            "Bell to the exact row in the app on each lane, both integrations cold starting "
+            "at the bell"
+        )
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
         remembered_metric = (
             "Primary time to hold 10,000 authenticated clients per lane from one shared "
@@ -511,7 +574,10 @@ def build_presenter_pack(
             "nearest-rank connect p99"
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
-        remembered_metric = "One exact live order in Delta with checkout still verified"
+        remembered_metric = (
+            "Bell to the exact order in the lakehouse on each lane, AWS DMS and Glue cold "
+            "starting at the bell"
+        )
     if (
         selected_round.id == RoundId.WAKE_IDLE_APP
         and competitor == CompetitorId.RDS_POSTGRES
@@ -536,8 +602,9 @@ def build_presenter_pack(
         )
     elif selected_round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
         stop_condition = (
-            "The clock ends only after the exact committed Delta version is observed synced "
-            "and a fresh Postgres read returns the exact row."
+            "The bell cold starts both integrations and commits one Delta change. Each "
+            "lane's clock stops at its first application read of the exact row, polled every "
+            "250 ms on both lanes."
         )
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
         stop_condition = (
@@ -550,8 +617,10 @@ def build_presenter_pack(
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
         stop_condition = (
-            "The clock stops when the exact committed order appears once in Delta history. "
-            "The result waits for a separate checkout to commit."
+            "The bell commits the same checkout on both sources and cold starts AWS DMS and "
+            "Glue. Each lane's clock stops at its first read of the exact order, once, in its "
+            "own Delta history, polled every second on both lanes. A separate checkout must "
+            "commit on each source."
         )
     elif selected_round.availability == Availability.PREVIEW:
         stop_condition = (

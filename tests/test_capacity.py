@@ -578,6 +578,23 @@ class TestDisclosure:
         assert [lane.lane_id for lane in disclosure.lanes] == ["lakebase"]
         assert "no compute comparison is made" in disclosure.note
 
+    @pytest.mark.parametrize("competitor", [AURORA, RDS])
+    def test_round_four_says_why_it_compares_no_compute_without_denying_its_databases(
+        self, competitor: CompetitorId
+    ) -> None:
+        # Its databases stand from v1.1 and its Glue lane writes into them where it
+        # is sealed, so the sentence Round 6 carries would be false here.
+        note = build_capacity_disclosure(RoundId.PUT_MODEL_SCORE_IN_APP, competitor).note
+        assert "No Aurora or RDS database is provisioned" not in note
+        assert "Round 4 times data movement, not database capacity" in note
+        assert "AWS Glue job" in note
+        # Round 6's databases stand from v1.1 too, ahead of its lane, so it may not
+        # deny them either.
+        round_six = build_capacity_disclosure(RoundId.ANALYZE_LIVE_ORDERS, competitor).note
+        assert "No Aurora or RDS database is provisioned" not in round_six
+        assert "Round 6 times data movement, not database capacity" in round_six
+        assert "own Aurora cluster and RDS instance stand ahead of an AWS lane" in round_six
+
     def test_round_six_discloses_that_it_scales_to_zero_like_every_other_round(
         self,
     ) -> None:
@@ -943,10 +960,15 @@ class TestTheRoundOneRdsLaneLeavesTheReport:
             lambda _profile, _endpoint: (2.0, LAKEBASE_MIN_CU),
         )
         assert lifecycle._capacity_parity(_v7_manifest(monkeypatch)).ok
+        # The instances for Rounds 4 and 6 are compared from v1.1 whether or not
+        # this installation races them: they stand, so their ceilings must already
+        # be the matched ones.
         assert described == [
             "anti-demo-rds-r2",
             "anti-demo-rds-r3",
+            "anti-demo-rds-r4",
             "anti-demo-rds-r5",
+            "anti-demo-rds-r6",
         ]
 
     def test_shrinking_a_scored_instance_still_fails_the_gate_under_v7(
@@ -995,13 +1017,38 @@ class TestEachRoundIsComparedAgainstItsOwnEndpoint:
     is changed -- at which point the check would pass a lane it never looked at.
     """
 
-    def test_all_four_lanes_read_four_different_endpoints(
+    def test_every_aws_lane_reads_its_own_endpoint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Six from v1.1: the databases for Rounds 4 and 6 stand, so they are
+        # compared too.
         asked = _arm_lifecycle(monkeypatch)
         assert lifecycle._capacity_parity(_v7_manifest(monkeypatch)).ok
+        assert asked == [_round_endpoint(number) for number in (1, 2, 3, 4, 5, 6)]
+        assert len(set(asked)) == 6
+
+    def test_a_manifest_sealed_before_rounds_four_and_six_had_databases_skips_them(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A v1.0 manifest seals no AWS environment for Round 4 or Round 6; there is
+        # nothing to compare, and their absence is not a failure.
+        manifest = _v7_manifest(monkeypatch)
+        sealed = type(manifest).round_environment
+        unsealed = (4, 6, RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS)
+
+        def without_rounds_four_and_six(self: object, key: RoundId | int) -> SimpleNamespace:
+            environment = sealed(self, key)
+            if key in unsealed:
+                return SimpleNamespace(lakebase=environment.lakebase, aurora=None, rds=None)
+            return environment
+
+        monkeypatch.setattr(
+            type(manifest), "round_environment", without_rounds_four_and_six, raising=False
+        )
+        asked = _arm_lifecycle(monkeypatch)
+        assert lifecycle._capacity_parity(manifest).ok
         assert asked == [_round_endpoint(number) for number in (1, 2, 3, 5)]
-        assert len(set(asked)) == 4
+        assert lifecycle._sealed_aws_round_numbers(manifest) == (1, 2, 3, 5)
 
     def test_a_single_round_resized_on_its_own_fails_the_gate(
         self, monkeypatch: pytest.MonkeyPatch

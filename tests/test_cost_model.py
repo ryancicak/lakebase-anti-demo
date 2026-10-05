@@ -11,6 +11,7 @@ import server.cost_model as cost_model_module
 import server.pricing as pricing_module
 from server.capacity import (
     AURORA_AUTO_PAUSE_SECONDS,
+    LAKEBASE_ONLY_ROUNDS,
     LAKEBASE_SUSPEND_SECONDS,
     RDS_CLASS_MEMORY_GIB,
     RDS_INSTANCE_CLASS,
@@ -20,14 +21,19 @@ from server.cost_model import (
     ACU_SAMPLE_LEAD_SECONDS,
     ACU_SAMPLE_TAIL_SECONDS,
     AS_RUN_RDS_INSTANCE_CLASS,
+    AURORA_LANES_NOT_YET_MEASURED,
     AURORA_MIN_RUNNING_ACU,
     CUSTOMER_EQUIVALENT_FLOOR_REASON,
+    GLUE_MINIMUM_BILLED_SECONDS,
     IMPUTED_AURORA_ROUNDS,
     IMPUTED_RDS_ROUNDS,
     LAKEBASE_CEILING_CU,
     LAKEBASE_DBU_PER_CU_HOUR,
     LAKEBASE_NODE_DBU_PER_HOUR,
+    LOGICAL_REPLICATION_ROUNDS,
     RDS_MINIMUM_BILLED_SECONDS,
+    ROUND4_GLUE_DPU,
+    ROUND4_GLUE_TIMEOUT_SECONDS,
     SECONDS_PER_BILLING_MONTH,
     SECONDS_PER_HOUR,
     TERRAFORM_PROXY_SECRETS,
@@ -73,7 +79,7 @@ from server.cost_model import (
     telemetry_from_snapshot,
     v7_lakebase_burn_model,
 )
-from server.models import CompetitorId, RoundId
+from server.models import CompetitorId, LaneState, RoundId
 from server.pricing import (
     CONFIGURED_RDS_INSTANCE_CLASS,
     RDS_INSTANCE_HOUR_PRICES,
@@ -365,9 +371,10 @@ class TestHistoryIsNotRepricedByTheResize:
         cost rose by when the fleet was modified in place, not what it would
         rise by if a pending diff were applied.  Four instances stood at that
         moment, so the resize cost +$4.704/day when it landed; Round 1's
-        instance was deleted afterwards, so the fleet carrying the higher rate
-        today is three boxes and +$3.528/day.  Both are true of different
-        moments and neither may be quoted as the other.
+        instance was deleted afterwards, which left three boxes and +$3.528/day.
+        v1.1 then gave Rounds 4 and 6 an instance each, so five boxes carry the
+        higher rate today.  Each is true of a different moment and none may be
+        quoted as another.
         """
 
         per_hour = rds_instance_hour_usd("db.t4g.medium") - rds_instance_hour_usd("db.t4g.micro")
@@ -375,12 +382,14 @@ class TestHistoryIsNotRepricedByTheResize:
         assert per_hour * 24 == Decimal("1.176")
         # Four per-round RDS instances at the moment of the resize (r1, r2, r3,
         # r5), confirmed against `aws rds describe-db-instances` at the time.
-        at_resize = InstallationShape().with_r1_rds_instance()
-        assert at_resize.rds_instances == 4
-        assert per_hour * 24 * at_resize.rds_instances == Decimal("4.704")
-        # And what the fleet carries now that r1's box is gone.
-        assert InstallationShape().rds_instances == 3
-        assert per_hour * 24 * InstallationShape().rds_instances == Decimal("3.528")
+        # Written as history rather than derived from today's shape, which has
+        # since both lost r1's box and gained r4's and r6's.
+        assert per_hour * 24 * 4 == Decimal("4.704")
+        # What the fleet carried once r1's box was gone, before Round 4 had one.
+        assert per_hour * 24 * 3 == Decimal("3.528")
+        # And today: r2, r3, r4, r5 and r6.
+        assert InstallationShape().rds_instances == 5
+        assert per_hour * 24 * InstallationShape().rds_instances == Decimal("5.880")
 
 
 class TestTelemetryValidation:
@@ -907,7 +916,19 @@ class TestEveryProvisionedLaneProducesALine:
     def test_the_model_agrees_with_the_terraform_about_which_rounds_have_a_lane(
         self,
     ) -> None:
-        assert set(cost_model_module._AWS_ROUND_KEYS.values()) == self._terraform_round_keys()
+        raced = set(cost_model_module._AWS_ROUND_KEYS.values())
+        not_yet = set(cost_model_module._PROVISIONED_LANES_NOT_YET_RACED.values())
+        assert raced | not_yet == self._terraform_round_keys()
+        assert not raced & not_yet
+
+    def test_a_round_is_provisioned_but_unraced_only_while_its_lane_is_unsupported(
+        self,
+    ) -> None:
+        # The lane cannot land without its round moving into `_AWS_ROUND_KEYS`,
+        # where it owes a per-bout line and a measured Aurora quantity.
+        for round_id in cost_model_module._PROVISIONED_LANES_NOT_YET_RACED:
+            assert round_id in LAKEBASE_ONLY_ROUNDS
+            assert round_id not in cost_model_module._AWS_ROUND_KEYS
 
     def test_every_round_is_either_provisioned_or_explicitly_not(self) -> None:
         provisioned = set(cost_model_module._AWS_ROUND_KEYS)
@@ -939,8 +960,15 @@ class TestEveryProvisionedLaneProducesALine:
         assert gap[0].usd is None
         assert "r5" in gap[0].quantity.basis
 
-    def test_a_round_with_no_aws_stack_is_not_given_a_placeholder(self) -> None:
-        telemetry = _telemetry(RoundId.ANALYZE_LIVE_ORDERS, CompetitorId.AURORA_SERVERLESS_V2)
+    @pytest.mark.parametrize(
+        "round_id", [RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS]
+    )
+    def test_a_round_racing_lakebase_alone_is_not_given_a_placeholder(
+        self, round_id: RoundId
+    ) -> None:
+        telemetry = _telemetry(
+            round_id, CompetitorId.AURORA_SERVERLESS_V2, competitor_lane_supported=False
+        )
         assert cost_model_module._lane_coverage_lines([], telemetry, RateCard()) == []
 
 
@@ -973,6 +1001,20 @@ class TestTheFleetShapeMatchesTheFleet:
 
     def test_the_cluster_count_is_the_number_terraform_stands_up(self) -> None:
         assert InstallationShape().aurora_clusters == len(self._keys("v7_round_keys"))
+
+    def test_the_awake_clusters_are_the_rounds_terraform_replicates(self) -> None:
+        # The clusters priced as held awake are exactly those Terraform attaches the
+        # logical-replication parameter group to, and each is a cluster that stands.
+        keys = self._keys("v7_lakeflow_round_keys")
+        replicating = {
+            f"r{number}"
+            for number, round_id in enumerate(RoundId, start=1)
+            if round_id in LOGICAL_REPLICATION_ROUNDS
+        }
+        assert replicating == keys == {"r6"}
+        assert InstallationShape().aurora_replicating_clusters == len(keys)
+        assert keys <= self._keys("v7_round_keys")
+        assert keys <= self._keys("v7_rds_round_keys")
 
     def test_the_rds_fleet_is_the_rounds_that_are_not_imputed(self) -> None:
         # The two definitions have to name the same rounds: a round with no box
@@ -1019,8 +1061,16 @@ class TestTheMeasuredAuroraQuantities:
     smaller on Round 5 than the ceiling convention had projected.
     """
 
-    def test_only_the_rounds_terraform_provisions_aurora_for_are_measured(self) -> None:
-        assert set(V7_MEASURED_AURORA_ACU_SECONDS) == set(cost_model_module._AWS_ROUND_KEYS)
+    def test_every_raced_aurora_lane_is_measured_or_declared_not_yet_measured(self) -> None:
+        # Rounds 4 and 6 race their clusters from v1.1 and no bout of either has been
+        # sampled. Declared, so the gap cannot hide as a missing dictionary entry.
+        raced = set(cost_model_module._AWS_ROUND_KEYS)
+        assert set(V7_MEASURED_AURORA_ACU_SECONDS) | AURORA_LANES_NOT_YET_MEASURED == raced
+        assert not set(V7_MEASURED_AURORA_ACU_SECONDS) & AURORA_LANES_NOT_YET_MEASURED
+        assert AURORA_LANES_NOT_YET_MEASURED == {
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            RoundId.ANALYZE_LIVE_ORDERS,
+        }
 
     @pytest.mark.parametrize(
         ("round_id", "expected_usd"),
@@ -1179,18 +1229,267 @@ class TestWakeRound:
         assert wake.quantity.provenance is Provenance.MEASURED
 
 
+_BOTH_COMPETITORS = [CompetitorId.AURORA_SERVERLESS_V2, CompetitorId.RDS_POSTGRES]
+
+
 class TestRoundsWithoutAnAwsStack:
+    def test_every_round_races_an_aws_lane_from_v1_1(self) -> None:
+        assert cost_model_module._ROUNDS_WITHOUT_AWS == frozenset()
+
+    @pytest.mark.parametrize("competitor", _BOTH_COMPETITORS)
     @pytest.mark.parametrize(
-        "round_id",
-        [RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS],
+        "round_id", [RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS]
     )
-    def test_no_aws_line_is_invented_for_a_round_that_built_no_aws_stack(
+    def test_a_round_without_its_aws_lane_prices_no_aws_side(
         self,
         round_id: RoundId,
+        competitor: CompetitorId,
     ) -> None:
-        estimate = estimate_bout_cost(_telemetry(round_id, CompetitorId.AURORA_SERVERLESS_V2))
+        # An installation that has not sealed the round's AWS lane races Lakebase
+        # alone. Its databases stand, but no bout touched them, and a zero line
+        # would claim the AWS alternative is free.
+        telemetry = _telemetry(round_id, competitor, competitor_lane_supported=False)
+        estimate = estimate_bout_cost(telemetry)
         assert all(line.cloud is Cloud.DATABRICKS for line in estimate.lines)
         assert estimate.by_cloud()[Cloud.AWS] == Decimal(0)
+        # And the coverage guard does not mistake it for a routing miss.
+        assert cost_model_module._lane_coverage_lines([], telemetry, RateCard()) == []
+
+    def test_only_rounds_four_and_six_price_on_whether_their_lane_was_supported(self) -> None:
+        # Round 1's RDS lane refuses to enter, and still owes its line.
+        telemetry = _telemetry(RoundId.WAKE_IDLE_APP, competitor_lane_supported=False)
+        assert any(line.cloud is Cloud.AWS for line in estimate_bout_cost(telemetry).lines)
+
+
+class TestTheLiveOrdersRound:
+    """Round 6 in v1.1: DMS captures the checkout and an AWS Glue run appends it to Delta."""
+
+    def test_an_rds_matchup_prices_the_standing_instance_at_no_marginal_hours(self) -> None:
+        estimate = estimate_bout_cost(
+            _telemetry(RoundId.ANALYZE_LIVE_ORDERS, CompetitorId.RDS_POSTGRES)
+        )
+        (database,) = [
+            line
+            for line in estimate.lines
+            if line.cloud is Cloud.AWS and "DMS capture" in line.component
+        ]
+        assert "already-running instance" in database.component
+        assert database.usd == Decimal(0)
+        assert database.quantity.provenance is Provenance.ASSUMED
+        assert _glue_line(estimate).lane_id == "competitor"
+
+    def test_an_aurora_matchup_is_unavailable_until_it_is_sampled(self) -> None:
+        # The writer never parks, so a bout's capacity is what it adds above the
+        # replication floor, which the lane clock does not predict.
+        estimate = estimate_bout_cost(
+            _telemetry(RoundId.ANALYZE_LIVE_ORDERS, CompetitorId.AURORA_SERVERLESS_V2)
+        )
+        (database,) = [
+            line for line in estimate.lines if line.component.startswith("Aurora Serverless v2")
+        ]
+        assert "above the replication floor" in database.component
+        assert database.usd is None
+
+    def test_the_glue_run_is_priced_from_what_glue_reported(self) -> None:
+        telemetry = _telemetry(
+            RoundId.ANALYZE_LIVE_ORDERS,
+            CompetitorId.RDS_POSTGRES,
+            observed_glue_execution_seconds=Decimal(90),
+        )
+        line = _glue_line(estimate_bout_cost(telemetry))
+        assert line.usd == Decimal(90) * 2 / 3600 * Decimal("0.44")
+
+    def test_the_dms_task_has_no_line_of_its_own(self) -> None:
+        # It bills nothing beyond its replication instance, which is carrying cost.
+        for competitor in _BOTH_COMPETITORS:
+            estimate = estimate_bout_cost(_telemetry(RoundId.ANALYZE_LIVE_ORDERS, competitor))
+            assert not [line for line in estimate.lines if "replication instance" in line.component]
+
+
+class TestTheDmsReplicationInstance:
+    """Round 6's one DMS instance stands whether or not its tasks run."""
+
+    def test_it_bills_every_hour_at_the_published_single_az_rate(self) -> None:
+        (line,) = [
+            line
+            for line in estimate_carrying_cost(_A_DAY).lines
+            if "DMS replication instance" in line.component
+        ]
+        assert line.usd == Decimal("0.036") * 24
+        assert line.lane_id == "competitor"
+        assert "X2XEG8FG4898H6YD" in line.rate.source
+
+    def test_an_installation_without_the_lane_has_no_line_for_it(self) -> None:
+        shape = InstallationShape(dms_replication_instances=0)
+        assert not [
+            line
+            for line in estimate_carrying_cost(_A_DAY, shape=shape).lines
+            if "DMS" in line.component
+        ]
+
+    def test_the_session_receipt_prices_the_same_rate(self) -> None:
+        from server import pricing
+
+        assert Decimal(str(pricing.ROUND6_DMS_INSTANCE_HOUR_USD)) == (
+            RateCard().dms_t3_small_hour.usd
+        )
+
+    def test_round_fives_receipt_prices_the_runners_the_panel_prices(self) -> None:
+        # Its runner lines had kept the single m6i.large the two-runner seal replaced.
+        from server import pricing
+
+        assert Decimal(str(pricing.ROUND5_RUNNER_INSTANCE_HOUR_USD)) == (
+            RateCard().ec2_c7i_2xlarge_hour.usd
+        )
+        assert pricing.ROUND5_RUNNER_INSTANCES == InstallationShape().runner_instances
+
+    def test_the_terraform_is_the_instance_that_is_priced(self) -> None:
+        source = Path("infra/aws/round6_aws.tf").read_text()
+        assert 'replication_instance_class  = "dms.t3.small"' in source
+        assert "multi_az                    = false" in source
+        # Inside the 50 GB of gp2 a T3 instance includes, so its storage bills nothing.
+        match = re.search(r"allocated_storage\s*=\s*(\d+)", source)
+        assert match is not None and int(match.group(1)) <= 50
+
+
+def _glue_line(estimate):
+    (line,) = [line for line in estimate.lines if "AWS Glue" in line.component]
+    return line
+
+
+class TestTheModelScoreRound:
+    """Round 4 in v1.1: an AWS Glue run carries the change into the round's own database."""
+
+    def test_an_rds_matchup_prices_the_standing_instance_at_no_marginal_hours(self) -> None:
+        estimate = estimate_bout_cost(
+            _telemetry(RoundId.PUT_MODEL_SCORE_IN_APP, CompetitorId.RDS_POSTGRES)
+        )
+        (database,) = [
+            line
+            for line in estimate.lines
+            if line.cloud is Cloud.AWS and "Glue writes and app reads" in line.component
+        ]
+        assert "already-running instance" in database.component
+        assert database.usd == Decimal(0)
+        assert database.quantity.provenance is Provenance.ASSUMED
+        assert database.rate == RateCard().rds_instance_hour
+        assert _glue_line(estimate).lane_id == "competitor"
+
+    def test_an_aurora_matchup_is_unavailable_until_it_is_sampled(self) -> None:
+        # The cluster parks at 0 ACU, so a bout's capacity is marginal, and the
+        # lane clock does not predict it.
+        unsampled = estimate_bout_cost(
+            _telemetry(RoundId.PUT_MODEL_SCORE_IN_APP, CompetitorId.AURORA_SERVERLESS_V2)
+        )
+        (database,) = [
+            line for line in unsampled.lines if line.component.startswith("Aurora Serverless v2")
+        ]
+        assert database.usd is None
+        assert database in unsampled.unavailable
+        sampled = estimate_bout_cost(
+            _telemetry(
+                RoundId.PUT_MODEL_SCORE_IN_APP,
+                CompetitorId.AURORA_SERVERLESS_V2,
+                observed_acu_seconds_above_floor=Decimal("480"),
+            )
+        )
+        (measured,) = [
+            line for line in sampled.lines if line.component.startswith("Aurora Serverless v2")
+        ]
+        assert measured.quantity.provenance is Provenance.MEASURED
+        assert measured.usd == Decimal("480") / SECONDS_PER_HOUR * RateCard().aurora_acu_hour.usd
+
+    @pytest.mark.parametrize("competitor", _BOTH_COMPETITORS)
+    def test_the_glue_run_is_priced_from_the_seconds_glue_reported_it_consumed(
+        self, competitor: CompetitorId
+    ) -> None:
+        # 152 s is one of the bout runs measured on the v1.1 test installation.
+        line = _glue_line(
+            estimate_bout_cost(
+                _telemetry(
+                    RoundId.PUT_MODEL_SCORE_IN_APP,
+                    competitor,
+                    observed_glue_execution_seconds=Decimal("152"),
+                )
+            )
+        )
+        expected_dpu_hours = Decimal("152") * ROUND4_GLUE_DPU / SECONDS_PER_HOUR
+        assert line.quantity.provenance is Provenance.MEASURED
+        assert line.quantity.point == expected_dpu_hours
+        assert line.usd == expected_dpu_hours * Decimal("0.44")
+        assert line.usd == pytest.approx(Decimal("0.037156"), rel=Decimal("1e-4"))
+        assert "ExecutionTime of 152 s" in line.quantity.basis
+        assert "minimum" not in line.quantity.basis
+
+    def test_a_short_run_is_billed_its_one_minute_minimum(self) -> None:
+        line = _glue_line(
+            estimate_bout_cost(
+                _telemetry(
+                    RoundId.PUT_MODEL_SCORE_IN_APP,
+                    observed_glue_execution_seconds=Decimal("45"),
+                )
+            )
+        )
+        minimum = GLUE_MINIMUM_BILLED_SECONDS * ROUND4_GLUE_DPU / SECONDS_PER_HOUR
+        assert line.quantity.point == minimum
+        assert "provider minimum applied" in line.quantity.basis
+
+    def test_a_run_that_has_not_stopped_is_unavailable_with_its_bounds_named(self) -> None:
+        # Glue reports ExecutionTime only once the run stops, after the bout
+        # settles. Its lifetime is not its billed time, and no clock stands in.
+        line = _glue_line(
+            estimate_bout_cost(
+                _telemetry(RoundId.PUT_MODEL_SCORE_IN_APP, competitor_lane_seconds=Decimal("110"))
+            )
+        )
+        assert line.usd is None
+        assert line.quantity.provenance is Provenance.UNAVAILABLE
+        minimum = GLUE_MINIMUM_BILLED_SECONDS * ROUND4_GLUE_DPU / SECONDS_PER_HOUR
+        ceiling = ROUND4_GLUE_TIMEOUT_SECONDS * ROUND4_GLUE_DPU / SECONDS_PER_HOUR
+        assert f"[{minimum:.6f}, {ceiling:.6f}] DPU-hours" in line.quantity.basis
+        assert "30-minute timeout" in line.quantity.basis
+
+    def test_a_run_stopped_while_starting_keeps_both_readings_and_prices_what_glue_reported(
+        self,
+    ) -> None:
+        # Whether Glue bills its minimum for a run that consumed nothing is not
+        # documented, and pricing the opponent above what it was observed to
+        # consume is the worst direction this error could point.
+        line = _glue_line(
+            estimate_bout_cost(
+                _telemetry(
+                    RoundId.PUT_MODEL_SCORE_IN_APP, observed_glue_execution_seconds=Decimal(0)
+                )
+            )
+        )
+        minimum = GLUE_MINIMUM_BILLED_SECONDS * ROUND4_GLUE_DPU / SECONDS_PER_HOUR
+        assert line.quantity.provenance is Provenance.MEASURED
+        assert (line.quantity.point, line.quantity.low, line.quantity.high) == (
+            Decimal(0),
+            Decimal(0),
+            minimum,
+        )
+        assert "not documented" in line.quantity.basis
+
+    def test_the_glue_rate_is_on_the_card_with_its_source(self) -> None:
+        rate = RateCard().glue_dpu_hour
+        assert rate.usd == Decimal("0.44")
+        assert rate.unit == "DPU-hour"
+        assert "us-west-2" in rate.source
+        assert "1-minute minimum" in rate.source
+
+    def test_the_run_shape_is_the_one_terraform_builds(self) -> None:
+        # Two DPU, a 60 s minimum and a 30-minute ceiling are read off the job, so
+        # a change to the job has to change the price with it.
+        source = Path("infra/aws/round4_glue.tf").read_text()
+        job = source[source.index('resource "aws_glue_job" "round4_writer"') :]
+        job = job[: job.index("\n}\n")]
+        assert re.search(r'worker_type\s*=\s*"G\.1X"', job)
+        workers = re.search(r"number_of_workers\s*=\s*(\d+)", job)
+        timeout = re.search(r"\n\s*timeout\s*=\s*(\d+)", job)
+        assert workers is not None and Decimal(workers.group(1)) == ROUND4_GLUE_DPU
+        assert timeout is not None and Decimal(timeout.group(1)) * 60 == ROUND4_GLUE_TIMEOUT_SECONDS
+        assert re.search(r'glue_version\s*=\s*"5\.0"', job)
 
 
 class TestCapacityUnitConversion:
@@ -1457,6 +1756,20 @@ class TestCarryingCost:
         assert carrying.total_usd(EstimateScope.CARRYING) > 0
         assert carrying.total_usd(EstimateScope.OVERHEAD) > 0
 
+    def test_each_public_address_is_priced_once(self) -> None:
+        # Eleven database writers and two runners hold thirteen addresses. The runners'
+        # two have their own line, and the database line used to count them again.
+        shape = InstallationShape()
+        carrying = estimate_carrying_cost(CarryingWindow(seconds=Decimal(86400)), shape=shape)
+        address_hours = sum(
+            line.quantity.point for line in carrying.lines if line.rate.unit == "address-hour"
+        )
+        assert address_hours == Decimal(24) * shape.public_ipv4_addresses
+        database = next(line for line in carrying.lines if line.component.startswith("Database"))
+        assert database.quantity.point == Decimal(24) * (
+            shape.rds_instances + shape.aurora_clusters
+        )
+
     def test_a_zero_floor_aurora_cluster_parks_free(self) -> None:
         carrying = estimate_carrying_cost(CarryingWindow(seconds=Decimal(86400)))
         aurora = next(
@@ -1470,13 +1783,45 @@ class TestCarryingCost:
         aurora = next(
             line for line in carrying.lines if "Aurora Serverless v2 baseline" in line.component
         )
-        assert aurora.usd == Decimal(24) * Decimal(4) * Decimal("0.5") * Decimal("0.12")
+        # The fleet size is pinned against the Terraform elsewhere; this pins the
+        # floor's arithmetic for whatever that fleet is (six clusters in v1.1, one
+        # of them held awake by logical replication and priced on its own line).
+        assert (shape.aurora_clusters, shape.aurora_replicating_clusters) == (6, 1)
+        assert aurora.usd == Decimal(24) * Decimal(5) * Decimal("0.5") * Decimal("0.12")
+        awake = next(line for line in carrying.lines if "held awake" in line.component)
+        assert awake.usd == Decimal(24) * Decimal(1) * Decimal("0.5") * Decimal("0.12")
+
+    def test_the_replicating_cluster_bills_its_floor_even_at_a_zero_minimum(self) -> None:
+        # AWS never pauses an Aurora PostgreSQL writer with logical replication on,
+        # so the zero minimum that parks every other cluster does not park it.
+        carrying = estimate_carrying_cost(CarryingWindow(seconds=Decimal(86400)))
+        awake = next(line for line in carrying.lines if "held awake" in line.component)
+        assert InstallationShape().aurora_min_acu == 0
+        assert awake.usd == Decimal("1.44")
+        assert awake.scope is EstimateScope.CARRYING
+        assert "rds.logical_replication = 1" in awake.quantity.basis
+        assert "0.5 ACU" in awake.quantity.basis
+
+    def test_a_raised_floor_above_half_an_acu_is_what_the_replicating_cluster_holds(
+        self,
+    ) -> None:
+        # The awake cluster sits at whichever is higher, the configured minimum or
+        # the least a running cluster holds, and is never counted on both lines.
+        shape = InstallationShape(aurora_min_acu=Decimal("1"))
+        carrying = estimate_carrying_cost(CarryingWindow(seconds=Decimal(86400)), shape=shape)
+        awake = next(line for line in carrying.lines if "held awake" in line.component)
+        floor = next(
+            line for line in carrying.lines if "Aurora Serverless v2 baseline" in line.component
+        )
+        assert awake.usd == Decimal(24) * Decimal("1") * Decimal("0.12")
+        assert floor.usd == Decimal(24) * Decimal(5) * Decimal("1") * Decimal("0.12")
 
     def test_the_runner_is_overhead_and_not_charged_to_round_five(self) -> None:
         carrying = estimate_carrying_cost(CarryingWindow(seconds=Decimal(3600)))
         runner = next(line for line in carrying.lines if "burst runner" in line.component)
         assert runner.scope is EstimateScope.OVERHEAD
-        assert runner.usd == Decimal("0.8568")
+        # Two runners at us-west-2's $0.357 (it read $0.8568 at a misread $0.4284).
+        assert runner.usd == Decimal("0.714")
 
     def test_posted_lakebase_carrying_usage_is_priced_when_supplied(self) -> None:
         carrying = estimate_carrying_cost(
@@ -1523,6 +1868,18 @@ def _aws_usd(estimate) -> Decimal:
 def _imputed_rds_day(rates: RateCard | None = None, shape: InstallationShape | None = None):
     return imputed_total_usd(
         imputed_round_carrying_lines(RoundId.WAKE_IDLE_APP, _A_DAY, rates=rates, shape=shape)
+    )
+
+
+def _modeled_cluster(shape: InstallationShape | None = None) -> tuple:
+    """One modeled idle Aurora cluster, the lines the idle contrast prices.
+
+    Round 6 imputed exactly these until v1.1 stood its own cluster up; since then
+    no round imputes one, so the lines are read from the builder directly.
+    """
+
+    return cost_model_module._modeled_aurora_lines(
+        _A_DAY, RateCard(), shape or InstallationShape()
     )
 
 
@@ -1581,7 +1938,8 @@ class TestTheImputationIsStructuralNotTextual:
         assert RateCard().rds_instance_class not in line.quantity.basis
 
     def test_the_aurora_compute_zero_carries_its_own_derivation(self) -> None:
-        lines = imputed_round_carrying_lines(RoundId.ANALYZE_LIVE_ORDERS, _A_DAY)
+        lines = _modeled_cluster()
+        assert all(line.imputed for line in lines)
         compute = next(
             line for line in lines if line.component.startswith("Aurora Serverless v2 compute")
         )
@@ -1595,9 +1953,7 @@ class TestTheImputationIsStructuralNotTextual:
         raised = InstallationShape(aurora_min_acu=Decimal("0.5"))
         compute = next(
             line
-            for line in imputed_round_carrying_lines(
-                RoundId.ANALYZE_LIVE_ORDERS, _A_DAY, shape=raised
-            )
+            for line in _modeled_cluster(raised)
             if line.component.startswith("Aurora Serverless v2 compute")
         )
         assert compute.usd > 0
@@ -1607,7 +1963,7 @@ class TestTheImputationIsStructuralNotTextual:
     def test_the_aurora_standing_basis_names_the_gap_it_does_not_price(self) -> None:
         line = next(
             item
-            for item in imputed_round_carrying_lines(RoundId.PUT_MODEL_SCORE_IN_APP, _A_DAY)
+            for item in _modeled_cluster()
             if item.component == "Aurora baseline storage · modelled"
         )
         basis = line.quantity.basis
@@ -1626,10 +1982,7 @@ class TestTheImputationIsStructuralNotTextual:
 
 
 class TestWhichRoundsOweACounterfactual:
-    @pytest.mark.parametrize(
-        "round_id",
-        [RoundId.WAKE_IDLE_APP, RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS],
-    )
+    @pytest.mark.parametrize("round_id", [RoundId.WAKE_IDLE_APP])
     def test_a_round_with_no_rds_instance_gets_a_modelled_one(self, round_id: RoundId) -> None:
         lines = imputed_round_carrying_lines(round_id, _A_DAY)
         assert [line.kind for line in lines if "RDS" in line.component] == [
@@ -1644,7 +1997,11 @@ class TestWhichRoundsOweACounterfactual:
         [
             RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
             RoundId.RECOVER_DELETED_ORDER,
+            # From v1.1, even before its lane races: its databases are real.
+            RoundId.PUT_MODEL_SCORE_IN_APP,
             RoundId.SURVIVE_CONNECTION_SPIKE,
+            # From v1.1 too, ahead of its lane: its databases are real.
+            RoundId.ANALYZE_LIVE_ORDERS,
         ],
     )
     def test_a_round_that_stands_its_own_lanes_up_gets_nothing(self, round_id: RoundId) -> None:
@@ -1659,13 +2016,13 @@ class TestWhichRoundsOweACounterfactual:
         assert RoundId.WAKE_IDLE_APP in IMPUTED_RDS_ROUNDS
         assert RoundId.WAKE_IDLE_APP not in IMPUTED_AURORA_ROUNDS
 
-    @pytest.mark.parametrize(
-        "round_id", [RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS]
-    )
-    def test_a_round_with_no_aws_lane_at_all_gets_both(self, round_id: RoundId) -> None:
-        lines = imputed_round_carrying_lines(round_id, _A_DAY)
-        assert sum(1 for line in lines if "RDS" in line.component) == 4
-        assert sum(1 for line in lines if "Aurora" in line.component) == 4
+    def test_no_round_imputes_an_aurora_cluster_from_v1_1(self) -> None:
+        # Round 6 was the last round with no AWS database at all. Its cluster
+        # stands from v1.1, so every round's Aurora lane is real and none imputed.
+        assert IMPUTED_AURORA_ROUNDS == frozenset()
+        for round_id in RoundId:
+            lines = imputed_round_carrying_lines(round_id, _A_DAY)
+            assert not any("Aurora" in line.component for line in lines)
 
 
 class TestTheImputedFiguresDeriveFromTheRateCard:
@@ -1701,11 +2058,8 @@ class TestTheImputedFiguresDeriveFromTheRateCard:
         shape = InstallationShape()
         hours = _A_DAY.hours
         months = _A_DAY.months
-        aurora = tuple(
-            line
-            for line in imputed_round_carrying_lines(RoundId.ANALYZE_LIVE_ORDERS, _A_DAY)
-            if "Aurora" in line.component
-        )
+        aurora = _modeled_cluster()
+        assert all("Aurora" in line.component for line in aurora)
         expected = (
             hours * shape.aurora_min_acu * rates.aurora_acu_hour.usd
             + months * shape.aurora_storage_gb * rates.aurora_storage_gb_month.usd
@@ -1756,27 +2110,49 @@ class TestTheTwoTotalsNeverMerge:
                 unpriced_services=(),
             )
 
-    def test_the_counterfactual_covers_exactly_the_three_unprovisioned_rounds(self) -> None:
+    def test_the_counterfactual_covers_exactly_the_unprovisioned_rounds(self) -> None:
         equivalent = customer_equivalent_carrying_cost(_A_DAY)
         assert set(equivalent.rounds) == set(IMPUTED_RDS_ROUNDS)
+        assert set(equivalent.rounds) == {RoundId.WAKE_IDLE_APP}
 
-    def test_the_counterfactual_is_a_floor_and_says_why_in_the_model(self) -> None:
+    def test_the_counterfactual_is_an_estimate_once_no_round_imputes_a_cluster(self) -> None:
+        # Round 1's modelled RDS instance is the whole of it from v1.1, and nothing
+        # about that instance is missing a pipeline service, so it is no floor.
+        equivalent = customer_equivalent_carrying_cost(_A_DAY)
+        assert equivalent.floor is False
+        assert equivalent.floor_reason == ""
+        assert equivalent.unpriced_services == ()
+
+    def test_a_round_that_imputes_a_cluster_again_makes_it_a_floor_and_says_why(
+        self, monkeypatch
+    ) -> None:
+        # The floor still follows the rounds that make it true, so a round that
+        # loses its cluster again cannot be quoted as an estimate.
+        monkeypatch.setattr(
+            cost_model_module, "IMPUTED_AURORA_ROUNDS", frozenset({RoundId.ANALYZE_LIVE_ORDERS})
+        )
         equivalent = customer_equivalent_carrying_cost(_A_DAY)
         assert equivalent.floor is True
         assert equivalent.floor_reason == CUSTOMER_EQUIVALENT_FLOOR_REASON
         assert "floor rather than an estimate" in equivalent.floor_reason
-        assert "Rounds 4 and 6" in equivalent.floor_reason
+        # Named by what makes it a floor, not by a round that may no longer be one.
+        assert "Round" not in equivalent.floor_reason.split("A floor")[1]
         assert equivalent.unpriced_services == UNPRICED_PIPELINE_SERVICES
 
     def test_the_floor_claim_follows_the_rounds_that_make_it_true(self) -> None:
         # Round 1 alone is not a floor: its own Aurora cluster is real, and nothing
         # about it is missing a pipeline service. The claim is not a blanket caveat.
-        round_one = customer_equivalent_carrying_cost(_A_DAY, rounds=(RoundId.WAKE_IDLE_APP,))
-        assert round_one.floor is False
-        assert round_one.floor_reason == ""
-        assert round_one.unpriced_services == ()
-        for round_id in (RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS):
-            assert customer_equivalent_carrying_cost(_A_DAY, rounds=(round_id,)).floor is True
+        # Rounds 4 and 6 are not either from v1.1: their AWS databases are real, and
+        # their lanes are this installation's own, priced where they run.
+        for round_id in (
+            RoundId.WAKE_IDLE_APP,
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            RoundId.ANALYZE_LIVE_ORDERS,
+        ):
+            alone = customer_equivalent_carrying_cost(_A_DAY, rounds=(round_id,))
+            assert alone.floor is False
+            assert alone.floor_reason == ""
+            assert alone.unpriced_services == ()
 
     def test_a_floor_cannot_be_declared_without_saying_why(self) -> None:
         with pytest.raises(ValueError, match="why it is a floor"):
@@ -1815,21 +2191,13 @@ class TestTheTwoTotalsNeverMerge:
         )
 
     def test_the_customer_total_is_the_installation_total_plus_the_imputed_lines(self) -> None:
-        # The sum is only ever formed with both halves named. Three modelled RDS
-        # instances and two modelled idle clusters, on top of what is really billed.
+        # The sum is only ever formed with both halves named. One modeled RDS
+        # instance (Round 1's) on top of what is really billed; Rounds 4 and 6
+        # stand their own databases from v1.1.
         after = InstallationShape()
         installation = _aws_usd(estimate_carrying_cost(_A_DAY, shape=after))
         equivalent = customer_equivalent_carrying_cost(_A_DAY, shape=after)
-        aurora_day = imputed_total_usd(
-            tuple(
-                line
-                for line in imputed_round_carrying_lines(
-                    RoundId.ANALYZE_LIVE_ORDERS, _A_DAY, shape=after
-                )
-                if "Aurora" in line.component
-            )
-        )
-        parts = 3 * _imputed_rds_day(shape=after) + 2 * aurora_day
+        parts = 1 * _imputed_rds_day(shape=after)
         assert abs(equivalent.usd - parts) < Decimal("1e-24")
         assert equivalent.usd > 0
         # The two never collapse into one number.
@@ -1843,19 +2211,67 @@ class TestTheDeletionIdentities:
     figure on screen is not the thing to adjust.
     """
 
-    def test_the_model_reproduces_the_shipped_aws_standing_figure(self) -> None:
-        # The resident architecture adds two runner addresses and one
-        # lane-scoped event secret per runner to both fleet generations.
-        before = InstallationShape().with_r1_rds_instance()
-        assert before.rds_instances == 4
-        assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=before)).quantize(
+    def test_the_model_reproduces_the_shipped_aws_standing_figures(self) -> None:
+        # Four fleet generations, each built. The resident architecture adds two
+        # runner addresses and one lane-scoped event secret per runner to all four.
+        # The first three predate Round 6's databases, so they are written out as
+        # they stood rather than derived from today's shape, and none of them held
+        # a cluster awake with logical replication.
+        #
+        # Every figure here is $3.67 below the one the panel showed from the
+        # two-runner seal (2026-09-16) until 2026-10-02. The runners were priced at
+        # $0.4284 an hour, a rate no region publishes (us-west-2's is $0.357), and the
+        # database address line counted the runners' two addresses, which their own
+        # line already prices.
+        v1_0 = InstallationShape(
+            rds_instances=3,
+            aurora_clusters=4,
+            public_ipv4_addresses=9,
+            managed_secrets=11,
+            aurora_replicating_clusters=0,
+            dms_replication_instances=0,
+        )
+        before_r1_deletion = v1_0.with_r1_rds_instance()
+        assert before_r1_deletion.rds_instances == 4
+        assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=before_r1_deletion)).quantize(
             Decimal("0.01")
-        ) == Decimal("28.82")
+        ) == Decimal("25.15")
+        assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=v1_0)).quantize(
+            Decimal("0.01")
+        ) == Decimal("23.39")
+        # v1.1's Round 4 added its Aurora cluster and RDS instance, each with an
+        # address and a managed secret.
+        with_round4 = InstallationShape(
+            rds_instances=4,
+            aurora_clusters=5,
+            public_ipv4_addresses=11,
+            managed_secrets=13,
+            aurora_replicating_clusters=0,
+            dms_replication_instances=0,
+        )
+        assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=with_round4)).quantize(
+            Decimal("0.01")
+        ) == Decimal("25.29")
+        # v1.1's Round 6 adds its pair the same way, and its cluster cannot pause:
+        # logical replication holds its writer at 0.5 ACU, $1.44 a day of it.
+        round6_databases = InstallationShape(dms_replication_instances=0)
+        assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=round6_databases)).quantize(
+            Decimal("0.01")
+        ) == Decimal("28.64")
+        # And its AWS lane's DMS replication instance, which stands whether or not its
+        # tasks run: $0.036 an hour, $0.864 a day.
         now = InstallationShape()
-        assert (now.rds_instances, now.public_ipv4_addresses, now.managed_secrets) == (3, 9, 11)
+        assert (
+            now.rds_instances,
+            now.aurora_clusters,
+            now.public_ipv4_addresses,
+            now.managed_secrets,
+            now.aurora_replicating_clusters,
+            now.dms_replication_instances,
+        ) == (5, 6, 13, 15, 1, 1)
         assert _aws_usd(estimate_carrying_cost(_A_DAY, shape=now)).quantize(
             Decimal("0.01")
-        ) == Decimal("27.05")
+        ) == Decimal("29.50")
 
     def test_removing_r1s_instance_takes_exactly_one_imputed_line_off_the_bill(self) -> None:
         # The internal consistency check the whole imputation rests on: what this
@@ -1897,22 +2313,22 @@ class TestTheDeletionIdentities:
         before = after.with_r1_rds_instance()
         installation_before = _aws_usd(estimate_carrying_cost(_A_DAY, shape=before))
         installation_after = _aws_usd(estimate_carrying_cost(_A_DAY, shape=after))
+        # Before the deletion no round owed a counterfactual: the databases for
+        # Rounds 4 and 6 are real from v1.1, so they owe none in either generation.
         customer_before = (
             installation_before
-            + customer_equivalent_carrying_cost(
-                _A_DAY,
-                shape=before,
-                rounds=(RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS),
-            ).usd
+            + customer_equivalent_carrying_cost(_A_DAY, shape=before, rounds=()).usd
         )
         customer_after = (
             installation_after + customer_equivalent_carrying_cost(_A_DAY, shape=after).usd
         )
         assert installation_after < installation_before
-        assert customer_after == customer_before
+        # Equal to the last place Decimal's 28 digits hold; summing the lines in a
+        # different grouping can move the 28th, which is rounding, not money.
+        quantum = Decimal("0.000000000000000000000001")
+        assert customer_after.quantize(quantum) == customer_before.quantize(quantum)
         gap_before = customer_before - installation_before
         gap_after = customer_after - installation_after
-        quantum = Decimal("0.000000000000000000000001")
         assert (gap_after - gap_before).quantize(quantum) == _imputed_rds_day().quantize(quantum)
 
 
@@ -2047,6 +2463,7 @@ def _snapshot(
     lakebase_ms: float | None = 17432.582375,
     competitor_ms: float | None = 811308.759458,
     round5_setup: object | None = None,
+    competitor_state: LaneState = LaneState.VERIFIED,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         run_started_at=run_started_at,
@@ -2054,8 +2471,8 @@ def _snapshot(
         round=SimpleNamespace(id=round_id),
         competitor=SimpleNamespace(id=competitor_id),
         lanes={
-            "lakebase": SimpleNamespace(elapsed_ms=lakebase_ms),
-            "competitor": SimpleNamespace(elapsed_ms=competitor_ms),
+            "lakebase": SimpleNamespace(elapsed_ms=lakebase_ms, state=LaneState.VERIFIED),
+            "competitor": SimpleNamespace(elapsed_ms=competitor_ms, state=competitor_state),
         },
         round5_setup=round5_setup,
     )
@@ -2122,6 +2539,25 @@ class TestTelemetryFromSnapshot:
         )
         assert telemetry is not None
         assert telemetry.observed_restore_lifetime_seconds is None
+
+    def test_a_round_four_receipt_says_whether_its_aws_lane_raced(self) -> None:
+        # The one thing the receipt knows on its own: an installation without the
+        # Glue lane marks the competitor lane not supported.
+        alone = telemetry_from_snapshot(
+            _snapshot(  # type: ignore[arg-type]
+                round_id=RoundId.PUT_MODEL_SCORE_IN_APP,
+                competitor_ms=None,
+                competitor_state=LaneState.NOT_SUPPORTED,
+            )
+        )
+        assert alone is not None and alone.competitor_lane_supported is False
+        assert all(line.cloud is Cloud.DATABRICKS for line in estimate_bout_cost(alone).lines)
+        raced = telemetry_from_snapshot(
+            _snapshot(round_id=RoundId.PUT_MODEL_SCORE_IN_APP),  # type: ignore[arg-type]
+            observed_glue_execution_seconds=Decimal("109"),
+        )
+        assert raced is not None and raced.competitor_lane_supported is True
+        assert _glue_line(estimate_bout_cost(raced)).quantity.provenance is Provenance.MEASURED
 
 
 class TestReconciliation:

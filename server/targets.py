@@ -60,6 +60,11 @@ PROBE_TABLE = "public.anti_demo_probe"
 #: grant so that changing the SQL and changing the privilege are the same edit.
 PROBE_PRIVILEGES = ("SELECT", "INSERT", "UPDATE")
 
+#: The control-plane states in which a database still serves. RDS and Aurora read
+#: `backing-up` for the minute of each daily automated backup; on 2026-10-02 that refused
+#: a Round 3 bout on rc10, and these arm checks were just as strict.
+_SERVING_STATES = frozenset({"available", "backing-up"})
+
 
 def lakebase_region_from_host(host: str) -> str:
     match = _LAKEBASE_HOST.fullmatch(host.strip())
@@ -501,7 +506,7 @@ class AuroraCredentialProvider:
             raise TargetConfigurationError("Aurora writer is not db.serverless")
         if str(writer.get("Engine") or "").lower() != "aurora-postgresql":
             raise TargetConfigurationError("Aurora writer is not PostgreSQL")
-        if str(writer.get("DBInstanceStatus") or "").lower() != "available":
+        if str(writer.get("DBInstanceStatus") or "").lower() not in _SERVING_STATES:
             raise TargetNotArmedError("Aurora writer control plane is not available")
         return cluster, writer
 
@@ -520,7 +525,7 @@ class AuroraCredentialProvider:
         auto_pause = int(scaling.get("SecondsUntilAutoPause", 0))
         if auto_pause <= 0:
             raise TargetConfigurationError("Aurora automatic pause is not enabled")
-        if str(cluster.get("Status", "")).lower() != "available":
+        if str(cluster.get("Status", "")).lower() not in _SERVING_STATES:
             raise TargetNotArmedError("Aurora cluster control plane is not available")
 
         end = datetime.now(UTC)
@@ -901,7 +906,7 @@ class RdsCredentialProvider:
             "RDS instance ARN",
         )
         status = str(instance.get("DBInstanceStatus") or "").lower()
-        if status != "available":
+        if status not in _SERVING_STATES:
             raise TargetNotArmedError(
                 f"RDS PostgreSQL control plane is {status.upper() or 'UNKNOWN'}, not AVAILABLE"
             )

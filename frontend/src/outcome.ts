@@ -184,16 +184,55 @@ function baseDecision(
     }
   }
 
-  if (roundId === 'put_model_score_in_app'
-    || roundId === 'analyze_live_orders_without_slowing_checkout') {
+  if (
+    roundId === 'put_model_score_in_app'
+    || roundId === 'analyze_live_orders_without_slowing_checkout'
+  ) {
+    // Rounds 4 and 6 race an AWS integration, and the verdict is the engine's, read
+    // from each lane's own exact reads. Only an installation without the AWS lane
+    // is a capability result.
     if (
       input.roundContractVerified
-      && evidence.laneShape === 'lakebase_only_exact'
-      && evidence.competitor.notSupported
+      && evidence.shape === 'capability_gap'
+      && evidence.exactLane === 'lakebase'
     ) {
       return {
         status: 'declared_capability',
         formalWinner: 'lakebase',
+        marginMs: null,
+        contractComplete: true,
+        shareable: true,
+      }
+    }
+    if (evidence.laneShape === 'both_exact_verified') {
+      return input.roundContractVerified && hasValidComparison
+        ? {
+            status: 'declared_comparison',
+            ...comparison,
+            contractComplete: true,
+            shareable: true,
+          }
+        : {
+            status: 'comparison_incomplete',
+            formalWinner: null,
+            marginMs: null,
+            contractComplete: false,
+            shareable: false,
+          }
+    }
+    // One lane read the exact row, and the other lane's ending decides what that
+    // is worth. A lane stopped short of its row -- the towel's censored lower
+    // bound, or the whole frozen bound run out -- leaves an adjudicated stoppage.
+    // A lane that errored measured nothing, so nobody wins over it.
+    const stoppage = evidence.laneShape === 'exact_and_censored_lower_bound'
+      || (
+        input.comparison?.kind === 'adjudicated_stoppage'
+        && input.comparison.winnerLaneId === evidence.exactLane
+      )
+    if (input.roundContractVerified && evidence.exactLane && stoppage) {
+      return {
+        status: 'adjudicated_stoppage',
+        formalWinner: evidence.exactLane,
         marginMs: null,
         contractComplete: true,
         shareable: true,

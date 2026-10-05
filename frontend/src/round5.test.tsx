@@ -2570,10 +2570,12 @@ it('preserves a lane\'s locked 10,000 time on a mid-hold towel and calls the hol
     /no exact verified result · no declared winner · margin N\/A/i,
   )
 
-  // The four immediate towel actions are still present.
-  expect(screen.getByRole('button', { name: /instant replay/i })).toBeInTheDocument()
+  // Neither lane finished (reaching 10,000 is not finishing a 30-second hold), so,
+  // as in every other round, there is nothing to replay or post: the room can
+  // still have it explained and move on.
+  expect(screen.queryByRole('button', { name: /instant replay/i })).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: /explain to the room/i })).toBeInTheDocument()
-  expect(screen.getByRole('button', { name: /share the receipt/i })).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /share the receipt/i })).not.toBeInTheDocument()
   expect(screen.getByRole('button', { name: /a · (next round|fight card)/i })).toBeInTheDocument()
 })
 
@@ -2723,23 +2725,17 @@ it('screenshot fixture: receiptPresentation uses 14.15 evidence, never 0.01/EXAC
   expect(receipt.competitorLabel).toMatch(/RDS Proxy/i)
 })
 
-it('screenshot fixture: clicking Share renders the honest Lakebase lane node in the DOM', () => {
-  stubReceiptCanvas()
+it('screenshot fixture: a towel nobody finished offers nothing to share or replay', () => {
+  // Lakebase reached 10,000 at 14.15s and was toweled mid-hold; Aurora never
+  // reached 10,000. Neither finished, so -- as in every other round -- the room
+  // gets the explanation and the next round, and no receipt of an unfinished bout.
+  // The receipt's honest labels stay pinned by `receiptPresentation` above.
   render(
     <RoundFiveProof session={screenshotTowelRoundFiveSession()} {...twoPhaseArenaProps} />,
   )
-  fireEvent.click(screen.getByRole('button', { name: /share the receipt/i }))
-  const share = screen.getByRole('dialog', { name: /share the proof/i })
-  const poster = within(share).getByLabelText(/poster preview/i)
-  expect(poster).not.toHaveTextContent(/Verified result poster/i)
-  const lakebaseLane = within(share).getByLabelText('Lakebase receipt result')
-  expect(lakebaseLane).toHaveTextContent('14.15s')
-  expect(lakebaseLane).toHaveTextContent(/10,000 CLIENTS REACHED · HOLD INTERRUPTED/i)
-  expect(lakebaseLane).not.toHaveTextContent(/·\s*EXACT VERIFIED/)
-  expect(lakebaseLane).not.toHaveTextContent(/0\.01/)
-  const auroraLane = within(share).getByLabelText(/Aurora Serverless v2(?: \+ RDS Proxy)? receipt result/i)
-  expect(auroraLane).toHaveTextContent('>23.89s')
-  expect(poster).not.toHaveTextContent(/Earlier pooled path|Same setup time/i)
+  expect(screen.queryByRole('button', { name: /share the receipt/i })).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /instant replay/i })).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /explain to the room/i })).toBeInTheDocument()
 })
 
 it('screenshot fixture: caption, replay, and explain all agree with the poster', () => {

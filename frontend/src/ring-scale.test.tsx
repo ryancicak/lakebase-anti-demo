@@ -2,7 +2,7 @@ import { cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RoundId } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
-import { FightRing, ringAct } from './ring'
+import { FightRing, blueCornerLane, laneKeyText, ringAct, roundBell, roundBrief } from './ring'
 
 /**
  * The figure size, per act.
@@ -131,5 +131,55 @@ describe('figure size per act', () => {
       expect(found, `${selector} in ${roundId} is not carried by a zoom`).toBe(true)
       cleanup()
     }
+  })
+})
+
+describe('Rounds 4 and 6: the blue corner races', () => {
+  beforeEach(() => {
+    vi.stubGlobal('ResizeObserver', class {
+      observe = vi.fn()
+      unobserve = vi.fn()
+      disconnect = vi.fn()
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('races the AWS Glue lane, so both corners are timed and the far fighter stands in the ring', () => {
+    const round = FALLBACK_CATALOG.rounds.find((item) => item.id === 'put_model_score_in_app')!
+    for (const competitor of FALLBACK_CATALOG.competitors) {
+      expect(blueCornerLane(round, competitor.id)).toBe('race')
+      expect(laneKeyText(round, competitor.id)).toBe('Both corners timed')
+    }
+    expect(roundBell('put_model_score_in_app')).toMatch(/Both integrations cold start at the bell/)
+    expect(`${roundBrief('put_model_score_in_app')} ${roundBell('put_model_score_in_app')}`)
+      .not.toMatch(/No opponent time|no margin|idle courier/i)
+
+    const { container } = render(<FightRing {...props('put_model_score_in_app')} />)
+    expect(container.querySelector('.ring-stage')).toHaveAttribute('data-far', 'race')
+    expect(container.querySelector('#ring-away')).not.toBeNull()
+    expect(container.querySelector('.vacant')).toBeNull()
+  })
+
+  it('races Round 6’s AWS DMS and Glue lane too, and says only AWS cold starts', () => {
+    const round = FALLBACK_CATALOG.rounds.find((item) => item.id === 'analyze_live_orders_without_slowing_checkout')!
+    for (const competitor of FALLBACK_CATALOG.competitors) {
+      expect(blueCornerLane(round, competitor.id)).toBe('race')
+      expect(laneKeyText(round, competitor.id)).toBe('Both corners timed')
+    }
+    const copy = `${roundBrief('analyze_live_orders_without_slowing_checkout')} ${roundBell('analyze_live_orders_without_slowing_checkout')}`
+    expect(roundBell('analyze_live_orders_without_slowing_checkout')).toMatch(
+      /AWS DMS and Glue cold start at the bell; Lakebase’s change feed is built in and always on/,
+    )
+    expect(copy).not.toMatch(/not built|no equivalent|live-validated seal|warm/i)
+
+    const { container } = render(<FightRing {...props('analyze_live_orders_without_slowing_checkout')} />)
+    expect(container.querySelector('.ring-stage')).toHaveAttribute('data-far', 'race')
+    expect(container.querySelector('#ring-away')).not.toBeNull()
+    expect(container.querySelector('.vacant')).toBeNull()
   })
 })

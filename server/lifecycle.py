@@ -19,6 +19,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -42,8 +43,10 @@ from .aws_auth import (
 from .capacity import (
     LAKEBASE_MAX_CU,
     LAKEBASE_MIN_CU,
+    LAKEBASE_ONLY_ROUNDS,
     LAKEBASE_SUSPEND_SECONDS,
     capacity_parity,
+    rds_instance_is_provisioned,
     rds_lane_is_scored,
 )
 from .connection_fanin import RUNNER_INSTANCE_TYPE as ROUND5_RUNNER_INSTANCE_TYPE
@@ -305,12 +308,152 @@ def _round_rds_provider(manifest: DemoManifest, round_id: RoundId | int) -> RdsC
     return provider
 
 
+#: Terraform's colour codes, and the box it draws around each diagnostic.
+_TERMINAL_COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+_DIAGNOSTIC_BOX = "╷│╵"
+
+
+def _failure_summary(output: str) -> str:
+    """The line that says what went wrong.
+
+    The last line, except where that is only the edge of a Terraform diagnostic box.
+    rc12's install stopped on "ERROR ╵" (2026-10-02): `terraform output` had said
+    "Error: Backend initialization required" a few lines up, and only the box's
+    bottom edge reached the operator. So a diagnostic's own ``Error:`` line comes
+    first, and box edges and colour codes never count as the message.
+    """
+
+    lines = [_TERMINAL_COLOUR.sub("", line).strip() for line in output.strip().splitlines()]
+    for line in lines:
+        body = line.lstrip(_DIAGNOSTIC_BOX).strip()
+        if body.startswith("Error:"):
+            return body
+    meaningful = [line for line in lines if line.strip(_DIAGNOSTIC_BOX + " ")]
+    return meaningful[-1] if meaningful else "command failed"
+
+
+class NetworkFailure(RuntimeError):
+    """A command that failed only because this host lost the network: a DNS name or a connection.
+
+    Asking again can succeed, which no other failure here can, so this is the one failure
+    `_asking_again_on_network_failure` retries.
+    """
+
+
+#: How a lost network reads in what a failed command printed: Go's resolver and dialer, as the
+#: AWS provider and the Databricks CLI both report them, and the AWS SDKs' words for a request
+#: that never reached AWS. rc16's install stopped on the first (2026-10-04), a laptop DNS outage.
+_NETWORK_FAILURE_MARKERS = (
+    "no such host",
+    "server misbehaving",
+    "temporary failure in name resolution",
+    "dial tcp",
+    "i/o timeout",
+    "tls handshake timeout",
+    "connection reset by peer",
+    "network is unreachable",
+    "no route to host",
+    "request send failed",
+    "send request failed",
+    "client.timeout exceeded",
+)
+
+#: What a missing credential reads like, dialer words and all: with nothing else to try, the
+#: AWS provider asks the EC2 metadata address, which a laptop doesn't answer. No retry finds it.
+_CREDENTIAL_FAILURE_MARKERS = ("no valid credential sources", "169.254.169.254")
+
+
+def _lost_the_network(output: str) -> bool:
+    """Whether every error a failed command reported is a lost network, and nothing else.
+
+    Each Terraform diagnostic is read whole, its detail lines with its ``Error:`` line, because
+    a provider can put the cause on either. One that names anything else, a refusal or a bad
+    argument, is a failure that asking again cannot fix.
+    """
+
+    errors: list[list[str]] = []
+    current: list[str] | None = None
+    for line in (_TERMINAL_COLOUR.sub("", raw).strip() for raw in output.splitlines()):
+        body = line.lstrip(_DIAGNOSTIC_BOX).strip()
+        if body.startswith("Error:"):
+            current = [body]
+            errors.append(current)
+        elif current is not None and line.startswith("│"):
+            current.append(body)
+        else:
+            current = None
+    if not errors:
+        errors = [[_failure_summary(output)]]
+    texts = [" ".join(error).lower() for error in errors]
+    return all(
+        any(marker in text for marker in _NETWORK_FAILURE_MARKERS)
+        and not any(marker in text for marker in _CREDENTIAL_FAILURE_MARKERS)
+        for text in texts
+    )
+
+
 def _safe_failure(result: subprocess.CompletedProcess[str]) -> RuntimeError:
     # Redact at this chokepoint so no raw control-plane secret can ride the
     # RuntimeError -- or its __cause__ via `raise ... from exc` -- into any log or
     # message, for every subprocess this module runs, not just the identity path.
-    lines = (result.stderr or result.stdout or "command failed").strip().splitlines()
-    return RuntimeError(_redact_databricks_secrets(lines[-1] if lines else "command failed"))
+    output = result.stderr or result.stdout or "command failed"
+    message = _redact_databricks_secrets(_failure_summary(output))
+    return NetworkFailure(message) if _lost_the_network(output) else RuntimeError(message)
+
+
+#: How much of a streamed command's output is kept for its error. Terraform's diagnostics come
+#: last, and a whole apply prints thousands of lines.
+_KEPT_OUTPUT_LINES = 400
+
+
+def _run_streamed(
+    arguments: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str] | None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a command the operator watches, and keep the end of what it said.
+
+    Its output reaches this process's stdout line by line, as it did when the command inherited
+    it. But then `_run` could only say "command failed" about output it never saw, and rc16's
+    install stopped on exactly that (2026-10-04): Terraform had said why, a lookup of
+    iam.amazonaws.com that found no host, and only the log above the error showed it. The kept
+    lines let `_safe_failure` say why, and whether the network is all that went wrong.
+    """
+
+    kept: deque[str] = deque(maxlen=_KEPT_OUTPUT_LINES)
+    expired = threading.Event()
+    with subprocess.Popen(
+        arguments,
+        cwd=PROJECT_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    ) as process:
+
+        def expire() -> None:
+            expired.set()
+            process.kill()
+
+        # What `subprocess.run` does with a timeout: kill the command, then raise.
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                kept.append(line)
+            returncode = process.wait()
+        finally:
+            timer.cancel()
+    output = "".join(kept)
+    if expired.is_set():
+        raise subprocess.TimeoutExpired(arguments, timeout, output=output)
+    return subprocess.CompletedProcess(arguments, returncode, stdout=output, stderr="")
 
 
 def _run(
@@ -320,15 +463,18 @@ def _run(
     capture: bool = False,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        arguments,
-        cwd=PROJECT_ROOT,
-        capture_output=capture,
-        text=True,
-        check=False,
-        timeout=timeout,
-        env=env,
-    )
+    if capture:
+        result = subprocess.run(
+            arguments,
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            env=env,
+        )
+    else:
+        result = _run_streamed(arguments, timeout=timeout, env=env)
     if result.returncode != 0:
         raise _safe_failure(result)
     return result
@@ -722,6 +868,10 @@ class DeployedAwsPosture:
     egress_prefix_count: int = 0
     egress_published_at: int | None = None
     runtime_role_sealed: bool = False
+    #: Whether Round 4's AWS Glue lane is sealed, which is what makes Round 4 race AWS.
+    round4_aws_sealed: bool = False
+    #: The same for Round 6's AWS DMS and Glue lane.
+    round6_aws_sealed: bool = False
 
     @property
     def egress_sealed(self) -> bool:
@@ -767,11 +917,14 @@ def deployed_aws_posture(*, manifest: DemoManifest | None = None) -> DeployedAws
     if moment < expires_at:
         return cached
     try:
-        aws = (manifest or load_manifest()).aws
+        loaded = manifest or load_manifest()
+        aws = loaded.aws
         posture = DeployedAwsPosture(
             egress_prefix_count=len(aws.serverless_egress_cidrs or ()),
             egress_published_at=aws.serverless_egress_published_at,
             runtime_role_sealed=aws.runtime_role_arn is not None,
+            round4_aws_sealed=getattr(loaded, "round4_aws", None) is not None,
+            round6_aws_sealed=getattr(loaded, "round6_aws", None) is not None,
         )
         ttl = OPERATOR_INGRESS_TTL_SECONDS
     except Exception:
@@ -1458,6 +1611,17 @@ def _terraform_variables(
     }
     if manifest.installation_id is not None:
         values["installation_id"] = manifest.installation_id
+        # Absent until the installer has recorded where Round 4's Delta source
+        # lives, and then on every plan, so a reconcile never destroys the lane.
+        values["round4_source_location"] = _round4_glue_source_location(manifest)
+        # The same for Round 6's lane: absent until the installer has created its
+        # storage credential and recorded the external ID its role's trust needs.
+        values["round6_uc_external_id"] = _round6_aws_external_id(manifest)
+        # Each lane's /24, once the installer has chosen it from the VPC's free space.
+        # Absent, Terraform keeps the digest's /24, which is what a lane it already
+        # built stands on.
+        values["round4_glue_subnet_cidr"] = getattr(manifest, "round4_glue_subnet_cidr", None)
+        values["round6_dms_subnet_cidr"] = getattr(manifest, "round6_dms_subnet_cidr", None)
     arguments: list[str] = []
     for name, value in values.items():
         # Terraform's CLI parses `-var name=null` as the literal string "null"
@@ -1569,6 +1733,56 @@ def _terraform_apply(manifest: DemoManifest, plan_path: Path) -> None:
     )
 
 
+#: The pauses before a Terraform step is asked again when the network is all that failed it:
+#: twelve and a half minutes in all, for a laptop whose DNS or Wi-Fi drops for a few minutes.
+TERRAFORM_NETWORK_RETRY_SECONDS = (30.0, 60.0, 120.0, 240.0, 300.0)
+
+
+def _asking_again_on_network_failure[T](step: Callable[[], T]) -> T:
+    """Run a Terraform step, and again after a pause each time only the network failed it.
+
+    rc16's install stopped on one lookup of iam.amazonaws.com that found no host (2026-10-04),
+    a laptop's DNS gone for a few minutes, and had to be finished by hand. Any other failure
+    raises at once, and so does the network's after the last pause.
+    """
+
+    pauses = iter(TERRAFORM_NETWORK_RETRY_SECONDS)
+    while True:
+        try:
+            return step()
+        except NetworkFailure as failure:
+            pause = next(pauses, None)
+            if pause is None:
+                raise
+            print(
+                f"WAIT  {pause:.0f}s for the network, then Terraform again: {failure}", flush=True
+            )
+            time.sleep(pause)
+
+
+def _plan_and_apply(
+    manifest: DemoManifest,
+    *,
+    check: Callable[[Path], None] | None = None,
+    **plan_options: Any,
+) -> Path:
+    """Plan, check the plan, and apply it, and all three again when the network drops.
+
+    Again from a new plan, never the old one: an apply the network stopped may have made part
+    of what its plan described, and Terraform refuses a stale plan. `check` raises on a plan
+    that must not be applied, and sees every plan before it is.
+    """
+
+    def attempt() -> Path:
+        plan = _terraform_plan(manifest, **plan_options)
+        if check is not None:
+            check(plan)
+        _terraform_apply(manifest, plan)
+        return plan
+
+    return _asking_again_on_network_failure(attempt)
+
+
 def _terraform_outputs(manifest: DemoManifest) -> dict[str, Any]:
     payload = _run_json(
         _terraform_base() + ["output", "-json"],
@@ -1642,14 +1856,42 @@ _LEGACY_DATABASE_STATE_ADDRESSES = {
 _INDEXED_LEGACY_AWS_STATE_ADDRESSES = (
     EXPECTED_AWS_STATE_ADDRESSES - _LEGACY_DATABASE_STATE_ADDRESSES
 ) | {f"{address}[0]" for address in _LEGACY_DATABASE_STATE_ADDRESSES}
-_V7_ROUND_KEYS = ("r1", "r2", "r3", "r5")
+# Round 4 joined for v1.1: its AWS lane is a writer pipeline carrying each Delta
+# change into its own Aurora cluster and RDS instance. Round 6 joined for the same
+# reason in reverse: AWS DMS captures its checkout from its own Aurora cluster and
+# RDS instance into the lakehouse. Mirrors `infra/aws/locals.tf:v7_round_keys`.
+_V7_ROUND_KEYS = ("r1", "r2", "r3", "r4", "r5", "r6")
 # Round 1 stands up no RDS instance, so its instance and security group are absent
 # from Terraform state by construction rather than by failure. Aurora, the subnet
-# groups and the per-round slugs still cover all four rounds; keeping the two key
+# groups and the per-round slugs still cover every AWS round; keeping the two key
 # lists separate here mirrors `infra/aws/locals.tf:v7_rds_round_keys`, and folding
 # them back together would make `_aws_state_is_complete` demand a resource the
 # checked-in Terraform deliberately does not create.
-_V7_RDS_ROUND_KEYS = ("r2", "r3", "r5")
+_V7_RDS_ROUND_KEYS = ("r2", "r3", "r4", "r5", "r6")
+# Round 6's databases are read by logical replication, so Terraform gives them
+# their own parameter groups (`infra/aws/parameter_groups.tf`). Mirrors
+# `infra/aws/locals.tf:v7_lakeflow_round_keys`.
+_V7_LOGICAL_REPLICATION_ROUND_KEYS = ("r6",)
+# The same rounds by number, for the checks that validate what each one stands
+# up: ownership, ingress and capacity. See `_sealed_aws_round_numbers`.
+_V7_AWS_ROUND_NUMBERS = tuple(int(key.removeprefix("r")) for key in _V7_ROUND_KEYS)
+
+
+def _sealed_aws_round_numbers(manifest: DemoManifest) -> tuple[int, ...]:
+    """The AWS rounds a v7 manifest seals, for the checks that validate them.
+
+    Every AWS round, except that the seals for Rounds 4 and 6 are optional: a
+    manifest sealed before v1.1 has none, and a round whose resources this
+    installation never stood up has nothing to validate. The rounds that must
+    carry a seal still do; `DemoManifest` refuses to load without them.
+    """
+
+    return tuple(
+        number
+        for number in _V7_AWS_ROUND_NUMBERS
+        if _ROUND_NUMBER_IDS[number] not in LAKEBASE_ONLY_ROUNDS
+        or manifest.round_environment(number).aurora is not None
+    )
 _V7_AWS_STATE_ADDRESSES = (
     (EXPECTED_AWS_STATE_ADDRESSES - _LEGACY_DATABASE_STATE_ADDRESSES)
     | {
@@ -1670,13 +1912,27 @@ _V7_AWS_STATE_ADDRESSES = (
         )
         for round_key in _V7_RDS_ROUND_KEYS
     }
+    | {
+        f'{address}["{round_key}"]'
+        for address in (
+            "aws_rds_cluster_parameter_group.lakeflow_aurora",
+            "aws_db_parameter_group.lakeflow_rds",
+        )
+        for round_key in _V7_LOGICAL_REPLICATION_ROUND_KEYS
+    }
 )
 
 
 # Conditional on the seal rather than unconditional, because `_aws_state_is_complete`
 # demands exact set equality: adding these to the base set would make every
 # installation that predates the runtime role read as incomplete state.
-_ANTI_DEMO_RUNTIME_POLICY_KEYS = ("1-network", "2-databases", "3-identity")
+_ANTI_DEMO_RUNTIME_POLICY_KEYS = (
+    "1-network",
+    "2-databases",
+    "3-identity",
+    "5-round4",
+    "6-round6",
+)
 _ANTI_DEMO_RUNTIME_STATE_ADDRESSES = {
     "aws_iam_role.anti_demo_runtime[0]",
     *(f'aws_iam_policy.anti_demo_runtime["{key}"]' for key in _ANTI_DEMO_RUNTIME_POLICY_KEYS),
@@ -1689,6 +1945,118 @@ _ROUND5_COMPETITOR_COORDINATION_EGRESS_ADDRESS = (
     "aws_vpc_security_group_egress_rule.round5_competitor_runner_postgres"
 )
 
+# Round 4's AWS Glue lane, which a second apply builds once the Round 4 Delta
+# source exists (`infra/aws/round4_glue.tf`). Conditional on the lane's recorded
+# source location for the reason the runtime role's addresses are conditional on
+# its seal: `_aws_state_is_complete` demands exact equality, and an installation
+# without the lane has none of these.
+_ROUND4_GLUE_COMPETITORS = ("aurora", "rds")
+_ROUND4_GLUE_STATE_ADDRESSES = frozenset(
+    {
+        "aws_subnet.round4_glue[0]",
+        "aws_route_table.round4_glue[0]",
+        "aws_route_table_association.round4_glue[0]",
+        "aws_vpc_endpoint.round4_glue_s3[0]",
+        "aws_security_group.round4_glue[0]",
+        "aws_s3_bucket.round4_glue[0]",
+        "aws_s3_bucket_public_access_block.round4_glue[0]",
+        "aws_s3_bucket_ownership_controls.round4_glue[0]",
+        "aws_s3_bucket_server_side_encryption_configuration.round4_glue[0]",
+        "aws_s3_bucket_lifecycle_configuration.round4_glue[0]",
+        "aws_s3_object.round4_glue_script[0]",
+        "aws_iam_role.round4_glue[0]",
+        "aws_iam_role_policy_attachment.round4_glue_service[0]",
+        "aws_iam_role_policy.round4_glue_access[0]",
+        *(f'aws_glue_connection.round4["{name}"]' for name in _ROUND4_GLUE_COMPETITORS),
+        *(f'aws_glue_job.round4_writer["{name}"]' for name in _ROUND4_GLUE_COMPETITORS),
+    }
+)
+# The lane's resources that carry no tags of their own. Each belongs to a tagged
+# parent in the same set: the bucket, the route table or the Glue role.
+_ROUND4_GLUE_UNTAGGED_ADDRESSES = frozenset(
+    {
+        "aws_route_table_association.round4_glue[0]",
+        "aws_s3_bucket_public_access_block.round4_glue[0]",
+        "aws_s3_bucket_ownership_controls.round4_glue[0]",
+        "aws_s3_bucket_server_side_encryption_configuration.round4_glue[0]",
+        "aws_s3_bucket_lifecycle_configuration.round4_glue[0]",
+        "aws_s3_object.round4_glue_script[0]",
+    }
+)
+
+
+def _round4_glue_source_location(manifest: DemoManifest) -> str | None:
+    """Where Round 4's Glue lane reads, once the installer has recorded it.
+
+    The one answer both the Terraform variable and the expected state read, so a
+    plan can never build the lane while the completeness check forgets it, or the
+    reverse. Recorded before the lane's first apply and never cleared, so every
+    later plan keeps the lane instead of destroying it.
+    """
+
+    return getattr(manifest, "round4_aws_source_location", None)
+
+
+# Round 6's AWS DMS and Glue lane, which a second apply builds once the lane's
+# Unity Catalog storage credential exists (`infra/aws/round6_aws.tf`). Conditional
+# on the credential's recorded external ID, for the reason Round 4's lane is
+# conditional on its source location.
+_ROUND6_AWS_COMPETITORS = ("aurora", "rds")
+_ROUND6_AWS_STATE_ADDRESSES = frozenset(
+    {
+        "aws_subnet.round6_dms[0]",
+        "aws_subnet.round6_dms[1]",
+        "aws_route_table.round6_dms[0]",
+        "aws_route_table_association.round6_dms[0]",
+        "aws_route_table_association.round6_dms[1]",
+        "aws_vpc_endpoint.round6_dms_s3[0]",
+        "aws_security_group.round6_dms[0]",
+        "aws_s3_bucket.round6_aws[0]",
+        "aws_s3_bucket_public_access_block.round6_aws[0]",
+        "aws_s3_bucket_ownership_controls.round6_aws[0]",
+        "aws_s3_bucket_server_side_encryption_configuration.round6_aws[0]",
+        "aws_s3_bucket_lifecycle_configuration.round6_aws[0]",
+        "aws_s3_object.round6_glue_script[0]",
+        "aws_iam_role.round6_dms_s3[0]",
+        "aws_iam_role_policy.round6_dms_s3_access[0]",
+        "aws_iam_role.round6_glue[0]",
+        "aws_iam_role_policy_attachment.round6_glue_service[0]",
+        "aws_iam_role_policy.round6_glue_access[0]",
+        "aws_iam_role.round6_uc[0]",
+        "aws_iam_role_policy.round6_uc_access[0]",
+        "aws_dms_replication_subnet_group.round6[0]",
+        "aws_dms_replication_instance.round6[0]",
+        *(f'aws_dms_endpoint.round6_source["{name}"]' for name in _ROUND6_AWS_COMPETITORS),
+        *(f'aws_dms_s3_endpoint.round6_target["{name}"]' for name in _ROUND6_AWS_COMPETITORS),
+        *(f'aws_dms_replication_task.round6["{name}"]' for name in _ROUND6_AWS_COMPETITORS),
+        *(f'aws_glue_job.round6_writer["{name}"]' for name in _ROUND6_AWS_COMPETITORS),
+    }
+)
+# The lane's resources that carry no tags of their own. Each belongs to a tagged
+# parent in the same set: the bucket or the route table.
+_ROUND6_AWS_UNTAGGED_ADDRESSES = frozenset(
+    {
+        "aws_route_table_association.round6_dms[0]",
+        "aws_route_table_association.round6_dms[1]",
+        "aws_s3_bucket_public_access_block.round6_aws[0]",
+        "aws_s3_bucket_ownership_controls.round6_aws[0]",
+        "aws_s3_bucket_server_side_encryption_configuration.round6_aws[0]",
+        "aws_s3_bucket_lifecycle_configuration.round6_aws[0]",
+        "aws_s3_object.round6_glue_script[0]",
+    }
+)
+
+
+def _round6_aws_external_id(manifest: DemoManifest) -> str | None:
+    """The external ID Round 6's lane is built with, once the installer has recorded it.
+
+    The one answer both the Terraform variable and the expected state read, as
+    `_round4_glue_source_location` is for Round 4. Recorded before the lane's first
+    apply and never cleared, so every later plan keeps the lane.
+    """
+
+    return getattr(manifest, "round6_aws_uc_external_id", None)
+
 
 def _expected_aws_state_addresses(manifest: DemoManifest) -> set[str]:
     base = (
@@ -1696,6 +2064,10 @@ def _expected_aws_state_addresses(manifest: DemoManifest) -> set[str]:
         if manifest.installation_id is not None
         else EXPECTED_AWS_STATE_ADDRESSES
     )
+    if manifest.installation_id is not None and _round4_glue_source_location(manifest):
+        base = base | _ROUND4_GLUE_STATE_ADDRESSES
+    if manifest.installation_id is not None and _round6_aws_external_id(manifest):
+        base = base | _ROUND6_AWS_STATE_ADDRESSES
     # Resolve through the same helper that builds the Terraform variables rather
     # than through the sealed field: on a first provision the seal is written
     # *after* this check runs, so reading the manifest alone expects 37 addresses
@@ -1705,15 +2077,43 @@ def _expected_aws_state_addresses(manifest: DemoManifest) -> set[str]:
     return base | _ANTI_DEMO_RUNTIME_STATE_ADDRESSES
 
 
+def _unfinished_lane_addresses(manifest: DemoManifest) -> frozenset[str]:
+    """The addresses of each Round 4 or Round 6 AWS lane whose stage recorded it, then stopped.
+
+    A lane stage records the value that enables the lane before its apply, so every later plan
+    keeps the lane, and seals the lane only once it is proven. In between, Terraform holds some
+    of the lane, or none of it.
+    """
+
+    return (
+        _ROUND4_GLUE_STATE_ADDRESSES
+        if getattr(manifest, "round4_aws", None) is None and _round4_glue_source_location(manifest)
+        else frozenset()
+    ) | (
+        _ROUND6_AWS_STATE_ADDRESSES
+        if getattr(manifest, "round6_aws", None) is None and _round6_aws_external_id(manifest)
+        else frozenset()
+    )
+
+
 def _aws_state_is_complete(
     manifest: DemoManifest,
     addresses: set[str],
     *,
     allow_legacy_missing_coordination_egress: bool = False,
+    allow_unfinished_lanes: bool = False,
 ) -> bool:
     expected = _expected_aws_state_addresses(manifest)
     if addresses == expected:
         return True
+    # Every round built, and a lane stage stopped partway or before it began: rc16's install
+    # lost the network in Round 6's lane plan (2026-10-04). Cleanup can take that apart, as
+    # Terraform holds all of it. It refused instead, and the resume it asked for did not reach
+    # the lane, so nothing could remove the installation.
+    if allow_unfinished_lanes:
+        unfinished = _unfinished_lane_addresses(manifest)
+        if unfinished and expected - unfinished <= addresses <= expected:
+            return True
     # This one egress rule was added after existing Round 5 installations had
     # already sealed. Its absence is a known migration state, not evidence of a
     # partial apply, and destroy mode must remain able to tear that fleet down
@@ -1744,6 +2144,8 @@ def _terraform_managed_addresses(manifest: DemoManifest) -> set[str]:
         | _INDEXED_LEGACY_AWS_STATE_ADDRESSES
         | _V7_AWS_STATE_ADDRESSES
         | _ANTI_DEMO_RUNTIME_STATE_ADDRESSES
+        | _ROUND4_GLUE_STATE_ADDRESSES
+        | _ROUND6_AWS_STATE_ADDRESSES
         | ROUND5_LEGACY_PARTIAL_ADDRESSES
         | ROUND5_LEGACY_REFUSED_ADDRESSES
         | ROUND5_LEGACY_DYNAMIC_ADDRESSES
@@ -2013,7 +2415,9 @@ def _v7_aws_environment_seals(
         "r1": RoundId.WAKE_IDLE_APP,
         "r2": RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
         "r3": RoundId.RECOVER_DELETED_ORDER,
+        "r4": RoundId.PUT_MODEL_SCORE_IN_APP,
         "r5": RoundId.SURVIVE_CONNECTION_SPIKE,
+        "r6": RoundId.ANALYZE_LIVE_ORDERS,
     }
     sealed: dict[RoundId, tuple[AuroraEnvironmentSeal, RdsEnvironmentSeal | None]] = {}
     for key, round_id in round_ids.items():
@@ -2236,6 +2640,10 @@ def _validate_partial_aws_destroy_retry(
         "aws_iam_role_policy_attachment.anti_demo_runtime[\"1-network\"]",
         "aws_iam_role_policy_attachment.anti_demo_runtime[\"2-databases\"]",
         "aws_iam_role_policy_attachment.anti_demo_runtime[\"3-identity\"]",
+        "aws_iam_role_policy_attachment.anti_demo_runtime[\"5-round4\"]",
+        "aws_iam_role_policy_attachment.anti_demo_runtime[\"6-round6\"]",
+        *_ROUND4_GLUE_UNTAGGED_ADDRESSES,
+        *_ROUND6_AWS_UNTAGGED_ADDRESSES,
         "aws_vpc_security_group_egress_rule.round5_proxy_to_rds",
         "aws_vpc_security_group_egress_rule.round5_runner_outbound",
         "aws_vpc_security_group_ingress_rule.round5_runner_to_proxy",
@@ -3714,14 +4122,16 @@ def _capacity_parity(manifest: DemoManifest) -> Check:
                     # Round 1 seals no RDS instance: its lane refuses to enter on
                     # engine semantics and is never timed, so there is nothing here
                     # to compare and nothing to report as missing. Reading the seal
-                    # unconditionally validated a lane that does not compete.
+                    # unconditionally validated a lane that does not compete. Round
+                    # 4's instance is compared although it is not raced yet: it
+                    # stands, so its ceiling must already be the matched one.
                     (
                         manifest.round_environment(number).rds
-                        if rds_lane_is_scored(_ROUND_NUMBER_IDS[number])
+                        if rds_instance_is_provisioned(_ROUND_NUMBER_IDS[number])
                         else None
                     ),
                 )
-                for number in (1, 2, 3, 5)
+                for number in _sealed_aws_round_numbers(manifest)
             ]
         else:
             # The pre-v7 layout has one endpoint and one instance for the whole
@@ -4280,9 +4690,23 @@ def _configure_round5_runner(
     resident_lane_id: str,
     resident_control_queue_url: str,
     resident_control_secret_arn: str,
+    keep_trust_bundle_sha256: str | None = None,
 ) -> str:
+    """Install the runner, rotate its resident agent, and return its trust bundle's checksum.
+
+    ``keep_trust_bundle_sha256`` is the sealed bundle's checksum, where there is a seal. A
+    runner whose bundle still has it keeps that bundle, and only one that does not is rebuilt
+    from the host's CA bundle and AWS's current RDS bundle. The download is AWS's to change:
+    on 2026-09-29 it republished that bundle, and every re-run of setup rebuilt both runners'
+    bundles, then refused them for differing from the seal.
+    """
+
     from .connection_spike_live import RUNNER_PATH, runner_asset_sha256s
 
+    if keep_trust_bundle_sha256 is not None and not re.fullmatch(
+        r"[0-9a-f]{64}", keep_trust_bundle_sha256
+    ):
+        raise RuntimeError("The sealed Round 5 trust bundle checksum is not a sha256")
     install_root = str(Path(RUNNER_PATH).parent)
     trust_bundle_path = f"{install_root}/round5-ca.pem"
     expected_assets = runner_asset_sha256s()
@@ -4332,9 +4756,7 @@ def _configure_round5_runner(
         "",
     )
     _install_round5_runner_assets(session, runner_instance_id=runner_instance_id)
-    commands = [
-        "set -euo pipefail",
-        "test -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    rebuild = [
         "curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "
         "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem "
         f"--output {install_root}/aws-rds-global.pem.tmp",
@@ -4347,6 +4769,20 @@ def _configure_round5_runner(
         f"mv {trust_bundle_path}.tmp {trust_bundle_path}",
         f"rm -f {install_root}/aws-rds-global.pem.tmp",
     ]
+    commands = [
+        "set -euo pipefail",
+        "test -s /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    ]
+    if keep_trust_bundle_sha256 is None:
+        commands.extend(rebuild)
+    else:
+        commands.append(
+            f"if test -s {trust_bundle_path} && "
+            f'test "$(sha256sum {trust_bundle_path} | cut -d " " -f 1)" = '
+            f"'{keep_trust_bundle_sha256}'; then echo TRUST_BUNDLE=kept; else "
+            + "; ".join(rebuild)
+            + "; echo TRUST_BUNDLE=rebuilt; fi"
+        )
     _run_round5_ssm_command(
         session.client("ssm"),
         runner_instance_id=runner_instance_id,
@@ -4742,6 +5178,12 @@ def _required_round5_outputs(outputs: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
+#: Database states in which a sealed source is still itself. RDS and Aurora read `backing-up`
+#: for the minute of each daily automated backup, which can land in any setup or re-run; it
+#: changes nothing a seal records. On 2026-10-02 the same strictness refused a Round 3 bout.
+_SEALED_DATABASE_SERVING_STATES = frozenset({"available", "backing-up"})
+
+
 def _round5_aurora_cluster_resource_id(
     manifest: DemoManifest,
     rds: Any,
@@ -4779,7 +5221,7 @@ def _round5_aurora_cluster_resource_id(
     members = cluster.get("DBClusterMembers") or []
     if (
         cluster.get("DBClusterIdentifier") != cluster_id
-        or str(cluster.get("Status") or "").lower() != "available"
+        or str(cluster.get("Status") or "").lower() not in _SEALED_DATABASE_SERVING_STATES
         or str(cluster.get("Endpoint") or "") != direct_host
         or str((cluster.get("MasterUserSecret") or {}).get("SecretArn") or "") != master_secret_arn
         or not resource_id
@@ -4798,7 +5240,7 @@ def _round5_aurora_cluster_resource_id(
     if (
         writer.get("DBInstanceIdentifier") != writer_instance_id
         or writer.get("DBClusterIdentifier") != cluster_id
-        or str(writer.get("DBInstanceStatus") or "").lower() != "available"
+        or str(writer.get("DBInstanceStatus") or "").lower() not in _SEALED_DATABASE_SERVING_STATES
     ):
         raise RuntimeError("Round 5 Aurora writer identity differs from the seal")
     return resource_id
@@ -4968,10 +5410,149 @@ def _anti_demo_runtime_trust_check(manifest: DemoManifest) -> Check:
         return Check("anti_demo_runtime_trust", False, str(exc))
 
 
+def _round5_runners_replaced_by_terraform(manifest: DemoManifest) -> Round5Resources | None:
+    """The Round 5 seal with its runners moved to the ones this installation's Terraform holds.
+
+    Until 65e319f a newer Amazon Linux image made any apply replace both runners, which left a
+    seal naming instances that no longer exist, and cleanup refused such an installation for
+    ever, because its topology could never match again (the v1.1 test installation,
+    2026-09-29). This names that one case and no other. Every sealed runner must be gone,
+    terminated or unknown to EC2, and each runner in this installation's Terraform state must be
+    a running instance carrying this run's ownership tags, so the destroy that follows removes
+    exactly the instances cleanup verified. Everything else about Round 5's topology is still
+    checked against the seal, unchanged, by the caller.
+    """
+
+    if not manifest.round5_ready:
+        return None
+    sealed = manifest.require_round5_resources()
+    outputs = _terraform_outputs(manifest)
+    replacements = (
+        str(outputs.get("round5_runner_instance_id") or ""),
+        str(outputs.get("round5_competitor_runner_instance_id") or ""),
+    )
+    sealed_ids = (str(sealed.runner_instance_id), str(sealed.competitor_runner_instance_id))
+    if not all(replacements) or set(replacements) & set(sealed_ids):
+        return None
+    ec2 = _aws_session(manifest).client("ec2")
+    for instance_id in sealed_ids:
+        try:
+            reservations = ec2.describe_instances(InstanceIds=[instance_id]).get(
+                "Reservations", []
+            )
+        except ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "InvalidInstanceID.NotFound":
+                continue
+            raise
+        states = {
+            str((instance.get("State") or {}).get("Name") or "")
+            for reservation in reservations
+            for instance in reservation.get("Instances", [])
+        }
+        if states - {"terminated"}:
+            return None
+    reservations = ec2.describe_instances(InstanceIds=list(replacements)).get("Reservations", [])
+    live = [
+        instance for reservation in reservations for instance in reservation.get("Instances", [])
+    ]
+    if {str(instance.get("InstanceId") or "") for instance in live} != set(replacements):
+        return None
+    for instance in live:
+        tags = {str(tag.get("Key")): str(tag.get("Value")) for tag in instance.get("Tags") or []}
+        if (
+            (instance.get("State") or {}).get("Name") != "running"
+            or tags.get("anti-demo-run-id") != manifest.run_id
+            or tags.get("managed-by") != "terraform"
+        ):
+            return None
+    return sealed.model_copy(
+        update={
+            "runner_instance_id": replacements[0],
+            "competitor_runner_instance_id": replacements[1],
+        }
+    )
+
+
+def _verify_round5_runners(
+    session: Any,
+    sealed: Round5Resources,
+    runner_ids: Sequence[str],
+    *,
+    contents: bool,
+) -> None:
+    """Each runner online in SSM and, with ``contents``, holding what the seal says it holds."""
+
+    ssm = session.client("ssm")
+    for runner_instance_id in runner_ids:
+        managed = ssm.describe_instance_information(
+            Filters=[{"Key": "InstanceIds", "Values": [runner_instance_id]}]
+        ).get("InstanceInformationList", [])
+        if (
+            len(managed) != 1
+            or managed[0].get("InstanceId") != runner_instance_id
+            or str(managed[0].get("PingStatus") or "").upper() != "ONLINE"
+        ):
+            raise RuntimeError("A Round 5 physical runner is not online in SSM")
+        if not contents:
+            continue
+        harness, trust = _round5_runner_checksums(
+            session,
+            runner_instance_id=runner_instance_id,
+            trust_bundle_path=sealed.trust_bundle_path,
+        )
+        if harness != sealed.harness_sha256 or trust != sealed.trust_bundle_sha256:
+            raise RuntimeError("A Round 5 runner or trust-bundle checksum differs from the seal")
+    if not contents:
+        return
+    digests = (
+        {
+            **_round5_runner_credential_digests(
+                session,
+                runner_instance_id=sealed.runner_instance_id,
+                credential_ids=("lakebase",),
+            ),
+            **_round5_runner_credential_digests(
+                session,
+                runner_instance_id=str(sealed.competitor_runner_instance_id),
+                credential_ids=("aurora", "rds"),
+            ),
+        }
+        if sealed.v3_factory_ready
+        else _round5_runner_credential_digests(
+            session,
+            runner_instance_id=sealed.runner_instance_id,
+        )
+    )
+    # `getattr` without a default on purpose: if a sealed field is ever
+    # renamed, this raises rather than quietly comparing nothing.
+    drifted = sorted(
+        lane
+        for lane, digest in digests.items()
+        if digest != getattr(sealed, f"{lane}_credential_sha256")
+    )
+    if drifted:
+        raise RuntimeError(
+            "Round 5 sealed credential digests differ from the runner's baseline "
+            f"files for {', '.join(drifted)}: the seal names credentials the runner "
+            "has already replaced, so those lanes fail baseline_auth_hash_invalid "
+            "after the bell. Re-seal Round 5 to record what is on disk."
+        )
+
+
 def _round5_topology_check(
     manifest: DemoManifest,
     resources: Round5Resources | None = None,
+    *,
+    runner_contents: bool = True,
 ) -> Check:
+    """Whether Round 5's live topology is exactly its seal.
+
+    ``runner_contents=False`` leaves out the runners' installed harness, trust bundle and
+    credential digests, and keeps everything that says whose they are. Only cleanup passes it,
+    for runners this installation's Terraform replaced (`_round5_runners_replaced_by_terraform`):
+    those were never configured, so what the seal says is installed cannot be on them.
+    """
+
     sealed = resources or (manifest.round5 if manifest.round5_ready else None)
     if not isinstance(sealed, Round5Resources):
         return Check("round5_secret_free_topology", False, "manifest has no Round 5 seal")
@@ -5037,7 +5618,8 @@ def _round5_topology_check(
             raise RuntimeError("Round 5 RDS subnets differ from the baseline seal")
         parameter_groups = database.get("DBParameterGroups") or []
         if (
-            str(database.get("DBInstanceStatus") or "").lower() != "available"
+            str(database.get("DBInstanceStatus") or "").lower()
+            not in _SEALED_DATABASE_SERVING_STATES
             or len(parameter_groups) != 1
             or parameter_groups[0].get("DBParameterGroupName") != "default.postgres17"
             or str(parameter_groups[0].get("ParameterApplyStatus") or "").lower() != "in-sync"
@@ -5277,59 +5859,7 @@ def _round5_topology_check(
                 or any(secret_tags.get(key) != value for key, value in expected_secret_tags.items())
             ):
                 raise RuntimeError(f"Round 5 static {lane_id} Proxy secret differs from the seal")
-        ssm = session.client("ssm")
-        for runner_instance_id in runner_ids:
-            managed = ssm.describe_instance_information(
-                Filters=[{"Key": "InstanceIds", "Values": [runner_instance_id]}]
-            ).get("InstanceInformationList", [])
-            if (
-                len(managed) != 1
-                or managed[0].get("InstanceId") != runner_instance_id
-                or str(managed[0].get("PingStatus") or "").upper() != "ONLINE"
-            ):
-                raise RuntimeError("A Round 5 physical runner is not online in SSM")
-            harness, trust = _round5_runner_checksums(
-                session,
-                runner_instance_id=runner_instance_id,
-                trust_bundle_path=sealed.trust_bundle_path,
-            )
-            if harness != sealed.harness_sha256 or trust != sealed.trust_bundle_sha256:
-                raise RuntimeError(
-                    "A Round 5 runner or trust-bundle checksum differs from the seal"
-                )
-        digests = (
-            {
-                **_round5_runner_credential_digests(
-                    session,
-                    runner_instance_id=sealed.runner_instance_id,
-                    credential_ids=("lakebase",),
-                ),
-                **_round5_runner_credential_digests(
-                    session,
-                    runner_instance_id=str(sealed.competitor_runner_instance_id),
-                    credential_ids=("aurora", "rds"),
-                ),
-            }
-            if sealed.v3_factory_ready
-            else _round5_runner_credential_digests(
-                session,
-                runner_instance_id=sealed.runner_instance_id,
-            )
-        )
-        # `getattr` without a default on purpose: if a sealed field is ever
-        # renamed, this raises rather than quietly comparing nothing.
-        drifted = sorted(
-            lane
-            for lane, digest in digests.items()
-            if digest != getattr(sealed, f"{lane}_credential_sha256")
-        )
-        if drifted:
-            raise RuntimeError(
-                "Round 5 sealed credential digests differ from the runner's baseline "
-                f"files for {', '.join(drifted)}: the seal names credentials the runner "
-                "has already replaced, so those lanes fail baseline_auth_hash_invalid "
-                "after the bell. Re-seal Round 5 to record what is on disk."
-            )
+        _verify_round5_runners(session, sealed, runner_ids, contents=runner_contents)
         _require_round5_tags_the_control_role_allows(iam, sealed)
         _require_round5_clean_baseline(manifest)
         return Check(
@@ -5408,11 +5938,17 @@ def _require_round5_tags_the_control_role_allows(iam: Any, sealed: Round5Resourc
         )
 
 
-def _require_round5_runner_idle(manifest: DemoManifest) -> None:
-    """Fail cleanup closed while either physical Round 5 runner is active."""
+def _require_round5_runner_idle(
+    manifest: DemoManifest, resources: Round5Resources | None = None
+) -> None:
+    """Fail cleanup closed while either physical Round 5 runner is active.
+
+    ``resources`` is the seal cleanup verified, when it is not the manifest's own: the runners
+    this installation's Terraform replaced (`_round5_runners_replaced_by_terraform`).
+    """
     if not manifest.round5_ready:
         return
-    round5 = manifest.require_round5_resources()
+    round5 = resources or manifest.require_round5_resources()
     ssm = _aws_session(manifest).client("ssm")
     for lane_id, runner_instance_id in (
         ("lakebase", round5.runner_instance_id),
@@ -5627,6 +6163,8 @@ def _refresh_round5_runner_locked(
                     if lane_id == "lakebase"
                     else sealed.competitor_runner_control_secret_arn
                 ),
+                # A refresh never changes the seal, so a runner keeps the sealed bundle.
+                keep_trust_bundle_sha256=sealed.trust_bundle_sha256,
             )
         except Exception as exc:
             stage = re.search(r" at stage ([a-z_]{1,32})", str(exc))
@@ -5653,9 +6191,12 @@ def _refresh_round5_runner_locked(
                 "the manifest seal was not changed (category=runner_hash_mismatch)"
             )
         if installed_trust != sealed.trust_bundle_sha256:
+            # Reached only when the runner no longer held the sealed bundle and it was rebuilt
+            # from AWS's current one. A refresh may not change the seal; setup may, and adopts it.
             raise RuntimeError(
                 f"{lane_id} runner refresh found trust-bundle drift; "
-                "the manifest seal was not changed (category=runner_trust_mismatch)"
+                "the manifest seal was not changed (category=runner_trust_mismatch). "
+                "Run 'antidemo setup' to adopt AWS's current RDS CA bundle into the seal"
             )
         installed_by_lane[lane_id] = (
             installed_assets,
@@ -6009,6 +6550,26 @@ def _reassert_round5_aws_credentials(
         )
 
 
+#: Round 5's outputs that are sets, not sequences: AWS lists a VPC's subnets, and a rule set's
+#: members, in no fixed order.
+_ROUND5_UNORDERED_OUTPUTS = frozenset(
+    {"proxy_subnet_ids", "lakebase_runner_egress_rule_ids", "competitor_runner_egress_rule_ids"}
+)
+
+
+def _round5_output_matches_seal(field: str, current: Any, sealed: Any) -> bool:
+    """Whether one Terraform output still says what Round 5 sealed.
+
+    Subnet and rule IDs compare as sets. The release run's re-run on an idle installation
+    (2026-09-30) read the VPC's same four subnets in another order and refused the seal:
+    "Round 5 Terraform output proxy_subnet_ids differs from the v5 seal".
+    """
+
+    if field in _ROUND5_UNORDERED_OUTPUTS:
+        return sorted(current) == sorted(sealed)
+    return current == sealed
+
+
 def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
     from .connection_spike import ConnectionSpikeContract
     from .connection_spike_live import runner_harness_sha256
@@ -6102,7 +6663,7 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             "rds_proxy_security_group_id",
             "bout_name_prefix",
         ):
-            if outputs[field] != getattr(sealed, field):
+            if not _round5_output_matches_seal(field, outputs[field], getattr(sealed, field)):
                 raise RuntimeError(f"Round 5 Terraform output {field} differs from the v5 seal")
         trust_bundle_sha256 = _configure_round5_runner(
             session,
@@ -6111,6 +6672,7 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             resident_lane_id="lakebase",
             resident_control_queue_url=outputs["lakebase_control_queue_url"],
             resident_control_secret_arn=outputs["runner_control_secret_arn"],
+            keep_trust_bundle_sha256=sealed.trust_bundle_sha256,
         )
         competitor_trust_bundle_sha256 = _configure_round5_runner(
             session,
@@ -6119,11 +6681,23 @@ def _prepare_and_reseal_round5(manifest: DemoManifest, *, timeout: float) -> Dem
             resident_lane_id="competitor",
             resident_control_queue_url=outputs["competitor_control_queue_url"],
             resident_control_secret_arn=outputs["competitor_runner_control_secret_arn"],
+            keep_trust_bundle_sha256=sealed.trust_bundle_sha256,
         )
         if competitor_trust_bundle_sha256 != trust_bundle_sha256:
             raise RuntimeError("Round 5 physical runners installed different trust bundles")
         if trust_bundle_sha256 != sealed.trust_bundle_sha256:
-            raise RuntimeError("Round 5 trust bundle differs from the existing v5 seal")
+            # Each runner kept a bundle that matched the seal, so both were rebuilt: from the
+            # host's CA bundle and AWS's current RDS bundle, which is what a fresh install would
+            # take today. That happens when AWS republishes its bundle and a runner lost the
+            # sealed one. On 2026-09-29 a setup that rebuilt unconditionally did both, and then
+            # refused its own work. Both runners now hold the same bundle, so the seal adopts
+            # it, and everything below verifies against it; the app reads it once redeployed.
+            print(
+                "RESEAL Round 5's trust bundle: both runners hold AWS's current RDS CA bundle, "
+                "so the seal adopts it",
+                flush=True,
+            )
+            sealed = _reseal_round5(sealed, trust_bundle_sha256=trust_bundle_sha256)
         ssm = session.client("ssm")
         public_key_result = _round5_setup_request(
             ssm,
@@ -6797,6 +7371,237 @@ def _wait_round4_sync_position(
                 "Round 4 baseline restore did not reach the synced table before timeout"
             )
         time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
+#: Newest-update states in which Round 4's pipeline is doing something, so it is
+#: not parked. `STOPPING` is here: a stop still settling is not yet parked.
+_ROUND4_ACTIVE_UPDATE_STATES = frozenset(
+    {
+        "QUEUED",
+        "CREATED",
+        "WAITING_FOR_RESOURCES",
+        "INITIALIZING",
+        "RESETTING",
+        "SETTING_UP_TABLES",
+        "RUNNING",
+        "STOPPING",
+    }
+)
+
+#: How long the installer waits for the pipeline to park or to come up.
+_ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS = 600.0
+#: How long a park after the baseline lets the pipeline's update settle into a continuous sync
+#: before it stops it anyway.
+_ROUND4_PARK_SETTLE_SECONDS = 300.0
+#: The newest-update states in which the pipeline is still bringing the synced table online.
+_ROUND4_UNSETTLED_UPDATE_STATES = frozenset(
+    {
+        "QUEUED",
+        "CREATED",
+        "WAITING_FOR_RESOURCES",
+        "INITIALIZING",
+        "RESETTING",
+        "SETTING_UP_TABLES",
+        "RUNNING",
+    }
+)
+
+
+def _round4_pipeline_signals(manifest: DemoManifest, names: dict[str, str], pipeline_id: str):
+    """The pipeline and its `/database` synced table, as the power decisions read them."""
+
+    from .model_score_live import PipelineSignals
+
+    pipeline = _round4_get_pipeline(manifest, pipeline_id)
+    database = _round4_get_database_synced_table(manifest, names) or {}
+    status = database.get("data_synchronization_status") or {}
+    return PipelineSignals(
+        pipeline_state=str(pipeline.get("state") or ""),
+        update_state=latest_pipeline_update_state(pipeline),
+        synced_table_state=str(status.get("detailed_state") or ""),
+        continuous_reported=bool(status.get("continuous_update_status")),
+    )
+
+
+def _round4_pipeline_parked(manifest: DemoManifest, pipeline_id: str) -> bool:
+    pipeline = _round4_get_pipeline(manifest, pipeline_id)
+    state = str(pipeline.get("state") or "").strip().upper()
+    update = latest_pipeline_update_state(pipeline).strip().upper()
+    return state == "IDLE" and update not in _ROUND4_ACTIVE_UPDATE_STATES
+
+
+def _round4_pipeline_verb(manifest: DemoManifest, pipeline_id: str, verb: str) -> None:
+    """Issue ``stop`` or ``start`` to Round 4's pipeline, and record it when there is a seal.
+
+    The power record is keyed to the sealed pipeline, and a first install seals
+    Round 4 only after this has run, so until then the verb is issued on its
+    own, through the same exact-path guard.
+    """
+
+    from . import pipeline_power
+
+    sealed = str(getattr(manifest.round4, "pipeline_id", "") or "") if manifest.round4 else ""
+    if sealed == pipeline_id:
+        if verb == "stop":
+            pipeline_power.stop(manifest, _databricks_api)
+        else:
+            pipeline_power.start(manifest, _databricks_api)
+        return
+    if verb == "stop":
+        path, body = f"/api/2.0/pipelines/{pipeline_id}/stop", None
+    else:
+        path, body = f"/api/2.0/pipelines/{pipeline_id}/updates", {"full_refresh": False}
+    _databricks_api(
+        manifest.databricks.profile,
+        "post",
+        pipeline_power._require_pipeline_path(pipeline_id, path),
+        body=body,
+    )
+
+
+def _park_round4_pipeline(
+    manifest: DemoManifest,
+    pipeline_id: str,
+    *,
+    settle_names: dict[str, str] | None = None,
+) -> None:
+    """Stop Round 4's pipeline and wait until it is parked. A parked one costs one read.
+
+    With ``settle_names``, an update still bringing the synced table online settles into a
+    continuous sync first, read healthy twice in a row as a start's is. rc20 (2026-10-05) parked
+    a new pipeline 35 s after creating it, three seconds into its first update's RUNNING, and
+    the synced table then read ``SYNCED_TABLE_OFFLINE_FAILED``, which setup's closing check
+    refuses as a broken table. Every park of a settled sync has left it online.
+    """
+
+    from .model_score_live import pipeline_signals_are_healthy
+
+    if settle_names is not None:
+        update = latest_pipeline_update_state(_round4_get_pipeline(manifest, pipeline_id))
+        if update.strip().upper() in _ROUND4_UNSETTLED_UPDATE_STATES:
+            settle_deadline = time.monotonic() + _ROUND4_PARK_SETTLE_SECONDS
+            healthy = 0
+            while True:
+                signals = _round4_pipeline_signals(manifest, settle_names, pipeline_id)
+                healthy = healthy + 1 if pipeline_signals_are_healthy(signals) else 0
+                if healthy >= 2:
+                    break
+                if time.monotonic() >= settle_deadline:
+                    print(
+                        "WAIT  Round 4's Managed Sync pipeline did not settle into a continuous "
+                        f"sync within {_ROUND4_PARK_SETTLE_SECONDS:.0f}s "
+                        f"({signals.describe()}); parking it anyway",
+                        flush=True,
+                    )
+                    break
+                time.sleep(3)
+
+    deadline = time.monotonic() + _ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS
+    requested = False
+    while True:
+        pipeline = _round4_get_pipeline(manifest, pipeline_id)
+        state = str(pipeline.get("state") or "").strip().upper()
+        update = latest_pipeline_update_state(pipeline).strip().upper()
+        if state == "IDLE" and update not in _ROUND4_ACTIVE_UPDATE_STATES:
+            return
+        if not requested and update != "STOPPING":
+            print("PARK  Round 4 Managed Sync pipeline", flush=True)
+            _round4_pipeline_verb(manifest, pipeline_id, "stop")
+            requested = True
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Round 4's Managed Sync pipeline {pipeline_id} did not park within "
+                f"{_ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS:.0f}s (pipeline {state or 'UNKNOWN'}, "
+                f"update {update or 'NONE'}); stop it with '{ROUND4_PIPELINE_STOP_COMMAND}'"
+            )
+        time.sleep(3)
+
+
+def _start_round4_pipeline(
+    manifest: DemoManifest, names: dict[str, str], pipeline_id: str
+) -> None:
+    """Start Round 4's parked pipeline and wait for a healthy continuous sync."""
+
+    from .model_score_live import pipeline_signals_are_healthy
+
+    deadline = time.monotonic() + _ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS
+    while latest_pipeline_update_state(_round4_get_pipeline(manifest, pipeline_id)) == "STOPPING":
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Round 4's Managed Sync pipeline did not finish stopping")
+        time.sleep(3)
+    print("START Round 4 Managed Sync pipeline to carry its baseline", flush=True)
+    _round4_pipeline_verb(manifest, pipeline_id, "start")
+    healthy = 0
+    while True:
+        signals = _round4_pipeline_signals(manifest, names, pipeline_id)
+        healthy = healthy + 1 if pipeline_signals_are_healthy(signals) else 0
+        # Twice in a row: the pipeline and synced-table views disagree briefly while
+        # a stopped continuous update resumes.
+        if healthy >= 2:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "Round 4's Managed Sync pipeline did not reach a healthy continuous sync "
+                f"within {_ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS:.0f}s ({signals.describe()})"
+            )
+        time.sleep(3)
+
+
+def _carry_round4_baseline(
+    manifest: DemoManifest,
+    names: dict[str, str],
+    warehouse_id: str,
+    *,
+    project_uid: str,
+    branch_uid: str,
+    pipeline_id: str,
+    timeout: float,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Make the baseline exact in the source and the synced table, and leave the pipeline parked.
+
+    v1.1 parks Round 4's pipeline between bouts, because both lanes are cold at
+    the bell. So the baseline is carried only when it has to be: a source and a
+    synced table that both read it exactly, behind a parked pipeline, are left
+    alone, and ``None`` says so. Otherwise the pipeline is started, the baseline
+    committed and waited for, and the pipeline parked again on every way out. A
+    process killed in between leaves a running pipeline that the next setup and
+    the app's next Round 4 Prepare both park.
+    """
+
+    parked = _round4_pipeline_parked(manifest, pipeline_id)
+    if (
+        parked
+        and _read_round4_source_row(manifest, names, warehouse_id) == ROUND4_BASELINE_ROW
+        and asyncio.run(_read_round4_baseline(manifest, names))
+        == (
+            ROUND4_BASELINE_ENTITY_ID,
+            ROUND4_BASELINE_SCORE,
+            ROUND4_BASELINE_MODEL_VERSION,
+            ROUND4_BASELINE_PROOF_NONCE,
+        )
+    ):
+        print("OK    Round 4 baseline is exact in the source and the synced table", flush=True)
+        return None
+    # Only a carry that worked waits for the sync to settle before the park: one that failed
+    # parks at once, so a broken pipeline is not left billing for the settle's minutes.
+    settle_names: dict[str, str] | None = None
+    try:
+        if parked:
+            _start_round4_pipeline(manifest, names, pipeline_id)
+        source_version = _repair_round4_baseline(manifest, names, warehouse_id)
+        carried = _wait_round4_baseline(
+            manifest,
+            names,
+            source_version,
+            project_uid=project_uid,
+            branch_uid=branch_uid,
+            pipeline_id=pipeline_id,
+            timeout=timeout,
+        )
+        settle_names = names
+        return carried
+    finally:
+        _park_round4_pipeline(manifest, pipeline_id, settle_names=settle_names)
 
 
 def _restore_round4_baseline_if_owned(
@@ -8557,16 +9362,19 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
 
     # Only after all pre-existing cross-endpoint resources pass validation may
     # resume repair the source baseline.
-    source_version = _repair_round4_baseline(manifest, names, warehouse_id)
-    ready, ready_database = _wait_round4_baseline(
+    carried = _carry_round4_baseline(
         manifest,
         names,
-        source_version,
+        warehouse_id,
         project_uid=project_uid,
         branch_uid=branch_uid,
         pipeline_id=pipeline_id,
         timeout=timeout,
     )
+    if carried is None:
+        ready, ready_database = postgres, database
+    else:
+        ready, ready_database = carried
     uid, pipeline_id = _validate_round4_synced_table(manifest, ready, names, sealed=sealed)
     _validate_round4_database_synced_table(
         ready_database,
@@ -8574,7 +9382,9 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
         project_uid=project_uid,
         branch_uid=branch_uid,
         pipeline_id=pipeline_id,
-        require_sync_position=True,
+        # A parked pipeline reports no continuous position, and a baseline that
+        # was already exact everywhere was never carried, so there is none to hold.
+        require_sync_position=carried is not None,
     )
     resource_name = str(ready.get("name") or "")
     # Every Lakebase project the app must reach, before any role work needs one
@@ -8705,6 +9515,542 @@ def _prepare_and_reseal_round4(manifest: DemoManifest, *, timeout: float) -> Dem
     return manifest
 
 
+async def _ensure_round4_writer_targets(manifest: DemoManifest, password: str) -> None:
+    """Round 4's writer role and ledger on the r4 Aurora cluster and RDS instance."""
+
+    from .round4_aws_lifecycle import ensure_writer_target
+
+    for label, provider in (
+        ("Aurora", _round_aurora_provider(manifest, 4)),
+        ("RDS", _round_rds_provider(manifest, 4)),
+    ):
+        material = await provider.connection_material()
+        print(f"CREATE/VERIFY Round 4 {label} writer role and ledger", flush=True)
+        connection = await _connect(material, autocommit=True)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await ensure_writer_target(
+                    cursor,
+                    database=material.database,
+                    password=password,
+                )
+
+
+async def _read_round4_aws_target(
+    manifest: DemoManifest, competitor: str
+) -> ModelScoreRow | None:
+    from .round4_aws_lifecycle import read_target_row
+
+    provider = (
+        _round_aurora_provider(manifest, 4)
+        if competitor == "aurora"
+        else _round_rds_provider(manifest, 4)
+    )
+    connection = await _connect(await provider.connection_material(), autocommit=True)
+    async with connection:
+        return await read_target_row(connection, ROUND4_BASELINE_ENTITY_ID)
+
+
+def _choose_lane_subnet(
+    manifest: DemoManifest,
+    *,
+    field: str,
+    subnet_address: str,
+    preferred_netnum: int,
+    label: str,
+    avoid: tuple[str, ...] = (),
+) -> None:
+    """Record a free /24 for a lane before its first apply (`server/lane_subnets.py`).
+
+    Nothing is chosen for a lane Terraform already built: it stands on the digest's /24, and
+    Terraform keeps using it while the manifest records none. Chosen once and then kept, so
+    every later plan reads the same /24.
+    """
+
+    from .lane_subnets import free_lane_cidr, vpc_subnet_cidrs
+
+    if getattr(manifest, field, None) is not None:
+        return
+    if subnet_address in _terraform_managed_addresses(manifest):
+        return
+    vpc_id = str(_terraform_outputs(manifest)["vpc_id"])
+    ec2 = _aws_session(manifest).client("ec2", region_name=manifest.aws.region)
+    vpcs = ec2.describe_vpcs(VpcIds=[vpc_id]).get("Vpcs") or []
+    if len(vpcs) != 1:
+        raise RuntimeError(f"AWS did not return exactly the VPC {vpc_id}")
+    cidr = free_lane_cidr(
+        str(vpcs[0]["CidrBlock"]),
+        vpc_subnet_cidrs(ec2, vpc_id),
+        preferred_netnum=preferred_netnum,
+        avoid=avoid,
+    )
+    setattr(manifest, field, cidr)
+    save_manifest(manifest)
+    print(f"CHOOSE {label} subnet {cidr}, free in {vpc_id}", flush=True)
+
+
+def _choose_enabled_lane_subnets(manifest: DemoManifest) -> None:
+    """Choose a /24 for every lane the next plan builds, before that plan.
+
+    A lane is in every plan from the moment the value that enables it is recorded, not only in
+    its own stage's apply. The v1.1 test installation of 2026-09-29 recorded Round 4's source,
+    failed in the lane's apply, and on the resume the reconcile planned the lane's subnet on the
+    digest's /24, the same collision, before the lane stage could choose. So every plan that can
+    build a lane chooses here first.
+    """
+
+    from .lane_subnets import round4_preferred_netnum, round6_preferred_netnum
+
+    if manifest.installation_id is None:
+        return
+    if _round4_glue_source_location(manifest) is not None:
+        _choose_lane_subnet(
+            manifest,
+            field="round4_glue_subnet_cidr",
+            subnet_address="aws_subnet.round4_glue[0]",
+            preferred_netnum=round4_preferred_netnum(manifest.installation_id),
+            label="Round 4 Glue lane",
+        )
+    if _round6_aws_external_id(manifest) is not None:
+        _choose_lane_subnet(
+            manifest,
+            field="round6_dms_subnet_cidr",
+            subnet_address="aws_subnet.round6_dms[0]",
+            preferred_netnum=round6_preferred_netnum(manifest.installation_id),
+            label="Round 6 DMS lane",
+            # Round 4's /24 is in the VPC once its lane is built; named here as well, in case
+            # it was chosen and not yet applied.
+            avoid=tuple(
+                cidr for cidr in (getattr(manifest, "round4_glue_subnet_cidr", None),) if cidr
+            ),
+        )
+
+
+def _prepare_and_reseal_round4_aws(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
+    """Build, prove and seal Round 4's AWS Glue lane. Idempotent, and nothing before v7.
+
+    A second, additive Terraform apply, because the Glue role reads Round 4's
+    Delta table and nothing else in the workspace's storage, and that table's S3
+    location is known only once `_ensure_round4` has created it. Its location is
+    recorded before the apply, so every later plan keeps the lane rather than
+    destroying it, and the lane is sealed only after both jobs have carried the
+    source's baseline into their targets.
+    """
+
+    from .round4_aws_lifecycle import (
+        ROUND4_COMPETITORS,
+        new_writer_password,
+        prove_lane,
+        script_sha256,
+        seal,
+        set_connection_password,
+        source_location,
+        source_table_id,
+    )
+    from .round4_glue import GlueWriterJob
+
+    if (
+        manifest.installation_id is None
+        or manifest.round_environments is None
+        or manifest.round4 is None
+    ):
+        return manifest
+    environment = manifest.round_environment(4)
+    if environment.aurora is None or environment.rds is None:
+        return manifest
+    # This connects from here to both r4 databases, after an install long enough
+    # for a rotating NAT to have moved this host.
+    _follow_operator_address(manifest)
+    location = source_location(
+        manifest.databricks.profile,
+        manifest.round4.source_table_full_name,
+        _databricks_api,
+    )
+    if manifest.round4_aws_source_location != location:
+        if manifest.round4_aws_source_location is not None:
+            print(
+                "RESEAL Round 4's Delta source moved; the Glue lane follows it and is "
+                "proven again",
+                flush=True,
+            )
+        manifest.round4_aws = None
+        manifest.round4_aws_source_location = location
+        save_manifest(manifest)
+    print("CREATE/VERIFY Round 4 AWS Glue lane (second, additive apply)", flush=True)
+    _terraform_init(manifest)
+    _choose_enabled_lane_subnets(manifest)
+
+    def refuse_more_than_the_lane(plan: Path) -> None:
+        violations = _round4_glue_plan_violations(manifest, _terraform_plan_json(manifest, plan))
+        if violations:
+            raise RuntimeError(
+                "Round 4's AWS Glue lane apply would change more than the lane, so nothing was "
+                "applied: "
+                + "; ".join(violations)
+                + ". Run 'antidemo setup' again: its first apply converges every round before "
+                "this one runs."
+            )
+
+    _plan_and_apply(manifest, check=refuse_more_than_the_lane)
+    if not _aws_state_is_complete(manifest, _terraform_managed_addresses(manifest)):
+        raise RuntimeError("Terraform did not converge to the exact Round 4 Glue lane state")
+    lane = _terraform_outputs(manifest).get("round4_glue")
+    if not isinstance(lane, Mapping):
+        raise RuntimeError("Terraform built no Round 4 Glue lane although its source is recorded")
+
+    password = new_writer_password()
+    asyncio.run(_ensure_round4_writer_targets(manifest, password))
+    session = _aws_session(manifest)
+    glue = session.client("glue")
+    for competitor in ROUND4_COMPETITORS:
+        set_connection_password(glue, str(lane["connections"][competitor]), password)
+
+    unchanged = (
+        manifest.round4_aws is not None
+        and manifest.round4_aws.script_sha256 == script_sha256()
+        and manifest.round4_aws.source_location == location
+    )
+    if not unchanged:
+        # The proof is that each job carries the source's own row into its target, so the
+        # source has to be the baseline the targets are then held to.
+        if (
+            _read_round4_source_row(manifest, _round4_names(manifest), manifest.round4.warehouse_id)
+            != ROUND4_BASELINE_ROW
+        ):
+            raise RuntimeError(
+                "Round 4's source row is not its sealed baseline, so its AWS lane cannot be "
+                "proven against it. Let Round 4 finish settling, then run 'antidemo setup' again."
+            )
+        table_id = source_table_id(
+            _sql_rows(
+                _sql_statement(
+                    manifest.databricks.profile,
+                    manifest.round4.warehouse_id,
+                    "DESCRIBE DETAIL "
+                    + ".".join(
+                        f"`{part}`" for part in manifest.round4.source_table_full_name.split(".")
+                    ),
+                )
+            )
+        )
+        for competitor in ROUND4_COMPETITORS:
+            print(f"PROVE Round 4 {competitor} Glue writer carries the baseline", flush=True)
+            elapsed = prove_lane(
+                GlueWriterJob(
+                    session,
+                    str(lane["jobs"][competitor]),
+                    bucket=str(lane["bucket"]),
+                ),
+                competitor=competitor,
+                source_table_id=table_id,
+                expected=ROUND4_BASELINE_ROW,
+                read_target=lambda competitor=competitor: asyncio.run(
+                    _read_round4_aws_target(manifest, competitor)
+                ),
+                notify=lambda message: print(f"WAIT  {message}", flush=True),
+                timeout_seconds=min(timeout, 600.0),
+            )
+            print(
+                f"OK    Round 4 {competitor} Glue writer carried the baseline in "
+                f"{elapsed:.0f}s and is parked",
+                flush=True,
+            )
+    manifest.round4_aws = seal(lane)
+    save_manifest(manifest)
+    return manifest
+
+
+def _round6_provider(
+    manifest: DemoManifest, competitor: str
+) -> AuroraCredentialProvider | RdsCredentialProvider:
+    return (
+        _round_aurora_provider(manifest, 6)
+        if competitor == "aurora"
+        else _round_rds_provider(manifest, 6)
+    )
+
+
+async def _ensure_round6_capture_sources(manifest: DemoManifest, password: str) -> None:
+    """Round 6's source table and capture role on the r6 Aurora cluster and RDS instance."""
+
+    from .round6_aws_lifecycle import ROUND6_COMPETITORS, ensure_capture_source
+
+    for competitor in ROUND6_COMPETITORS:
+        material = await _round6_provider(manifest, competitor).connection_material()
+        print(f"CREATE/VERIFY Round 6 {competitor} source table and capture role", flush=True)
+        connection = await _connect(material, autocommit=True)
+        async with connection:
+            async with connection.cursor() as cursor:
+                await ensure_capture_source(cursor, database=material.database, password=password)
+
+
+async def _round6_source_call(manifest: DemoManifest, competitor: str, step: Any) -> Any:
+    """Run one step against a competitor's r6 source, on its own autocommitted connection."""
+
+    connection = await _connect(
+        await _round6_provider(manifest, competitor).connection_material(), autocommit=True
+    )
+    async with connection:
+        async with connection.cursor() as cursor:
+            return await step(cursor)
+
+
+def _round6_uc_role_arn(manifest: DemoManifest) -> str:
+    """The lane's read-only role, named before Terraform makes it: `round6_aws.tf` fixes it."""
+
+    partition = (
+        "aws-us-gov"
+        if manifest.aws.region.startswith("us-gov-")
+        else "aws-cn"
+        if manifest.aws.region.startswith("cn-")
+        else "aws"
+    )
+    role = f"{_round_installation_slug(manifest, 'r6')}-uc"
+    return f"arn:{partition}:iam::{manifest.aws.account_id}:role/{role}"
+
+
+def _prepare_and_reseal_round6_aws(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
+    """Build, prove and seal Round 6's AWS DMS and Glue lane. Idempotent, and nothing before v7.
+
+    A second, additive Terraform apply, because the lane's read-only role trusts
+    Databricks' Unity Catalog role only with the storage credential's external ID,
+    and that ID is known only once the credential exists. The ID is recorded before
+    the apply, so every later plan keeps the lane rather than destroying it, and the
+    lane is sealed only after both competitors have carried a proof order into the
+    lakehouse. An identity that may not create the lane's Unity Catalog objects
+    seals why instead, and Round 6 races Lakebase alone.
+    """
+
+    from .round4_glue import GlueWriterJob
+    from .round6_aws_lifecycle import (
+        ROUND6_COMPETITORS,
+        Round6AwsUnsupported,
+        commit_proof_order,
+        ensure_dms_vpc_role,
+        ensure_external_location,
+        ensure_storage_credential,
+        history_read_statement,
+        history_table_full_name,
+        history_table_statement,
+        new_capture_password,
+        prove_lane,
+        replication_slots,
+        script_sha256,
+        seal,
+        set_endpoint_password,
+        test_endpoint,
+        uc_names,
+        withdraw_order,
+    )
+    from .round6_dms import DmsCaptureTask
+
+    if (
+        manifest.installation_id is None
+        or manifest.round_environments is None
+        or manifest.round6 is None
+    ):
+        return manifest
+    environment = manifest.round_environment(6)
+    if environment.aurora is None or environment.rds is None:
+        return manifest
+    # This connects from here to both r6 databases, after an install long enough
+    # for a rotating NAT to have moved this host.
+    _follow_operator_address(manifest)
+    names = uc_names(manifest.run_id)
+    session = _aws_session(manifest)
+    dms_role = ensure_dms_vpc_role(session.client("iam"))
+    print(f"OK    DMS's account-wide dms-vpc-role ({dms_role})", flush=True)
+    if dms_role == "created":
+        # IAM is eventually consistent, and DMS refuses a subnet group while its
+        # new role has not reached it yet (the spike, 2026-09-29).
+        print("WAIT  20s for the new dms-vpc-role to reach DMS", flush=True)
+        time.sleep(20.0)
+    try:
+        external_id = ensure_storage_credential(
+            _databricks_api,
+            _databricks_api_optional,
+            manifest.databricks.profile,
+            name=names["storage_credential"],
+            role_arn=_round6_uc_role_arn(manifest),
+        )
+    except Round6AwsUnsupported as refusal:
+        manifest.round6_aws = None
+        manifest.round6_aws_unsupported = str(refusal)
+        save_manifest(manifest)
+        print(f"SKIP  Round 6 races Lakebase alone here: {refusal}", flush=True)
+        return manifest
+    if manifest.round6_aws_uc_external_id != external_id or manifest.round6_aws_unsupported:
+        if manifest.round6_aws_uc_external_id not in (None, external_id):
+            print(
+                "RESEAL Round 6's storage credential was replaced; its lane trusts the new "
+                "one and is proven again",
+                flush=True,
+            )
+        manifest.round6_aws = None
+        manifest.round6_aws_unsupported = None
+        manifest.round6_aws_uc_external_id = external_id
+        save_manifest(manifest)
+
+    print("CREATE/VERIFY Round 6 AWS DMS lane (second, additive apply)", flush=True)
+    _terraform_init(manifest)
+    _choose_enabled_lane_subnets(manifest)
+
+    def refuse_more_than_the_lane(plan: Path) -> None:
+        violations = _round6_aws_plan_violations(manifest, _terraform_plan_json(manifest, plan))
+        if violations:
+            raise RuntimeError(
+                "Round 6's AWS DMS lane apply would change more than the lane, so nothing was "
+                "applied: "
+                + "; ".join(violations)
+                + ". Run 'antidemo setup' again: its first apply converges every round before "
+                "this one runs."
+            )
+
+    _plan_and_apply(manifest, check=refuse_more_than_the_lane)
+    if not _aws_state_is_complete(manifest, _terraform_managed_addresses(manifest)):
+        raise RuntimeError("Terraform did not converge to the exact Round 6 DMS lane state")
+    lane = _terraform_outputs(manifest).get("round6_aws")
+    if not isinstance(lane, Mapping):
+        raise RuntimeError("Terraform built no Round 6 DMS lane although its credential exists")
+
+    password = new_capture_password()
+    asyncio.run(_ensure_round6_capture_sources(manifest, password))
+    dms = session.client("dms")
+    for competitor in ROUND6_COMPETITORS:
+        endpoint = str(lane["source_endpoints"][competitor])
+        set_endpoint_password(dms, endpoint, password)
+        for tested in (endpoint, str(lane["target_endpoints"][competitor])):
+            test_endpoint(
+                dms,
+                instance_arn=str(lane["replication_instance_arn"]),
+                endpoint_arn=tested,
+            )
+        print(f"OK    Round 6 {competitor} DMS endpoints connect", flush=True)
+
+    try:
+        # The credential is checked on the bucket before the location is first created.
+        ensure_external_location(
+            _databricks_api,
+            _databricks_api_optional,
+            manifest.databricks.profile,
+            name=names["external_location"],
+            url=str(lane["delta_location"]),
+            credential=names["storage_credential"],
+            validate_url=f"s3://{lane['bucket']}/",
+        )
+    except Round6AwsUnsupported as refusal:
+        manifest.round6_aws = None
+        manifest.round6_aws_unsupported = str(refusal)
+        save_manifest(manifest)
+        print(f"SKIP  Round 6 races Lakebase alone here: {refusal}", flush=True)
+        return manifest
+
+    sealed6 = manifest.round6
+    history_tables = {
+        competitor: history_table_full_name(
+            sealed6.destination_catalog, sealed6.destination_schema, competitor
+        )
+        for competitor in ROUND6_COMPETITORS
+    }
+    unchanged = (
+        manifest.round6_aws is not None and manifest.round6_aws.script_sha256 == script_sha256()
+    )
+    if not unchanged:
+        s3 = session.client("s3")
+        bucket = str(lane["bucket"])
+        for competitor in ROUND6_COMPETITORS:
+            location = str(lane["history_locations"][competitor])
+            full_name = history_tables[competitor]
+            log_prefix = location.removeprefix(f"s3://{bucket}/") + "/_delta_log/"
+
+            def ensure_history_table(
+                location: str = location,
+                full_name: str = full_name,
+                log_prefix: str = log_prefix,
+            ) -> bool:
+                listed = s3.list_objects_v2(Bucket=bucket, Prefix=log_prefix, MaxKeys=1)
+                if not listed.get("KeyCount"):
+                    return False
+                _sql_statement(
+                    manifest.databricks.profile,
+                    sealed6.warehouse_id,
+                    history_table_statement(full_name, location),
+                )
+                return True
+
+            def read_history(order_id: str, nonce: str, full_name: str = full_name) -> bool:
+                rows = _sql_rows(
+                    _sql_statement(
+                        manifest.databricks.profile,
+                        sealed6.warehouse_id,
+                        history_read_statement(full_name, order_id, nonce),
+                    )
+                )
+                return bool(rows) and int(rows[0].get("n") or 0) == 1
+
+            def wait_for_slot(competitor: str = competitor) -> None:
+                deadline = time.monotonic() + 300.0
+                while not asyncio.run(
+                    _round6_source_call(manifest, competitor, replication_slots)
+                ):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            f"Round 6's {competitor} DMS task runs but made no replication slot"
+                        )
+                    time.sleep(2.0)
+
+            print(
+                f"PROVE Round 6 {competitor} lane carries an order into the lakehouse",
+                flush=True,
+            )
+            elapsed = prove_lane(
+                DmsCaptureTask(session, str(lane["tasks"][competitor])),
+                GlueWriterJob(session, str(lane["jobs"][competitor]), bucket=bucket),
+                competitor=competitor,
+                wait_for_slot=wait_for_slot,
+                commit_proof=lambda order_id, nonce, competitor=competitor: asyncio.run(
+                    _round6_source_call(
+                        manifest,
+                        competitor,
+                        lambda cursor: commit_proof_order(cursor, order_id, nonce),
+                    )
+                ),
+                withdraw_proof=lambda order_id, competitor=competitor: asyncio.run(
+                    _round6_source_call(
+                        manifest, competitor, lambda cursor: withdraw_order(cursor, order_id)
+                    )
+                ),
+                ensure_history_table=ensure_history_table,
+                read_history=read_history,
+                notify=lambda message: print(f"WAIT  {message}", flush=True),
+                timeout_seconds=min(timeout, 900.0),
+            )
+            print(
+                f"OK    Round 6 {competitor} lane carried its proof order in {elapsed:.0f}s; "
+                "its task and writer are parked",
+                flush=True,
+            )
+    # The deployed app reads each AWS history as itself, on the warehouse it reads Lakebase's
+    # on, so it needs SELECT on each table the way v1's grants give it on Lakebase's; the
+    # schema's USE grants are v1's already. The proofs above read as this installer, which is
+    # why nothing before the app's first Prepare would have found the gap. Re-stated on every
+    # run, because a GRANT is idempotent and the tables may have been re-created.
+    for full_name in history_tables.values():
+        _sql_statement(
+            manifest.databricks.profile,
+            sealed6.warehouse_id,
+            UnityCatalogAppGrant("TABLE", full_name, ("SELECT",)).statement(
+                sealed6.app_service_principal_client_id
+            ),
+        )
+    print("OK    the app may read Round 6's AWS history tables", flush=True)
+    manifest.round6_aws = seal(
+        lane, external_id=external_id, names=names, history_tables=history_tables
+    )
+    save_manifest(manifest)
+    return manifest
+
+
 async def _ensure_lakebase_database(
     database: str, provider: LakebaseCredentialProvider | None = None
 ) -> None:
@@ -8763,6 +10109,9 @@ async def _apply_schema(material: ConnectionMaterial) -> str:
 async def seed_identical_schema(manifest: DemoManifest) -> tuple[str, str, str]:
     apply_manifest_environment(manifest)
     if manifest.round_environments is not None:
+        # The rounds that race on this orders schema. Round 4 stands AWS databases
+        # up from v1.1, but they hold its writer's target table, not this schema,
+        # so they are deliberately not seeded here.
         round_numbers = (1, 2, 3, 5)
         # Round 1 stands up no RDS instance, so there is nothing there to seed.
         # Lakebase and Aurora keep all four rounds; only the RDS fleet is short
@@ -9178,7 +10527,15 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
 
 
 def _round5_active_journal_addons(manifest: DemoManifest) -> list[str]:
-    """Return unresolved append-only journal identities from the coordination DB."""
+    """Return unresolved append-only journal identities from the coordination DB.
+
+    A journal that was never made has nothing in it. Setup makes the coordination database
+    and then its tables, both before Round 5 is sealed, and only a Round 5 bout writes the
+    journal, so an installation whose Round 5 was never sealed and has no journal never ran
+    one. rc22's install stopped before making the database (2026-10-05), and its cleanup
+    spent two minutes waiting for the database to come up, then refused. Once Round 5 is
+    sealed, a missing journal is a damaged baseline, and the cleanup still refuses.
+    """
     endpoint_name = _coordination_endpoint_name(manifest)
     endpoint = _databricks_json(
         manifest.databricks.profile, "postgres", "get-endpoint", endpoint_name
@@ -9193,13 +10550,49 @@ def _round5_active_journal_addons(manifest: DemoManifest) -> list[str]:
     token = str(credential.get("token") or "")
     if endpoint.get("name") != endpoint_name or not host or not token:
         raise RuntimeError("Round 5 journal inspection could not bind the exact endpoint")
+    database = manifest.databricks.database
+
+    def never_made(what: str, missing: BaseException | None = None) -> list[str]:
+        if manifest.manifest_version < 4:
+            return []
+        if manifest.round5_ready:
+            raise RuntimeError(
+                f"Round 5 journal {what} is missing from the sealed baseline"
+            ) from missing
+        print(
+            f"ABSENT Round 5 journal {what}: setup stopped before making it, and Round 5 was "
+            "never sealed, so no Round 5 bout ran here and there is nothing to reconcile",
+            flush=True,
+        )
+        return []
+
+    async def database_exists() -> bool:
+        # Asked of `postgres`, which every Lakebase endpoint has: a connection to a database
+        # that does not exist fails without a SQLSTATE, and `_connect` waits that out.
+        connection = await _connect(
+            ConnectionMaterial(
+                host=host,
+                port=5432,
+                database="postgres",
+                user=manifest.databricks.user,
+                password=token,
+            ),
+            autocommit=True,
+        )
+        async with connection:
+            async with connection.cursor() as cursor:
+                await cursor.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
+                return await cursor.fetchone() is not None
+
+    if not asyncio.run(database_exists()):
+        return never_made(f"database {database}")
 
     async def inspect() -> list[str]:
         connection = await _connect(
             ConnectionMaterial(
                 host=host,
                 port=5432,
-                database=manifest.databricks.database,
+                database=database,
                 user=manifest.databricks.user,
                 password=token,
             )
@@ -9227,9 +10620,7 @@ def _round5_active_journal_addons(manifest: DemoManifest) -> list[str]:
     try:
         return asyncio.run(inspect())
     except (psycopg.errors.InvalidSchemaName, psycopg.errors.UndefinedTable) as exc:
-        if manifest.manifest_version < 4:
-            return []
-        raise RuntimeError("Round 5 journal table is missing from the sealed baseline") from exc
+        return never_made("table", exc)
 
 
 def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
@@ -9319,6 +10710,29 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
             if secret
             else re.fullmatch(r"[0-9a-f]{16}-.+", suffix)
         )
+
+    def readable_tags(
+        read: Callable[..., Mapping[str, Any]], key: str, *, ours: bool, **arguments: Any
+    ) -> list[dict[str, Any]] | None:
+        """A resource's tags, or None for one this principal may not read and has no claim to.
+
+        The inventory runs as the installation's runtime role, which may read this
+        installation's resources and not the account's. With Round 5 unsealed it
+        reads the tags of every role and proxy, and a foreign one refuses: rc12's
+        install failed before its Round 5 seal (2026-10-02), and its cleanup then
+        stopped on ``AccessDenied@ListRoleTags``, leaving the partial install
+        billing. A resource whose tags cannot be read cannot be proven this
+        installation's, so cleanup has no business touching it; one this
+        installation names as its own still has to answer.
+        """
+
+        try:
+            return read(**arguments).get(key, [])
+        except ClientError as error:
+            code = str(error.response.get("Error", {}).get("Code") or "")
+            if ours or code not in {"AccessDenied", "AccessDeniedException"}:
+                raise
+            return None
 
     session = _aws_session(manifest)
     secrets_manager = session.client("secretsmanager")
@@ -9431,7 +10845,14 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
             arn = str(proxy.get("DBProxyArn") or "")
             name = str(proxy.get("DBProxyName") or "")
             if arn:
-                tags = rds.list_tags_for_resource(ResourceName=arn).get("TagList", [])
+                tags = readable_tags(
+                    rds.list_tags_for_resource,
+                    "TagList",
+                    ours=matching_name(name),
+                    ResourceName=arn,
+                )
+                if tags is None:
+                    continue
                 if matching_name(name) or (sealed is None and is_legacy_candidate(tags)):
                     accept(arn, name, tags)
         marker = str(page.get("Marker") or "") or None
@@ -9464,7 +10885,14 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
                 continue
             tags = role.get("Tags")
             if tags is None and role_name:
-                tags = iam.list_role_tags(RoleName=role_name).get("Tags", [])
+                tags = readable_tags(
+                    iam.list_role_tags,
+                    "Tags",
+                    ours=candidate_role,
+                    RoleName=role_name,
+                )
+                if tags is None:
+                    continue
             if identity in static_iam_roles:
                 # Exact on everything but the lease, which the app moves while
                 # the installation is in use and which proves nothing about
@@ -9958,8 +11386,7 @@ def _complete_provision(manifest: DemoManifest, zero_timeout_seconds: float) -> 
         _run(_terraform_base() + ["validate"], env=_terraform_environment(manifest))
         # Proxy creation is intentionally staged after lifecycle writes the
         # anti_demo_burst AWSCURRENT secret versions outside Terraform.
-        create_plan = _terraform_plan(manifest, targets=ROUND5_PREFLIGHT_TARGETS)
-        _terraform_apply(manifest, create_plan)
+        _plan_and_apply(manifest, targets=ROUND5_PREFLIGHT_TARGETS)
         if not _aws_state_is_complete(manifest, _terraform_managed_addresses(manifest)):
             raise RuntimeError("Terraform did not converge to the exact Round 5 baseline state")
         outputs = _terraform_outputs(manifest)
@@ -10135,6 +11562,40 @@ def provision(
         print("CHECK selected SQL warehouse is usable (read-only SELECT 1)", flush=True)
         _probe_sql_warehouse(databricks_profile, setup_warehouse_id)
     return _complete_provision(manifest, zero_timeout_seconds)
+
+
+def _aws_lane_stage_stopped(manifest: DemoManifest) -> bool:
+    """A ready installation whose Round 4 or Round 6 AWS lane stage stopped before its seal.
+
+    Setup seals both lanes last, after the installation already says `ready`, so this is an
+    interrupted provision, not a finished install (the v1.1 virgin install, 2026-09-29).
+    """
+
+    return (
+        manifest.status == "ready"
+        and manifest.round6_ready
+        and (manifest.round4_aws_pending or manifest.round6_aws_pending)
+    )
+
+
+def resume(zero_timeout_seconds: float = 900) -> DemoManifest:
+    """`antidemo resume`: an interrupted provision, finished as far as setup's seals go.
+
+    `resume_provision` ends at Round 6's Lakebase half, and setup seals the AWS lanes of
+    Rounds 4 and 6 after it, last of all. So resuming an install that had stopped in a lane
+    stage said "recovered safely" with the lane half built, and the cleanup that had asked for
+    the resume refused again (rc16, 2026-10-04). This takes setup's own path: the reconcile
+    for a stopped lane stage, because each lane's apply refuses a plan that also finishes the
+    other lane, and both lane stages after it or after any other resume.
+    """
+
+    manifest = load_manifest()
+    if _aws_lane_stage_stopped(manifest):
+        manifest = reconcile_infrastructure(manifest)
+    else:
+        manifest = resume_provision(zero_timeout_seconds)
+    manifest = _prepare_and_reseal_round4_aws(manifest, timeout=zero_timeout_seconds)
+    return _prepare_and_reseal_round6_aws(manifest, timeout=zero_timeout_seconds)
 
 
 def resume_provision(zero_timeout_seconds: float = 900) -> DemoManifest:
@@ -10315,20 +11776,41 @@ def _follow_operator_address(manifest: DemoManifest) -> None:
             "Refusing to change database ingress because owned AWS resources could not be verified"
         )
     manifest.aws.operator_cidr = current
-    try:
-        _terraform_init(manifest)
-        plan = _terraform_plan(manifest)
+
+    def refuse_more_than_the_ingress(plan: Path) -> None:
         violations = _ingress_plan_violations(manifest, _terraform_plan_json(manifest, plan))
         if violations:
             raise RuntimeError(
                 "the plan does more than move the operator ingress: " + "; ".join(violations)
             )
-        _terraform_apply(manifest, plan)
+
+    try:
+        _terraform_init(manifest)
+        _plan_and_apply(manifest, check=refuse_more_than_the_ingress)
     except BaseException:
         manifest.aws.operator_cidr = previous
         raise
     save_manifest(manifest)
     reset_operator_ingress_cache()
+
+
+def _plan_value_unknown(flag: object) -> bool:
+    """Whether a plan's ``after_unknown`` entry marks anything unknown, at any depth.
+
+    Terraform writes a nested block's entry as a structure of booleans, and a list of
+    all-false leaves means "known". Read as plain truthiness it is "unknown". The Glue
+    lane's first apply, which adds an ingress rule naming a group the same apply creates,
+    marked every r4 group's unchanged ``egress`` that way, and the guard refused it (the
+    v1.1 virgin install, 2026-09-29).
+    """
+
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, Mapping):
+        return any(_plan_value_unknown(value) for value in flag.values())
+    if isinstance(flag, list | tuple):
+        return any(_plan_value_unknown(value) for value in flag)
+    return False
 
 
 def _ingress_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) -> list[str]:
@@ -10340,6 +11822,10 @@ def _ingress_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) ->
     """
 
     allowed_addresses = _expected_aws_state_addresses(manifest)
+    # A Round 4 Glue lane or Round 6 DMS lane recorded but not yet sealed is a lane
+    # whose own apply was interrupted; creating the rest of it is finishing that
+    # apply, not drift.
+    unfinished_lane = _unfinished_lane_addresses(manifest)
     violations: list[str] = []
     for entry in plan.get("resource_changes") or []:
         address = str(entry.get("address") or "?")
@@ -10350,6 +11836,8 @@ def _ingress_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) ->
         if address not in allowed_addresses:
             violations.append(f"{address}: not a manifest-owned address")
             continue
+        if address in unfinished_lane and actions == ["create"]:
+            continue
         if entry.get("type") != "aws_security_group" or actions != ["update"]:
             violations.append(f"{address}: plans {'+'.join(actions)}, not an ingress update")
             continue
@@ -10357,8 +11845,73 @@ def _ingress_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) ->
         after = change.get("after") or {}
         unknown = change.get("after_unknown") or {}
         touched = {key for key in {*before, *after} if before.get(key) != after.get(key)}
-        touched |= {str(key) for key, flag in unknown.items() if flag}
+        touched |= {str(key) for key, flag in unknown.items() if _plan_value_unknown(flag)}
         forbidden = sorted(touched - {"ingress"})
+        if forbidden:
+            violations.append(f"{address}: changes {', '.join(forbidden)}")
+    return violations
+
+
+#: What the Glue lane's apply may change on a resource outside the lane: its tags.
+_ROUND4_GLUE_PLAN_TAG_ATTRIBUTES = frozenset({"tags", "tags_all", "volume_tags"})
+
+
+def _round4_glue_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) -> list[str]:
+    """Reject a Glue lane apply that would change anything but the lane.
+
+    The lane's apply runs after every other round is sealed, so drift from elsewhere applied
+    here changes a sealed round behind its seal. On the test installation (2026-09-29), a new
+    AMI in the plan replaced both of Round 5's runners this way. The lane's own resources may be
+    created, changed or replaced; a security group may change its ingress, which is how the
+    lane reaches the r4 databases; any resource may move its tags. The rest is left to
+    `antidemo setup`, whose first apply converges every round before its seal.
+    """
+
+    return _lane_plan_violations(manifest, plan, lane_addresses=_ROUND4_GLUE_STATE_ADDRESSES)
+
+
+def _round6_aws_plan_violations(manifest: DemoManifest, plan: Mapping[str, Any]) -> list[str]:
+    """Reject a DMS lane apply that would change anything but the lane.
+
+    The same rule as Round 4's lane (`_round4_glue_plan_violations`): its own resources may be
+    created, changed or replaced, a security group may change its ingress, which is how DMS
+    reaches the r6 databases, and any resource may move its tags.
+    """
+
+    return _lane_plan_violations(manifest, plan, lane_addresses=_ROUND6_AWS_STATE_ADDRESSES)
+
+
+def _lane_plan_violations(
+    manifest: DemoManifest,
+    plan: Mapping[str, Any],
+    *,
+    lane_addresses: frozenset[str],
+) -> list[str]:
+    allowed_addresses = _expected_aws_state_addresses(manifest)
+    violations: list[str] = []
+    for entry in plan.get("resource_changes") or []:
+        address = str(entry.get("address") or "?")
+        change = entry.get("change") or {}
+        actions = [str(action) for action in (change.get("actions") or [])]
+        if not actions or actions == ["no-op"] or actions == ["read"]:
+            continue
+        if address in lane_addresses:
+            continue
+        if address not in allowed_addresses:
+            violations.append(f"{address}: not a manifest-owned address")
+            continue
+        if actions != ["update"]:
+            violations.append(f"{address}: plans {'+'.join(actions)}")
+            continue
+        before = change.get("before") or {}
+        after = change.get("after") or {}
+        unknown = change.get("after_unknown") or {}
+        touched = {key for key in {*before, *after} if before.get(key) != after.get(key)}
+        touched |= {str(key) for key, flag in unknown.items() if _plan_value_unknown(flag)}
+        allowed = _ROUND4_GLUE_PLAN_TAG_ATTRIBUTES | (
+            {"ingress"} if entry.get("type") == "aws_security_group" else frozenset()
+        )
+        forbidden = sorted(touched - allowed)
         if forbidden:
             violations.append(f"{address}: changes {', '.join(forbidden)}")
     return violations
@@ -10457,8 +12010,9 @@ def reconcile_infrastructure(manifest: DemoManifest) -> DemoManifest:
     if isinstance(manifest.round5, Round5Resources) and migrating_round5:
         _require_round5_clean_baseline(manifest)
     _run(_terraform_base() + ["validate"], env=_terraform_environment(manifest))
-    plan = _terraform_plan(manifest)
-    _terraform_apply(manifest, plan)
+    # A lane whose stage recorded its enabling value and then stopped is in this plan too.
+    _choose_enabled_lane_subnets(manifest)
+    _plan_and_apply(manifest)
     managed_after = _terraform_managed_addresses(manifest)
     expected_addresses = _expected_aws_state_addresses(manifest)
     if not _aws_state_is_complete(manifest, managed_after):
@@ -10563,7 +12117,7 @@ def _renew_plan_violations(
         after = change.get("after") or {}
         unknown = change.get("after_unknown") or {}
         touched = {key for key in {*before, *after} if before.get(key) != after.get(key)}
-        touched |= {str(key) for key, flag in unknown.items() if flag}
+        touched |= {str(key) for key, flag in unknown.items() if _plan_value_unknown(flag)}
         forbidden = sorted(touched - _RENEW_ALLOWED_PLAN_ATTRIBUTES)
         if forbidden:
             violations.append(f"{address}: changes {', '.join(forbidden)}")
@@ -11023,15 +12577,16 @@ def _renew_locked(
             flush=True,
         )
 
-    try:
-        _terraform_init(manifest)
-        plan = _terraform_plan(manifest, expires_at_override=target)
+    def refuse_more_than_the_tag(plan: Path) -> None:
         violations = _renew_plan_violations(manifest, _terraform_plan_json(manifest, plan))
         if violations:
             raise RuntimeError(
                 "the plan does more than move the expires-at tag: " + "; ".join(violations)
             )
-        _terraform_apply(manifest, plan)
+
+    try:
+        _terraform_init(manifest)
+        _plan_and_apply(manifest, check=refuse_more_than_the_tag, expires_at_override=target)
     except Exception as exc:
         raise RuntimeError(
             _renew_inconsistency_report(previous_tag, target_tag, "apply", str(exc))
@@ -11180,7 +12735,7 @@ def _ownership_environments(manifest: DemoManifest) -> list[tuple[str, Any, Any]
                 manifest.round_environment(number).aurora,
                 manifest.round_environment(number).rds,
             )
-            for number in (1, 2, 3, 5)
+            for number in _sealed_aws_round_numbers(manifest)
         ]
     resources = manifest.aws.resources
     return [
@@ -11372,9 +12927,9 @@ def _aws_ingress(manifest: DemoManifest) -> Check:
                 (
                     f"r{number}",
                     manifest.round_environment(number).aurora.security_group_id,
-                    round5_groups if number == 5 else (),
+                    _round_source_ingress_groups(manifest, number, round5_groups),
                 )
-                for number in (1, 2, 3, 5)
+                for number in _sealed_aws_round_numbers(manifest)
             ]
         else:
             groups = [
@@ -11475,14 +13030,16 @@ def _rds_ingress(manifest: DemoManifest) -> Check:
                 (
                     f"r{number}",
                     manifest.round_environment(number).rds,
-                    round5_groups if number == 5 else (),
+                    _round_source_ingress_groups(manifest, number, round5_groups),
                 )
-                for number in (1, 2, 3, 5)
+                for number in _sealed_aws_round_numbers(manifest)
                 # Round 1 seals no RDS instance: its lane refuses to enter on
                 # engine semantics and is never timed, so there is no instance and
                 # no security group to validate ingress on. Reading the seal
-                # unconditionally validated a lane that does not compete.
-                if rds_lane_is_scored(_ROUND_NUMBER_IDS[number])
+                # unconditionally validated a lane that does not compete. Round
+                # 4's is validated although it is not raced yet: it is reachable,
+                # so what may reach it matters already.
+                if rds_instance_is_provisioned(_ROUND_NUMBER_IDS[number])
             ]
         else:
             resources = manifest.aws.resources
@@ -11673,15 +13230,25 @@ def _round4_check(manifest: DemoManifest, *, timeout_seconds: float = 120) -> Ch
         database_payload = _round4_get_database_synced_table(manifest, names)
         if database_payload is None:
             raise RuntimeError("sealed Round 4 /database synced table does not exist")
+        pipeline_payload = _round4_get_pipeline(manifest, sealed.pipeline_id)
+        # v1.1 parks the pipeline between bouts, because both lanes are cold at the
+        # bell: parked is Round 4's resting state, not a fault. The deployed app
+        # parks it after every bout and records that where this laptop cannot read,
+        # so a parked pipeline is judged by its own shape here, not by a marker.
+        parked = str(
+            pipeline_payload.get("state") or ""
+        ).strip().upper() == "IDLE" and latest_pipeline_update_state(
+            pipeline_payload
+        ).strip().upper() not in _ROUND4_ACTIVE_UPDATE_STATES
         _validate_round4_database_synced_table(
             database_payload,
             names,
             project_uid=project_uid,
             branch_uid=branch_uid,
             pipeline_id=sealed.pipeline_id,
-            require_sync_position=True,
+            # A parked pipeline reports no continuous position to hold.
+            require_sync_position=not parked,
         )
-        pipeline_payload = _round4_get_pipeline(manifest, sealed.pipeline_id)
         _validate_round4_pipeline(
             pipeline_payload,
             pipeline_id=sealed.pipeline_id,
@@ -11719,6 +13286,8 @@ def _round4_check(manifest: DemoManifest, *, timeout_seconds: float = 120) -> Ch
         ):
             if observed in SYNCED_TABLE_HEALTHY_STATES:
                 continue
+            if stopped_not_broken and parked:
+                continue
             if stopped_not_broken:
                 raise RuntimeError(
                     f"Round 4 {label} reports {observed} because pipeline "
@@ -11745,13 +13314,21 @@ def _round4_check(manifest: DemoManifest, *, timeout_seconds: float = 120) -> Ch
             or str(properties.get("delta.enableChangeDataFeed", "")).lower() != "true"
         ):
             raise RuntimeError("Round 4 source table is not CDF-enabled")
-        restored = _restore_round4_baseline_if_owned(
-            manifest,
-            names,
-            sealed.warehouse_id,
-            pipeline_id=sealed.pipeline_id,
-            timeout=timeout_seconds,
-        )
+        if parked:
+            # Nothing here may start the pipeline: a bout's own Prepare puts a
+            # demo-owned row back, and anything else is not this check's to touch.
+            row = _read_round4_source_row(manifest, names, sealed.warehouse_id)
+            if row != ROUND4_BASELINE_ROW and not is_owned_prior_proof(row):
+                raise RuntimeError("Round 4 source table does not contain the exact baseline")
+            restored = False
+        else:
+            restored = _restore_round4_baseline_if_owned(
+                manifest,
+                names,
+                sealed.warehouse_id,
+                pipeline_id=sealed.pipeline_id,
+                timeout=timeout_seconds,
+            )
         expected_contract = ModelScoreContract(
             pipeline_id=sealed.pipeline_id,
             source_table=sealed.source_table_full_name,
@@ -11766,6 +13343,13 @@ def _round4_check(manifest: DemoManifest, *, timeout_seconds: float = 120) -> Ch
         # stop cost a bout rather than a day. Read off the pipeline payload this
         # check already fetched above, so saying what it costs adds no call.
         baseline_note = " · baseline restored after a completed run" if restored else ""
+        if parked:
+            return Check(
+                "round4_managed_sync",
+                True,
+                f"{sealed.synced_table_resource_name} · pipeline parked between bouts, "
+                "as Round 4 starts both lanes cold at the bell",
+            )
         running = PipelinePower(
             pipeline_id=sealed.pipeline_id,
             cloud_state=str(pipeline_payload.get("state") or ""),
@@ -11779,6 +13363,86 @@ def _round4_check(manifest: DemoManifest, *, timeout_seconds: float = 120) -> Ch
         )
     except Exception as exc:
         return Check("round4_managed_sync", False, str(exc))
+
+
+def _round4_aws_check(manifest: DemoManifest) -> Check:
+    """Round 4's AWS Glue lane, read-only: its jobs, connections and script, all parked."""
+
+    from .round4_aws_lifecycle import check_lane
+
+    if manifest.round4_aws is None and not manifest.round4_aws_source_location:
+        return Check("round4_aws_lane", True, "no AWS lane on this installation")
+    try:
+        environment = manifest.round_environment(4)
+        assert environment.aurora is not None and environment.rds is not None
+        ok, detail = check_lane(
+            manifest,
+            _aws_session(manifest),
+            hosts={
+                "aurora": environment.aurora.direct_host,
+                "rds": environment.rds.direct_host,
+            },
+        )
+    except Exception as exc:
+        return Check(
+            "round4_aws_lane",
+            False,
+            f"could not validate the Glue lane ({type(exc).__name__})",
+        )
+    return Check("round4_aws_lane", ok, detail)
+
+
+def _round6_aws_check(manifest: DemoManifest) -> Check:
+    """Round 6's AWS DMS lane, read-only: its tasks, endpoints, jobs and script, all parked."""
+
+    from .round6_aws_lifecycle import check_lane
+
+    if (
+        manifest.round6_aws is None
+        and not manifest.round6_aws_uc_external_id
+        and not manifest.round6_aws_unsupported
+    ):
+        return Check("round6_aws_lane", True, "no AWS lane on this installation")
+    try:
+        environment = manifest.round_environment(6)
+        assert environment.aurora is not None and environment.rds is not None
+        ok, detail = check_lane(
+            manifest,
+            _aws_session(manifest),
+            hosts={
+                "aurora": environment.aurora.direct_host,
+                "rds": environment.rds.direct_host,
+            },
+        )
+    except Exception as exc:
+        return Check(
+            "round6_aws_lane",
+            False,
+            f"could not validate the DMS lane ({type(exc).__name__})",
+        )
+    return Check("round6_aws_lane", ok, detail)
+
+
+def _round_source_ingress_groups(
+    manifest: DemoManifest,
+    number: int,
+    round5_groups: tuple[str, ...],
+) -> tuple[str, ...]:
+    """The security groups a round's database admits besides the sealed CIDRs.
+
+    Round 5's runner and Proxy reach its sources, Round 4's Glue writer reaches
+    its targets once its lane is sealed, and Round 6's DMS instance reaches its
+    sources once its lane is sealed. Terraform writes each as an inline rule, so
+    the group's whole rule set stays authoritative.
+    """
+
+    if number == 5:
+        return round5_groups
+    if number == 4 and manifest.round4_aws is not None:
+        return (manifest.round4_aws.security_group_id,)
+    if number == 6 and manifest.round6_aws is not None:
+        return (manifest.round6_aws.security_group_id,)
+    return ()
 
 
 def _round6_check(manifest: DemoManifest) -> Check:
@@ -11937,6 +13601,7 @@ def doctor(competitor: str = "aurora", *, timeout_seconds: float = 90) -> list[C
     checks.append(_region_parity(manifest))
     checks.append(_capacity_parity(manifest))
     checks.append(_round4_check(manifest, timeout_seconds=timeout_seconds))
+    checks.append(_round4_aws_check(manifest))
     if manifest.round5_ready:
         checks.append(_round5_topology_check(manifest))
     else:
@@ -11948,6 +13613,7 @@ def doctor(competitor: str = "aurora", *, timeout_seconds: float = 90) -> list[C
             )
         )
     checks.append(_round6_check(manifest))
+    checks.append(_round6_aws_check(manifest))
     checks.append(asyncio.run(_coordination_check(manifest)))
     checks.extend([_aws_ownership(manifest), _aws_ingress(manifest), _rds_ingress(manifest)])
     checks.extend(_installation_presence_checks(manifest))
@@ -11957,7 +13623,96 @@ def doctor(competitor: str = "aurora", *, timeout_seconds: float = 90) -> list[C
     return checks
 
 
+#: The pauses before setup carries on after a database dropped one of its connections: two
+#: and a half minutes in all.
+SETUP_DROPPED_CONNECTION_RETRY_SECONDS = (10.0, 20.0, 40.0, 80.0)
+
+#: Postgres's own words for a server that is shutting down or starting up under a connection.
+_SERVER_GOING_AWAY_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
+
+
+def _dropped_connection(error: BaseException) -> psycopg.OperationalError | None:
+    """The dropped database connection implicated in `error`, if there is one.
+
+    Lakebase shuts a compute down a minute after its last query, and a connection that lands
+    as it does is cut. rc22's install stopped that way (2026-10-05): AdminShutdown, SQLSTATE
+    57P01, in its seed, as Round 3's new compute went idle. The same connection made again
+    wakes the compute. A connection lost with no SQLSTATE at all ("server closed the
+    connection unexpectedly") is the same event without the server's goodbye.
+
+    Followed through `raise ... from`, and not into a context a `from None` suppressed:
+    `_connect` raises its own error that way after two minutes of trying, and that wait is
+    not repeated here.
+    """
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, psycopg.OperationalError):
+            sqlstate = current.sqlstate
+            if (
+                sqlstate is None
+                or sqlstate.startswith("08")
+                or sqlstate in _SERVER_GOING_AWAY_SQLSTATES
+            ):
+                return current
+        current = current.__cause__ or (
+            None if current.__suppress_context__ else current.__context__
+        )
+    return None
+
+
 def setup(
+    *,
+    databricks_profile: str,
+    aws_profile: str,
+    aws_region: str,
+    expected_account: str,
+    owner: str,
+    operator_cidr: str | None,
+    ttl_hours: float | None,
+    timeout_seconds: float,
+) -> DemoManifest:
+    """`antidemo setup`, carried on from where it stopped each time a database drops it.
+
+    Carrying on is the resume the failure tells an operator to run, `./bootstrap.sh --apply`,
+    which takes the manifest's own word for how far setup got and does not repeat what it
+    finished. It is only taken once a manifest exists, and any other failure raises at once,
+    as does a dropped connection after the last pause.
+    """
+
+    pauses = iter(SETUP_DROPPED_CONNECTION_RETRY_SECONDS)
+    while True:
+        try:
+            return _setup_once(
+                databricks_profile=databricks_profile,
+                aws_profile=aws_profile,
+                aws_region=aws_region,
+                expected_account=expected_account,
+                owner=owner,
+                operator_cidr=operator_cidr,
+                ttl_hours=ttl_hours,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as failure:
+            dropped = _dropped_connection(failure)
+            if dropped is None or not manifest_path().exists():
+                raise
+            pause = next(pauses, None)
+            if pause is None:
+                raise
+            print(
+                f"WAIT  {pause:.0f}s: a database dropped one of setup's connections "
+                f"({type(dropped).__name__}), then setup carries on from where it stopped",
+                flush=True,
+            )
+            time.sleep(pause)
+            # The manifest exists now, and `--ttl-hours` is refused on one that does.
+            ttl_hours = None
+
+
+def _setup_once(
     *,
     databricks_profile: str,
     aws_profile: str,
@@ -11986,7 +13741,15 @@ def setup(
                 "re-seals the Round 5 ownership tags."
             )
         existing = load_manifest()
-        if existing.status == "ready" and existing.round6_ready:
+        if _aws_lane_stage_stopped(existing):
+            # The reconcile is the first apply a lane stage's refusal asks for. Nothing
+            # is reset: no other round needs it, and a reset is what bootstrap.sh keeps
+            # behind --reset-ready.
+            manifest = reconcile_infrastructure(existing)
+            round4_prepared = True
+            round5_prepared = True
+            round6_prepared = True
+        elif existing.status == "ready" and existing.round6_ready:
             if existing.round5_ready:
                 _require_round5_clean_baseline(existing)
             reconcile_infrastructure(existing)
@@ -12035,6 +13798,13 @@ def setup(
         # Once more for the checks below. A ready install rebinds in
         # `reconcile_infrastructure` and a resume in `resume_provision`.
         _follow_operator_address(manifest)
+    # Last of the seals and on every path, a fresh install, a resume and a re-run
+    # alike: it needs Round 4's Delta source, which only exists once the Lakebase
+    # half is sealed, and it is idempotent, so a re-run costs a no-op plan.
+    manifest = _prepare_and_reseal_round4_aws(manifest, timeout=timeout_seconds)
+    # Round 6's lane the same way, after Round 6's Lakebase half, whose history
+    # schema its own tables sit in.
+    manifest = _prepare_and_reseal_round6_aws(manifest, timeout=timeout_seconds)
     _keep_lease_current(manifest)
     failures: list[str] = []
     # Why, and not only which: a real install stopped on "Setup checks failed:
@@ -12396,6 +14166,129 @@ def _delete_databricks_app(manifest: DemoManifest) -> None:
         time.sleep(5)
 
 
+def _park_round4_glue_writers(manifest: DemoManifest, managed_addresses: set[str]) -> None:
+    """Stop both Round 4 Glue writers, if Terraform built them, before anything is destroyed."""
+
+    from .round4_glue import GlueWriterJob
+
+    if not managed_addresses & {
+        f'aws_glue_job.round4_writer["{name}"]' for name in _ROUND4_GLUE_COMPETITORS
+    }:
+        return
+    state_values = _terraform_state_resource_values(manifest, managed_addresses)
+    session = _aws_session(manifest)
+    for name in _ROUND4_GLUE_COMPETITORS:
+        values = state_values.get(f'aws_glue_job.round4_writer["{name}"]') or {}
+        job_name = str(values.get("name") or "")
+        if not job_name:
+            continue
+        print(f"PARK  Round 4 {name} Glue writer {job_name}", flush=True)
+        GlueWriterJob(session, job_name).park(
+            lambda message: print(f"WAIT  {message}", flush=True)
+        )
+
+
+def _park_round6_aws_lane(manifest: DemoManifest, managed_addresses: set[str]) -> None:
+    """Stop both Round 6 DMS tasks and Glue writers, if Terraform built them, before anything
+    is destroyed. DMS deletes only a stopped task, and a running writer holds its job."""
+
+    from .round4_glue import GlueWriterJob
+    from .round6_dms import DmsCaptureTask
+
+    lane = {
+        *(f'aws_dms_replication_task.round6["{name}"]' for name in _ROUND6_AWS_COMPETITORS),
+        *(f'aws_glue_job.round6_writer["{name}"]' for name in _ROUND6_AWS_COMPETITORS),
+    }
+    if not managed_addresses & lane:
+        return
+    # The whole state, as `_terraform_state_resource_values` insists, so a state that differs
+    # from the managed list refuses here rather than parking half of it.
+    state_values = _terraform_state_resource_values(manifest, managed_addresses)
+    session = _aws_session(manifest)
+    for name in _ROUND6_AWS_COMPETITORS:
+        task_arn = str(
+            (state_values.get(f'aws_dms_replication_task.round6["{name}"]') or {}).get(
+                "replication_task_arn"
+            )
+            or ""
+        )
+        if task_arn:
+            print(f"PARK  Round 6 {name} DMS task {task_arn}", flush=True)
+            DmsCaptureTask(session, task_arn).park(
+                lambda message: print(f"WAIT  {message}", flush=True)
+            )
+        job_name = str(
+            (state_values.get(f'aws_glue_job.round6_writer["{name}"]') or {}).get("name") or ""
+        )
+        if job_name:
+            print(f"PARK  Round 6 {name} Glue writer {job_name}", flush=True)
+            GlueWriterJob(session, job_name).park(
+                lambda message: print(f"WAIT  {message}", flush=True)
+            )
+
+
+def _round6_aws_catalog_objects(
+    manifest: DemoManifest,
+) -> list[tuple[str, str, dict[str, Any] | None]]:
+    """The lane's two metastore-level objects, as `(kind, name, current or None)`.
+
+    Named from the run ID, as the installer names them. Its history tables need no entry:
+    they sit in Round 6's history schema, which `cleanup_round6` force-deletes.
+    """
+
+    from .round6_aws_lifecycle import uc_names
+
+    if manifest.installation_id is None:
+        return []
+    names = uc_names(manifest.run_id)
+    objects: list[tuple[str, str, dict[str, Any] | None]] = []
+    for kind, path in (
+        ("external location", "/api/2.1/unity-catalog/external-locations"),
+        ("storage credential", "/api/2.1/unity-catalog/storage-credentials"),
+    ):
+        name = names["external_location" if kind == "external location" else "storage_credential"]
+        current = _databricks_api_optional(
+            manifest.databricks.profile, f"{path}/{quote(name, safe='')}"
+        )
+        objects.append((kind, name, current))
+    return objects
+
+
+def _delete_round6_aws_catalog(manifest: DemoManifest) -> None:
+    """Delete the lane's external location, then its storage credential.
+
+    Each is proven this installation's before it goes: the credential must name this
+    installation's own read-only role, and the location must use that credential. Neither
+    bills, and both outlive every AWS resource if left behind, so a mismatch refuses rather
+    than guessing.
+    """
+
+    objects = _round6_aws_catalog_objects(manifest)
+    role_arn = _round6_uc_role_arn(manifest) if objects else ""
+    credential_name = next((name for kind, name, _ in objects if kind == "storage credential"), "")
+    for kind, name, current in objects:
+        if current is None:
+            continue
+        if kind == "external location":
+            if current.get("credential_name") != credential_name:
+                raise RuntimeError(
+                    f"Cleanup refused: the external location {name} does not use this "
+                    "installation's Round 6 storage credential"
+                )
+            path = "/api/2.1/unity-catalog/external-locations"
+        else:
+            if (current.get("aws_iam_role") or {}).get("role_arn") != role_arn:
+                raise RuntimeError(
+                    f"Cleanup refused: the storage credential {name} names an IAM role other "
+                    "than this installation's Round 6 role"
+                )
+            path = "/api/2.1/unity-catalog/storage-credentials"
+        print(f"DELETE Round 6 AWS lane {kind} {name}", flush=True)
+        _databricks_api_delete_no_response(
+            manifest.databricks.profile, f"{path}/{quote(name, safe='')}?force=true"
+        )
+
+
 def _detach_runtime_role_from_destroy_state(
     manifest: DemoManifest,
     managed_addresses: set[str],
@@ -12422,7 +14315,122 @@ def _detach_runtime_role_from_destroy_state(
         + ["state", "rm", *sorted(_ANTI_DEMO_RUNTIME_STATE_ADDRESSES)],
         env=_terraform_environment(manifest),
     )
+    # Keep the caller's list what the state now is, as the destroy guard's removal does. The
+    # Glue writers' park compares the two, and refused every first uninstall of a v1.1
+    # installation until it did (the test installation, 2026-09-29).
+    managed_addresses.difference_update(_ANTI_DEMO_RUNTIME_STATE_ADDRESSES)
     return True
+
+
+def _destroy_after_releasing_interfaces(manifest: DemoManifest, destroy_plan: Path) -> None:
+    """The destroy, once the network interfaces AWS left behind are out of its way.
+
+    An interface this principal may not delete still goes to the destroy: it removes
+    everything else, so nothing is left billing, and stops on that one security group.
+    The failure then names the interface and the command that deletes it, not Terraform's 403.
+    """
+
+    undeletable = _release_interfaces_left_on_security_groups(manifest)
+    plans = [destroy_plan]
+
+    def destroy() -> None:
+        # After a lost network, part of the plan may have been applied, and Terraform refuses
+        # a stale plan, so each later attempt destroys from a new one.
+        plan = plans.pop() if plans else _terraform_plan(manifest, destroy=True)
+        _terraform_apply(manifest, plan)
+
+    try:
+        _asking_again_on_network_failure(destroy)
+    except Exception as error:
+        if not undeletable:
+            raise
+        named = "; ".join(
+            f"{made_by} left {interface_id} detached on {groups}"
+            for interface_id, made_by, groups in undeletable
+        )
+        commands = " && ".join(
+            f"aws ec2 delete-network-interface --network-interface-id {interface_id} "
+            f"--region {manifest.aws.region}"
+            for interface_id, _made_by, _groups in undeletable
+        )
+        raise RuntimeError(
+            f"The destroy removed what it could and stopped on network interfaces this "
+            f"principal may not delete (ec2:DeleteNetworkInterface): {named}. A security group "
+            f"can't be deleted while an interface holds it. Delete them with: {commands}, then "
+            "run cleanup again"
+        ) from error
+
+
+def _release_interfaces_left_on_security_groups(
+    manifest: DemoManifest,
+) -> list[tuple[str, str, str]]:
+    """Delete the network interfaces AWS left detached on this installation's security groups.
+
+    A security group can't be deleted while a network interface holds it. Deleting a
+    database normally takes its interface with it, but on 2026-09-30 RDS left one detached
+    on Round 2's RDS security group, and the live uninstall stopped there after destroying
+    everything else: Terraform's provider tried to delete the interface and got 403.
+
+    Runs after the app is deleted, so no bout can be creating a database whose interface is
+    not attached yet, and just before the destroy. It touches an interface only when an AWS
+    service manages it, it is detached, and it holds nothing but this installation's own
+    security groups. The requester is not the test: RDS signs an instance's interface
+    `amazon-rds` and an Aurora writer's with an AWS account ID, and DMS and Glue sign their
+    own. Returns (interface, made by, security groups) for each one this principal may not
+    delete.
+    """
+
+    ec2 = _aws_session(manifest).client("ec2")
+    owned_groups = {
+        str(group["GroupId"])
+        for page in ec2.get_paginator("describe_security_groups").paginate(
+            Filters=[{"Name": f"tag:{TAG_RUN_ID}", "Values": [manifest.run_id]}]
+        )
+        for group in page.get("SecurityGroups") or []
+    }
+    if not owned_groups:
+        return []
+    left_behind = []
+    for page in ec2.get_paginator("describe_network_interfaces").paginate(
+        Filters=[
+            {"Name": "group-id", "Values": sorted(owned_groups)},
+            {"Name": "status", "Values": ["available"]},
+        ]
+    ):
+        for interface in page.get("NetworkInterfaces") or []:
+            held = {str(group.get("GroupId") or "") for group in interface.get("Groups") or []}
+            if (
+                interface.get("Status") == "available"
+                and not interface.get("Attachment")
+                and interface.get("RequesterManaged") is True
+                and held
+                and held <= owned_groups
+            ):
+                left_behind.append((interface, ", ".join(sorted(held))))
+    undeletable: list[tuple[str, str, str]] = []
+    for interface, groups in left_behind:
+        interface_id = str(interface["NetworkInterfaceId"])
+        made_by = str(interface.get("Description") or "an AWS service")
+        try:
+            ec2.delete_network_interface(NetworkInterfaceId=interface_id)
+        except ClientError as error:
+            code = error.response.get("Error", {}).get("Code")
+            if code == "InvalidNetworkInterfaceID.NotFound":
+                continue  # the service removed it itself between the read and the delete
+            if code != "UnauthorizedOperation":
+                raise
+            print(
+                f"WARN  network interface {interface_id} ({made_by}) is left detached on "
+                f"{groups}, and this principal may not delete it: the destroy will stop there",
+                flush=True,
+            )
+            undeletable.append((interface_id, made_by, groups))
+            continue
+        print(
+            f"DELETED network interface {interface_id} ({made_by}) left detached on {groups}",
+            flush=True,
+        )
+    return undeletable
 
 
 def _delete_detached_runtime_role(manifest: DemoManifest) -> None:
@@ -12961,6 +14969,7 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         manifest,
         managed_addresses,
         allow_legacy_missing_coordination_egress=True,
+        allow_unfinished_lanes=True,
     )
     destroy_plan: Path | None = None
     if aws_resources_exist:
@@ -13029,6 +15038,9 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
     print(f"OWNED Round 4 synced table: {round4_inventory[0]['resource_name']} ({round4_state})")
     for line in _round4_survivor_lines(manifest):
         print(line, flush=True)
+    for kind, name, current in _round6_aws_catalog_objects(manifest):
+        state = "exists" if current is not None else "already removed"
+        print(f"OWNED Round 6 AWS lane {kind}: {name} ({state})", flush=True)
     for line in _secret_scope_survivor_lines(manifest):
         print(line, flush=True)
     if aws_resources_exist:
@@ -13162,14 +15174,31 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
             _require_round5_clean_baseline(manifest)
         if dry_run:
             return manifest
+        verified_round5: Round5Resources | None = None
         if manifest.round5_ready and complete_baseline:
             round5 = _round5_topology_check(manifest)
+            if not round5.ok:
+                replaced = _round5_runners_replaced_by_terraform(manifest)
+                if replaced is not None:
+                    round5 = _round5_topology_check(
+                        manifest, resources=replaced, runner_contents=False
+                    )
+                    if round5.ok:
+                        verified_round5 = replaced
+                        print(
+                            "REPLACED Round 5's sealed runners are gone, and this "
+                            "installation's own Terraform holds their replacements "
+                            f"({replaced.runner_instance_id}, "
+                            f"{replaced.competitor_runner_instance_id}): verified against the "
+                            "rest of the seal, and destroyed with it",
+                            flush=True,
+                        )
             if not round5.ok:
                 raise RuntimeError(
                     "Cleanup refused: Round 5 ownership topology differs from the manifest"
                 )
         if complete_baseline:
-            _require_round5_runner_idle(manifest)
+            _require_round5_runner_idle(manifest, verified_round5)
         delete_detached_runtime_role = False
         if complete_baseline:
             clean_receipt = _write_round5_clean_receipt(manifest)
@@ -13184,8 +15213,16 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
             manifest,
             managed_addresses,
         )
+        # A running Glue writer keeps its network interfaces in the lane's subnet
+        # and security group, and neither can be deleted around them. Parking is
+        # the same verb the app uses after every bout.
+        _park_round4_glue_writers(manifest, managed_addresses)
+        # Round 6's lane the same way: DMS deletes only a stopped task.
+        _park_round6_aws_lane(manifest, managed_addresses)
         if aws_resources_exist:
-            destroy_plan = _terraform_plan(manifest, destroy=True)
+            destroy_plan = _asking_again_on_network_failure(
+                lambda: _terraform_plan(manifest, destroy=True)
+            )
             print(f"PLAN  {destroy_plan}", flush=True)
         # Before the destroy, not after. The app assumes the runtime IAM role
         # Terraform is about to remove, so destroying first leaves an app that
@@ -13193,6 +15230,9 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         # destroy scroll past has no reason to look for it.
         _delete_databricks_app(manifest)
         _delete_round4_resources(manifest, round4_inventory)
+        # Before the destroy takes the role and bucket they point at. The lane's
+        # history tables went with Round 6's schema above.
+        _delete_round6_aws_catalog(manifest)
         if destroy_plan is not None:
             if complete_baseline:
                 # The destroy below takes the sources with it, so Round 3's
@@ -13208,7 +15248,7 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
                 # attempting legacy cleanup against its blank fields strands
                 # the destroy plan before Terraform can remove the fleet.
                 asyncio.run(reset_safe_change_only_artifacts(manifest))
-            _terraform_apply(manifest, destroy_plan)
+            _destroy_after_releasing_interfaces(manifest, destroy_plan)
         for profile, project_id, project in lakebase_projects:
             if project is None:
                 continue
@@ -13282,5 +15322,11 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         encoding="utf-8",
     )
     receipt.chmod(0o600)
+    # The deploy record describes an app this cleanup has just deleted, found gone, or found to
+    # be someone else's, so it goes with the manifest. Left behind, it outranked the next
+    # install's own record: rc20's reinstall into this directory (2026-10-05) failed before
+    # its deploy, and its cleanup, still reading the deleted app's principal here, could not
+    # show the new app to be ours and left it running.
+    (manifest_path().parent / "app-deploy.json").unlink(missing_ok=True)
     manifest_path().unlink()
     return manifest

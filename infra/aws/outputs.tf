@@ -423,3 +423,54 @@ output "required_tags" {
   description = "Exact ownership tags applied to Terraform-managed resources; IAM roles and instance profiles canonicalize owner to lowercase."
   value       = local.required_tags
 }
+
+output "round4_glue" {
+  description = "Round 4's AWS Glue lane, or null before its second apply. Sealed by the installer as round4_aws."
+  value = local.round4_glue_enabled ? {
+    bucket            = aws_s3_bucket.round4_glue[0].bucket
+    script_key        = aws_s3_object.round4_glue_script[0].key
+    script_sha256     = filesha256(local.round4_script_path)
+    role_arn          = aws_iam_role.round4_glue[0].arn
+    subnet_id         = aws_subnet.round4_glue[0].id
+    subnet_cidr       = aws_subnet.round4_glue[0].cidr_block
+    route_table_id    = aws_route_table.round4_glue[0].id
+    s3_endpoint_id    = aws_vpc_endpoint.round4_glue_s3[0].id
+    security_group_id = aws_security_group.round4_glue[0].id
+    source_location   = trimsuffix(var.round4_source_location, "/")
+    writer_role       = local.round4_writer_database_role
+    target_schema     = local.round4_target_schema
+    target_table      = local.round4_target_table
+    jobs              = { for competitor, job in aws_glue_job.round4_writer : competitor => job.name }
+    connections       = { for competitor, connection in aws_glue_connection.round4 : competitor => connection.name }
+  } : null
+}
+
+output "round6_aws" {
+  description = "Round 6's AWS DMS and Glue lane, or null before its second apply. Sealed by the installer as round6_aws."
+  value = local.round6_aws_enabled ? {
+    bucket                   = aws_s3_bucket.round6_aws[0].bucket
+    script_key               = aws_s3_object.round6_glue_script[0].key
+    script_sha256            = filesha256(local.round6_script_path)
+    glue_role_arn            = aws_iam_role.round6_glue[0].arn
+    dms_s3_role_arn          = aws_iam_role.round6_dms_s3[0].arn
+    uc_role_arn              = aws_iam_role.round6_uc[0].arn
+    subnet_ids               = aws_subnet.round6_dms[*].id
+    subnet_cidr              = local.round6_dms_subnet_cidr
+    route_table_id           = aws_route_table.round6_dms[0].id
+    s3_endpoint_id           = aws_vpc_endpoint.round6_dms_s3[0].id
+    security_group_id        = aws_security_group.round6_dms[0].id
+    replication_instance_arn = aws_dms_replication_instance.round6[0].replication_instance_arn
+    capture_role             = local.round6_capture_database_role
+    source_schema            = local.round6_source_schema
+    source_table             = local.round6_source_table
+    delta_location           = "s3://${aws_s3_bucket.round6_aws[0].bucket}/delta/"
+    source_endpoints         = { for competitor, endpoint in aws_dms_endpoint.round6_source : competitor => endpoint.endpoint_arn }
+    target_endpoints         = { for competitor, endpoint in aws_dms_s3_endpoint.round6_target : competitor => endpoint.endpoint_arn }
+    tasks                    = { for competitor, task in aws_dms_replication_task.round6 : competitor => task.replication_task_arn }
+    jobs                     = { for competitor, job in aws_glue_job.round6_writer : competitor => job.name }
+    history_locations = {
+      for competitor in local.round6_aws_competitors :
+      competitor => "s3://${aws_s3_bucket.round6_aws[0].bucket}/delta/${competitor}/${local.round6_history_table}"
+    }
+  } : null
+}

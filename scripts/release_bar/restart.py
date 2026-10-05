@@ -1,13 +1,18 @@
 """Restart the app under live bouts, and require every round to heal by itself.
 
-    restart.py EVIDENCE_DIR [--after-bell SECS] [--competitor ID] [ROUND_ID ...]
+    restart.py EVIDENCE_DIR [--after-bell SECS] [--competitor ID] [--stop-start] [ROUND_ID ...]
 
 Starts one bout per named round (default: Rounds 2, 3 and 5, the three holding
-per-bout AWS resources mid-race), waits SECS after the last bell (default 90),
-then writes READY_FOR_RESTART into EVIDENCE_DIR and waits for the app to restart.
+per-bout AWS resources mid-race, and Rounds 4 and 6), waits SECS after the last bell
+(default 90), then writes READY_FOR_RESTART into EVIDENCE_DIR and waits for the app to
+restart.
 The restart is `run.sh`'s job: it redeploys the same build with `bootstrap.sh
 --deploy-only`, which fails its Databricks identity check when launched from a
 Python subprocess. If that deploy fails, `run.sh` writes DEPLOY_FAILED instead.
+
+With `--stop-start` it stops and starts the app itself instead, deploying
+nothing, which takes seconds where a redeploy takes minutes: soon enough to land
+inside a Round 4 bout, which is over in about three, or a Round 6 bout.
 
 The restart has happened once the old sessions are gone (they live in the old
 process). From then on the board is polled until all six rounds are READY again,
@@ -32,9 +37,19 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import AppClient, all_ready  # noqa: E402
+from _common import AppClient, ResponseLost, all_ready  # noqa: E402
 
-DEFAULT_ROUNDS = ("make_schema_change_safely", "recover_deleted_order", "survive_connection_spike")
+#: The session states arm and run leave behind once the app has acted on them.
+ARMED_OR_LATER = {"checking", "armed", "running", "verified", "towelled", "failed"}
+RUNG_OR_LATER = {"running", "verified", "towelled", "failed"}
+
+DEFAULT_ROUNDS = (
+    "make_schema_change_safely",
+    "recover_deleted_order",
+    "put_model_score_in_app",
+    "survive_connection_spike",
+    "analyze_live_orders_without_slowing_checkout",
+)
 RESTART_TIMEOUT_SECONDS = 30 * 60
 HEAL_TIMEOUT_SECONDS = 45 * 60
 
@@ -49,6 +64,7 @@ def main() -> int:
     parser.add_argument("rounds", nargs="*", default=list(DEFAULT_ROUNDS))
     parser.add_argument("--after-bell", type=float, default=90.0, metavar="SECS")
     parser.add_argument("--competitor", default="aurora_serverless_v2")
+    parser.add_argument("--stop-start", action="store_true")
     # Intermixed, so an option between EVIDENCE_DIR and the rounds parses: plain
     # `parse_args` refuses that order on early Python 3.12 releases (3.12.3 does).
     args = parser.parse_intermixed_args()
@@ -69,6 +85,23 @@ def main() -> int:
         except Exception as error:  # noqa: BLE001
             return None, {"error": type(error).__name__}
 
+    def post(path: str, *, settled: set[str] | None = None, body: Any = None) -> tuple[int, Any]:
+        """A POST whose answer is lost is read back from its session.
+
+        It is sent once more only when the session shows the app never acted on it. A
+        create has no session to read yet, and a draft holds nothing, so it is just sent
+        again (see `chaos.Harness.settle_lost`).
+        """
+        try:
+            return client.call("POST", path, body, timeout=600)
+        except ResponseLost as lost:
+            log("response_lost", path=path, detail=str(lost))
+            if settled is not None:
+                _, snapshot = get(path.rsplit("/", 1)[0])
+                if (snapshot or {}).get("state") in settled:
+                    return 200, snapshot
+            return client.call("POST", path, body, timeout=600)
+
     status, board = get("/api/bout/all")
     if status != 200 or not all_ready((board or {}).get("rounds") or {}):
         log("refused", reason="not every round was READY", status=status)
@@ -76,10 +109,9 @@ def main() -> int:
 
     sessions: dict[str, str] = {}
     for round_id in args.rounds:
-        status, created = client.call(
-            "POST",
+        status, created = post(
             "/api/sessions",
-            {
+            body={
                 "competitor": args.competitor,
                 "primary_persona": "sre",
                 "corners": ["performance", "simplicity"],
@@ -90,7 +122,7 @@ def main() -> int:
             log("create_failed", round=round_id, status=status, body=created)
             return 2
         sessions[round_id] = created["id"]
-        client.call("POST", f"/api/sessions/{created['id']}/arm", timeout=600)
+        post(f"/api/sessions/{created['id']}/arm", settled=ARMED_OR_LATER)
     for round_id, session_id in sessions.items():
         snapshot: Any = {}
         deadline = time.monotonic() + 600
@@ -106,7 +138,7 @@ def main() -> int:
             log("arm_failed", round=round_id, failure=(snapshot or {}).get("failure"))
             return 2
     for round_id, session_id in sessions.items():
-        status, snapshot = client.call("POST", f"/api/sessions/{session_id}/run", timeout=600)
+        status, snapshot = post(f"/api/sessions/{session_id}/run", settled=RUNG_OR_LATER)
         log("bell", round=round_id, status=status, state=(snapshot or {}).get("state"))
     time.sleep(args.after_bell)
     for round_id, session_id in sessions.items():
@@ -119,6 +151,13 @@ def main() -> int:
 
     log("restart_begin")
     (evidence / "READY_FOR_RESTART").write_text(now(), encoding="utf-8")
+    if args.stop_start:
+        try:
+            name = client.stop_start()
+        except Exception as error:  # noqa: BLE001
+            log("stop_start_failed", error=f"{type(error).__name__}: {error}")
+            return 2
+        log("stop_start_done", app=name)
     probe = next(iter(sessions.values()))
     deadline = time.monotonic() + RESTART_TIMEOUT_SECONDS
     while True:

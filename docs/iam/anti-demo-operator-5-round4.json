@@ -1,0 +1,136 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StandRound4GlueNetwork",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:AssociateRouteTable",
+        "ec2:CreateRouteTable",
+        "ec2:CreateSubnet",
+        "ec2:CreateVpcEndpoint",
+        "ec2:DeleteRouteTable",
+        "ec2:DeleteSubnet",
+        "ec2:DeleteVpcEndpoints",
+        "ec2:DescribePrefixLists",
+        "ec2:DescribeVpcEndpoints",
+        "ec2:DisassociateRouteTable",
+        "ec2:ModifySubnetAttribute",
+        "ec2:ModifyVpcEndpoint"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<AWS_REGION>"
+        }
+      }
+    },
+    {
+      "Sid": "ManageRound4GlueBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:GetAccelerateConfiguration",
+        "s3:GetBucket*",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetReplicationConfiguration",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:PutBucketOwnershipControls",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketTagging",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutLifecycleConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::lakebase-ant*-r4-glue"
+    },
+    {
+      "Sid": "ManageRound4GlueObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:GetObject",
+        "s3:GetObjectTagging",
+        "s3:GetObjectVersion",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::lakebase-ant*-r4-glue/*"
+    },
+    {
+      "Sid": "ManageAndRunRound4GlueWriters",
+      "Effect": "Allow",
+      "Action": [
+        "glue:BatchStopJobRun",
+        "glue:CreateConnection",
+        "glue:CreateJob",
+        "glue:DeleteConnection",
+        "glue:DeleteJob",
+        "glue:GetConnection",
+        "glue:GetJob",
+        "glue:GetJobRun",
+        "glue:GetJobRuns",
+        "glue:GetTags",
+        "glue:StartJobRun",
+        "glue:TagResource",
+        "glue:UntagResource",
+        "glue:UpdateConnection",
+        "glue:UpdateJob"
+      ],
+      "Resource": [
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:catalog",
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:connection/lakebase-ant*",
+        "arn:aws:glue:<AWS_REGION>:<AWS_ACCOUNT_ID>:job/lakebase-ant*"
+      ]
+    },
+    {
+      "Sid": "ManageTheRound4GlueRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:DeleteRolePolicy",
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRolePolicies",
+        "iam:ListRoleTags",
+        "iam:PutRolePolicy",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:UpdateRole",
+        "iam:UpdateRoleDescription"
+      ],
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r4-*"
+    },
+    {
+      "Sid": "AttachOnlyTheGlueServicePolicyToTheRound4Role",
+      "Effect": "Allow",
+      "Action": [
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy"
+      ],
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r4-*",
+      "Condition": {
+        "ArnEquals": {
+          "iam:PolicyARN": "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+        }
+      }
+    },
+    {
+      "Sid": "PassTheRound4RoleToGlueOnly",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/i*-r4-*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "glue.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

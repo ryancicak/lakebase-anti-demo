@@ -7,23 +7,27 @@ before spending anything, prints what the spend will be, and then runs
 `./antidemo setup`.
 
 > **`--apply` spends real money and the installation does not expire.** What you
-> pay for merely having this installed is the AWS half: about **$8.36/day**, from
+> pay for merely having this installed is the AWS half: about **$29.50/day**, from
 > `--apply` until `cleanup`, whether or not anyone runs a round. Deploying the App
-> as well makes it about **$19.29/day**, because a running App bills for its
-> provisioned capacity until someone stops it. Round 4's pipeline is **not** a
-> daily cost — it runs for the minutes a bout needs and is then released.
+> as well makes it about **$40.43/day**, because a running App bills for its
+> provisioned capacity until someone stops it, plus about $1.06/day for the
+> Lakebase coordination database the running app keeps awake. Round 4's pipeline
+> is **not** a daily cost — it runs for the minutes a bout needs and is then
+> released. Nor is the SQL warehouse: it bills about $8.40 for each hour it runs
+> (a Small serverless warehouse), and the app sends it nothing while nobody is
+> using the app.
 >
-> Left up for a full day that pipeline reads higher than anything else here:
-> about **$22.93/day with the Round 4 pipeline running, and
-> about $8.36/day with that pipeline stopped**. Add the Databricks App's own
+> Left up for a full day that pipeline would be the largest line after AWS:
+> about **$44.07/day with the Round 4 pipeline running, and
+> about $29.50/day with that pipeline stopped**. Add the Databricks App's own
 > compute — about **$10.93/day**, which bills whether or not this project exists
-> — and the all-in figure is about **$33.86/day**, or about **$19.29/day** with
+> — and the all-in figure is about **$55.00/day**, or about **$40.43/day** with
 > the pipeline stopped. Which of the two pairs is yours depends on whether that
-> workspace was already running an App. `$22.93` and `$19.29` are two different
+> workspace was already running an App. `$44.07` and `$40.43` are two different
 > quantities `$3.64` apart: the subtotal with the pipeline **running**
 > against the all-in with it **stopped**.
 >
-> Of the $22.93: ~$8.36 is AWS and ~$14.57 is the Round 4 pipeline. The AWS half
+> Of the $44.07: ~$29.50 is AWS and ~$14.57 is the Round 4 pipeline. The AWS half
 > is **rate-card arithmetic that no invoice has ever confirmed** —
 > `ce:GetCostAndUsage` is denied to this installation, so there is no posted
 > counterpart to check it against, and that is where the error bar now runs
@@ -31,30 +35,34 @@ before spending anything, prints what the spend will be, and then runs
 > disclosure checks itself: posted came in 1.7% above its own projection over the
 > window the two share.
 >
-> **Every standing figure here traces to one sealed receipt** — the standing-cost
-> disclosure in receipt `EECDD4D6`, as of `2026-08-25T02:10Z` — **and was priced
-> in one region, `us-west-2`.** You choose your own, both vendors price per
-> region, and half these figures are a live meter that moves between seals. Treat
-> all of it as that installation's bill on that night rather than yours. The
-> Round 4 pipeline rate is the one exception and no longer reconciles to that
+> **The AWS figure is the cost model's arithmetic for v1.1's fleet** — eleven
+> databases, two Round 5 runners and Round 6's DMS instance — with every rate read
+> back from the AWS Price List API and every count from a running installation on
+> 2026-10-02. **The App compute figure traces to one sealed receipt** — the
+> standing-cost disclosure in receipt `EECDD4D6`, as of `2026-08-25T02:10Z` — **and
+> all of it was priced in one region, `us-west-2`.** You choose your own, both
+> vendors price per region, and half these figures are a live meter that moves
+> between seals. Treat all of it as one installation's bill rather than yours. The
+> Round 4 pipeline rate does not reconcile to that
 > receipt: the receipt divided that line's posted DBU by the span between its
 > first and last posted interval, which included every hour the pipeline was
 > stopped, so its `$11.07/day` blends a 62.5% duty cycle into what it calls a
 > rate. Dividing the same meter by uptime gives `$0.61/hour` — `$14.57/day` — and
 > that is the figure above.
 >
-> The base $8.36 accrues whether or not anyone runs a round. The pipeline is not
-> meant to stay resident after Round 4: arm starts it, settlement schedules a
-> stop after a 20-minute redo window, and graceful shutdown stops it sooner when
-> that process started it. A stop that fires costs cents: one bout costs about
-> `$0.32` end to end, and a longer 32.85-minute warm window came to `$0.50` once
-> its posted usage had settled. Posted usage lags by hours, so a window read
-> early is a watermark rather than the finished line and reads low. That line bills for as
-> long as it is up, and it does not stop itself if the server process dies, so
-> do not mistake a terminal session or `ready` ring for a completed stop:
-> `RUNNING` is expected during the 20-minute redo window. If the owner process
-> dies, or a conservative no-redo test budget allowing for settlement plus that
-> window expires, preserve available events outside the repository, run
+> The base $29.50 accrues whether or not anyone runs a round. Neither of Round 4's
+> integrations stays resident: both are parked at rest, the bell starts the
+> pipeline and the AWS Glue job, and the bout's settle parks both again, 3–5
+> minutes later on the test installation. At `$0.61/hour` a bout's pipeline time
+> is cents, an estimate from the bout's length that has not been reconciled to
+> posted usage yet. Posted usage lags by hours, so a window read early is a
+> watermark rather than the finished line and reads low. The pipeline bills for
+> as long as it is up, and it does not stop itself if the server process dies, so
+> do not mistake a terminal session for a completed stop: both integrations run
+> until the settle has restored the row. The stop each bell owes is repaid by the
+> next serving process 30 minutes after that bell, and the Glue job stops itself at
+> its 30-minute timeout. If the owner process dies and you would rather not wait,
+> preserve available events outside the repository, run
 > `./antidemo pipeline stop`, and ignore its immediate `STOPPED` / `$0.00/day`
 > acknowledgement. Poll every 10 seconds for up to 5 minutes for pipeline
 > `IDLE`, newest update `CANCELED`, no continuous update, and synced table
@@ -260,6 +268,14 @@ run. The script says so rather than implying it proved them.
   duplicating. `--apply` and `--deploy-only` record their derived values in
   `<manifest dir>/bootstrap.json`, mode 600, with no credentials in it; check
   mode writes nothing there.
+- **It rides out a dropped network.** A Terraform plan or apply that fails only
+  because this machine lost its DNS or its connection is planned and applied
+  again, after pauses that grow from 30 seconds to 5 minutes, twelve and a half
+  minutes in all. Any other failure stops at once, with Terraform's own `Error:`
+  line. An install that stops anyway can still go either way:
+  `bootstrap.sh --apply` or `./antidemo resume` finishes it, AWS lanes included,
+  and `./antidemo cleanup --yes` removes it, even with a Round 4 or Round 6 AWS
+  lane half built.
 - **It never prints or stores a secret.** Prompts use `read -s`; the
   `~/.databrickscfg` write happens in a subprocess that receives values through
   the environment, not `argv`; and a profile that already exists with different
@@ -603,9 +619,10 @@ reads — `bootstrap.sh` prints that path and flags unused siblings; `./antidemo
 carries the same file forward but, holding secrets, prints nothing.
 
 A serve that ends up with no AWS credentials prints a block naming the file and
-the two variables, and says which four rounds it just lost. It is not fatal —
-Rounds 4 and 6 reach Lakebase and no AWS, and they genuinely work — because the
-bug was never the degrade, it was the silence. Confirm from the server rather
+the two variables, and says which rounds it just lost. It is not fatal — a round
+that reaches Lakebase and no AWS (Round 4 or 6 on an installation without its AWS
+lane) genuinely works — because the bug was never the degrade, it was the silence.
+Confirm from the server rather
 than from the absence of the banner:
 
 ```bash

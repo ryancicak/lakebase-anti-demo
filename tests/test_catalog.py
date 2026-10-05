@@ -38,44 +38,46 @@ def test_round_four_catalog_availability_copy_and_metadata_are_exact() -> None:
     assert planned.availability == Availability.PLANNED
     assert ready.title == "Move lakehouse data into live applications"
     assert ready.capability == (
-        "Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres"
+        "Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres, "
+        "raced against an AWS Glue job writing the same change into Aurora or RDS"
     )
     assert ready.scorecard_by_corner[Corner.PERFORMANCE] == (
-        "Reverse ETL sync and end-to-end proof time"
+        "Bell to the exact row in the app, with both integrations cold starting at the bell"
     )
-    assert ready.comparison_kind == ComparisonKind.CAPABILITY_GAP
+    # v1.1 races both lanes, both cold at the bell, so the round is a measurement.
+    assert ready.comparison_kind == ComparisonKind.MEASURED
     assert [metric.id for metric in ready.metric_specs] == [
+        "bell_to_exact_read_ms",
         "managed_availability_ms",
-        "application_proof_elapsed_ms",
         "delta_commit_version",
         "exact_row_verified",
     ]
-    assert ready.redo is not None
-    assert ready.redo.policy == "show"
-    assert ready.redo.badge == "★ SHOW"
-    assert ready.redo.label == "CHANGE SCORE IN LAKEHOUSE → WATCH APP UPDATE"
-    assert "from v1 to v2" in ready.redo.description
-    assert "live app record update" in ready.redo.description
-    assert ready.non_claims == [
-        (
-            "RDS/Aurora are destination databases only; the same outcome requires a "
-            "separate reverse-ETL stack that must be selected or built, secured, "
-            "networked, configured, monitored, and operated."
-        ),
-        "The AWS lane was not executed or timed.",
-        "No cross-platform speed comparison or margin is claimed.",
-        "No dollar savings are claimed.",
-        "No eliminated system is claimed.",
-        "No full model-serving capability is claimed.",
-    ]
-    assert next(
-        item for item in catalog().rounds if item.id == RoundId.PUT_MODEL_SCORE_IN_APP
-    ).availability == Availability.PLANNED
-    assert next(
-        item
-        for item in catalog(model_score_available=True).rounds
-        if item.id == RoundId.PUT_MODEL_SCORE_IN_APP
-    ).availability == Availability.READY
+    # No re-do: after a bout both integrations are running, so it could not start cold.
+    assert ready.redo is None
+    # The condition is on the card, so the comparison is transparent, not cherry-picked.
+    assert ready.non_claims[0] == (
+        "Both integrations cold start at the bell, and each lane's clock contains its "
+        "own start. Neither is warmed for the audience."
+    )
+    assert any("around Unity Catalog" in claim for claim in ready.non_claims)
+    assert "This is one live proof session, not a benchmark." in ready.non_claims
+    assert not any(
+        "warm" in claim.lower() and "neither" not in claim.lower() for claim in ready.non_claims
+    )
+    assert (
+        next(
+            item for item in catalog().rounds if item.id == RoundId.PUT_MODEL_SCORE_IN_APP
+        ).availability
+        == Availability.PLANNED
+    )
+    assert (
+        next(
+            item
+            for item in catalog(model_score_available=True).rounds
+            if item.id == RoundId.PUT_MODEL_SCORE_IN_APP
+        ).availability
+        == Availability.READY
+    )
 
 
 def test_round_five_is_named_for_the_outcome_it_scores() -> None:
@@ -86,10 +88,7 @@ def test_round_five_is_named_for_the_outcome_it_scores() -> None:
     """
     # Unchanged on purpose. The 10,000 is carried by the flow and proof lines beside it
     # rather than by the title, which names the operator's task.
-    assert (
-        round_by_id(RoundId.SURVIVE_CONNECTION_SPIKE).title
-        == "Ready a pooled application path"
-    )
+    assert round_by_id(RoundId.SURVIVE_CONNECTION_SPIKE).title == "Ready a pooled application path"
     assert (
         round_by_id(
             RoundId.SURVIVE_CONNECTION_SPIKE,
@@ -195,19 +194,21 @@ def test_redo_presentation_policy_is_locked_by_round() -> None:
 
     assert round_one.redo is not None
     assert (round_one.redo.policy, round_one.redo.badge, round_one.redo.label) == (
-        "show", "★ SHOW", "RE-DO ROUND"
+        "show",
+        "★ SHOW",
+        "RE-DO ROUND",
     )
     assert round_two.redo is not None
     assert (round_two.redo.policy, round_two.redo.badge, round_two.redo.label) == (
-        "optional", "OPTIONAL", "RE-DO ROUND"
+        "optional",
+        "OPTIONAL",
+        "RE-DO ROUND",
     )
     assert round_three.redo is not None
     assert round_three.redo.policy == "skip"
     assert "retain" in round_three.redo.description
-    assert round_four.redo is not None
-    assert (round_four.redo.policy, round_four.redo.badge, round_four.redo.label) == (
-        "show", "★ SHOW", "CHANGE SCORE IN LAKEHOUSE → WATCH APP UPDATE"
-    )
+    # v1.1: both of Round 4's lanes are running after a bout, so a re-do could not start cold.
+    assert round_four.redo is None
     assert round_five.redo is None
     assert round_six.redo is None
 
@@ -226,7 +227,7 @@ def test_round_four_recommendation_requires_live_availability() -> None:
     assert ready.id == RoundId.PUT_MODEL_SCORE_IN_APP
 
 
-def test_round_four_presenter_copy_has_one_clock_and_exact_stop_boundary() -> None:
+def test_round_four_presenter_copy_has_one_bell_and_an_exact_stop_on_each_lane() -> None:
     presenter = build_presenter_pack(
         persona_by_id("data_engineer"),
         [],
@@ -236,10 +237,11 @@ def test_round_four_presenter_copy_has_one_clock_and_exact_stop_boundary() -> No
     )
 
     assert presenter.stop_condition == (
-        "The clock ends only after the exact committed Delta version is observed synced and "
-        "a fresh Postgres read returns the exact row."
+        "The bell cold starts both integrations and commits one Delta change. Each "
+        "lane's clock stops at its first application read of the exact row, polled every "
+        "250 ms on both lanes."
     )
-    assert "both" not in presenter.stop_condition.lower()
+    assert "cold starting at the bell" in presenter.remembered_metric
     assert "same outcome" not in presenter.remembered_metric.lower()
 
 

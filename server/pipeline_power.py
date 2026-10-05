@@ -233,6 +233,14 @@ _SECONDS_PER_DAY = Decimal(86400)
 #: follows it.
 RESTART_SECONDS_ESTIMATE = 30
 
+#: What a stopped pipeline costs a bout since v1.1: nothing it can see. Both lanes are
+#: cold at the bell, so the pipeline's start is part of the race, and Prepare parks a
+#: pipeline that was started early rather than racing it warm.
+BELL_START_SENTENCE = (
+    "Round 4 starts it at the bell, cold, as it starts the AWS lane, and the race clock "
+    "includes that start"
+)
+
 #: How long :func:`wait_until_running` will wait for a resumed pipeline before it
 #: gives up and says so.
 #:
@@ -469,9 +477,9 @@ class PipelinePower:
         Arm now starts a stopped pipeline and waits for it, so that warning
         would send an operator to run a command the next arm runs for them --
         and a surface that asks for input the system no longer needs is how an
-        unattended installation acquires an attendant. The cost is named
-        instead, because a wait before the bout clock is a real thing to know
-        and is the only thing a stop still costs.
+        unattended installation acquires an attendant. Since v1.1 a stop costs a
+        bout nothing it can see, because the pipeline starts at the bell as part
+        of the race (`BELL_START_SENTENCE`), and parked is the rest state.
         """
 
         if not self.cloud_state_observed:
@@ -535,11 +543,18 @@ class PipelinePower:
             return (
                 f"STOPPED ON PURPOSE{stamp}{actor} · $0.00/day "
                 f"(saving up to ${PIPELINE_USD_PER_DAY:.2f}/day while it would "
-                f"otherwise be up) · Round 4 starts it back up at "
-                f"arm and waits for it, adding roughly {RESTART_SECONDS_ESTIMATE}s "
-                f"before the bout clock begins · no operator action needed"
+                f"otherwise be up) · {BELL_START_SENTENCE} · no operator action needed"
             )
         state = self.cloud_state or "UNKNOWN"
+        if state.upper() == "IDLE":
+            # Parked is Round 4's rest state between bouts since v1.1, recorded or not: a
+            # first install parks it before Round 4 is sealed, and the app records its
+            # own parks where a laptop cannot read them. A failed update is FAILED above.
+            return (
+                f"PARKED (IDLE) · $0.00/day (saving up to ${PIPELINE_USD_PER_DAY:.2f}/day "
+                f"while it would otherwise be up) · {BELL_START_SENTENCE} · no operator "
+                "action needed"
+            )
         return (
             f"NOT RUNNING ({state}) and no deliberate stop was recorded · "
             f"$0.00/day, but this is a failure rather than a choice"
@@ -1781,9 +1796,7 @@ def session_notice(
         when = f" at {stamp}" if stamp else ""
         return [
             f"PIPELINE {pipeline_id} IS STOPPED ON PURPOSE{when} — $0.00/day.",
-            f"         Round 4 will start it at arm and wait, adding roughly "
-            f"{RESTART_SECONDS_ESTIMATE}s before the bout clock. To spend that now "
-            f"instead: ./antidemo pipeline start",
+            f"         {BELL_START_SENTENCE}. Nothing to do before a bout.",
         ]
     if intent == _INTENT_RESUMING:
         stamp = str(in_effect.get("resumed_at") or "") if in_effect else ""

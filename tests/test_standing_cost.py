@@ -28,7 +28,9 @@ from types import SimpleNamespace
 
 import pytest
 
+import server.standing_cost as standing_cost_module
 from server.capacity import (
+    AURORA_AUTO_PAUSE_SECONDS,
     LAKEBASE_SUSPEND_SECONDS,
     RDS_SCORED_ROUNDS,
     rds_lane_is_scored,
@@ -95,9 +97,21 @@ class FakeManifest:
     that it currently gets the same answer without them.
     """
 
-    def __init__(self, created_at: datetime | None = ORIGIN, run_id: str = RUN_ID) -> None:
+    def __init__(
+        self,
+        created_at: datetime | None = ORIGIN,
+        run_id: str = RUN_ID,
+        round4_aws: object | None = None,
+        round6_aws: object | None = None,
+    ) -> None:
         self.run_id = run_id
         self.created_at = created_at
+        # Round 4's AWS Glue lane seal, which decides whether Round 4 races its
+        # instance. None is an installation that has not sealed the lane.
+        self.round4_aws = round4_aws
+        # Round 6's AWS DMS and Glue lane seal, which decides the same for Round 6
+        # and whether its DMS replication instance stands.
+        self.round6_aws = round6_aws
 
     @property
     def expires_at(self) -> datetime:
@@ -312,6 +326,17 @@ class TestTheSixLanes:
         runner = lane(full(), StandingCostLaneId.NEUTRAL_RUNNER)
         assert runner.side == "shared"
         assert runner.figure.state == "priced"
+
+    def test_the_runner_lane_prices_its_two_addresses_once(self):
+        # The runners' addresses have their own line. The database line used to count
+        # them as well, so the panel billed each runner's address twice.
+        runner = lane(full(), StandingCostLaneId.NEUTRAL_RUNNER)
+        addresses = [item for item in runner.components if "IPv4" in item.component]
+        assert [item.component for item in addresses] == [
+            "Two isolated runner public IPv4 addresses"
+        ]
+        expected = RateCard().public_ipv4_hour.usd * InstallationShape().runner_instances * 24
+        assert addresses[0].figure.usd_per_day == pytest.approx(float(expected))
 
     def test_the_proxy_lane_is_not_zero_because_its_secrets_stand(self):
         # describe-db-proxies returns nothing, and the lane is still not free: the
@@ -576,8 +601,8 @@ class TestTheTwoTotals:
             * HOURS_PER_DAY
         )
         assert RateCard().rds_instance_class == "db.t4g.medium"
-        assert shape.rds_instances == 3
-        assert delta == Decimal(3) * (Decimal("0.129") - Decimal("0.065")) * Decimal(24)
+        assert shape.rds_instances == 5
+        assert delta == Decimal(5) * (Decimal("0.129") - Decimal("0.065")) * Decimal(24)
         assert before.totals is not None and after.totals is not None
         moved = Decimal(str(after.totals.installation.usd_per_day)) - Decimal(
             str(before.totals.installation.usd_per_day)
@@ -1003,17 +1028,91 @@ class TestTheCopy:
         # IMPUTED_RDS_ROUNDS, and the round that lost its box has to be named as
         # imputed rather than billed.
         copy = lane(full(), StandingCostLaneId.RDS)
-        assert "An instance stands for Rounds 2, 3 and 5" in copy.caveat
-        assert "each of those rounds races it" in copy.caveat
-        assert "Rounds 1, 4 and 6 have no instance here" in copy.caveat
-        assert "Round 1's was deleted" in copy.caveat
+        assert "An instance stands for Rounds 2, 3, 4, 5 and 6" in copy.caveat
+        # This installation has not sealed Round 4's AWS Glue lane, so its instance
+        # stands without being raced, and may not be said to race. Round 6's stands
+        # ahead of a lane that does not race anywhere yet.
+        assert (
+            "Rounds 2, 3 and 5 race theirs, and those for Rounds 4 and 6 stand for AWS "
+            "lanes this installation does not race"
+        ) in copy.caveat
+        assert "each of those rounds races it" not in copy.caveat
+        assert "AWS Glue lane adds no standing line" not in copy.caveat
+        # One round has no instance here, and the sentence says so in the singular.
+        assert "Round 1 has no instance here" in copy.caveat
+        assert "its instance was deleted" in copy.caveat
         # And it says which question the figure answers, because the two answers
-        # differ by three instance-days and only one of them is on screen.
+        # differ by an instance-day and only one of them is on screen.
         assert "what we pay, not what the workload costs" in copy.caveat
-        assert "three more boxes" in copy.caveat
+        assert "that round pays for one more box," in copy.caveat
         # The old wording, in the exact shapes it took, may not come back.
         assert "Rounds 1, 2, 3 and 5" not in copy.caveat
+        assert "Rounds 1 and 6 have no instance here" not in copy.caveat
+        assert "Round 1 have" not in copy.caveat
+        assert "one more boxes" not in copy.caveat
         assert "bills without ever being timed" not in copy.caveat
+
+    def test_the_aurora_lane_names_the_cluster_that_cannot_park(self):
+        # Round 6's cluster has logical replication on, and AWS never pauses such a
+        # writer, so the lane may not say every cluster sleeps while its figure
+        # bills that one awake.
+        aurora = lane(full(), StandingCostLaneId.AURORA)
+        assert aurora.idle_label == (
+            f"Sleeps · {AURORA_AUTO_PAUSE_SECONDS}s auto-pause, except Round 6's, which "
+            "logical replication holds awake at 0.5 ACU"
+        )
+        assert "on every cluster except Round 6's" in aurora.caveat
+        assert "Round 6's cannot park: it has logical replication on" in aurora.caveat
+        assert "it bills 0.5 ACU around the clock" in aurora.caveat
+        assert "Compute parks at the sealed minimum, and that zero" not in aurora.caveat
+        # And the figure bills exactly the awake cluster's floor for the window.
+        held = [c for c in aurora.components if "held awake" in c.component]
+        assert len(held) == 1
+
+    def test_the_aurora_copy_says_every_cluster_parks_only_when_every_one_does(self):
+        idle, caveat = standing_cost_module._aurora_copy(
+            InstallationShape(aurora_replicating_clusters=0)
+        )
+        assert idle == (
+            f"Sleeps · {AURORA_AUTO_PAUSE_SECONDS}s auto-pause, and parks at the sealed "
+            "minimum capacity"
+        )
+        assert caveat.startswith("Compute parks at the sealed minimum, and that zero")
+        assert "cannot park" not in caveat
+
+    def test_the_caveat_says_every_round_races_its_instance_only_when_every_one_does(self):
+        assert standing_cost_module._rds_raced_clause(()) == (
+            ", and each of those rounds races it."
+        )
+        # The plural, for a future round whose instance also stands unraced.
+        assert standing_cost_module._rds_raced_clause((4, 6)) == (
+            "; Rounds 2, 3 and 5 race theirs, and those for Rounds 4 and 6 stand for AWS "
+            "lanes this installation does not race."
+        )
+
+    def test_an_installation_that_sealed_round_fours_glue_lane_races_its_instance(self):
+        # Round 4 races its instance exactly where its Glue lane is sealed, and the
+        # lane's own resources are said to cost nothing standing rather than left out.
+        # Round 6's instance still stands ahead of its lane, and is named apart.
+        sealed = build(
+            manifest=FakeManifest(round4_aws=object()),
+            posted=posted_usage(),
+            report=ReconciliationReport(run_id=RUN_ID),
+        )
+        copy = lane(sealed, StandingCostLaneId.RDS)
+        assert (
+            "An instance stands for Rounds 2, 3, 4, 5 and 6; Rounds 2, 3, 4 and 5 race "
+            "theirs, and Round 6's stands for an AWS lane this installation does not race."
+        ) in copy.caveat
+        assert "Round 4's stands" not in copy.caveat
+        assert "Round 4's AWS Glue lane adds no standing line of its own" in copy.caveat
+        assert "S3 gateway endpoint" in copy.caveat
+        assert "So nothing of it is priced here." in copy.caveat
+        # And it adds no figure: the totals are the unsealed installation's.
+        unsealed = full()
+        assert sealed.totals is not None and unsealed.totals is not None
+        assert sealed.totals.installation.usd_per_day == unsealed.totals.installation.usd_per_day
+        assert sealed.totals.with_platform.usd_per_day == unsealed.totals.with_platform.usd_per_day
 
     def test_the_rounds_the_caveat_names_are_the_fleet_it_prices(self):
         # The prose is prose, so this pins it to the two things it describes: the
@@ -1032,14 +1131,21 @@ class TestTheCopy:
         )
         assert len(standing) == shape.rds_instances
         assert set(standing) | set(imputed) == set(range(1, 7))
+
+        def spelled(numbers: tuple[int, ...]) -> str:
+            return "Rounds " + ", ".join(map(str, numbers[:-1])) + f" and {numbers[-1]}"
+
         caveat = lane(full(), StandingCostLaneId.RDS).caveat
-        assert f"An instance stands for Rounds {standing[0]}, {standing[1]} and {standing[2]}" in (
-            caveat
-        )
-        assert f"Rounds {imputed[0]}, {imputed[1]} and {imputed[2]} have no instance" in caveat
+        assert f"An instance stands for {spelled(standing)}" in caveat
         # The count of extra boxes a customer pays for is the count of rounds
-        # without one here, spelled from the same list.
-        assert f"{number_word(len(imputed))} more boxes" in caveat
+        # without one here, spelled from the same list -- in the singular while
+        # that list is one round long.
+        if len(imputed) == 1:
+            assert f"Round {imputed[0]} has no instance" in caveat
+            assert "one more box," in caveat
+        else:
+            assert f"{spelled(imputed)} have no instance" in caveat
+            assert f"{number_word(len(imputed))} more boxes" in caveat
 
     def test_the_scored_rounds_named_here_are_the_ones_the_parity_check_uses(self):
         # The prose above is prose, so this pins it to the policy it describes
@@ -1058,7 +1164,8 @@ class TestTheCopy:
         # costs, so it may only count the first.
         disclosure = full()
         databricks = installation_half_usd_per_day(disclosure, "databricks")
-        aws = aws_usd_per_day(RateCard(), InstallationShape())
+        # `full()`'s installation has not sealed Round 6's lane, so no DMS instance stands.
+        aws = aws_usd_per_day(RateCard(), InstallationShape(dms_replication_instances=0))
         assert f"${databricks:.2f}/day" in disclosure.fairness.paragraph
         assert f"${aws:.2f}/day" in disclosure.fairness.paragraph
         assert f"{max(databricks, aws) / min(databricks, aws):.1f}x" in (
@@ -1179,17 +1286,20 @@ class TestTheCopy:
         # not add up to is the defect this whole module exists to prevent.
         accrued = Decimal(str(continuous.usd_per_hour)) * Decimal(str(disclosure.elapsed_hours))
         assert f"${accrued:.2f} has accrued" in continuous.paragraph
-        # A justification is a claim, and this one was measured false. The panel
-        # used to tell an audience the pipeline had to run around the clock
-        # because "starting the pipeline at the bell would move its startup
-        # inside the bout clock and change what the round measures". It is
-        # started at arm rather than at the bell, `armed_at` is captured after
-        # `arm()` returns, and the round's figure is taken from the commit the
-        # bell itself makes -- so no part of a start is inside the bout clock and
-        # none of it reaches the measurement. A wrong claim on the panel an
-        # audience reads is worse than no claim.
+        # A justification is a claim, and two of these have been wrong. The panel
+        # once said the pipeline had to run around the clock because "starting the
+        # pipeline at the bell would move its startup inside the bout clock", and
+        # then that it started at arm so no start reached the clock. v1.1 parks it
+        # at rest and starts both integrations at the bell, so its start is on
+        # Lakebase's own clock by design, and the paragraph now says exactly that.
+        # A wrong claim on the panel an audience reads is worse than no claim.
         assert "inside the bout clock" not in continuous.paragraph
         assert "around the clock" not in continuous.paragraph
+        assert "when a round arms" not in continuous.paragraph
+        assert "started at the bell and parked again once that bout has settled" in (
+            continuous.paragraph
+        )
+        assert "Its start counts against Lakebase's own clock" in continuous.paragraph
         # A share that is not the whole may not print as the whole. Live, every
         # Lakebase endpoint scales to zero and posts a structural-zero always-on
         # minimum, which leaves storage at a third of a cent a day as the only
@@ -1273,12 +1383,18 @@ class TestTheCopy:
         paragraph = disclosure.fairness.paragraph
         # The observed day was fed in as $29.8568 across both Databricks lanes,
         # of which the app's third predates this installation. The paragraph
-        # quotes the other two thirds, against an AWS half that is still the
-        # deleted-instance fleet plus two physical runners.
+        # quotes the other two thirds, against the v1.1 AWS half: r1's instance
+        # still deleted, the instances and clusters for Rounds 4 and 6 added (Round
+        # 6's cluster held awake by logical replication), plus two physical
+        # runners. It was $23.39/day before Round 4 had its pair, and $25.29/day
+        # before Round 6 had its own. This installation has not sealed Round 6's AWS
+        # lane, so its DMS replication instance does not stand. (Each read $3.67
+        # higher until 2026-10-02: the runners were priced at $0.4284 an hour against
+        # us-west-2's published $0.357, and their two addresses were priced twice.)
         databricks = installation_half_usd_per_day(disclosure, "databricks")
-        aws = aws_usd_per_day(RateCard(), InstallationShape())
+        aws = aws_usd_per_day(RateCard(), InstallationShape(dms_replication_instances=0))
         assert f"${aws:.2f}/day AWS" in paragraph
-        assert f"{aws:.2f}" == "27.05"
+        assert f"{aws:.2f}" == "28.64"
         larger = "Databricks" if databricks > aws else "AWS"
         ratio = max(databricks, aws) / min(databricks, aws)
         assert (
@@ -1363,7 +1479,8 @@ class TestNoRateLiterals:
         one_of_each = InstallationShape(
             rds_instances=1,
             aurora_clusters=1,
-            public_ipv4_addresses=2,
+            # One per database, plus the two runners' own.
+            public_ipv4_addresses=4,
             managed_secrets=3,
         )
         disclosure = build(shape=one_of_each, posted=posted_usage())
@@ -1375,12 +1492,59 @@ class TestNoRateLiterals:
                     + RateCard().public_ipv4_hour.usd
                     + RateCard().rds_gp3_gb_month.usd * one_of_each.rds_allocated_gb / Decimal(730)
                     + RateCard().secret_month.usd / Decimal(730)
+                    # Half the shape's one DMS instance: one of its two capture tasks.
+                    + RateCard().dms_t3_small_hour.usd / 2
                 )
                 * HOURS_PER_DAY
             ),
             rel=1e-3,
         )
         assert lane(disclosure, StandingCostLaneId.RDS_PROXY).figure.state == "priced"
+
+
+class TestRoundSixsAwsLane:
+    """Round 6's DMS instance stands only where its lane is sealed, and the always-on
+    Glue figure is disclosed beside the halves, never summed into them."""
+
+    def test_a_sealed_lane_bills_its_dms_instance_across_both_competitor_lanes(self):
+        disclosure = build(manifest=FakeManifest(round6_aws=object()), posted=posted_usage())
+        per_lane = {
+            lane_id: sum(
+                (
+                    item.figure.usd_per_day or 0.0
+                    for item in lane(disclosure, lane_id).components
+                    if "DMS replication instance" in item.component
+                ),
+                0.0,
+            )
+            for lane_id in (StandingCostLaneId.AURORA, StandingCostLaneId.RDS)
+        }
+        half_a_day = float(RateCard().dms_t3_small_hour.usd * HOURS_PER_DAY / 2)
+        assert per_lane == {
+            StandingCostLaneId.AURORA: pytest.approx(half_a_day),
+            StandingCostLaneId.RDS: pytest.approx(half_a_day),
+        }
+        for lane_id in (StandingCostLaneId.AURORA, StandingCostLaneId.RDS):
+            assert "DMS replication instance" in lane(disclosure, lane_id).caveat
+
+    def test_an_unsealed_lane_has_no_dms_instance_and_says_nothing_of_one(self):
+        disclosure = build(posted=posted_usage())
+        for lane_id in (StandingCostLaneId.AURORA, StandingCostLaneId.RDS):
+            found = lane(disclosure, lane_id)
+            assert not [item for item in found.components if "DMS" in item.component]
+            assert "DMS" not in found.caveat
+        assert "Round 6" not in disclosure.fairness.paragraph
+
+    def test_the_always_on_glue_figure_is_disclosed_and_summed_into_neither_half(self):
+        sealed = build(manifest=FakeManifest(round6_aws=object()), posted=posted_usage())
+        paragraph = sealed.fairness.paragraph
+        glue_per_day = RateCard().glue_dpu_hour.usd * 2 * HOURS_PER_DAY
+        assert f"${glue_per_day:.2f}/day, which is in neither total" in paragraph
+        assert "always on" in paragraph and "cold start at the bell" in paragraph
+        # The AWS half quoted beside it is the sealed shape's, DMS instance included and
+        # the all-day Glue job not.
+        aws = aws_usd_per_day(RateCard(), InstallationShape())
+        assert f"${aws:.2f}/day AWS" in paragraph
 
 
 class TestPostedUsageParsing:
@@ -1752,8 +1916,14 @@ class TestThePublishedCostBoxAgrees:
     def test_round4_stop_contract_agrees(self):
         for name in _COST_DOCUMENTS:
             prose = _normalised_cost_prose(name)
-            assert "20-minute redo window" in prose
-            assert "settlement" in prose
+            # v1.1: both integrations parked at rest and started at the bell, parked
+            # again by the bout's own settle, with no re-do window to wait out; and
+            # the two backstops a dead process leaves behind.
+            assert "parked at rest" in prose
+            assert "20-minute redo window" not in prose
+            assert "30 minutes after that bell" in prose
+            assert "30-minute" in prose
+            assert "settle" in prose
             assert "observation budget" in prose
             assert "not proof that a stop request failed" in prose
             assert "IDLE" in prose

@@ -48,7 +48,6 @@ from server.lifecycle import (
     installation_presence_async,
     operator_ingress_drift_async,
 )
-from server.live_orders import LiveOrdersEngine
 from server.manager import InvalidStateError, RoundStorageReadinessError, RunManager
 from server.manifest import (
     MANIFEST_JSON_ENV,
@@ -56,7 +55,6 @@ from server.manifest import (
     load_manifest,
     manifest_path,
 )
-from server.model_score import ModelScoreEngine
 from server.models import CompetitorId, RoundId
 from server.pipeline_power import (
     DurablePipelinePowerStore,
@@ -97,8 +95,10 @@ from server.reconcile import (
     presence_from_report,
     reconcile_live,
 )
+from server.round4_race import Round4RaceEngine
 from server.round4_stop_recovery import build_inherited_round4_stop_recovery
 from server.round5_cleanup_owed import round5_cleanup_owed_notice
+from server.round6_race import Round6RaceEngine
 from server.round_construction import (
     build_round,
     exception_diagnostic,
@@ -435,20 +435,25 @@ def _owned_manifest_or_none(manifest: DemoManifest | None) -> DemoManifest | Non
 
 def model_score_factory_from_manifest(
     manifest: DemoManifest | None = None,
-) -> Callable[[], ModelScoreEngine] | None:
-    """Return a lazy Round 4 factory for any manifest carrying the v2 seal."""
+) -> Callable[[CompetitorId], Round4RaceEngine] | None:
+    """Return a lazy Round 4 factory for any manifest carrying the v2 seal.
+
+    The factory takes the matchup's competitor: Round 4 races Lakebase against
+    that competitor's Glue lane when this installation's AWS lane is sealed, and
+    Lakebase alone when it is not.
+    """
     owned = _owned_manifest_or_none(manifest)
     if owned is None:
         return None
 
-    def build() -> Callable[[], ModelScoreEngine] | None:
+    def build() -> Callable[[CompetitorId], Round4RaceEngine] | None:
         if owned.manifest_version < 2 or owned.round4 is None:
             return None
 
-        def factory() -> ModelScoreEngine:
-            from server.model_score_live import build_model_score_engine
+        def factory(competitor: CompetitorId) -> Round4RaceEngine:
+            from server.round4_race_live import build_round4_race_engine
 
-            return build_model_score_engine(owned)
+            return build_round4_race_engine(owned, competitor)
 
         return factory
 
@@ -468,17 +473,17 @@ def delta_storage_probe_from_manifest(
     async def probe() -> None:
         from server.model_score_live import DeltaPathDoesNotExistError
 
-        model_score = model_score_factory()
-        source_probe = getattr(model_score.adapter, "probe_source_storage", None)
+        # Either matchup's engine shares the one Delta source, and building an engine makes
+        # no network call; the probe reads Delta history through the source and nothing else.
+        model_score = await asyncio.to_thread(model_score_factory, CompetitorId.RDS_POSTGRES)
+        source = getattr(model_score, "source", None)
+        source_probe = getattr(source, "probe_storage", None)
         if not callable(source_probe):
-            raise InvalidStateError("Round 4 adapter has no read-only Delta storage probe")
+            raise InvalidStateError("Round 4's source has no read-only Delta storage probe")
         try:
             await source_probe()
         except DeltaPathDoesNotExistError as exc:
-            repair_job_id = str(
-                getattr(getattr(model_score.adapter, "config", None), "source_repair_job_id", "")
-                or ""
-            )
+            repair_job_id = str(getattr(source, "repair_job_id", "") or "")
             if not repair_job_id:
                 raise RoundStorageReadinessError(
                     RoundId.PUT_MODEL_SCORE_IN_APP,
@@ -488,9 +493,14 @@ def delta_storage_probe_from_manifest(
             # built for. Keep the round available and continue checking Round 6.
         if live_orders_factory is None:
             return
-        live_orders = live_orders_factory()
+        # Lakebase's lane is always the first, and its history is the one Delta path Round 6
+        # seals; the AWS lane's external table is Prepare's to check, never catalog readiness's.
+        live_orders = await asyncio.to_thread(live_orders_factory, CompetitorId.RDS_POSTGRES)
+        history_probe = getattr(live_orders.lanes[0], "probe_storage", None)
+        if not callable(history_probe):
+            raise InvalidStateError("Round 6's Lakebase lane has no read-only Delta history probe")
         try:
-            await live_orders.adapter.read_history(live_orders.contract.baseline)
+            await history_probe()
         except DeltaPathDoesNotExistError as exc:
             raise RoundStorageReadinessError(
                 RoundId.ANALYZE_LIVE_ORDERS,
@@ -795,43 +805,88 @@ def connection_spike_factory_from_manifest(
 
 def live_orders_factory_from_manifest(
     manifest: DemoManifest | None = None,
-) -> Callable[[], LiveOrdersEngine] | None:
-    """Expose Round 6 only when its native-CDF contract has been sealed."""
+) -> Callable[[CompetitorId], Round6RaceEngine] | None:
+    """Expose Round 6 only when its native-CDF contract has been sealed.
+
+    The factory takes the matchup's competitor: Round 6 races Lakebase's built-in change
+    feed against that competitor's DMS and Glue lane when this installation's AWS lane is
+    sealed, and Lakebase alone when it is not.
+    """
     owned = _owned_manifest_or_none(manifest)
     if owned is None:
         return None
 
-    def build() -> Callable[[], LiveOrdersEngine] | None:
+    def build() -> Callable[[CompetitorId], Round6RaceEngine] | None:
         if not getattr(owned, "round6_ready", False):
             return None
 
-        def factory() -> LiveOrdersEngine:
-            from server.live_orders import build_live_orders_engine
+        def factory(competitor: CompetitorId) -> Round6RaceEngine:
+            from server.round6_race_live import build_round6_race_engine
 
-            return build_live_orders_engine(owned)
+            return build_round6_race_engine(owned, competitor)
 
         return factory
 
     return build_round(6, RoundId.ANALYZE_LIVE_ORDERS, build)
 
 
-async def _refresh_posted_usage(cache: PostedUsageCache) -> None:
-    """Keep the posted read warm without ever putting it on a request.
+#: How long after a person last loaded a page or did something the posted read still
+#: counts as watched: the twenty minutes a warm lane waits before it parks.
+POSTED_USAGE_WATCHED_SECONDS = 20 * 60.0
+#: How often the refresh task looks at whether a read is due.
+POSTED_USAGE_CHECK_SECONDS = 60.0
+
+
+async def _refresh_posted_usage(
+    cache: PostedUsageCache,
+    watched: Callable[[], bool],
+    *,
+    check_seconds: float = POSTED_USAGE_CHECK_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Keep the posted read fresh while a person is using the app, and only then.
 
     The read runs in a worker thread because it is a blocking warehouse round
     trip, and every failure is swallowed for the same reason the reaper's are:
     losing the posted comparison narrows one panel, and taking the event loop
     down over a billing query would lose the demo.
+
+    It waits for a person because the read is a warehouse statement, and the
+    warehouse stops only after ten quiet minutes. Read every fifteen minutes on a
+    timer, it kept that warehouse running with nobody on the app: replayed from
+    the R6 test installation's own query history on 2026-10-02, up 68% of the
+    time, about $138 a day at the published rate, and no panel showed it. Now an
+    idle installation sends the warehouse nothing, and a watched one reads at
+    most once per cache interval.
     """
 
+    last_read: float | None = None
     while True:
-        try:
-            await asyncio.to_thread(cache.refresh)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - a billing read may never take the app down
-            LOGGER.warning("Could not refresh posted Databricks usage", exc_info=True)
-        await asyncio.sleep(cache.interval_seconds)
+        due = last_read is None or clock() - last_read >= cache.interval_seconds
+        if due and watched():
+            last_read = clock()
+            try:
+                await asyncio.to_thread(cache.refresh)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a billing read may never take the app down
+                LOGGER.warning("Could not refresh posted Databricks usage", exc_info=True)
+        await sleep(check_seconds)
+
+
+def _watched_by_a_person(app: FastAPI) -> Callable[[], bool]:
+    """Whether a person loaded a page or did something in the last twenty minutes.
+
+    The same test the Round 4 warm keeper uses, and not the lease's: an open tab
+    polls the API every few seconds, and that alone must not keep a warehouse up.
+    """
+
+    def watched() -> bool:
+        last = getattr(app.state, "last_person_action", None)
+        return last is not None and time.monotonic() - last < POSTED_USAGE_WATCHED_SECONDS
+
+    return watched
 
 
 #: Failures that mean the sweep could not *look*, rather than that the sweep is
@@ -1106,8 +1161,8 @@ def _deployed_credential_preflight() -> CredentialVerdict | None:
             f"serving degraded rather than refusing to boot: {exc}. It is in "
             "exactly the state it would be in if these credentials had died "
             "under it while it was serving -- the rounds that race a live "
-            "Aurora or RDS opponent cannot arm, and Rounds 4 and 6 reach "
-            "Lakebase and no AWS at all, so they are unaffected. The credential "
+            "Aurora or RDS opponent cannot arm, and the rounds that reach "
+            "Lakebase and no AWS at all are unaffected. The credential "
             "probe re-asks AWS on its own interval, so a working key published "
             "into this app clears this without a restart, and a restart clears "
             "nothing that a working key does not."
@@ -1118,7 +1173,7 @@ def _deployed_credential_preflight() -> CredentialVerdict | None:
             "%s. /readyz reports it as credentials_state=%s with the full "
             "diagnosis in credentials_detail. Every round that races a live "
             "Aurora or RDS opponent will refuse to arm until this clears; "
-            "Rounds 4 and 6 are unaffected.",
+            "the rounds that reach Lakebase alone are unaffected.",
             exc,
             state,
             exc_info=True,
@@ -1448,6 +1503,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round5_prearm_guard=readiness_gate.round5_prearm_guard,
             model_score_factory=model_score_factory_from_manifest(manifest),
             delta_storage_probe=delta_storage_probe_from_manifest(manifest),
+            delta_storage_probe_watched=_watched_by_a_person(app),
             connection_spike_factory=connection_spike_factory,
             round5_warm_coordinator=round5_warm_coordinator,
             live_orders_factory=live_orders_factory_from_manifest(manifest),
@@ -1516,7 +1572,9 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         app.state.startup_reap = await _reap_startup_orphans(manifest, lease_store)
         if round5_warm_coordinator is not None:
             await round5_warm_coordinator.start()
-        posted_usage_task = asyncio.create_task(_refresh_posted_usage(posted_usage_cache))
+        posted_usage_task = asyncio.create_task(
+            _refresh_posted_usage(posted_usage_cache, _watched_by_a_person(app))
+        )
         # What the startup check found, kept for the window before the probe's
         # first answer -- and for the case where there is no probe at all,
         # which is the one that would otherwise report a refused credential as
@@ -1677,37 +1735,18 @@ def _start_round4_warm_keeper(
     app: FastAPI,
     manifest: DemoManifest | None,
 ) -> asyncio.Task[None] | None:
-    """Keep Round 4's Managed Sync pipeline up while a person is using the app.
+    """Start nothing: v1.1 keeps no Round 4 lane warm.
 
-    A parked pipeline takes about half a minute to start, and until this existed
-    that start happened after the presenter pressed Prepare. The keeper starts it
-    when the app is loaded or acted on, so Prepare meets a running pipeline. Like
-    the lease keeper it is an observer: building it performs no network call, and
-    a failure to build it only means Prepare starts the pipeline, as before.
+    v1.0's keeper held Round 4's pipeline up while the app was in use so Prepare
+    never waited on a start.
     """
 
+    # v1.1 starts both of Round 4's lanes cold at the bell (design section 2),
+    # so nothing keeps either lane warm between bouts, and a kept-warm pipeline
+    # would put Lakebase ahead of the AWS lane. The hook stays so startup and
+    # shutdown keep one shape.
     app.state.round4_warm_keeper = None
-    owned = _owned_manifest_or_none(manifest)
-    if owned is None or owned.manifest_version < 2 or owned.round4 is None:
-        return None
-    try:
-        from server.model_score_live import build_round4_warm_keeper
-
-        # Performs no work now: the keeper builds its client on the first use,
-        # off the loop. The manager's prewarm lets it leave a fresh warm proof
-        # behind too, only ever while no Round 4 bout is in flight.
-        manager = getattr(app.state, "run_manager", None)
-        keeper = build_round4_warm_keeper(
-            owned,
-            prewarm=getattr(manager, "prewarm_round4", None),
-        )
-    except Exception:  # noqa: BLE001 - an observer may never break startup
-        LOGGER.warning("Could not start the Round 4 warm keeper", exc_info=True)
-        return None
-    app.state.round4_warm_keeper = keeper
-    task = asyncio.create_task(keeper.run(), name="round4-warm-keeper")
-    task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
-    return task
+    return None
 
 
 def _lease_session(manifest: DemoManifest) -> Any:
@@ -2094,10 +2133,13 @@ async def note_installation_use(request: Any, call_next: Callable[..., Any]) -> 
     if keeper is not None and _is_a_use(request):
         # Records a timestamp and at most sets an event: no I/O on this path.
         keeper.note_activity()
-    warm_keeper = getattr(app.state, "round4_warm_keeper", None)
-    if warm_keeper is not None and _is_a_warm_use(request):
-        # The same contract: a timestamp and an event, nothing else.
-        warm_keeper.note_use()
+    if _is_a_warm_use(request):
+        # The same contract: a timestamp and an event, nothing else. The posted
+        # billing read waits on this timestamp (`_watched_by_a_person`).
+        app.state.last_person_action = time.monotonic()
+        warm_keeper = getattr(app.state, "round4_warm_keeper", None)
+        if warm_keeper is not None:
+            warm_keeper.note_use()
     return await call_next(request)
 
 
@@ -2418,9 +2460,10 @@ def _readiness_response(
             payload["status"] = "degraded"
     if installation.state in {PRESENCE_MISSING, PRESENCE_UNVERIFIED}:
         # Degraded rather than not_ready, on the same reasoning as ingress drift
-        # below: the ring is still able to serve, Rounds 4 and 6 need no AWS at
-        # all, and turning an observation into a 503 would take the app out of
-        # rotation over something a monitor can already read here.
+        # below: the ring is still able to serve, the rounds that reach Lakebase
+        # alone need no AWS at all, and turning an observation into a 503 would
+        # take the app out of rotation over something a monitor can already read
+        # here.
         #
         # `unverified` degrades as well as `missing`, because a surface that
         # cannot see the account and says nothing is the defect this whole signal

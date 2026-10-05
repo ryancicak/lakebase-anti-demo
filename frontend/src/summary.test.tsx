@@ -24,6 +24,7 @@ import {
   verdictFor,
   winnerLabel,
 } from './recap'
+import { finaleLaneBars } from './App'
 import { Summary } from './summary'
 
 /** Built from the receipts actually on disk under .anti-demo-v7/receipts/. */
@@ -268,11 +269,13 @@ describe('surviving a restart', () => {
 })
 
 describe('reading the numbers', () => {
-  it('prints seconds under a minute and m:ss above it', () => {
+  it('prints seconds under a minute and minutes above it, each with its unit', () => {
     expect(summaryDuration(2399.8)).toBe('2.40s')
     expect(summaryDuration(59_999)).toBe('60.00s')
     // 480707ms is eight minutes; as a decimal it is unreadable.
-    expect(summaryDuration(480_707.65)).toBe('8:00')
+    expect(summaryDuration(480_707.65)).toBe('8m 00s')
+    // A bare 1:48 beside Lakebase's 11.33s read as the faster lane.
+    expect(summaryDuration(108_210)).toBe('1m 48s')
     expect(summaryDuration(-1)).toBe('0.00s')
   })
 
@@ -284,7 +287,7 @@ describe('reading the numbers', () => {
     ] as const)
       .map((status) => winnerLabel({
         roundId: 'wake_idle_app', roundNumber: '01', roundTitle: 'T', status,
-        opponent: null, lakebaseMs: null, opponentMs: null,
+        opponent: null, opponentId: null, lakebaseMs: null, opponentMs: null, lakebaseIsLowerBound: false,
         opponentIsLowerBound: false, marginMs: null, source: null, boutsOnRecord: 0,
         stoppedShort: false, sealedAt: null,
       }))
@@ -293,12 +296,87 @@ describe('reading the numbers', () => {
   })
 })
 
+/**
+ * Ryan's rule for every round: at a towel each lane shows where its clock stood,
+ * marked unfinished, and never as a finish time.
+ */
+describe('a towel on the ledger', () => {
+  // Receipt 3C275636 on the v1.1 test app: Round 6 toweled 1.02 s after its bell,
+  // both clocks unfinished at the same floor. The summary printed "1.02s vs >1.02s".
+  const floor: BoutReceipt['lakebase'] = {
+    ms: 1023.598057,
+    state: 'incomplete',
+    lower_bound: true,
+    reason: 'Toweled · unfinished at cutoff · >1.02s lower bound',
+  }
+  const towelled = receipt({
+    receipt: '3C275636',
+    session_id: '3c275636899549549505ce99c1ef02de',
+    round_id: 'analyze_live_orders_without_slowing_checkout',
+    round_title: 'Move live application data into the lakehouse',
+    opponent: 'RDS PostgreSQL',
+    opponent_id: 'rds_postgres',
+    outcome: 'stopped_short',
+    sealing_event: 'towel_finished',
+    lakebase: floor,
+    opponent_lane: floor,
+    margin_ms: null,
+    start_skew_ms: null,
+    sealed_at: '2026-09-30T02:02:42.418943Z',
+    remembered_result: 'Toweled at >1.02s · No exact result verified · No winner · Margin N/A',
+  })
+  const roundSix = () => summariseRounds([towelled])
+    .find((result) => result.roundId === 'analyze_live_orders_without_slowing_checkout')!
+
+  it('carries each lane as a floor, never a finish time', () => {
+    expect(roundSix()).toMatchObject({
+      status: 'no_result',
+      lakebaseMs: 1023.598057,
+      opponentMs: 1023.598057,
+      lakebaseIsLowerBound: true,
+      opponentIsLowerBound: true,
+    })
+  })
+
+  it('prints both floors on the summary, each marked, and says why', async () => {
+    stubReceipts([towelled])
+    render(<Summary onBack={() => {}} />)
+    await screen.findByText(/of 6 rounds have a result/i)
+
+    const row = document.querySelector('[data-round="analyze_live_orders_without_slowing_checkout"]')!
+    expect(row.querySelector('.summary-time')).toHaveTextContent('>1.02s')
+    expect(row.querySelector('.summary-against')).toHaveTextContent('vs >1.02s RDS PostgreSQL')
+    expect(row.textContent).not.toMatch(/(^|[^>])1\.02s/)
+    expect(row).toHaveTextContent(/Towel thrown/)
+  })
+
+  it('draws both floors on the finale tile, with no proportional fill', () => {
+    const bars = finaleLaneBars(roundSix())
+    expect(bars.lakebase).toEqual({ share: null, label: '>1.02s', lowerBound: true })
+    expect(bars.opponent).toEqual({ share: null, label: '>1.02s', lowerBound: true })
+  })
+
+  it('never draws a floor as a finish time, whichever lane holds it', () => {
+    // The blue corner verified first and the towel stopped Lakebase's clock at 4 s.
+    const bars = finaleLaneBars({
+      ...roundSix(),
+      status: 'competitor_faster',
+      lakebaseMs: 4000,
+      opponentMs: 3000,
+      lakebaseIsLowerBound: true,
+      opponentIsLowerBound: false,
+    })
+    expect(bars.lakebase).toEqual({ share: null, label: '>4.00s', lowerBound: true })
+    expect(bars.opponent).toEqual({ share: null, label: '3.00s' })
+  })
+})
+
 describe('verdictFor', () => {
   function result(over: Partial<RoundResult> = {}): RoundResult {
     return {
       roundId: 'wake_idle_app', roundNumber: '01', roundTitle: 'T',
-      status: 'lakebase_faster', opponent: 'Aurora Serverless v2',
-      lakebaseMs: 2860, opponentMs: 41200, opponentIsLowerBound: false,
+      status: 'lakebase_faster', opponent: 'Aurora Serverless v2', opponentId: 'aurora_serverless_v2',
+      lakebaseMs: 2860, opponentMs: 41200, lakebaseIsLowerBound: false, opponentIsLowerBound: false,
       marginMs: 38340, source: 'receipt', boutsOnRecord: 1,
       stoppedShort: false, sealedAt: null, ...over,
     }
@@ -336,7 +414,7 @@ describe('verdictFor', () => {
     expect(verdict.winner).toEqual({ badge: 'LB', name: 'LAKEBASE' })
     expect(verdict.qualifier).toBe('STOPPED SHORT')
     expect(verdict.laneNote).toBe(
-      'AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1:33 · MARGIN N/A',
+      'AURORA SERVERLESS V2 · UNVERIFIED WHEN STOPPED · LOWER BOUND 1m 33s · MARGIN N/A',
     )
     // Their number must never read as a time they achieved.
     expect(verdict.laneNote).toContain('LOWER BOUND')

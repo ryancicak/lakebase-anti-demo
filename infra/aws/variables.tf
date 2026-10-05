@@ -219,6 +219,65 @@ variable "anti_demo_runtime_max_session_seconds" {
   }
 }
 
+variable "round4_source_location" {
+  description = "S3 location of Round 4's Delta source table, as Unity Catalog reports it. Null builds no Glue lane: the installer sets it in a second apply, once the table exists, and every installation sealed before v1.1 has none."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.round4_source_location == null || can(regex("^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[^*?]+$", var.round4_source_location))
+    error_message = "round4_source_location must be null or an s3://bucket/prefix location."
+  }
+}
+
+variable "round4_glue_subnet_cidr" {
+  description = "A free /24 for Round 4's Glue subnet. Required with an explicit VPC; the default VPC derives one from the installation ID."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.round4_glue_subnet_cidr == null || (can(cidrnetmask(var.round4_glue_subnet_cidr)) && can(regex("/24$", var.round4_glue_subnet_cidr)))
+    error_message = "round4_glue_subnet_cidr must be null or an IPv4 /24."
+  }
+}
+
+variable "round6_uc_external_id" {
+  description = "The external ID of Round 6's Unity Catalog storage credential, which the installer creates before this lane exists. Null builds no DMS lane: the installer sets it in a second apply, and every installation sealed before v1.1, or whose identity may not create the credential, has none."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.round6_uc_external_id == null || can(regex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.round6_uc_external_id))
+    error_message = "round6_uc_external_id must be null or the storage credential's external ID, a UUID."
+  }
+}
+
+variable "round6_dms_subnet_cidr" {
+  description = "A free /24 for Round 6's two DMS subnets. Required with an explicit VPC; the default VPC derives one from the installation ID."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.round6_dms_subnet_cidr == null || (can(cidrnetmask(var.round6_dms_subnet_cidr)) && can(regex("/24$", var.round6_dms_subnet_cidr)))
+    error_message = "round6_dms_subnet_cidr must be null or an IPv4 /24."
+  }
+}
+
+variable "round6_uc_master_role_arn" {
+  description = "The Databricks Unity Catalog role that assumes Round 6's read-only role, as a storage credential reports it (`unity_catalog_iam_arn`). The default is the one for Databricks on AWS commercial regions."
+  type        = string
+  default     = "arn:aws:iam::414351767826:role/unity-catalog-prod-UCMasterRole-14S5ZJVKOTYTL"
+
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/", var.round6_uc_master_role_arn))
+    error_message = "round6_uc_master_role_arn must be an IAM role ARN."
+  }
+}
+
 variable "round5_runner_instance_type" {
   description = "Neutral runner shape for the frozen dual-10,000-client Round 5 protocol."
   type        = string

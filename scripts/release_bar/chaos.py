@@ -49,7 +49,14 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import ALL_ROUNDS, AppClient  # noqa: E402
+from _common import (  # noqa: E402
+    ALL_ROUNDS,
+    PLATFORM_RETRY_SECONDS,
+    AppClient,
+    PlatformAnswered,
+    ResponseLost,
+    answered_by_the_platform,
+)
 
 ROUNDS = tuple(
     item for item in os.environ.get("CHAOS_ROUNDS", ",".join(ALL_ROUNDS)).split(",") if item
@@ -63,23 +70,29 @@ SCENARIOS = tuple(
     ).split(",")
     if item
 )
+#: Seconds after the session reads `running`. Round 4 (v1.1) rings its bell about 3 s after that,
+#: once its verifier's connections are open, so its early towel lands before the bell, its
+#: mid-stage towel with both lanes starting, and its late towel after Lakebase's row (30-45 s) and
+#: before Glue's (77-160 s): the one-sided stoppage a presenter would actually call. Round 6 (v1.1)
+#: the same way: its mid-stage towel lands while DMS and Glue start, and its late towel after
+#: Lakebase's change feed has delivered (10-18 s) and before AWS's pipeline has (62-93 s cold).
 DELAYS = {
     "early-towel": dict.fromkeys(ROUNDS, 0.30),
     "mid-stage-towel": {
         "wake_idle_app": 1.50,
         "make_schema_change_safely": 5.0,
         "recover_deleted_order": 2.0,
-        "put_model_score_in_app": 2.5,
+        "put_model_score_in_app": 10.0,
         "survive_connection_spike": 16.0,
-        "analyze_live_orders_without_slowing_checkout": 2.5,
+        "analyze_live_orders_without_slowing_checkout": 5.0,
     },
     "late-towel": {
         "wake_idle_app": 3.0,
         "make_schema_change_safely": 75.0,
         "recover_deleted_order": 75.0,
-        "put_model_score_in_app": 7.0,
+        "put_model_score_in_app": 60.0,
         "survive_connection_spike": 75.0,
-        "analyze_live_orders_without_slowing_checkout": 6.0,
+        "analyze_live_orders_without_slowing_checkout": 35.0,
     },
     "rapid-rearm-towel": dict.fromkeys(ROUNDS, 0.35),
 }
@@ -90,6 +103,19 @@ for _item in os.environ.get("CHAOS_DELAYS", "").split(","):
         _scenario, _round = _key.split(":")
         DELAYS.setdefault(_scenario, {})[_round] = float(_seconds)
 TERMINAL = {"verified", "towelled", "failed"}
+#: How long a bout may take to reach a verdict. Every racing round decides its bout by its
+#: lanes' one maximum from the bell (`server/bout_limit.BOUT_TIME_LIMIT_SECONDS`, 15
+#: minutes), so this is the harness's own limit for a bout that hangs.
+VERDICT_TIMEOUT_SECONDS = 3300
+#: The session states a control leaves behind once the app has acted on it. A POST whose
+#: answer was lost is settled from the session against these, and sent again only when the
+#: session shows it never happened.
+APPLIED = {
+    "arm": {"checking", "armed", "running"} | TERMINAL,
+    "run": {"running"} | TERMINAL,
+    "towel": TERMINAL,
+    "cancel-arm": TERMINAL,
+}
 #: "scenario:round_id" pairs to leave out, e.g. a known failure on the build under test.
 SKIP = set(item for item in os.environ.get("CHAOS_SKIP", "").split(",") if item)
 
@@ -140,36 +166,53 @@ class Harness:
     def request(
         self, method: str, path: str, *, body: dict[str, Any] | None = None, timeout: float = 300
     ) -> tuple[int, Any]:
-        # The client re-mints its OAuth token every few minutes: the first all-rounds
-        # run died after an hour on the token it minted at start.
-        with self.lock:
-            self.client.headers()
-        status_code, payload = self.client.call(method, path, body, timeout=timeout)
-        logged_payload = payload
-        if "/api/sessions/" in path and isinstance(payload, dict):
-            logged_payload = {
-                "id": payload.get("id"),
-                "state": payload.get("state"),
-                "failure": payload.get("failure"),
-                "lanes": {
-                    key: {
-                        "state": value.get("state"),
-                        "phase": (value.get("activity") or {}).get("phase"),
-                        "elapsed_ms": value.get("elapsed_ms"),
-                        "error": value.get("error"),
-                    }
-                    for key, value in (payload.get("lanes") or {}).items()
-                },
-                "round5_start": payload.get("round5_start"),
-            }
-        self.log(
-            "http",
-            method=method,
-            path=path,
-            status=status_code,
-            payload=logged_payload,
-        )
-        return status_code, payload
+        """Status and body, asked again while the Databricks Apps front end answers a GET.
+
+        The front end answering in the app's place is not the app failing, and the room's
+        browser keeps its board and asks again. A POST it answered may or may not have
+        reached the app, so it raises `ResponseLost`, and its caller settles it from the
+        session, as it does for an answer cut off on the way back.
+        """
+
+        pauses = iter(PLATFORM_RETRY_SECONDS)
+        while True:
+            # The client re-mints its OAuth token every few minutes: the first all-rounds
+            # run died after an hour on the token it minted at start.
+            with self.lock:
+                self.client.headers()
+            status_code, payload = self.client.call(method, path, body, timeout=timeout)
+            logged_payload = payload
+            if "/api/sessions/" in path and isinstance(payload, dict):
+                logged_payload = {
+                    "id": payload.get("id"),
+                    "state": payload.get("state"),
+                    "failure": payload.get("failure"),
+                    "lanes": {
+                        key: {
+                            "state": value.get("state"),
+                            "phase": (value.get("activity") or {}).get("phase"),
+                            "elapsed_ms": value.get("elapsed_ms"),
+                            "error": value.get("error"),
+                        }
+                        for key, value in (payload.get("lanes") or {}).items()
+                    },
+                    "round5_start": payload.get("round5_start"),
+                }
+            self.log(
+                "http",
+                method=method,
+                path=path,
+                status=status_code,
+                payload=logged_payload,
+            )
+            if not answered_by_the_platform(status_code, payload):
+                return status_code, payload
+            if method != "GET":
+                raise ResponseLost(method, path, PlatformAnswered(status_code, payload))
+            pause = next(pauses, None)
+            if pause is None:
+                return status_code, payload
+            time.sleep(pause)
 
     def all_status(self) -> dict[str, Any]:
         issued_at = time.monotonic()
@@ -238,26 +281,57 @@ class Harness:
             self.poller.join(timeout=10)
 
     def create(self, round_id: str) -> str:
-        status, payload = self.request(
-            "POST",
-            "/api/sessions",
-            body={
-                "competitor": os.environ.get("CHAOS_COMPETITOR", "aurora_serverless_v2"),
-                "primary_persona": "sre",
-                "corners": ["performance", "simplicity"],
-                "round_id": round_id,
-            },
-        )
+        body = {
+            "competitor": os.environ.get("CHAOS_COMPETITOR", "aurora_serverless_v2"),
+            "primary_persona": "sre",
+            "corners": ["performance", "simplicity"],
+            "round_id": round_id,
+        }
+        try:
+            status, payload = self.request("POST", "/api/sessions", body=body)
+        except ResponseLost as lost:
+            # A draft holds no ring, so a second one is harmless; the lost one is never armed.
+            self.log("response_lost", round=round_id, control="create", detail=str(lost))
+            status, payload = self.request("POST", "/api/sessions", body=body)
         if status != 201:
             raise RuntimeError(f"{round_id} create returned {status}: {payload}")
         return str(payload["id"])
 
     def post(self, session_id: str, control: str, timeout: float = 300) -> dict[str, Any]:
+        try:
+            status, payload = self.request(
+                "POST", f"/api/sessions/{session_id}/{control}", timeout=timeout
+            )
+        except ResponseLost as lost:
+            return self.settle_lost(session_id, control, lost, timeout)
+        if status != 200:
+            raise RuntimeError(f"{control} returned {status}: {payload}")
+        return payload
+
+    def settle_lost(
+        self, session_id: str, control: str, lost: ResponseLost, timeout: float
+    ) -> dict[str, Any]:
+        """Read the session for the answer a lost response would have carried.
+
+        A towel can still be stopping the bout when its answer is lost, so it is given
+        its whole timeout to land. Anything else has either happened by the time the
+        session is read or not at all, and is sent once more only in the second case.
+        """
+
+        self.log("response_lost", session_id=session_id, control=control, detail=str(lost))
+        applied = APPLIED.get(control)
+        if applied is None:
+            raise lost
+        if control == "towel":
+            return self.wait_session(session_id, applied, timeout, session_id)
+        latest = self.get_session(session_id)
+        if latest.get("state") in applied:
+            return latest
         status, payload = self.request(
             "POST", f"/api/sessions/{session_id}/{control}", timeout=timeout
         )
         if status != 200:
-            raise RuntimeError(f"{control} returned {status}: {payload}")
+            raise RuntimeError(f"{control} returned {status} after a lost response: {payload}")
         return payload
 
     def towel_or_finished(self, session_id: str) -> tuple[dict[str, Any], bool]:
@@ -269,7 +343,13 @@ class Harness:
         so a mid-bout towel there routinely arrives after the finish.
         """
 
-        status, payload = self.request("POST", f"/api/sessions/{session_id}/towel", timeout=600)
+        try:
+            status, payload = self.request(
+                "POST", f"/api/sessions/{session_id}/towel", timeout=600
+            )
+        except ResponseLost as lost:
+            settled = self.settle_lost(session_id, "towel", lost, 600)
+            return settled, settled.get("state") != "towelled"
         if status == 200:
             return payload, False
         if status == 409:
@@ -277,6 +357,30 @@ class Harness:
             if latest.get("state") in TERMINAL:
                 return latest, True
         raise RuntimeError(f"towel returned {status}: {payload}")
+
+    def release(self, session_id: str, round_id: str) -> None:
+        """Bring a session a failed scenario left behind to rest, as a presenter would.
+
+        A fight card still checking takes no control but Round 1's cancel, so it is let
+        finish first: sending `run` into the check is what the app rightly refused with
+        a 409 (rc8, 2026-10-01). An armed card is then released, as "Change the matchup"
+        does, and a bout still running is towelled. A draft or a finished session holds
+        nothing.
+        """
+
+        snapshot = self.get_session(session_id)
+        state = snapshot.get("state")
+        if state == "checking" and round_id == "wake_idle_app":
+            self.post(session_id, "cancel-arm", timeout=600)
+            return
+        if state == "checking":
+            state = self.wait_session(session_id, {"armed"} | TERMINAL, 600, round_id).get(
+                "state"
+            )
+        if state == "armed":
+            self.post(session_id, "cancel-arm", timeout=600)
+        elif state == "running":
+            self.towel_or_finished(session_id)
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         status, payload = self.request("GET", f"/api/sessions/{session_id}", timeout=60)
@@ -450,11 +554,20 @@ class Harness:
                     nonlocal final
                     deadline = time.monotonic() + 10
                     while not cancel_won.is_set() and time.monotonic() < deadline:
-                        status, payload = self.request(
-                            "POST",
-                            f"/api/sessions/{session_id}/cancel-arm",
-                            timeout=600,
-                        )
+                        try:
+                            status, payload = self.request(
+                                "POST",
+                                f"/api/sessions/{session_id}/cancel-arm",
+                                timeout=600,
+                            )
+                        except ResponseLost:
+                            # The cancel may have won with its answer lost; the session says.
+                            snapshot = self.get_session(session_id)
+                            status, payload = (
+                                (200, snapshot)
+                                if snapshot.get("state") in TERMINAL
+                                else (0, snapshot)
+                            )
                         if status == 200:
                             with final_lock:
                                 if final is None:
@@ -514,11 +627,13 @@ class Harness:
                 final, raced = self.towel_or_finished(session_id)
                 if raced:
                     result["towel_raced_finish"] = True
-                    final = self.wait_session(session_id, TERMINAL, 1500, round_id)
+                    final = self.wait_session(
+                        session_id, TERMINAL, VERDICT_TIMEOUT_SECONDS, round_id
+                    )
             elif delay is not None:
                 final = running
             else:
-                final = self.wait_session(session_id, TERMINAL, 1500, round_id)
+                final = self.wait_session(session_id, TERMINAL, VERDICT_TIMEOUT_SECONDS, round_id)
                 if scenario == "finish-linger" and final.get("state") == "verified":
                     # The presenter lets the bout finish and leaves the result up
                     # without touching anything. Nothing on screen may change.
@@ -533,9 +648,29 @@ class Harness:
                     and round_id != "survive_connection_spike"
                     and (not cooldown or cooldown.get("state") == "failed")
                 ):
-                    status, payload = self.request(
-                        "POST", f"/api/sessions/{session_id}/cooldown", timeout=600
-                    )
+                    try:
+                        status, payload = self.request(
+                            "POST", f"/api/sessions/{session_id}/cooldown", timeout=600
+                        )
+                    except ResponseLost as lost:
+                        self.log(
+                            "response_lost",
+                            session_id=session_id,
+                            control="cooldown",
+                            detail=str(lost),
+                        )
+                        latest = self.get_session(session_id)
+                        started = (latest.get("cooldown") or {}).get("state") not in (
+                            None,
+                            "failed",
+                        )
+                        status, payload = (
+                            (200, latest)
+                            if started
+                            else self.request(
+                                "POST", f"/api/sessions/{session_id}/cooldown", timeout=600
+                            )
+                        )
                     result["cooldown_post"] = status
                     if status not in (200, 409):
                         raise RuntimeError(f"cooldown returned {status}: {payload}")
@@ -578,7 +713,9 @@ class Harness:
                     rearm_final, raced = self.towel_or_finished(rearm_id)
                     if raced:
                         result["rearm_towel_raced_finish"] = True
-                        rearm_final = self.wait_session(rearm_id, TERMINAL, 1500, round_id)
+                        rearm_final = self.wait_session(
+                            rearm_id, TERMINAL, VERDICT_TIMEOUT_SECONDS, round_id
+                        )
                 else:
                     rearm_final = rearm_running
                 rearm_ready = self.wait_round_ready(round_id)
@@ -599,28 +736,22 @@ class Harness:
                 error=result["error"],
                 detail=result["detail"],
             )
+            session_id = result.get("rearm_session_id") or result.get("session_id")
             try:
-                session_id = result.get("rearm_session_id") or result.get("session_id")
                 if session_id:
-                    snapshot = self.get_session(session_id)
-                    if snapshot.get("state") == "checking" and round_id == "wake_idle_app":
-                        self.post(session_id, "cancel-arm", timeout=600)
-                    elif snapshot.get("state") in {"armed", "checking"}:
-                        self.post(session_id, "run", timeout=600)
-                        self.wait_session(
-                            session_id,
-                            {"running", "verified", "failed", "towelled"},
-                            600,
-                            round_id,
-                        )
-                        current = self.get_session(session_id)
-                        if current.get("state") == "running":
-                            self.post(session_id, "towel", timeout=600)
-                    elif snapshot.get("state") == "running":
-                        self.post(session_id, "towel", timeout=600)
-                    self.wait_round_ready(round_id, timeout=1200)
+                    self.release(session_id, round_id)
             except Exception as recovery:
                 result["recovery_error"] = f"{type(recovery).__name__}: {recovery}"
+            # Whatever the release did, the next scenario needs this round back. A
+            # recovery that raised used to skip this wait, and the next four scenarios
+            # found the round busy and failed in two seconds (rc8, 2026-10-01).
+            if session_id:
+                try:
+                    self.wait_round_ready(round_id, timeout=1200)
+                except Exception as unready:
+                    result.setdefault(
+                        "recovery_error", f"{type(unready).__name__}: {unready}"
+                    )
         result["elapsed_seconds"] = round(time.monotonic() - started, 2)
         result["finished_at"] = now()
         with self.lock:

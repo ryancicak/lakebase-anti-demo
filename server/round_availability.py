@@ -93,11 +93,13 @@ from .reconcile import PRESENCE_MISSING, InstallationPresence
 
 #: Rounds that reach a live Aurora or RDS opponent, and so cannot arm without
 #: working AWS credentials and the sealed infrastructure still being in the
-#: account. Rounds 4 and 6 are deliberately absent: both are capability-gap
-#: rounds whose AWS lane is disclosed rather than raced, so they execute against
-#: Lakebase alone and need no AWS at all. `/readyz` reasons about them the same
-#: way -- it refuses to turn a missing installation into a 503 partly because
-#: "Rounds 4 and 6 need no AWS at all".
+#: account. Rounds 4 and 6 are absent from the set and join it per installation:
+#: once a round's AWS lane is sealed (Round 4's Glue writer, Round 6's DMS and
+#: Glue pipeline) it races Aurora or RDS like the rest
+#: (`AvailabilitySignals.round4_aws_sealed`, `round6_aws_sealed`), and without its
+#: lane it races Lakebase alone and needs no AWS at all. `/readyz` reasons about
+#: them the same way -- it refuses to turn a missing installation into a 503 partly
+#: because some rounds need no AWS.
 #:
 #: This set also decides the deployed-context network refusal, because "reaches a
 #: live Aurora or RDS opponent" is exactly "must open TCP 5432 to a security group
@@ -219,8 +221,8 @@ AWS_LANE_DEPLOYED_REFUSAL = (
     "by an operator running './antidemo setup' -- which re-polls the published "
     "list, reseals it and re-applies the security groups. This installation has "
     "not sealed that list, so until it does, the round runs from a local "
-    "checkout, attended, from the sealed operator address. Rounds 4 and 6 reach "
-    "no AWS database and are unaffected here."
+    "checkout, attended, from the sealed operator address. The rounds that reach "
+    "no AWS database are unaffected here."
 )
 
 ROUND5_DEPLOYED_REFUSAL = (
@@ -355,6 +357,11 @@ class AvailabilitySignals:
     #: trusting exactly one principal while both callers reach it. Same default
     #: and same reasoning as the field above.
     round5_runtime_role_sealed: bool = False
+    #: Whether this installation sealed Round 4's AWS Glue lane, which makes Round 4 an
+    #: AWS-backed round here. Defaults to the answer an installation without the lane has.
+    round4_aws_sealed: bool = False
+    #: The same for Round 6's AWS DMS and Glue lane.
+    round6_aws_sealed: bool = False
     #: Rounds Databricks has already refused on authorization in this process,
     #: keyed to the reason an operator should read. Written by the arm path in
     #: `server.manager`, which is the only thing here that has made the call, and
@@ -400,6 +407,16 @@ def _credential_detail(signals: AvailabilitySignals) -> str | None:
     return getattr(signals.credentials, "detail", None) if signals.credentials else None
 
 
+def aws_backed(round_id: RoundId, signals: AvailabilitySignals) -> bool:
+    """Whether this round races a live AWS lane on this installation."""
+
+    return (
+        round_id in AWS_BACKED_ROUNDS
+        or (round_id == RoundId.PUT_MODEL_SCORE_IN_APP and signals.round4_aws_sealed)
+        or (round_id == RoundId.ANALYZE_LIVE_ORDERS and signals.round6_aws_sealed)
+    )
+
+
 def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | None:
     """Why this round cannot arm right now, or None if nothing says it cannot.
 
@@ -429,7 +446,8 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
         )
 
     credential_state = _credential_state(signals)
-    if round_id in AWS_BACKED_ROUNDS and credential_state in _TOTAL_CREDENTIAL_FAULTS:
+    racing_aws = aws_backed(round_id, signals)
+    if racing_aws and credential_state in _TOTAL_CREDENTIAL_FAULTS:
         return RoundRefusal(
             _CREDENTIALS_HEADLINE,
             _credential_detail(signals)
@@ -439,7 +457,7 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
             ),
         )
 
-    if signals.deployed and round_id in AWS_BACKED_ROUNDS:
+    if signals.deployed and racing_aws:
         # Deployed before the transient signals below: these refusals are
         # structural, and reporting a structural refusal as one of the transient
         # ones would invite an operator to wait for something that will not
@@ -502,9 +520,9 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
         # round, and this is the round itself having been refused by name. A
         # prediction does not outrank an observation.
         #
-        # For Rounds 4 and 6 -- the only two this realistically fires for, since
-        # they are the only two that reach Lakebase and no AWS -- none of the
-        # branches above applies at all, so this is effectively the first check.
+        # For a Round 4 or Round 6 without its AWS lane -- the rounds this
+        # realistically fires for, since they reach Lakebase and no AWS -- none of
+        # the branches above applies at all, so this is effectively the first check.
         return RoundRefusal(_GRANT_HEADLINE, grant_refused)
 
     if round_id == RoundId.SURVIVE_CONNECTION_SPIKE:
@@ -530,7 +548,7 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
 
     presence = signals.presence
     if (
-        round_id in AWS_BACKED_ROUNDS
+        racing_aws
         and presence is not None
         and presence.state == PRESENCE_MISSING
     ):

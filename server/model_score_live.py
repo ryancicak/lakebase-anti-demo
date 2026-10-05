@@ -96,8 +96,11 @@ PIPELINE_UPDATE_FAILED_STATES = frozenset({"FAILED"})
 #:
 #: `SYNCED_TABLE_OFFLINE_FAILED` is deliberately absent, and its absence is what
 #: keeps this from becoming a blanket exemption. That state says the table itself
-#: went offline and failed, which no stop produces, so it stays terminal however
-#: the update ended.
+#: went offline and failed, so it stays terminal however the update ended. A stop
+#: of a settled continuous sync never produces it. One stop did: rc20's setup
+#: (2026-10-05) cancelled a new pipeline's first update three seconds into
+#: RUNNING, before the table was online in every view, and setup now lets that
+#: update settle before it parks (`lifecycle._park_round4_pipeline`).
 STOPPABLE_SYNCED_TABLE_FAILED_STATE = "SYNCED_TABLE_ONLINE_PIPELINE_FAILED"
 
 #: The newest-update states that mean somebody ended the update rather than the

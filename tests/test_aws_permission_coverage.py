@@ -59,7 +59,7 @@ APP_RUNTIME_POLICY = IAM_DOCS / "anti-demo-app-runtime.json"
 #: this list because all but one of its actions travel on an assumed role; that
 #: one is asserted by
 #: `test_the_app_principal_can_assume_the_round_five_control_role`.
-APP_ROUNDS = (1, 2, 3)
+APP_ROUNDS = (1, 2, 3, 4, 6)
 
 #: IAM's own cap on a customer-managed policy, counted over non-whitespace JSON.
 IAM_POLICY_CHARACTER_LIMIT = 6144

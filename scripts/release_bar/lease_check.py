@@ -17,8 +17,11 @@ on every resource its Terraform made, and fails unless:
 
 With `--plan` it then runs `terraform plan`, which applies nothing, and fails
 on any proposed resource or output change: the app's retag must be invisible to
-Terraform. Needs `ANTI_DEMO_APP_URL` and `ANTI_DEMO_PROFILE`, and uses the AWS
-key in CHECKOUT's `.env.bootstrap`. Prints counts and times, never identifiers.
+Terraform. Two changes are set aside, because nothing the app does makes them:
+a resource whose only change is losing tags someone else added to it, and an
+output whose list holds the same items in another order. Needs
+`ANTI_DEMO_APP_URL` and `ANTI_DEMO_PROFILE`, and uses the AWS key in
+CHECKOUT's `.env.bootstrap`. Prints counts and times, never identifiers.
 Exit 0 when every check passed, 1 when one failed.
 """
 
@@ -26,11 +29,14 @@ from __future__ import annotations
 
 import argparse
 import collections
+import json
 import os
 import sys
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import AppClient, use_checkout  # noqa: E402
@@ -43,6 +49,105 @@ READYZ_WAIT_SECONDS = 12 * 60
 
 def _aware(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+_TAG_ATTRIBUTES = ("tags", "tags_all")
+#: The tag keys the installation's Terraform sets, beside every key under `anti-demo`.
+_OWN_TAG_KEYS = frozenset({"Name", "Owner", "owner", "expires-at", "managed-by"})
+
+
+def _own_tag(key: str) -> bool:
+    return key in _OWN_TAG_KEYS or key.startswith("anti-demo")
+
+
+def _unknown(flag: Any) -> bool:
+    """Whether an ``after_unknown`` entry marks anything unknown, at any depth: Terraform writes
+    a known nested block as a structure of falses, which reads as true taken whole."""
+
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, Mapping):
+        return any(_unknown(value) for value in flag.values())
+    if isinstance(flag, list | tuple):
+        return any(_unknown(value) for value in flag)
+    return False
+
+
+def only_loses_foreign_tags(change: Mapping[str, Any]) -> bool:
+    """Whether a planned update does nothing but drop tags someone else added.
+
+    rc19 (2026-10-05): the account's own automation tagged two of the installation's VPC
+    endpoints at 04:00Z, and the plan after the bar proposed taking the tag off again. So every
+    tag the plan keeps must keep its value, and every tag it drops must have a key the
+    installation never uses. A tag of its own that is missing, changed or dropped is still
+    drift, and so is any other attribute.
+    """
+
+    if change.get("actions") != ["update"]:
+        return False
+    before = change.get("before") or {}
+    after = change.get("after") or {}
+    if _unknown(change.get("after_unknown")):
+        return False
+    others = {key for key in {*before, *after} if key not in _TAG_ATTRIBUTES}
+    if any(before.get(key) != after.get(key) for key in others):
+        return False
+    dropped_some = False
+    for attribute in _TAG_ATTRIBUTES:
+        had = before.get(attribute) or {}
+        keeps = after.get(attribute) or {}
+        if not isinstance(had, Mapping) or not isinstance(keeps, Mapping):
+            return False
+        if any(had.get(key) != value for key, value in keeps.items()):
+            return False
+        dropped = set(had) - set(keeps)
+        if any(_own_tag(key) for key in dropped):
+            return False
+        dropped_some = dropped_some or bool(dropped)
+    return dropped_some
+
+
+def only_reorders(change: Mapping[str, Any]) -> bool:
+    """Whether a planned output change holds the same list items in another order.
+
+    rc19 (2026-10-05): AWS listed the same three subnets in another order, and `subnet_ids`
+    changed with nothing in it changing.
+    """
+
+    before, after = change.get("before"), change.get("after")
+    if _unknown(change.get("after_unknown")):
+        return False
+    if not isinstance(before, list) or not isinstance(after, list):
+        return False
+
+    def items(values: list[Any]) -> list[str]:
+        return sorted(json.dumps(value, sort_keys=True) for value in values)
+
+    return before != after and items(before) == items(after)
+
+
+def plan_drift(document: Mapping[str, Any]) -> tuple[list[tuple[str, list[str]]], list[str], int]:
+    """A plan's resource and output changes, less the ones set aside, and how many were."""
+
+    changes: list[tuple[str, list[str]]] = []
+    set_aside = 0
+    for entry in document.get("resource_changes") or []:
+        change = entry.get("change") or {}
+        if change.get("actions") in (["no-op"], ["read"], None):
+            continue
+        if only_loses_foreign_tags(change):
+            set_aside += 1
+            continue
+        changes.append((str(entry.get("address")), list(change.get("actions") or [])))
+    outputs = []
+    for name, change in sorted((document.get("output_changes") or {}).items()):
+        if change.get("actions") in (["no-op"], None):
+            continue
+        if only_reorders(change):
+            set_aside += 1
+            continue
+        outputs.append(name)
+    return changes, outputs, set_aside
 
 
 def wait_for_current_lease(client: AppClient) -> tuple[bool, dict[str, object]]:
@@ -116,15 +221,10 @@ def main() -> int:
     if args.plan:
         lifecycle._terraform_init(manifest)
         document = lifecycle._terraform_plan_json(manifest, lifecycle._terraform_plan(manifest))
-        changes = [
-            (entry.get("address"), entry.get("change", {}).get("actions"))
-            for entry in document.get("resource_changes") or []
-            if entry.get("change", {}).get("actions") not in (["no-op"], ["read"], None)
-        ]
-        outputs = sorted(
-            name
-            for name, change in (document.get("output_changes") or {}).items()
-            if change.get("actions") not in (["no-op"], None)
+        changes, outputs, set_aside = plan_drift(document)
+        print(
+            "terraform plan changes set aside (foreign tags dropped, outputs reordered):",
+            set_aside,
         )
         print("terraform plan resource changes:", len(changes))
         for address, actions in changes:

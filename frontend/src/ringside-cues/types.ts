@@ -21,11 +21,9 @@ export const OUTCOME_IDS = [
   'one_sided_verified',
   'one_sided_towel_lower_bound',
   'one_sided_setup_verified_towel',
-  'score_identity_unverified',
   'setup_incomplete',
   'bounded_check_failed',
   'cleanup_failed',
-  'checkout_guardrail_unverified',
   'no_result',
   'towel_no_verified_lane',
 ] as const

@@ -1,10 +1,11 @@
 """What this installation is billed for while nobody is ringing the bell.
 
 The marginal question -- "what did that bout cost?" -- is answered elsewhere and
-is usually the smaller number. This module answers the other one. Four RDS
-instances, four Aurora clusters, a runner, a synced-table pipeline and an
-always-on app bill every second of every day whether or not anyone opens the
-browser, and none of that appears on a bout receipt.
+is usually the smaller number. This module answers the other one. Five RDS
+instances, six Aurora clusters (one of them held awake by logical replication),
+Round 6's DMS replication instance, two runners and an always-on app bill every
+second of every day whether or not anyone opens the browser, a synced-table
+pipeline bills every second it is up, and none of that appears on a bout receipt.
 
 **This path must never read CDF or change-feed status through the Lakebase
 control plane. Reproduced twice, it wakes the endpoint and bills the thing being
@@ -69,6 +70,9 @@ from .capacity import AURORA_AUTO_PAUSE_SECONDS, LAKEBASE_SUSPEND_SECONDS
 from .cost_model import (
     AS_RUN_RDS_INSTANCE_CLASS,
     IMPUTED_RDS_ROUNDS,
+    LOGICAL_REPLICATION_ROUNDS,
+    PROVISIONED_NOT_YET_RACED_ROUNDS,
+    ROUND4_GLUE_DPU,
     TERRAFORM_PROXY_SECRETS,
     TERRAFORM_RUNNER_CONTROL_SECRETS,
     CarryingWindow,
@@ -146,6 +150,26 @@ _IMPUTED_RDS_ROUND_NUMBERS: tuple[int, ...] = tuple(
 )
 
 
+# An instance can stand without its round racing it, and which ones do is a fact
+# about the installation, so it is read per build rather than at import. Rounds 4
+# and 6 stand theirs on every installation from v1.1, and each races it only where
+# that installation has sealed the round's AWS lane (`manifest.round4_aws`,
+# `manifest.round6_aws`). A round still in `PROVISIONED_NOT_YET_RACED_ROUNDS`
+# stands ahead of a lane that has not landed at all. The caveat names them apart,
+# so it never says they race.
+def _unraced_rds_round_numbers(manifest: object | None) -> tuple[int, ...]:
+    unraced = set(PROVISIONED_NOT_YET_RACED_ROUNDS)
+    if getattr(manifest, "round4_aws", None) is None:
+        unraced.add(RoundId.PUT_MODEL_SCORE_IN_APP)
+    if getattr(manifest, "round6_aws", None) is None:
+        unraced.add(RoundId.ANALYZE_LIVE_ORDERS)
+    return tuple(
+        _ROUND_NUMBERS[round_id]
+        for round_id in RoundId
+        if round_id not in IMPUTED_RDS_ROUNDS and round_id in unraced
+    )
+
+
 def _round_list(numbers: tuple[int, ...]) -> str:
     """ "Rounds 2, 3 and 5" from (2, 3, 5), so the prose tracks the fleet."""
 
@@ -155,6 +179,21 @@ def _round_list(numbers: tuple[int, ...]) -> str:
         return f"Round {numbers[0]}"
     head = ", ".join(str(number) for number in numbers[:-1])
     return f"Rounds {head} and {numbers[-1]}"
+
+
+def _rds_raced_clause(unraced: tuple[int, ...]) -> str:
+    """Which of the standing instances are raced, without claiming any that are not."""
+
+    if not unraced:
+        return ", and each of those rounds races it."
+    raced = tuple(number for number in _STANDING_RDS_ROUND_NUMBERS if number not in unraced)
+    standing = (
+        f"Round {unraced[0]}'s stands for an AWS lane this installation does not race"
+        if len(unraced) == 1
+        else f"those for {_round_list(unraced)} stand for AWS lanes this installation "
+        "does not race"
+    )
+    return f"; {_round_list(raced)} race theirs, and {standing}."
 
 
 # The paragraph is derived from the current physical topology. Round 5 V4 uses
@@ -176,14 +215,27 @@ _FAIRNESS_PARAGRAPH = (
     "can scale to zero at any price."
 )
 
+# Round 6's cold rule, priced where it is disclosed (the v1.1 design, section 2):
+# Lakebase's change feed is part of the database and never stops, while AWS's DMS
+# task and Glue job are parked at rest and cold start at the bell. What keeping the
+# Glue job up all day would cost is the fair counterpart to a feed that is always
+# on, so it is stated here, from the rate card, and added to neither total, because
+# nothing here runs it all day. The DMS instance stands either way and is already
+# in the AWS half.
+_ROUND6_ALWAYS_ON_SENTENCE = (
+    " In Round 6 Lakebase's change feed is part of the database and always on, while "
+    "AWS's DMS task and Glue job stay parked and cold start at the bell. Keeping that "
+    "Glue job running all day to match would add {glue}/day, which is in neither total."
+)
+
 # The one platform meter this module says anything more about than "it bills".
 # Held here and imported by the caller that labels the posted rows, so the two
 # cannot drift into naming the same pipeline two ways -- which would silently
 # withhold the paragraph below rather than fail.
 ROUND4_PIPELINE_LABEL = "Round 4 synced-table pipeline"
 
-# The platform meters that are deliberately intermittent: brought up when a round
-# arms and released once its bout has settled. Declared per component for the
+# The platform meters that are deliberately intermittent: parked at rest, started
+# at the bell and parked again once the bout has settled. Declared per component for the
 # reason `bout_cost.ROUNDS_WITHOUT_AURORA` is -- being up around the clock is a
 # property of the resource, not of the method that prices it -- because the
 # divisor that is exact for one is wrong for the other.
@@ -211,19 +263,17 @@ INTERMITTENT_PLATFORM_COMPONENTS = frozenset({ROUND4_PIPELINE_LABEL})
 # in this payload measures how long a bout runs, and an assumed length multiplied
 # by a real rate produces a figure that looks measured and is not.
 #
-# TWO CLAIMS WERE REMOVED FROM THIS PARAGRAPH BECAUSE A MEASUREMENT CONTRADICTED
-# THEM. It used to justify running around the clock on the grounds that "starting
-# the pipeline at the bell would move its startup inside the bout clock and
-# change what the round measures". Neither half survived contact with the
-# account. The pipeline is started at *arm*, not at the bell, and `armed_at` is
-# captured after `arm()` returns, so no part of a start is inside the bout clock.
-# And what the round measures is `sync_end - committed_at` on the commit the bell
-# itself makes, with `_prove_update` refusing unless the status commit is that
-# exact commit -- nothing reads a backfill watermark or any window before the
-# bell -- so a pipeline started ninety seconds earlier measures the same quantity
-# a resident one measures. Measured 2026-08-24: a stopped pipeline resumed to a
-# fully healthy continuous sync in 19.2 s, at the same Delta version it stopped
-# on rather than re-seeding.
+# WHAT THIS PARAGRAPH SAYS ABOUT THE START HAS BEEN WRONG BEFORE, SO IT SAYS ONLY
+# WHAT THE ROUND DOES NOW. It once justified running around the clock on the
+# grounds that starting at the bell would move the startup onto the clock; v1 then
+# started the pipeline at *arm*, so no start was on the clock at all, and the
+# paragraph said that instead. v1.1 races Lakebase against an AWS Glue job with
+# both integrations parked at the bell (`docs/design/v1.1-rounds-4-6-aws.md`), so
+# the pipeline's start is on Lakebase's own clock by design, exactly as the Glue
+# job's start is on AWS's. The paragraph states that, because it is the round's
+# condition rather than a cost of it. Measured 2026-08-24: a stopped pipeline
+# resumed to a fully healthy continuous sync in 19.2 s, at the same Delta version
+# it stopped on rather than re-seeding.
 #
 # The accrued figure is here for a reason worth stating. `pipeline_power.
 # session_notice` was the accepted mitigation for this cost and it reasons from
@@ -240,13 +290,13 @@ _CONTINUOUS_PARAGRAPH = (
     "against it over the {elapsed} this installation has existed. Continuous "
     "governed sync is what the round demonstrates, so the pipeline is continuous "
     "whenever it is up. It does not have to be up between bouts to be continuous "
-    "during them: it is started when a round arms and stopped once that bout has "
-    "settled, which takes the {per_day} down to roughly {per_hour} for each hour "
-    "a bout is actually held. What the round measures is unaffected, because the "
-    "figure it reports is taken from the commit the bell itself makes and not "
-    "from any window before it. No per-bout figure is claimed here: nothing in "
-    "this disclosure measures how long a bout runs, and an assumed length "
-    "multiplied by that rate would read as a measurement without being one."
+    "during them: it is parked at rest, started at the bell and parked again once "
+    "that bout has settled, which takes the {per_day} down to roughly {per_hour} "
+    "for each hour a bout is actually held. Its start counts against Lakebase's "
+    "own clock, because the round times each integration from a cold start at the bell. "
+    "No per-bout figure is claimed here: nothing in this disclosure measures how "
+    "long a bout runs, and an assumed length multiplied by that rate would read as "
+    "a measurement without being one."
 )
 
 _CONTINUOUS_LARGEST = ", and the largest single line on that side"
@@ -549,50 +599,137 @@ def _rds_class_basis(configured: str, observed: str | None) -> str:
     )
 
 
+def _imputed_rds_clause() -> str:
+    """Which rounds have no instance here, spelled for one round or several."""
+
+    numbers = _IMPUTED_RDS_ROUND_NUMBERS
+    rounds = _round_list(numbers)
+    if len(numbers) == 1:
+        return (
+            f"{rounds} has no instance here -- its instance was deleted because RDS "
+            "has no idle state to wake from, so it billed without ever being timed -- "
+            "so this is what we pay, not what the workload costs: a customer who needs "
+            "that round pays for one more box, because RDS cannot scale to zero."
+        )
+    return (
+        f"{rounds} have no instance here -- Round 1's was deleted because RDS has no "
+        "idle state to wake from, so it billed without ever being timed -- so this is "
+        "what we pay, not what the workload costs: a customer who needs those rounds "
+        f"pays for {number_word(len(numbers))} more boxes, because RDS cannot scale "
+        "to zero."
+    )
+
+
+def _aurora_copy(shape: InstallationShape) -> tuple[str, str]:
+    """The Aurora lane's idle label and caveat, naming any cluster that cannot park.
+
+    Read off the shape and `LOGICAL_REPLICATION_ROUNDS`, the same inputs that price
+    the lane, so the prose cannot say every cluster sleeps while the figure bills
+    one awake.
+    """
+
+    replicating = shape.aurora_replicating_clusters
+    if replicating <= 0:
+        return (
+            f"Sleeps · {AURORA_AUTO_PAUSE_SECONDS}s auto-pause, and parks at the sealed "
+            "minimum capacity",
+            "Compute parks at the sealed minimum, and that zero is a configuration "
+            "rather than a missing measurement. Storage, the writer's address and its "
+            "managed secret bill regardless of whether the cluster is awake.",
+        )
+    numbers = tuple(
+        _ROUND_NUMBERS[round_id] for round_id in RoundId if round_id in LOGICAL_REPLICATION_ROUNDS
+    )
+    named = (
+        f"{_round_list(numbers)}'s" if len(numbers) == 1 else f"those for {_round_list(numbers)}"
+    )
+    # The capacity the carrying line bills, so the two can never disagree.
+    awake = f"{_plain_acu(max(shape.aurora_min_acu, shape.aurora_replicating_acu))} ACU"
+    one = replicating == 1
+    return (
+        f"Sleeps · {AURORA_AUTO_PAUSE_SECONDS}s auto-pause, except {named}, which "
+        f"logical replication holds awake at {awake}",
+        f"Compute parks at the sealed minimum on every cluster except {named}, and that "
+        "zero is a configuration rather than a missing measurement. "
+        f"{named[0].upper()}{named[1:]} cannot park: {'it has' if one else 'they have'} "
+        "logical replication on for AWS change capture, and AWS does not auto-pause an "
+        "Aurora PostgreSQL writer with logical replication on, so "
+        f"{'it bills' if one else 'each bills'} {awake} around the clock, the least a "
+        "running cluster holds. Storage, each writer's address and its managed secret "
+        "bill regardless of whether the cluster is awake.",
+    )
+
+
+def _plain_acu(value: Decimal) -> str:
+    """0.5 rather than 0.50 or 5E-1, for a capacity said in prose."""
+
+    return format(value.normalize(), "f")
+
+
 def _lane_copy(
     rates: RateCard,
     *,
     observed_rds_instance_class: str | None = None,
+    unraced_rds_rounds: tuple[int, ...] = (),
+    round4_glue_lane_sealed: bool = False,
+    round6_dms_lane_sealed: bool = False,
+    shape: InstallationShape | None = None,
 ) -> dict[StandingCostLaneId, _LaneCopy]:
     """Lane labels, with every number in them read off the same inputs."""
 
     rds_basis = _rds_class_basis(rates.rds_instance_class, observed_rds_instance_class)
+    aurora_idle, aurora_caveat = _aurora_copy(shape or InstallationShape())
+
+    # Split between the two competitor lanes by `_allocations`, so each lane says so.
+    def dms_lane(other: str) -> str:
+        if not round6_dms_lane_sealed:
+            return ""
+        return (
+            " Round 6's AWS DMS replication instance runs both competitors' capture "
+            "tasks and bills around the clock whether or not they run, so half of it is "
+            f"in this lane and half in the {other} lane. Its Glue job bills nothing while "
+            "parked."
+        )
+    # Stated where the lane exists, and not priced, because nothing in it bills at
+    # rest beyond storage measured in kilobytes. Said rather than left out, so its
+    # absence from the total is a finding and not a gap.
+    glue_lane = (
+        " Round 4's AWS Glue lane adds no standing line of its own: its jobs and "
+        "connections bill nothing while parked, its subnet, route table, S3 gateway "
+        "endpoint and role are free, and its bucket holds only kilobytes, the job's "
+        "script and checkpoints and run markers that expire within a week. So nothing "
+        "of it is priced here."
+        if round4_glue_lane_sealed
+        else ""
+    )
     return {
         StandingCostLaneId.RDS: _LaneCopy(
             product=f"RDS PostgreSQL {rates.rds_instance_class}",
             side="competitor",
             idle_label="Never sleeps · no idle floor to descend into",
             caveat=(
-                # Every instance that stands is now also raced, which was not true
-                # while Round 1 had one. The rounds that no longer carry a box are
-                # not free for a customer -- RDS cannot scale to zero, so
+                # Every instance that stands is raced, except one whose lane this
+                # installation does not race (Round 4's, until it seals its AWS
+                # Glue lane), which `_rds_raced_clause` names apart. That was not
+                # true while Round 1 had one either: its box billed without ever
+                # being timed. The rounds that carry no box are not free for a
+                # customer -- RDS cannot scale to zero, so
                 # `imputed_round_carrying_lines` prices them as if running -- and
                 # this figure covers only what *this* installation is billed, so
                 # the caveat has to say which is which or the total reads as the
                 # whole of the alternative.
-                f"An instance stands for {_round_list(_STANDING_RDS_ROUND_NUMBERS)}, and "
-                "each of those rounds races it. This figure covers those instances only. "
-                f"{_round_list(_IMPUTED_RDS_ROUND_NUMBERS)} have no instance here -- "
-                "Round 1's was deleted because RDS has no idle state to wake from, so it "
-                "billed without ever being timed -- so this is what we pay, not what the "
-                "workload costs: a customer who needs those rounds pays for "
-                f"{number_word(len(_IMPUTED_RDS_ROUND_NUMBERS))} more boxes, because RDS "
-                "cannot scale to zero. Nothing in this app stops or starts the instances "
-                f"that do stand.{rds_basis}"
+                f"An instance stands for {_round_list(_STANDING_RDS_ROUND_NUMBERS)}"
+                f"{_rds_raced_clause(unraced_rds_rounds)} This figure covers those "
+                f"instances only. {_imputed_rds_clause()} Nothing in this app stops or "
+                f"starts the instances that do stand.{glue_lane}{dms_lane('Aurora')}"
+                f"{rds_basis}"
             ),
         ),
         StandingCostLaneId.AURORA: _LaneCopy(
             product="Aurora Serverless v2",
             side="competitor",
-            idle_label=(
-                f"Sleeps · {AURORA_AUTO_PAUSE_SECONDS}s auto-pause, and parks at the "
-                "sealed minimum capacity"
-            ),
-            caveat=(
-                "Compute parks at the sealed minimum, and that zero is a configuration "
-                "rather than a missing measurement. Storage, the writer's address and "
-                "its managed secret bill regardless of whether the cluster is awake."
-            ),
+            idle_label=aurora_idle,
+            caveat=f"{aurora_caveat}{dms_lane('RDS')}",
         ),
         StandingCostLaneId.LAKEBASE: _LaneCopy(
             product="Lakebase",
@@ -628,7 +765,7 @@ def _lane_copy(
         StandingCostLaneId.DATABRICKS_PLATFORM: _LaneCopy(
             product="Databricks platform",
             side="platform",
-            idle_label="Never sleeps · the pipeline holds state and the app is always on",
+            idle_label="The app never sleeps · the pipeline parks between bouts, keeping its state",
             caveat=(
                 "This is not the Lakebase lane. The synced-table pipeline and the app's "
                 "own compute are the largest standing lines in the installation, and "
@@ -664,6 +801,12 @@ def _allocations(line: CostLine, shape: InstallationShape) -> tuple[_Allocation,
         return _address_allocations(shape)
     if "credentials" in lowered:
         return _secret_allocations(shape)
+    if "dms replication instance" in lowered:
+        # One instance, one capture task per competitor, so it splits evenly.
+        return tuple(
+            _Allocation(lane, 1, 2, "one of the replication instance's two capture tasks")
+            for lane in (StandingCostLaneId.AURORA, StandingCostLaneId.RDS)
+        )
     if "aurora" in lowered:
         return (_Allocation(StandingCostLaneId.AURORA, 1, 1),)
     if "rds" in lowered:
@@ -672,10 +815,11 @@ def _allocations(line: CostLine, shape: InstallationShape) -> tuple[_Allocation,
 
 
 def _address_allocations(shape: InstallationShape) -> tuple[_Allocation, ...]:
-    total = shape.public_ipv4_addresses
+    # The database line only: the runners' addresses have a line of their own, which
+    # `_allocations` already gives the neutral runner whole.
+    total = shape.database_public_ipv4_addresses
     rds = min(shape.rds_instances, total)
     aurora = min(shape.aurora_clusters, total - rds)
-    runner = total - rds - aurora
     parts = (
         (StandingCostLaneId.RDS, rds, "one address per publicly reachable RDS instance"),
         (
@@ -683,14 +827,9 @@ def _address_allocations(shape: InstallationShape) -> tuple[_Allocation, ...]:
             aurora,
             "one address per publicly reachable Aurora writer",
         ),
-        (
-            StandingCostLaneId.NEUTRAL_RUNNER,
-            runner,
-            "one address per resident runner instance",
-        ),
     )
     return tuple(
-        _Allocation(lane, units, total, f"{units} of {total} chargeable addresses · {basis}")
+        _Allocation(lane, units, total, f"{units} of {total} database addresses · {basis}")
         for lane, units, basis in parts
         if units > 0
     )
@@ -990,8 +1129,19 @@ def _lanes(
     platform: Sequence[PlatformComponent],
     observed: bool,
     observed_rds_instance_class: str | None = None,
+    unraced_rds_rounds: tuple[int, ...] = (),
+    round4_glue_lane_sealed: bool = False,
+    round6_dms_lane_sealed: bool = False,
+    shape: InstallationShape | None = None,
 ) -> list[StandingCostLane]:
-    copy = _lane_copy(rates, observed_rds_instance_class=observed_rds_instance_class)
+    copy = _lane_copy(
+        rates,
+        observed_rds_instance_class=observed_rds_instance_class,
+        unraced_rds_rounds=unraced_rds_rounds,
+        round4_glue_lane_sealed=round4_glue_lane_sealed,
+        round6_dms_lane_sealed=round6_dms_lane_sealed,
+        shape=shape,
+    )
     lanes: list[StandingCostLane] = []
     for lane_id in StandingCostLaneId:
         owned = [item for item in items if item.lane is lane_id]
@@ -1428,10 +1578,20 @@ def _drift(report: DriftReport | None, now: datetime) -> StandingCostDrift:
     )
 
 
+def _round6_always_on(rates: RateCard, *, sealed: bool) -> str:
+    """What keeping Round 6's Glue job up all day would add, where its lane races."""
+
+    if not sealed:
+        return ""
+    glue_per_day = rates.glue_dpu_hour.usd * ROUND4_GLUE_DPU * HOURS_PER_DAY
+    return _ROUND6_ALWAYS_ON_SENTENCE.format(glue=_money(glue_per_day, 2))
+
+
 def _fairness(
     *,
     databricks_per_day: Decimal | None,
     aws_per_day: Decimal | None,
+    round6_always_on: str = "",
 ) -> StandingCostFairness:
     """Fill the current topology's figures in, or withhold it entirely."""
 
@@ -1460,7 +1620,8 @@ def _fairness(
             larger="Databricks" if databricks_per_day > aws_per_day else "AWS",
             now=f"{now_ratio:.1f}",
             suspend=LAKEBASE_SUSPEND_SECONDS,
-        ),
+        )
+        + round6_always_on,
     )
 
 
@@ -1739,7 +1900,15 @@ def build_standing_cost_disclosure(
         )
 
     rates = rates or RateCard()
-    shape = shape or InstallationShape()
+    round6_dms_lane_sealed = getattr(manifest, "round6_aws", None) is not None
+    # Round 6's DMS instance stands only where the installation built its lane, and the
+    # seal is the one account of that this builder may read without I/O.
+    shape = shape or replace(
+        InstallationShape(),
+        dms_replication_instances=(
+            InstallationShape().dms_replication_instances if round6_dms_lane_sealed else 0
+        ),
+    )
     window = CarryingWindow(seconds=seconds)
     hours = window.hours
 
@@ -1839,6 +2008,10 @@ def build_standing_cost_disclosure(
         platform=platform,
         observed=observed,
         observed_rds_instance_class=observed_rds_instance_class,
+        unraced_rds_rounds=_unraced_rds_round_numbers(manifest),
+        round4_glue_lane_sealed=getattr(manifest, "round4_aws", None) is not None,
+        round6_dms_lane_sealed=round6_dms_lane_sealed,
+        shape=shape,
     )
     partial_reasons = (
         ["unclassified carrying line(s) not grouped into any lane: " + ", ".join(unclassified)]
@@ -1911,6 +2084,7 @@ def build_standing_cost_disclosure(
                 databricks_per_hour * HOURS_PER_DAY if databricks_per_hour is not None else None
             ),
             aws_per_day=aws_per_hour * HOURS_PER_DAY if aws_per_hour is not None else None,
+            round6_always_on=_round6_always_on(rates, sealed=round6_dms_lane_sealed),
         ),
         continuous=_continuous(
             counted,

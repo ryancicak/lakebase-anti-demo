@@ -506,13 +506,15 @@ def read_posted_databricks_usage(
 
 
 def warehouse_query_executor(manifest: object) -> QueryExecutor | None:
-    """A ``SELECT``-only executor over the warehouse the installation already owns.
+    """A ``SELECT``-only executor over the warehouse Rounds 4 and 6 already read through.
 
-    The seal names a SQL warehouse for Round 4 and another for Round 6, and both
-    are warehouses this installation created and is already billed for. One of
-    them is picked rather than a new one started: waking a second warehouse to
-    measure standing cost would add standing cost, which is the mistake this whole
-    module is written around.
+    The seal names the SQL warehouse for Round 4 and for Round 6. The installer
+    creates none: it takes ``DATABRICKS_WAREHOUSE_ID``, or the workspace's own, so
+    other installations and other work may share it. That one is used rather than
+    a new one started: a second warehouse to measure standing cost would add
+    standing cost, which is the mistake this whole module is written around. Each
+    statement still keeps this one up until its auto-stop, which is why the read
+    waits for a person (`app._refresh_posted_usage`).
 
     ``None`` when the seal names no warehouse, which
     :func:`read_posted_databricks_usage` turns into an unavailable rather than a
@@ -559,7 +561,9 @@ class PostedUsageCache:
 
     Posted usage moves hourly at best: ``system.billing.usage`` publishes on an
     interval measured in tens of minutes, so a refresh far more often than that
-    would re-read a table that has not changed.
+    would re-read a table that has not changed. Each read also keeps the
+    warehouse up until its auto-stop, so it is hourly, and only while a person
+    is using the app (`app._refresh_posted_usage`).
     """
 
     def __init__(
@@ -567,7 +571,7 @@ class PostedUsageCache:
         manifest: object | None,
         *,
         execute: QueryExecutor | None = None,
-        interval_seconds: float = 900.0,
+        interval_seconds: float = 3600.0,
     ) -> None:
         self._manifest = manifest
         self._execute = execute

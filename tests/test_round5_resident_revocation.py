@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -186,6 +187,25 @@ class _FakeControlPlane:
             default=0,
         )
 
+    def event_at(self, installation, lane, gen, token, job, sequence) -> dict | None:
+        """The event already holding this job's sequence: the table's unique key."""
+        return next(
+            (
+                ev
+                for ev in self.events
+                if (
+                    ev["installation"],
+                    ev["lane"],
+                    ev["generation"],
+                    ev["token"],
+                    ev["job"],
+                    ev["sequence"],
+                )
+                == (installation, lane, gen, token, job, sequence)
+            ),
+            None,
+        )
+
 
 class _FakeCursor:
     def __init__(self, plane: _FakeControlPlane) -> None:
@@ -214,13 +234,17 @@ class _FakeCursor:
                 kind,
                 binding_json,
                 payload_json,
-                _occurred,
+                occurred_at,
             ) = params
             binding = json.loads(binding_json)
             if not self._plane.rls_authorized(installation, lane, gen, token, job, binding):
                 raise runner.psycopg.errors.InsufficientPrivilege(
                     "new row violates row-level security policy"
                 )
+            if self._plane.event_at(installation, lane, gen, token, job, sequence) is not None:
+                # ON CONFLICT (... job_id, sequence) DO NOTHING: RETURNING yields no row.
+                self._result = []
+                return
             self._plane.events.append(
                 {
                     "event_id": event_id,
@@ -233,9 +257,25 @@ class _FakeCursor:
                     "kind": kind,
                     "binding": binding,
                     "payload": json.loads(payload_json),
+                    "occurred_at": occurred_at,
                 }
             )
             self._result = [(event_id,)]
+        elif "SELECT event_id, binding, payload, kind, occurred_at" in statement:
+            existing = self._plane.event_at(*params)
+            self._result = (
+                []
+                if existing is None
+                else [
+                    (
+                        existing["event_id"],
+                        existing["binding"],
+                        existing["payload"],
+                        existing["kind"],
+                        existing["occurred_at"],
+                    )
+                ]
+            )
         else:  # pragma: no cover - defensive
             self._result = []
 
@@ -542,6 +582,99 @@ async def test_cancelled_inflight_release_never_opens_gate_and_fifo_cancel_settl
     assert {"release", "cancel"}.issubset(sqs.deleted)
     assert not any(event["kind"] == "quarantined" for event in plane.events)
     assert any(event["kind"] == "settled" for event in plane.events)
+
+
+# --------------------------------------------------------------------------- #
+# A heartbeat that lands during a new job's first sequence read.
+# --------------------------------------------------------------------------- #
+async def test_heartbeat_during_a_new_jobs_first_publish_takes_the_next_sequence(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """rc9, 2026-10-01: a stage's 'prepared' and the heartbeat each read MAX(sequence)
+    = 0 for the new job, both took sequence 1, and the second insert failed the arm as
+    resident_runner_event_conflict."""
+
+    plane = _FakeControlPlane()
+    preload, request = _preload_event(lane_id="lakebase", token="attempt-A", job_id="a" * 64)
+    stage_job = "b" * 64
+    claimed = Round5ControlBinding(
+        **{
+            **preload.binding.wire_value(),
+            "job_id": stage_job,
+            "claim_id": "claim-one",
+            "bout_id": "bout-one",
+            "bell_id": "bell-one",
+            "fence": 1,
+            "runner_process_boot_id": "process-" + "0" * 32,
+        }
+    )
+    stage = Round5ControlEvent.create(
+        binding=claimed,
+        sequence=1,
+        kind=Round5ControlKind.STAGE,
+        payload={"request": request},
+    )
+    for event in (preload, stage):
+        plane.dispatch(event)
+    plane.make_current("attempt-A")
+
+    # Hold each of the stage job's MAX(sequence) reads until a second one arrives, or
+    # half a second passes: the window the heartbeat and 'prepared' both landed in.
+    max_sequence = plane.max_sequence
+    readers = threading.Condition()
+    arrived = {"reads": 0}
+
+    def overlapping_first_read(installation, lane, gen, token, job) -> int:
+        if job == stage_job:
+            with readers:
+                arrived["reads"] += 1
+                readers.notify_all()
+                readers.wait_for(lambda: arrived["reads"] >= 2, timeout=0.5)
+        return max_sequence(installation, lane, gen, token, job)
+
+    monkeypatch.setattr(plane, "max_sequence", overlapping_first_read)
+
+    async def execute(
+        _request,
+        _targets,
+        cancelled,
+        *,
+        resident_pool=None,
+        resident_release_gate=None,
+        on_resident_prepared=None,
+    ):
+        del _request, _targets, cancelled, resident_pool, resident_release_gate
+        assert on_resident_prepared is not None
+        await on_resident_prepared()
+        raise runner.RunnerContractError("resident_cancelled")
+
+    monkeypatch.setattr(runner, "_execute_fanin_request", execute)
+    monkeypatch.setattr(
+        runner,
+        "_decode_fanin_request",
+        lambda _encoded: (stage_job, (), "", request),
+    )
+    await _drive(
+        monkeypatch,
+        tmp_path,
+        plane,
+        batches=[
+            [{"Body": preload.encoded_body(), "ReceiptHandle": "preload"}],
+            [{"Body": stage.encoded_body(), "ReceiptHandle": "stage"}],
+            *([[]] * 6),
+        ],
+    )
+
+    stage_events = [event for event in plane.events if event["job"] == stage_job]
+    kinds = [event["kind"] for event in stage_events]
+    assert "prepared" in kinds and "heartbeat" in kinds, kinds
+    assert not any(
+        event["payload"].get("code") == "resident_runner_event_conflict" for event in stage_events
+    ), [(event["sequence"], event["kind"], event["payload"]) for event in stage_events]
+    # One number per event, committed in order, so a reader paging by sequence sees all.
+    sequences = [event["sequence"] for event in stage_events]
+    assert sequences == list(range(1, len(sequences) + 1)), sequences
 
 
 # --------------------------------------------------------------------------- #

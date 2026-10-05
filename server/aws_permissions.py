@@ -67,8 +67,6 @@ class RuntimeSurface:
 
 
 #: The AWS-touching surface of each round the deployed app can run against AWS.
-#: Round 4 and Round 6 are Databricks-only lanes and open no AWS client at all,
-#: which is why they are absent rather than empty.
 #:
 #: ``aws_auth`` is in every one of them because `validate_app_aws_environment`
 #: is the first AWS call the process makes and every round depends on it having
@@ -87,10 +85,26 @@ ROUND_SURFACES: Mapping[int, RuntimeSurface] = {
         ("recovery_live", "safe_change_live", "aws_auth"),
         "build_recovery_engine",
     ),
+    # Round 4's AWS lane: the Glue writer started at the bell and parked after,
+    # and the destination read through the same credential providers Round 1
+    # uses for Aurora and RDS.
+    4: RuntimeSurface(
+        "round4_glue_lane",
+        ("round4_glue", "targets", "aws_auth"),
+        "GlueWriterJob",
+    ),
     5: RuntimeSurface(
         "round5_connection_spike",
         ("connection_spike_live", "aws_auth"),
         "connection_spike_live_config_from_manifest",
+    ),
+    # Round 6's AWS lane: the DMS task and the Glue writer started at the bell and
+    # parked after, and the checkout committed through the same credential
+    # providers Round 1 uses for Aurora and RDS. The lakehouse read is Databricks'.
+    6: RuntimeSurface(
+        "round6_dms_lane",
+        ("round6_dms", "round4_glue", "targets", "aws_auth"),
+        "DmsCaptureTask",
     ),
 }
 
@@ -112,11 +126,16 @@ APP_RUNTIME_SURFACES: tuple[RuntimeSurface, ...] = (
 #: `lifecycle` is the installer and the doctor, `cli` is their entry point; both
 #: run on an operator's laptop as an Identity Center role. Listed rather than
 #: ignored, so that `unclassified_aws_modules` stays exhaustive.
-OPERATOR_ONLY_MODULES: tuple[str, ...] = ("lifecycle", "cli")
+OPERATOR_ONLY_MODULES: tuple[str, ...] = (
+    "lifecycle",
+    "cli",
+    "round4_aws_lifecycle",
+    "round6_aws_lifecycle",
+)
 
 #: The rounds this reports on. Round 5 is included because its gaps are worth
 #: knowing even where it cannot run.
-AWS_ROUNDS: tuple[int, ...] = (1, 2, 3, 5)
+AWS_ROUNDS: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
 
 
 @dataclass(frozen=True)
