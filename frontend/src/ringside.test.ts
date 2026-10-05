@@ -119,28 +119,26 @@ function verifiedSession(
   }
 
   if (roundId === 'put_model_score_in_app') {
-    session.lanes.lakebase.evidence = {
+    // A two-lane race like Rounds 1-3: both integrations start parked at the bell and
+    // each lane's clock is its own bell-to-exact-read time.
+    const row = {
       primary_key: 'customer-42',
       score: 0.81,
       model_version: 'risk-v1',
       proof_nonce: 'round4-proof',
       delta_version: 11,
-      verified_row: {
-        primary_key: 'customer-42',
-        score: 0.81,
-        model_version: 'risk-v1',
-        proof_nonce: 'round4-proof',
-      },
     }
+    session.lanes.lakebase.evidence = { ...row, managed_availability_ms: 980 }
+    session.lanes.competitor.evidence = { ...row, glue_run: 'jr_fixture' }
     session.metrics = [
-      { spec_id: 'application_proof_elapsed_ms', lane_id: 'lakebase', value: 1_840 },
+      { spec_id: 'bell_to_exact_read_ms', lane_id: 'lakebase', value: 1_234 },
+      { spec_id: 'bell_to_exact_read_ms', lane_id: 'competitor', value: 5_678 },
+      { spec_id: 'managed_availability_ms', lane_id: 'lakebase', value: 980 },
     ]
-    session.lanes.competitor.state = 'not_supported'
-    session.lanes.competitor.elapsed_ms = null
     session.comparison = {
-      kind: 'capability_gap',
+      kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: null,
+      margin: { spec_id: 'bell_to_exact_read_ms', value: 4_444, display_value: '4.44 s' },
       detail: 'fixture',
     }
   }
@@ -241,16 +239,28 @@ function verifiedSession(
   }
 
   if (roundId === 'analyze_live_orders_without_slowing_checkout') {
+    // A two-lane race like Round 4's: AWS DMS and Glue cold start at the bell, Lakebase's
+    // change feed is built in, and each lane's clock is its own bell-to-exact-read time.
+    const order = {
+      order_id: 'order-42',
+      total_cents: 8_450,
+      total_display: '$84.50',
+      proof_nonce: 'r6-bout-0123456789abcdef',
+      checkout_guardrail_order_id: 'order-43',
+    }
+    session.lanes.lakebase.evidence = { ...order, history_lsn: 42 }
+    session.lanes.competitor.evidence = { ...order, glue_run: 'jr_fixture' }
     session.metrics = [
-      { spec_id: 'analytics_available_ms', lane_id: 'lakebase', value: 2_430 },
+      { spec_id: 'bell_to_exact_history_ms', lane_id: 'lakebase', value: 1_234 },
+      { spec_id: 'bell_to_exact_history_ms', lane_id: 'competitor', value: 5_678 },
       { spec_id: 'checkout_verified', lane_id: 'lakebase', value: true },
+      { spec_id: 'checkout_verified', lane_id: 'competitor', value: true },
+      { spec_id: 'commit_skew_ms', value: 3 },
     ]
-    session.lanes.competitor.state = 'not_supported'
-    session.lanes.competitor.elapsed_ms = null
     session.comparison = {
-      kind: 'capability_gap',
+      kind: 'measured',
       winner_lane_id: 'lakebase',
-      margin: null,
+      margin: { spec_id: 'bell_to_exact_history_ms', value: 4_444, display_value: '4.44 s' },
       detail: 'fixture',
     }
   }
@@ -291,6 +301,170 @@ function noResult(roundId: RoundId): DemoSession {
   session.lanes.competitor.elapsed_ms = null
   session.metrics = []
   session.round5_setup = null
+  return session
+}
+
+/** Round 4 on an installation without its AWS lane: Lakebase races alone. */
+function roundFourWithoutAwsLane(): DemoSession {
+  const session = verifiedSession('put_model_score_in_app')
+  session.lanes.competitor.state = 'not_supported'
+  session.lanes.competitor.elapsed_ms = null
+  session.lanes.competitor.evidence = { unsupported_reason: 'The AWS lane is not installed.' }
+  session.metrics = session.metrics!.filter((metric) => metric.lane_id !== 'competitor')
+  session.comparison = {
+    kind: 'capability_gap',
+    winner_lane_id: 'lakebase',
+    margin: null,
+    detail: 'fixture',
+  }
+  session.remembered_result = 'LAKEBASE 1.2s · AWS LANE NOT INSTALLED'
+  return session
+}
+
+/** Round 4 when the two arrivals overlap within the verifiers' 250 ms reads. */
+function roundFourTie(): DemoSession {
+  const session = verifiedSession('put_model_score_in_app')
+  session.lanes.competitor.elapsed_ms = 1_300
+  session.comparison = {
+    kind: 'tie',
+    winner_lane_id: null,
+    margin: null,
+    detail: 'Both rows arrived within the verifiers’ measurement resolution.',
+  }
+  session.remembered_result = 'TIE · WITHIN MEASUREMENT RESOLUTION'
+  return session
+}
+
+/** Round 4 when the AWS lane ran out its whole bound: a declared lower bound, never a margin. */
+function roundFourStoppage(): DemoSession {
+  const session = verifiedSession('put_model_score_in_app')
+  session.lanes.competitor.state = 'failed'
+  session.lanes.competitor.elapsed_ms = null
+  session.lanes.competitor.status = 'Did not deliver the row within its bound'
+  session.comparison = {
+    kind: 'adjudicated_stoppage',
+    winner_lane_id: 'lakebase',
+    margin: null,
+    detail: 'fixture',
+  }
+  session.remembered_result = 'LAKEBASE WINS · MARGIN IS A LOWER BOUND'
+  return session
+}
+
+/** Round 4 when the AWS lane errored: it measured nothing, so nobody wins. */
+function roundFourErroredLane(): DemoSession {
+  const session = verifiedSession('put_model_score_in_app')
+  session.state = 'failed'
+  session.lanes.competitor.state = 'failed'
+  session.lanes.competitor.elapsed_ms = null
+  session.lanes.competitor.status = 'Could not be measured'
+  session.comparison = {
+    kind: 'not_comparable',
+    winner_lane_id: null,
+    margin: null,
+    detail: 'No verdict: the other lane failed rather than finished.',
+  }
+  session.remembered_result = null
+  return session
+}
+
+/** Round 4 toweled before either lane read its row: both clocks are lower bounds. */
+function roundFourNoResultTowel(): DemoSession {
+  const session = noResult('put_model_score_in_app')
+  session.state = 'towelled'
+  session.lanes.lakebase.state = 'towelled'
+  session.lanes.competitor.state = 'towelled'
+  session.towel = {
+    state: 'cleaning',
+    requested_at: session.updated_at,
+    cutoff_ms: 20_000,
+    censored_lower_bounds_ms: { lakebase: 20_000, competitor: 20_000 },
+    restore_started: true,
+    cleanup_failure: null,
+  }
+  session.comparison = { kind: 'not_comparable', winner_lane_id: null, margin: null }
+  return session
+}
+
+/** Round 6 on an installation without its AWS lane: Lakebase races alone. */
+function roundSixWithoutAwsLane(): DemoSession {
+  const session = verifiedSession('analyze_live_orders_without_slowing_checkout')
+  session.lanes.competitor.state = 'not_supported'
+  session.lanes.competitor.elapsed_ms = null
+  session.lanes.competitor.evidence = { unsupported_reason: 'The AWS lane is not installed.' }
+  session.metrics = session.metrics!.filter((metric) => metric.lane_id === 'lakebase')
+  session.comparison = {
+    kind: 'capability_gap',
+    winner_lane_id: 'lakebase',
+    margin: null,
+    detail: 'fixture',
+  }
+  session.remembered_result = 'LAKEBASE 1.2s · AWS LANE NOT INSTALLED'
+  return session
+}
+
+/** Round 6 when the two orders arrive within the verifiers' one-second reads. */
+function roundSixTie(): DemoSession {
+  const session = verifiedSession('analyze_live_orders_without_slowing_checkout')
+  session.lanes.competitor.elapsed_ms = 1_300
+  session.comparison = {
+    kind: 'tie',
+    winner_lane_id: null,
+    margin: null,
+    detail: 'Both orders arrived within the verifiers’ measurement resolution.',
+  }
+  session.remembered_result = 'TIE · WITHIN MEASUREMENT RESOLUTION'
+  return session
+}
+
+/** Round 6 when the AWS lane ran out its whole bound: a declared lower bound, never a margin. */
+function roundSixStoppage(): DemoSession {
+  const session = verifiedSession('analyze_live_orders_without_slowing_checkout')
+  session.lanes.competitor.state = 'failed'
+  session.lanes.competitor.elapsed_ms = null
+  session.lanes.competitor.status = 'Did not deliver the order within its bound'
+  session.comparison = {
+    kind: 'adjudicated_stoppage',
+    winner_lane_id: 'lakebase',
+    margin: null,
+    detail: 'fixture',
+  }
+  session.remembered_result = 'LAKEBASE WINS · MARGIN IS A LOWER BOUND'
+  return session
+}
+
+/** Round 6 when the AWS lane errored: it measured nothing, so nobody wins. */
+function roundSixErroredLane(): DemoSession {
+  const session = verifiedSession('analyze_live_orders_without_slowing_checkout')
+  session.state = 'failed'
+  session.lanes.competitor.state = 'failed'
+  session.lanes.competitor.elapsed_ms = null
+  session.lanes.competitor.status = 'Could not be measured'
+  session.comparison = {
+    kind: 'not_comparable',
+    winner_lane_id: null,
+    margin: null,
+    detail: 'No verdict: the other lane failed rather than finished.',
+  }
+  session.remembered_result = null
+  return session
+}
+
+/** Round 6 toweled before either lane read its order: both clocks are lower bounds. */
+function roundSixNoResultTowel(): DemoSession {
+  const session = noResult('analyze_live_orders_without_slowing_checkout')
+  session.state = 'towelled'
+  session.lanes.lakebase.state = 'towelled'
+  session.lanes.competitor.state = 'towelled'
+  session.towel = {
+    state: 'cleaning',
+    requested_at: session.updated_at,
+    cutoff_ms: 20_000,
+    censored_lower_bounds_ms: { lakebase: 20_000, competitor: 20_000 },
+    restore_started: true,
+    cleanup_failure: null,
+  }
+  session.comparison = { kind: 'not_comparable', winner_lane_id: null, margin: null }
   return session
 }
 
@@ -516,7 +690,7 @@ describe('canonical Ringside sources', () => {
     expect(sha256(outcomes)).toBe(OUTCOME_COPY_SHA256)
     expect(sha256(roundFivePersonaOutcomes)).toBe(ROUND_FIVE_PERSONA_OUTCOMES_SHA256)
     expect(parsedSource('verified-corpus.jsonl')).toHaveLength(420)
-    expect(parsedSource('outcome-copy.jsonl')).toHaveLength(29)
+    expect(parsedSource('outcome-copy.jsonl')).toHaveLength(33)
     expect(parsedSource('round5-persona-outcomes.jsonl')).toHaveLength(50)
   })
 
@@ -554,26 +728,32 @@ describe('canonical Ringside sources', () => {
     expect(getVerifiedRecord('wake_idle_app', 'software_engineer', 'performance')).toMatchObject({
       meaning_record_id: 'r1.say.software-engineer.performance',
       question_record_id: 'r1.ask.software-engineer.performance',
-      meaning: 'The application completed a real database transaction after wake. That isolates database readiness from the rest of application startup.',
-      question: 'What timeout does the application enforce while the database wakes?',
+      meaning: 'Your app finished a real transaction after the database woke. That times the database by itself, separate from the rest of startup.',
+      question: 'What timeout does your app enforce while the database wakes up?',
     })
   })
 
-  it('preserves the exact 29-record outcome matrix', () => {
+  it('preserves the exact 33-record outcome matrix', () => {
+    // Rounds 4 and 6 race two lanes: a comparison, a one-sided result and a towel with
+    // no verified lane, plus the capability case for an installation without its AWS
+    // lane. Round 6's separate checkout is the server's to enforce, so it has no row.
     expect(OUTCOME_COPY_RECORDS.map(({ round_id, outcome_id }) => [round_id, outcome_id])).toEqual([
       ['wake_idle_app', 'verified_comparison'],
       ['make_schema_change_safely', 'verified_comparison'],
       ['recover_deleted_order', 'verified_comparison'],
+      ['put_model_score_in_app', 'verified_comparison'],
       ['put_model_score_in_app', 'verified_capability_gap'],
       ['survive_connection_spike', 'verified_comparison'],
+      ['analyze_live_orders_without_slowing_checkout', 'verified_comparison'],
       ['analyze_live_orders_without_slowing_checkout', 'verified_capability_gap'],
       ['wake_idle_app', 'verified_rds_capability_gap'],
       ['wake_idle_app', 'one_sided_verified'],
       ['make_schema_change_safely', 'one_sided_verified'],
       ['recover_deleted_order', 'one_sided_verified'],
+      ['put_model_score_in_app', 'one_sided_verified'],
+      ['analyze_live_orders_without_slowing_checkout', 'one_sided_verified'],
       ['recover_deleted_order', 'one_sided_towel_lower_bound'],
       ['survive_connection_spike', 'one_sided_setup_verified_towel'],
-      ['put_model_score_in_app', 'score_identity_unverified'],
       ['wake_idle_app', 'cleanup_failed'],
       ['make_schema_change_safely', 'cleanup_failed'],
       ['recover_deleted_order', 'cleanup_failed'],
@@ -582,7 +762,6 @@ describe('canonical Ringside sources', () => {
       ['survive_connection_spike', 'bounded_check_failed'],
       ['survive_connection_spike', 'cleanup_failed'],
       ['analyze_live_orders_without_slowing_checkout', 'cleanup_failed'],
-      ['analyze_live_orders_without_slowing_checkout', 'checkout_guardrail_unverified'],
       ['wake_idle_app', 'no_result'],
       ['make_schema_change_safely', 'no_result'],
       ['recover_deleted_order', 'no_result'],
@@ -590,6 +769,8 @@ describe('canonical Ringside sources', () => {
       ['survive_connection_spike', 'no_result'],
       ['analyze_live_orders_without_slowing_checkout', 'no_result'],
       ['recover_deleted_order', 'towel_no_verified_lane'],
+      ['put_model_score_in_app', 'towel_no_verified_lane'],
+      ['analyze_live_orders_without_slowing_checkout', 'towel_no_verified_lane'],
     ])
     for (const record of OUTCOME_COPY_RECORDS) {
       expect(getOutcomeRecord(record.round_id, record.outcome_id)).toBe(record)
@@ -620,13 +801,9 @@ describe('canonical Ringside sources', () => {
 })
 
 describe('one generic evidence classifier with six round contracts', () => {
-  const roundFourPartial = verifiedSession('put_model_score_in_app')
-  roundFourPartial.lanes.lakebase.evidence = undefined
+  const roundFourPartial = roundFourErroredLane()
 
-  const roundSixPartial = verifiedSession('analyze_live_orders_without_slowing_checkout')
-  roundSixPartial.metrics = [
-    { spec_id: 'analytics_available_ms', lane_id: 'lakebase', value: 2_430 },
-  ]
+  const roundSixPartial = roundSixErroredLane()
 
   const rdsGap = verifiedSession('wake_idle_app', 'rds_postgres')
   rdsGap.lanes.competitor.state = 'not_supported'
@@ -636,9 +813,13 @@ describe('one generic evidence classifier with six round contracts', () => {
     ['R1 verified comparison', verifiedSession('wake_idle_app'), 'verified_comparison'],
     ['R2 verified comparison', verifiedSession('make_schema_change_safely'), 'verified_comparison'],
     ['R3 verified comparison', verifiedSession('recover_deleted_order'), 'verified_comparison'],
-    ['R4 verified capability', verifiedSession('put_model_score_in_app'), 'verified_capability_gap'],
+    ['R4 verified comparison', verifiedSession('put_model_score_in_app'), 'verified_comparison'],
+    ['R4 without its AWS lane', roundFourWithoutAwsLane(), 'verified_capability_gap'],
+    ['R4 stoppage at the bound', roundFourStoppage(), 'one_sided_verified'],
     ['R5 verified comparison', verifiedSession('survive_connection_spike'), 'verified_comparison'],
-    ['R6 verified capability', verifiedSession('analyze_live_orders_without_slowing_checkout'), 'verified_capability_gap'],
+    ['R6 verified comparison', verifiedSession('analyze_live_orders_without_slowing_checkout'), 'verified_comparison'],
+    ['R6 without its AWS lane', roundSixWithoutAwsLane(), 'verified_capability_gap'],
+    ['R6 stoppage at the bound', roundSixStoppage(), 'one_sided_verified'],
     ['R1 RDS gap', rdsGap, 'verified_rds_capability_gap'],
     ['R1 one-sided', oneSided('wake_idle_app'), 'one_sided_verified'],
     ['R2 one-sided', oneSided('make_schema_change_safely'), 'one_sided_verified'],
@@ -646,13 +827,15 @@ describe('one generic evidence classifier with six round contracts', () => {
     ['R3 towel lower bound', oneSidedTowel(), 'one_sided_towel_lower_bound'],
     ['R5 one-sided setup towel', oneSidedRoundFiveSetupTowel(), 'one_sided_setup_verified_towel'],
     ['R5 both setups unverified at towel', noVerifiedRoundFiveSetupTowel(), 'setup_incomplete'],
-    ['R4 identity incomplete', roundFourPartial, 'score_identity_unverified'],
+    ['R4 errored lane', roundFourPartial, 'one_sided_verified'],
     ['R5 setup incomplete', incompleteSetup(), 'setup_incomplete'],
     ['R5 bounded check failed', failedSpike(), 'bounded_check_failed'],
     ['R5 cleanup failed', failedCleanup(), 'cleanup_failed'],
-    ['R6 guardrail incomplete', roundSixPartial, 'checkout_guardrail_unverified'],
+    ['R6 errored lane', roundSixPartial, 'one_sided_verified'],
     ...ROUND_IDS.map((roundId) => [`${roundId} no result`, noResult(roundId), 'no_result'] as [string, DemoSession, RingsideOutcomeId]),
     ['R3 towel without a verified lane', noResultTowel(), 'towel_no_verified_lane'],
+    ['R4 towel without a verified lane', roundFourNoResultTowel(), 'towel_no_verified_lane'],
+    ['R6 towel without a verified lane', roundSixNoResultTowel(), 'towel_no_verified_lane'],
   ]
 
   it.each(cases)('%s', (_label, session, expected) => {
@@ -684,14 +867,24 @@ describe('one generic evidence classifier with six round contracts', () => {
     ['R1 comparison', verifiedSession('wake_idle_app'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
     ['R2 comparison', verifiedSession('make_schema_change_safely'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
     ['R3 comparison', verifiedSession('recover_deleted_order'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
-    ['R4 capability', verifiedSession('put_model_score_in_app'), 'capability_gap', 'declared_capability', 'lakebase', null],
+    ['R4 comparison', verifiedSession('put_model_score_in_app'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
+    ['R4 within resolution', roundFourTie(), 'both_exact_verified', 'declared_comparison', 'tie', null],
+    ['R4 without its AWS lane', roundFourWithoutAwsLane(), 'capability_gap', 'declared_capability', 'lakebase', null],
+    // A lane that ran out its bound leaves a stoppage; one that errored leaves nothing.
+    ['R4 stoppage at the bound', roundFourStoppage(), 'lakebase_only_exact', 'adjudicated_stoppage', 'lakebase', null],
+    ['R4 errored lane', roundFourPartial, 'lakebase_only_exact', 'comparison_incomplete', null, null],
+    ['R4 both bounds', roundFourNoResultTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
     ['R5 comparison', verifiedSession('survive_connection_spike'), 'both_exact_verified', 'declared_comparison', 'lakebase', 11_650],
-    ['R6 capability', verifiedSession('analyze_live_orders_without_slowing_checkout'), 'capability_gap', 'declared_capability', 'lakebase', null],
+    ['R6 comparison', verifiedSession('analyze_live_orders_without_slowing_checkout'), 'both_exact_verified', 'declared_comparison', 'lakebase', 4_444],
+    ['R6 within resolution', roundSixTie(), 'both_exact_verified', 'declared_comparison', 'tie', null],
+    ['R6 without its AWS lane', roundSixWithoutAwsLane(), 'capability_gap', 'declared_capability', 'lakebase', null],
+    ['R6 stoppage at the bound', roundSixStoppage(), 'lakebase_only_exact', 'adjudicated_stoppage', 'lakebase', null],
+    ['R6 errored lane', roundSixPartial, 'lakebase_only_exact', 'comparison_incomplete', null, null],
+    ['R6 both bounds', roundSixNoResultTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
     ['R2 Lakebase only', oneSided('make_schema_change_safely'), 'lakebase_only_exact', 'adjudicated_stoppage', 'lakebase', null],
     ['R2 competitor only', competitorOnly('make_schema_change_safely'), 'competitor_only_exact', 'adjudicated_stoppage', 'competitor', null],
     ['R3 exact plus bound', oneSidedTowel(), 'exact_and_censored_lower_bound', 'adjudicated_stoppage', 'lakebase', null],
     ['R3 both bounds', noResultTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
-    ['R4 guardrail', roundFourPartial, 'guardrail_failure', 'guardrail_failure', null, null],
     ['R5 verified-first', oneSidedRoundFiveSetupTowel(), 'exact_and_censored_lower_bound', 'comparison_incomplete', null, null],
     ['R5 both bounds', noVerifiedRoundFiveSetupTowel(), 'both_lower_bounds', 'no_verified_evidence', null, null],
     ['R5 bounded-check guardrail', failedSpike(), 'guardrail_failure', 'guardrail_failure', null, null],
@@ -700,7 +893,6 @@ describe('one generic evidence classifier with six round contracts', () => {
     // the SEALED verified Round 5 result keeps its declared comparison and stays
     // shareable regardless of backstage ring cleanup.
     ['R5 cleanup after result', verifiedCleanupFailure(), 'cleanup_failure', 'declared_comparison', 'lakebase', 11_650],
-    ['R6 guardrail', roundSixPartial, 'guardrail_failure', 'guardrail_failure', null, null],
   ] as const)(
     '%s has one evidence and contract decision',
     (_label, session, shape, status, winner, margin) => {
@@ -716,6 +908,54 @@ describe('one generic evidence classifier with six round contracts', () => {
       )
     },
   )
+
+  it('words every Round 4 verdict the way the server declared it', () => {
+    // The server's remembered line is the verdict for every declared bout; a bout the
+    // server could not declare says so, and never borrows a winner from the lane clocks.
+    const headline = (session: DemoSession) => classifyOutcome(session).headline
+    expect(headline(verifiedSession('put_model_score_in_app'))).toBe('RESULT DECLARED')
+    expect(headline(roundFourTie())).toMatch(/WITHIN MEASUREMENT RESOLUTION$/)
+    expect(headline(roundFourStoppage())).toMatch(/MARGIN IS A LOWER BOUND$/)
+    expect(headline(roundFourPartial)).toBe('NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A')
+    expect(headline(roundFourWithoutAwsLane())).toBe('LAKEBASE 1.2s · AWS LANE NOT INSTALLED')
+    const unremembered = roundFourWithoutAwsLane()
+    unremembered.remembered_result = null
+    expect(headline(unremembered)).toBe('LAKEBASE 1.23s · AWS LANE NOT INSTALLED')
+    expect(buildRingsideShow(roundFourTie())).toBe(
+      'Bell to exact app read, both integrations from a cold start: Lakebase 1.23s. AWS Glue → Aurora Serverless v2 1.30s. Model execution was not tested.',
+    )
+    expect(buildRingsideShow(roundFourPartial)).toBe(
+      'Bell to exact app read: Lakebase 1.23s. Aurora Serverless v2 did not verify, so no margin was measured.',
+    )
+  })
+
+  it('words every Round 6 verdict the way the server declared it', () => {
+    // As in Round 4: the server's remembered line is the verdict for every declared bout,
+    // and a bout the server could not declare never borrows a winner from the clocks.
+    const headline = (session: DemoSession) => classifyOutcome(session).headline
+    expect(headline(verifiedSession('analyze_live_orders_without_slowing_checkout'))).toBe('RESULT DECLARED')
+    expect(headline(roundSixTie())).toBe('TIE · WITHIN MEASUREMENT RESOLUTION')
+    expect(headline(roundSixStoppage())).toBe('LAKEBASE WINS · MARGIN IS A LOWER BOUND')
+    expect(headline(roundSixPartial)).toBe('NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A')
+    expect(headline(roundSixWithoutAwsLane())).toBe('LAKEBASE 1.2s · AWS LANE NOT INSTALLED')
+    const unremembered = roundSixWithoutAwsLane()
+    unremembered.remembered_result = null
+    expect(headline(unremembered)).toBe('LAKEBASE 1.23s · AWS LANE NOT INSTALLED')
+    expect(buildRingsideShow(roundSixTie())).toBe(
+      "Bell to exact Delta read, with AWS DMS and Glue cold starting at the bell and Lakebase's change feed built in: Lakebase 1.23s. AWS DMS + Glue from Aurora Serverless v2 1.30s. A separate checkout committed on each source. Throughput and p99 were not tested.",
+    )
+    expect(buildRingsideShow(roundSixPartial)).toBe(
+      'Bell to exact Delta read: Lakebase 1.23s. Aurora Serverless v2 did not verify, so no margin was measured.',
+    )
+    expect(buildRingsideShow(roundSixWithoutAwsLane())).toBe(
+      'Bell to exact Delta read: Lakebase 1.23s. A separate checkout committed. This installation has no AWS lane, so nothing was compared. Throughput and p99 were not tested.',
+    )
+    // Lakebase's feed is never called cold, and nothing calls it warm.
+    const copy = [roundSixTie(), roundSixStoppage(), roundSixWithoutAwsLane()]
+      .map((session) => buildRingsideShow(session))
+      .join(' ')
+    expect(copy).not.toMatch(/Lakebase[^.]*cold start|warm/i)
+  })
 
   it('classifies the generic evidence shapes before applying a round contract', () => {
     const lane = (exactMs: number | null, lowerBoundMs: number | null, notSupported = false) => ({
@@ -753,12 +993,12 @@ describe('one generic evidence classifier with six round contracts', () => {
   })
 
   it.each([
-    ['Round 4', 'put_model_score_in_app'],
-    ['Round 6', 'analyze_live_orders_without_slowing_checkout'],
+    ['Round 4 without its AWS lane', roundFourWithoutAwsLane],
+    ['Round 6 without its AWS lane', roundSixWithoutAwsLane],
   ] as const)(
     '%s complete capability gap unconditionally produces Lakebase health bars',
-    (_label, roundId) => {
-      const session = verifiedSession(roundId)
+    (_label, fixture) => {
+      const session = fixture()
       const classified = classifyOutcome(session)
       const receipt = receiptPresentation(session, 'round')
 
@@ -817,7 +1057,14 @@ describe('one generic evidence classifier with six round contracts', () => {
       oneSidedTowel(),
       oneSidedRoundFiveSetupTowel(),
       roundFourPartial,
+      roundFourWithoutAwsLane(),
+      roundFourStoppage(),
+      roundFourNoResultTowel(),
       roundSixPartial,
+      roundSixWithoutAwsLane(),
+      roundSixTie(),
+      roundSixStoppage(),
+      roundSixNoResultTowel(),
     ]
 
     for (const session of sessions) {
@@ -891,8 +1138,13 @@ describe('one generic evidence classifier with six round contracts', () => {
         session.round.id === 'put_model_score_in_app'
         || session.round.id === 'analyze_live_orders_without_slowing_checkout'
       ) {
-        expect(classified.marginMs).toBeNull()
-        expect(allCopy).not.toMatch(/aws.*\d+\.\d+s sooner|speed margin \d/i)
+        // Rounds 4 and 6 race, so a margin exists exactly when a winner was declared by
+        // measurement; a tie, a lower bound, an errored lane or a missing AWS lane never
+        // carries one.
+        expect(classified.marginMs === null).toBe(
+          classified.status !== 'declared_comparison' || classified.formalWinner === 'tie',
+        )
+        expect(allCopy).not.toMatch(/not built or timed|separate reverse-ETL stack|separate CDC stack/i)
       }
     }
   })
@@ -924,9 +1176,9 @@ describe('Ringside output behavior', () => {
       'performance',
     )
     expect(cue.say).toBe(
-      'The application completed a real database transaction after wake. That isolates database readiness from the rest of application startup.',
+      'Your app finished a real transaction after the database woke. That times the database by itself, separate from the rest of startup.',
     )
-    expect(cue.ask).toBe('What timeout does the application enforce while the database wakes?')
+    expect(cue.ask).toBe('What timeout does your app enforce while the database wakes up?')
     expect(cue.show).toBe(
       'First committed transaction after idle: Lakebase 1.23s. Aurora Serverless v2 5.68s. Only the database transaction was tested.',
     )

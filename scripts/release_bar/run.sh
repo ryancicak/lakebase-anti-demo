@@ -5,9 +5,15 @@
 #   chaos      every wave with all six rounds at once against Aurora, then against
 #              RDS, then each round alone: against Aurora, and against RDS too for
 #              the rounds that race an AWS lane
-#   restart    redeploy the same build under live Round 2, 3 and 5 bouts; every
+#   backup     a manual snapshot of each Round 1, 2, 3 and 5 AWS source, and a full
+#              bout of that round while the source reads backing-up, as it does in its
+#              daily automated backup
+#   restart    redeploy the same build under live Round 2, 3, 4, 5 and 6 bouts; every
 #              round must heal by itself
-#   leaks      no per-bout AWS resource is left behind
+#   crash      stop and start the app 20 s after a Round 4 bell, and again after a
+#              Round 6 bell, while both lanes race; each round's next bout must heal
+#              what that stranded
+#   leaks      no per-bout AWS resource is left behind, and no Glue run still going
 #   lease      the app kept its own lease alive, and `terraform plan` is empty
 #
 # Usage: scripts/release_bar/run.sh CHECKOUT
@@ -20,7 +26,7 @@
 #   ANTI_DEMO_APP_URL  the test installation's app URL (required)
 #   ANTI_DEMO_PROFILE  a Databricks CLI profile that can reach that app (required)
 #   EVIDENCE           where to write (default: release-bar-evidence/<UTC time>)
-#   STEPS              which steps to run (default: chaos,restart,leaks,lease)
+#   STEPS              which steps to run (default: chaos,backup,restart,crash,leaks,lease)
 #   PYTHON             an interpreter with this repository's dependencies
 #                      (default: CHECKOUT/.venv/bin/python)
 #
@@ -42,7 +48,7 @@ CHECKOUT="$(cd "$CHECKOUT" && pwd)"
 : "${ANTI_DEMO_PROFILE:?set ANTI_DEMO_PROFILE to a Databricks CLI profile that can reach it}"
 export ANTI_DEMO_APP_URL ANTI_DEMO_PROFILE
 PYTHON="${PYTHON:-$CHECKOUT/.venv/bin/python}"
-STEPS="${STEPS:-chaos,restart,leaks,lease}"
+STEPS="${STEPS:-chaos,backup,restart,crash,leaks,lease}"
 EVIDENCE="${EVIDENCE:-release-bar-evidence/$(date -u +%Y%m%dT%H%M%SZ)}"
 
 WAVES="pre-bell-cancel,early-towel,mid-stage-towel,late-towel,rapid-rearm-towel,finish-linger"
@@ -55,11 +61,44 @@ ROUNDS=(
   analyze_live_orders_without_slowing_checkout
 )
 # The rounds whose bout races an AWS lane, so running alone against each competitor
-# tests something different. Rounds 4 and 6 race Lakebase alone for now; add them
-# here when they gain an AWS lane.
-AWS_LANE_ROUNDS=(wake_idle_app make_schema_change_safely recover_deleted_order survive_connection_spike)
-# The three rounds that hold per-bout AWS resources mid-race, and so can leak them.
-RESTART_ROUNDS=(make_schema_change_safely recover_deleted_order survive_connection_spike)
+# tests something different: every round from v1.1.
+AWS_LANE_ROUNDS=(
+  wake_idle_app
+  make_schema_change_safely
+  recover_deleted_order
+  put_model_score_in_app
+  survive_connection_spike
+  analyze_live_orders_without_slowing_checkout
+)
+# The three rounds that hold per-bout AWS resources mid-race, and so can leak them,
+# and Rounds 4 and 6. The redeploy may find their bouts settled, so this holds only
+# that the new process reads them READY with nothing stranded; `crash` lands inside
+# their bouts.
+RESTART_ROUNDS=(
+  make_schema_change_safely
+  recover_deleted_order
+  put_model_score_in_app
+  survive_connection_spike
+  analyze_live_orders_without_slowing_checkout
+)
+# The rounds `crash` stops the app inside, 20 s after the bell, while both lanes race.
+CRASH_ROUNDS=(
+  put_model_score_in_app
+  analyze_live_orders_without_slowing_checkout
+)
+# For the minute or minutes of each daily automated backup, an RDS instance or Aurora
+# cluster reads `backing-up`, and on 2026-10-02 rc10 found Rounds 2, 3 and 5 refusing or
+# pausing on it. AWS picks those windows from a morning block, so a run overnight never
+# meets one; `backup` makes one on purpose for each of these sources (backup.py).
+BACKUP_PAIRS=(
+  wake_idle_app:aurora_serverless_v2
+  make_schema_change_safely:aurora_serverless_v2
+  make_schema_change_safely:rds_postgres
+  recover_deleted_order:aurora_serverless_v2
+  recover_deleted_order:rds_postgres
+  survive_connection_spike:aurora_serverless_v2
+  survive_connection_spike:rds_postgres
+)
 RESTART_AFTER_BELL=90
 # How long a round may take to come back READY before the next step starts.
 READY_WAIT_SECONDS=2400
@@ -139,6 +178,29 @@ chaos() {
   done
 }
 
+# Like the chaos phases, one failed pair does not stop the rest; only a round that never
+# comes back READY does.
+backup() {
+  local pair round competitor started code name
+  for pair in "${BACKUP_PAIRS[@]}"; do
+    round="${pair%%:*}"
+    competitor="${pair##*:}"
+    name="backup-$round-${competitor%%_*}"
+    started="$(now)"
+    if ! wait_ready; then
+      say "$name: the rounds never all came back READY; stopping"
+      record "$name" 3 "$started"
+      return 1
+    fi
+    say "$name start"
+    "$PYTHON" -u "$HERE/backup.py" "$CHECKOUT" "$round" "$competitor" "$EVIDENCE/$name" \
+      >"$EVIDENCE/logs/$name.log" 2>&1
+    code=$?
+    record "$name" "$code" "$started"
+    say "$name exit=$code: $(tail -1 "$EVIDENCE/logs/$name.log")"
+  done
+}
+
 restart() {
   local started dir pid code
   started="$(now)"
@@ -171,6 +233,34 @@ restart() {
   say "restart exit=$code"
 }
 
+# A Round 4 bout is over in about three minutes, sooner than the redeploy above even
+# stops the app, so the restart step finds Round 4 settled (found 2026-09-29), and a
+# Round 6 bout is over sooner still. This stops and starts the app 20 s after each
+# round's bell instead, deploying nothing, while both lanes still race. In Round 4 that
+# strands a Glue run, a running pipeline and a source row off its baseline; in Round 6,
+# a running DMS task and Glue run and the bout's orders in both sources. Each round's
+# next bout's Prepare must put all of it right.
+crash() {
+  local started code round
+  for round in "${CRASH_ROUNDS[@]}"; do
+    started="$(now)"
+    if ! wait_ready; then
+      say "crash: the rounds never all came back READY; stopping"
+      record "crash-$round" 3 "$started"
+      return 1
+    fi
+    say "crash: a $round bout, with the app stopped and started 20s after its bell"
+    "$PYTHON" -u "$HERE/restart.py" --after-bell 20 --stop-start "$EVIDENCE/crash-$round" \
+      "$round" >"$EVIDENCE/logs/crash-$round.log" 2>&1
+    code=$?
+    record "crash-$round" "$code" "$started"
+    say "crash $round exit=$code"
+    ((code == 0)) || return 1
+    chaos_phase "crash-heal-$round" CHAOS_ROUNDS="$round" CHAOS_SCENARIOS=full-proof ||
+      return 1
+  done
+}
+
 leaks() {
   local started code
   started="$(now)"
@@ -195,7 +285,9 @@ say "release bar against $ANTI_DEMO_APP_URL from $CHECKOUT; evidence in $EVIDENC
 if preflight; then
   stopped=0
   if want chaos; then chaos || stopped=1; fi
+  if want backup && [[ "$stopped" == 0 ]]; then backup || stopped=1; fi
   if want restart && [[ "$stopped" == 0 ]]; then restart || stopped=1; fi
+  if want crash && [[ "$stopped" == 0 ]]; then crash || stopped=1; fi
   if want leaks; then leaks; fi
   if want lease; then lease; fi
 fi

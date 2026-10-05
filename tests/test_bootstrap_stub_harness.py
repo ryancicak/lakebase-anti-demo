@@ -474,6 +474,7 @@ def _run_ready_gate(
     status: str = "ready",
     manifest_version: int = 7,
     has_round6: bool = True,
+    extra: dict | None = None,
 ):
     """Run bootstrap.sh's own ready-install gate with nothing else around it.
 
@@ -493,6 +494,7 @@ def _run_ready_gate(
                 "status": status,
                 "manifest_version": manifest_version,
                 "round6": {"sealed": True} if has_round6 else None,
+                **(extra or {}),
             }
         )
         + "\n",
@@ -582,6 +584,102 @@ def test_apply_against_a_ready_install_refuses_and_names_the_redeploy_path(tmp_p
     )
     assert partial.returncode == 0, partial.stderr
     assert "REACHED THE PROVISION" in partial.stdout, partial.stdout
+
+
+_ROUND4_AWS_LANE_UNSEALED = {
+    "installation_id": "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1",
+    "round4": {"sealed": True},
+    "round4_aws": None,
+    "round_environments": {
+        "put_model_score_in_app": {"aurora": {"sealed": True}, "rds": {"sealed": True}}
+    },
+}
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not on PATH")
+def test_apply_resumes_a_ready_install_whose_round4_aws_lane_is_unsealed(tmp_path):
+    """Setup seals Round 4's AWS lane last, after the manifest already says `ready`.
+
+    The v1.1 virgin install stopped in that stage on 2026-09-29, and --apply then refused
+    it as a finished install, whose only way on was a reset of both database lanes.
+    """
+
+    source = (REPO / "bootstrap.sh").read_text(encoding="utf-8")
+
+    pending = _run_ready_gate(tmp_path, source, reset_ready=0, extra=_ROUND4_AWS_LANE_UNSEALED)
+    assert pending.returncode == 0, pending.stderr
+    assert "TARGETS A COMPLETE INSTALL" not in pending.stdout, pending.stdout
+    assert "REACHED THE PROVISION" in pending.stdout, pending.stdout
+
+    sealed = _run_ready_gate(
+        tmp_path,
+        source,
+        reset_ready=0,
+        extra={**_ROUND4_AWS_LANE_UNSEALED, "round4_aws": {"sealed": True}},
+    )
+    assert sealed.returncode != 0, sealed.stdout
+    assert "already 'ready'" in sealed.stderr, sealed.stderr
+
+    lakebase_only = _run_ready_gate(
+        tmp_path,
+        source,
+        reset_ready=0,
+        extra={
+            **_ROUND4_AWS_LANE_UNSEALED,
+            "round_environments": {"put_model_score_in_app": {"aurora": None, "rds": None}},
+        },
+    )
+    assert lakebase_only.returncode != 0, lakebase_only.stdout
+    assert "already 'ready'" in lakebase_only.stderr, lakebase_only.stderr
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="jq is not on PATH")
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
+def test_a_setup_that_failed_in_the_round4_aws_lane_names_the_resume(tmp_path):
+    """A failure in the lane stage leaves a `ready` manifest that --apply resumes.
+
+    Naming --deploy-only there would deploy an app whose Round 4 cannot race AWS.
+    """
+
+    source = (REPO / "bootstrap.sh").read_text(encoding="utf-8")
+    manifest = tmp_path / "gen" / "manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(
+        json.dumps(
+            {"status": "ready", "manifest_version": 7, "round6": {}, **_ROUND4_AWS_LANE_UNSEALED}
+        ),
+        encoding="utf-8",
+    )
+    script = tmp_path / "block.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        "RED=''; RESET=''\n"
+        "MODE=apply\n"
+        f"ANTI_DEMO_MANIFEST={manifest}\n"
+        f"MANIFEST_DIR={manifest.parent}\n"
+        "SETUP_ARGS=(setup --owner me --no-serve)\n"
+        + _extract(source, "die() {\n", "\n}\n")
+        + _extract(source, "apply_targets_complete_ready_install() {", "\n}\n")
+        + _extract(source, "SETUP_STATUS=0\n", "\nfi\n"),
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "antidemo"
+    launcher.write_text("#!/usr/bin/env bash\nexit 3\n", encoding="utf-8")
+    launcher.chmod(0o755)
+
+    result = subprocess.run(
+        [shutil.which("bash") or "bash", str(script)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "exited 3" in result.stderr, result.stderr
+    assert "./bootstrap.sh --apply   (resumes; does not duplicate)" in result.stderr
+    assert "--deploy-only" not in result.stderr, result.stderr
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")

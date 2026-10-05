@@ -75,6 +75,14 @@ resource "aws_rds_cluster" "aurora_by_round" {
   vpc_security_group_ids = [aws_security_group.aurora_by_round[each.key].id]
   network_type           = "IPV4"
 
+  # Round 6 (r6) gets a cluster parameter group that turns on logical
+  # replication for AWS DMS; every other round resolves to null and keeps the
+  # default.aurora-postgresql17 group, so their clusters see no change. The
+  # group is attached at creation, so the parameter is in force from first boot
+  # (parameter_groups.tf). With it on, r6's cluster never auto-pauses: it idles
+  # at its lowest capacity instead, and the cost model bills it that way.
+  db_cluster_parameter_group_name = lookup(local.v7_aurora_cluster_parameter_group_names, each.key, null)
+
   serverlessv2_scaling_configuration {
     min_capacity             = 0
     max_capacity             = 2

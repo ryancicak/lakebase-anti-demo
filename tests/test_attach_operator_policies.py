@@ -115,7 +115,15 @@ esac
 exit 0
 """
 
-POLICIES = ("AntiDemoOperatorNetwork", "AntiDemoOperatorDatabases", "AntiDemoOperatorIdentity")
+#: Every required operator policy, the AWS lanes of Rounds 4 and 6 among them. The script left
+#: Round 4's out until Round 6's joined it, so an operator attaching by script lacked the lane.
+POLICIES = (
+    "AntiDemoOperatorNetwork",
+    "AntiDemoOperatorDatabases",
+    "AntiDemoOperatorIdentity",
+    "AntiDemoOperatorRound4",
+    "AntiDemoOperatorRound6",
+)
 
 
 def _run(

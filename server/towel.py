@@ -201,6 +201,7 @@ def adjudicate_round_five_bell_towel(
     *,
     lanes: Mapping[str, LaneSnapshot],
     runtime_lanes: Mapping[str, RoundFiveRuntimeLaneSnapshot],
+    cutoff_ms: float | None = None,
 ) -> TowelAdjudication:
     """Freeze a V4 (``round5-bell-to-10k-v4``) towel from the runtime, not setup.
 
@@ -216,8 +217,13 @@ def adjudicate_round_five_bell_towel(
     * reached 10,000 clients (``bell_to_10000_observed_ms`` set) but cancelled or
       failed mid-hold: the exact observed time is preserved as *timed evidence*,
       but the lane is TOWELLED/FAILED and never verified.
-    * never reached 10,000 clients: a censored lower bound from the lane's own
-      runtime clock (``elapsed_at_snapshot_ms``), or untimed when it published nothing.
+    * never reached 10,000 clients: a censored lower bound at the towel. Both clocks
+      run from the one server bell, and ``cutoff_ms`` is the bell to the towel on that
+      origin -- the time the room watched each lane's clock reach, as the live
+      projection draws it. The lane's last published progress can raise that floor
+      and never lower it. Without ``cutoff_ms`` the floor was that progress alone: a
+      towel 3.09 s after the bell froze Lakebase at its 0.48 s runner release and left
+      Aurora, still registering its database with the Proxy, "not timed".
 
     No winner or margin is ever declared here; that requires the full contract.
     """
@@ -272,9 +278,12 @@ def adjudicate_round_five_bell_towel(
                 "display_value": f"{observed_ms / 1000:.2f}s",
             }
             continue
-        # Never reached 10,000 clients. The lane's own runtime clock at the stop
-        # is a censored lower bound; a lane that published nothing stays untimed.
+        # Never reached 10,000 clients: its clock ran from the bell to the towel,
+        # which is its censored lower bound.
         lower_bound_ms = _finite_ms(runtime_lane.elapsed_at_snapshot_ms)
+        at_cutoff_ms = _finite_ms(cutoff_ms)
+        if at_cutoff_ms is not None:
+            lower_bound_ms = max(lower_bound_ms or 0.0, at_cutoff_ms)
         lane.state = LaneState.TOWELLED
         lane.elapsed_ms = None
         lane.activity = LaneActivity(phase=LaneState.TOWELLED)
@@ -357,6 +366,13 @@ def adjudicate_towel(
         if lane.state in _ACTIVE_STATES:
             frozen[lane_id] = _censor_active_lane(lane, cutoff_ms)
             censored[lane_id] = cutoff_ms
+        elif lane.state == LaneState.SEALED:
+            # A lane whose clock never started (Round 4 before its bell) is stopped
+            # untimed: there is no elapsed time to censor.
+            lane.state = LaneState.TOWELLED
+            lane.elapsed_ms = None
+            lane.status = "Toweled before the bell · not timed"
+            lane.activity = LaneActivity(phase=LaneState.TOWELLED)
         elif lane.state == LaneState.NOT_SUPPORTED:
             # Unsupported is a capability N/A, never a censored timer.
             lane.elapsed_ms = None
@@ -415,6 +431,18 @@ def adjudicate_towel(
             if opponent in censored
             else f"{opponent} had no exact verified result"
         )
+        # The lane that finished wins over one the towel stopped, as at the bout's own limit.
+        # Ryan (2026-10-03): "if round 6 finishes in say 15 seconds and AWS is still running
+        # after 50 seconds and i throw the towel - Lakebase should be deemed the winner!"
+        public_result = (
+            f"{lanes[winner].name.upper()} WINS · TOWEL THROWN AT "
+            f"{cutoff.removeprefix('>')} · MARGIN IS A LOWER BOUND"
+            if opponent in censored
+            else (
+                f"Toweled · {winner} exact proof preserved · {opponent_result} · "
+                "Adjudicated stoppage · Margin N/A"
+            )
+        )
         return TowelAdjudication(
             cutoff_ms=cutoff_ms,
             lanes=frozen,
@@ -428,10 +456,7 @@ def adjudicate_towel(
                     "No speed margin was calculated."
                 ),
             ),
-            public_result=(
-                f"Toweled · {winner} exact proof preserved · {opponent_result} · "
-                "Adjudicated stoppage · Margin N/A"
-            ),
+            public_result=public_result,
         )
 
     return TowelAdjudication(

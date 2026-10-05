@@ -2,15 +2,12 @@ import { describe, expect, it } from 'vitest'
 import { FALLBACK_CATALOG } from './catalog'
 import type { CooldownSnapshot, DemoSession, RedoSnapshot, RunEvent } from './api/types'
 import {
-  ROUND_FOUR_FOOTER,
-  ROUND_FOUR_LEGEND,
-  ROUND_FOUR_SCOPE,
   acceptsReconciledSession,
   applyRunEventSnapshot,
-  canStartRoundFourRedo,
+  isRoundFour,
   modelScoreEvidence,
-  roundFourFooter,
-  roundFourPresentation,
+  roundFourLaneLabel,
+  roundFourStackLabel,
   roundFourUnsupportedReason,
   selectRound4Session,
 } from './round4'
@@ -30,10 +27,6 @@ function proofLane(version: 'v1' | 'v2') {
       primary_key: 'customer-42', score: v2 ? 0.33 : 0.81,
       model_version: v2 ? 'risk-v2' : 'risk-v1', proof_nonce: nonce,
       delta_version: v2 ? 12 : 11,
-      verified_row: {
-        primary_key: 'customer-42', score: v2 ? 0.33 : 0.81,
-        model_version: v2 ? 'risk-v2' : 'risk-v1', proof_nonce: nonce,
-      },
     },
   }
 }
@@ -73,54 +66,57 @@ function session(updatedAt = '2026-08-18T20:00:00Z'): DemoSession {
 }
 
 describe('Round 4 policy and state selection', () => {
-  it('locks exact metadata and non-comparison copy', () => {
+  it('races both lanes as a measured round with no re-do', () => {
     expect(FALLBACK_CATALOG.rounds[0].redo).toMatchObject({ policy: 'show', badge: '★ SHOW', label: 'RE-DO ROUND' })
     expect(FALLBACK_CATALOG.rounds[1].redo).toMatchObject({ policy: 'optional', badge: 'OPTIONAL', label: 'RE-DO ROUND' })
     expect(FALLBACK_CATALOG.rounds[2].redo).toMatchObject({ policy: 'skip' })
-    expect(FALLBACK_CATALOG.rounds[3].redo).toMatchObject({ policy: 'show', badge: '★ SHOW', label: 'CHANGE SCORE IN LAKEHOUSE → WATCH APP UPDATE' })
+    // A second change could not start both integrations cold, so racing again is a new bout.
+    expect(FALLBACK_CATALOG.rounds[3].redo).toBeUndefined()
     expect(FALLBACK_CATALOG.rounds[4].redo).toBeUndefined()
     expect(FALLBACK_CATALOG.rounds[5].redo).toBeUndefined()
-    expect(ROUND_FOUR_LEGEND).toBe('★ proves a different product behavior')
-    expect(ROUND_FOUR_SCOPE).toBe('AWS NOT TIMED · MARGIN N/A')
-    expect(ROUND_FOUR_FOOTER).toBe('LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A')
-    expect(roundFourFooter({
-      ...session(),
-      state: 'running',
-      comparison: null,
-    })).toBe(ROUND_FOUR_SCOPE)
-    expect(roundFourFooter(session())).toBe(ROUND_FOUR_FOOTER)
-    expect(roundFourFooter({ ...session(), state: 'running', redo: redo('running') })).toBe(ROUND_FOUR_FOOTER)
-    expect(roundFourFooter({ ...session(), redo: redo('verified') })).toBe(ROUND_FOUR_FOOTER)
-    expect(roundFourFooter({ ...session(), redo: redo('failed') })).toBe(ROUND_FOUR_FOOTER)
-    expect(roundFourFooter({
-      ...session(),
-      state: 'failed',
-      lanes: {
-        ...session().lanes,
-        lakebase: { ...session().lanes.lakebase, state: 'failed' },
-      },
-      comparison: null,
-      remembered_result: null,
-    })).toBe(ROUND_FOUR_SCOPE)
+    const round = FALLBACK_CATALOG.rounds[3]
+    expect(isRoundFour(session())).toBe(true)
+    expect(round.comparison_kind).toBe('measured')
+    expect(round.metric_specs?.find((spec) => spec.role === 'primary')?.id).toBe('bell_to_exact_read_ms')
+    // Lakebase's own sync figure is shown and never compared.
+    expect(round.metric_specs?.find((spec) => spec.id === 'managed_availability_ms')?.role).toBe('secondary')
+    expect(round.non_claims?.[0]).toMatch(/Both integrations cold start at the bell/)
+    expect(JSON.stringify(round)).not.toMatch(/application_proof_elapsed_ms|not executed or timed|separate reverse-ETL stack/i)
   })
 
-  it('gates redo to verified v1 with a ready show policy', () => {
-    const ready = session()
-    expect(canStartRoundFourRedo(ready)).toBe(true)
-    expect(canStartRoundFourRedo({ ...ready, state: 'failed' })).toBe(false)
-    expect(canStartRoundFourRedo({ ...ready, redo: redo('running') })).toBe(false)
-    expect(roundFourPresentation({ ...ready, state: 'running', redo: null })).toBe('initial_running')
-    expect(roundFourPresentation({ ...ready, state: 'failed', redo: null })).toBe('initial_failed')
-    expect(roundFourPresentation({ ...ready, state: 'running', redo: redo('running') })).toBe('redo_running')
-    expect(roundFourPresentation({ ...ready, redo: redo('verified') })).toBe('redo_verified')
-    expect(roundFourPresentation({ ...ready, redo: { ...redo('failed'), failure: 'v2 failed' } })).toBe('redo_failed')
+  it('names each lane by the integration that carries the row', () => {
+    const aurora = session()
+    expect(roundFourStackLabel(aurora, 'lakebase')).toBe('Lakebase synced table')
+    expect(roundFourStackLabel(aurora, 'competitor')).toBe('AWS Glue → Aurora Serverless v2')
+    expect(roundFourStackLabel(
+      { competitor: FALLBACK_CATALOG.competitors[1] },
+      'competitor',
+    )).toBe('AWS Glue → RDS PostgreSQL')
   })
 
-  it('requires the exact row, including the full nonce', () => {
-    expect(modelScoreEvidence(proofLane('v1')).exactRowVerified).toBe(true)
-    const lane = proofLane('v1')
-    lane.evidence.verified_row.proof_nonce = 'different'
-    expect(modelScoreEvidence(lane).exactRowVerified).toBe(false)
+  it('tags both lanes alike with their cold start, wherever a lane is labeled', () => {
+    const aurora = session()
+    expect(roundFourLaneLabel(aurora, 'lakebase')).toBe('Lakebase synced table (cold start)')
+    expect(roundFourLaneLabel(aurora, 'competitor')).toBe(
+      'AWS Glue → Aurora Serverless v2 (cold start)',
+    )
+  })
+
+  it('reads the committed row from lane evidence and never invents a value', () => {
+    expect(modelScoreEvidence(proofLane('v1'))).toEqual({
+      primaryKey: 'customer-42',
+      score: '0.81',
+      modelVersion: 'risk-v1',
+      proofNonce: 'round4-v1-nonce-full-value',
+      deltaVersion: '11',
+    })
+    expect(modelScoreEvidence({ ...proofLane('v1'), evidence: {} })).toEqual({
+      primaryKey: '—',
+      score: '—',
+      modelVersion: '—',
+      proofNonce: '—',
+      deltaVersion: '—',
+    })
   })
 })
 

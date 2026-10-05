@@ -40,15 +40,8 @@ from server.manager import (
 )
 from server.manifest import DemoManifest
 from server.model_score import (
-    WARM_PROOF_REUSE_SECONDS,
-    ModelScoreArm,
+    DeltaCommit,
     ModelScoreContract,
-    ModelScoreEngine,
-    ModelScorePhase,
-    ModelScoreProgress,
-    ModelScoreProofKind,
-    ModelScoreProofResult,
-    ModelScoreRunResult,
     is_owned_prior_proof,
 )
 from server.models import (
@@ -59,7 +52,6 @@ from server.models import (
     CooldownState,
     Corner,
     LaneState,
-    RedoState,
     ResetMode,
     RoundId,
     SessionCreate,
@@ -77,7 +69,19 @@ from server.recovery import (
     RecoveryRunResult,
     RecoveryStoppedResult,
 )
+from server.round4_race import (
+    COMPETITOR_LANE,
+    LAKEBASE_LANE,
+    Bell,
+    LaneOutcome,
+    Round4Arm,
+    Round4Phase,
+    Round4RaceResult,
+)
+from server.round4_race import PROTOCOL as ROUND4_PROTOCOL
+from server.round4_race import resolve as resolve_round4
 from server.round5_warm import Round5Variant, Round5WarmState, WarmStoreConflictError
+from server.round6_race import Round6Phase, Round6RaceEngine
 from server.round_availability import GRANT_REFUSAL_HEADLINE
 from server.safe_change import (
     SafeChangeArm,
@@ -96,6 +100,8 @@ from server.safe_change import (
 )
 from server.targets import TargetNotArmedError
 from server.verifier import FatalProbeError, NeutralVerifier, RetryPolicy
+from tests.test_round6_race import BASELINE as ROUND6_BASELINE
+from tests.test_round6_race import FakeLane as Round6FakeLane
 
 
 @pytest.mark.parametrize(
@@ -153,6 +159,58 @@ def test_native_pipeline_round_receipts_exclude_aws_database_and_keep_unknowns_p
     assert components["Databricks SQL warehouse query compute"].quantity is None
     assert any(line.component.startswith("Delta ") for line in receipt.lines)
     assert components[external_component].status == "selection_required"
+    assert receipt.known_bout_estimate_usd is None
+
+
+GLUE_RECEIPT_LINE = "AWS Glue job · 2 DPU (G.1X × 2) · billed seconds pending"
+
+
+def test_a_round_four_receipt_with_its_glue_lane_prices_the_job_not_a_product_to_select() -> None:
+    receipt = build_cost_receipt(
+        RoundId.PUT_MODEL_SCORE_IN_APP, CompetitorId.RDS_POSTGRES, round4_aws_lane=True
+    )
+    components = {line.component: line for line in receipt.lines}
+
+    assert not any("reverse-ETL product" in component for component in components)
+    glue = components[GLUE_RECEIPT_LINE]
+    assert glue.lane_id == "competitor"
+    assert glue.unit == "DPU-hour" and glue.unit_rate_usd == pytest.approx(0.44)
+    # Glue reports billed seconds only once the run has stopped: pending, never a clock.
+    assert glue.quantity is None and glue.subtotal_usd is None
+    assert glue.status == "usage_pending"
+    # Its own RDS instance is on the receipt, as every raced round's database is.
+    assert any(component.startswith("RDS PostgreSQL") for component in components)
+    assert receipt.known_bout_estimate_usd is None
+
+
+DMS_RECEIPT_LINE = (
+    "AWS DMS replication instance · dms.t3.small · stands whether or not its tasks run"
+)
+
+
+@pytest.mark.parametrize(
+    "competitor", [CompetitorId.RDS_POSTGRES, CompetitorId.AURORA_SERVERLESS_V2]
+)
+def test_a_round_six_receipt_with_its_aws_lane_prices_dms_and_glue_not_a_stack_to_select(
+    competitor: CompetitorId,
+) -> None:
+    receipt = build_cost_receipt(RoundId.ANALYZE_LIVE_ORDERS, competitor, round6_aws_lane=True)
+    components = {line.component: line for line in receipt.lines}
+
+    assert not any("CDC-to-Delta stack" in component for component in components)
+    # The replication instance stands, so it is a month's carrying cost at its rate.
+    dms = components[DMS_RECEIPT_LINE]
+    assert dms.lane_id == "competitor"
+    assert dms.scope == "required_monthly_carrying_cost"
+    assert dms.unit_rate_usd == pytest.approx(0.036)
+    assert dms.quantity == pytest.approx(730.0)
+    assert dms.subtotal_usd == pytest.approx(26.28)
+    # The Glue run is pending until Glue reports its billed seconds, as Round 4's is.
+    glue = components[GLUE_RECEIPT_LINE]
+    assert glue.quantity is None and glue.status == "usage_pending"
+    # Its own database is on the receipt, as every raced round's is.
+    assert any(component.startswith(("RDS PostgreSQL", "Aurora ")) for component in components)
+    assert receipt.known_monthly_carrying_cost_usd is not None
     assert receipt.known_bout_estimate_usd is None
 
 
@@ -1387,179 +1445,153 @@ class TransitionRaceRecoveryEngine(TowelRecoveryEngine):
 
 
 class FakeModelScoreEngine:
+    """A Round 4 engine with the two-lane engine's interface and a fixed, verified result.
+
+    ``prepare`` confirms both lanes parked; ``run`` returns a result in which Lakebase's row
+    arrives 31.5 s after the bell and the competitor's 77.8 s after it, resolved by the real
+    ``round4_race.resolve``; ``settle_and_restore_baseline`` counts its calls.
+    """
+
     def __init__(self) -> None:
         self.contract = ModelScoreContract(
             pipeline_id="round4-model-score-sync",
             source_table="main.anti_demo.model_scores",
             synced_table="public.model_scores",
         )
+        self.lane_ids = (LAKEBASE_LANE, COMPETITOR_LANE)
         self.arm_calls = 0
         self.run_calls = 0
-        self.redo_calls = 0
+        self.settle_calls = 0
         self.emit_progress = True
-        #: What `arm` raises instead of returning, if anything. An exception
+        #: What `prepare` raises instead of returning, if anything. An exception
         #: rather than a boolean so a test can hand over the real refusal it is
         #: about -- a flag could only ever produce a stand-in, and a stand-in is
         #: what a test of "does the cause survive" must not accept.
         self.arm_error: BaseException | None = None
         self.fail_run = False
-        self.fail_redo = False
-        self.redo_entered = asyncio.Event()
-        self.allow_redo = asyncio.Event()
-        self.allow_redo.set()
-        self.arm_result = ModelScoreArm(
+        self.lakebase_ms = 31_500.0
+        self.competitor_ms = 77_800.0
+        self.arm_result = Round4Arm(
             arm_id="round4-arm",
             armed_at=datetime(2026, 8, 18, 12, 0, tzinfo=UTC),
-            contract_sha256=self.contract.sha256,
             source_version=10,
+            source_table_id="table-1",
             baseline=self.contract.baseline,
+            lanes=self.lane_ids,
         )
-        self.initial_result: ModelScoreRunResult | None = None
-        self.redo_received_result: ModelScoreRunResult | None = None
+        self.initial_result: Round4RaceResult | None = None
+        #: When set, ``run`` waits on it before its bell, as the real engine waits while it
+        #: opens and wakes the verifier's connections; ``waiting_for_bell`` says it got there.
+        self.before_bell: asyncio.Event | None = None
+        self.waiting_for_bell = asyncio.Event()
 
-    async def _emit(self, callback, phase: ModelScorePhase, status: str, attempt=None):
-        if not self.emit_progress or callback is None:
-            return
-        try:
-            await callback(
-                ModelScoreProgress(
-                    phase=phase,
-                    status=status,
-                    occurred_at=datetime.now(UTC),
-                    attempt=attempt,
-                )
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            return
-
-    async def arm(self, on_progress=None):
+    async def prepare(self, notify):
         self.arm_calls += 1
-        await self._emit(
-            on_progress,
-            ModelScorePhase.PREFLIGHT,
-            "Inspecting Managed Sync",
-        )
+        if self.emit_progress:
+            await notify("Confirming every integration is parked")
         if self.arm_error is not None:
             raise self.arm_error
         return self.arm_result
 
-    @staticmethod
-    def _proof(kind, update, version: int) -> ModelScoreProofResult:
-        commit_time = datetime(2026, 8, 18, 12, 0, version, tzinfo=UTC)
-        return ModelScoreProofResult(
-            kind=kind,
-            update=update,
-            source_version=version,
-            delta_commit_time=commit_time,
-            sync_end_time=commit_time + timedelta(milliseconds=125),
-            managed_availability_ms=125.0,
-            application_read_elapsed_ms=250.0,
-            poll_attempts=2,
-            verified_row=update.row,
-        )
-
-    async def run(self, arm, update, on_progress=None):
+    async def run(self, arm, update, on_progress):
         self.run_calls += 1
         assert arm is self.arm_result
-        await self._emit(
-            on_progress,
-            ModelScorePhase.COMMITTING_SOURCE,
-            "Committing source update",
-        )
-        await self._emit(
-            on_progress,
-            ModelScorePhase.WAITING_SYNC,
-            "Waiting for Managed Sync",
-            attempt=2,
-        )
+        if self.before_bell is not None:
+            self.waiting_for_bell.set()
+            await self.before_bell.wait()
+        if self.emit_progress:
+            for lane_id in self.lane_ids:
+                try:
+                    await on_progress(lane_id, Round4Phase.STARTING, "Starting from parked", 0.0)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The real engine treats progress as observation; so does this one.
+                    pass
         if self.fail_run:
             raise RuntimeError("initial proof failed")
-        result = ModelScoreRunResult(
+        outcomes = {
+            LAKEBASE_LANE: LaneOutcome(
+                lane_id=LAKEBASE_LANE,
+                verified=True,
+                elapsed_ms=self.lakebase_ms,
+                last_negative_ms=self.lakebase_ms - 250.0,
+                reads=126,
+                max_read_gap_ms=250.0,
+                evidence={"managed_availability_ms": 2400.0},
+            ),
+            COMPETITOR_LANE: LaneOutcome(
+                lane_id=COMPETITOR_LANE,
+                verified=True,
+                elapsed_ms=self.competitor_ms,
+                last_negative_ms=self.competitor_ms - 250.0,
+                reads=311,
+                max_read_gap_ms=250.0,
+                evidence={"glue_run": "jr_1"},
+            ),
+        }
+        result = Round4RaceResult(
+            protocol=ROUND4_PROTOCOL,
             arm_id=arm.arm_id,
-            contract_sha256=self.contract.sha256,
-            initial=self._proof(ModelScoreProofKind.INITIAL, update, 11),
+            update=update,
+            bell=Bell(
+                bout_id=arm.arm_id,
+                rung_at=datetime(2026, 8, 18, 12, 0, 10, tzinfo=UTC),
+                source_table_id="table-1",
+            ),
+            commit=DeltaCommit(
+                version=11,
+                committed_at=datetime(2026, 8, 18, 12, 0, 13, tzinfo=UTC),
+            ),
+            commit_ack_ms=3200.0,
+            outcomes=outcomes,
+            resolution=resolve_round4(outcomes),
         )
         self.initial_result = result
         return result
 
-    async def redo(self, arm, result, update, on_progress=None):
-        self.redo_calls += 1
-        self.redo_received_result = result
-        assert arm is self.arm_result
-        assert result is self.initial_result
-        self.redo_entered.set()
-        await self.allow_redo.wait()
-        await self._emit(
-            on_progress,
-            ModelScorePhase.COMMITTING_SOURCE,
-            "Committing v2 source update",
-        )
-        if self.fail_redo:
-            raise RuntimeError("redo failed")
-        return replace(
-            result,
-            redo=self._proof(ModelScoreProofKind.REDO, update, 12),
-        )
+    async def settle_and_restore_baseline(self) -> None:
+        self.settle_calls += 1
 
 
 class BlockingTowelModelScoreEngine(FakeModelScoreEngine):
-    """A Round 4 engine that blocks in ``run`` and settles for real at the pipeline.
+    """A Round 4 engine that blocks in ``run``, so a towel lands mid-bout, and settles.
 
-    ``settle_and_restore_baseline`` used to do nothing but set its own flag, and
-    the Round 4 row of the towel test asserted only that the flag was set. That
-    passed throughout the entire period in which a towelled bout left its
-    Managed Sync pipeline running and billing, because a flag a fake sets cannot
-    see a pipeline. It read as covering the towel's cleanup and covered nothing
-    of the kind.
-
-    So the release decision is delegated to the production one rather than
-    re-stated here. ``ModelScoreEngine._release_pipeline`` is the method that
-    chooses between the delayed release and the immediate one out of
-    ``_issued_results``, and calling it unbound against this fake runs that exact
-    branch instead of a test-local imitation of it -- which is how the original
-    guard came to be vacuous in the first place.
-
-    The activation underneath is the real one, wired to a fake pipeline API that
-    goes down only when a ``/stop`` actually reaches it. That is the thing which
-    would notice a stop not happening.
+    v1.1's towel owes Round 4 one thing: the engine's settlement, which restores the source row
+    while both lanes run and then parks both. The park itself is the engine's and is tested
+    against its lanes in ``tests/test_round4_race.py``; here the manager is held to calling it.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.run_entered = asyncio.Event()
         self.baseline_restored = asyncio.Event()
-        # The state `_release_pipeline` decides on. Empty is what a towel looks
-        # like from inside the engine: `run` was cancelled mid-flight, no result
-        # was issued, and no redo was ever published for a window to protect.
-        self._issued_results: dict = {}
-        self.pipeline = FakeRound4PipelineApi(running=False)
-        self._activation = model_score_live.Round4PipelineActivation(
-            round4_activation_manifest(),
-            self.pipeline,
-            pipeline_id="pipeline-1",
-            poll_seconds=0,
-        )
 
-    async def arm(self, on_progress=None):
-        # The real preflight, so the pipeline is up for the same reason it is up
-        # in production: this bout's own arm started it.
-        await self._activation.ensure_running(lambda _status: asyncio.sleep(0))
-        return await super().arm(on_progress)
-
-    async def run(self, arm, update, on_progress=None):
-        await self._emit(
-            on_progress,
-            ModelScorePhase.COMMITTING_SOURCE,
-            "Committing source update",
-        )
+    async def run(self, arm, update, on_progress):
         self.run_entered.set()
         await asyncio.Event().wait()
 
-    async def settle_and_restore_baseline(self):
+    async def settle_and_restore_baseline(self) -> None:
+        self.settle_calls += 1
         self.baseline_restored.set()
-        await ModelScoreEngine._release_pipeline(self)
+
+
+class SettlingModelScoreEngine(FakeModelScoreEngine):
+    """A Round 4 engine whose post-bout settlement can be held open."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.settle_started = asyncio.Event()
+        self.allow_settle = asyncio.Event()
+        self.settled = False
+
+    async def settle_and_restore_baseline(self) -> None:
+        self.settle_calls += 1
+        self.settle_started.set()
+        await self.allow_settle.wait()
+        self.settled = True
+
+
 
 
 class FakeRound4PipelineApi:
@@ -1620,22 +1652,45 @@ def round4_activation_manifest() -> SimpleNamespace:
     )
 
 
-class BlockingTowelLiveOrdersEngine:
+class BlockingTowelLiveOrdersEngine(Round6RaceEngine):
+    """Round 6's real engine on lanes whose order never arrives, so a towel is what ends it.
+
+    ``run_entered`` is set only once every lane is waiting on its history: both checkouts are
+    committed and AWS's pipeline started, so the towel's settle has real rows to take back out.
+    """
+
     def __init__(self) -> None:
+        super().__init__(
+            (
+                Round6FakeLane(LAKEBASE_LANE, "Lakebase", arrives_on_read=None),
+                Round6FakeLane(COMPETITOR_LANE, "AWS", arrives_on_read=None),
+            ),
+            baseline=ROUND6_BASELINE,
+            poll_seconds=0.001,
+            watch_seconds=0.001,
+            lane_timeout_seconds=60.0,
+        )
         self.run_entered = asyncio.Event()
         self.cleaned = asyncio.Event()
-        self.orders = None
 
-    async def arm(self, on_progress=None):
-        return SimpleNamespace(committed_lsn=1)
+    async def run(self, arm, order, guardrail_order, on_progress):
+        waiting: set[str] = set()
 
-    async def run(self, arm, order, checkout_guardrail_order, on_progress=None):
-        self.orders = (order, checkout_guardrail_order)
-        self.run_entered.set()
-        await asyncio.Event().wait()
+        async def observed(lane_id, phase, status, elapsed_ms):
+            await on_progress(lane_id, phase, status, elapsed_ms)
+            if phase == Round6Phase.WAITING:
+                waiting.add(lane_id)
+                if waiting == set(self.lane_ids):
+                    self.run_entered.set()
 
-    async def settle_and_cleanup_owned(self, order, checkout_guardrail_order):
-        assert self.orders == (order, checkout_guardrail_order)
+        return await super().run(arm, order, guardrail_order, observed)
+
+    async def settle_and_cleanup_owned(self) -> None:
+        await super().settle_and_cleanup_owned()
+        for lane in self.lanes:
+            assert {"delete:checkout", "delete:checkout-guardrail"} <= set(lane.events)
+            assert set(lane.source) == {ROUND6_BASELINE.order_id}
+            assert lane.events[-1] == "park"
         self.cleaned.set()
 
 
@@ -1943,7 +1998,7 @@ async def test_round_five_keeps_both_leases_until_full_backstage_cleanup() -> No
     round5_store = InMemoryBoutLeaseStore(ring_key="round5")
     manager = RunManager(
         connection_spike_factory=lambda _competitor: engine,
-        live_orders_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
         lease_store=main_store,
         round5_lease_store=round5_store,
     )
@@ -2928,8 +2983,39 @@ def test_no_round_five_towel_branch_names_the_preflight_inclusive_origin() -> No
         "against the current shape rather than deleting it."
     )
 
+    # The V4 bell protocol is the one exception, and it is exact rather than tolerated:
+    # its run origin IS the bell. `start_run` stamps it from the warm coordinator's
+    # `t0_monotonic_ns`, and the live projection draws both lanes' clocks from it, so
+    # its towel freezes each lane at the elapsed the room watched (a towel 3.09 s after
+    # the bell once froze Lakebase at a 0.48 s milestone and Aurora at "not timed").
+    def is_bell_protocol_branch(node: ast.AST) -> bool:
+        return isinstance(node, ast.If) and any(
+            isinstance(child, ast.Constant) and child.value == "round5-bell-to-10k-v4"
+            for child in ast.walk(node.test)
+        )
+
+    bell_branch_lines = set(
+        origin_lines(
+            [
+                statement
+                for branch in round_five_branches
+                for node in ast.walk(branch)
+                if is_bell_protocol_branch(node)
+                for statement in node.body
+            ]
+        )
+    )
+    assert bell_branch_lines, (
+        "the V4 bell protocol's towel no longer reads its bell origin, so each lane's "
+        "floor is back to its last published milestone -- or this guard no longer finds "
+        "the V4 branch it exempts"
+    )
+
     in_round_five = sorted(
-        line for node in round_five_branches for line in origin_lines(node.body)
+        line
+        for node in round_five_branches
+        for line in origin_lines(node.body)
+        if line not in bell_branch_lines
     )
     assert not in_round_five, (
         f"server/manager.py{in_round_five} reads run_started_monotonic_ns inside "
@@ -3134,7 +3220,7 @@ async def test_round_five_setup_is_primary_and_burst_is_a_secondary_gate(
     runner_ipv4 = next(
         line
         for line in created.cost_receipt.lines
-        if line.component == "Neutral runner public IPv4"
+        if line.component == "Two isolated runner public IPv4 addresses"
     )
     assert runner_ipv4.source_as_of == datetime(2026, 7, 24, 15, 42, 25, tzinfo=UTC)
     assert "AmazonVPC" in runner_ipv4.source
@@ -3571,14 +3657,6 @@ async def sealed_receipt(session_id: str, until=None):
     return found
 
 
-async def wait_for_redo(manager: RunManager, session_id: str, state: RedoState):
-    for _ in range(100):
-        snapshot = await manager.get(session_id)
-        if snapshot.redo and snapshot.redo.state == state:
-            return snapshot
-        await asyncio.sleep(0.005)
-    raise AssertionError(f"Re-do never reached {state}")
-
 
 async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> None:
     settle_zero = asyncio.Event()
@@ -3689,14 +3767,10 @@ async def test_a_towel_thrown_mid_run_settles_each_rounds_own_engine() -> None:
     block in, and Round 5's towel is a two-ring handshake rather than a single
     settle.
 
-    **Round 4's row asserts a second, more expensive restoration.** Its engine
-    owns a Managed Sync pipeline that bills $14.57/day while up, and a towelled
-    bout leaves no redo to protect, so the towel owes an immediate stop. That
-    was asserted for a long time only as "the fake set ``baseline_restored``",
-    which a fake can set without a pipeline existing anywhere -- so the row
-    passed throughout the period the pipeline was being left running. It now
-    asserts against the pipeline wire, which goes down only when a ``/stop``
-    actually reaches it.
+    Round 4's settlement is also its park: it restores the source row while both
+    lanes run, then parks both. That the park reaches the lanes is the engine's
+    own test (``tests/test_round4_race.py``); this row holds the manager to
+    calling it.
     """
 
     cases: tuple[tuple[str, str, object, RoundId, str, Corner, str, bool], ...] = (
@@ -3734,7 +3808,8 @@ async def test_a_towel_thrown_mid_run_settles_each_rounds_own_engine() -> None:
 
     for name, factory_kwarg, engine_cls, round_id, persona, corner, flag, cooldown in cases:
         engine = engine_cls()
-        manager = RunManager(**{factory_kwarg: lambda engine=engine: engine})
+        # Rounds 4 and 6 take the matchup's competitor; Round 2 takes nothing.
+        manager = RunManager(**{factory_kwarg: lambda *_matchup, engine=engine: engine})
         created = await manager.create(
             SessionCreate(
                 competitor=CompetitorId.AURORA_SERVERLESS_V2,
@@ -3754,17 +3829,6 @@ async def test_a_towel_thrown_mid_run_settles_each_rounds_own_engine() -> None:
         if cooldown:
             assert settled.cooldown is not None, name
             assert settled.cooldown.state == CooldownState.READY, name
-        pipeline = getattr(engine, "pipeline", None)
-        if pipeline is not None:
-            # The restoration the flag above cannot see. This bout's own arm
-            # started the pipeline and the towel published no redo, so the
-            # window that twenty minutes of billing buys protects nothing and
-            # the stop is owed immediately.
-            assert pipeline.stop_verbs, (
-                f"{name}: the towel settled its engine but never stopped the Managed "
-                f"Sync pipeline its own arm started, which bills until somebody notices"
-            )
-            assert pipeline.running is False, name
 
 
 async def test_shutdown_performs_the_round_four_pipeline_stop_no_record_owns() -> None:
@@ -3889,21 +3953,10 @@ async def verified_round_four(
     # `wait_for_state` watches the snapshot, and the snapshot is not the whole
     # of "the run is over". The Round 4 run sets `state = VERIFIED` and then
     # keeps going inside the same task -- it still has the terminal event to
-    # publish and the round settlement to schedule. Every one of the fourteen
-    # callers of this helper goes straight on to `start_redo`, and `start_redo`
-    # refuses with "A session operation is already running" while `record.task`
-    # is unfinished. So returning on the snapshot alone hands the caller a bout
-    # that is ready only if the 5ms poll above happened to land after the task
-    # finished rather than during its tail.
-    #
-    # It almost always does, which is what made this look like a phantom: the
-    # tail is sub-millisecond, and instrumenting the window showed it shut on
-    # every one of forty randomised orders of this file alone, and on 200
-    # consecutive runs of the sequence in a quiet loop. It opens under the
-    # loaded event loop of a full-suite run -- one of twelve whole-suite
-    # randomised orders caught it, and that order also failed
-    # `test_lost_redo_lease_preserves_initial_verified_proof` with the refusal
-    # above. A file-scoped stress run would never have found it.
+    # publish and the round settlement to schedule. A caller that goes straight
+    # on to the next operation would meet "A session operation is already
+    # running" if the 5ms poll above landed during that tail, which it does only
+    # under the loaded event loop of a full-suite run.
     #
     # Awaited rather than slept on, because the task is precisely the thing
     # being waited for. Bounded because nothing in this suite bounds a hung
@@ -3955,28 +4008,73 @@ async def test_round_four_factory_is_lazy_and_missing_factory_arm_precedes_lease
     assert await lease_store.current() is None
 
     engine = FakeModelScoreEngine()
-    factory_calls = 0
+    factory_calls: list[CompetitorId] = []
 
-    def factory():
-        nonlocal factory_calls
-        factory_calls += 1
+    def factory(competitor: CompetitorId):
+        factory_calls.append(competitor)
         return engine
 
     available = RunManager(model_score_factory=factory)
     ready = await available.create(round_four_request())
     assert ready.round.availability.value == "ready"
-    assert factory_calls == 0
+    assert factory_calls == []
     await available.get(ready.id)
-    assert factory_calls == 0
+    assert factory_calls == []
     await available.start_arm(ready.id)
     await wait_for_state(available, ready.id, SessionState.ARMED)
-    assert factory_calls == 1
+    # Built once, for this matchup's competitor, whose Glue lane it races.
+    assert factory_calls == [CompetitorId.RDS_POSTGRES]
     assert available._records[ready.id].model_score_engine is engine
 
 
-async def test_round_four_initial_proof_has_exact_evidence_metrics_and_gap() -> None:
+async def test_round_four_fight_card_wakes_each_matchup_at_most_once_a_minute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fight card asks when it opens and while it stays open; the manager wakes sparingly."""
+
+    woken: list[CompetitorId] = []
+    held = asyncio.Event()
+    rds_waking = asyncio.Event()
+
+    class Engine:
+        def __init__(self, competitor: CompetitorId) -> None:
+            self.competitor = competitor
+
+        async def wake(self) -> None:
+            woken.append(self.competitor)
+            if self.competitor == CompetitorId.RDS_POSTGRES:
+                rds_waking.set()
+                await held.wait()
+
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr("server.manager.time.monotonic", lambda: clock["now"])
+    manager = RunManager(model_score_factory=Engine)
+    aurora, rds = CompetitorId.AURORA_SERVERLESS_V2, CompetitorId.RDS_POSTGRES
+
+    assert manager.wake_round4(aurora) is True
+    assert manager.wake_round4(aurora) is False
+    assert manager.wake_round4(rds) is True
+    await manager._round4_wake_tasks[aurora]
+    assert manager.wake_round4(aurora) is False
+    clock["now"] += 61.0
+    assert manager.wake_round4(aurora) is True
+    await manager._round4_wake_tasks[aurora]
+    await asyncio.wait_for(rds_waking.wait(), 5.0)
+    # One still waking is never doubled, however long it takes.
+    assert manager.wake_round4(rds) is False
+    assert sorted(woken) == sorted([aurora, rds, aurora])
+
+    # Closing the manager cancels a wake still in flight.
+    await manager.close()
+    assert manager._round4_wake_tasks == {}
+    assert manager.wake_round4(aurora) is False
+
+    assert RunManager().wake_round4(aurora) is False
+
+
+async def test_round_four_two_lane_bout_has_both_clocks_the_engines_verdict_and_no_redo() -> None:
     engine = FakeModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-4")
 
     created, verified = await verified_round_four(manager, operator)
@@ -3988,47 +4086,143 @@ async def test_round_four_initial_proof_has_exact_evidence_metrics_and_gap() -> 
     assert record.model_score_arm is engine.arm_result
     assert record.model_score_result is engine.initial_result
     assert verified.remembered_result == (
-        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
+        "LAKEBASE WINS · MARGIN 46.3s"
     )
     assert derive_receipt(verified, "run_finished").remembered_result == (
         verified.remembered_result
     )
-    assert verified.lanes["competitor"].state == LaneState.NOT_SUPPORTED
-    assert set(verified.lanes["competitor"].evidence) == {"unsupported_reason"}
-    assert verified.lanes["competitor"].evidence["unsupported_reason"] == (
-        "No AWS-native equivalent lane was configured or timed in this scoped proof."
-    )
-    evidence = verified.lanes["lakebase"].evidence
-    assert evidence["primary_key"] == engine.contract.entity_id
-    assert evidence["score"] == 0.81
-    assert evidence["model_version"] == "risk-v1"
-    assert evidence["proof_nonce"].startswith("round4-v1-")
-    assert evidence["delta_version"] == 11
-    assert evidence["status_delta_commit_time"] == datetime(2026, 8, 18, 12, 0, 11, tzinfo=UTC)
-    assert evidence["sync_end_time"] == datetime(2026, 8, 18, 12, 0, 11, 125000, tzinfo=UTC)
-    assert evidence["verified_row"]["proof_nonce"] == evidence["proof_nonce"]
-    assert verified.lanes["lakebase"].elapsed_ms == 250.0
-    metrics = {item.spec_id: item for item in verified.metrics}
-    assert metrics["managed_availability_ms"].value == 125.0
-    assert metrics["application_proof_elapsed_ms"].value == 250.0
-    assert metrics["delta_commit_version"].value == 11
-    assert metrics["exact_row_verified"].value is True
+    for lane_id, elapsed in (("lakebase", 31_500.0), ("competitor", 77_800.0)):
+        lane = verified.lanes[lane_id]
+        assert lane.state == LaneState.VERIFIED
+        assert lane.elapsed_ms == elapsed
+        assert lane.evidence["primary_key"] == engine.contract.entity_id
+        assert lane.evidence["score"] == 0.81
+        assert lane.evidence["model_version"] == "risk-v1"
+        assert lane.evidence["proof_nonce"].startswith("round4-v1-")
+        assert lane.evidence["delta_version"] == 11
+        assert lane.evidence["protocol"] == "round4-two-lane-v1"
+    assert verified.lanes["competitor"].evidence["glue_run"] == "jr_1"
+    metrics = {(item.spec_id, item.lane_id): item for item in verified.metrics}
+    assert metrics[("bell_to_exact_read_ms", "lakebase")].value == 31_500.0
+    assert metrics[("bell_to_exact_read_ms", "competitor")].value == 77_800.0
+    # Lakebase's own figure is shown and never compared: the AWS lane has none like it.
+    assert metrics[("managed_availability_ms", "lakebase")].value == 2400.0
+    assert ("managed_availability_ms", "competitor") not in metrics
+    assert metrics[("delta_commit_version", None)].value == 11
+    assert metrics[("exact_row_verified", "competitor")].value is True
     assert verified.comparison is not None
-    assert verified.comparison.kind == ComparisonKind.CAPABILITY_GAP
+    assert verified.comparison.kind == ComparisonKind.MEASURED
     assert verified.comparison.winner_lane_id == "lakebase"
-    assert verified.comparison.margin is None
+    assert verified.comparison.margin is not None
+    assert verified.comparison.margin.value == 46_300.0
     assert verified.comparison.detail == (
-        "Lakebase verified the scoped native Synced Tables capability; no AWS-native "
-        "equivalent lane was timed. This is not a speed comparison."
+        "Lakebase put the exact row in the application 46.30 s sooner; both integrations "
+        "cold start at the bell."
     )
-    assert verified.redo is not None and verified.redo.state == RedoState.READY
+    assert verified.redo is None
+    # The engine raced the AWS lane, so the receipt prices it rather than asking for a product.
+    receipt_components = {line.component for line in verified.cost_receipt.lines}
+    assert GLUE_RECEIPT_LINE in receipt_components
+    assert not any("reverse-ETL product" in component for component in receipt_components)
+    # The row is put back and both lanes parked, in the background, after the result.
+    task = record.settlement_task
+    if task is not None:
+        await asyncio.wait_for(asyncio.shield(task), timeout=5)
+    assert engine.settle_calls == 1
+
+
+async def test_round_four_clocks_start_at_the_bell_not_while_the_verifier_connects() -> None:
+    """Live, the engine rang its bell about 3 s after the run began: opening and waking the
+    verifier's connections takes that long. Timed from the run, every lane's display ran 3 s
+    ahead of its own clock and jumped back when the lane verified."""
+
+    clock = {"ns": 1_000_000_000}
+    engine = FakeModelScoreEngine()
+    engine.before_bell = asyncio.Event()
+    manager = RunManager(
+        model_score_factory=lambda _competitor: engine, clock_ns=lambda: clock["ns"]
+    )
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-bell")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    await asyncio.wait_for(engine.waiting_for_bell.wait(), timeout=1)
+    record = manager._records[created.id]
+
+    # Running, and nothing timed: the lanes are sealed and publish no clock floor.
+    clock["ns"] += 3_000_000_000
+    connecting = await manager.get(created.id)
+    assert connecting.state == SessionState.RUNNING
+    assert record.run_started_monotonic_ns is None
+    for lane in connecting.lanes.values():
+        assert lane.state == LaneState.SEALED
+        assert lane.elapsed_at_snapshot_ms is None
+
+    bell_ns = clock["ns"]
+    engine.before_bell.set()
+    await wait_for_state(manager, created.id, SessionState.VERIFIED)
+    assert record.run_started_monotonic_ns == bell_ns
+
+
+async def test_a_round_four_towel_before_the_bell_stops_the_bout_with_nothing_timed() -> None:
+    # The verifier can take seconds to open its connections (a paused Aurora resumes first);
+    # the operator's stop must work in that window too, and must not invent a time.
+    engine = FakeModelScoreEngine()
+    engine.before_bell = asyncio.Event()
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-early-towel")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    await asyncio.wait_for(engine.waiting_for_bell.wait(), timeout=1)
+
+    towelled = await manager.start_towel(created.id, operator)
+
+    assert towelled.towel is not None
+    assert towelled.comparison is not None
+    assert towelled.comparison.kind == ComparisonKind.NOT_COMPARABLE
+    for lane in towelled.lanes.values():
+        assert lane.state == LaneState.TOWELLED
+        assert lane.elapsed_ms is None
+        assert lane.status == "Toweled before the bell · not timed"
+    assert engine.initial_result is None
+
+
+async def test_a_round_four_arm_without_its_aws_lane_keeps_its_receipt_lakebase_only() -> None:
+    engine = FakeModelScoreEngine()
+    engine.lane_ids = (LAKEBASE_LANE,)
+    engine.arm_result = replace(engine.arm_result, lanes=(LAKEBASE_LANE,))
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-alone")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+
+    armed = await wait_for_state(manager, created.id, SessionState.ARMED)
+
+    assert armed.lanes["competitor"].state == LaneState.NOT_SUPPORTED
+    components = {line.component for line in armed.cost_receipt.lines}
+    assert "Required external reverse-ETL product" in components
+    assert GLUE_RECEIPT_LINE not in components
+
+
+async def test_round_four_has_no_redo() -> None:
+    engine = FakeModelScoreEngine()
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-no-redo")
+    created, _ = await verified_round_four(manager, operator)
+
+    with pytest.raises(InvalidStateError, match="Round 4 has no re-do"):
+        await manager.start_redo(created.id, operator)
+    assert engine.run_calls == 1
 
 
 @pytest.mark.parametrize("emit_progress", [False, True])
 async def test_round_four_progress_is_observational(emit_progress: bool) -> None:
     engine = FakeModelScoreEngine()
     engine.emit_progress = emit_progress
-    manager = RunManager(model_score_factory=lambda: engine)
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-progress")
     created = await manager.create(round_four_request())
     await manager.start_arm(created.id, operator)
@@ -4063,7 +4257,7 @@ async def test_round_four_initial_failure_waits_for_confirmed_release(caplog) ->
     engine = FakeModelScoreEngine()
     engine.fail_run = True
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-failure")
@@ -4081,12 +4275,11 @@ async def test_round_four_initial_failure_waits_for_confirmed_release(caplog) ->
     lease_store.allow_release.set()
     with caplog.at_level(logging.ERROR, logger="server.manager"):
         failed = await wait_for_state(manager, created.id, SessionState.FAILED)
-    assert failed.failure == "The live Managed Sync proof failed unexpectedly."
+    assert failed.failure == "Round 4 failed unexpectedly."
     assert failed.comparison is None
     assert failed.remembered_result is None
-    assert failed.lanes["competitor"].evidence["unsupported_reason"] == (
-        "No AWS-native equivalent lane was configured or timed in this scoped proof."
-    )
+    # Both lanes were in the bout, so both carry the failure; neither is "not supported".
+    assert {lane.state for lane in failed.lanes.values()} == {LaneState.FAILED}
 
     bout = [
         record
@@ -4140,7 +4333,7 @@ async def test_a_databricks_refusal_survives_the_arm_and_lifts_on_the_next_succe
     )
     engine = FakeModelScoreEngine()
     engine.arm_error = PermissionDenied(verbatim)
-    manager = RunManager(model_score_factory=lambda: engine)
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-denied")
 
     created = await manager.create(round_four_request())
@@ -4149,7 +4342,9 @@ async def test_a_databricks_refusal_survives_the_arm_and_lifts_on_the_next_succe
 
     assert failed.failure is not None
     # The round's own words for what it was doing, kept and kept first.
-    assert failed.failure.startswith("The Managed Sync baseline could not be verified. ")
+    assert failed.failure.startswith(
+        "Round 4 could not confirm both lanes parked at their baseline. "
+    )
     # Then who refused, that waiting will not help, and who can fix it.
     assert GRANT_REFUSAL_HEADLINE in failed.failure
     # Databricks' exact table and principal remain in the operator log and the
@@ -4188,7 +4383,7 @@ async def test_statement_provider_details_stay_in_logs_and_off_the_fight_card(
     )
     engine = FakeModelScoreEngine()
     engine.arm_error = denied
-    manager = RunManager(model_score_factory=lambda: engine)
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
     created = await manager.create(round_four_request())
 
     with caplog.at_level(logging.ERROR, logger="server.manager"):
@@ -4258,6 +4453,43 @@ async def test_catalog_storage_probe_is_cached_single_flight_and_recovers() -> N
     await manager.refresh_delta_storage_readiness(force=True)
     assert calls == 2
     assert manager.storage_refusals == {}
+
+
+async def test_an_open_tab_alone_does_not_re_probe_storage_once_a_verdict_exists() -> None:
+    """The catalog poll every thirty seconds kept the warehouse up all night (2026-10-02).
+
+    The probe's one-minute cache spaced the statements out but never let a warehouse
+    with a ten-minute auto-stop stop. With a verdict in hand, a stale cache is re-read
+    only while a person is on the app.
+    """
+
+    calls = 0
+    person_on = False
+
+    async def probe() -> None:
+        nonlocal calls
+        calls += 1
+
+    manager = RunManager(
+        delta_storage_probe=probe,
+        delta_storage_probe_interval_seconds=0,
+        delta_storage_probe_watched=lambda: person_on,
+    )
+    # The first answer is read whoever is watching: nothing is advertised before it.
+    await manager.refresh_delta_storage_readiness()
+    assert calls == 1
+    # A tab left open: polls arrive, the cache is stale, and nothing is sent.
+    for _ in range(5):
+        await manager.refresh_delta_storage_readiness()
+    assert calls == 1
+    # A person comes back, and the verdict is read again.
+    person_on = True
+    await manager.refresh_delta_storage_readiness()
+    assert calls == 2
+    # Startup's forced read does not wait for anyone.
+    person_on = False
+    await manager.refresh_delta_storage_readiness(force=True)
+    assert calls == 3
 
 
 async def test_missing_round6_delta_history_disables_only_round_six() -> None:
@@ -4333,7 +4565,7 @@ async def test_initial_terminal_release_retries_same_fence_until_confirmed(
     )
     engine = FakeModelScoreEngine()
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     manager._terminal_release_backoff_cap = 0.01
@@ -4353,7 +4585,7 @@ async def test_initial_terminal_release_retries_same_fence_until_confirmed(
     lease_store.allow_success.set()
     finished = await wait_for_state(manager, created.id, SessionState.VERIFIED)
     assert finished.remembered_result == (
-        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
+        "LAKEBASE WINS · MARGIN 46.3s"
     )
     assert lease_store.release_calls == 2
     assert record.lease_heartbeat_task is None
@@ -4370,7 +4602,7 @@ async def test_initial_terminal_release_maps_confirmed_loss_without_storing_resu
     )
     engine = FakeModelScoreEngine()
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-loss-initial")
@@ -4381,44 +4613,36 @@ async def test_initial_terminal_release_maps_confirmed_loss_without_storing_resu
 
     failed = await wait_for_state(manager, created.id, SessionState.FAILED)
     record = manager._records[created.id]
-    assert failed.failure == ("Managed Sync proof lease was lost before terminal verification.")
+    assert failed.failure == "Round 4's ring lease was lost before the result could be published."
     assert record.model_score_result is None
     assert record.lease_heartbeat_task is None
     assert [event.event for event in record.event_log.events].count("session_failed") == 1
 
 
-@pytest.mark.parametrize("phase", ["run_committed", "redo_committed"])
-async def test_slow_terminal_coordinator_io_keeps_lease_renewable_and_lock_free(
-    phase: str,
-) -> None:
+async def test_slow_terminal_coordinator_io_keeps_lease_renewable_and_lock_free() -> None:
+    phase = "run_committed"
     lease_store = SlowRenewableTerminalStore(phase=phase)
     engine = FakeModelScoreEngine()
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     operator = BoutOperator(display_name="Round Four Owner", subject=f"owner-slow-{phase}")
 
-    if phase == "run_committed":
-        created = await manager.create(round_four_request())
-        await manager.start_arm(created.id, operator)
-        await wait_for_state(manager, created.id, SessionState.ARMED)
-    else:
-        created, _ = await verified_round_four(manager, operator)
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
     record = manager._records[created.id]
 
     # The short lease belongs only to the terminal phase under test. Applying it
-    # before the prerequisite arm/verification made unrelated setup depend on a
-    # 30 ms wall-clock deadline and fail when a shared runner descheduled Python.
+    # before the prerequisite arm made unrelated setup depend on a 30 ms
+    # wall-clock deadline and fail when a shared runner descheduled Python.
     manager._lease_heartbeat = 0.01
     manager._active_lease_ttl = 0.2
     manager._running_lease_ttl = 0.2
     manager._terminal_release_call_timeout = 2
     manager._terminal_release_backoff_cap = 0.01
-    if phase == "run_committed":
-        await manager.start_run(created.id, operator)
-    else:
-        await manager.start_redo(created.id, operator)
+    await manager.start_run(created.id, operator)
 
     async def read_lease_under_lock():
         async with record.lease_lock:
@@ -4442,27 +4666,19 @@ async def test_slow_terminal_coordinator_io_keeps_lease_renewable_and_lock_free(
     assert await asyncio.wait_for(read_lease_under_lock(), timeout=1) is not None
     lease_store.allow_current.set()
 
-    if phase == "run_committed":
-        finished = await wait_for_state(manager, created.id, SessionState.VERIFIED)
-        assert finished.failure is None
-        terminal_event = "run_finished"
-    else:
-        finished = await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-        assert finished.state == SessionState.VERIFIED
-        terminal_event = "redo_finished"
+    finished = await wait_for_state(manager, created.id, SessionState.VERIFIED)
+    assert finished.failure is None
     assert lease_store.release_calls == 2
     assert record.lease_heartbeat_task is None
-    assert [event.event for event in record.event_log.events].count(terminal_event) == 1
+    assert [event.event for event in record.event_log.events].count("run_finished") == 1
 
 
-@pytest.mark.parametrize("phase", ["run_committed", "redo_committed"])
-async def test_heartbeat_defers_loss_when_release_clears_row_before_true_response(
-    phase: str,
-) -> None:
+async def test_heartbeat_defers_loss_when_release_clears_row_before_true_response() -> None:
+    phase = "run_committed"
     lease_store = ClearBeforeReleaseReturnsStore(phase=phase)
     engine = FakeModelScoreEngine()
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     manager._lease_heartbeat = 0.01
@@ -4470,60 +4686,40 @@ async def test_heartbeat_defers_loss_when_release_clears_row_before_true_respons
     manager._running_lease_ttl = 0.03
     manager._terminal_release_call_timeout = 0.5
     operator = BoutOperator(display_name="Round Four Owner", subject=f"owner-clear-{phase}")
-    if phase == "run_committed":
-        created = await manager.create(round_four_request())
-        await manager.start_arm(created.id, operator)
-        await wait_for_state(manager, created.id, SessionState.ARMED)
-        await manager.start_run(created.id, operator)
-    else:
-        created, _ = await verified_round_four(manager, operator)
-        await manager.start_redo(created.id, operator)
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
     record = manager._records[created.id]
     await asyncio.wait_for(lease_store.row_cleared.wait(), timeout=1)
 
-    if phase == "run_committed":
-        finished = await wait_for_state(manager, created.id, SessionState.VERIFIED)
-        terminal_event = "run_finished"
-        forbidden_event = "session_failed"
-    else:
-        finished = await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-        assert finished.state == SessionState.VERIFIED
-        terminal_event = "redo_finished"
-        forbidden_event = "redo_failed"
+    await wait_for_state(manager, created.id, SessionState.VERIFIED)
     for _ in range(100):
         if record.model_score_terminal_task is None:
             break
         await asyncio.sleep(0.005)
     events = [event.event for event in record.event_log.events]
-    assert events.count(terminal_event) == 1
-    assert forbidden_event not in events
+    assert events.count("run_finished") == 1
+    assert "session_failed" not in events
     assert record.lease_heartbeat_task is None
     assert record.lease_heartbeat_lease is None
     assert record.model_score_terminal_task is None
     assert record.model_score_terminal_lease is None
 
 
-@pytest.mark.parametrize("phase", ["run_committed", "redo_committed"])
-async def test_terminalizer_never_adopts_or_releases_a_newer_local_fence(
-    phase: str,
-) -> None:
+async def test_terminalizer_never_adopts_or_releases_a_newer_local_fence() -> None:
+    phase = "run_committed"
     lease_store = DelayedOldFenceReleaseStore(phase=phase)
     engine = FakeModelScoreEngine()
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     operator = BoutOperator(display_name="Round Four Owner", subject=f"owner-fence-{phase}")
-    if phase == "run_committed":
-        created = await manager.create(round_four_request())
-        await manager.start_arm(created.id, operator)
-        await wait_for_state(manager, created.id, SessionState.ARMED)
-        await manager.start_run(created.id, operator)
-        original_lane = None
-    else:
-        created, verified = await verified_round_four(manager, operator)
-        original_lane = verified.lanes["lakebase"].model_dump(mode="json")
-        await manager.start_redo(created.id, operator)
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
     record = manager._records[created.id]
     await asyncio.wait_for(lease_store.release_started.wait(), timeout=1)
     async with record.lease_lock:
@@ -4541,17 +4737,8 @@ async def test_terminalizer_never_adopts_or_releases_a_newer_local_fence(
     manager._start_lease_heartbeat(record, timedelta(seconds=1))
     lease_store.allow_response.set()
 
-    if phase == "run_committed":
-        failed = await wait_for_state(manager, created.id, SessionState.FAILED)
-        assert failed.failure == ("Managed Sync proof lease was lost before terminal verification.")
-        terminal_event = "session_failed"
-    else:
-        failed = await wait_for_redo(manager, created.id, RedoState.FAILED)
-        assert failed.state == SessionState.VERIFIED
-        assert failed.redo is not None
-        assert failed.redo.failure == "Managed Sync re-do lease was lost"
-        assert failed.lanes["lakebase"].model_dump(mode="json") == original_lane
-        terminal_event = "redo_failed"
+    failed = await wait_for_state(manager, created.id, SessionState.FAILED)
+    assert failed.failure == "Round 4's ring lease was lost before the result could be published."
     for _ in range(100):
         if record.model_score_terminal_task is None:
             break
@@ -4563,7 +4750,7 @@ async def test_terminalizer_never_adopts_or_releases_a_newer_local_fence(
     assert record.lease_heartbeat_lease is new_lease
     assert record.model_score_terminal_task is None
     assert record.model_score_terminal_lease is None
-    assert [event.event for event in record.event_log.events].count(terminal_event) == 1
+    assert [event.event for event in record.event_log.events].count("session_failed") == 1
     manager._cancel_lease_heartbeat(record)
     lease_store._lease = None
 
@@ -4572,7 +4759,7 @@ async def test_initial_terminal_cancellation_waits_for_release_and_publication()
     lease_store = RetryTerminalReleaseStore(phase="run_committed")
     engine = FakeModelScoreEngine()
     manager = RunManager(
-        model_score_factory=lambda: engine,
+        model_score_factory=lambda _competitor: engine,
         lease_store=lease_store,
     )
     manager._terminal_release_backoff_cap = 0.01
@@ -4623,7 +4810,7 @@ async def _unreachable_round_four(
     """A Round 4 bout parked in the terminal settlement of an unreachable ring."""
 
     manager = RunManager(
-        model_score_factory=lambda: FakeModelScoreEngine(),
+        model_score_factory=lambda _competitor: FakeModelScoreEngine(),
         lease_store=lease_store,
     )
     # The heartbeat would otherwise decide the lease's fate before the wait does.
@@ -4779,7 +4966,7 @@ async def test_the_terminal_lease_settlement_gives_up_rather_than_retrying_forev
 
     lease_store = UnreachableTerminalReleaseStore(phase="no-such-phase")
     manager = RunManager(
-        model_score_factory=lambda: FakeModelScoreEngine(),
+        model_score_factory=lambda _competitor: FakeModelScoreEngine(),
         lease_store=lease_store,
     )
     manager._lease_heartbeat = 10
@@ -4821,7 +5008,7 @@ async def test_the_abandoned_terminal_settlement_leaves_the_durable_lease_to_its
 
     lease_store = UnreachableTerminalReleaseStore(phase="no-such-phase")
     manager = RunManager(
-        model_score_factory=lambda: FakeModelScoreEngine(),
+        model_score_factory=lambda _competitor: FakeModelScoreEngine(),
         lease_store=lease_store,
     )
     manager._lease_heartbeat = 10
@@ -4852,207 +5039,29 @@ async def test_the_abandoned_terminal_settlement_leaves_the_durable_lease_to_its
     assert record.lease_heartbeat_task is None
 
 
-class PrewarmingModelScoreEngine(FakeModelScoreEngine):
-    """A Round 4 engine whose background warm-up can be held open."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.activation = None
-        self.prewarms = 0
-        self.prewarm_started = asyncio.Event()
-        self.allow_prewarm = asyncio.Event()
-
-    async def settle_and_restore_baseline(self) -> None:
-        return None
-
-    async def prewarm(self) -> None:
-        self.prewarms += 1
-        self.prewarm_started.set()
-        await self.allow_prewarm.wait()
 
 
-async def test_a_background_warm_up_runs_only_while_round_four_is_idle() -> None:
-    engine = PrewarmingModelScoreEngine()
-    engine.allow_prewarm.set()
-    manager = RunManager(model_score_factory=lambda: engine)
-
-    await manager.prewarm_round4()
-    assert engine.prewarms == 1
-
-    # A card the UI is about to arm is left alone.
-    await manager.create(round_four_request())
-    await manager.prewarm_round4()
-    assert engine.prewarms == 1
 
 
-async def test_a_background_warm_up_leaves_a_fresh_preparation_alone() -> None:
-    """Refreshed once the older of its proof and storage check is half a window old."""
-
-    engine = PrewarmingModelScoreEngine()
-    engine.allow_prewarm.set()
-    manager = RunManager(model_score_factory=lambda: engine)
-
-    engine.activation = SimpleNamespace(preparation_age=lambda: WARM_PROOF_REUSE_SECONDS / 2)
-    await manager.prewarm_round4()
-    assert engine.prewarms == 0
-
-    engine.activation = SimpleNamespace(
-        preparation_age=lambda: WARM_PROOF_REUSE_SECONDS / 2 + 1
-    )
-    await manager.prewarm_round4()
-    assert engine.prewarms == 1
-
-    # None: a Prepare now would have to make one of the two itself.
-    engine.activation = SimpleNamespace(preparation_age=lambda: None)
-    await manager.prewarm_round4()
-    assert engine.prewarms == 2
 
 
-async def test_an_arm_waits_for_a_background_warm_up_already_running() -> None:
-    engine = PrewarmingModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-prewarm-arm")
-    warm = asyncio.create_task(manager.prewarm_round4())
-    await asyncio.wait_for(engine.prewarm_started.wait(), timeout=1)
-
-    created = await manager.create(round_four_request())
-    await manager.start_arm(created.id, operator)
-    await asyncio.sleep(0.05)
-    assert engine.arm_calls == 0
-
-    engine.allow_prewarm.set()
-    await wait_for_state(manager, created.id, SessionState.ARMED)
-    assert engine.arm_calls == 1
-    await asyncio.wait_for(warm, timeout=1)
 
 
-async def test_a_redo_waits_for_a_background_warm_up_already_running() -> None:
-    engine = PrewarmingModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-prewarm-redo")
-    created, _ = await verified_round_four(manager, operator)
-    settlement = manager._round4_settlement
-    if settlement is not None:
-        await asyncio.wait_for(asyncio.shield(settlement), timeout=1)
-
-    warm = asyncio.create_task(manager.prewarm_round4())
-    await asyncio.wait_for(engine.prewarm_started.wait(), timeout=1)
-    await manager.start_redo(created.id, operator)
-    await asyncio.sleep(0.05)
-    assert engine.redo_calls == 0
-
-    engine.allow_prewarm.set()
-    await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-    assert engine.redo_calls == 1
-    await asyncio.wait_for(warm, timeout=1)
 
 
-async def test_round_four_redo_retains_identity_and_preserves_initial_evidence() -> None:
-    engine = FakeModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-redo")
-    created, verified = await verified_round_four(manager, operator)
-    initial_evidence = dict(verified.lanes["lakebase"].evidence)
-    initial_metrics = [item.model_dump() for item in verified.metrics]
-
-    started = await manager.start_redo(created.id, operator)
-    assert started.state == SessionState.RUNNING
-    assert started.redo is not None and started.redo.state == RedoState.RUNNING
-    finished = await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-
-    assert engine.redo_calls == 1
-    assert engine.redo_received_result is engine.initial_result
-    assert finished.state == SessionState.VERIFIED
-    assert finished.lanes["lakebase"].evidence == initial_evidence
-    assert [item.model_dump() for item in finished.metrics] == initial_metrics
-    assert finished.redo is not None
-    redo_evidence = finished.redo.lanes["lakebase"].evidence
-    assert redo_evidence["primary_key"] == initial_evidence["primary_key"]
-    assert redo_evidence["score"] == 0.33
-    assert redo_evidence["model_version"] == "risk-v2"
-    assert redo_evidence["proof_nonce"].startswith("round4-v2-")
-    assert redo_evidence["proof_nonce"] != initial_evidence["proof_nonce"]
-    assert redo_evidence["delta_version"] == 12
-    assert finished.redo.comparison is not None
-    assert finished.redo.comparison.kind == ComparisonKind.CAPABILITY_GAP
-    assert finished.redo.comparison.winner_lane_id == "lakebase"
-    assert finished.redo.comparison.margin is None
-    assert finished.redo.comparison.detail == (
-        "Lakebase verified the scoped native Synced Tables capability; no AWS-native "
-        "equivalent lane was timed. This is not a speed comparison."
-    )
 
 
-async def test_concurrent_and_terminal_redo_posts_are_idempotent() -> None:
-    engine = FakeModelScoreEngine()
-    engine.allow_redo.clear()
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-concurrent")
-    created, _ = await verified_round_four(manager, operator)
-
-    first = await manager.start_redo(created.id, operator)
-    second = await manager.start_redo(created.id, operator)
-    await asyncio.wait_for(engine.redo_entered.wait(), timeout=1)
-
-    assert first.redo is not None and first.redo.state == RedoState.RUNNING
-    assert second.redo is not None and second.redo.state == RedoState.RUNNING
-    assert engine.redo_calls == 1
-    events = manager._records[created.id].event_log.events
-    assert [event.event for event in events].count("redo_started") == 1
-
-    engine.allow_redo.set()
-    await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-    event_count = len(events)
-    replay = await manager.start_redo(created.id, operator)
-    assert replay.redo is not None and replay.redo.state == RedoState.VERIFIED
-    assert engine.redo_calls == 1
-    assert len(events) == event_count
 
 
-class SettlingModelScoreEngine(FakeModelScoreEngine):
-    """A Round 4 engine whose post-bout restore of the source row can be held open."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.settle_started = asyncio.Event()
-        self.allow_settle = asyncio.Event()
-        self.settled = False
-        self.redo_saw_settled: bool | None = None
-
-    async def settle_and_restore_baseline(self) -> None:
-        self.settle_started.set()
-        await self.allow_settle.wait()
-        self.settled = True
-
-    async def redo(self, arm, result, update, on_progress=None):
-        self.redo_saw_settled = self.settled
-        return await super().redo(arm, result, update, on_progress)
 
 
-async def test_round_four_redo_waits_for_the_first_proofs_row_to_be_put_back() -> None:
-    """Two of three live re-dos on 2026-09-28 raced this restore and lost (2D521)."""
-
-    engine = SettlingModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-settle")
-    created, _ = await verified_round_four(manager, operator)
-    await asyncio.wait_for(engine.settle_started.wait(), timeout=1)
-
-    await manager.start_redo(created.id, operator)
-    await asyncio.sleep(0.05)
-    assert engine.redo_calls == 0
-
-    engine.allow_settle.set()
-    await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-    assert engine.redo_calls == 1
-    assert engine.redo_saw_settled is True
 
 
 async def test_the_next_round_four_arm_waits_for_the_last_bouts_row_to_be_put_back() -> None:
     """A quick Ring Again raced the previous bout's restore the same way the re-do did."""
 
     engine = SettlingModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-ring-again")
     await verified_round_four(manager, operator)
     await asyncio.wait_for(engine.settle_started.wait(), timeout=1)
@@ -5072,7 +5081,7 @@ async def test_round_four_schedules_its_restore_before_it_publishes_the_result()
     """A re-do can be requested the moment READY is visible; the restore must exist by then."""
 
     engine = SettlingModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
     operator = BoutOperator(display_name="Round Four Owner", subject="owner-ordering")
     created = await manager.create(round_four_request())
     record = manager._records[created.id]
@@ -5098,286 +5107,22 @@ async def test_round_four_schedules_its_restore_before_it_publishes_the_result()
         engine.allow_settle.set()
 
 
-async def test_redo_idempotent_refresh_bypasses_disappeared_readiness() -> None:
-    engine = FakeModelScoreEngine()
-    engine.allow_redo.clear()
-
-    def factory():
-        return engine
-
-    manager = RunManager(model_score_factory=factory)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-readiness")
-    created, _ = await verified_round_four(manager, operator)
-
-    manager._model_score_factory = None
-    with pytest.raises(InvalidStateError, match="live adapter is not configured"):
-        await manager.start_redo(created.id, operator)
-    ready = await manager.get(created.id)
-    assert ready.redo is not None and ready.redo.state == RedoState.READY
-
-    manager._model_score_factory = factory
-    await manager.start_redo(created.id, operator)
-    await asyncio.wait_for(engine.redo_entered.wait(), timeout=1)
-
-    def no_longer_ready() -> None:
-        raise InvalidStateError("dynamic readiness disappeared")
-
-    manager._model_score_factory = None
-    manager._readiness_check = no_longer_ready
-    running = await manager.start_redo(created.id, operator)
-    assert running.redo is not None and running.redo.state == RedoState.RUNNING
-    engine.allow_redo.set()
-    await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-    verified = await manager.start_redo(created.id, operator)
-    assert verified.redo is not None and verified.redo.state == RedoState.VERIFIED
-    assert engine.redo_calls == 1
 
 
-async def test_redo_lease_claim_failure_leaves_ready_without_dispatch() -> None:
-    engine = FakeModelScoreEngine()
-    manager = RunManager(
-        model_score_factory=lambda: engine,
-        lease_store=RejectRedoClaimStore(),
-    )
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-claim")
-    created, _ = await verified_round_four(manager, operator)
-
-    with pytest.raises(InvalidStateError, match="redo lease unavailable"):
-        await manager.start_redo(created.id, operator)
-
-    snapshot = await manager.get(created.id)
-    assert snapshot.state == SessionState.VERIFIED
-    assert snapshot.redo is not None and snapshot.redo.state == RedoState.READY
-    assert engine.redo_calls == 0
-    assert all(
-        event.event != "redo_started" for event in manager._records[created.id].event_log.events
-    )
 
 
-async def test_redo_failure_is_terminal_and_preserves_initial_proof() -> None:
-    engine = FakeModelScoreEngine()
-    engine.fail_redo = True
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-redo-fail")
-    created, verified = await verified_round_four(manager, operator)
-    initial_evidence = dict(verified.lanes["lakebase"].evidence)
-    initial_result = manager._records[created.id].model_score_result
-    await manager.start_redo(created.id, operator)
-
-    failed = await wait_for_redo(manager, created.id, RedoState.FAILED)
-
-    assert failed.state == SessionState.VERIFIED
-    assert failed.lanes["lakebase"].evidence == initial_evidence
-    assert failed.remembered_result == (
-        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
-    )
-    assert failed.comparison is not None
-    assert failed.comparison.winner_lane_id == "lakebase"
-    assert manager._records[created.id].model_score_result is initial_result
-    assert engine.redo_calls == 1
-    event_count = len(manager._records[created.id].event_log.events)
-    manager._model_score_factory = None
-
-    def no_longer_ready() -> None:
-        raise InvalidStateError("dynamic readiness disappeared")
-
-    manager._readiness_check = no_longer_ready
-    replay = await manager.start_redo(created.id, operator)
-    assert replay.redo is not None and replay.redo.state == RedoState.FAILED
-    assert engine.redo_calls == 1
-    assert len(manager._records[created.id].event_log.events) == event_count
 
 
-async def test_redo_terminal_state_and_event_wait_for_release() -> None:
-    lease_store = BlockingRedoReleaseStore()
-    engine = FakeModelScoreEngine()
-    manager = RunManager(
-        model_score_factory=lambda: engine,
-        lease_store=lease_store,
-    )
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-release")
-    created, _ = await verified_round_four(manager, operator)
-    await manager.start_redo(created.id, operator)
-
-    await asyncio.wait_for(lease_store.release_started.wait(), timeout=1)
-    pending = manager._records[created.id].snapshot
-    assert pending.state == SessionState.RUNNING
-    assert pending.redo is not None and pending.redo.state == RedoState.RUNNING
-    assert all(
-        event.event != "redo_finished" for event in manager._records[created.id].event_log.events
-    )
-
-    lease_store.allow_release.set()
-    finished = await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-    assert finished.state == SessionState.VERIFIED
-    assert any(
-        event.event == "redo_finished" for event in manager._records[created.id].event_log.events
-    )
 
 
-async def test_redo_terminal_release_retries_same_fence_until_confirmed() -> None:
-    lease_store = RetryTerminalReleaseStore(phase="redo_committed")
-    engine = FakeModelScoreEngine()
-    manager = RunManager(
-        model_score_factory=lambda: engine,
-        lease_store=lease_store,
-    )
-    manager._terminal_release_backoff_cap = 0.01
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-retry-redo")
-    created, _ = await verified_round_four(manager, operator)
-    await manager.start_redo(created.id, operator)
-
-    await asyncio.wait_for(lease_store.retry_started.wait(), timeout=1)
-    record = manager._records[created.id]
-    assert record.snapshot.state == SessionState.RUNNING
-    assert record.snapshot.redo is not None
-    assert record.snapshot.redo.state == RedoState.RUNNING
-    assert record.lease_heartbeat_task is not None
-    assert not record.lease_heartbeat_task.done()
-    assert all(event.event != "redo_finished" for event in record.event_log.events)
-
-    lease_store.allow_success.set()
-    finished = await wait_for_redo(manager, created.id, RedoState.VERIFIED)
-    assert finished.state == SessionState.VERIFIED
-    assert lease_store.release_calls == 2
-    assert record.lease_heartbeat_task is None
-    assert [event.event for event in record.event_log.events].count("redo_finished") == 1
 
 
-@pytest.mark.parametrize("current_state", ["different", "none"])
-async def test_redo_terminal_release_loss_preserves_byte_equivalent_v1_proof(
-    current_state: str,
-) -> None:
-    lease_store = LoseTerminalLeaseStore(
-        phase="redo_committed",
-        current_state=current_state,
-    )
-    engine = FakeModelScoreEngine()
-    manager = RunManager(
-        model_score_factory=lambda: engine,
-        lease_store=lease_store,
-    )
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-loss-redo")
-    created, verified = await verified_round_four(manager, operator)
-    original_evidence = verified.lanes["lakebase"].model_dump(mode="json")
-    original_metrics = [item.model_dump(mode="json") for item in verified.metrics]
-    original_remembered = verified.remembered_result
-    await manager.start_redo(created.id, operator)
-
-    failed = await wait_for_redo(manager, created.id, RedoState.FAILED)
-    record = manager._records[created.id]
-    assert failed.state == SessionState.VERIFIED
-    assert failed.failure is None
-    assert failed.lanes["lakebase"].model_dump(mode="json") == original_evidence
-    assert [item.model_dump(mode="json") for item in failed.metrics] == original_metrics
-    assert failed.remembered_result == original_remembered
-    assert failed.redo is not None
-    assert failed.redo.failure == "Managed Sync re-do lease was lost"
-    assert record.model_score_pending_update is None
-    assert record.lease_heartbeat_task is None
-    assert [event.event for event in record.event_log.events].count("redo_failed") == 1
 
 
-async def test_redo_terminal_cancellation_waits_for_confirmed_loss() -> None:
-    lease_store = RetryTerminalReleaseStore(phase="redo_committed")
-    engine = FakeModelScoreEngine()
-    manager = RunManager(
-        model_score_factory=lambda: engine,
-        lease_store=lease_store,
-    )
-    manager._lease_heartbeat = 10
-    manager._terminal_release_backoff_cap = 0.01
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-cancel-redo")
-    created, verified = await verified_round_four(manager, operator)
-    original_lane = verified.lanes["lakebase"].model_dump(mode="json")
-    original_metrics = [item.model_dump(mode="json") for item in verified.metrics]
-    await manager.start_redo(created.id, operator)
-    await asyncio.wait_for(lease_store.retry_started.wait(), timeout=1)
-    record = manager._records[created.id]
-    outer = record.task
-    child = record.model_score_terminal_task
-    assert outer is not None and child is not None
-
-    outer.cancel()
-    await asyncio.sleep(0.01)
-    assert not outer.done()
-    assert not child.done()
-    lease_store._lease = None
-    lease_store.allow_success.set()
-
-    failed = await wait_for_redo(manager, created.id, RedoState.FAILED)
-    for _ in range(100):
-        if outer.done():
-            break
-        await asyncio.sleep(0.005)
-    assert failed.state == SessionState.VERIFIED
-    assert failed.lanes["lakebase"].model_dump(mode="json") == original_lane
-    assert [item.model_dump(mode="json") for item in failed.metrics] == original_metrics
-    assert failed.redo is not None
-    assert failed.redo.failure == "Managed Sync re-do lease was lost"
-    assert outer.cancelled()
-    assert record.model_score_terminal_task is None
-    assert record.lease_heartbeat_task is None
-    assert [event.event for event in record.event_log.events].count("redo_failed") == 1
-    refresh = await manager.start_redo(created.id, operator)
-    assert refresh.redo is not None and refresh.redo.state == RedoState.FAILED
 
 
-async def test_lost_redo_lease_preserves_initial_verified_proof() -> None:
-    engine = FakeModelScoreEngine()
-    engine.allow_redo.clear()
-    manager = RunManager(model_score_factory=lambda: engine)
-    operator = BoutOperator(display_name="Round Four Owner", subject="owner-lost")
-    created, verified = await verified_round_four(manager, operator)
-    initial_evidence = dict(verified.lanes["lakebase"].evidence)
-    await manager.start_redo(created.id, operator)
-    await asyncio.wait_for(engine.redo_entered.wait(), timeout=1)
-    record = manager._records[created.id]
-    assert record.lease is not None
-
-    await manager._handle_lost_lease(record, record.lease)
-
-    failed_redo = await manager.get(created.id)
-    assert failed_redo.state == SessionState.VERIFIED
-    assert failed_redo.remembered_result == (
-        "ANALYTICS CHANGE → LIVE APP · 0.25s · AWS NOT TIMED · MARGIN N/A"
-    )
-    assert failed_redo.lanes["lakebase"].evidence == initial_evidence
-    assert failed_redo.redo is not None
-    assert failed_redo.redo.state == RedoState.FAILED
-    assert failed_redo.redo.failure == "Managed Sync re-do lease was lost"
-    assert any(event.event == "redo_failed" for event in record.event_log.events)
 
 
-async def test_round_four_redo_rejects_wrong_owner_state_round_and_cooldown() -> None:
-    engine = FakeModelScoreEngine()
-    manager = RunManager(model_score_factory=lambda: engine)
-    owner = BoutOperator(display_name="Owner", subject="owner-auth")
-    intruder = BoutOperator(display_name="Intruder", subject="other-auth")
-    created = await manager.create(round_four_request())
-
-    with pytest.raises(InvalidStateError, match="must verify"):
-        await manager.start_redo(created.id, owner)
-    await manager.start_arm(created.id, owner)
-    await wait_for_state(manager, created.id, SessionState.ARMED)
-    await manager.start_run(created.id, owner)
-    await wait_for_state(manager, created.id, SessionState.VERIFIED)
-
-    with pytest.raises(InvalidStateError, match="ONLY THE RING OWNER"):
-        await manager.start_redo(created.id, intruder)
-    with pytest.raises(InvalidStateError, match="Re-do behavior is not defined"):
-        await manager.start_cooldown(created.id, owner)
-
-    round_one = await manager.create(
-        SessionCreate(
-            competitor=CompetitorId.AURORA_SERVERLESS_V2,
-            primary_persona="sre",
-            corners=[Corner.PERFORMANCE],
-            round_id=RoundId.WAKE_IDLE_APP,
-        )
-    )
-    with pytest.raises(InvalidStateError, match="only in Round 4"):
-        await manager.start_redo(round_one.id, owner)
 
 
 async def test_manifest_readiness_gate_applies_to_create_arm_and_run() -> None:
@@ -6264,9 +6009,11 @@ async def test_round_three_towel_freezes_cutoff_and_keeps_one_fenced_lease() -> 
 
     engine.allow_reset.set()
     finished = await wait_for_towel(manager, first.id, "ready")
-    assert finished.remembered_result is not None
-    assert "lakebase exact proof preserved" in finished.remembered_result
-    assert "Margin N/A" in finished.remembered_result
+    # Lakebase finished and the towel stopped the other lane, so Lakebase wins (Ryan,
+    # 2026-10-03).
+    assert finished.remembered_result == (
+        "LAKEBASE WINS · TOWEL THROWN AT 90.01s · MARGIN IS A LOWER BOUND"
+    )
     assert finished.lanes["lakebase"].state == LaneState.VERIFIED
     assert finished.lanes["lakebase"].elapsed_ms == 14_380.0
     assert finished.lanes["competitor"].state == LaneState.TOWELLED
@@ -6938,6 +6685,7 @@ async def test_round_three_executes_and_resets_owned_recovery_environments() -> 
                     elapsed_ms=elapsed,
                     recovery_at=recovery_at,
                     error=None,
+                    timed_out=False,
                 )
             return SimpleNamespace(launch_skew_ms=0.01, lanes=lanes, all_verified=True)
 

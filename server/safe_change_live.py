@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import itertools
 import json
 import logging
 import math
 import os
 import re
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -17,13 +18,22 @@ from urllib.parse import quote, urlencode
 import boto3
 import psycopg
 from botocore.exceptions import ClientError
-from databricks.sdk.errors import DatabricksError, NotFound
+from databricks.sdk.errors import (
+    Aborted,
+    DatabricksError,
+    DeadlineExceeded,
+    InternalError,
+    NotFound,
+    TemporarilyUnavailable,
+    TooManyRequests,
+)
 
 from .aws_auth import (
     AwsAuthMode,
     session_arguments,
     validate_runtime_auth,
 )
+from .bout_limit import BOUT_TIME_LIMIT_SECONDS
 from .manifest import DemoManifest, load_manifest
 from .models import CompetitorId
 from .safe_change import (
@@ -52,8 +62,11 @@ class SafeChangeControlPlaneError(SafeChangeError):
 
 
 class ControlPlaneCommandError(SafeChangeControlPlaneError):
-    def __init__(self, message: str, *, not_found: bool = False) -> None:
+    def __init__(self, message: str, *, not_found: bool = False, transient: bool = False) -> None:
         self.not_found = not_found
+        # Databricks said the request was not served, not that it was wrong: asking again
+        # is the answer it gave ("Please try again later").
+        self.transient = transient
         super().__init__(message)
 
 
@@ -140,7 +153,73 @@ def _control_plane_failure(error: DatabricksError) -> ControlPlaneCommandError:
         return ControlPlaneCommandError(
             "Databricks control-plane resource was not found", not_found=True
         )
-    return ControlPlaneCommandError("Databricks control-plane request was refused")
+    return ControlPlaneCommandError(
+        "Databricks control-plane request was refused", transient=_is_transient(error)
+    )
+
+
+#: The workspace's answers that mean the request was not served rather than refused.
+_TRANSIENT_ERRORS = (
+    Aborted,
+    DeadlineExceeded,
+    InternalError,
+    TemporarilyUnavailable,
+    TooManyRequests,
+)
+_TRANSIENT_CODES = frozenset(
+    {
+        "ABORTED",
+        "DEADLINE_EXCEEDED",
+        "INTERNAL_ERROR",
+        "REQUEST_LIMIT_EXCEEDED",
+        "RESOURCE_EXHAUSTED",
+        "TEMPORARILY_UNAVAILABLE",
+    }
+)
+
+
+def _is_transient(error: DatabricksError) -> bool:
+    code = str(getattr(error, "error_code", "") or "").upper()
+    return (
+        isinstance(error, _TRANSIENT_ERRORS)
+        or code in _TRANSIENT_CODES
+        or "try again later" in str(error).lower()
+    )
+
+
+#: The first pauses before a request Databricks answered as transient is asked again, and the
+#: pause after them. Inside the lane's own clock, so a retry costs Lakebase's time and not the
+#: competitor's.
+LAKEBASE_TRANSIENT_RETRY_SECONDS = (1.0, 2.0, 4.0, 8.0)
+LAKEBASE_TRANSIENT_RETRY_EVERY_SECONDS = 15.0
+
+
+def lakebase_transient_pauses() -> Iterator[float]:
+    """The pauses before each retry, until they would add up past the round's one maximum.
+
+    Asked again until the lane's bound from the bell ends it, which then decides the bout as
+    any lane still running there does: the lane that finished wins on a lower bound. They
+    used to stop after 15 s, with most of the lane's bound still to go. (rc14's and rc17's
+    refusals, which prompted these retries, were in fact one request Lakebase refuses every
+    time: see `recovery_live.lakebase_source_branch_time`.) The total is for a caller outside
+    any lane, which must not wait on Databricks forever.
+    """
+
+    waited = 0.0
+    for pause in itertools.chain(
+        LAKEBASE_TRANSIENT_RETRY_SECONDS, itertools.repeat(LAKEBASE_TRANSIENT_RETRY_EVERY_SECONDS)
+    ):
+        if waited + pause > BOUT_TIME_LIMIT_SECONDS:
+            return
+        waited += pause
+        yield pause
+
+
+def _is_create(method: str, path: str) -> bool:
+    """A POST that creates a named child. Those are asked again only after an existence check
+    (`create_lakebase_resource`), because the refused one may have made the resource."""
+
+    return method == "POST" and re.search(r"[?&](branch|endpoint)_id=", path) is not None
 
 
 class DatabricksRestRunner:
@@ -164,11 +243,13 @@ class DatabricksRestRunner:
         *,
         profile: str = "",
         workspace_client: Any | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._profile = profile
         self._workspace = workspace_client
         self._api: Callable[..., dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
+        self._sleep = sleep
 
     def _build_workspace(self) -> Any:
         from databricks.sdk import WorkspaceClient
@@ -195,6 +276,45 @@ class DatabricksRestRunner:
         body: Mapping[str, Any] | None,
         timeout_seconds: float,
     ) -> Mapping[str, Any]:
+        """One request, asked again while Databricks answers that it was not served.
+
+        rc14 (2026-10-03): a Round 3 branch POST came back INTERNAL_ERROR "Please try again
+        later" six seconds after the bell, and the Lakebase lane failed on that first answer.
+        Lookups, deletes and credentials are asked again here; a create is asked again by
+        `create_lakebase_resource`, which first checks whether the refused one made it.
+        """
+
+        pauses = iter(() if _is_create(method, path) else lakebase_transient_pauses())
+        asked_again = False
+        while True:
+            try:
+                return await self._request_once(
+                    method, path, body=body, timeout_seconds=timeout_seconds
+                )
+            except ControlPlaneCommandError as error:
+                if method == "DELETE" and asked_again and error.not_found:
+                    # The DELETE answered as not served was served: what it asked for is done.
+                    return {}
+                pause = next(pauses, None)
+                if not error.transient or pause is None:
+                    raise
+                LOGGER.warning(
+                    "Databricks asked to try %s %s again later; asking again in %.0fs",
+                    method,
+                    path,
+                    pause,
+                )
+                await self._sleep(pause)
+                asked_again = True
+
+    async def _request_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Mapping[str, Any] | None,
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
         api = await self._accessor()
         payload = dict(body) if body is not None else None
         try:
@@ -211,6 +331,18 @@ class DatabricksRestRunner:
                 "Databricks control-plane request timed out"
             ) from exc
         except DatabricksError as exc:
+            if not isinstance(exc, NotFound):
+                # The workspace's own answer: code, message and trace ID. A lane
+                # records only the classified sentence, and on 2026-10-02 rc10
+                # lost a Round 3 bout to "request was refused" with this answer
+                # in no log at all. NotFound is routine (every absence probe).
+                LOGGER.warning(
+                    "Databricks control plane refused %s %s: %s %s",
+                    method,
+                    path,
+                    getattr(exc, "error_code", "") or type(exc).__name__,
+                    exc,
+                )
             raise _control_plane_failure(exc) from exc
         if not isinstance(result, Mapping):
             raise ControlPlaneCommandError(
@@ -381,6 +513,101 @@ def _lakebase_create_path(parent: str, collection: str, id_parameter: str, value
     """
 
     return f"{lakebase_resource_path(parent)}/{collection}?{urlencode({id_parameter: value})}"
+
+
+#: How long a Lakebase branch DELETE gets before it is sent again.
+LAKEBASE_DELETE_REASK_SECONDS = 10.0
+
+
+async def wait_lakebase_branch_gone(
+    runner: DatabricksRunner,
+    branch_name: str,
+    still_present: Callable[[], Awaitable[bool]],
+    *,
+    clock: Callable[[], float],
+    sleep: Sleeper,
+    config: Any,
+    still_exists: str,
+) -> None:
+    """Wait for an owned branch's DELETE to land, sending it again while the branch stays.
+
+    Lakebase accepts a DELETE sent while a branch is still initializing and then never acts
+    on it. On 2026-10-02 the R6 test installation kept such a branch for five minutes after a
+    DELETE that answered `done`, and refused its name to the next create ("branch already
+    exists"). Rounds 2 and 3 reuse one branch name per installation, and a towel can land
+    mid-create, so a single DELETE followed by a wait could stall to its deadline.
+    """
+
+    path = lakebase_resource_path(branch_name)
+    deadline = clock() + config.poll_timeout_seconds
+    asked_at = clock()
+    while await still_present():
+        now = clock()
+        if now >= deadline:
+            raise SafeChangeControlPlaneError(still_exists)
+        if now - asked_at >= LAKEBASE_DELETE_REASK_SECONDS:
+            asked_at = now
+            # A warning, so the operator log shows each time Lakebase dropped a DELETE.
+            LOGGER.warning(
+                "Lakebase branch %s is still present %.0fs after its DELETE; sending it again",
+                branch_name,
+                LAKEBASE_DELETE_REASK_SECONDS,
+            )
+            try:
+                await runner.run("DELETE", path, timeout_seconds=config.control_timeout_seconds)
+            except ControlPlaneCommandError as error:
+                if not error.not_found:
+                    LOGGER.info(
+                        "Lakebase branch %s DELETE resent, not accepted: %s", branch_name, error
+                    )
+        await sleep(config.poll_interval_seconds)
+
+
+async def create_lakebase_resource(
+    runner: DatabricksRunner,
+    path: str,
+    *,
+    body: Mapping[str, Any],
+    timeout_seconds: float,
+    created: Callable[[], Awaitable[bool]],
+    sleep: Sleeper,
+) -> None:
+    """Create a Lakebase branch or endpoint, asking again while Databricks says to.
+
+    A create answered as transient may still have made the resource, and asking again would
+    then meet "already exists". So before each retry ``created`` says whether the resource
+    now exists as this lane asked for it, in which case that was the create; it raises when
+    the name is taken by something that is not this lane's.
+    """
+
+    pauses = lakebase_transient_pauses()
+    while True:
+        try:
+            await runner.json("POST", path, body=body, timeout_seconds=timeout_seconds)
+            return
+        except ControlPlaneCommandError as error:
+            pause = next(pauses, None)
+            if not error.transient or pause is None:
+                raise
+            LOGGER.warning(
+                "Databricks asked to try POST %s again later; asking again in %.0fs "
+                "unless the refused create made it",
+                path,
+                pause,
+            )
+            await sleep(pause)
+            if await created():
+                LOGGER.warning("Lakebase made %s on the POST it answered as failed", path)
+                return
+
+
+def _same_instant(left: str, right: str) -> bool:
+    try:
+        return datetime.fromisoformat(left.replace("Z", "+00:00")) == datetime.fromisoformat(
+            right.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return left == right
 
 
 def _lakebase_owner_endpoint_id(plan: SafeChangePlan) -> str:
@@ -608,6 +835,54 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
                 )
             await self._sleep(self.config.poll_interval_seconds)
 
+    async def _branch_made(
+        self,
+        branch_name: str,
+        *,
+        source_branch_time: str | None = None,
+    ) -> bool:
+        """Whether a branch this lane asked for exists, and raise if the name is someone else's."""
+
+        branch = await self._get_or_none(branch_name)
+        if branch is None:
+            return False
+        self._resource_name(branch, branch_name, "branch")
+        status = branch.get("status") or {}
+        spec = branch.get("spec") or {}
+
+        def field(key: str) -> str:
+            return str(
+                (status.get(key) if isinstance(status, Mapping) else "")
+                or (spec.get(key) if isinstance(spec, Mapping) else "")
+                or ""
+            )
+
+        if field("source_branch") != self._source_branch:
+            raise SafeChangeControlPlaneError(
+                f"Lakebase branch {branch_name} exists but was not branched from the source"
+            )
+        reported_time = field("source_branch_time")
+        if source_branch_time and reported_time and not _same_instant(
+            reported_time, source_branch_time
+        ):
+            raise SafeChangeControlPlaneError(
+                f"Lakebase branch {branch_name} exists at another recovery point"
+            )
+        return True
+
+    async def _endpoint_made(self, endpoint_name: str) -> bool:
+        """Whether the read-write endpoint this lane asked for exists."""
+
+        endpoint = await self._get_or_none(endpoint_name)
+        if endpoint is None:
+            return False
+        self._resource_name(endpoint, endpoint_name, "endpoint")
+        if _lakebase_endpoint_type(endpoint) != "ENDPOINT_TYPE_READ_WRITE":
+            raise SafeChangeControlPlaneError(
+                f"Lakebase endpoint {endpoint_name} exists but is not read-write"
+            )
+        return True
+
     async def _wait_branch_present(self, branch_name: str) -> Mapping[str, Any]:
         """Wait for a requested branch to exist, before anything is created under it.
 
@@ -637,11 +912,13 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
     async def create_isolated(self, plan: SafeChangePlan, report) -> ArtifactInspection:
         self._assert_plan(plan)
         branch_name = f"{self._project}/branches/{plan.artifact_id}"
-        await self._runner.json(
-            "POST",
+        await create_lakebase_resource(
+            self._runner,
             _lakebase_create_path(self._project, "branches", "branch_id", plan.artifact_id),
             body={"spec": {"source_branch": self._source_branch, "no_expiry": True}},
             timeout_seconds=self.config.control_timeout_seconds,
+            created=lambda: self._branch_made(branch_name),
+            sleep=self._sleep,
         )
         await report("Lakebase branch created from production")
         await self._wait_branch_present(branch_name)
@@ -649,8 +926,8 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
         endpoint_name = f"{branch_name}/endpoints/{endpoint_id}"
         endpoint = await self._get_or_none(endpoint_name)
         if endpoint is None:
-            await self._runner.json(
-                "POST",
+            await create_lakebase_resource(
+                self._runner,
                 _lakebase_create_path(branch_name, "endpoints", "endpoint_id", endpoint_id),
                 body={
                     "spec": {
@@ -660,6 +937,8 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
                     }
                 },
                 timeout_seconds=self.config.control_timeout_seconds,
+                created=lambda: self._endpoint_made(endpoint_name),
+                sleep=self._sleep,
             )
         else:
             self._resource_name(endpoint, endpoint_name, "isolated endpoint")
@@ -774,13 +1053,19 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
             "Waiting for the owned Lakebase branch deletion",
             f"GET {LAKEBASE_API_ROOT}/<branch>",
         )
-        deadline = self._clock() + self.config.poll_timeout_seconds
-        while await self.inspect_artifact(plan) is not None:
-            if self._clock() >= deadline:
-                raise SafeChangeControlPlaneError(
-                    "Lakebase isolated branch still exists after deletion"
-                )
-            await self._sleep(self.config.poll_interval_seconds)
+
+        async def still_present() -> bool:
+            return await self.inspect_artifact(plan) is not None
+
+        await wait_lakebase_branch_gone(
+            self._runner,
+            branch_name,
+            still_present,
+            clock=self._clock,
+            sleep=self._sleep,
+            config=self.config,
+            still_exists="Lakebase isolated branch still exists after deletion",
+        )
 
     async def abandon_isolated(self, plan: SafeChangePlan) -> None:
         """Issue branch deletion for a cancelled lane without waiting for it.
@@ -839,17 +1124,29 @@ _SAFE_CHANGE_MANAGER = "lakebase-anti-demo-round-2"
 # still retries transient connection errors, which is what makes accepting the
 # earlier state safe.
 _RDS_SERVING_STATES = frozenset({"available", "backing-up"})
+# A source in its daily automated backup is serving too. On 2026-10-02 rc10 lost a
+# Round 3 bout to one: the Aurora source's first automated snapshot started three
+# seconds before the lane read it, inside the cluster's 08:50-09:20 backup window,
+# and the check wanted `available`. Whether a restore or a clone can start then is
+# AWS's to answer; a source check must not refuse over AWS's own housekeeping.
+_SOURCE_SERVING_STATES = _RDS_SERVING_STATES
 _RDS_TERMINAL_STATES = frozenset(
     {"failed", "incompatible-restore", "inaccessible-encryption-credentials"}
 )
 
-# `DEFAULT_POLL_TIMEOUT_SECONDS` bounds a single control-plane wait;
-# `DEFAULT_RUN_TIMEOUT_SECONDS` bounds an entire lane from the bell. The run
-# budget must stay comfortably above the poll budget, otherwise raising the
-# poll budget alone just relocates the failure to the lane deadline. Rounds 2
-# and 3 share both values.
-DEFAULT_POLL_TIMEOUT_SECONDS = 900.0
-DEFAULT_RUN_TIMEOUT_SECONDS = 1080.0
+# `DEFAULT_POLL_TIMEOUT_SECONDS` bounds a single control-plane wait, and
+# `DEFAULT_RUN_TIMEOUT_SECONDS` bounds cleanup, which can wait out a clone AWS is
+# still creating. Rounds 2 and 3 share both. rc13 (2026-10-03) ran a Round 2 bout
+# against Aurora while the source took a snapshot: AWS accepted the copy-on-write
+# clone at the bell and created it 14.6 minutes later (75 seconds earlier the same
+# night). Every source takes a daily automated backup, so cleanup can meet that
+# clone on any day.
+DEFAULT_POLL_TIMEOUT_SECONDS = 2400.0
+DEFAULT_RUN_TIMEOUT_SECONDS = 2700.0
+
+# Each lane's bound from the bell is the bout's one maximum (`server/bout_limit.py`). rc13's
+# bout ended "could not verify" while AWS was still making the clone; since then the lane that
+# finished wins, and cleanup removes the rest.
 
 
 def _aws_child_id(artifact_id: str, suffix: str) -> str:
@@ -1621,8 +1918,11 @@ class AuroraSafeChangeAdapter(_AwsSafeChangeAdapter, SafeChangeAdapter):
         version = str(cluster.get("EngineVersion") or "")
         if not version.startswith(f"{self.config.expected_postgres_major}."):
             raise SafeChangeLiveConfigurationError("Aurora source PostgreSQL major version changed")
-        if str(cluster.get("Status") or "").lower() != "available":
-            raise SafeChangeLiveConfigurationError("Aurora source cluster is not available")
+        status = str(cluster.get("Status") or "").lower()
+        if status not in _SOURCE_SERVING_STATES:
+            raise SafeChangeLiveConfigurationError(
+                f"Aurora source cluster is not available (status {status or 'unknown'})"
+            )
         if str(cluster.get("DBSubnetGroup") or "") != self.config.db_subnet_group_name:
             raise SafeChangeLiveConfigurationError(
                 "Aurora source DB subnet group does not match the manifest"
@@ -1663,7 +1963,7 @@ class AuroraSafeChangeAdapter(_AwsSafeChangeAdapter, SafeChangeAdapter):
             str(writer.get("DBClusterIdentifier") or "") != self.source_id
             or str(writer.get("DBInstanceClass") or "") != "db.serverless"
             or str(writer.get("Engine") or "").lower() != "aurora-postgresql"
-            or str(writer.get("DBInstanceStatus") or "").lower() != "available"
+            or str(writer.get("DBInstanceStatus") or "").lower() not in _SOURCE_SERVING_STATES
         ):
             raise SafeChangeLiveConfigurationError(
                 "Aurora source writer is not the available db.serverless writer"
@@ -2081,8 +2381,11 @@ class RdsSafeChangeAdapter(_AwsSafeChangeAdapter, SafeChangeAdapter):
         version = str(instance.get("EngineVersion") or "")
         if not version.startswith(f"{self.config.expected_postgres_major}."):
             raise SafeChangeLiveConfigurationError("RDS source PostgreSQL major version changed")
-        if str(instance.get("DBInstanceStatus") or "").lower() != "available":
-            raise SafeChangeLiveConfigurationError("RDS source instance is not available")
+        status = str(instance.get("DBInstanceStatus") or "").lower()
+        if status not in _SOURCE_SERVING_STATES:
+            raise SafeChangeLiveConfigurationError(
+                f"RDS source instance is not available (status {status or 'unknown'})"
+            )
         subnet = instance.get("DBSubnetGroup") or {}
         if str(subnet.get("DBSubnetGroupName") or "") != self.config.db_subnet_group_name:
             raise SafeChangeLiveConfigurationError(
@@ -2634,7 +2937,7 @@ def build_safe_change_engine(
         run_timeout_seconds=_positive_float(
             env,
             "ANTI_DEMO_SAFE_CHANGE_RUN_TIMEOUT_SECONDS",
-            DEFAULT_RUN_TIMEOUT_SECONDS,
+            BOUT_TIME_LIMIT_SECONDS,
         ),
         reset_timeout_seconds=_positive_float(
             env,

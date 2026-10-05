@@ -1250,6 +1250,117 @@ async def test_run_returns_one_bell_and_two_advancing_clocks_without_provider_pr
     await manager.close()
 
 
+async def test_a_towel_freezes_both_clocks_at_the_towel_not_at_their_last_milestone() -> None:
+    """Ryan's towel 3.09 s after the bell: both clocks had run 3.09 s, as the room watched.
+
+    Before the fix the towel froze each lane at its last published progress: Lakebase at
+    its 0.48 s runner release and Aurora, still registering its database with the Proxy
+    and having published nothing, at "not timed".
+    """
+
+    release = asyncio.Event()
+
+    class Engine:
+        has_timed_setup = True
+        _armed = object()
+
+        def bind_claim(self, claim) -> None:
+            del claim
+
+        async def prepare(self, bout_id, fencing_token) -> None:
+            del bout_id, fencing_token
+
+        async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
+            del bout_id, fencing_token
+
+        async def setup(
+            self, bout_id, fencing_token, on_setup_progress, on_lane_progress, on_lane_result
+        ):
+            del bout_id, fencing_token, on_setup_progress, on_lane_progress, on_lane_result
+            await release.wait()
+
+        async def cancel_setup_and_settle(self, bout_id) -> None:
+            del bout_id
+            release.set()
+
+    engine = Engine()
+    claim = SimpleNamespace(
+        claim_id="claim-one", lakebase_job_id="a" * 64, competitor_job_id="b" * 64
+    )
+    capsule = SimpleNamespace(
+        variant_contexts={Round5Variant.AURORA: engine, Round5Variant.RDS: engine}
+    )
+    bell_ns = 1_000_000_000
+
+    class Warm:
+        ring_ready = True
+        store = SimpleNamespace()
+
+        async def claim(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(claim=claim), capsule
+
+        def release_claim_active(self, claim_id):
+            del claim_id
+
+        async def accept_bell(self, claim_id):
+            return BellContext(
+                bell_id="bell-one",
+                claim_id=claim_id,
+                warm_generation=4,
+                bout_id="bout-one",
+                bout_fence=1,
+                bell_at_utc=datetime(2026, 9, 30, 3, 9, 11, tzinfo=UTC),
+                t0_monotonic_ns=bell_ns,
+            )
+
+    clock = {"ns": bell_ns + 50_000_000}
+    manager = RunManager(
+        connection_spike_factory=lambda competitor: engine,
+        round5_warm_coordinator=Warm(),
+        clock_ns=lambda: clock["ns"],
+    )
+
+    async def no_cost_window(*_args, **_kwargs):
+        return None
+
+    manager._open_cost_bout = no_cost_window
+    operator = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    await manager.start_arm(created.id, operator)
+    for _ in range(100):
+        armed = await manager.get(created.id)
+        if armed.state == SessionState.ARMED:
+            break
+        await asyncio.sleep(0)
+    running = await asyncio.wait_for(manager.start_run(created.id, operator), timeout=1)
+    assert running.round5_runtime is not None
+    assert running.round5_runtime.protocol == "round5-bell-to-10k-v4"
+
+    clock["ns"] = bell_ns + 3_090_000_000
+    towelled = await manager.start_towel(created.id, operator)
+
+    assert towelled.towel is not None
+    assert towelled.towel.censored_lower_bounds_ms == {
+        "lakebase": pytest.approx(3_090.0),
+        "competitor": pytest.approx(3_090.0),
+    }
+    for lane in towelled.lanes.values():
+        assert lane.state == LaneState.TOWELLED
+        assert lane.evidence["lower_bound_ms"] == pytest.approx(3_090.0)
+        assert lane.evidence["display_value"] != "NOT TIMED"
+    release.set()
+    await asyncio.sleep(0)
+    await manager.close()
+
+
 async def test_progress_terminal_inversion_is_ordered_and_late_callback_is_ignored() -> None:
     class Engine:
         has_timed_setup = True

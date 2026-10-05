@@ -7,6 +7,10 @@ Proxy with its own security group, security-group rules and secrets. Each is
 tagged with the installation's run id and a `managed-by` other than `terraform`,
 and each must be gone once its round is READY again. This lists every resource
 carrying the run id that Terraform did not make, across all of those types.
+A Round 4 bout starts a run of its competitor's Glue writer instead, which bills
+while it lasts, so a run of this installation's writers still active counts too.
+A Round 6 bout starts its competitor's DMS task and Glue writer, so a task still
+running counts as well as the run.
 
 With `--wait`, it polls every 30 s for up to SECS while AWS finishes deletions
 that were already under way. Prints counts by type, owner and status, never an
@@ -24,7 +28,20 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import installation_run_id, load_checkout_aws  # noqa: E402
+from _common import (  # noqa: E402
+    GLUE_LANE_PREFIX,
+    counted_when_settled,
+    dms_listing,
+    installation_run_id,
+    load_checkout_aws,
+    require_env,
+    tags_of,
+)
+
+#: A Glue run in any of these has not let go of its workers yet.
+_GLUE_ACTIVE_STATES = {"STARTING", "RUNNING", "STOPPING", "WAITING"}
+#: A DMS task in any of these is still reading its source.
+_DMS_ACTIVE_STATES = {"starting", "running", "stopping", "modifying"}
 
 
 def _tags(values: list[dict[str, str]] | None) -> dict[str, str]:
@@ -49,10 +66,13 @@ def leftovers(session, run_id: str) -> collections.Counter:
             tags = _tags(item.get("TagList"))
             if per_bout(tags):
                 found[("rds-instance", tags.get("managed-by"), item["DBInstanceStatus"])] += 1
+    # Every Proxy in the account is asked in turn, other teams' too, so one deleted
+    # between the listing and its tag read is skipped rather than allowed to crash this.
     for page in rds.get_paginator("describe_db_proxies").paginate():
         for item in page["DBProxies"]:
-            listed = rds.list_tags_for_resource(ResourceName=item["DBProxyArn"])
-            tags = _tags(listed.get("TagList"))
+            tags = _tags(
+                tags_of(rds.list_tags_for_resource, "TagList", ResourceName=item["DBProxyArn"])
+            )
             if per_bout(tags):
                 found[("rds-proxy", tags.get("managed-by"), item["Status"])] += 1
 
@@ -82,6 +102,40 @@ def leftovers(session, run_id: str) -> collections.Counter:
             tags = _tags(item.get("Tags"))
             if per_bout(tags):
                 found[("secret", tags.get("managed-by"), "present")] += 1
+
+    # The writer jobs are Terraform's and stay; their runs are the bouts'. A run a
+    # dead app could not stop ends by the job's own 30-minute timeout
+    # (infra/aws/round4_glue.tf), which `--wait` gives room for.
+    glue = session.client("glue")
+    account = session.client("sts").get_caller_identity()["Account"]
+    arn = f"arn:aws:glue:{session.region_name}:{account}:job"
+    for page in glue.get_paginator("get_jobs").paginate():
+        for job in page["Jobs"]:
+            name = job["Name"]
+            if not name.startswith(GLUE_LANE_PREFIX):
+                continue
+            tags = glue.get_tags(ResourceArn=f"{arn}/{name}").get("Tags") or {}
+            if tags.get("anti-demo-run-id") != run_id:
+                continue
+            for runs in glue.get_paginator("get_job_runs").paginate(JobName=name):
+                for run in runs["JobRuns"]:
+                    if run["JobRunState"] in _GLUE_ACTIVE_STATES:
+                        found[("glue-job-run", "app", run["JobRunState"])] += 1
+
+    # Round 6's DMS tasks are Terraform's and stay, parked; a task still running is
+    # the bout's. DMS lists no tags with its tasks, so each one named like the
+    # installation's is asked in turn.
+    dms = session.client("dms")
+    for task in dms_listing(dms, "describe_replication_tasks", "ReplicationTasks"):
+        if not str(task.get("ReplicationTaskIdentifier", "")).startswith(GLUE_LANE_PREFIX):
+            continue
+        listed = tags_of(
+            dms.list_tags_for_resource, "TagList", ResourceArn=task["ReplicationTaskArn"]
+        )
+        if _tags(listed).get("anti-demo-run-id") != run_id:
+            continue
+        if task.get("Status") in _DMS_ACTIVE_STATES:
+            found[("dms-task", "app", task["Status"])] += 1
     return found
 
 
@@ -94,12 +148,13 @@ def main() -> int:
     if run_id is None:
         raise SystemExit(f"no installation found in {args.checkout}")
     load_checkout_aws(args.checkout)
+    region = require_env("AWS_DEFAULT_REGION", f"no installation in {args.checkout} names one")
     import boto3
 
-    session = boto3.Session(region_name=os.environ["AWS_DEFAULT_REGION"])
+    session = boto3.Session(region_name=region)
     deadline = time.monotonic() + args.wait
     while True:
-        found = leftovers(session, run_id)
+        found = counted_when_settled(lambda: leftovers(session, run_id))
         if not found:
             print("no per-bout resources remain")
             return 0

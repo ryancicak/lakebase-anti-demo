@@ -88,8 +88,14 @@ MAX_CONNECTIONS_DIVISOR = 9531392
 MAX_CONNECTIONS_CEILING = 5000
 _BYTES_PER_GIB = 1073741824
 
-# Rounds 4 and 6 provision no AWS database at all; infra/aws/locals.tf builds
-# Aurora for r1, r2, r3 and r5 only.
+# Rounds whose competitor lane is not raced on every installation. The Aurora
+# clusters and RDS instances for Rounds 4 and 6 stand from v1.1
+# (infra/aws/locals.tf), and each round's AWS lane races them only on an
+# installation that has sealed that lane (`manifest.round4_aws`, Round 4's Glue
+# writer; `manifest.round6_aws`, Round 6's DMS and Glue pipeline). Both stay here
+# for that reason: their AWS seals are optional (`lifecycle._sealed_aws_round_numbers`),
+# and without its lane each races Lakebase alone. What a bout priced is decided per
+# bout, not here (`cost_model.BoutTelemetry.competitor_lane_supported`).
 LAKEBASE_ONLY_ROUNDS = frozenset(
     {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
 )
@@ -109,6 +115,16 @@ RDS_SCORED_ROUNDS = frozenset(
         RoundId.SURVIVE_CONNECTION_SPIKE,
     }
 )
+
+# Rounds for which an RDS instance stands (infra/aws/locals.tf:v7_rds_round_keys).
+# Wider than RDS_SCORED_ROUNDS by exactly the rounds whose instance is raced only
+# once its AWS lane is: Rounds 4 and 6, from v1.1. Whatever stands is validated --
+# its ownership, its ingress and its capacity -- whether or not it is raced yet;
+# only racing it waits for the lane.
+RDS_PROVISIONED_ROUNDS = RDS_SCORED_ROUNDS | {
+    RoundId.PUT_MODEL_SCORE_IN_APP,
+    RoundId.ANALYZE_LIVE_ORDERS,
+}
 
 # No round disables suspension. Round 6 alone once did, on the theory that its
 # change feed needed a continuously live replication connection. A live
@@ -320,15 +336,22 @@ def rds_lane_is_scored(round_id: RoundId) -> bool:
     return round_id in RDS_SCORED_ROUNDS
 
 
+def rds_instance_is_provisioned(round_id: RoundId) -> bool:
+    """Whether an RDS instance stands for this round, raced or not."""
+
+    return round_id in RDS_PROVISIONED_ROUNDS
+
+
 def configured_rds_instance_class(round_id: RoundId) -> str | None:
     """The instance class Terraform applies for this round, if any.
 
-    Only the rounds that race the RDS lane get an instance. Round 1 has an
-    Aurora cluster but no RDS box, because its RDS lane refuses to enter on
-    engine semantics and a provisioned instance would bill without measuring.
+    The rounds that race the RDS lane get an instance, and so does Round 4's
+    from v1.1, ahead of its lane. Round 1 has an Aurora cluster but no RDS box,
+    because its RDS lane refuses to enter on engine semantics and a provisioned
+    instance would bill without measuring.
     """
 
-    return RDS_INSTANCE_CLASS if rds_lane_is_scored(round_id) else None
+    return RDS_INSTANCE_CLASS if rds_instance_is_provisioned(round_id) else None
 
 
 def competitor_is_aurora(competitor_id: CompetitorId) -> bool:
@@ -470,20 +493,33 @@ def build_capacity_disclosure(
 ) -> CapacityDisclosure:
     """Assemble the on-screen compute disclosure for one round.
 
-    Rounds 4 and 6 provision no AWS database, so they disclose the Lakebase lane
-    alone and say plainly that there is no opposing box to compare against.
+    Rounds 4 and 6 disclose the Lakebase lane alone, and each says why. Both
+    rounds' databases stand from v1.1, but what each races is data movement, into
+    those databases for Round 4 and out of them for Round 6. Whether Round 4's AWS
+    lane runs at all depends on the installation, which this disclosure is not
+    told, and Round 6's AWS lane does not race yet.
     """
 
     lakebase, lakebase_min_cu, lakebase_max_cu = _lakebase_lane(round_id, observed)
     if not round_has_aws_lane(round_id):
+        note = (
+            "Round 4 times data movement, not database capacity: where this "
+            "installation has sealed its AWS lane, an AWS Glue job writes into this "
+            "round's own Aurora cluster or RDS instance. Either way no compute "
+            "comparison is made here and no capacity margin is claimed."
+            if round_id is RoundId.PUT_MODEL_SCORE_IN_APP
+            else (
+                "Round 6 times data movement, not database capacity. This round's "
+                "own Aurora cluster and RDS instance stand ahead of an AWS lane that "
+                "does not race yet, so no compute comparison is made and no margin "
+                "is claimed."
+            )
+        )
         return CapacityDisclosure(
             lanes=[lakebase],
             matched=True,
             summary=f"{lakebase.product} {lakebase.configured} ({lakebase.memory})",
-            note=(
-                "No Aurora or RDS database is provisioned for this round, so no "
-                "compute comparison is made and no margin is claimed."
-            ),
+            note=note,
         )
 
     if competitor_is_aurora(competitor_id):

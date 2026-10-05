@@ -225,6 +225,7 @@ def _is_gone(error: ClientError) -> bool:
             "InvalidID",
             "QueueDoesNotExist",
             "AWS.SimpleQueueService.NonExistentQueue",
+            "NoSuchBucket",
         }
     )
 
@@ -255,6 +256,17 @@ def _ec2_targets(session: Any, manifest: DemoManifest) -> list[LeaseTarget]:
     for page in ec2.get_paginator("describe_security_group_rules").paginate(Filters=owned):
         for rule in page.get("SecurityGroupRules") or []:
             found.append((str(rule["SecurityGroupRuleId"]), _tag_map(rule.get("Tags"))))
+    # Round 4's Glue lane: its own subnet, the route table beside it and that table's S3
+    # gateway endpoint.
+    for page in ec2.get_paginator("describe_subnets").paginate(Filters=owned):
+        for subnet in page.get("Subnets") or []:
+            found.append((str(subnet["SubnetId"]), _tag_map(subnet.get("Tags"))))
+    for page in ec2.get_paginator("describe_route_tables").paginate(Filters=owned):
+        for table in page.get("RouteTables") or []:
+            found.append((str(table["RouteTableId"]), _tag_map(table.get("Tags"))))
+    for page in ec2.get_paginator("describe_vpc_endpoints").paginate(Filters=owned):
+        for endpoint in page.get("VpcEndpoints") or []:
+            found.append((str(endpoint["VpcEndpointId"]), _tag_map(endpoint.get("Tags"))))
     return [
         _target("ec2", identifier, tags) for identifier, tags in found if _owned(manifest, tags)
     ]
@@ -393,9 +405,15 @@ def _iam_targets(session: Any, manifest: DemoManifest) -> list[LeaseTarget]:
     policy attached from somewhere else is read and left alone.
     """
     round5 = manifest.round5
+    round6_aws = getattr(manifest, "round6_aws", None)
     role_arns = [
         manifest.aws.runtime_role_arn,
         *(getattr(round5, field, None) for field in _ROUND5_ROLE_FIELDS),
+        getattr(getattr(manifest, "round4_aws", None), "role_arn", None),
+        *(
+            getattr(round6_aws, field, None)
+            for field in ("glue_role_arn", "dms_s3_role_arn", "uc_role_arn")
+        ),
     ]
     roles = list(
         dict.fromkeys(
@@ -457,12 +475,123 @@ def _iam_targets(session: Any, manifest: DemoManifest) -> list[LeaseTarget]:
     return targets
 
 
+def _glue_targets(session: Any, manifest: DemoManifest) -> list[LeaseTarget]:
+    """The Glue jobs and connections of Rounds 4 and 6, from their seals, each proven ours by
+    its tags."""
+    arns: list[str] = []
+    sealed = getattr(manifest, "round4_aws", None)
+    if sealed is not None:
+        partition = str(sealed.role_arn).split(":")[1]
+        prefix = f"arn:{partition}:glue:{manifest.aws.region}:{manifest.aws.account_id}"
+        arns += [
+            *(f"{prefix}:job/{lane.job_name}" for lane in (sealed.aurora, sealed.rds)),
+            *(
+                f"{prefix}:connection/{lane.connection_name}"
+                for lane in (sealed.aurora, sealed.rds)
+            ),
+        ]
+    round6 = getattr(manifest, "round6_aws", None)
+    if round6 is not None:
+        partition = str(round6.glue_role_arn).split(":")[1]
+        prefix = f"arn:{partition}:glue:{manifest.aws.region}:{manifest.aws.account_id}"
+        arns += [f"{prefix}:job/{lane.job_name}" for lane in (round6.aurora, round6.rds)]
+    if not arns:
+        return []
+    glue = session.client("glue", region_name=manifest.aws.region, config=_BOTO_CONFIG)
+    targets: list[LeaseTarget] = []
+    for arn in arns:
+        try:
+            tags = _tag_map(glue.get_tags(ResourceArn=arn).get("Tags"))
+        except ClientError as error:
+            if _is_gone(error):
+                continue
+            raise
+        if _owned(manifest, tags):
+            targets.append(_target("glue", arn, tags))
+    return targets
+
+
+def _bucket_targets(session: Any, manifest: DemoManifest) -> list[LeaseTarget]:
+    """The buckets of Round 4's and Round 6's AWS lanes, from their seals: the only buckets this
+    installation makes."""
+    buckets = [
+        sealed.bucket
+        for sealed in (getattr(manifest, "round4_aws", None), getattr(manifest, "round6_aws", None))
+        if sealed is not None
+    ]
+    if not buckets:
+        return []
+    s3 = session.client("s3", region_name=manifest.aws.region, config=_BOTO_CONFIG)
+    targets: list[LeaseTarget] = []
+    for bucket in buckets:
+        try:
+            tags = _tag_map(s3.get_bucket_tagging(Bucket=bucket).get("TagSet"))
+        except ClientError as error:
+            if _is_gone(error):
+                continue
+            raise
+        if _owned(manifest, tags):
+            targets.append(_target("s3-bucket", bucket, tags))
+    return targets
+
+
+def _dms_targets(session: Any, manifest: DemoManifest) -> list[LeaseTarget]:
+    """Round 6's DMS instance, its subnet group, endpoints and tasks, from the seal.
+
+    DMS lists no tags with its resources, so each sealed ARN is asked for its own. The subnet
+    group carries no ARN in the seal and is read off the instance that uses it.
+    """
+    sealed = getattr(manifest, "round6_aws", None)
+    if sealed is None:
+        return []
+    dms = session.client("dms", region_name=manifest.aws.region, config=_BOTO_CONFIG)
+    arns = [
+        sealed.replication_instance_arn,
+        *(
+            arn
+            for lane in (sealed.aurora, sealed.rds)
+            for arn in (lane.source_endpoint_arn, lane.target_endpoint_arn, lane.task_arn)
+        ),
+    ]
+    try:
+        instances = dms.describe_replication_instances(
+            Filters=[
+                {"Name": "replication-instance-arn", "Values": [sealed.replication_instance_arn]}
+            ]
+        ).get("ReplicationInstances") or []
+    except ClientError as error:
+        if not _is_gone(error):
+            raise
+        instances = []
+    for instance in instances:
+        group = str(
+            (instance.get("ReplicationSubnetGroup") or {}).get("ReplicationSubnetGroupIdentifier")
+            or ""
+        )
+        if group:
+            arns.append(sealed.replication_instance_arn.split(":rep:", 1)[0] + f":subgrp:{group}")
+    targets: list[LeaseTarget] = []
+    for arn in arns:
+        try:
+            tags = _tag_map(dms.list_tags_for_resource(ResourceArn=arn).get("TagList"))
+        except ClientError as error:
+            if _is_gone(error):
+                continue
+            raise
+        if _owned(manifest, tags):
+            targets.append(_target("dms", arn, tags))
+    return targets
+
+
 _DISCOVERY: tuple[tuple[str, Callable[[Any, DemoManifest], list[LeaseTarget]]], ...] = (
     ("ec2", _ec2_targets),
     ("rds", _rds_targets),
     ("secretsmanager", _secret_targets),
     ("sqs", _queue_targets),
     ("iam", _iam_targets),
+    ("glue", _glue_targets),
+    ("s3", _bucket_targets),
+    ("dms", _dms_targets),
 )
 
 
@@ -502,6 +631,23 @@ def _lease_writers(
     secrets = session.client("secretsmanager", region_name=region, config=_BOTO_CONFIG)
     sqs = session.client("sqs", region_name=region, config=_BOTO_CONFIG)
     iam = session.client("iam", config=_BOTO_CONFIG)
+    glue = session.client("glue", region_name=region, config=_BOTO_CONFIG)
+    s3 = session.client("s3", region_name=region, config=_BOTO_CONFIG)
+    dms = session.client("dms", region_name=region, config=_BOTO_CONFIG)
+
+    def move_bucket_lease(bucket: str) -> None:
+        # S3 replaces a bucket's whole tag set, so the set just read is written back with
+        # only the lease changed. A set that cannot be read, or no longer proves this
+        # installation owns the bucket, is never overwritten.
+        tags = _tag_map(s3.get_bucket_tagging(Bucket=bucket).get("TagSet"))
+        if not _owned(manifest, tags):
+            raise ValueError(f"{bucket}'s tags no longer prove this installation owns it")
+        tags[LEASE_TAG] = value
+        s3.put_bucket_tagging(
+            Bucket=bucket,
+            Tagging={"TagSet": [{"Key": key, "Value": tag} for key, tag in tags.items()]},
+        )
+
     return {
         "ec2": lambda identifier: ec2.create_tags(Resources=[identifier], Tags=pair),
         "rds": lambda identifier: rds.add_tags_to_resource(ResourceName=identifier, Tags=pair),
@@ -512,6 +658,11 @@ def _lease_writers(
         "iam-instance-profile": lambda identifier: iam.tag_instance_profile(
             InstanceProfileName=identifier, Tags=pair
         ),
+        "glue": lambda identifier: glue.tag_resource(
+            ResourceArn=identifier, TagsToAdd={LEASE_TAG: value}
+        ),
+        "s3-bucket": move_bucket_lease,
+        "dms": lambda identifier: dms.add_tags_to_resource(ResourceArn=identifier, Tags=pair),
     }
 
 

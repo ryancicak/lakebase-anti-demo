@@ -95,38 +95,35 @@ const recoverRound: RoundDefinition = {
   },
 }
 
+// Mirrors server/catalog.py. Round 4 has no re-do: a second change could not start
+// both integrations cold, so racing again is a new bout.
 const modelScoreRound: RoundDefinition = {
   id: 'put_model_score_in_app',
   title: 'Move lakehouse data into live applications',
-  capability: 'Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres',
+  capability: 'Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres, raced against an AWS Glue job writing the same change into Aurora or RDS',
   scorecard_by_corner: {
-    cost: 'Database list rates captured; required reverse ETL remains unpriced',
-    simplicity: 'Analytics Delta to exact operational Postgres application row',
-    performance: 'Reverse ETL sync and end-to-end proof time',
+    cost: 'Published rates: the synced-table pipeline and the Glue job each bill only while a bout runs',
+    simplicity: 'One synced table against a Glue job, its role, network, connection, ledger and checkpoint',
+    performance: 'Bell to the exact row in the app, with both integrations cold starting at the bell',
   },
   competitors: ['aurora_serverless_v2', 'rds_postgres'],
   availability: 'planned',
   metric_specs: [
-    { id: 'managed_availability_ms', label: 'Reverse ETL sync', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
-    { id: 'application_proof_elapsed_ms', label: 'End-to-end proof', role: 'secondary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'bell_to_exact_read_ms', label: 'Bell to the exact row in the app', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'managed_availability_ms', label: 'Reverse ETL sync (Lakebase’s own timestamps)', role: 'secondary', unit: 'milliseconds', direction: 'lower_is_better' },
     { id: 'delta_commit_version', label: 'Delta commit version', role: 'guardrail', unit: 'version', direction: 'exact' },
     { id: 'exact_row_verified', label: 'Exact row verified', role: 'guardrail', unit: 'boolean', direction: 'exact' },
   ],
-  comparison_kind: 'capability_gap',
+  comparison_kind: 'measured',
   non_claims: [
-    'RDS/Aurora are destination databases only; the same outcome requires a separate reverse-ETL stack that must be selected or built, secured, networked, configured, monitored, and operated.',
-    'The AWS lane was not executed or timed.',
-    'No cross-platform speed comparison or margin is claimed.',
+    'Both integrations cold start at the bell, and each lane’s clock contains its own start. Neither is warmed for the audience.',
+    'AWS moves the AWS lane’s data: an AWS Glue 5.0 job reads the Delta table’s files straight from S3, around Unity Catalog’s permissions, lineage and audit, and writes over JDBC. The supported routes for an outside engine (credential vending, Iceberg REST, Delta Sharing) would each put Databricks back in the lane.',
+    'One change, one verifier: one Delta commit feeds both lanes, and each lane is read by the same query on the same client every 250 ms.',
+    'The Glue job, its role, network and connection are installed once and standing.',
+    'This is one live proof session, not a benchmark.',
     'No dollar savings are claimed.',
-    'No eliminated system is claimed.',
     'No full model-serving capability is claimed.',
   ],
-  redo: {
-    policy: 'show',
-    badge: '★ SHOW',
-    label: 'CHANGE SCORE IN LAKEHOUSE → WATCH APP UPDATE',
-    description: 'Change this demo’s customer risk score from v1 to v2 in the lakehouse, then watch the same live app record update.',
-  },
 }
 
 const connectionSpikeRound: RoundDefinition = {
@@ -158,17 +155,35 @@ const connectionSpikeRound: RoundDefinition = {
   ],
 }
 
+// Mirrors server/catalog.py. Round 6 races AWS DMS and Glue, cold at the bell, against
+// Lakebase's built-in change feed, which is always on.
 const liveOrdersRound: RoundDefinition = {
   id: 'analyze_live_orders_without_slowing_checkout',
   title: 'Move live application data into the lakehouse',
-  capability: 'Built-in change feed (CDF) to separate Delta history',
+  capability: 'Lakebase’s built-in change feed into Delta, raced against AWS DMS capturing the same checkout from Aurora or RDS and an AWS Glue job appending it to Delta',
   scorecard_by_corner: {
-    cost: 'Database list rates captured; required AWS CDC stack remains unpriced',
-    simplicity: 'Built-in change feed: one checkout to one exact Delta answer',
-    performance: 'Commit-to-answer freshness; a separate checkout is the correctness guardrail',
+    cost: 'Published rates: the DMS instance stands, and the Glue job bills only while a bout runs',
+    simplicity: 'One built-in change feed against a DMS instance, task and endpoints, a Glue job, its role, network, bucket and checkpoint',
+    performance: 'Bell to the exact order in the lakehouse, with AWS DMS and Glue cold starting at the bell',
   },
   competitors: ['aurora_serverless_v2', 'rds_postgres'],
   availability: 'preview',
+  metric_specs: [
+    { id: 'bell_to_exact_history_ms', label: 'Bell to the exact order in the lakehouse', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'commit_skew_ms', label: 'Checkout commit skew between the lanes', role: 'guardrail', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'exact_order_verified', label: 'Exact order verified', role: 'guardrail', unit: 'boolean', direction: 'exact' },
+    { id: 'checkout_verified', label: 'Checkout guardrail', role: 'guardrail', unit: 'boolean', direction: 'exact' },
+  ],
+  comparison_kind: 'measured',
+  non_claims: [
+    'AWS DMS and Glue cold start at the bell, and the AWS lane’s clock contains their start. Lakebase’s change feed is built into the database and always on, so its side has nothing to start. What It Cost shows what keeping AWS’s pipeline running all day would cost.',
+    'AWS moves the AWS lane’s data: DMS captures the checkout from the database’s write-ahead log into S3, and an AWS Glue 5.0 job appends it to a Delta table that Unity Catalog reads as an external table.',
+    'One checkout, one verifier: the bell commits the same order on both sources, and each lane’s Delta history is read by the same query on the same SQL warehouse every second.',
+    'Each history keeps its own shape: Lakebase’s feed writes a change type and LSN, and DMS writes an operation and commit timestamp. The claim is the order’s delivery, not identical tables.',
+    'The DMS instance, task and endpoints, the Glue job, its role, network and bucket are installed once and standing.',
+    'This is one live proof session, not a benchmark.',
+    'No dollar savings are claimed.',
+  ],
 }
 
 export const FALLBACK_CATALOG: CatalogResponse = {
@@ -268,7 +283,7 @@ export function stopCondition(
     return 'Each clock stops after the exact order reads from recovery and remains absent at the final source check.'
   }
   if (roundId === 'put_model_score_in_app') {
-    return 'The clock stops only after the committed Delta version is synchronized and a fresh application connection reads the exact operational Postgres row.'
+    return 'The bell cold starts both integrations and commits one Delta change. Each lane’s clock stops at its first application read of the exact row, polled every 250 ms on both lanes.'
   }
   if (roundId === 'survive_connection_spike') {
     if (fanIn) {
@@ -281,7 +296,7 @@ export function stopCondition(
     return 'Each pooled-path setup clock stops at an exact application transaction from the database-only declared start. Lakebase verifies its included pool; the selected AWS managed pooling path provisions a new RDS Proxy. The 128-attempt, maximum-64-concurrent check and separate 64-client witness must then pass.'
   }
   if (roundId === 'analyze_live_orders_without_slowing_checkout') {
-    return 'The clock stops when the exact committed order appears once in Delta. The result waits for a separate checkout to commit.'
+    return 'The bell commits the same checkout on both sources and cold starts AWS DMS and Glue. Each lane’s clock stops at its first read of the exact order, once, in its own Delta history, polled every second on both lanes. A separate checkout must commit on each source.'
   }
   return 'This planned round is non-executable; it has no verifier or timing boundary.'
 }

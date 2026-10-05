@@ -290,6 +290,29 @@ async def test_a_capability_gap_records_no_margin_and_no_shared_start() -> None:
     assert receipt.has_measurements is True
 
 
+async def test_a_declared_tie_records_no_margin_from_the_two_clocks() -> None:
+    """The Round 4 and Round 6 shape: both lanes verified, within the verifiers' resolution.
+
+    The two clocks differ, but by less than the verifiers can show, so the server declares
+    a tie and gives no margin. Subtracting the clocks anyway made the receipt read the
+    tie as a win for the lower one.
+    """
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.comparison = ComparisonSnapshot(
+        kind=ComparisonKind.TIE,
+        detail="Both orders arrived within the verifiers' measurement resolution.",
+    )
+    snapshot.remembered_result = "TIE · WITHIN MEASUREMENT RESOLUTION"
+
+    receipt = derive_receipt(snapshot, "run_finished")
+
+    assert receipt.outcome == "declared"
+    assert receipt.lakebase.state == receipt.opponent_lane.state == "verified"
+    assert receipt.margin_ms is None
+    assert receipt.remembered_result == "TIE · WITHIN MEASUREMENT RESOLUTION"
+
+
 async def test_prefers_the_orchestrators_own_margin_over_arithmetic() -> None:
     """Round 5 is judged on setup, and its margin comes from the comparison."""
     snapshot = await verified_round_one_snapshot()

@@ -18,6 +18,7 @@ from botocore.stub import Stubber
 from databricks.sdk.errors import NotFound, PermissionDenied
 
 from server import safe_change_live
+from server.bout_limit import BOUT_TIME_LIMIT_SECONDS
 from server.manager import operator_diagnosis
 from server.manifest import (
     AwsManifest,
@@ -1287,7 +1288,7 @@ def test_builder_exposes_all_three_live_adapters_without_cloud_calls() -> None:
         RdsSafeChangeAdapter,
     )
     assert len(sessions) == 2
-    assert engine.run_timeout_seconds == DEFAULT_RUN_TIMEOUT_SECONDS
+    assert engine.run_timeout_seconds == BOUT_TIME_LIMIT_SECONDS
     assert engine.reset_timeout_seconds == DEFAULT_RUN_TIMEOUT_SECONDS
     assert engine.lakebase.config.control_timeout_seconds == 120.0
     assert engine.lakebase.config.poll_timeout_seconds == DEFAULT_POLL_TIMEOUT_SECONDS
@@ -1561,11 +1562,14 @@ async def test_aurora_writer_readiness_is_unchanged_and_still_requires_available
 
 
 def test_timeout_defaults_are_single_sourced_and_correctly_ordered() -> None:
-    assert DEFAULT_POLL_TIMEOUT_SECONDS == 900.0
-    assert DEFAULT_RUN_TIMEOUT_SECONDS == 1080.0
-    # A per-wait budget at or above the whole-lane budget is unreachable: the
-    # lane deadline would always fire first and the poll value would be a lie.
+    assert DEFAULT_POLL_TIMEOUT_SECONDS == 2400.0
+    assert DEFAULT_RUN_TIMEOUT_SECONDS == 2700.0
+    # A per-wait budget at or above the cleanup budget it runs inside is
+    # unreachable: the cleanup deadline would always fire first and the poll value
+    # would be a lie. A lane's bound is below it on purpose: a lane still waiting
+    # there is a result (tests/test_lane_bound_stoppage.py).
     assert DEFAULT_RUN_TIMEOUT_SECONDS > DEFAULT_POLL_TIMEOUT_SECONDS
+    assert BOUT_TIME_LIMIT_SECONDS < DEFAULT_POLL_TIMEOUT_SECONDS
 
     # The dataclass default must be the same constant the builder uses, so it
     # can never quietly drift into a value nothing honours.
@@ -1586,6 +1590,18 @@ def test_timeout_defaults_are_single_sourced_and_correctly_ordered() -> None:
     )
 
 
+def test_a_clone_that_aws_delays_through_its_own_backup_is_still_cleaned_up() -> None:
+    # rc13 (2026-10-03): the clone was accepted at the bell, created 14.6 minutes
+    # later, and its writer was still starting when the old 18-minute lane ended.
+    # The same clone was created 75 seconds after the bell outside a backup. The
+    # lane's bound now decides that bout; cleanup still has to outlast the clone to
+    # delete it.
+    observed_clone_wait = 14.6 * 60
+    writer = 7 * 60
+    assert DEFAULT_POLL_TIMEOUT_SECONDS > observed_clone_wait
+    assert DEFAULT_RUN_TIMEOUT_SECONDS > observed_clone_wait + writer + 15 * 60
+
+
 def test_builder_applies_the_shared_timeout_defaults() -> None:
     engine = build_safe_change_engine(
         owned_manifest(),
@@ -1596,8 +1612,8 @@ def test_builder_applies_the_shared_timeout_defaults() -> None:
         sleep=no_sleep,
     )
 
-    assert engine.run_timeout_seconds == DEFAULT_RUN_TIMEOUT_SECONDS
-    # Every whole-operation budget must stay above the per-wait budget it wraps.
+    assert engine.run_timeout_seconds == BOUT_TIME_LIMIT_SECONDS
+    # Cleanup's budget must stay above the per-wait budget it wraps.
     assert engine.reset_timeout_seconds > DEFAULT_POLL_TIMEOUT_SECONDS
     for adapter in engine.competitors.values():
         assert adapter.config.poll_timeout_seconds == DEFAULT_POLL_TIMEOUT_SECONDS
@@ -2257,3 +2273,48 @@ async def test_a_clone_that_never_becomes_deletable_stays_loud(
     # It spent its whole budget before saying so, and the budget is the
     # per-wait one, deliberately under the lane's own reset deadline.
     assert clock.now >= adapter.config.poll_timeout_seconds
+
+
+async def test_an_aurora_source_in_its_automated_backup_is_still_a_source() -> None:
+    """2026-10-02: rc10's Round 3 refused its Aurora source three seconds into the cluster's
+    first automated snapshot, which reads `backing-up` until the snapshot is done."""
+
+    session = FakeAwsSession()
+    session.rds.clusters[AURORA_SOURCE]["Status"] = "backing-up"
+    session.rds.instances[AURORA_WRITER]["DBInstanceStatus"] = "backing-up"
+
+    cluster, writer = await aurora_adapter(session)._source()
+
+    assert cluster["Status"] == "backing-up"
+    assert writer["DBInstanceStatus"] == "backing-up"
+
+
+async def test_an_rds_source_in_its_automated_backup_is_still_a_source() -> None:
+    session = FakeAwsSession()
+    session.rds.instances[RDS_SOURCE]["DBInstanceStatus"] = "backing-up"
+
+    instance = await rds_adapter(session)._source()
+
+    assert instance["DBInstanceStatus"] == "backing-up"
+
+
+@pytest.mark.parametrize("status", ["modifying", "stopped", "rebooting", "upgrading"])
+async def test_a_source_in_any_other_state_is_still_refused_and_says_which(status) -> None:
+    says = f"not available \\(status {status}\\)"
+    aurora = FakeAwsSession()
+    aurora.rds.clusters[AURORA_SOURCE]["Status"] = status
+    with pytest.raises(SafeChangeLiveConfigurationError, match=says):
+        await aurora_adapter(aurora)._source()
+
+    rds = FakeAwsSession()
+    rds.rds.instances[RDS_SOURCE]["DBInstanceStatus"] = status
+    with pytest.raises(SafeChangeLiveConfigurationError, match=says):
+        await rds_adapter(rds)._source()
+
+
+async def test_an_aurora_writer_in_any_other_state_is_still_refused() -> None:
+    session = FakeAwsSession()
+    session.rds.instances[AURORA_WRITER]["DBInstanceStatus"] = "modifying"
+
+    with pytest.raises(SafeChangeLiveConfigurationError, match="available db.serverless writer"):
+        await aurora_adapter(session)._source()

@@ -4097,6 +4097,7 @@ async def _resident_agent(
     heartbeat_binding: dict[str, object] | None = None
     last_heartbeat_at = 0.0
     event_sequences: dict[str, int] = {}
+    publish_locks: dict[str, asyncio.Lock] = {}
     consumed_control_events: set[str] = set()
 
     def persist(path: Path, value: Mapping[str, object]) -> None:
@@ -4195,25 +4196,33 @@ async def _resident_agent(
         payload: Mapping[str, object],
     ) -> None:
         job_id = str(binding["job_id"])
-        if job_id not in event_sequences:
-            event_sequences[job_id] = await asyncio.to_thread(
-                _last_resident_event_sequence,
+        # The heartbeat and the job's own events publish from different tasks, so
+        # one job's events are numbered and written one at a time. Unlocked, a
+        # heartbeat landing during a new job's first MAX(sequence) read took the
+        # same number as the job's 'prepared', and the second insert failed the
+        # arm as resident_runner_event_conflict. Holding the lock through the
+        # insert also commits events in sequence order: the server pages by
+        # sequence, so an event committed after a higher one is never read.
+        async with publish_locks.setdefault(job_id, asyncio.Lock()):
+            if job_id not in event_sequences:
+                event_sequences[job_id] = await asyncio.to_thread(
+                    _last_resident_event_sequence,
+                    control_dsn,
+                    binding,
+                )
+            sequence = event_sequences[job_id] + 1
+            event_sequences[job_id] = sequence
+            event_payload = dict(payload)
+            if kind == "progress":
+                event_payload["sequence"] = sequence
+            await asyncio.to_thread(
+                _write_resident_event,
                 control_dsn,
-                binding,
+                binding=binding,
+                sequence=sequence,
+                kind=kind,
+                payload=event_payload,
             )
-        sequence = event_sequences.get(job_id, 0) + 1
-        event_sequences[job_id] = sequence
-        event_payload = dict(payload)
-        if kind == "progress":
-            event_payload["sequence"] = sequence
-        await asyncio.to_thread(
-            _write_resident_event,
-            control_dsn,
-            binding=binding,
-            sequence=sequence,
-            kind=kind,
-            payload=event_payload,
-        )
 
     async def stop_pool() -> None:
         nonlocal pool

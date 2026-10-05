@@ -149,9 +149,6 @@ quantities, which move with every read, so they are named rather than fixed.
 | Aurora | AWS-managed credentials | AWS | assumed | 4 of 9 | `$0.40`/secret-month |
 | RDS Proxy | Terraform-managed proxy secrets | AWS | assumed | 2 of 9 | `$0.40`/secret-month |
 | Neutral runner | `m6i.large` burst runner | AWS | assumed | 1 | `$0.096`/instance-hour |
-
-The capacity-safe Round 5 default adds approximately `$0.096` per runner-hour
-over the former `m6i.large`. This is an hourly delta, not a monthly forecast.
 | Neutral runner | gp3 root volume | AWS | assumed | 20 GB | `$0.08`/GB-month |
 | Neutral runner | public IPv4 | AWS | assumed | 1 | `$0.005`/address-hour |
 | Lakebase | always-on minimum compute | Databricks | measured | none posted | `$0.26`/DBU |
@@ -185,6 +182,18 @@ Five details in that table do real work:
 > was resized on 2026-08-21, and Round 1's RDS instance was deleted after that,
 > which is why three instances stand rather than four.
 > `server/cost_model.py` is authoritative for both the rates and the shape.
+
+**v1.1's shape, checked on 2026-10-02.** Five RDS instances and six Aurora
+clusters, Round 6's held awake at 0.5 ACU by logical replication; two
+`c7i.2xlarge` Round 5 runners at `$0.357` an hour each, in place of the receipt's
+one `m6i.large`; thirteen public IPv4 addresses, eleven on databases and two on
+runners; fifteen managed secrets; and Round 6's `dms.t3.small` replication
+instance at `$0.036` an hour. Every rate in `server/cost_model.py` was read back
+from the AWS Price List API that day and every count from a running installation.
+All matched except the runner rate, which had read `$0.4284` since the two-runner
+seal, a figure no region publishes, and the runners' two addresses, which were
+counted twice. The workspace's own `system.billing.list_prices` agreed with every
+Databricks rate here.
 
 ### The AWS rate sources
 

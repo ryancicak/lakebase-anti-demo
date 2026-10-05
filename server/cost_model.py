@@ -33,7 +33,7 @@ from enum import StrEnum
 
 from .capacity import AURORA_AUTO_PAUSE_SECONDS, LAKEBASE_SUSPEND_SECONDS
 from .capacity import AURORA_MAX_ACU as _AURORA_MAX_ACU
-from .models import CompetitorId, RoundId, SessionSnapshot
+from .models import CompetitorId, LaneState, RoundId, SessionSnapshot
 from .pricing import (
     CONFIGURED_RDS_INSTANCE_CLASS,
     rds_instance_compute_source,
@@ -92,6 +92,17 @@ TERRAFORM_RUNNER_CONTROL_SECRETS = 2
 # ninety seconds is still billed for six hundred, which is why Round 3's short
 # failed bouts do not cost proportionally less than its long ones.
 RDS_MINIMUM_BILLED_SECONDS = Decimal(600)
+
+# Round 4's AWS lane, read off `infra/aws/round4_glue.tf`.  Each competitor's job
+# runs `worker_type = "G.1X"`, one DPU per worker, with `number_of_workers = 2`
+# counting the driver, so a run holds two DPU for as long as it consumes
+# resources.  Glue bills that per second with a one-minute minimum.  A run nothing
+# stops, because the app died, stops itself at the job's `timeout = 30` minutes,
+# which is therefore the most a bout's run can bill.  Round 6's AWS lane runs a Glue
+# job of the same size and bound (`infra/aws/round6_aws.tf`), so these price it too.
+ROUND4_GLUE_DPU = Decimal(2)
+GLUE_MINIMUM_BILLED_SECONDS = Decimal(60)
+ROUND4_GLUE_TIMEOUT_SECONDS = Decimal(30 * 60)
 
 # A Lakebase compute unit meters at this rate on AWS at the ENTERPRISE tier.
 #
@@ -560,15 +571,36 @@ class RateCard:
         "capacity-hour",
         "Amazon RDS Proxy pricing · us-west-2 · 10-minute minimum",
     )
+    # Round 4's AWS lane is a Glue 5.0 Spark streaming job, billed per DPU-hour for
+    # the seconds a run consumed resources (`ROUND4_GLUE_DPU` and the minimum above).
+    glue_dpu_hour: Rate = Rate(
+        Decimal("0.44"),
+        "DPU-hour",
+        "AWS Glue pricing · Spark job DPU-hour · us-west-2 · per second, 1-minute minimum",
+    )
+    # Round 6's AWS lane captures changes on one DMS replication instance
+    # (`infra/aws/round6_aws.tf`: dms.t3.small, Single-AZ), which bills around the
+    # clock whether or not its tasks run.  Its 20 GB is inside the 50 GB of gp2 a T3
+    # instance includes, and a T3 instance's CPU credits bill only above its
+    # baseline, which a parked task never reaches (AWS DMS pricing, read 2026-09-29).
+    dms_t3_small_hour: Rate = Rate(
+        Decimal("0.036"),
+        "instance-hour",
+        "AWS Price List API · AWSDatabaseMigrationSvc · OnDemand · us-west-2 · "
+        "SKU X2XEG8FG4898H6YD",
+    )
     ec2_m6i_large_hour: Rate = Rate(
         Decimal("0.096"),
         "instance-hour",
         "AWS Price List API · AmazonEC2 · OnDemand · us-west-2",
     )
+    # Read back from the Price List API on 2026-10-02 (Linux, shared tenancy, offer
+    # published 2026-09-25). This had said $0.4284 since the two-runner seal of
+    # 2026-09-16, a figure no region publishes; us-west-1 is $0.4452.
     ec2_c7i_2xlarge_hour: Rate = Rate(
-        Decimal("0.4284"),
+        Decimal("0.357"),
         "instance-hour",
-        "AWS Price List API · AmazonEC2 · OnDemand · us-west-2",
+        "AWS Price List API · AmazonEC2 · OnDemand · us-west-2 · SKU 7JMQ8KWB3NTKK3TB",
     )
     ebs_gp3_gb_month: Rate = Rate(
         Decimal("0.08"),
@@ -614,6 +646,20 @@ class RateCard:
         return cls(rds_instance_class=_INSTANCE_CLASS_BY_BASIS[basis])
 
 
+#: The rounds whose databases are read by logical replication, and so run on the
+#: parameter groups in `infra/aws/parameter_groups.tf`: Round 6, whose AWS lane is
+#: AWS DMS change capture. `tests/test_cost_model.py` ties this to
+#: `infra/aws/locals.tf:v7_lakeflow_round_keys`.
+LOGICAL_REPLICATION_ROUNDS: frozenset[RoundId] = frozenset({RoundId.ANALYZE_LIVE_ORDERS})
+
+# The smallest capacity a *running* Serverless v2 instance reports.  Below this
+# there is only the paused state at 0 ACU; AWS scales in 0.5 ACU steps and the
+# measured descents sat at exactly 0.500 for their whole length.  This is what
+# makes a woken cluster's cost floor positive rather than zero, and what a cluster
+# that cannot pause holds while idle.
+AURORA_MIN_RUNNING_ACU = Decimal("0.5")
+
+
 @dataclass(frozen=True, slots=True)
 class InstallationShape:
     """Sealed configuration of one provisioned generation.
@@ -622,31 +668,65 @@ class InstallationShape:
     than guessed, so a change to the Terraform must change this too.
     """
 
-    # Three, not four. `infra/aws/locals.tf` stands an RDS instance up for
-    # `v7_rds_round_keys = ["r2","r3","r5"]` only, and the v7 manifest agrees --
-    # Round 1's `round_environments` entry seals `rds: null`. Round 1's instance
-    # was deleted because its lane refuses to enter on engine semantics and was
-    # never timed, so it billed to measure nothing. Its cost did not go away for
-    # a *customer*, which is what `imputed_round_carrying_lines` prices; it went
-    # away for this installation, which is what this shape prices.
-    rds_instances: int = 3
+    # Five, not six. `infra/aws/locals.tf` stands an RDS instance up for
+    # `v7_rds_round_keys = ["r2","r3","r4","r5","r6"]` only, and the v7 manifest
+    # agrees -- Round 1's `round_environments` entry seals `rds: null`. Round 1's
+    # instance was deleted because its lane refuses to enter on engine semantics
+    # and was never timed, so it billed to measure nothing. Its cost did not go
+    # away for a *customer*, which is what `imputed_round_carrying_lines` prices; it
+    # went away for this installation, which is what this shape prices. The
+    # instances and clusters for Rounds 4 and 6 are real from v1.1: Round 4's AWS
+    # lane writes into its pair, and Round 6's captures changes out of its pair.
+    rds_instances: int = 5
     rds_allocated_gb: Decimal = Decimal(20)
-    aurora_clusters: int = 4
+    aurora_clusters: int = 6
     # `serverlessv2_scaling_configuration.min_capacity = 0` in the v7 state, which
     # is why an idle Aurora cluster here parks for free and Round 1 has something
     # to wake up. Raise this and the carrying total moves immediately.
     aurora_min_acu: Decimal = Decimal(0)
+    # Round 6's cluster is the exception to that zero. Logical replication is on
+    # for its AWS lane (`infra/aws/parameter_groups.tf`), and AWS documents that
+    # when "an Aurora PostgreSQL cluster has logical replication enabled ... the
+    # writer instance ... [doesn't] automatically pause". So it idles awake at 0.5
+    # ACU, the least a running Serverless v2 instance holds. On 2026-09-29 a cluster
+    # with logical replication on and a 0.5 ACU minimum read 0.5 ACU flat in
+    # CloudWatch while idle, so replication's health checks add nothing above that
+    # floor. Counted apart from `aurora_clusters`' floor rather than folded into
+    # it, so neither line prices that cluster twice.
+    aurora_replicating_clusters: int = len(LOGICAL_REPLICATION_ROUNDS)
+    aurora_replicating_acu: Decimal = AURORA_MIN_RUNNING_ACU
+    # Round 6's one DMS replication instance, which both competitors' capture tasks
+    # run on.  It stands only where the installation built Round 6's AWS lane, so
+    # `server/standing_cost.py` sets it from the manifest's seal.
+    dms_replication_instances: int = 1
     aurora_storage_gb: Decimal = Decimal(1)
-    # Seven publicly reachable database writers plus two resident runner instances.
-    public_ipv4_addresses: int = 9
-    # Seven RDS-managed master credentials -- three RDS instances plus four Aurora
+    # Eleven publicly reachable database writers plus two resident runner instances.
+    public_ipv4_addresses: int = 13
+    # Eleven RDS-managed master credentials -- five RDS instances plus six Aurora
     # clusters -- plus four Terraform-managed Round 5 secret containers. The
     # `rds!`-prefixed managed secrets are chargeable: the RDS guide states plainly
     # that "you are charged for that secret".
-    managed_secrets: int = 11
+    managed_secrets: int = 15
     runner_instances: int = 2
     runner_root_gb: Decimal = Decimal(20)
     lakebase_projects: int = 7
+
+    @property
+    def database_public_ipv4_addresses(self) -> int:
+        """The addresses on database endpoints alone.
+
+        The runners' two are priced on their own line, so the database line counts
+        only these. Pricing ``public_ipv4_addresses`` there too had billed each
+        runner's address twice.
+        """
+
+        databases = self.public_ipv4_addresses - self.runner_instances
+        if databases < 0:
+            raise ValueError(
+                "public_ipv4_addresses counts every chargeable address, the runners' "
+                f"included, so it cannot be fewer than the {self.runner_instances} runners"
+            )
+        return databases
 
     def with_r1_rds_instance(self) -> InstallationShape:
         """The fleet as it stood before Round 1's RDS instance was deleted.
@@ -668,6 +748,9 @@ class InstallationShape:
             rds_allocated_gb=self.rds_allocated_gb,
             aurora_clusters=self.aurora_clusters,
             aurora_min_acu=self.aurora_min_acu,
+            aurora_replicating_clusters=self.aurora_replicating_clusters,
+            aurora_replicating_acu=self.aurora_replicating_acu,
+            dms_replication_instances=self.dms_replication_instances,
             aurora_storage_gb=self.aurora_storage_gb,
             public_ipv4_addresses=self.public_ipv4_addresses + 1,
             managed_secrets=self.managed_secrets + 1,
@@ -696,6 +779,16 @@ class BoutTelemetry:
     ``MEASURED`` with a band rather than being collapsed to a single number the
     evidence does not support.  ``acu_observation_basis`` travels with them so
     the line can say on screen where its quantity came from.
+
+    ``observed_glue_execution_seconds`` is Round 4's or Round 6's: the
+    ``ExecutionTime`` Glue reported for the bout's job run, which is the seconds the
+    run consumed resources and so exactly what Glue bills.  Glue reports it once the
+    run has stopped, which is after the bout has settled, and not before.
+
+    ``competitor_lane_supported`` is False when the bout ran with its competitor
+    lane not supported.  Only Rounds 4 and 6 price on it: an installation that has
+    not sealed that round's AWS lane races Lakebase alone.  Every other round prices
+    its competitor side from its own shape, whatever state the lane was in.
     """
 
     round_id: RoundId
@@ -711,6 +804,8 @@ class BoutTelemetry:
     observed_acu_seconds_high: Decimal | None = None
     acu_observation_basis: str | None = None
     observed_lakebase_dbu: Decimal | None = None
+    observed_glue_execution_seconds: Decimal | None = None
+    competitor_lane_supported: bool = True
 
     # How much longer than the measured lane a torn-down resource is assumed to
     # live: the harness waits through `backing-up` and
@@ -730,6 +825,7 @@ class BoutTelemetry:
             "observed_acu_seconds_low",
             "observed_acu_seconds_high",
             "observed_lakebase_dbu",
+            "observed_glue_execution_seconds",
         ):
             value = getattr(self, name)
             if value is not None and value < 0:
@@ -778,12 +874,6 @@ ACU_SAMPLE_LEAD_SECONDS = Decimal(300)
 
 # CloudWatch's finest published period for this metric.
 ACU_SAMPLE_PERIOD_SECONDS = Decimal(60)
-
-# The smallest capacity a *running* Serverless v2 instance reports.  Below this
-# there is only the paused state at 0 ACU; AWS scales in 0.5 ACU steps and the
-# measured descents sat at exactly 0.500 for their whole length.  This is what
-# makes a woken cluster's cost floor positive rather than zero.
-AURORA_MIN_RUNNING_ACU = Decimal("0.5")
 
 
 def integrate_acu_seconds(
@@ -977,8 +1067,8 @@ class AuroraAcuMeasurement:
 # `.anti-demo-v7/aurora-acu-2026-08-21.md`, us-west-2, run `ad-20260820-1446-abcd`.
 # These are the only real Aurora quantities this installation has.
 #
-# Rounds 4 and 6 are absent on purpose: `infra/aws/locals.tf` provisions no
-# Aurora for them, so their zero is exact and needs no measurement.
+# Rounds 4 and 6 are absent because their lanes race their clusters from v1.1 and no
+# bout of either has been sampled yet (`AURORA_LANES_NOT_YET_MEASURED`).
 V7_MEASURED_AURORA_ACU_SECONDS: dict[RoundId, AuroraAcuMeasurement] = {
     RoundId.WAKE_IDLE_APP: AuroraAcuMeasurement(
         round_id=RoundId.WAKE_IDLE_APP,
@@ -1041,6 +1131,20 @@ V7_MEASURED_AURORA_ACU_SECONDS: dict[RoundId, AuroraAcuMeasurement] = {
         ),
     ),
 }
+
+
+# Raced Aurora lanes with no recorded integral, named so the gap is a declared
+# fact rather than a missing dictionary entry.  Round 4's AWS Glue lane writes
+# into its cluster from v1.1 and the app reads it back, so a bout wakes it and
+# bills its descent like any other.  Round 6's cluster never parks (logical
+# replication holds it at its running floor, which is carrying cost), and a bout's
+# checkout and DMS's capture add capacity above that floor.  Until a bout's
+# ServerlessDatabaseCapacity integral is recorded, what either costs is unknown,
+# and `server/bout_cost.py` says so on its row instead of printing the structural
+# zero each had while it raced Lakebase alone.
+AURORA_LANES_NOT_YET_MEASURED: frozenset[RoundId] = frozenset(
+    {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+)
 
 
 def aurora_acu_seconds_for(round_id: RoundId) -> AuroraAcuMeasurement | None:
@@ -1504,6 +1608,181 @@ def _baseline_wake_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[Cost
     ]
 
 
+def _glue_dpu_quantity(telemetry: BoutTelemetry) -> Quantity:
+    """A bout's Glue run in DPU-hours, Round 4's or Round 6's: the billed seconds Glue
+    reported, or unavailable.
+
+    Glue bills a run for the seconds it consumed resources, which it reports as
+    the run's ``ExecutionTime`` once the run has stopped.  That is not the run's
+    lifetime, and no clock here stands in for it: the 60-95 seconds in which Glue
+    provisions a run are inside its span from ``StartedOn`` to ``STOPPED`` and are
+    not billed.  On the v1.1 test installation on 2026-09-29 four bout runs
+    reported 78, 100, 109 and 152 seconds against lifetimes of roughly 150-260,
+    and the lane clock, which stops at the row rather than at the stop, bounds
+    neither.
+
+    So before the run has stopped there is nothing to price, and the line is
+    unavailable with its bounds named: the one-minute minimum below and the job's
+    30-minute timeout above.  A run stopped while it was still starting reports
+    0 seconds, and whether Glue bills its minimum for a run that consumed nothing
+    is not documented, so the band runs to the minimum while the point stays at
+    what Glue reported.  Pricing the opponent above what it was observed to
+    consume is the worst direction this error could point.
+    """
+
+    def dpu_hours(seconds: Decimal) -> Decimal:
+        # Multiplied before it is divided, so a whole number of seconds stays exact.
+        return seconds * ROUND4_GLUE_DPU / SECONDS_PER_HOUR
+
+    observed = telemetry.observed_glue_execution_seconds
+    minimum = dpu_hours(GLUE_MINIMUM_BILLED_SECONDS)
+    if observed is None:
+        ceiling = dpu_hours(ROUND4_GLUE_TIMEOUT_SECONDS)
+        return Quantity.unavailable(
+            "Glue reports a run's billed ExecutionTime only once the run has stopped, "
+            "after the bout settles, and no clock here stands in for it because Glue "
+            f"does not bill its own provisioning. Bounded to [{minimum:.6f}, "
+            f"{ceiling:.6f}] DPU-hours: the 1-minute minimum at {ROUND4_GLUE_DPU} DPU, "
+            "and the job's 30-minute timeout"
+        )
+    if observed == 0:
+        return Quantity.banded(
+            Decimal(0),
+            low=Decimal(0),
+            high=minimum,
+            provenance=Provenance.MEASURED,
+            basis=(
+                "Glue reported 0 s of ExecutionTime: the run was stopped before it "
+                "consumed resources. Whether Glue bills its 1-minute minimum for such a "
+                "run is not documented, so the band runs to the minimum and the point "
+                "is what Glue reported"
+            ),
+        )
+    billed = max(observed, GLUE_MINIMUM_BILLED_SECONDS)
+    minimum_applied = (
+        f"; {GLUE_MINIMUM_BILLED_SECONDS} s provider minimum applied"
+        if observed < GLUE_MINIMUM_BILLED_SECONDS
+        else ""
+    )
+    return Quantity.exact(
+        dpu_hours(billed),
+        provenance=Provenance.MEASURED,
+        basis=(
+            f"Glue-reported ExecutionTime of {observed} s, the seconds the run consumed "
+            f"resources, at {ROUND4_GLUE_DPU} DPU (G.1X x 2){minimum_applied}"
+        ),
+    )
+
+
+def _model_score_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[CostLine]:
+    """Round 4's AWS lane: a Glue run carries the bout's change into a standing database.
+
+    Two lines.  The database is the round's own Aurora cluster or RDS instance,
+    which the Glue job writes into and the app reads back, and it is priced as
+    Round 1 prices a wake: a provisioned RDS instance bills around the clock, so
+    the bout adds no instance-hours to it, while Aurora parks at 0 ACU and every
+    unit the bout makes it allocate is marginal, the descent after the bell
+    included.  The Glue run is the lane's own compute, started at the bell and
+    stopped once the bout has settled.
+    """
+
+    if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2:
+        database = _line(
+            "Aurora Serverless v2 Glue writes and app reads",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.BOUT,
+            lane_id="competitor",
+            quantity=_aurora_acu_quantity(telemetry),
+            rate=rates.aurora_acu_hour,
+        )
+    else:
+        database = _line(
+            f"{rates.rds_compute_label} Glue writes and app reads · already-running instance",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.BOUT,
+            lane_id="competitor",
+            quantity=Quantity.exact(
+                Decimal(0),
+                provenance=Provenance.ASSUMED,
+                basis=(
+                    "a provisioned RDS instance bills continuously, so the Glue job's "
+                    "writes and the app's reads add no incremental instance-hours; the "
+                    "Glue run is the lane's marginal compute"
+                ),
+            ),
+            rate=rates.rds_instance_hour,
+        )
+    return [
+        database,
+        _line(
+            f"AWS Glue streaming job · {ROUND4_GLUE_DPU} DPU",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.BOUT,
+            lane_id="competitor",
+            quantity=_glue_dpu_quantity(telemetry),
+            rate=rates.glue_dpu_hour,
+        ),
+    ]
+
+
+def _live_orders_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[CostLine]:
+    """Round 6's AWS lane: DMS captures the bout's checkout and a Glue run appends it to Delta.
+
+    Two lines, as Round 4's.  The database is the round's own Aurora cluster or RDS
+    instance, which DMS reads.  Round 6's Aurora writer never parks, because logical
+    replication holds it at its running floor, which is priced as carrying cost, so
+    a bout's marginal compute is what the checkout and the capture add above that
+    floor.  A provisioned RDS instance bills around the clock either way.  The DMS
+    task has no line of its own: it bills nothing beyond its replication instance,
+    which stands and is carrying cost.  The Glue run is the lane's own compute,
+    started at the bell and stopped once the bout has settled.
+    """
+
+    if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2:
+        database = _line(
+            "Aurora Serverless v2 checkout and DMS capture above the replication floor",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.BOUT,
+            lane_id="competitor",
+            quantity=_aurora_acu_quantity(telemetry),
+            rate=rates.aurora_acu_hour,
+        )
+    else:
+        database = _line(
+            f"{rates.rds_compute_label} checkout and DMS capture · already-running instance",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.BOUT,
+            lane_id="competitor",
+            quantity=Quantity.exact(
+                Decimal(0),
+                provenance=Provenance.ASSUMED,
+                basis=(
+                    "a provisioned RDS instance bills continuously, so the checkout and "
+                    "DMS's reads add no incremental instance-hours; the Glue run is the "
+                    "lane's marginal compute"
+                ),
+            ),
+            rate=rates.rds_instance_hour,
+        )
+    return [
+        database,
+        _line(
+            f"AWS Glue streaming job · {ROUND4_GLUE_DPU} DPU",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.BOUT,
+            lane_id="competitor",
+            quantity=_glue_dpu_quantity(telemetry),
+            rate=rates.glue_dpu_hour,
+        ),
+    ]
+
+
 def _lakebase_lines(
     telemetry: BoutTelemetry,
     rates: RateCard,
@@ -1523,23 +1802,69 @@ def _lakebase_lines(
 
 
 _ROUNDS_WITH_RESTORE = frozenset({RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER})
-_ROUNDS_WITHOUT_AWS = frozenset({RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS})
+# Every round races an AWS lane from v1.1.  Round 6 was the last to leave, when its
+# DMS and Glue lane landed.
+_ROUNDS_WITHOUT_AWS: frozenset[RoundId] = frozenset()
 
-# Which rounds Terraform actually stands a competitor database up for, keyed by
-# the round key `infra/aws/locals.tf` uses.  `v7_round_keys = ["r1","r2","r3","r5"]`
-# provisions an Aurora cluster per key; the narrower
-# `v7_rds_round_keys = ["r2","r3","r5"]` provisions the RDS instances, which is
-# why Round 1 appears here with a cluster and no box.  Every one of these lanes
-# is armable, so every one of them owes a line.
-# `tests/test_cost_model.py` reads the Terraform back and asserts this map agrees
-# with it, because the two drifting apart is precisely how Round 5's Aurora lane
-# went unpriced.
+# The rounds whose AWS lane races only on an installation that has sealed it, and
+# which otherwise race Lakebase alone (`BoutTelemetry.competitor_lane_supported`).
+_ROUNDS_WITH_OPTIONAL_AWS_LANES = frozenset(
+    {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+)
+
+# Which rounds Terraform actually stands a competitor database up for, and whose
+# competitor lane is raced, keyed by the round key `infra/aws/locals.tf` uses.
+# `v7_round_keys = ["r1",...,"r6"]` provisions an Aurora cluster per key; the
+# narrower `v7_rds_round_keys = ["r2",...,"r6"]` provisions the RDS instances,
+# which is why Round 1 appears here with a cluster and no box.  Every one of these
+# lanes is armable, so every one of them owes a line.
+# `tests/test_cost_model.py` reads the Terraform back and asserts that this map
+# and `_PROVISIONED_LANES_NOT_YET_RACED` together agree with it, because the two
+# drifting apart is precisely how Round 5's Aurora lane went unpriced.
+#
+# Rounds 4 and 6 joined in v1.1, when their AWS lanes landed (Round 4's Glue writer,
+# Round 6's DMS and Glue pipeline).  They are the rounds here whose lane races only
+# on an installation that has sealed it (`manifest.round4_aws`, `manifest.round6_aws`):
+# without that seal their databases still stand, but the bout races Lakebase alone,
+# says so with an unsupported competitor lane, and owes no AWS line
+# (`BoutTelemetry.competitor_lane_supported`).
 _AWS_ROUND_KEYS: dict[RoundId, str] = {
     RoundId.WAKE_IDLE_APP: "r1",
     RoundId.MAKE_SCHEMA_CHANGE_SAFELY: "r2",
     RoundId.RECOVER_DELETED_ORDER: "r3",
+    RoundId.PUT_MODEL_SCORE_IN_APP: "r4",
     RoundId.SURVIVE_CONNECTION_SPIKE: "r5",
+    RoundId.ANALYZE_LIVE_ORDERS: "r6",
 }
+
+# Rounds whose competitor databases Terraform stands up before their lane is
+# raced.  Their standing cost is real and is priced in `InstallationShape`; what
+# they lack is a per-bout lane line, because no bout touches them yet, and a
+# per-round Aurora measurement for `V7_MEASURED_AURORA_ACU_SECONDS`, which only a
+# raced lane can produce.  A round belongs here only while its competitor lane is
+# not supported (`server/capacity.py:LAKEBASE_ONLY_ROUNDS`); the test holds that,
+# so the lane cannot land without moving its round into `_AWS_ROUND_KEYS`.
+#
+# Empty from v1.1: Round 4 left when its Glue lane landed, and Round 6 when its DMS
+# and Glue lane did.
+_PROVISIONED_LANES_NOT_YET_RACED: dict[RoundId, str] = {}
+#: The same rounds, for the standing-cost copy, which must not say they race.
+PROVISIONED_NOT_YET_RACED_ROUNDS: frozenset[RoundId] = frozenset(_PROVISIONED_LANES_NOT_YET_RACED)
+
+
+def _competitor_lane_raced(telemetry: BoutTelemetry) -> bool:
+    """Whether this bout raced its round's AWS lane.
+
+    Always, except for a Round 4 or Round 6 bout on an installation that has not
+    sealed that round's AWS lane, which raced Lakebase alone.  Every other round's
+    lane state is not consulted: Round 1's RDS lane refuses to enter and still owes
+    its line.
+    """
+
+    return (
+        telemetry.round_id not in _ROUNDS_WITH_OPTIONAL_AWS_LANES
+        or telemetry.competitor_lane_supported
+    )
 
 
 def _competitor_database_rate(telemetry: BoutTelemetry, rates: RateCard) -> Rate:
@@ -1569,7 +1894,7 @@ def _lane_coverage_lines(
     """
 
     round_key = _AWS_ROUND_KEYS.get(telemetry.round_id)
-    if round_key is None:
+    if round_key is None or not _competitor_lane_raced(telemetry):
         return []
     if any(
         line.cloud is Cloud.AWS and line.kind is CostKind.COMPUTE and line.lane_id == "competitor"
@@ -1617,12 +1942,15 @@ def estimate_bout_cost(
     elif telemetry.round_id is RoundId.SURVIVE_CONNECTION_SPIKE:
         lines.extend(_connection_spike_database_lines(telemetry, rates))
         lines.extend(_proxy_lines(telemetry, rates))
-    elif telemetry.round_id in _ROUNDS_WITHOUT_AWS:
-        # Rounds 4 and 6 build no competing AWS stack, which is exactly what the
-        # acceptance contract says they measure.  Emitting a zero here would
-        # claim the AWS alternative is free; emitting nothing states the truth,
-        # that this round priced no AWS side at all.
-        pass
+    elif telemetry.round_id is RoundId.PUT_MODEL_SCORE_IN_APP:
+        # Without its AWS lane Round 4 races Lakebase alone, and then prices no AWS
+        # side at all rather than a zero that would claim the AWS alternative is free.
+        if _competitor_lane_raced(telemetry):
+            lines.extend(_model_score_lines(telemetry, rates))
+    elif telemetry.round_id is RoundId.ANALYZE_LIVE_ORDERS:
+        # Round 6 the same way, where its DMS and Glue lane is not sealed.
+        if _competitor_lane_raced(telemetry):
+            lines.extend(_live_orders_lines(telemetry, rates))
 
     lines.extend(_lane_coverage_lines(lines, telemetry, rates))
 
@@ -1709,8 +2037,26 @@ def estimate_carrying_cost(
             scope=EstimateScope.CARRYING,
             lane_id="competitor",
             quantity=fixed(
-                hours * shape.aurora_clusters * shape.aurora_min_acu,
+                hours
+                * (shape.aurora_clusters - shape.aurora_replicating_clusters)
+                * shape.aurora_min_acu,
                 "min_capacity in infra/aws/aurora.tf; zero means the cluster parks free",
+            ),
+            rate=rates.aurora_acu_hour,
+        ),
+        _line(
+            "Aurora Serverless v2 compute held awake by logical replication",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=fixed(
+                hours
+                * shape.aurora_replicating_clusters
+                * max(shape.aurora_min_acu, shape.aurora_replicating_acu),
+                "rds.logical_replication = 1 in infra/aws/parameter_groups.tf; AWS does "
+                "not auto-pause a writer with logical replication on, so it idles at "
+                f"{_plain(shape.aurora_replicating_acu)} ACU",
             ),
             rate=rates.aurora_acu_hour,
         ),
@@ -1733,7 +2079,7 @@ def estimate_carrying_cost(
             scope=EstimateScope.CARRYING,
             lane_id="competitor",
             quantity=fixed(
-                hours * shape.public_ipv4_addresses,
+                hours * shape.database_public_ipv4_addresses,
                 "one address per publicly reachable database endpoint",
             ),
             rate=rates.public_ipv4_hour,
@@ -1787,6 +2133,25 @@ def estimate_carrying_cost(
             rate=rates.public_ipv4_hour,
         ),
     ]
+
+    # Only where the installation built Round 6's AWS lane: without it there is no
+    # instance, and a $0.00 line would read as one that bills nothing.
+    if shape.dms_replication_instances > 0:
+        lines.append(
+            _line(
+                "AWS DMS replication instance, dms.t3.small",
+                cloud=Cloud.AWS,
+                kind=CostKind.COMPUTE,
+                scope=EstimateScope.CARRYING,
+                lane_id="competitor",
+                quantity=fixed(
+                    hours * shape.dms_replication_instances,
+                    "Round 6's change capture, in infra/aws/round6_aws.tf; it bills whether "
+                    "or not its tasks run",
+                ),
+                rate=rates.dms_t3_small_hour,
+            )
+        )
 
     lines.append(
         _line(
@@ -1842,31 +2207,32 @@ def estimate_carrying_cost(
 # --------------------------------------------------------------------------- #
 
 # Rounds that stand no RDS instance up.  Round 1 has an Aurora cluster and no RDS
-# box, because its RDS lane refuses to enter on engine semantics; Rounds 4 and 6
-# build no competing AWS stack at all.  In all three a customer solving the same
-# problem on AWS still pays for a Postgres, which is the whole point: RDS cannot
-# scale to zero, so the bill does not follow the workload.
-IMPUTED_RDS_ROUNDS: frozenset[RoundId] = frozenset(
-    {
-        RoundId.WAKE_IDLE_APP,
-        RoundId.PUT_MODEL_SCORE_IN_APP,
-        RoundId.ANALYZE_LIVE_ORDERS,
-    }
-)
+# box, because its RDS lane refuses to enter on engine semantics.  A customer
+# solving the same problem on AWS still pays for a Postgres, which is the whole
+# point: RDS cannot scale to zero, so the bill does not follow the workload.
+# Rounds 4 and 6 left this set in v1.1: their Aurora clusters and RDS instances
+# are real and priced in `InstallationShape`, so imputing them as well would count
+# them twice.
+IMPUTED_RDS_ROUNDS: frozenset[RoundId] = frozenset({RoundId.WAKE_IDLE_APP})
 
-# Rounds that stand no Aurora cluster up.  Round 1 is deliberately absent: its
-# cluster is real, and giving it an imputed one on top would double-count the
-# only lane that competes in it.
-IMPUTED_AURORA_ROUNDS: frozenset[RoundId] = frozenset(
-    {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
-)
+# Rounds that stand no Aurora cluster up.  None from v1.1.  Round 1 was never
+# here: its cluster is real, and giving it an imputed one on top would
+# double-count the only lane that competes in it.  Rounds 4 and 6 left for the
+# same reason once their clusters stood.
+IMPUTED_AURORA_ROUNDS: frozenset[RoundId] = frozenset()
 
-# What a customer doing Rounds 4 and 6 on AWS would additionally need, and what
-# is therefore missing from the figure.  Aurora has no native equivalent for
-# either round's work, so a standing cluster is the floor of the alternative
-# rather than the whole of it.  Named instead of guessed: an honest gap beats a
-# confident number, and every one of these is priced per-provisioned-capacity or
-# per-request in ways this installation has no measurement for.
+# What a customer would additionally need for a round this installation stands no
+# Aurora cluster up for, and what is therefore missing from the figure: Aurora has
+# no native equivalent for that work, so a standing cluster is the floor of the
+# alternative rather than the whole of it.  Named instead of guessed: an honest
+# gap beats a confident number, and every one of these is priced
+# per-provisioned-capacity or per-request in ways this installation has no
+# measurement for.  From v1.1 no round needs it.  Round 4's lane is an AWS Glue
+# job that each bout prices from the run's own billed seconds
+# (`_model_score_lines`), and Round 6's is AWS DMS and AWS Glue running against
+# its own databases, this installation's own and priced with that lane.  Kept
+# with `CustomerEquivalent`'s floor, which it makes true for any round that
+# imputes an Aurora cluster again.
 UNPRICED_PIPELINE_SERVICES: tuple[str, ...] = ("DMS", "Glue", "Kinesis", "Firehose", "Lambda")
 
 # The condition the customer-equivalent total may not be quoted without.  Lives
@@ -1874,9 +2240,9 @@ UNPRICED_PIPELINE_SERVICES: tuple[str, ...] = ("DMS", "Glue", "Kinesis", "Fireho
 # makes it true.
 CUSTOMER_EQUIVALENT_FLOOR_REASON = (
     "What a customer would pay for the same workload, including rounds this "
-    "installation provisions nothing for. A floor rather than an estimate: Rounds 4 "
-    "and 6 additionally require pipeline services that are deliberately not priced "
-    "here."
+    "installation provisions nothing for. A floor rather than an estimate: a round "
+    "priced here with an imputed Aurora cluster additionally requires pipeline "
+    "services that are deliberately not priced here."
 )
 
 _IMPUTED_RDS_BASIS = (
@@ -1939,113 +2305,122 @@ def imputed_round_carrying_lines(
 
     rates = rates or RateCard()
     shape = shape or InstallationShape()
+    lines: list[CostLine] = []
+    if round_id in IMPUTED_RDS_ROUNDS:
+        lines.extend(_modeled_rds_lines(window, rates, shape))
+    if round_id in IMPUTED_AURORA_ROUNDS:
+        lines.extend(_modeled_aurora_lines(window, rates, shape))
+    return tuple(lines)
+
+
+def _modeled_rds_lines(
+    window: CarryingWindow, rates: RateCard, shape: InstallationShape
+) -> tuple[CostLine, ...]:
+    """One RDS instance running continuously, as a customer would pay for it."""
+
     hours = window.hours
     months = window.months
-    lines: list[CostLine] = []
+    basis = _IMPUTED_RDS_BASIS.format(instance_class=rates.rds_instance_class)
+    return (
+        _line(
+            f"{rates.rds_compute_label} · modelled continuous instance",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(hours, basis),
+            rate=rates.rds_instance_hour,
+            imputed=True,
+        ),
+        _line(
+            "RDS PostgreSQL gp3 storage · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.STORAGE,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(months * shape.rds_allocated_gb, basis),
+            rate=rates.rds_gp3_gb_month,
+            imputed=True,
+        ),
+        _line(
+            "RDS PostgreSQL public IPv4 · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.NETWORK,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(hours, basis),
+            rate=rates.public_ipv4_hour,
+            imputed=True,
+        ),
+        _line(
+            "RDS PostgreSQL managed credential · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.OTHER,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(months, basis),
+            rate=rates.secret_month,
+            imputed=True,
+        ),
+    )
 
-    if round_id in IMPUTED_RDS_ROUNDS:
-        basis = _IMPUTED_RDS_BASIS.format(instance_class=rates.rds_instance_class)
-        lines.extend(
-            (
-                _line(
-                    f"{rates.rds_compute_label} · modelled continuous instance",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.COMPUTE,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(hours, basis),
-                    rate=rates.rds_instance_hour,
-                    imputed=True,
-                ),
-                _line(
-                    "RDS PostgreSQL gp3 storage · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.STORAGE,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(months * shape.rds_allocated_gb, basis),
-                    rate=rates.rds_gp3_gb_month,
-                    imputed=True,
-                ),
-                _line(
-                    "RDS PostgreSQL public IPv4 · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.NETWORK,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(hours, basis),
-                    rate=rates.public_ipv4_hour,
-                    imputed=True,
-                ),
-                _line(
-                    "RDS PostgreSQL managed credential · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.OTHER,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(months, basis),
-                    rate=rates.secret_month,
-                    imputed=True,
-                ),
-            )
-        )
 
-    if round_id in IMPUTED_AURORA_ROUNDS:
-        compute_units = hours * shape.aurora_min_acu
-        compute_template = (
-            _IMPUTED_AURORA_COMPUTE_BASIS if compute_units == 0 else _IMPUTED_AURORA_FLOOR_BASIS
-        )
-        lines.extend(
-            (
-                _line(
-                    "Aurora Serverless v2 compute at the configured floor · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.COMPUTE,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(
-                        compute_units,
-                        compute_template.format(min_acu=_plain(shape.aurora_min_acu)),
-                    ),
-                    rate=rates.aurora_acu_hour,
-                    imputed=True,
-                ),
-                _line(
-                    "Aurora baseline storage · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.STORAGE,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(
-                        months * shape.aurora_storage_gb, _IMPUTED_AURORA_STANDING_BASIS
-                    ),
-                    rate=rates.aurora_storage_gb_month,
-                    imputed=True,
-                ),
-                _line(
-                    "Aurora writer public IPv4 · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.NETWORK,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(hours, _IMPUTED_AURORA_STANDING_BASIS),
-                    rate=rates.public_ipv4_hour,
-                    imputed=True,
-                ),
-                _line(
-                    "Aurora managed credential · modelled",
-                    cloud=Cloud.AWS,
-                    kind=CostKind.OTHER,
-                    scope=EstimateScope.CARRYING,
-                    lane_id="competitor",
-                    quantity=_imputed(months, _IMPUTED_AURORA_STANDING_BASIS),
-                    rate=rates.secret_month,
-                    imputed=True,
-                ),
-            )
-        )
+def _modeled_aurora_lines(
+    window: CarryingWindow, rates: RateCard, shape: InstallationShape
+) -> tuple[CostLine, ...]:
+    """One Aurora cluster standing by at the sealed minimum, as a customer would pay."""
 
-    return tuple(lines)
+    hours = window.hours
+    months = window.months
+    compute_units = hours * shape.aurora_min_acu
+    compute_template = (
+        _IMPUTED_AURORA_COMPUTE_BASIS if compute_units == 0 else _IMPUTED_AURORA_FLOOR_BASIS
+    )
+    return (
+        _line(
+            "Aurora Serverless v2 compute at the configured floor · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.COMPUTE,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(
+                compute_units,
+                compute_template.format(min_acu=_plain(shape.aurora_min_acu)),
+            ),
+            rate=rates.aurora_acu_hour,
+            imputed=True,
+        ),
+        _line(
+            "Aurora baseline storage · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.STORAGE,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(months * shape.aurora_storage_gb, _IMPUTED_AURORA_STANDING_BASIS),
+            rate=rates.aurora_storage_gb_month,
+            imputed=True,
+        ),
+        _line(
+            "Aurora writer public IPv4 · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.NETWORK,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(hours, _IMPUTED_AURORA_STANDING_BASIS),
+            rate=rates.public_ipv4_hour,
+            imputed=True,
+        ),
+        _line(
+            "Aurora managed credential · modelled",
+            cloud=Cloud.AWS,
+            kind=CostKind.OTHER,
+            scope=EstimateScope.CARRYING,
+            lane_id="competitor",
+            quantity=_imputed(months, _IMPUTED_AURORA_STANDING_BASIS),
+            rate=rates.secret_month,
+            imputed=True,
+        ),
+    )
 
 
 def imputed_total_usd(lines: Iterable[CostLine]) -> Decimal:
@@ -2067,12 +2442,14 @@ class CustomerEquivalent:
     and *what a customer would pay for the same workload*.  The first excludes
     every line in here by construction, because these resources do not exist.
 
-    ``floor`` is not a caveat someone remembered to write down.  For Rounds 4 and
-    6 the figure is a lower bound rather than an estimate, because Aurora has no
-    native equivalent for either round's work and the pipeline services a customer
-    would additionally need are deliberately unpriced.  Carrying it as a field is
-    what stops the total being quoted as an estimate once the prose is out of
-    sight.
+    ``floor`` is not a caveat someone remembered to write down.  For a round that
+    imputes an Aurora cluster the figure is a lower bound rather than an estimate,
+    because Aurora has no native equivalent for that round's work and the pipeline
+    services a customer would additionally need are deliberately unpriced.  Rounds
+    4 and 6 were those rounds until v1.1 stood their clusters up, and since then no
+    round is, so the figure is Round 1's RDS instance alone and an estimate.
+    Carrying it as a field is what stops the total being quoted as an estimate once
+    the prose is out of sight.
     """
 
     # Kept per round rather than flattened, so the total can be taken apart again
@@ -2260,13 +2637,12 @@ def idle_contrast(
     shape = shape or InstallationShape()
     window = CarryingWindow(seconds=_A_DAY_SECONDS)
 
-    rds_lines = imputed_round_carrying_lines(
-        RoundId.WAKE_IDLE_APP, window, rates=rates, shape=shape
-    )
-    aurora_lines = imputed_round_carrying_lines(
-        RoundId.ANALYZE_LIVE_ORDERS, window, rates=rates, shape=shape
-    )
-    aurora_only = tuple(line for line in aurora_lines if "aurora" in line.component.lower())
+    # One modeled engine of each kind, priced directly rather than borrowed from
+    # whichever rounds happen to be imputed: which rounds those are is a fact about
+    # this installation, and the contrast is a fact about the engines.  It borrowed
+    # Round 6's imputed cluster until v1.1 stood a real one up.
+    rds_lines = _modeled_rds_lines(window, rates, shape)
+    aurora_only = _modeled_aurora_lines(window, rates, shape)
 
     def compute_of(lines: Sequence[CostLine]) -> Decimal:
         return _total(
@@ -2436,7 +2812,10 @@ def telemetry_from_snapshot(
     same as a bout that cost nothing, and the caller must not treat it as zero.
 
     Any ``observed_*`` keyword overrides the corresponding telemetry field, which
-    is how a provider-confirmed lifetime is promoted over a lane clock.
+    is how a provider-confirmed lifetime is promoted over a lane clock, and how a
+    stopped Round 4 Glue run's ``ExecutionTime`` arrives.  Whether the competitor
+    lane was supported is read off the receipt itself, because it is the one thing
+    about a Round 4 bout the receipt can say on its own.
     """
 
     if snapshot.run_started_at is None:
@@ -2445,12 +2824,16 @@ def telemetry_from_snapshot(
     if span <= 0:
         return None
     accepted = {name: value for name, value in observations.items() if value is not None}
+    competitor = snapshot.lanes.get("competitor")
     return BoutTelemetry(
         round_id=snapshot.round.id,
         competitor_id=snapshot.competitor.id,
         bout_seconds=Decimal(str(span)),
         lakebase_lane_seconds=_lane_seconds(snapshot, "lakebase"),
         competitor_lane_seconds=_lane_seconds(snapshot, "competitor"),
+        competitor_lane_supported=(
+            getattr(competitor, "state", None) != LaneState.NOT_SUPPORTED
+        ),
         **accepted,  # type: ignore[arg-type]
     )
 

@@ -38,11 +38,15 @@ Round 3 is **Recover this deleted order**:
 
 Round 4 is **Move lakehouse data into live applications**:
 
-- The capability story is reverse ETL / OLAP → OLTP: governed Analytics Delta → managed reverse ETL → operational Postgres → a live application in one Databricks platform path, without a separate reverse-ETL product or operating stack. This does not claim zero configuration or zero security work.
-- This bout uses one exact customer risk-score row as the concrete example and verifies the Lakebase Postgres destination through a fresh application read. The pattern also applies to segments, recommendations, fraud flags, pricing, and inventory.
-- The result names the exact lakehouse change that reached the live app. Delta version, full nonce, timings, and exact-row identity remain its proof receipt.
-- RDS/Aurora alone are OLTP sinks and do not move lakehouse data. The same outcome requires an added stack for source/target connectors, IAM/secrets, network access, mappings/upserts, checkpoints/retries, and monitoring. That stack is not built or timed, so no cross-platform speed margin is claimed.
-- Re-do changes this bout's score from v1 to v2 in the lakehouse, then verifies the same customer record updates in the live app.
+- Both lanes move one lakehouse change into a live application's database, reverse ETL / OLAP → OLTP. Lakebase uses its managed synced table. AWS uses an AWS Glue 5.0 Spark job that reads the same Delta table's change feed straight from S3 and upserts into the selected Aurora or RDS database over JDBC. AWS moves the data: a Databricks pipeline writing into Aurora would be Databricks moving it, and AWS DMS cannot read a lakehouse.
+- **Both integrations start from parked at the bell.** Prepare starts nothing: it confirms both lanes are parked and every destination reads the sealed baseline. The bell starts both integrations and commits one Delta `MERGE` of the contracted customer risk-score row: score, model version and a per-bout nonce. The pattern also applies to segments, recommendations, fraud flags, pricing, and inventory.
+- Each lane's clock runs from the bell to the completion of its first fresh application read that returns that exact row. One verifier reads both destinations every 250 ms, over connections opened and woken before the bell, so no clock contains a database resume. Nothing else waits on a verifier's path.
+- A bout's Glue run starts on a fresh checkpoint and reads the change feed from just after the version Prepare verified every destination holds, which is what a checkpointed stream resuming reads, and what Lakebase's pipeline reads.
+- Resolution comes from evidence. A lane wins only when its first exact read completed before the other lane's last miss began; anything closer is `WITHIN MEASUREMENT RESOLUTION`. A lane that runs out its 420 s bound gives the other a lower bound, never a margin, and a lane that errors measures nothing, so nobody wins over it.
+- The setup asymmetry is shown, never hidden. Lakebase's lane is one synced table. The AWS lane needs a Glue job per competitor and its script, an IAM role that reads the table's files from S3 around Unity Catalog, an isolated subnet with its own route table and S3 endpoint, a Glue security group and a database ingress rule, a Glue connection with a writer role, and a target table with its ledger. The installer builds all of it and proves each job once; nothing is created per bout.
+- Lakebase's own Reverse ETL sync figure, from the synced table's timestamps, is shown as Lakebase's alone and never compared.
+- After the result the row is restored while both lanes still run, and both are parked. Round 4 has no re-do: after a bout both integrations are running, so a re-do could not start cold. Racing again is a new bout.
+- An installation without the AWS lane races Lakebase alone. The competitor lane says the lane is not installed and why, and no margin is claimed.
 
 Round 5 is **Ready a pooled application path**. It scores pooled-path setup and then
 runs a bounded connection check as a pass/fail guard:
@@ -61,10 +65,16 @@ runs a bounded connection check as a pass/fail guard:
 
 Round 6 is **Move live application data into the lakehouse**:
 
-- The capability story is OLTP → lakehouse analytics: operational Lakebase Postgres → built-in change feed (CDF) → separate Delta history → an exact analytical answer.
-- One committed checkout row is the concrete proof, not the name of the broader capability. The clock stops only when that exact row appears once in Delta and produces the expected answer.
-- A separate checkout must also commit successfully as a correctness guardrail. This does not claim measured throughput, p99 impact, or zero production impact.
-- Aurora/RDS require a separately selected, secured, operated, and priced CDC-to-Delta stack. That stack is not built or timed, so no AWS speed margin or dollar savings is claimed.
+- Both lanes move one live checkout from an application's database into the lakehouse, OLTP → lakehouse analytics, each into a Delta history table read on the same SQL warehouse. Lakebase uses its built-in change feed (CDF). AWS uses AWS DMS, which captures the change from the selected Aurora or RDS database's write-ahead log into S3, and an AWS Glue 5.0 job that appends it to a Delta table Unity Catalog reads as an external table. AWS moves the data, as in Round 4, in an open table format.
+- **AWS starts cold at the bell; Lakebase's feed is always on.** Lakebase's change feed is part of the database: it has no start or stop, and it streams continuously. The AWS lane's DMS task and Glue job are parked between bouts and started at the bell, so the AWS lane's clock contains their start. The card says so, and What It Cost states what keeping the Glue job running all day would cost.
+- Prepare starts nothing. It confirms Lakebase's feed is streaming, the DMS task is stopped and the Glue job has no run, and every source and history holds the sealed baseline. It removes any order an interrupted bout left behind, and only orders a bout wrote.
+- The bell commits the same $84.50 checkout, with a per-bout nonce, on both sources at once, and starts the DMS task and the Glue job. Each lane's clock runs from the bell to its first read of that exact order, as one insert, in its own Delta history table. The same query reads both tables every second, on the same warehouse. The two commits' acknowledgment times are recorded, never scored: each lane's clock already contains its own commit.
+- A separate checkout must also commit and read back on each source, as a correctness guardrail. This does not claim measured throughput, p99 impact, or zero production impact.
+- Resolution is Round 4's evidence rule. A lane wins only when its first exact read completed before the other lane's last miss began; anything closer is `WITHIN MEASUREMENT RESOLUTION`. A lane that runs out its 420 s bound gives the other a lower bound, never a margin, and a lane that errors measures nothing, so nobody wins over it.
+- The setup asymmetry is shown, never hidden. Lakebase's lane is its change feed on the source table. The AWS lane needs, per installation, a DMS replication instance, a subnet group of two isolated subnets with their own route table and S3 endpoint, and a bucket. Per competitor it needs a logical-replication parameter group on the database, a capture role, DMS source and target endpoints, a CDC task with its standing replication slot, a Glue job, and a Unity Catalog external table over its Delta table, behind a read-only storage credential and external location. The installer builds all of it and proves each competitor's pipeline once; nothing is created per bout.
+- Each history keeps its own shape: Lakebase's feed writes a change type and LSN, and DMS writes an operation and commit timestamp. The claim is the order's delivery, not identical tables.
+- After the result the bout's orders are deleted from both sources and the AWS pipeline is parked. The deletes are captured at the next bell; a per-bout nonce keeps an old row from ever matching.
+- An installation without the AWS lane races Lakebase alone. The competitor lane says the lane is not installed and why, and no margin is claimed. No dollar savings are claimed either way.
 
 Round 1 re-do is a different contract: each lane's clock starts when that
 lane's final data-plane connection closes and independently freezes at its
@@ -173,6 +183,8 @@ React audience/presenter UI
              -> Rounds 1-4 neutral async PostgreSQL client
                   -> Lakebase Autoscaling
                   -> Aurora Serverless v2 or RDS PostgreSQL
+             -> Round 4 AWS Glue API (start and park the sealed job only)
+                  -> Glue Spark job: the Delta table's files in S3 -> Aurora or RDS over JDBC
              -> Round 5 least-privilege STS role -> SSM
                   -> neutral m6i.large EC2 runner
                        -> Lakebase built-in pooled host
@@ -204,7 +216,7 @@ Production code has no simulation mode. Deterministic fakes exist only inside au
 - Coordination traffic never touches or wakes the measured Round 1 Lakebase endpoint.
 - Every live phase has a bounded lease; active work heartbeats it and abandoned work expires.
 - Aurora ingress is restricted to a sealed allow-list; never `0.0.0.0/0`.
-- Aurora and direct public RDS ingress admit the operator's exact current `/32`, plus — on an installation that seals them — the four Databricks-published serverless egress prefixes for the workspace's region, which is what lets the deployed app race an opponent over TCP 5432 at all. Both sets are sealed into the manifest and applied to the database security groups by Terraform; neither permits broad CIDR ingress, and the egress prefixes are the vendor's published ranges rather than anything this project chooses. An installation that seals no egress prefixes admits the operator `/32` alone, and its deployed app is refused the four AWS-backed rounds at the network. RDS separately accepts scored PostgreSQL traffic from the owned proxy security group and direct observer/cleanup control traffic from the owned runner security group.
+- Aurora and direct public RDS ingress admit the operator's exact current `/32`, plus — on an installation that seals them — the four Databricks-published serverless egress prefixes for the workspace's region, which is what lets the deployed app race an opponent over TCP 5432 at all. Both sets are sealed into the manifest and applied to the database security groups by Terraform; neither permits broad CIDR ingress, and the egress prefixes are the vendor's published ranges rather than anything this project chooses. An installation that seals no egress prefixes admits the operator `/32` alone, and its deployed app is refused every AWS-backed round at the network: Rounds 1, 2, 3 and 5, and Round 4 wherever its Glue lane is sealed. RDS separately accepts scored PostgreSQL traffic from the owned proxy security group and direct observer/cleanup control traffic from the owned runner security group.
 - Every baseline resource is tagged and persisted in the manifest. Per-bout resources are ownership-tagged and tracked only in the server-side cleanup journal; cleanup remains ownership-scoped and dry-run first, and journal details never enter browser payloads.
 - Interrupted provisioning resumes from the same manifest and revalidates both identities before changing resources.
 - Round 5 cannot arm without a complete secret-free clean-baseline manifest v5 sealing the runner baseline, exact app-assumed execution role, SSM document and harness digests, returned Lakebase hosts, install-time IAM/credential prerequisites, and every frozen proof constant. Earlier manifests do not prove the clean baseline. Per-bout security-group/rule, Proxy, target-group, and target identifiers remain internal and never enter browser payloads.

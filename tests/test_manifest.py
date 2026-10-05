@@ -940,6 +940,24 @@ def test_manifest_v7_round_trips_immutable_installation_and_exact_environments(
     assert provisional.round_lakebase(1) == provisional_round1.lakebase
 
 
+def test_a_ready_install_whose_round4_aws_lane_is_unsealed_is_still_pending(tmp_path) -> None:
+    """Setup seals Round 4's AWS lane last, after the installation already says `ready`."""
+
+    lakebase_only = _v7_manifest(tmp_path)
+    assert not lakebase_only.round4_aws_pending
+
+    payload = lakebase_only.model_dump(mode="json")
+    payload["round_environments"][RoundId.PUT_MODEL_SCORE_IN_APP.value].update(
+        aurora=_v7_aurora(4).model_dump(mode="json"),
+        rds=_v7_rds(4).model_dump(mode="json"),
+    )
+    pending = DemoManifest.model_validate(payload)
+    assert pending.round4_aws_pending
+
+    assert not pending.model_copy(update={"round4_aws": object()}).round4_aws_pending
+    assert not pending.model_copy(update={"installation_id": None}).round4_aws_pending
+
+
 @pytest.mark.parametrize(
     ("target", "source", "message"),
     [

@@ -6,85 +6,134 @@
  * line per round: who finished it and how long it took. Anything that would need a
  * second glance belongs on the proof screen, not here.
  *
+ * It sits in the same arena as the finale it is reached from: `.retro-screen`
+ * draws the frame and centres the column, and this lays the board out inside it
+ * with the finale's header, tiles and buttons. It once stood alone on a flat black
+ * page and read as a different app.
+ *
  * Every foreground is checked against the surface it actually sits on, and the
  * lowest pairing used is 7.79:1 -- comfortably past AA. The two brand accents that
  * fall under 4.5:1 on a lighter panel (--red, --blue) appear only as borders here,
  * never as text.
  */
 
-.summary-screen {
-  box-sizing: border-box;
-  min-height: 100vh;
-  width: 100%;
-  /* No horizontal scrollbar can be introduced by a child, at any width. */
+/* Doubled on purpose: styles.css loads after this file, and its `.retro-screen`
+   would otherwise centre the text, clip the scroll and flatten the background. */
+.retro-screen.summary-screen {
+  justify-content: safe center;
+  gap: clamp(10px, 1.6vh, 20px);
+  padding: clamp(30px, 4.4vh, 52px) 4vw clamp(26px, 3.6vh, 44px);
+  /* No horizontal scrollbar can be introduced by a child, at any width; a short
+     screen scrolls the board inside the frame instead of cutting it off. */
   overflow-x: hidden;
-  padding: 20px 16px 28px;
-  background: #02040e;
-  color: var(--cream);
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+  overflow-y: auto;
+  text-align: left;
+  background: radial-gradient(circle at 50% 8%, #17214c 0, var(--navy) 44%, #040713 100%);
 }
 
 .summary-screen * {
   box-sizing: border-box;
 }
 
+.summary-header,
+.summary-status,
+.summary-rounds,
+.summary-footer {
+  position: relative;
+  z-index: 6;
+  flex: none;
+  width: min(1180px, 92vw);
+}
+
 .summary-header {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: clamp(8px, 1.2vh, 14px);
+  text-transform: uppercase;
 }
 
 .summary-header p {
   margin: 0;
   font-family: "Press Start 2P", monospace;
-  font-size: 8px;
-  letter-spacing: 0.08em;
+  font-size: clamp(8px, .62vw, 11px);
+  letter-spacing: 0.1em;
   color: #f8d83b;
 }
 
 .summary-header h1 {
   margin: 0;
   font-family: "Press Start 2P", monospace;
-  font-size: 18px;
-  line-height: 1.5;
+  font-size: clamp(22px, 2.7vw, 48px);
+  line-height: 1.1;
   color: var(--cream);
+  text-shadow: .09em .09em #ee452d, .18em .18em #000;
   overflow-wrap: anywhere;
 }
 
 .summary-header span {
   font-family: ui-monospace, monospace;
   font-weight: 900;
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: clamp(11px, .82vw, 15px);
+  line-height: 1.5;
   color: #9aa3c4;
+  text-transform: none;
   overflow-wrap: anywhere;
 }
 
 .summary-rounds {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+  display: grid;
+  gap: clamp(6px, .9vh, 12px);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
+/* A tile like the finale's: square, bordered, dropped on a hard black shadow, with
+   the round's own accent down its left edge. */
 .summary-round {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 24px;
+  padding: clamp(9px, 1.25vh, 16px) clamp(14px, 1.2vw, 22px);
   border: 3px solid #46527c;
+  border-left-width: 10px;
   background: var(--navy);
-  padding: 12px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+  box-shadow: .3em .3em #000;
 }
 
-/* The one lit row: a round with a stopwatch result. */
-.summary-round[data-status="lakebase_faster"] {
+.summary-round[data-round="wake_idle_app"],
+.summary-round[data-round="put_model_score_in_app"] {
+  border-left-color: #ee452d;
+}
+
+.summary-round[data-round="make_schema_change_safely"],
+.summary-round[data-round="survive_connection_spike"] {
+  border-left-color: #74a5ff;
+}
+
+.summary-round[data-round="recover_deleted_order"],
+.summary-round[data-round="analyze_live_orders_without_slowing_checkout"] {
+  border-left-color: #f8d83b;
+}
+
+.summary-round[data-status="unrun"] {
+  background: #080d24;
+  box-shadow: none;
+}
+
+/* The lit rows, in the colour of the corner that took the round. */
+.summary-round[data-status="lakebase_faster"],
+.summary-round[data-status="lakebase_finished"],
+.summary-round[data-status="uncontested"] {
   border-color: #ee452d;
 }
 
+.summary-round[data-status="competitor_faster"] {
+  border-color: #74a5ff;
+}
+
+.summary-round[data-status="tie"],
 .summary-round[data-status="running"] {
   border-color: #f8d83b;
 }
@@ -92,21 +141,21 @@
 .summary-round-head {
   display: flex;
   align-items: baseline;
-  gap: 10px;
-  flex-wrap: wrap;
+  gap: 14px;
+  min-width: 0;
 }
 
 .summary-round-head b {
-  font-family: "Press Start 2P", monospace;
-  font-size: 12px;
-  color: #f8d83b;
   flex: none;
+  font-family: "Press Start 2P", monospace;
+  font-size: clamp(11px, .9vw, 16px);
+  color: #f8d83b;
 }
 
 .summary-round-head strong {
   font-family: "Press Start 2P", monospace;
-  font-size: 9px;
-  line-height: 1.7;
+  font-size: clamp(9px, .72vw, 13px);
+  line-height: 1.6;
   letter-spacing: 0.04em;
   color: var(--cream);
   /* Receipts carry sentence-case titles and the unrun fallback is uppercase.
@@ -119,16 +168,18 @@
 .summary-result {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  justify-content: flex-end;
+  gap: 10px;
   flex-wrap: wrap;
   font-family: ui-monospace, monospace;
   font-weight: 900;
   min-width: 0;
+  text-align: right;
 }
 
 .summary-winner {
   font-family: "Press Start 2P", monospace;
-  font-size: 10px;
+  font-size: clamp(9px, .72vw, 13px);
   letter-spacing: 0.04em;
   color: #f8d83b;
   overflow-wrap: anywhere;
@@ -140,75 +191,62 @@
 }
 
 .summary-time {
-  font-size: 15px;
+  font-family: "Press Start 2P", monospace;
+  font-size: clamp(11px, .95vw, 17px);
   color: var(--cream);
   overflow-wrap: anywhere;
 }
 
 .summary-against {
-  font-size: 13px;
+  font-size: clamp(11px, .8vw, 14px);
   color: #9aa3c4;
   overflow-wrap: anywhere;
 }
 
 .summary-note {
+  grid-column: 1 / -1;
   margin: 0;
   font-family: ui-monospace, monospace;
   font-weight: 900;
-  font-size: 12px;
-  line-height: 1.6;
+  font-size: clamp(10px, .72vw, 13px);
+  line-height: 1.5;
   color: #9aa3c4;
   overflow-wrap: anywhere;
 }
 
 .summary-footer {
-  border-top: 3px solid #46527c;
-  padding-top: 14px;
   display: flex;
-  flex-direction: column;
-  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 2vw;
+  flex-wrap: wrap;
+  padding-top: clamp(10px, 1.4vh, 16px);
+  border-top: 3px solid #46527c;
 }
 
 .summary-footer p {
+  flex: 1 1 18em;
   margin: 0;
   font-family: ui-monospace, monospace;
   font-weight: 900;
-  font-size: 12px;
+  font-size: clamp(10px, .74vw, 13px);
   line-height: 1.6;
   color: #9aa3c4;
   overflow-wrap: anywhere;
 }
 
-.summary-actions {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
+/* The buttons are the finale's own (`.game-back`, `.finale-summary` inside
+   `.finale-actions`), so the two screens cannot drift apart. */
 .summary-actions button {
-  font-family: "Press Start 2P", monospace;
-  font-size: 9px;
-  line-height: 1.7;
-  letter-spacing: 0.04em;
-  color: var(--cream);
-  background: var(--navy);
-  border: 3px solid #46527c;
-  padding: 10px 12px;
-  cursor: pointer;
-  overflow-wrap: anywhere;
   min-width: 0;
+  overflow-wrap: anywhere;
   transition: background 120ms steps(2);
-}
-
-.summary-actions button:hover,
-.summary-actions button:focus-visible {
-  background: #151e48;
 }
 
 .summary-status {
   font-family: ui-monospace, monospace;
   font-weight: 900;
-  font-size: 12px;
+  font-size: clamp(11px, .8vw, 14px);
   line-height: 1.6;
   color: #f8d83b;
   margin: 0;
@@ -221,16 +259,13 @@
   }
 }
 
-@media (min-width: 720px) {
-  .summary-screen {
-    padding: 32px 40px 40px;
+@media (max-width: 720px) {
+  .summary-round {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .summary-header h1 {
-    font-size: 26px;
-  }
-
-  .summary-round-head strong {
-    font-size: 11px;
+  .summary-result {
+    justify-content: flex-start;
+    text-align: left;
   }
 }

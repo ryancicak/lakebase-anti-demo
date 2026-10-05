@@ -50,24 +50,14 @@ export function ringAct(roundId: RoundId): RingAct {
  */
 export type BlueCornerLane = 'race' | 'untimed' | 'none'
 
-/**
- * Rounds where the opponent is a destination, not a pipeline: the same outcome
- * needs a stack nobody built, so there is no native lane to time. Round 4 says
- * this in the catalog as `comparison_kind: 'capability_gap'`; Round 6 says it
- * in `scorecard_by_corner` ("required AWS CDC stack remains unpriced") and in
- * its non-claims, but carries no machine-readable marker, so it is named here.
- */
-const CAPABILITY_GAP_ROUNDS = new Set<string>([
-  'put_model_score_in_app',
-  'analyze_live_orders_without_slowing_checkout',
-])
-
 export function blueCornerLane(round: RoundDefinition, competitorId: CompetitorId): BlueCornerLane {
   // The catalog decides who is even in this round. A pairing the round does not
   // list has an empty corner, whatever the opponent is called.
   if (!round.competitors.includes(competitorId)) return 'none'
+  // A round whose opponent needs a stack nobody built says so in the catalog. Rounds
+  // 4 and 6 race an AWS integration (Glue, and DMS with Glue), so both of their
+  // corners are timed.
   if (round.comparison_kind === 'capability_gap') return 'none'
-  if (CAPABILITY_GAP_ROUNDS.has(round.id)) return 'none'
   // RDS cannot pause, so it is described through the control plane before the
   // bell and then left alone. It is present and it carries no clock; this is
   // the same fact `stopCondition()` states in prose for the same pairing.
@@ -140,19 +130,22 @@ const ROUND_COPY: Record<string, RoundCopy> = {
     brief: 'One row, one deletion barrier. The clock runs eligibility, restore, handshake and both reads. Ready stops nothing.',
     bell: 'A real point-in-time restore. Sit down and let the silence happen.',
   },
-  // The empty trolley reads as zero setup unless somebody says otherwise.
+  // Both corners cold start, and each start is on its own clock. That is
+  // the condition the result travels with, so it is said before the bell.
   put_model_score_in_app: {
-    brief: 'Governed lakehouse data, moved by the platform itself, read back out of the live app as one exact row.',
-    bell: 'No opponent time and no margin — that is the finding, not a hole in it. An idle courier means no stack in the middle, not zero configuration and not zero security work.',
+    brief: 'One Delta change, carried into a live app by each corner’s own integration. Each clock stops at its own first exact read of the row.',
+    bell: 'Both integrations cold start at the bell, so each clock contains its own start. One bout, not a benchmark — and no model serving is tested.',
   },
   survive_connection_spike: {
     brief: 'Setup is the score. We bring nothing to pool with; the burst afterwards only checks it.',
     bell: 'Real changes to a real AWS account, made and removed, on one thirty-minute deadline. The burst is never added to the setup time.',
   },
+  // Only AWS cold starts: Lakebase's feed is part of the database and never stops.
+  // That is the condition the result travels with, so it is said before the bell.
   // An unbroken beat reads as measured zero impact. It is drawn, not measured.
   analyze_live_orders_without_slowing_checkout: {
-    brief: 'One committed checkout, out through the built-in change feed, stopping when that exact row answers correctly.',
-    bell: 'A second checkout rides along as guardrail. The steady queue is staged, not measured — no throughput, p99 or zero-impact claim. Needs a live-validated seal before it will arm.',
+    brief: 'One checkout, committed on both sources and carried into Delta by each corner’s own path. Each clock stops at its own first exact read of the order.',
+    bell: 'AWS DMS and Glue cold start at the bell; Lakebase’s change feed is built in and always on. A second checkout rides along as guardrail, and the queue is staged — no throughput or p99 claim.',
   },
 }
 
@@ -283,6 +276,27 @@ function crowdSeats(width: number) {
     })
   }
   return seats
+}
+
+/**
+ * Whether Round 5 is only resetting after a bout, which is the round working.
+ *
+ * Every Round 5 bout ends with cleanup and then its 10,000 clients warming again,
+ * and the server calls that stage TEMPORARILY_UNAVAILABLE. The tile printed that
+ * in red after every bout, so a normal reset read as an outage. It reads RESETTING,
+ * in the cleanup colour, until something has gone wrong: an error or a pending
+ * retry, a call for an operator, a recovery worker not confirmed, or a second attempt.
+ */
+function roundFiveResetting(status: FightCardRoundStatus | null): boolean {
+  const start = status?.round5_start
+  if (!start || !['cleaning', 'rewarming', 'identity-refresh', 'claim-drain'].includes(start.stage)) {
+    return false
+  }
+  if (start.recovery_scheduled === false) return false
+  const detail = status?.detail ?? ''
+  if (/operator attention required|· error |· retry /i.test(detail)) return false
+  const attempt = /· attempt (\d+)/.exec(detail)
+  return attempt === null || Number(attempt[1]) <= 1
 }
 
 export function FightRing(props: {
@@ -1104,8 +1118,9 @@ export function FightRing(props: {
               ? 'cleanup_in_progress'
               : item.availability === 'ready' ? 'ready' : 'unavailable')
           const busy = state === 'bout_in_progress'
-          const cleaning = state === 'cleanup_in_progress'
-          const stateNote = state.replaceAll('_', ' ').toUpperCase()
+          const resetting = state === 'temporarily_unavailable' && roundFiveResetting(live)
+          const cleaning = state === 'cleanup_in_progress' || resetting
+          const stateNote = resetting ? 'RESETTING' : state.replaceAll('_', ' ').toUpperCase()
           const words = busy ? stateNote : laneKeyText(item, props.competitor)
           const badge = state === 'ready' || busy ? null : stateNote
           const selectable = live?.can_start

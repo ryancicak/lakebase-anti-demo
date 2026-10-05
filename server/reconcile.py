@@ -181,9 +181,10 @@ class Finding:
 def expected_resources(manifest: DemoManifest) -> tuple[ExpectedResource, ...]:
     """The resident AWS resources the manifest seals.
 
-    Rounds 4 and 6 seal no Aurora or RDS block, so they contribute nothing. That
-    is the manifest recording that those rounds have no AWS stack, not an
-    omission on its part.
+    A round contributes exactly the databases its seal names. Round 1 seals no
+    RDS instance, and a manifest sealed before v1.1 seals no Aurora or RDS block
+    for Rounds 4 and 6. Either is the manifest recording that the database does
+    not stand, not an omission on its part.
     """
 
     expected: list[ExpectedResource] = []

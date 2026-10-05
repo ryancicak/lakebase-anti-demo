@@ -375,6 +375,65 @@ class Round4Resources(BaseModel):
     contract_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+#: Round 4's AWS lane reads its Delta source here. The same shape
+#: `infra/aws/variables.tf:round4_source_location` validates.
+ROUND4_SOURCE_LOCATION_PATTERN = r"^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[^*?]+$"
+
+#: An AWS lane's /24, as `infra/aws/variables.tf` takes it.
+LANE_CIDR_PATTERN = r"^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}0/24$"
+
+
+class Round4AwsLaneSeal(BaseModel):
+    """One competitor's half of Round 4's AWS Glue lane: its job and its connection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    job_name: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,255}$")
+    connection_name: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,255}$")
+
+
+class Round4AwsResources(BaseModel):
+    """Round 4's AWS Glue lane, sealed only once each job has carried the table into its target.
+
+    Kept out of `Round4Resources` on purpose: that seal is the Lakebase lane's, and every
+    installation sealed before v1.1 has one without this.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_location: str = Field(pattern=ROUND4_SOURCE_LOCATION_PATTERN)
+    bucket: str = Field(pattern=r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+    script_key: str = Field(min_length=1)
+    script_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    role_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
+    subnet_id: str = Field(pattern=r"^subnet-[0-9a-f]{8,17}$")
+    subnet_cidr: str = Field(min_length=9)
+    route_table_id: str = Field(pattern=r"^rtb-[0-9a-f]{8,17}$")
+    s3_endpoint_id: str = Field(pattern=r"^vpce-[0-9a-f]{8,17}$")
+    security_group_id: str = Field(pattern=r"^sg-[0-9a-f]{8,17}$")
+    writer_role: Literal["round4_writer"] = "round4_writer"
+    target_schema: Literal["round4"] = "round4"
+    target_table: Literal["model_score_ledger"] = "model_score_ledger"
+    #: What the application reads, on both lanes: the same four columns, and on this
+    #: lane only the rows whose ledger entry is not a tombstone.
+    target_view: Literal["model_scores"] = "model_scores"
+    aurora: Round4AwsLaneSeal
+    rds: Round4AwsLaneSeal
+
+    def lane(self, competitor: str) -> Round4AwsLaneSeal:
+        """The half for ``aurora`` or ``rds``, or for either competitor's catalog ID."""
+
+        key = {
+            "aurora": "aurora",
+            "aurora_serverless_v2": "aurora",
+            "rds": "rds",
+            "rds_postgres": "rds",
+        }.get(str(getattr(competitor, "value", competitor)))
+        if key is None:
+            raise ValueError(f"Round 4's AWS lane has no competitor {competitor!r}")
+        return self.aurora if key == "aurora" else self.rds
+
+
 class Round6Resources(BaseModel):
     """Sealed identifiers for the native Lakebase CDF live-order proof."""
 
@@ -498,6 +557,103 @@ class Round6Resources(BaseModel):
         if self.contract_sha256 != expected_hash:
             raise ValueError("Round 6 contract hash does not match the sealed resources")
         return self
+
+
+#: The external ID of Round 6's Unity Catalog storage credential: a UUID. The same shape
+#: `infra/aws/variables.tf:round6_uc_external_id` validates.
+ROUND6_UC_EXTERNAL_ID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+_DMS_ARN = r"^arn:[^:]+:dms:[a-z0-9-]+:\d{12}:"
+_UC_NAME = r"^[A-Za-z0-9_-]{1,255}$"
+
+
+class Round6AwsLaneSeal(BaseModel):
+    """One competitor's half of Round 6's AWS lane: its DMS endpoints and task, and its Glue job.
+
+    ``history_table_full_name`` is the Unity Catalog external table over the job's Delta table,
+    which the verifier reads on the same SQL warehouse as Lakebase's history table.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_endpoint_arn: str = Field(pattern=_DMS_ARN + r"endpoint:[A-Z0-9]+$")
+    target_endpoint_arn: str = Field(pattern=_DMS_ARN + r"endpoint:[A-Z0-9]+$")
+    task_arn: str = Field(pattern=_DMS_ARN + r"task:[A-Z0-9]+$")
+    job_name: str = Field(pattern=r"^[A-Za-z0-9_.-]{1,255}$")
+    history_location: str = Field(pattern=r"^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[^*?]+$")
+    history_table_full_name: str = Field(min_length=5)
+
+
+class Round6AwsResources(BaseModel):
+    """Round 6's AWS DMS and Glue lane, sealed only once each job has carried a change through.
+
+    Kept out of `Round6Resources` on purpose: that seal is the Lakebase lane's, and every
+    installation sealed before v1.1 has one without this.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bucket: str = Field(pattern=r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+    script_key: str = Field(min_length=1)
+    script_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    glue_role_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
+    dms_s3_role_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
+    uc_role_arn: str = Field(pattern=r"^arn:[^:]+:iam::\d{12}:role/[A-Za-z0-9+=,.@_/-]+$")
+    subnet_ids: tuple[str, str]
+    subnet_cidr: str = Field(min_length=9)
+    route_table_id: str = Field(pattern=r"^rtb-[0-9a-f]{8,17}$")
+    s3_endpoint_id: str = Field(pattern=r"^vpce-[0-9a-f]{8,17}$")
+    security_group_id: str = Field(pattern=r"^sg-[0-9a-f]{8,17}$")
+    replication_instance_arn: str = Field(pattern=_DMS_ARN + r"rep:[A-Z0-9]+$")
+    capture_role: Literal["round6_capture"] = "round6_capture"
+    source_schema: Literal["round6"] = "round6"
+    source_table: Literal["live_orders"] = "live_orders"
+    uc_storage_credential: str = Field(pattern=_UC_NAME)
+    uc_external_location: str = Field(pattern=_UC_NAME)
+    uc_external_id: str = Field(pattern=ROUND6_UC_EXTERNAL_ID_PATTERN)
+    aurora: Round6AwsLaneSeal
+    rds: Round6AwsLaneSeal
+
+    @field_validator("subnet_ids")
+    @classmethod
+    def require_two_subnets(cls, value: tuple[str, str]) -> tuple[str, str]:
+        if len(set(value)) != 2 or not all(
+            re.fullmatch(r"subnet-[0-9a-f]{8,17}", subnet) for subnet in value
+        ):
+            raise ValueError("Round 6's DMS lane needs two distinct subnets")
+        return value
+
+    @model_validator(mode="after")
+    def require_separate_lanes(self) -> Round6AwsResources:
+        a, b = self.aurora, self.rds
+        shared = {
+            "source endpoint": a.source_endpoint_arn == b.source_endpoint_arn,
+            "target endpoint": a.target_endpoint_arn == b.target_endpoint_arn,
+            "task": a.task_arn == b.task_arn,
+            "job": a.job_name == b.job_name,
+            "history table": a.history_table_full_name == b.history_table_full_name,
+            "history location": a.history_location == b.history_location,
+        }
+        for piece, same in shared.items():
+            if same:
+                raise ValueError(f"Round 6's two AWS lanes must not share a {piece}")
+        for lane in (a, b):
+            if not lane.history_location.startswith(f"s3://{self.bucket}/delta/"):
+                raise ValueError("Round 6's history tables must live in the lane's own bucket")
+        return self
+
+    def lane(self, competitor: str) -> Round6AwsLaneSeal:
+        """The half for ``aurora`` or ``rds``, or for either competitor's catalog ID."""
+
+        key = {
+            "aurora": "aurora",
+            "aurora_serverless_v2": "aurora",
+            "rds": "rds",
+            "rds_postgres": "rds",
+        }.get(str(getattr(competitor, "value", competitor)))
+        if key is None:
+            raise ValueError(f"Round 6's AWS lane has no competitor {competitor!r}")
+        return self.aurora if key == "aurora" else self.rds
 
 
 class Round5FrozenConstants(BaseModel):
@@ -1039,8 +1195,36 @@ class DemoManifest(BaseModel):
     last_reset_at: datetime | None = None
     round3_anchor: Round3Anchor | None = None
     round4: Round4Resources | None = None
+    #: Where Round 4's AWS lane reads, recorded before the lane's own Terraform
+    #: apply and kept for the installation's life, so that every later plan keeps
+    #: the lane. The lane is not raced until `round4_aws` is sealed as well.
+    round4_aws_source_location: str | None = Field(
+        default=None,
+        pattern=ROUND4_SOURCE_LOCATION_PATTERN,
+    )
+    round4_aws: Round4AwsResources | None = None
+    #: The /24 each AWS lane's own subnets take, chosen by the installer from the VPC's free
+    #: space before that lane's first apply (`server/lane_subnets.py`) and kept for the
+    #: installation's life. None where Terraform built the lane from its installation-ID digest,
+    #: which it keeps doing for that lane.
+    round4_glue_subnet_cidr: str | None = Field(default=None, pattern=LANE_CIDR_PATTERN)
+    round6_dms_subnet_cidr: str | None = Field(default=None, pattern=LANE_CIDR_PATTERN)
     round5: Round5Resources | LegacyRound5Resources | None = None
     round6: Round6Resources | None = None
+    #: The external ID of Round 6's Unity Catalog storage credential, recorded once the
+    #: installer has created the credential and before the lane's own Terraform apply, and kept
+    #: for the installation's life, so that every later plan keeps the lane. The lane is not
+    #: raced until `round6_aws` is sealed as well.
+    round6_aws_uc_external_id: str | None = Field(
+        default=None,
+        pattern=ROUND6_UC_EXTERNAL_ID_PATTERN,
+    )
+    round6_aws: Round6AwsResources | None = None
+    #: Why this installation races Round 6 against Lakebase alone, when its identity may not
+    #: create the lane's Unity Catalog storage credential or external location. Sealed by the
+    #: installer with the exact refusal (docs/design/v1.1-rounds-4-6-aws.md, section 5), and
+    #: cleared by a later setup that succeeds.
+    round6_aws_unsupported: str | None = Field(default=None, min_length=1, max_length=2000)
     round_environments: dict[RoundId, RoundEnvironmentSeal] | None = None
     coordination_environment: LakebaseEnvironmentSeal | None = None
 
@@ -1075,8 +1259,107 @@ class DemoManifest(BaseModel):
             )
         if self.manifest_version < 6 and self.round6 is not None:
             raise ValueError("sealed Round 6 resources require manifest_version 6")
+        self._validate_round4_aws()
+        self._validate_round6_aws()
         self._validate_environment_seals()
         return self
+
+    def _validate_round6_aws(self) -> None:
+        if self.round6_aws_uc_external_id is not None and self.installation_id is None:
+            raise ValueError("Round 6's AWS lane needs a per-round installation")
+        sealed = self.round6_aws
+        if sealed is not None and self.round6_aws_unsupported is not None:
+            raise ValueError("Round 6's AWS lane cannot be both sealed and unsupported")
+        if sealed is None:
+            return
+        if self.round6 is None:
+            raise ValueError("Round 6's AWS lane requires the sealed Round 6 source")
+        if sealed.uc_external_id != self.round6_aws_uc_external_id:
+            raise ValueError("Round 6's AWS lane seal trusts a different credential than recorded")
+        if self.round_environments is not None:
+            environment = self.round_environments.get(RoundId.ANALYZE_LIVE_ORDERS)
+            if environment is None or environment.aurora is None or environment.rds is None:
+                raise ValueError("Round 6's AWS lane requires sealed r6 Aurora and RDS")
+        for lane in (sealed.aurora, sealed.rds):
+            catalog_and_schema = lane.history_table_full_name.rsplit(".", 1)[0]
+            if catalog_and_schema != (
+                f"{self.round6.destination_catalog}.{self.round6.destination_schema}"
+            ):
+                raise ValueError(
+                    "Round 6's AWS history tables must sit beside Lakebase's, in its schema"
+                )
+
+    @property
+    def round6_aws_ready(self) -> bool:
+        """Whether Round 6's AWS lane is sealed and so can race."""
+
+        return self.round6_aws is not None
+
+    @property
+    def round6_aws_pending(self) -> bool:
+        """Whether Round 6 races AWS here but its lane is not sealed yet.
+
+        Setup seals the lane last, after the installation already says `ready`, so a lane stage
+        that stopped leaves a ready manifest that is still an interrupted provision, as Round 4's
+        does. The one finished state without a lane is an installation whose identity may not
+        create the lane's Unity Catalog objects: it races Lakebase alone and says why
+        (`round6_aws_unsupported`). bootstrap.sh's `apply_targets_complete_ready_install` reads
+        the same condition from the manifest file.
+        """
+
+        if (
+            self.round6_aws is not None
+            or self.round6_aws_unsupported is not None
+            or self.installation_id is None
+            or self.round6 is None
+        ):
+            return False
+        environment = (self.round_environments or {}).get(RoundId.ANALYZE_LIVE_ORDERS)
+        if environment is None:
+            return False
+        return environment.aurora is not None and environment.rds is not None
+
+    def _validate_round4_aws(self) -> None:
+        if self.round4_aws_source_location is not None and self.installation_id is None:
+            raise ValueError("Round 4's AWS lane needs a per-round installation")
+        sealed = self.round4_aws
+        if sealed is None:
+            return
+        if self.round4 is None:
+            raise ValueError("Round 4's AWS lane requires the sealed Round 4 source")
+        if sealed.source_location != self.round4_aws_source_location:
+            raise ValueError("Round 4's AWS lane seal reads a different source than was recorded")
+        if self.round_environments is not None:
+            environment = self.round_environments.get(RoundId.PUT_MODEL_SCORE_IN_APP)
+            if environment is None or environment.aurora is None or environment.rds is None:
+                raise ValueError("Round 4's AWS lane requires sealed r4 Aurora and RDS")
+        if sealed.aurora.job_name == sealed.rds.job_name or (
+            sealed.aurora.connection_name == sealed.rds.connection_name
+        ):
+            raise ValueError("Round 4's two AWS lanes must not share a job or a connection")
+
+    @property
+    def round4_aws_ready(self) -> bool:
+        """Whether Round 4's AWS lane is sealed and so can race."""
+
+        return self.round4_aws is not None
+
+    @property
+    def round4_aws_pending(self) -> bool:
+        """Whether Round 4 races AWS here but its lane is not sealed yet.
+
+        Setup seals the lane last, after the installation already says `ready`, so
+        a lane stage that stopped leaves a ready manifest that is still an
+        interrupted provision. bootstrap.sh's `apply_targets_complete_ready_install`
+        reads the same condition from the manifest file.
+        """
+
+        if self.round4_aws is not None or self.installation_id is None or self.round4 is None:
+            return False
+        environment = (self.round_environments or {}).get(RoundId.PUT_MODEL_SCORE_IN_APP)
+        if environment is None:
+            return False
+        return environment.aurora is not None and environment.rds is not None
 
     def _validate_environment_seals(self) -> None:
         environments = self.round_environments

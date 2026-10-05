@@ -51,6 +51,23 @@ def test_control_role_cannot_tag_databases_or_reopen_static_runner_egress() -> N
     assert static_egress_grant.search(control) is None
 
 
+def test_a_newer_amazon_linux_image_never_replaces_a_sealed_runner() -> None:
+    """2026-09-29: a new AL2023 image made an apply on the v1.1 test installation replace both
+    runners, whose instance IDs, keys and trust bundle Round 5's seal holds. Setup then refused
+    the mismatch and `runner refresh` could not reach the sealed instances."""
+
+    runner_hcl = _terraform("round5_runner.tf")
+    assert "/aws/service/ami-amazon-linux-latest/" in runner_hcl
+    for resource in ("round5_runner", "round5_competitor_runner"):
+        instance = _block(runner_hcl, f'resource "aws_instance" "{resource}"', "\n}\n")
+        assert "ami                         = data.aws_ssm_parameter.round5_runner_ami.value" in (
+            instance
+        )
+        ignored = re.search(r"ignore_changes\s*=\s*\[([^\]]*)\]", instance)
+        assert ignored is not None, resource
+        assert "ami" in [item.strip() for item in ignored.group(1).split(",")], resource
+
+
 def test_terraform_isolates_runner_roles_secrets_and_network_identities() -> None:
     runner_hcl = _terraform("round5_runner.tf")
     network = _terraform("network.tf")

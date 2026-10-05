@@ -9,18 +9,6 @@ import type {
 } from './api/types'
 
 export const ROUND_FOUR_ID = 'put_model_score_in_app' as const
-export const ROUND_FOUR_LEGEND = '★ proves a different product behavior'
-export const ROUND_FOUR_SCOPE = 'AWS NOT TIMED · MARGIN N/A'
-export const ROUND_FOUR_FOOTER = 'LAKEBASE CAPABILITY WIN · AWS NOT TIMED · MARGIN N/A'
-
-export type RoundFourPresentation =
-  | 'initial_running'
-  | 'initial_verified'
-  | 'initial_towelled'
-  | 'initial_failed'
-  | 'redo_running'
-  | 'redo_verified'
-  | 'redo_failed'
 
 export function isRoundFour(
   session: DemoSession | null | undefined,
@@ -28,30 +16,33 @@ export function isRoundFour(
   return session?.round.id === ROUND_FOUR_ID
 }
 
-export function roundFourPresentation(session: DemoSession): RoundFourPresentation {
-  if (session.redo?.state === 'running') return 'redo_running'
-  if (session.redo?.state === 'verified') return 'redo_verified'
-  if (session.redo?.state === 'failed') return 'redo_failed'
-  if (session.state === 'verified') return 'initial_verified'
-  if (session.state === 'towelled') return 'initial_towelled'
-  if (session.state === 'failed') return 'initial_failed'
-  return 'initial_running'
+/**
+ * The integration each Round 4 lane races, printed under that lane's database.
+ *
+ * The lane's own name stays the database the application reads (Lakebase, or the
+ * matchup's Aurora or RDS), because that is where the clock stops. What moved the
+ * row there is the stack, and it is the only thing the two lanes do differently.
+ */
+export function roundFourStackLabel(
+  session: Pick<DemoSession, 'competitor'>,
+  laneId: 'lakebase' | 'competitor',
+): string {
+  return laneId === 'lakebase'
+    ? 'Lakebase synced table'
+    : `AWS Glue → ${session.competitor.short_name}`
 }
 
-export function canStartRoundFourRedo(session: DemoSession): boolean {
-  return isRoundFour(session)
-    && session.state === 'verified'
-    && session.redo?.state === 'ready'
-    && session.round.redo?.policy === 'show'
-}
-
-export function roundFourFooter(session: DemoSession): string {
-  const comparison = session.comparison
-  return comparison?.kind === 'capability_gap'
-    && comparison.winner_lane_id === 'lakebase'
-    && comparison.margin == null
-    ? ROUND_FOUR_FOOTER
-    : ROUND_FOUR_SCOPE
+/**
+ * A Round 4 lane's integration as the ring, the receipt and the replay label it.
+ *
+ * Both integrations cold start at the bell, and the result is only fair with that
+ * said, so each lane carries it beside its own name rather than in a caption.
+ */
+export function roundFourLaneLabel(
+  session: Pick<DemoSession, 'competitor'>,
+  laneId: 'lakebase' | 'competitor',
+): string {
+  return `${roundFourStackLabel(session, laneId)} (cold start)`
 }
 
 export function metricValue(
@@ -71,13 +62,19 @@ export function metricDisplay(
   return String(metric.value)
 }
 
+/**
+ * The row a Round 4 bout committed, as its lane evidence records it.
+ *
+ * A lane is only `verified` when its verifier read exactly this row back from its
+ * own application, so the lane state is the proof; these are the facts it proved.
+ * Anything absent stays an em dash instead of becoming an invented value.
+ */
 export interface ModelScoreEvidence {
   primaryKey: string
   score: string
   modelVersion: string
   proofNonce: string
   deltaVersion: string
-  exactRowVerified: boolean
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -91,22 +88,12 @@ function evidenceString(record: Record<string, unknown>, key: string): string {
 
 export function modelScoreEvidence(lane: LaneSnapshot): ModelScoreEvidence {
   const evidence = asRecord(lane.evidence)
-  const verifiedRow = asRecord(evidence.verified_row)
-  const primaryKey = evidenceString(evidence, 'primary_key')
-  const score = evidenceString(evidence, 'score')
-  const modelVersion = evidenceString(evidence, 'model_version')
-  const proofNonce = evidenceString(evidence, 'proof_nonce')
   return {
-    primaryKey,
-    score,
-    modelVersion,
-    proofNonce,
+    primaryKey: evidenceString(evidence, 'primary_key'),
+    score: evidenceString(evidence, 'score'),
+    modelVersion: evidenceString(evidence, 'model_version'),
+    proofNonce: evidenceString(evidence, 'proof_nonce'),
     deltaVersion: evidenceString(evidence, 'delta_version'),
-    exactRowVerified: primaryKey !== '—'
-      && evidenceString(verifiedRow, 'primary_key') === primaryKey
-      && evidenceString(verifiedRow, 'score') === score
-      && evidenceString(verifiedRow, 'model_version') === modelVersion
-      && evidenceString(verifiedRow, 'proof_nonce') === proofNonce,
   }
 }
 
@@ -246,10 +233,22 @@ function mergeRunningLaneLatches(
   return changed ? lanes : incoming
 }
 
+/**
+ * Before Prepare answers, no lane has a clock and none has settled, so there is
+ * nothing to latch: the server's next word on a lane replaces the one on screen.
+ * Round 6 once marked its AWS lane not supported when Prepare began, and the
+ * latch held that "not installed" through Prepare and past the bell, while the
+ * server raced the lane.
+ */
+function prepareStillDeciding(session: DemoSession): boolean {
+  return session.state === 'draft' || session.state === 'checking'
+}
+
 function preserveRunningLaneLatches(
   current: DemoSession,
   incoming: DemoSession,
 ): DemoSession {
+  if (prepareStillDeciding(current)) return incoming
   const lanes = mergeRunningLaneLatches(current.lanes, incoming.lanes)
   const redoLanes = current.redo && incoming.redo
     ? mergeRunningLaneLatches(current.redo.lanes, incoming.redo.lanes)
@@ -263,6 +262,7 @@ function preserveRunningLaneLatches(
 }
 
 function anyRunningLaneRegresses(current: DemoSession, incoming: DemoSession): boolean {
+  if (prepareStillDeciding(current)) return false
   const initialRegression = (['lakebase', 'competitor'] as const).some(
     (laneId) => runningLaneRegresses(current.lanes[laneId], incoming.lanes[laneId]),
   )

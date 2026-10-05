@@ -269,6 +269,43 @@ class StartupReadinessStore:
 
         await self._run(upsert)
 
+    async def carry_ready_forward(self, *, manifest_seal: str) -> bool:
+        """Move a READY row up to the ring's current generation without taking the ring.
+
+        Every claim advances the generation, so READY goes stale after each bout even
+        when its cleanup finished and nothing is left to reconcile. Re-stamping it
+        under a fresh ``startup_cleanup`` lease held the ring for a moment: the card
+        read CLEANUP IN PROGRESS, and a bell rung in that moment was refused (release
+        bar, 2026-10-01 01:20:27Z). This carries the stamp forward only while no lease
+        is held, and share-locks the ring row so that no claim can land between the
+        check and the write. Returns whether the row moved.
+        """
+
+        async def carry(cursor: Any) -> bool:
+            await cursor.execute(
+                f"""
+                UPDATE {READINESS_TABLE} AS readiness
+                SET fencing_token = ring.fencing_token,
+                    updated_at = clock_timestamp()
+                FROM (
+                    SELECT fencing_token
+                    FROM anti_demo_coordination.ring_lease
+                    WHERE ring_key = %s
+                      AND (lease_id IS NULL OR expires_at <= clock_timestamp())
+                    FOR SHARE
+                ) AS ring
+                WHERE readiness.ring_key = %s
+                  AND readiness.manifest_seal = %s
+                  AND readiness.state = 'ready'
+                  AND readiness.fencing_token < ring.fencing_token
+                RETURNING readiness.fencing_token
+                """,
+                (self.ring_key, self.ring_key, manifest_seal),
+            )
+            return await cursor.fetchone() is not None
+
+        return await self._run(carry)
+
 
 def _manifest_seal(manifest: DemoManifest) -> str:
     payload = manifest.model_dump_json(exclude_none=True)
@@ -950,6 +987,23 @@ class ShowtimeReadinessGate:
 
         durable = await store.read()
         generation = await store.ring_generation()
+        if (
+            durable is not None
+            and durable.manifest_seal == self._seal
+            and durable.state == "ready"
+            and durable.fencing_token != generation
+        ):
+            # A bout, its cleanup or a rewarm took the ring and gave it back since READY
+            # was stamped, and nothing is left to reconcile: no lease is live and the
+            # journal holds no unresolved bout. Only the stamp is behind. Catching it up
+            # under a fresh lease (the fallback below) held the ring for a moment, which
+            # read as CLEANUP IN PROGRESS on an idle round and refused a bell rung then.
+            # A claim that lands first leaves the row stale, and the fallback meets its
+            # lease as it always did.
+            await self._verify_round5_journal_lifecycle_contract(journal)
+            if await store.carry_ready_forward(manifest_seal=self._seal):
+                self._round5_ready()
+                return True
         if (
             durable is not None
             and durable.manifest_seal == self._seal

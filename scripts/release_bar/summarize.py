@@ -77,8 +77,8 @@ def main() -> int:
             total += len(results)
             passed_total += sum(1 for item in results if item.get("passed"))
             failures += [f"{name}: {detail}" for detail in details]
-        elif name == "restart":
-            summary = _load(evidence / "restart" / "summary.json", {})
+        elif name in {"restart", "crash"} or name.startswith("crash-"):
+            summary = _load(evidence / name / "summary.json", {})
             heal = summary.get("ready_after_restart_s") or {}
             if heal:
                 result += ": READY again after " + ", ".join(

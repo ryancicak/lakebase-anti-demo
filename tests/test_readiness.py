@@ -12,6 +12,7 @@ from server.coordination import (
     ROUND5_RING_KEY,
     CoordinationObjectsMissingError,
     InMemoryBoutLeaseStore,
+    LeaseHeldError,
     is_retryable_startup_error,
     round_ring_key,
 )
@@ -58,6 +59,27 @@ class FakeReadinessStore:
             detail=detail,
             fencing_token=lease.fencing_token,
         )
+
+    async def carry_ready_forward(self, *, manifest_seal) -> bool:
+        """The production statement's rule: READY, same seal, behind, and no lease held."""
+
+        value = self.value
+        generation = self.leases._generation
+        if (
+            await self.leases.current() is not None
+            or value is None
+            or value.manifest_seal != manifest_seal
+            or value.state != "ready"
+            or value.fencing_token >= generation
+        ):
+            return False
+        self.value = SimpleNamespace(
+            manifest_seal=value.manifest_seal,
+            state=value.state,
+            detail=value.detail,
+            fencing_token=generation,
+        )
+        return True
 
 
 class CountingLeaseStore(DurableFakeLeaseStore):
@@ -653,6 +675,132 @@ async def test_settled_round5_reconciler_wakes_on_demand_to_clean_a_late_failure
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+class ClaimRecordingLeaseStore(DurableFakeLeaseStore):
+    """Records every claim on the ring, so a test can prove readiness never took it."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.claimed_phases: list[str] = []
+
+    async def claim(self, **kwargs):
+        self.claimed_phases.append(kwargs["phase"])
+        return await super().claim(**kwargs)
+
+
+async def _a_round5_bout_comes_and_goes(leases: DurableFakeLeaseStore) -> None:
+    bout = await leases.claim(
+        session_id="finished-bout",
+        operator=BoutOperator(display_name="Round 5 owner", subject="round5-owner"),
+        phase="checking",
+        session_state=SessionState.CHECKING,
+        round_id="survive_connection_spike",
+        round_title="Ready a pooled application path",
+        competitor_id="rds_postgres",
+        competitor_name="RDS PostgreSQL",
+        ttl=timedelta(minutes=1),
+    )
+    assert await leases.release(bout) is True
+
+
+def _round5_gate(round5_leases, round5_state) -> ShowtimeReadinessGate:
+    main_leases = DurableFakeLeaseStore()
+    return ShowtimeReadinessGate(
+        manifest(round5_ready=True),
+        main_leases,
+        round5_lease_store=round5_leases,
+        safe_change_factory=lambda _manifest: CleanupEngine([], "round2"),
+        recovery_factory=lambda _manifest: CleanupEngine([], "round3"),
+        round5_factory=None,
+        state_store=FakeReadinessStore(main_leases),
+        round5_state_store=round5_state,
+    )
+
+
+async def _settled_round5(gate, round5_leases, round5_state, journal) -> None:
+    # The first pass stamps READY under its own lease; the second reads it back.
+    assert await gate._round5_iteration(round5_state, round5_leases, journal) is False
+    assert await gate._round5_iteration(round5_state, round5_leases, journal) is True
+    assert gate.round5_status.ring_ready is True
+
+
+async def test_a_finished_round5_bout_settles_without_taking_the_ring() -> None:
+    # Release bar, 2026-10-01 01:20:27Z: 13.5 minutes after Round 5's last bout, the
+    # settled reconciler's backstop pass found READY one generation behind and
+    # re-stamped it under a startup lease. The idle round read CLEANUP IN PROGRESS
+    # for that moment, and a bell rung then would have been refused.
+    round5_leases = ClaimRecordingLeaseStore(ring_key=ROUND5_RING_KEY)
+    round5_state = FakeReadinessStore(round5_leases)
+    journal = CountingJournal()
+    gate = _round5_gate(round5_leases, round5_state)
+    await _settled_round5(gate, round5_leases, round5_state, journal)
+
+    await _a_round5_bout_comes_and_goes(round5_leases)
+    assert round5_state.value.fencing_token < round5_leases._generation
+    round5_leases.claimed_phases.clear()
+
+    assert await gate._round5_iteration(round5_state, round5_leases, journal) is True
+
+    assert round5_leases.claimed_phases == []
+    assert round5_state.value.state == "ready"
+    assert round5_state.value.fencing_token == round5_leases._generation
+    assert gate.round5_status.ring_ready is True
+    assert gate.round5_status.reason_code is None
+
+
+async def test_a_claim_that_lands_first_leaves_the_round5_stamp_to_the_fenced_path() -> None:
+    round5_leases = ClaimRecordingLeaseStore(ring_key=ROUND5_RING_KEY)
+
+    class RacedReadiness(FakeReadinessStore):
+        async def carry_ready_forward(self, *, manifest_seal) -> bool:
+            # A bout claims the ring between the gate's lease read and this write.
+            await self.leases.claim(
+                session_id="racing-bout",
+                operator=BoutOperator(display_name="Round 5 owner", subject="round5-owner"),
+                phase="checking",
+                session_state=SessionState.CHECKING,
+                round_id="survive_connection_spike",
+                round_title="Ready a pooled application path",
+                competitor_id="rds_postgres",
+                competitor_name="RDS PostgreSQL",
+                ttl=timedelta(minutes=1),
+            )
+            return await super().carry_ready_forward(manifest_seal=manifest_seal)
+
+    round5_state = RacedReadiness(round5_leases)
+    journal = CountingJournal()
+    gate = _round5_gate(round5_leases, round5_state)
+    await _settled_round5(gate, round5_leases, round5_state, journal)
+    await _a_round5_bout_comes_and_goes(round5_leases)
+    stale = round5_state.value.fencing_token
+
+    # The fenced re-stamp meets the racing bout's lease, as it always did, and the
+    # run loop reads that contention as maintenance rather than a fault.
+    with pytest.raises(LeaseHeldError):
+        await gate._round5_iteration(round5_state, round5_leases, journal)
+
+    assert round5_state.value.fencing_token == stale
+    assert (await round5_leases.current()).session_id == "racing-bout"
+
+
+async def test_a_round5_stamp_that_is_not_ready_is_never_carried_forward() -> None:
+    round5_leases = ClaimRecordingLeaseStore(ring_key=ROUND5_RING_KEY)
+    round5_state = FakeReadinessStore(round5_leases)
+    journal = CountingJournal()
+    gate = _round5_gate(round5_leases, round5_state)
+    await _settled_round5(gate, round5_leases, round5_state, journal)
+    await _a_round5_bout_comes_and_goes(round5_leases)
+    round5_state.value.state = "blocked"
+    round5_leases.claimed_phases.clear()
+
+    # Only READY rides forward. A blocked stamp is evidence that the last attempt
+    # failed, so it is retried under the fence, which re-stamps it from scratch.
+    assert await gate._round5_iteration(round5_state, round5_leases, journal) is False
+
+    assert round5_leases.claimed_phases == ["startup_cleanup", "startup_cleanup"]
+    assert round5_state.value.state == "ready"
+    assert round5_state.value.fencing_token == round5_leases._generation
 
 
 async def test_bout_status_combines_durable_ring_with_cached_gate() -> None:

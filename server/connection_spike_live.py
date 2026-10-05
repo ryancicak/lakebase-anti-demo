@@ -351,6 +351,21 @@ def _require_warm_runner_online(
         )
 
 
+#: The source states in which Round 5's competitor database still serves. RDS and Aurora
+#: read `backing-up` through each daily automated backup, and Aurora's cluster went on
+#: reading it for about a minute and a half after its snapshot finished. On 2026-10-02
+#: rc10's Round 5 keeper saw it, marked the ring unclaimable for 25 seconds and re-warmed;
+#: a bell in that window would have been refused.
+_WARM_SOURCE_SERVING_STATES = frozenset({"available", "backing-up"})
+#: RegisterDBProxyTargets' answers for a database not in a state it will register.
+_PROXY_TARGET_STATE_FAULTS = frozenset(
+    {"InvalidDBInstanceStateFault", "InvalidDBClusterStateFault"}
+)
+#: About three minutes, the longest backup rc10 saw (an RDS instance, 11:38-11:41).
+PROXY_TARGET_STATE_ATTEMPTS = 37
+PROXY_TARGET_STATE_RETRY_SECONDS = 5.0
+
+
 def _require_warm_source_identity(
     source: _CompetitorSource,
     *,
@@ -401,7 +416,7 @@ def _require_warm_source_identity(
         raise ConnectionSpikeLiveConfigurationError(
             "Round 5 warm source identity changed"
         )
-    if source.status != "available":
+    if source.status not in _WARM_SOURCE_SERVING_STATES:
         raise ConnectionSpikeLiveSourceUnavailableError(
             "Round 5 warm source matches identity but is not available yet "
             f"(status={source.status!r})"
@@ -4479,11 +4494,24 @@ class LiveConnectionSpikeSetupOrchestrator:
     async def _register_proxy_target(
         self, clients: _SetupAwsClients, resources: _SetupResources, spec: ResourceSpec
     ) -> ResourceObservation:
-        await self._call(
-            clients.rds.register_db_proxy_targets,
-            DBProxyName=resources.names.proxy_name,
-            **self.config.proxy_registration,
-        )
+        # The warm check lets a bout start while the source is in its daily backup, so
+        # if AWS will not register a target in that state, the wait is AWS's: retry
+        # its state faults on the lane's own clock, a bounded number of times.
+        for attempt in range(PROXY_TARGET_STATE_ATTEMPTS):
+            try:
+                await self._call(
+                    clients.rds.register_db_proxy_targets,
+                    DBProxyName=resources.names.proxy_name,
+                    **self.config.proxy_registration,
+                )
+                break
+            except Exception as exc:
+                if (
+                    self._error_code(exc) not in _PROXY_TARGET_STATE_FAULTS
+                    or attempt == PROXY_TARGET_STATE_ATTEMPTS - 1
+                ):
+                    raise
+                await self._sleep(PROXY_TARGET_STATE_RETRY_SECONDS)
         return self._observation(spec, self.config.competitor_resource_id)
 
     def _proxy_targets_match(self, targets: Sequence[Mapping[str, object]]) -> bool:
@@ -4878,7 +4906,7 @@ class LiveConnectionSpikeSetupOrchestrator:
                 source.identifier == self.config.competitor_target_id
                 and source.resource_id == self.config.competitor_resource_id
                 and source.direct_host == self.config.competitor_direct_host
-                and source.status == "available"
+                and source.status in _WARM_SOURCE_SERVING_STATES
                 and source.vpc_id == self.config.vpc_id
                 and source.security_group_ids == (resources.rds_security_group_id,)
             ),
@@ -9606,6 +9634,23 @@ class LiveRound5WarmProvider:
                     raise RetryableWarmError(
                         "warm_resident_binding_transition"
                     ) from exc
+            if isinstance(exc, ConnectionSpikeCleanupError):
+                # A runner job whose cleanup and flock release could not be confirmed.
+                # The usual cause is a resident restarted under it: setup's re-run
+                # reconfigures both runners while this coordinator is warming, and the
+                # job dies without printing its evidence. Unconfirmed is not orphaned.
+                # The runner's resident lock refuses a second resident while an old one
+                # lives, so a fresh fenced warm is the check that settles it, retried on
+                # the bounded backoff and then on the self-verifiable recheck interval.
+                # Latching it as unexpected left Round 5 waiting for an operator after an
+                # idle installer re-run (release run rc7, 2026-10-01 08:39:57Z).
+                logger.warning(
+                    "round5_warm_runner_settlement_unconfirmed generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise RetryableWarmError("warm_runner_settlement_unconfirmed") from exc
             logger.warning(
                 "round5_warm_baseline_unexpected generation=%s cause=%s: %s",
                 generation,

@@ -19,8 +19,6 @@ from server.live_orders import (
     LiveOrdersVerificationError,
     NativeCdfStatus,
 )
-from server.manager import RunManager
-from server.models import CompetitorId, Corner, RoundId, SessionCreate, SessionState
 
 
 class FakeAdapter:
@@ -592,44 +590,3 @@ async def test_live_cleanup_uses_full_payload_and_verifies_absence() -> None:
         order.total_cents,
         order.status,
     )
-
-
-@pytest.mark.asyncio
-async def test_manager_runs_round6_as_one_native_cdf_lane() -> None:
-    expected = contract()
-    adapter = FakeAdapter(expected)
-    manager = RunManager(
-        live_orders_factory=lambda: LiveOrdersEngine(
-            adapter, contract=expected, poll_interval_seconds=0
-        )
-    )
-    created = await manager.create(
-        SessionCreate(
-            competitor=CompetitorId.AURORA_SERVERLESS_V2,
-            primary_persona="data_analyst",
-            secondary_personas=[],
-            corners=[Corner.PERFORMANCE],
-            round_id=RoundId.ANALYZE_LIVE_ORDERS,
-        )
-    )
-    await manager.start_arm(created.id)
-    for _ in range(100):
-        armed = await manager.get(created.id)
-        if armed.state == SessionState.ARMED:
-            break
-        await asyncio.sleep(0)
-    assert armed.state == SessionState.ARMED
-
-    await manager.start_run(created.id)
-    for _ in range(100):
-        finished = await manager.get(created.id)
-        if finished.state in {SessionState.VERIFIED, SessionState.FAILED}:
-            break
-        await asyncio.sleep(0)
-
-    assert finished.state == SessionState.VERIFIED
-    assert finished.lanes["competitor"].state.value == "not_supported"
-    assert finished.lanes["lakebase"].elapsed_ms == finished.metrics[0].value
-    assert finished.lanes["lakebase"].evidence["total_display"] == "$84.50"
-    assert finished.metrics[2].display_value == "SEPARATE CHECKOUT COMMITTED ✓"
-    assert finished.metrics[1].value == 1

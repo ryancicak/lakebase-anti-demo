@@ -16,6 +16,8 @@ AWS_EC2_AS_OF = datetime(2026, 8, 19, 16, 58, 43, tzinfo=UTC)
 AWS_VPC_AS_OF = datetime(2026, 7, 24, 15, 42, 25, tzinfo=UTC)
 AWS_SECRETS_AS_OF = datetime(2025, 8, 28, 15, 38, 4, tzinfo=UTC)
 AWS_PROXY_AS_OF = AWS_RDS_AS_OF
+#: The published list rate, read for the v1.1 design on this date, not a Price List capture.
+AWS_GLUE_AS_OF = datetime(2026, 9, 28, tzinfo=UTC)
 
 DBRICKS_PRICES = "system.billing.list_prices pricing.effective_list.default; normal pricing.default"
 AWS_RDS_PRICES = (
@@ -32,6 +34,24 @@ AWS_VPC_PRICES = (
 )
 AWS_SECRETS_PRICES = "AWS Price List API · AWSSecretsManager · OnDemand · us-west-2"
 AWS_PROXY_PRICES = "Amazon RDS Proxy pricing · us-west-2 · per ACU/vCPU-hour · 10-minute minimum"
+AWS_GLUE_PRICES = (
+    "AWS Glue pricing · Spark job DPU-hour · us-west-2 · per second, 1-minute minimum"
+)
+ROUND4_GLUE_DPU_HOUR_USD = 0.44
+#: Read from the AWS Price List API for Round 6's lane on this date.
+AWS_DMS_AS_OF = datetime(2026, 9, 29, tzinfo=UTC)
+AWS_DMS_PRICES = (
+    "AWS Price List API · AWSDatabaseMigrationSvc · OnDemand · us-west-2 · "
+    "SKU X2XEG8FG4898H6YD (dms.t3.small, Single-AZ)"
+)
+#: The same rate as `cost_model.RateCard.dms_t3_small_hour`, which a test holds it to.
+ROUND6_DMS_INSTANCE_HOUR_USD = 0.036
+#: Round 5's two resident runners, as `cost_model` prices them (a test holds the rate to
+#: `RateCard.ec2_c7i_2xlarge_hour` and the count to `InstallationShape.runner_instances`).
+ROUND5_RUNNER_INSTANCE_HOUR_USD = 0.357
+ROUND5_RUNNER_INSTANCES = 2
+#: A month's hours, as `cost_model` bills a month.
+_HOURS_PER_MONTH = 730.0
 
 RDS_PROXY_UNIT_RATE_USD = 0.015
 RDS_PROXY_MINIMUM_SECONDS = 600.0
@@ -468,6 +488,64 @@ def _databricks_pipeline_lines(round_id: RoundId) -> list[CostLineItem]:
     ]
 
 
+def _round_four_glue_lines() -> list[CostLineItem]:
+    """Round 4's AWS lane, where it is installed: the Glue job that carries the change.
+
+    Its rate is the published one; its quantity is the seconds the run consumed
+    resources, which Glue reports only once the run has stopped, after the bout
+    settles, so it stays pending here rather than being read off a clock.
+    """
+
+    return [
+        _line(
+            "competitor",
+            "AWS Glue job · 2 DPU (G.1X × 2) · billed seconds pending",
+            "DPU-hour",
+            ROUND4_GLUE_DPU_HOUR_USD,
+            AWS_GLUE_PRICES,
+            AWS_GLUE_AS_OF,
+        ),
+    ]
+
+
+def _round_six_aws_lines() -> list[CostLineItem]:
+    """Round 6's AWS lane, where it is installed: DMS captures the change and Glue appends it.
+
+    The replication instance stands, so it is monthly carrying cost whether or not a bout
+    runs, and its quantity is its configuration: every hour of the month. The DMS task
+    bills nothing beyond it. The Glue job's quantity is the seconds its run consumed, which
+    Glue reports only once the run has stopped, after the bout settles, so it stays pending
+    here, as Round 4's does.
+    """
+
+    return [
+        _line(
+            "competitor",
+            "AWS DMS replication instance · dms.t3.small · stands whether or not its tasks run",
+            "instance-hour",
+            ROUND6_DMS_INSTANCE_HOUR_USD,
+            AWS_DMS_PRICES,
+            AWS_DMS_AS_OF,
+            quantity=_HOURS_PER_MONTH,
+            subtotal=round(ROUND6_DMS_INSTANCE_HOUR_USD * _HOURS_PER_MONTH, 12),
+            cadence="month",
+            status="estimate",
+            scope="required_monthly_carrying_cost",
+            confidence="high",
+            quantity_method="selected_configuration",
+            reconciliation_status="estimate",
+        ),
+        _line(
+            "competitor",
+            "AWS Glue job · 2 DPU (G.1X × 2) · billed seconds pending",
+            "DPU-hour",
+            ROUND4_GLUE_DPU_HOUR_USD,
+            AWS_GLUE_PRICES,
+            AWS_GLUE_AS_OF,
+        ),
+    ]
+
+
 def _external_stack_lines(round_id: RoundId) -> list[CostLineItem]:
     product = (
         "Required external reverse-ETL product"
@@ -549,11 +627,13 @@ def _round_five_lines(competitor_id: CompetitorId) -> list[CostLineItem]:
             AWS_SECRETS_PRICES,
             AWS_SECRETS_AS_OF,
         ),
+        # The two resident runners, one per lane. These lines still described the
+        # single m6i.large runner (at m6i.xlarge's $0.192) the two-runner seal replaced.
         _line(
             "shared",
-            "Neutral m6i.large runner",
+            "Two isolated c7i.2xlarge runners",
             "instance-hour",
-            0.192,
+            ROUND5_RUNNER_INSTANCE_HOUR_USD,
             AWS_EC2_PRICES,
             AWS_EC2_AS_OF,
             cadence="month",
@@ -561,13 +641,13 @@ def _round_five_lines(competitor_id: CompetitorId) -> list[CostLineItem]:
         ),
         _line(
             "shared",
-            "Neutral runner gp3 root volume",
+            "Two isolated runner gp3 root volumes",
             "GB-month",
             0.08,
             AWS_EC2_PRICES,
             AWS_EC2_AS_OF,
-            quantity=20,
-            subtotal=1.60,
+            quantity=20 * ROUND5_RUNNER_INSTANCES,
+            subtotal=round(0.08 * 20 * ROUND5_RUNNER_INSTANCES, 12),
             cadence="month",
             status="estimate",
             scope="installation_overhead",
@@ -577,7 +657,7 @@ def _round_five_lines(competitor_id: CompetitorId) -> list[CostLineItem]:
         ),
         _line(
             "shared",
-            "Neutral runner public IPv4",
+            "Two isolated runner public IPv4 addresses",
             "address-hour",
             0.005,
             AWS_VPC_PRICES,
@@ -627,15 +707,38 @@ def build_cost_receipt(
     competitor_id: CompetitorId,
     *,
     rds_proxy_billable_seconds: float | None = None,
+    round4_aws_lane: bool = False,
+    round6_aws_lane: bool = False,
 ) -> CostReceiptSnapshot:
+    """The session's cost receipt.
+
+    ``round4_aws_lane`` is whether this installation races Round 4's AWS Glue lane.
+    With it, Round 4 prices its own Aurora or RDS database and the Glue job, like
+    any raced round. Without it, Round 4 races Lakebase alone, and the AWS side is
+    the reverse-ETL layer a customer would still have to select. ``round6_aws_lane``
+    is the same for Round 6's AWS DMS and Glue lane, whose AWS side without it is the
+    CDC-to-Delta stack a customer would still have to select.
+    """
+
     lines = _lakebase_database_lines()
-    if round_id not in {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}:
+    round_four_races_aws = round_id == RoundId.PUT_MODEL_SCORE_IN_APP and round4_aws_lane
+    round_six_races_aws = round_id == RoundId.ANALYZE_LIVE_ORDERS and round6_aws_lane
+    if (
+        round_id not in {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+        or round_four_races_aws
+        or round_six_races_aws
+    ):
         lines.extend(_aws_database_lines(competitor_id))
     if round_id in {RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}:
         lines.extend(_ephemeral_artifact_lines(round_id, competitor_id))
     if round_id in {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}:
         lines.extend(_databricks_pipeline_lines(round_id))
-        lines.extend(_external_stack_lines(round_id))
+        if round_four_races_aws:
+            lines.extend(_round_four_glue_lines())
+        elif round_six_races_aws:
+            lines.extend(_round_six_aws_lines())
+        else:
+            lines.extend(_external_stack_lines(round_id))
     if round_id == RoundId.SURVIVE_CONNECTION_SPIKE:
         lines.extend(_round_five_lines(competitor_id))
         if rds_proxy_billable_seconds is not None:

@@ -14,7 +14,6 @@ import asyncio
 
 import pytest
 
-from server.live_orders import LiveOrder, LiveOrdersResult, LiveOrdersVerificationError
 from server.manager import RunManager
 from server.models import (
     CompetitorId,
@@ -24,50 +23,50 @@ from server.models import (
     SessionState,
 )
 from server.receipts import derive_receipt
+from server.round6_race import (
+    BOUT_NONCE_PREFIX,
+    COMPETITOR_LANE,
+    LAKEBASE_LANE,
+    Round6RaceEngine,
+    Round6SettleError,
+)
+from tests.test_round6_race import BASELINE, FakeLane
 
 
-def _result(order: LiveOrder, guardrail: LiveOrder) -> LiveOrdersResult:
-    return LiveOrdersResult(
-        order=order,
-        checkout_guardrail_order=guardrail,
-        history_lsn=42,
-        matching_orders=1,
-        analytics_available_ms=12.5,
-        total_elapsed_ms=25.0,
-        checkout_commit_ms=3.0,
-        checkout_guardrail_commit_ms=4.0,
-        checkout_guardrail_read_ms=5.0,
-        checkout_verified=True,
-        poll_attempts=1,
-    )
+class _LiveOrdersEngine(Round6RaceEngine):
+    """Round 6's real engine on scripted lanes, counting the settles it is asked for."""
 
-
-class _LiveOrdersEngine:
-    """A Round 6 engine that records exactly which rows it was asked to settle."""
-
-    def __init__(self, *, fail: bool = False, settle_failures: int = 0) -> None:
-        self.fail = fail
+    def __init__(self, *lanes: FakeLane, settle_failures: int = 0) -> None:
+        super().__init__(
+            lanes or (FakeLane(LAKEBASE_LANE, "Lakebase"), FakeLane(COMPETITOR_LANE, "AWS")),
+            baseline=BASELINE,
+            poll_seconds=0.001,
+            watch_seconds=0.001,
+            lane_timeout_seconds=1.0,
+        )
         self.settle_failures = settle_failures
-        self.settled: list[tuple[LiveOrder, LiveOrder | None]] = []
         self.settle_attempts = 0
-        self.run_entered = asyncio.Event()
+        self.settled = 0
 
-    async def arm(self, on_progress=None):
-        from types import SimpleNamespace
-
-        return SimpleNamespace(committed_lsn=1)
-
-    async def run(self, arm, order, checkout_guardrail_order, on_progress=None):
-        self.run_entered.set()
-        if self.fail:
-            raise LiveOrdersVerificationError("native CDF proof did not arrive")
-        return _result(order, checkout_guardrail_order)
-
-    async def settle_and_cleanup_owned(self, order, checkout_guardrail_order):
+    async def settle_and_cleanup_owned(self) -> None:
         self.settle_attempts += 1
         if self.settle_attempts <= self.settle_failures:
-            raise LiveOrdersVerificationError("statement execution is briefly unavailable")
-        self.settled.append((order, checkout_guardrail_order))
+            raise Round6SettleError("statement execution is briefly unavailable")
+        await super().settle_and_cleanup_owned()
+        self.settled += 1
+
+
+def _bout_rows(engine: _LiveOrdersEngine) -> list[list[str]]:
+    """Each lane's rows that a bout wrote, by status: what settling has to take back out."""
+
+    return [
+        sorted(
+            order.status
+            for order in lane.source.values()
+            if order.proof_nonce.startswith(BOUT_NONCE_PREFIX)
+        )
+        for lane in engine.lanes
+    ]
 
 
 def _round_six() -> SessionCreate:
@@ -109,23 +108,39 @@ async def test_a_won_round_six_removes_its_own_proof_rows() -> None:
     """The defect in one sentence: a win used to leave its row behind."""
 
     engine = _LiveOrdersEngine()
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
 
     created = await _drive(manager, engine, SessionState.VERIFIED)
     verified = await manager.get(created.id)
-    assert verified.remembered_result == (
-        "EXACT DELTA ANSWER · 0.01s · AWS PIPELINE NOT BUILT · MARGIN N/A"
-    )
+    assert verified.remembered_result
     assert derive_receipt(verified, "run_finished").remembered_result == (
         verified.remembered_result
     )
     await _settled(engine)
 
-    order, guardrail = engine.settled[0]
-    assert order.order_id
-    # The guardrail checkout is a second owned row and leaks the same way.
-    assert guardrail is not None
-    assert guardrail.order_id != order.order_id
+    # Both sources held the bout's checkout and its guardrail, a second owned row that leaks
+    # the same way; settling took all four back out and parked both lanes.
+    assert _bout_rows(engine) == [[], []]
+    for lane in engine.lanes:
+        assert sorted(event for event in lane.events if event.startswith("delete:")) == [
+            "delete:checkout",
+            "delete:checkout-guardrail",
+        ]
+        assert lane.events[-1] == "park"
+    await manager.close()
+
+
+async def test_lakebase_alone_settles_its_own_rows_too() -> None:
+    engine = _LiveOrdersEngine(FakeLane(LAKEBASE_LANE, "Lakebase"))
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
+
+    created = await _drive(manager, engine, SessionState.VERIFIED)
+    verified = await manager.get(created.id)
+    assert verified.remembered_result is not None
+    assert verified.remembered_result.endswith(" · AWS LANE NOT INSTALLED")
+    await _settled(engine)
+
+    assert _bout_rows(engine) == [[]]
     await manager.close()
 
 
@@ -137,19 +152,28 @@ async def test_a_failed_round_six_still_removes_the_row_it_already_committed() -
     dropped the only handle anyone had on it.
     """
 
-    engine = _LiveOrdersEngine(fail=True)
-    manager = RunManager(live_orders_factory=lambda: engine)
+    engine = _LiveOrdersEngine(
+        FakeLane(LAKEBASE_LANE, "Lakebase"),
+        FakeLane(
+            COMPETITOR_LANE,
+            "AWS",
+            arrives_on_read=None,
+            failure_after_start="The Glue run ended FAILED",
+        ),
+    )
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
 
     await _drive(manager, engine, SessionState.FAILED)
     await _settled(engine)
 
-    assert len(engine.settled) == 1
+    assert engine.settled == 1
+    assert _bout_rows(engine) == [[], []]
     await manager.close()
 
 
 async def test_settlement_retries_a_transient_failure_instead_of_leaving_residue() -> None:
     engine = _LiveOrdersEngine(settle_failures=2)
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
     manager._cleanup_retry_initial = 0.001
     manager._cleanup_retry_max = 0.001
 
@@ -157,6 +181,7 @@ async def test_settlement_retries_a_transient_failure_instead_of_leaving_residue
     await _settled(engine)
 
     assert engine.settle_attempts == 3
+    assert _bout_rows(engine) == [[], []]
     await manager.close()
 
 
@@ -164,7 +189,7 @@ async def test_settlement_that_never_succeeds_gives_up_without_failing_the_bout(
     """Residue is a cost problem; a terminal path that throws is a broken bout."""
 
     engine = _LiveOrdersEngine(settle_failures=99)
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
     manager._cleanup_retry_initial = 0.001
     manager._cleanup_retry_max = 0.001
 
@@ -179,7 +204,7 @@ async def test_settlement_that_never_succeeds_gives_up_without_failing_the_bout(
     assert snapshot.state == SessionState.VERIFIED
     assert snapshot.failure is None
     assert engine.settle_attempts == manager._settlement_attempts
-    assert engine.settled == []
+    assert engine.settled == 0
     await manager.close()
 
 
@@ -190,7 +215,7 @@ async def test_an_engine_that_cannot_settle_is_skipped_not_raised_on() -> None:
         settle_and_cleanup_owned = None  # type: ignore[assignment]
 
     engine = _Unsettleable()
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
 
     created = await _drive(manager, engine, SessionState.VERIFIED)
 
@@ -204,7 +229,7 @@ async def test_one_settlement_runs_at_a_time_for_a_session() -> None:
     """Scheduling is idempotent, so a redo cannot stack duplicate cleanups."""
 
     engine = _LiveOrdersEngine()
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
     created = await manager.create(_round_six())
     record = manager._records[created.id]
 
@@ -231,7 +256,7 @@ async def test_settlement_is_not_scheduled_once_the_manager_is_closing() -> None
     """Shutdown settles what is running; it must not start new work."""
 
     engine = _LiveOrdersEngine()
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
     created = await manager.create(_round_six())
     record = manager._records[created.id]
     await manager.close()
@@ -251,7 +276,7 @@ async def test_a_cancelled_settlement_propagates_and_clears_its_slot() -> None:
     """Shutdown cancels settlement; it must not be swallowed as a retryable error."""
 
     engine = _LiveOrdersEngine()
-    manager = RunManager(live_orders_factory=lambda: engine)
+    manager = RunManager(live_orders_factory=lambda competitor: engine)
     created = await manager.create(_round_six())
     record = manager._records[created.id]
 

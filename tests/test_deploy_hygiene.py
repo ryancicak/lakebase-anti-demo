@@ -762,6 +762,8 @@ def test_the_env_template_names_the_optional_families_and_points_to_the_docs() -
 _OPERATOR_POLICY_FILES = (
     PROJECT_ROOT / "docs" / "iam" / "anti-demo-operator-2-databases.json",
     PROJECT_ROOT / "docs" / "iam" / "anti-demo-operator-3-identity.json",
+    PROJECT_ROOT / "docs" / "iam" / "anti-demo-operator-5-round4.json",
+    PROJECT_ROOT / "docs" / "iam" / "anti-demo-operator-6-round6.json",
 )
 
 

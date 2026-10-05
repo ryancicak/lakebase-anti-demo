@@ -2,8 +2,17 @@ locals {
   use_default_network = var.vpc_id == null && var.subnet_ids == null
   resource_name       = "${var.name_prefix}-${var.run_id}"
   v7_enabled          = var.installation_id != null
-  v7_round_keys       = toset(["r1", "r2", "r3", "r5"])
-  v7_rounds           = local.v7_enabled ? local.v7_round_keys : toset([])
+  # Round 4 (r4) races a writer pipeline that carries each Delta change into
+  # its own Aurora cluster and RDS instance, so it stands both up like the other
+  # AWS rounds. It needs no logical decoding, so it keeps the engine-default
+  # parameter groups, and its Aurora cluster can still pause when idle. These
+  # addresses match the ones fix/contest-ledger-set-integrity created, so an
+  # installation made from that branch keeps them. Round 6 (r6) joins for the
+  # same reason in reverse: AWS DMS captures its checkout from these databases
+  # into the lakehouse (docs/design/v1.1-rounds-4-6-aws.md, section 4). Keep this
+  # list in step with server/lifecycle.py:_V7_ROUND_KEYS.
+  v7_round_keys = toset(["r1", "r2", "r3", "r4", "r5", "r6"])
+  v7_rounds     = local.v7_enabled ? local.v7_round_keys : toset([])
 
   # RDS has its own key list because its fleet is no longer the same shape as
   # Aurora's. Round 1 keeps an Aurora cluster -- it is the only engine that can
@@ -16,9 +25,20 @@ locals {
   #
   # Do not fold this back into v7_round_keys. That list still drives Aurora, the
   # subnet groups and the per-round slugs, and dropping r1 from it would take
-  # r1's Aurora cluster with it.
-  v7_rds_round_keys = toset(["r2", "r3", "r5"])
+  # r1's Aurora cluster with it. Keep this list in step with
+  # server/lifecycle.py:_V7_RDS_ROUND_KEYS.
+  v7_rds_round_keys = toset(["r2", "r3", "r4", "r5", "r6"])
   v7_rds_rounds     = local.v7_enabled ? local.v7_rds_round_keys : toset([])
+
+  # The rounds whose databases are read by logical replication, and so run on the
+  # parameter groups in parameter_groups.tf rather than the engine defaults: Round
+  # 6, whose AWS lane is AWS DMS change capture. Aurora with logical replication on
+  # never auto-pauses, which is why no other round is here. Must be a subset of
+  # both lists above; the check in parameter_groups.tf enforces it. The name is the
+  # one fix/contest-ledger-set-integrity gave it, so its installations keep their
+  # parameter groups.
+  v7_lakeflow_round_keys = toset(["r6"])
+  v7_lakeflow_rounds     = local.v7_enabled ? local.v7_lakeflow_round_keys : toset([])
 
   # A stable 80-bit digest keeps independently installed copies in the same
   # account/workspace from colliding without exposing the installation ID.

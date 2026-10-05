@@ -34,6 +34,7 @@ from .models import (
     BoutOperator,
     BoutStatus,
     CatalogResponse,
+    CompetitorId,
     FightCardRoundStatus,
     FightCardState,
     RoundId,
@@ -248,6 +249,8 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         deployed=selfheal.deployed(),
         deployed_aws_path_sealed=posture.egress_sealed,
         round5_runtime_role_sealed=posture.runtime_role_sealed,
+        round4_aws_sealed=posture.round4_aws_sealed,
+        round6_aws_sealed=posture.round6_aws_sealed,
         grant_refusals=getattr(run_manager, "grant_refusals", None) or {},
         storage_refusals=getattr(run_manager, "storage_refusals", None) or {},
     )
@@ -662,6 +665,25 @@ async def create_session(body: SessionCreate, request: Request) -> SessionSnapsh
 @router.get("/sessions/{session_id}", response_model=SessionSnapshot)
 async def get_session(session_id: str, request: Request) -> SessionSnapshot:
     return await _control_operation(manager(request).get(session_id))
+
+
+class RoundWake(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    competitor: CompetitorId
+
+
+@router.post("/rounds/{round_id}/wake", status_code=status.HTTP_202_ACCEPTED)
+async def wake_round(round_id: str, body: RoundWake, request: Request) -> dict[str, bool]:
+    """Round 4's fight card opened: wake its destinations, so Prepare need not.
+
+    Only Round 4 has a database to wake that its race does not already time. Round 1's
+    Aurora waking is the race itself, so nothing here ever touches it.
+    """
+
+    if round_id != RoundId.PUT_MODEL_SCORE_IN_APP.value:
+        raise HTTPException(status_code=404, detail="Only Round 4 wakes its destinations early")
+    return {"waking": manager(request).wake_round4(body.competitor)}
 
 
 @router.get("/receipts", response_model=ReceiptsResponse)

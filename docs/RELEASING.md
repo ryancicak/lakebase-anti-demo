@@ -14,8 +14,8 @@ checkout's commit, and a pass on the previous commit says nothing about this one
 
 ## What it costs
 
-The whole bar takes a working day. The one command alone runs about seven hours
-with every round in use, on top of the test installation's standing cost
+The whole bar takes a working day. The one command alone runs about seven and a half
+hours with every round in use, on top of the test installation's standing cost
 ([docs/PRICING.md](PRICING.md)). The uninstall at the end stops all of it.
 
 ## 1. A test installation
@@ -90,9 +90,11 @@ directory, for investigating; a release needs one run with every step.
 | Step | What happens | Passes when |
 |---|---|---|
 | preflight | Reads `/api/version` and the board. | The app serves the checkout's commit with no uncommitted changes, and all six rounds are READY. |
-| chaos | Six waves: cancel before the bell (Round 1), towel early, mid-stage and late, towel then re-arm at once, and finish with the result held on screen for five minutes. First all six rounds at once against Aurora, then against RDS, then each round alone: against Aurora, and against RDS too for Rounds 1, 2, 3 and 5. 114 scenarios. | Every bout ends verified or toweled (Round 1's pre-bell cancel ends canceled), every round comes back READY, a held result never changes, and a round not in play is never anything but READY. |
-| restart | Starts Rounds 2, 3 and 5, redeploys the same build 90 seconds after the bell, and watches. | Every round is READY again within 45 minutes, with nobody touching it. Round 5 is the slow one: it waits out its old coordinator lease, then AWS. |
-| leaks | Lists every resource tagged with the run id that Terraform did not make: RDS clones, restores and proxies, security groups and rules, secrets. | Nothing remains within 30 minutes of every round being READY. |
+| chaos | Six waves: cancel before the bell (Round 1), towel early, mid-stage and late, towel then re-arm at once, and finish with the result held on screen for five minutes. First all six rounds at once against Aurora, then against RDS, then each round alone: against Aurora, and against RDS too, since every round races an AWS lane. 124 scenarios. | Every bout ends verified or toweled (Round 1's pre-bell cancel ends canceled), every round comes back READY, a held result never changes, and a round not in play is never anything but READY. |
+| backup | For each Round 1, 2, 3 and 5 AWS source (seven: Round 1 has only Aurora), takes a manual snapshot, which reads `backing-up` exactly as a source does through its daily automated backup, and runs one full bout of that round inside it; for Round 5 it also runs the installer's seal check there. Then deletes the snapshot. AWS schedules the real backups in a morning block, so a run overnight never meets one; rc10 met three on 2026-10-02 and Rounds 2, 3 and 5 refused or paused on them. | Every bout is verified, Round 5's seal check passes, both started while the source still read `backing-up` (a bout that missed the window fails, because it proves nothing), and every snapshot is gone. |
+| restart | Starts Rounds 2, 3, 4, 5 and 6, redeploys the same build 90 seconds after the bell, and watches. | Every round is READY again within 45 minutes, with nobody touching it. Round 5 is the slow one: it waits out its old coordinator lease, then AWS. |
+| crash | Starts a Round 4 bout and stops and starts the app 20 seconds after its bell, deploying nothing, while both lanes still race; then one Round 4 bout runs to the end. Then the same for Round 6. The redeploy above is too slow to land inside either round's bout. | Every round is READY again within 45 minutes, and each next bout is verified. Round 4's Prepare stops the Glue run the crash stranded and puts every destination back to its baseline first, which can take about five minutes. Round 6's stops the DMS task and Glue run it stranded and removes the bout's orders from both sources. The summary's scenario count includes these two bouts: 126. |
+| leaks | Lists every resource tagged with the run id that Terraform did not make: RDS clones, restores and proxies, security groups and rules, secrets. Also any run of Round 4's or Round 6's Glue writers still active, and any of Round 6's DMS tasks still running. | Nothing remains within 30 minutes of every round being READY. A Glue run the restart stranded ends by its job's 30-minute timeout. |
 | lease | Reads the `expires-at` lease on every resource Terraform made, then runs `terraform plan`, which applies nothing. | `/readyz` says the lease is current, it is no more than 7 hours behind `now + window`, it has moved past the expiry sealed at install once the installation is over 7 hours old, and the plan proposes no change. |
 
 Then uninstall the test installation (step 2's commands) and require `ALL GONE`
@@ -109,6 +111,8 @@ into a failure without the rest of the run. Each one's docstring has its usage.
 | `leftovers.py` | The leak check. Read-only. |
 | `lease_check.py` | The lease check; `--plan` adds the Terraform plan. Read-only. |
 | `gone.py` | After an uninstall, counts whatever is left. Read-only. |
+
+`leftovers.py` and `gone.py` list whole resource types across the account: IAM policies and instance profiles, SQS queues, and Glue jobs and connections, for example. The install's own policies in [docs/iam](iam/) do not grant all of those listings, so the AWS key in `.env.bootstrap` needs account-wide read access for the bar.
 | `summarize.py` | Writes `summary.md` from an evidence directory. |
 
 ## 4. Reading a failure
@@ -148,6 +152,11 @@ RDS ends in about a second) is accepted as the UI accepts it; a poll sent before
 round was released that lands after it is not counted as an isolation failure;
 and the OAuth token is minted again every five minutes, so a long phase cannot
 die of a 401.
+
+It also rides out the Databricks Apps front end answering in the app's place, with
+`TEMPORARILY_UNAVAILABLE` or a proxy page (rc23, 2026-10-05). A GET is asked again
+for up to fifteen seconds. A POST is settled from its session, as an answer cut
+off on its way back is. The app's own 503 still fails the scenario.
 
 ## 5. Tag
 

@@ -1,5 +1,6 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
-import { metricValue, modelScoreEvidence } from '../round4'
+import { modelScoreEvidence, roundFourStackLabel } from '../round4'
+import { roundSixStackLabel } from '../round6'
 import {
   roundFiveBellRuntime,
   roundFiveHasComparison,
@@ -47,21 +48,6 @@ function nonNegativeNumber(value: unknown): number | null {
 function verifiedElapsed(session: DemoSession, laneId: LaneId): number | null {
   const lane = session.lanes[laneId]
   return lane.state === 'verified' ? nonNegativeNumber(lane.elapsed_ms) : null
-}
-
-function roundMetricMs(session: DemoSession, specId: string): number | null {
-  const value = metricValue(session, specId)?.value
-  return nonNegativeNumber(typeof value === 'string' ? Number(value) : value)
-}
-
-function roundFourElapsed(session: DemoSession): number | null {
-  return roundMetricMs(session, 'application_proof_elapsed_ms')
-    ?? verifiedElapsed(session, 'lakebase')
-}
-
-function roundSixElapsed(session: DemoSession): number | null {
-  return roundMetricMs(session, 'analytics_available_ms')
-    ?? verifiedElapsed(session, 'lakebase')
 }
 
 /**
@@ -156,22 +142,16 @@ function comparisonFor(session: DemoSession): ContractComparison | null {
 
 function sessionEvidence(session: DemoSession) {
   const roundFive = session.round.id === 'survive_connection_spike'
+  // Rounds 4 and 6 score each lane's own clock, bell to its exact read: a lane is only
+  // verified when its verifier read that exact row back, so it needs no guardrail
+  // here. Round 6's separate checkout is the server's to enforce, and a bout whose
+  // checkout did not read back fails there rather than reaching this screen verified.
   const lakebaseExactMs = roundFive
     ? roundFiveExactPrimaryMs(session, 'lakebase')
-    : session.round.id === 'put_model_score_in_app'
-      ? verifiedElapsed(session, 'lakebase') === null ? null : roundFourElapsed(session)
-      : session.round.id === 'analyze_live_orders_without_slowing_checkout'
-        ? verifiedElapsed(session, 'lakebase') === null ? null : roundSixElapsed(session)
-        : verifiedElapsed(session, 'lakebase')
+    : verifiedElapsed(session, 'lakebase')
   const competitorExactMs = roundFive
     ? roundFiveExactPrimaryMs(session, 'competitor')
     : verifiedElapsed(session, 'competitor')
-  const roundFourGuardrailFailed = session.round.id === 'put_model_score_in_app'
-    && lakebaseExactMs !== null
-    && !modelScoreEvidence(session.lanes.lakebase).exactRowVerified
-  const roundSixGuardrailFailed = session.round.id === 'analyze_live_orders_without_slowing_checkout'
-    && lakebaseExactMs !== null
-    && metricValue(session, 'checkout_verified')?.value !== true
   const roundFiveGuardrailFailed = roundFive
     && lakebaseExactMs !== null
     && competitorExactMs !== null
@@ -179,8 +159,6 @@ function sessionEvidence(session: DemoSession) {
   const capabilityGap = lakebaseExactMs !== null
     && competitorExactMs === null
     && session.lanes.competitor.state === 'not_supported'
-    && !roundFourGuardrailFailed
-    && !roundSixGuardrailFailed
 
   return classifyEvidence({
     lakebase: {
@@ -194,8 +172,7 @@ function sessionEvidence(session: DemoSession) {
       notSupported: session.lanes.competitor.state === 'not_supported',
     },
     capabilityGap,
-    guardrailFailure:
-      roundFourGuardrailFailed || roundFiveGuardrailFailed || roundSixGuardrailFailed,
+    guardrailFailure: roundFiveGuardrailFailed,
     cleanupFailure: Boolean(
       session.towel?.cleanup_failure
       || session.round5_setup?.cleanup_failure
@@ -215,13 +192,15 @@ function sessionContractVerified(session: DemoSession): boolean {
     case 'recover_deleted_order':
       return comparisonFor(session) !== null
     case 'put_model_score_in_app':
-      return modelScoreEvidence(session.lanes.lakebase).exactRowVerified
-        && session.lanes.competitor.state === 'not_supported'
+    case 'analyze_live_orders_without_slowing_checkout':
+      // The verdict is the server's, from the engine's resolution; without the AWS
+      // lane installed it can only be Lakebase's capability.
+      return session.lanes.competitor.state === 'not_supported'
+        ? session.comparison?.kind === 'capability_gap'
+          && session.comparison.winner_lane_id === 'lakebase'
+        : comparisonFor(session) !== null
     case 'survive_connection_spike':
       return roundFiveHasComparison(session)
-    case 'analyze_live_orders_without_slowing_checkout':
-      return metricValue(session, 'checkout_verified')?.value === true
-        && session.lanes.competitor.state === 'not_supported'
   }
 }
 
@@ -260,11 +239,18 @@ function outcomeIdFor(
               ? 'one_sided_verified'
               : 'no_result'
     case 'put_model_score_in_app':
+    case 'analyze_live_orders_without_slowing_checkout':
+      // Either lane can be the one that read its row, so the one-sided proof names
+      // the lanes rather than assuming Lakebase finished.
       return decision.status === 'declared_capability'
         ? 'verified_capability_gap'
-        : evidence.exactLane === 'lakebase'
-          ? 'score_identity_unverified'
-          : 'no_result'
+        : evidence.laneShape === 'both_exact_verified'
+          ? 'verified_comparison'
+          : oneExact
+            ? 'one_sided_verified'
+            : session.towel && evidence.laneShape === 'both_lower_bounds'
+              ? 'towel_no_verified_lane'
+              : 'no_result'
     case 'survive_connection_spike':
       return decision.status === 'declared_comparison'
           ? 'verified_comparison'
@@ -275,12 +261,6 @@ function outcomeIdFor(
               : session.round5_setup
                 ? 'setup_incomplete'
                 : 'no_result'
-    case 'analyze_live_orders_without_slowing_checkout':
-      return decision.status === 'declared_capability'
-        ? 'verified_capability_gap'
-        : evidence.exactLane === 'lakebase'
-          ? 'checkout_guardrail_unverified'
-          : 'no_result'
   }
 }
 
@@ -369,15 +349,15 @@ function outcomeHeadline(
   if (decision.status === 'adjudicated_stoppage') {
     const winner = winnerName(session, decision.formalWinner)
     if (session.towel && decision.evidence.exactLane) {
+      // The lane that finished wins over one the towel stopped (Ryan, 2026-10-03: "Lakebase
+      // should be deemed the winner!"). Each lane's clock is on screen above this line: the
+      // finished lane's exact time and the other's floor.
       const exactLane = decision.evidence.exactLane
       const otherLane: LaneId = exactLane === 'lakebase' ? 'competitor' : 'lakebase'
-      const exactMs = required(seconds(decision.evidence[exactLane].exactMs), 'exact time')
       const cutoffMs = decision.evidence[otherLane].lowerBoundMs ?? towelCutoffMs(session)
-      const otherName = session.lanes[otherLane].name.toUpperCase()
       return (
-        `TOWEL THROWN AT ${required(seconds(cutoffMs), 'towel cutoff')} · `
-        + `${winner ?? exactLane.toUpperCase()} VERIFIED ${exactMs} · `
-        + `${otherName} UNVERIFIED WHEN STOPPED · LOWER BOUND`
+        `${winner ?? exactLane.toUpperCase()} WINS · `
+        + `TOWEL THROWN AT ${required(seconds(cutoffMs), 'towel cutoff')} · MARGIN IS A LOWER BOUND`
       )
     }
     if (session.remembered_result?.trim()) return session.remembered_result
@@ -390,11 +370,12 @@ function outcomeHeadline(
       seconds(decision.evidence.lakebase.exactMs),
       'capability elapsed time',
     )
-    if (session.round.id === 'put_model_score_in_app') {
-      return `ANALYTICS CHANGE → LIVE APP · ${elapsed} · AWS NOT TIMED · MARGIN N/A`
-    }
-    if (session.round.id === 'analyze_live_orders_without_slowing_checkout') {
-      return `EXACT DELTA ANSWER · ${elapsed} · AWS PIPELINE NOT BUILT · MARGIN N/A`
+    if (
+      session.round.id === 'put_model_score_in_app'
+      || session.round.id === 'analyze_live_orders_without_slowing_checkout'
+    ) {
+      return session.remembered_result?.trim()
+        || `LAKEBASE ${elapsed} · AWS LANE NOT INSTALLED`
     }
   }
   if (session.remembered_result?.trim()) return session.remembered_result
@@ -501,20 +482,25 @@ function proofValues(
       }
       return {
         LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
-        COMPETITOR_NAME: competitorName,
+        // Rounds 4 and 6 differ by the integration that moved the row, not by the database.
+        COMPETITOR_NAME: session.round.id === 'put_model_score_in_app'
+          ? roundFourStackLabel(session, 'competitor')
+          : session.round.id === 'analyze_live_orders_without_slowing_checkout'
+            ? roundSixStackLabel(session, 'competitor')
+            : competitorName,
         COMPETITOR_SECONDS: required(seconds(verifiedElapsed(session, 'competitor')), 'COMPETITOR_SECONDS'),
       }
     case 'verified_capability_gap':
       if (session.round.id === 'put_model_score_in_app') {
         const evidence = modelScoreEvidence(session.lanes.lakebase)
         return {
-          LAKEBASE_SECONDS: required(seconds(roundFourElapsed(session)), 'LAKEBASE_SECONDS'),
+          LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
           PRIMARY_KEY: required(evidence.primaryKey === '—' ? null : evidence.primaryKey, 'PRIMARY_KEY'),
           SCORE: required(evidence.score === '—' ? null : evidence.score, 'SCORE'),
         }
       }
       return {
-        LAKEBASE_SECONDS: required(seconds(roundSixElapsed(session)), 'LAKEBASE_SECONDS'),
+        LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
       }
     case 'verified_rds_capability_gap':
       return {
@@ -552,10 +538,6 @@ function proofValues(
           UNVERIFIED_SETUP_RESULT: unverifiedResult,
         }
       }
-    case 'score_identity_unverified':
-      return {
-        LAKEBASE_SECONDS: required(seconds(roundFourElapsed(session)), 'LAKEBASE_SECONDS'),
-      }
     case 'setup_incomplete':
       return {
         LAKEBASE_SETUP_STATUS: setupStatus(session, 'lakebase'),
@@ -583,10 +565,6 @@ function proofValues(
             || 'clean baseline verification',
           'CLEANUP_GATE',
         ),
-      }
-    case 'checkout_guardrail_unverified':
-      return {
-        LAKEBASE_SECONDS: required(seconds(roundSixElapsed(session)), 'LAKEBASE_SECONDS'),
       }
     case 'towel_no_verified_lane':
       return {

@@ -83,6 +83,42 @@ async def test_session_create_rejects_unknown_fields_before_defaulting_round() -
     assert issue["type"] == "extra_forbidden"
 
 
+async def test_only_round_four_wakes_its_destinations_and_only_for_a_real_competitor() -> None:
+    woken: list[CompetitorId] = []
+
+    class Engine:
+        def __init__(self, competitor: CompetitorId) -> None:
+            self.competitor = competitor
+
+        async def wake(self) -> None:
+            woken.append(self.competitor)
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = RunManager(model_score_factory=Engine)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        accepted = await client.post(
+            "/api/rounds/put_model_score_in_app/wake", json={"competitor": "aurora_serverless_v2"}
+        )
+        # Round 1's Aurora waking is the race itself.
+        refused = await client.post(
+            "/api/rounds/wake_idle_app/wake", json={"competitor": "aurora_serverless_v2"}
+        )
+        unknown = await client.post(
+            "/api/rounds/put_model_score_in_app/wake", json={"competitor": "oracle"}
+        )
+        await asyncio.gather(*api_app.state.run_manager._round4_wake_tasks.values())
+
+    assert accepted.status_code == 202 and accepted.json() == {"waking": True}
+    assert refused.status_code == 404
+    assert unknown.status_code == 422
+    assert woken == [CompetitorId.AURORA_SERVERLESS_V2]
+
+
 def test_other_public_request_models_also_forbid_unknown_fields() -> None:
     with pytest.raises(ValidationError, match="extra_forbidden"):
         RecoveryRequest.model_validate({"confirm": "expected phrase", "confim": "typo"})
@@ -658,9 +694,13 @@ async def test_the_catalog_stops_offering_a_round_databricks_has_already_refused
         async def arm(self, on_progress=None):
             raise PermissionDenied(self._message)
 
+        # Round 4's two-lane engine prepares rather than arms.
+        async def prepare(self, notify=None):
+            raise PermissionDenied(self._message)
+
     run_manager = RunManager(
-        model_score_factory=lambda: RefusingEngine(round_four_refusal),
-        live_orders_factory=lambda: RefusingEngine(round_six_refusal),
+        model_score_factory=lambda _competitor: RefusingEngine(round_four_refusal),
+        live_orders_factory=lambda _competitor: RefusingEngine(round_six_refusal),
     )
     api_app = FastAPI()
     api_app.include_router(router)
@@ -875,9 +915,9 @@ async def test_all_bout_statuses_cover_six_rounds_with_one_bounded_read(
     run_manager = RunManager(
         round_isolation=True,
         installation_id="install-board",
-        model_score_factory=lambda: object(),
+        model_score_factory=lambda _competitor: object(),
         connection_spike_factory=lambda: object(),
-        live_orders_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
     )
     monkeypatch.setattr(
         api_module,
@@ -1018,9 +1058,9 @@ async def test_cleanup_fence_classifies_before_arm_for_every_round(
     run_manager = RunManager(
         round_isolation=True,
         installation_id="install-cleanup-matrix",
-        model_score_factory=lambda: object(),
+        model_score_factory=lambda _competitor: object(),
         connection_spike_factory=lambda: object(),
-        live_orders_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
     )
     monkeypatch.setattr(
         api_module,
@@ -1186,9 +1226,9 @@ async def test_all_bout_statuses_keep_health_failures_unavailable(monkeypatch) -
     run_manager = RunManager(
         round_isolation=True,
         installation_id="install-blocked",
-        model_score_factory=lambda: object(),
+        model_score_factory=lambda _competitor: object(),
         connection_spike_factory=lambda: object(),
-        live_orders_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
     )
     monkeypatch.setattr(
         api_module,
@@ -1598,9 +1638,9 @@ async def test_catalog_probes_shared_storage_before_offering_rounds_four_and_six
     api_app = FastAPI()
     api_app.include_router(router)
     api_app.state.run_manager = RunManager(
-        model_score_factory=lambda: object(),
+        model_score_factory=lambda _competitor: object(),
         connection_spike_factory=lambda competitor: object(),
-        live_orders_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
         delta_storage_probe=denied,
     )
     async with AsyncClient(
@@ -1631,25 +1671,27 @@ async def test_catalog_storage_probe_reads_both_sealed_delta_paths(monkeypatch) 
     calls: list[str] = []
 
     class SourceAdapter:
-        async def probe_source_storage(self) -> None:
+        async def probe_storage(self) -> None:
             calls.append("round4")
 
-    class DestinationAdapter:
-        async def read_history(self, baseline) -> None:
-            assert baseline == "round6-baseline"
+    class LakebaseLane:
+        async def probe_storage(self) -> None:
             calls.append("round6")
+
+    class AwsLane:
+        async def probe_storage(self) -> None:
+            raise AssertionError("the AWS lane's table is Prepare's to check, never the catalog's")
 
     monkeypatch.setattr(
         app_module,
         "model_score_factory_from_manifest",
-        lambda manifest=None: lambda: SimpleNamespace(adapter=SourceAdapter()),
+        lambda manifest=None: lambda _competitor: SimpleNamespace(source=SourceAdapter()),
     )
     monkeypatch.setattr(
         app_module,
         "live_orders_factory_from_manifest",
-        lambda manifest=None: lambda: SimpleNamespace(
-            adapter=DestinationAdapter(),
-            contract=SimpleNamespace(baseline="round6-baseline"),
+        lambda manifest=None: (
+            lambda _competitor: SimpleNamespace(lanes=(LakebaseLane(), AwsLane()))
         ),
     )
 
@@ -1675,30 +1717,26 @@ async def test_storage_probe_attributes_unrepairable_round6_delta_absence(
     history_calls = 0
 
     class SourceAdapter:
-        config = SimpleNamespace(source_repair_job_id="123")
+        repair_job_id = "123"
 
-        async def probe_source_storage(self) -> None:
+        async def probe_storage(self) -> None:
             raise missing("DELTA_PATH_DOES_NOT_EXIST")
 
-    class DestinationAdapter:
-        async def read_history(self, baseline) -> None:
+    class LakebaseLane:
+        async def probe_storage(self) -> None:
             nonlocal history_calls
-            del baseline
             history_calls += 1
             raise missing("DELTA_METADATA_ABSENT_EXISTING_CATALOG_TABLE")
 
     monkeypatch.setattr(
         app_module,
         "model_score_factory_from_manifest",
-        lambda manifest=None: lambda: SimpleNamespace(adapter=SourceAdapter()),
+        lambda manifest=None: lambda _competitor: SimpleNamespace(source=SourceAdapter()),
     )
     monkeypatch.setattr(
         app_module,
         "live_orders_factory_from_manifest",
-        lambda manifest=None: lambda: SimpleNamespace(
-            adapter=DestinationAdapter(),
-            contract=SimpleNamespace(baseline=object()),
-        ),
+        lambda manifest=None: lambda _competitor: SimpleNamespace(lanes=(LakebaseLane(),)),
     )
 
     probe = app_module.delta_storage_probe_from_manifest(SimpleNamespace())
@@ -1788,6 +1826,8 @@ def test_round_five_warm_cleaning_is_cleanup_in_progress(
         lambda: SimpleNamespace(
             egress_sealed=True,
             runtime_role_sealed=True,
+            round4_aws_sealed=False,
+            round6_aws_sealed=False,
         ),
     )
     monkeypatch.setattr(api_module.selfheal, "deployed", lambda: False)
@@ -2038,6 +2078,8 @@ def test_round_five_without_warm_coordinator_uses_readiness_gate(
         lambda: SimpleNamespace(
             egress_sealed=True,
             runtime_role_sealed=True,
+            round4_aws_sealed=False,
+            round6_aws_sealed=False,
         ),
     )
     monkeypatch.setattr(api_module.selfheal, "deployed", lambda: False)
@@ -3648,6 +3690,78 @@ async def test_a_deployed_app_with_a_broken_aws_credential_boots_and_serves(
         assert refused["availability"] == "unavailable", round_id
         assert refused["availability_reason"], round_id
         assert refused["availability_headline"], round_id
+
+
+def test_round_four_races_aws_only_where_its_glue_lane_is_sealed() -> None:
+    """v1.1's Round 4 races Aurora or RDS through AWS Glue once that lane is sealed, and then
+    a dead credential or an unsealed network path stops it like any AWS round. Without the
+    lane it races Lakebase alone and needs no AWS at all."""
+
+    round_four = RoundId.PUT_MODEL_SCORE_IN_APP
+    dead = SimpleNamespace(state="rejected", detail=None)
+    racing = round_availability.AvailabilitySignals(credentials=dead, round4_aws_sealed=True)
+    alone = round_availability.AvailabilitySignals(credentials=dead)
+
+    assert round_availability.aws_backed(round_four, racing)
+    assert not round_availability.aws_backed(round_four, alone)
+    assert round_availability.refusal(round_four, alone) is None
+    refused = round_availability.refusal(round_four, racing)
+    assert refused is not None and "rejected" in refused.detail
+
+    deployed = round_availability.AvailabilitySignals(deployed=True, round4_aws_sealed=True)
+    network = round_availability.refusal(round_four, deployed)
+    assert network is not None
+    assert network.detail == round_availability.AWS_LANE_DEPLOYED_REFUSAL
+    # Round 6 has a lane of its own; Round 4's being sealed says nothing about it.
+    assert round_availability.refusal(RoundId.ANALYZE_LIVE_ORDERS, deployed) is None
+
+
+def test_round_six_races_aws_only_where_its_dms_lane_is_sealed() -> None:
+    """v1.1's Round 6 races Aurora or RDS through AWS DMS and Glue once that lane is sealed,
+    and is then refused like any AWS round. Without the lane it races Lakebase alone."""
+
+    round_six = RoundId.ANALYZE_LIVE_ORDERS
+    dead = SimpleNamespace(state="rejected", detail=None)
+    racing = round_availability.AvailabilitySignals(credentials=dead, round6_aws_sealed=True)
+    alone = round_availability.AvailabilitySignals(credentials=dead)
+
+    assert round_availability.aws_backed(round_six, racing)
+    assert not round_availability.aws_backed(round_six, alone)
+    assert round_availability.refusal(round_six, alone) is None
+    refused = round_availability.refusal(round_six, racing)
+    assert refused is not None and "rejected" in refused.detail
+
+    deployed = round_availability.AvailabilitySignals(deployed=True, round6_aws_sealed=True)
+    network = round_availability.refusal(round_six, deployed)
+    assert network is not None
+    assert network.detail == round_availability.AWS_LANE_DEPLOYED_REFUSAL
+    assert round_availability.refusal(RoundId.PUT_MODEL_SCORE_IN_APP, deployed) is None
+
+
+def test_the_deployed_posture_says_whether_each_aws_lane_is_sealed() -> None:
+    lifecycle.reset_deployed_aws_posture_cache()
+    try:
+        bare = SimpleNamespace(
+            aws=SimpleNamespace(
+                serverless_egress_cidrs=None,
+                serverless_egress_published_at=None,
+                runtime_role_arn=None,
+            ),
+            round4_aws=None,
+            round6_aws=None,
+        )
+        posture = lifecycle.deployed_aws_posture(manifest=bare)
+        assert not posture.round4_aws_sealed and not posture.round6_aws_sealed
+        lifecycle.reset_deployed_aws_posture_cache()
+        sealed = SimpleNamespace(aws=bare.aws, round4_aws=object(), round6_aws=None)
+        posture = lifecycle.deployed_aws_posture(manifest=sealed)
+        assert posture.round4_aws_sealed and not posture.round6_aws_sealed
+        lifecycle.reset_deployed_aws_posture_cache()
+        sealed = SimpleNamespace(aws=bare.aws, round4_aws=None, round6_aws=object())
+        posture = lifecycle.deployed_aws_posture(manifest=sealed)
+        assert posture.round6_aws_sealed and not posture.round4_aws_sealed
+    finally:
+        lifecycle.reset_deployed_aws_posture_cache()
 
 
 async def test_a_credential_that_becomes_valid_clears_a_degraded_boot(

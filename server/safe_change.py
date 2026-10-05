@@ -216,6 +216,10 @@ class SafeChangeLaneResult:
     completed_ns: int
     artifact_id: str
     error: str | None = None
+    #: True when the lane was still running at its bound from the bell: an unfinished
+    #: measurement, whose elapsed time is a floor. False for every other failure, which
+    #: measured nothing.
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -859,8 +863,9 @@ class SafeChangeEngine:
                 wire_call=wire_call,
             )
 
+        bound = asyncio.timeout(self.run_timeout_seconds)
         try:
-            async with asyncio.timeout(self.run_timeout_seconds):
+            async with bound:
                 await self._execute_lane(
                     plan,
                     adapter,
@@ -879,16 +884,22 @@ class SafeChangeEngine:
             raise
         except Exception as exc:
             completed_ns = self._clock_ns()
+            # The lane's own bound, not a TimeoutError raised inside it, which is an error.
+            timed_out = isinstance(exc, TimeoutError) and bound.expired()
             error = (
                 f"Safe-change lane exceeded {self.run_timeout_seconds:.0f} seconds"
-                if isinstance(exc, TimeoutError)
+                if timed_out
                 else str(exc) or type(exc).__name__
             )
             await self._emit(
                 on_progress,
                 plan,
                 SafeChangePhase.FAILED,
-                "The isolated schema change could not be verified",
+                (
+                    "Still running at its bound from the bell"
+                    if timed_out
+                    else "The isolated schema change could not be verified"
+                ),
                 started_ns,
                 error=error,
             )
@@ -902,6 +913,7 @@ class SafeChangeEngine:
                 completed_ns=completed_ns,
                 artifact_id=plan.artifact_id,
                 error=error,
+                timed_out=timed_out,
             )
 
         completed_ns = self._clock_ns()

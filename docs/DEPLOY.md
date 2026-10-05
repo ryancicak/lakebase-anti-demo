@@ -298,7 +298,7 @@ the startup retry did not apply — and the container never started. That made t
 sweep fatal in a way no credential design fixes, because `EphemeralNuke` deletes
 the IAM users along with the databases: a *running* process survives the sweep,
 having validated once at boot, and the next restart after it came up with nothing
-at all — including Rounds 4 and 6, which reach Lakebase and no AWS whatsoever.
+at all — including Rounds 4 and 6, which then reached Lakebase and no AWS whatsoever.
 The check is unchanged and still runs in the same place; what changed is that the
 answer is now reported instead of thrown. A refused credential comes up as
 `credentials_state` `rejected` (or `absent`, when nothing is exported at all) on

@@ -1,6 +1,7 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
 import { classifyOutcome } from './ringside-cues'
-import { metricValue, modelScoreEvidence } from './round4'
+import { modelScoreEvidence, roundFourLaneLabel } from './round4'
+import { liveOrderEvidence, roundSixLaneLabel } from './round6'
 import {
   ROUND_FIVE_BELL_PROTOCOL,
   ROUND_FIVE_FANIN_PROTOCOL,
@@ -33,18 +34,6 @@ export interface ReplayStory {
   beats: [ReplayBeat, ReplayBeat, ReplayBeat]
   metricBeat: 'setup' | 'takeaway'
   metrics: ReplayMetric[]
-}
-
-function number(value: unknown): number | null {
-  const parsed = typeof value === 'string' ? Number(value) : value
-  return typeof parsed === 'number' && Number.isFinite(parsed) && parsed >= 0
-    ? parsed
-    : null
-}
-
-function evidenceText(session: DemoSession, key: string): string | null {
-  const value = session.lanes.lakebase.evidence?.[key]
-  return value === null || value === undefined || value === '' ? null : String(value)
 }
 
 function laneName(session: DemoSession, laneId: LaneId): string {
@@ -141,9 +130,7 @@ function incompleteTakeaway(session: DemoSession): string | null {
       : 'The proof did not complete, and run-owned cleanup also failed. No winner or margin can be claimed.'
   }
   if (outcome.status === 'guardrail_failure') {
-    return session.round.id === 'analyze_live_orders_without_slowing_checkout'
-      ? 'The exact Delta answer was observed, but the separate checkout guardrail did not verify. The capability proof did not complete.'
-      : 'A timing was observed, but the exact row identity did not verify. The capability proof did not complete.'
+    return 'A timing was observed, but a required check did not verify. No winner or margin can be claimed.'
   }
   if (
     session.round.id === 'survive_connection_spike'
@@ -320,41 +307,41 @@ function roundThreeStory(session: DemoSession): ReplayStory {
 
 function roundFourStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
-  const outcome = classifyOutcome(session)
   const evidence = modelScoreEvidence(session.lanes.lakebase)
-  const score = evidence.score === '—' ? 'the model score' : `score ${evidence.score}`
+  const score = evidence.score === '—' ? 'one model score' : `score ${evidence.score}`
   const delta = evidence.deltaVersion === '—' ? '' : ` at Delta version ${evidence.deltaVersion}`
-  const metric = outcome.evidence.lakebase.exactMs === null
-    ? null
-    : number(metricValue(session, 'application_proof_elapsed_ms')?.value)
-      ?? outcome.evidence.lakebase.exactMs
+  const awsLane = session.lanes.competitor.state !== 'not_supported'
   return {
     ...state,
     metricBeat: 'takeaway',
-    metrics: metric === null
-      ? []
-      : [{
-          laneId: 'lakebase',
-          label: 'Delta commit → exact app read',
-          value: preciseDuration(metric),
-          note: 'Exact Lakebase result',
-        }],
+    metrics: observedMetrics(
+      session,
+      {
+        lakebase: roundFourLaneLabel(session, 'lakebase'),
+        competitor: roundFourLaneLabel(session, 'competitor'),
+      },
+      { lakebase: 'Bell to exact app read', competitor: 'Bell to exact app read' },
+    ),
     beats: [
       {
         id: 'setup',
         title: 'Setup',
-        body: `One exact ${score} was committed to the source Delta table${delta}.`,
+        body: awsLane
+          ? 'Both integrations were parked before the bell, and both applications read the baseline row.'
+          : 'Lakebase’s synced table was parked and its application read the baseline row. This installation has no AWS lane, so no AWS clock started.',
       },
       {
         id: 'same-test',
         title: 'Same test',
-        body: `Managed Reverse ETL had to report that exact Delta commit, then a fresh app connection had to return the exact row.${incompleteTestSuffix(session)}`,
+        body: `The bell started ${awsLane ? 'both integrations' : 'the synced table'} and committed ${score} to the Delta table${delta}. Each clock stopped at its own first exact read of that row, polled every 250 ms.${incompleteTestSuffix(session)}`,
       },
       {
         id: 'takeaway',
         title: 'Takeaway',
         body: incompleteTakeaway(session)
-          ?? 'This proves the Lakebase capability. No AWS reverse-ETL path was built or timed, so there is no AWS race or margin.',
+          ?? (awsLane
+            ? 'Each clock contains its own cold start. Lakebase’s sync figure comes from its own timestamps and is never compared. Model serving was not tested.'
+            : 'This proves the Lakebase path. Without the AWS lane there is no race or margin.'),
       },
     ],
   }
@@ -469,44 +456,42 @@ function roundFiveStory(session: DemoSession): ReplayStory {
 
 function roundSixStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
-  const outcome = classifyOutcome(session)
-  const sku = evidenceText(session, 'sku')
-  const store = evidenceText(session, 'store')
-  const total = evidenceText(session, 'total_display')
-  const order = [sku, store, total].filter(Boolean).join(' · ')
-  const elapsed = outcome.evidence.lakebase.exactMs === null
-    ? null
-    : number(metricValue(session, 'analytics_available_ms')?.value)
-      ?? outcome.evidence.lakebase.exactMs
+  const total = liveOrderEvidence(session.lanes.lakebase).totalDisplay
+  const checkout = total === '—' ? 'one checkout' : `one ${total} checkout`
+  const awsLane = session.lanes.competitor.state !== 'not_supported'
   return {
     ...state,
     metricBeat: 'takeaway',
-    metrics: elapsed === null
-      ? []
-      : [{
-          laneId: 'lakebase',
-          label: 'Checkout commit → exact Delta answer',
-          value: preciseDuration(elapsed),
-          note: 'Exact Lakebase result',
-        }],
+    metrics: observedMetrics(
+      session,
+      {
+        lakebase: roundSixLaneLabel(session, 'lakebase'),
+        competitor: roundSixLaneLabel(session, 'competitor'),
+      },
+      { lakebase: 'Bell to exact Delta read', competitor: 'Bell to exact Delta read' },
+    ),
     beats: [
       {
         id: 'setup',
         title: 'Setup',
-        body: order
-          ? `One checkout committed to application Postgres: ${order}.`
-          : 'One checkout committed to the live application Postgres table.',
+        body: awsLane
+          ? 'AWS DMS and Glue were parked before the bell, Lakebase’s change feed was streaming, and both sources read the baseline order.'
+          : 'Lakebase’s change feed was streaming and its source read the baseline order. This installation has no AWS lane, so no AWS clock started.',
       },
       {
         id: 'same-test',
         title: 'Same test',
-        body: `Delta history had to return that exact order once, and a separate checkout had to commit and read back as the guardrail.${incompleteTestSuffix(session)}`,
+        body: awsLane
+          ? `The bell committed ${checkout} on both sources and started AWS DMS and Glue cold. Each clock stopped at its own first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`
+          : `The bell committed ${checkout} on Lakebase. Its clock stopped at its first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`,
       },
       {
         id: 'takeaway',
         title: 'Takeaway',
         body: incompleteTakeaway(session)
-          ?? 'This proves the Lakebase change-data capability. No AWS CDC stack was built or timed, so there is no AWS race or margin.',
+          ?? (awsLane
+            ? 'AWS’s clock contains its cold start; Lakebase’s feed is built in and always on. A separate checkout committed on each source.'
+            : 'This proves the Lakebase path. Without the AWS lane there is no race or margin.'),
       },
     ],
   }

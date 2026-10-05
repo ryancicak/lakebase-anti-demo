@@ -111,6 +111,7 @@ class FakeSession:
             "tag_role",
             "tag_policy",
             "tag_instance_profile",
+            "put_bucket_tagging",
         }
         return [call for call in self.calls if call[1] in writes]
 
@@ -384,6 +385,232 @@ def test_discovery_keeps_only_this_installations_terraform_resources() -> None:
         assert names["tag:managed-by"] == ["terraform"]
     # Discovery only reads.
     assert session.tagged() == []
+
+
+GLUE_ARN = f"arn:aws:glue:us-west-2:{ACCOUNT}"
+
+
+def _manifest_with_round4_glue():
+    manifest = make_manifest()
+    manifest.round4_aws = SimpleNamespace(
+        role_arn=f"arn:aws:iam::{ACCOUNT}:role/i1-r4-glue-1",
+        bucket="lakebase-ant-x-r4-glue",
+        aurora=SimpleNamespace(
+            job_name="lakebase-ant-x-r4-writer-aurora", connection_name="lakebase-ant-x-r4-aurora"
+        ),
+        rds=SimpleNamespace(
+            job_name="lakebase-ant-x-r4-writer-rds", connection_name="lakebase-ant-x-r4-rds"
+        ),
+    )
+    return manifest
+
+
+def test_discovery_finds_round_four_s_glue_lane_from_its_seal_and_its_tags() -> None:
+    manifest = _manifest_with_round4_glue()
+    own = {**OWN, "expires-at": "2026-09-28T00:00:00Z"}
+    neighbor = f"{GLUE_ARN}:connection/lakebase-ant-x-r4-aurora"
+    session = FakeSession(
+        pages={
+            ("ec2", "describe_subnets"): [
+                {"Subnets": [{"SubnetId": "subnet-own", "Tags": _tags(own)}]}
+            ],
+            ("ec2", "describe_route_tables"): [
+                {"RouteTables": [{"RouteTableId": "rtb-own", "Tags": _tags(own)}]}
+            ],
+            ("ec2", "describe_vpc_endpoints"): [
+                {"VpcEndpoints": [{"VpcEndpointId": "vpce-own", "Tags": _tags(own)}]}
+            ],
+            ("iam", "list_attached_role_policies"): [
+                {
+                    "AttachedPolicies": [
+                        {"PolicyArn": "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"}
+                    ]
+                }
+            ],
+            ("iam", "list_instance_profiles_for_role"): [{"InstanceProfiles": []}],
+        },
+        responses={
+            # One connection's tags name another installation: read, and left alone.
+            ("glue", "get_tags"): lambda ResourceArn: {
+                "Tags": {**own, "anti-demo-run-id": "somebody-else"}
+                if ResourceArn == neighbor
+                else own
+            },
+            ("s3", "get_bucket_tagging"): {"TagSet": _tags(own)},
+            ("iam", "get_role"): lambda RoleName: {
+                "Role": {"RoleName": RoleName, "Tags": _tags(own)}
+            },
+        },
+    )
+
+    inventory = discover_lease_targets(session, manifest)
+
+    found = {(target.service, target.identifier) for target in inventory.targets}
+    assert found == {
+        ("ec2", "subnet-own"),
+        ("ec2", "rtb-own"),
+        ("ec2", "vpce-own"),
+        ("glue", f"{GLUE_ARN}:job/lakebase-ant-x-r4-writer-aurora"),
+        ("glue", f"{GLUE_ARN}:job/lakebase-ant-x-r4-writer-rds"),
+        ("glue", f"{GLUE_ARN}:connection/lakebase-ant-x-r4-rds"),
+        ("s3-bucket", "lakebase-ant-x-r4-glue"),
+        ("iam-role", "i1-r4-glue-1"),
+    }
+    assert inventory.unreadable == ()
+    assert session.tagged() == []
+
+
+def test_an_installation_without_the_glue_lane_asks_glue_and_s3_nothing() -> None:
+    session = FakeSession()
+
+    inventory = discover_lease_targets(session, make_manifest())
+
+    assert inventory.unreadable == ()
+    assert not [call for call in session.calls if call[0] in {"glue", "s3", "dms"}]
+
+
+DMS_ARN = f"arn:aws:dms:us-west-2:{ACCOUNT}"
+
+
+def _manifest_with_round6_lane():
+    manifest = make_manifest()
+    manifest.round6_aws = SimpleNamespace(
+        glue_role_arn=f"arn:aws:iam::{ACCOUNT}:role/i1-r6-glue-1",
+        dms_s3_role_arn=f"arn:aws:iam::{ACCOUNT}:role/i1-r6-dms-s3-1",
+        uc_role_arn=f"arn:aws:iam::{ACCOUNT}:role/i1-r6-uc",
+        bucket="lakebase-ant-x-r6-cdc",
+        replication_instance_arn=f"{DMS_ARN}:rep:INSTANCE",
+        aurora=SimpleNamespace(
+            job_name="lakebase-ant-x-r6-writer-aurora",
+            source_endpoint_arn=f"{DMS_ARN}:endpoint:SRCA",
+            target_endpoint_arn=f"{DMS_ARN}:endpoint:DSTA",
+            task_arn=f"{DMS_ARN}:task:TASKA",
+        ),
+        rds=SimpleNamespace(
+            job_name="lakebase-ant-x-r6-writer-rds",
+            source_endpoint_arn=f"{DMS_ARN}:endpoint:SRCR",
+            target_endpoint_arn=f"{DMS_ARN}:endpoint:DSTR",
+            task_arn=f"{DMS_ARN}:task:TASKR",
+        ),
+    )
+    return manifest
+
+
+def test_discovery_finds_round_six_s_dms_lane_from_its_seal_and_its_tags() -> None:
+    manifest = _manifest_with_round6_lane()
+    own = {**OWN, "expires-at": "2026-09-28T00:00:00Z"}
+    subnet_group = f"{DMS_ARN}:subgrp:lakebase-ant-x-r6-dms"
+    neighbor = f"{DMS_ARN}:endpoint:DSTR"
+    session = FakeSession(
+        pages={
+            ("iam", "list_attached_role_policies"): [{"AttachedPolicies": []}],
+            ("iam", "list_instance_profiles_for_role"): [{"InstanceProfiles": []}],
+        },
+        responses={
+            ("dms", "describe_replication_instances"): {
+                "ReplicationInstances": [
+                    {
+                        "ReplicationSubnetGroup": {
+                            "ReplicationSubnetGroupIdentifier": "lakebase-ant-x-r6-dms"
+                        }
+                    }
+                ]
+            },
+            # One endpoint's tags name another installation: read, and left alone.
+            ("dms", "list_tags_for_resource"): lambda ResourceArn: {
+                "TagList": _tags(
+                    {**own, "anti-demo-run-id": "somebody-else"}
+                    if ResourceArn == neighbor
+                    else own
+                )
+            },
+            ("glue", "get_tags"): {"Tags": own},
+            ("s3", "get_bucket_tagging"): {"TagSet": _tags(own)},
+            ("iam", "get_role"): lambda RoleName: {
+                "Role": {"RoleName": RoleName, "Tags": _tags(own)}
+            },
+        },
+    )
+
+    inventory = discover_lease_targets(session, manifest)
+
+    found = {(target.service, target.identifier) for target in inventory.targets}
+    assert {
+        ("dms", f"{DMS_ARN}:rep:INSTANCE"),
+        ("dms", subnet_group),
+        ("dms", f"{DMS_ARN}:endpoint:SRCA"),
+        ("dms", f"{DMS_ARN}:endpoint:DSTA"),
+        ("dms", f"{DMS_ARN}:endpoint:SRCR"),
+        ("dms", f"{DMS_ARN}:task:TASKA"),
+        ("dms", f"{DMS_ARN}:task:TASKR"),
+        ("glue", f"{GLUE_ARN}:job/lakebase-ant-x-r6-writer-aurora"),
+        ("glue", f"{GLUE_ARN}:job/lakebase-ant-x-r6-writer-rds"),
+        ("s3-bucket", "lakebase-ant-x-r6-cdc"),
+        ("iam-role", "i1-r6-glue-1"),
+        ("iam-role", "i1-r6-dms-s3-1"),
+        ("iam-role", "i1-r6-uc"),
+    } <= found
+    assert ("dms", neighbor) not in found
+    assert inventory.unreadable == ()
+    assert session.tagged() == []
+
+
+def test_the_dms_lease_moves_the_lease_key_alone() -> None:
+    manifest = _manifest_with_round6_lane()
+    session = FakeSession()
+    target = NOW + timedelta(hours=72)
+    arn = f"{DMS_ARN}:task:TASKA"
+    inventory = LeaseInventory((LeaseTarget(service="dms", identifier=arn, lease=NOW),), ())
+
+    renew_lease(session, manifest, target, inventory=inventory)
+
+    writes = [call for call in session.tagged() if call[0] == "dms"]
+    assert writes == [
+        (
+            "dms",
+            "add_tags_to_resource",
+            {"ResourceArn": arn, "Tags": [{"Key": "expires-at", "Value": format_lease(target)}]},
+        )
+    ]
+
+
+def test_the_bucket_lease_moves_alone_and_every_other_tag_is_written_back() -> None:
+    # S3 replaces a bucket's whole tag set, so a write of the lease alone would erase the
+    # ownership tags cleanup proves the bucket by.
+    manifest = _manifest_with_round4_glue()
+    current = {**OWN, "expires-at": "2026-09-28T00:00:00Z", "anti-demo-round": "r4"}
+    session = FakeSession(responses={("s3", "get_bucket_tagging"): {"TagSet": _tags(current)}})
+    target = NOW + timedelta(hours=72)
+    inventory = LeaseInventory(
+        (
+            LeaseTarget("s3-bucket", "lakebase-ant-x-r4-glue", NOW),
+            LeaseTarget("glue", f"{GLUE_ARN}:job/lakebase-ant-x-r4-writer-rds", NOW),
+        )
+    )
+
+    renewal = renew_lease(session, manifest, target, inventory=inventory)
+
+    written = {call[1]: call[2] for call in session.tagged()}
+    assert {
+        item["Key"]: item["Value"] for item in written["put_bucket_tagging"]["Tagging"]["TagSet"]
+    } == {**current, "expires-at": format_lease(target)}
+    assert written["tag_resource"] == {
+        "ResourceArn": f"{GLUE_ARN}:job/lakebase-ant-x-r4-writer-rds",
+        "TagsToAdd": {"expires-at": format_lease(target)},
+    }
+    assert renewal.complete and renewal.renewed == 2
+
+
+def test_a_bucket_whose_tags_no_longer_prove_it_ours_is_never_overwritten() -> None:
+    manifest = _manifest_with_round4_glue()
+    theirs = {"anti-demo-run-id": "somebody-else", "managed-by": "terraform"}
+    session = FakeSession(responses={("s3", "get_bucket_tagging"): {"TagSet": _tags(theirs)}})
+    inventory = LeaseInventory((LeaseTarget("s3-bucket", "lakebase-ant-x-r4-glue", NOW),))
+
+    renewal = renew_lease(session, manifest, NOW + timedelta(hours=72), inventory=inventory)
+
+    assert session.tagged() == []
+    assert renewal.failed == ("s3-bucket ValueError",)
 
 
 def test_a_service_that_cannot_be_listed_is_named_and_the_rest_still_read() -> None:

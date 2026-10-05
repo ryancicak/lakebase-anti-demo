@@ -27,6 +27,7 @@ import pytest
 from test_round5_warm import Clock, Provider, coordinator  # noqa: E402
 
 from server.connection_spike_live import (
+    ConnectionSpikeCleanupError,
     ConnectionSpikeLiveConfigurationError,
     ConnectionSpikeLiveSourceUnavailableError,
     ConnectionSpikeLiveSourceUnresolvedError,
@@ -53,8 +54,8 @@ SG = "sg-competitor"
 
 # A representative, non-exhaustive set of RDS/Aurora statuses that are transient:
 # the source is present and its identity is intact, it is simply not yet usable.
+# Not `backing-up`: a source serves through its daily backup (see the test below).
 TRANSIENT_STATUSES = [
-    "backing-up",
     "modifying",
     "failing-over",
     "rebooting",
@@ -101,6 +102,15 @@ def _classify(source: _CompetitorSource, *, sg: str | None = SG) -> None:
 def test_matching_identity_and_available_passes() -> None:
     _classify(_source())  # exact-security-group contract
     _classify(_source(), sg=None)  # preflight derives the group, wants exactly one
+
+
+def test_a_source_in_its_daily_backup_is_still_a_warm_source() -> None:
+    """2026-10-02: rc10's Round 5 Aurora source read `backing-up` for about a minute and a half
+    after its automated snapshot finished, and the keeper marked the ring unclaimable for 25
+    seconds while it re-warmed. A bell rung then would have been refused."""
+
+    _classify(_source(status="backing-up"))
+    _classify(_source(status="backing-up"), sg=None)
 
 
 @pytest.mark.parametrize("status", TRANSIENT_STATUSES)
@@ -246,6 +256,22 @@ async def test_prepare_fails_closed_on_unexpected_error() -> None:
     assert raised.value.code == "warm_baseline_unexpected"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Round 5 runner omitted cleanup or flock-release evidence",
+        "Round 5 runner cancellation did not confirm cleanup and flock release within 45s",
+    ],
+)
+async def test_prepare_maps_unconfirmed_runner_settlement_to_retryable(message: str) -> None:
+    # Release run rc7, 2026-10-01 08:39:57Z: setup's idle re-run reconfigured both
+    # runners mid-warm, the job died without printing its cleanup evidence, and the
+    # fail-closed fallthrough latched Round 5 for an operator.
+    with pytest.raises(RetryableWarmError) as raised:
+        await _prepare_with(ConnectionSpikeCleanupError(message))
+    assert raised.value.code == "warm_runner_settlement_unconfirmed"
+
+
 # --------------------------------------------------------------------------- #
 # 3. Taxonomy: the persistent escalation is self-verifiable, not terminal
 # --------------------------------------------------------------------------- #
@@ -324,6 +350,44 @@ async def test_persistent_source_unavailable_escalates_self_verifiable_not_termi
 
     # And it does self-heal without a human: clear the transient, cross the
     # self-verifiable recheck interval, and it returns to READY on its own.
+    clock.advance(SELF_VERIFIABLE_BLOCK_RETRY_SECONDS + 1)
+    provider.prepare_error = None
+    for _ in range(3):
+        await manager.run_one_cycle()
+        slot = await manager.store.read("install-one")
+        assert slot is not None
+        if slot.state == Round5WarmState.READY:
+            break
+        clock.advance(SELF_VERIFIABLE_BLOCK_RETRY_SECONDS + 1)
+    assert slot is not None
+    assert slot.state == Round5WarmState.READY
+
+
+async def test_unconfirmed_runner_settlement_rechecks_itself_back_to_ready() -> None:
+    # The resident keeps restarting for as long as setup is reconfiguring the runners,
+    # so the retries can run out before it settles. What they escalate to must still
+    # recheck on its own, and the round must come back once the runner is quiet.
+    assert "warm_runner_settlement_unconfirmed_persistent" in SELF_VERIFIABLE_BLOCK_CODES
+    clock = Clock()
+    provider = Provider(clock)
+    provider.release_prepare.set()
+    provider.prepare_error = RetryableWarmError("warm_runner_settlement_unconfirmed")
+    manager = coordinator(clock, provider)
+
+    slot = None
+    for _ in range(MAX_TRANSIENT_WARM_ATTEMPTS + 5):
+        await manager.run_one_cycle()
+        slot = await manager.store.read("install-one")
+        assert slot is not None
+        if slot.state == Round5WarmState.BLOCKED:
+            break
+        clock.advance(120)
+
+    assert slot is not None
+    assert slot.state == Round5WarmState.BLOCKED
+    assert slot.last_error_code == "warm_runner_settlement_unconfirmed_persistent"
+    assert manager.public_status_cached()["round5_warm_blocked_terminal"] is False
+
     clock.advance(SELF_VERIFIABLE_BLOCK_RETRY_SECONDS + 1)
     provider.prepare_error = None
     for _ in range(3):

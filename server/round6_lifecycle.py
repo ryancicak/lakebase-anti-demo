@@ -1512,9 +1512,22 @@ def cleanup_round6(
     # Asked before the CDF config is destroyed. The answer does not depend on
     # deleting it, and refusing afterwards would strand the environment.
     tables = _destination_tables(workspace, sealed)
-    if [(item.get("full_name"), item.get("table_id")) for item in tables] not in (
-        [],
-        [(sealed.destination_table_full_name, sealed.destination_table_id)],
+    # v1.1's AWS lane keeps its two history tables in this schema beside Lakebase's
+    # destination, named by its own rule in this installation's own schema. Every v1.1
+    # uninstall refused on them. They are accepted by that name, sealed or not: a lane
+    # whose stage made its table and then failed before sealing would otherwise leave a
+    # cleanup that refuses on every retry, and --force-round6 does not relax this check.
+    from .round6_aws_lifecycle import history_table_full_name  # imports this module
+
+    aws_history = {
+        history_table_full_name(sealed.destination_catalog, sealed.destination_schema, competitor)
+        for competitor in ("aurora", "rds")
+    }
+    destination = (sealed.destination_table_full_name, sealed.destination_table_id)
+    if any(
+        (item.get("full_name"), item.get("table_id")) != destination
+        and item.get("full_name") not in aws_history
+        for item in tables
     ):
         raise RuntimeError("Cleanup refused: Round 6 destination schema has unexpected tables")
     _delete_if_present(

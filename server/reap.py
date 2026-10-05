@@ -42,7 +42,7 @@ report and move on:
 * the identifier is independently re-derived as a per-bout artifact of this run,
   rather than trusted from the finding alone;
 * the identifier is not a resident the seal expects to exist;
-* the kind is an RDS instance or cluster, so the standing m6i.large runner is
+* the kind is an RDS instance or cluster, so Round 5's two standing runners are
   unreachable from here by construction;
 * no ring lease covers the round that owns it, on either the round's own key or
   the main key, because a held lease means a bout may genuinely still be running;

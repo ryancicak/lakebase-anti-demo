@@ -1399,3 +1399,102 @@ async def test_a_missing_aws_session_entirely_still_returns_unmeasured(
     started, ended = _bout_window()
 
     assert await AuroraCredentialProvider().sample_acu_seconds(started, ended) is None
+
+
+def _aurora_reporting(cluster_status: str, writer_status: str) -> FakeAuroraSession:
+    """The usual parked Aurora, with the control plane reporting the given states."""
+
+    session = FakeAuroraSession()
+    clusters, instances = session.rds.describe_db_clusters, session.rds.describe_db_instances
+
+    def describe_db_clusters(DBClusterIdentifier: str):  # noqa: N803 - boto3's keyword
+        response = clusters(DBClusterIdentifier)
+        response["DBClusters"][0]["Status"] = cluster_status
+        return response
+
+    def describe_db_instances(DBInstanceIdentifier: str):  # noqa: N803 - boto3's keyword
+        response = instances(DBInstanceIdentifier)
+        response["DBInstances"][0]["DBInstanceStatus"] = writer_status
+        return response
+
+    session.rds.describe_db_clusters = describe_db_clusters
+    session.rds.describe_db_instances = describe_db_instances
+    return session
+
+
+@pytest.mark.parametrize(
+    ("cluster_status", "writer_status"), [("backing-up", "available"), ("available", "backing-up")]
+)
+async def test_aurora_arms_through_its_daily_automated_backup(
+    monkeypatch: pytest.MonkeyPatch, cluster_status: str, writer_status: str
+) -> None:
+    """2026-10-02: the minute of a daily automated backup reads `backing-up`, and the same
+    strictness refused a Round 3 bout on rc10. The writer is still parked at zero."""
+
+    configure_aurora(monkeypatch)
+    session = _aurora_reporting(cluster_status, writer_status)
+    monkeypatch.setattr("server.targets.boto3.Session", lambda **kwargs: session)
+
+    evidence = await AuroraCredentialProvider().assert_armed()
+
+    assert evidence["state"] == "SCALE_ZERO"
+
+
+@pytest.mark.parametrize(
+    ("cluster_status", "writer_status"), [("modifying", "available"), ("available", "rebooting")]
+)
+async def test_aurora_in_any_other_state_still_does_not_arm(
+    monkeypatch: pytest.MonkeyPatch, cluster_status: str, writer_status: str
+) -> None:
+    configure_aurora(monkeypatch)
+    session = _aurora_reporting(cluster_status, writer_status)
+    monkeypatch.setattr("server.targets.boto3.Session", lambda **kwargs: session)
+
+    with pytest.raises(TargetNotArmedError, match="control plane is not available"):
+        await AuroraCredentialProvider().assert_armed()
+
+
+@pytest.mark.parametrize(("status", "arms"), [("backing-up", True), ("modifying", False)])
+async def test_rds_arms_through_its_daily_automated_backup(
+    monkeypatch: pytest.MonkeyPatch, status: str, arms: bool
+) -> None:
+    monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+    rds = boto3.Session(
+        aws_access_key_id="test-access",
+        aws_secret_access_key="test-secret",
+        region_name=REGION,
+    ).client("rds")
+    configure_rds(monkeypatch)
+    stub = Stubber(rds)
+    stub.add_response(
+        "describe_db_instances",
+        {
+            "DBInstances": [
+                {
+                    "DBInstanceIdentifier": "anti-demo-rds",
+                    "DBInstanceArn": f"arn:aws:rds:{REGION}:{ACCOUNT_ID}:db:anti-demo-rds",
+                    "DBInstanceStatus": status,
+                    "DBInstanceClass": "db.t4g.medium",
+                    "Engine": "postgres",
+                    "EngineVersion": "17.10",
+                    "PubliclyAccessible": True,
+                }
+            ]
+        },
+        {"DBInstanceIdentifier": "anti-demo-rds"},
+    )
+    stub.activate()
+
+    class StubbedSession:
+        def client(self, name: str):
+            return rds if name == "rds" else FakeStsClient()
+
+    monkeypatch.setattr("server.targets.boto3.Session", lambda **kwargs: StubbedSession())
+    provider = RdsCredentialProvider(round_id=SCORED_ROUND)
+
+    if arms:
+        assert (await provider.assert_armed())["state"] == "NO_SCALE_TO_ZERO"
+    else:
+        with pytest.raises(TargetNotArmedError, match="MODIFYING, not AVAILABLE"):
+            await provider.assert_armed()

@@ -1,18 +1,19 @@
 // What the final card is allowed to say about a round nobody entered against.
 //
-// WHY THIS FILE EXISTS. Round 6's `comparison_kind` is `capability_gap`: the
-// opponent lane reports `not_supported` because no AWS CDC pipeline was built,
-// so `competitor_ms` is null and `margin_ms` is null. Every screen that owns
-// Round 6 says so in words -- the receipt reads "NOT BUILT OR TIMED · NO HONEST
-// TIMER · NO SPEED MARGIN", the round summary reads "One lane only — a time, not
-// a race". The final scorecard was the one surface that did not, and it got
-// three separate things wrong about the same round:
+// WHY THIS FILE EXISTS. A Round 6 bout on an installation without its AWS lane is
+// a capability gap: the opponent lane reports `not_supported`, so `competitor_ms`
+// is null and `margin_ms` is null. (Until v1.1 every Round 6 bout was, because no
+// AWS pipeline was built; v1.1 races AWS DMS and Glue wherever that lane is
+// installed.) Every screen that owns such a bout says so in words -- the round
+// summary reads "One lane only — a time, not a race". The final scorecard was the
+// one surface that did not, and it got three separate things wrong about the same
+// round:
 //
 //   1. Its round-number lookup knew Rounds 1-3 only, so Round 6 fell to the
 //      row's position in the list and printed whatever index it sat at.
 //   2. Its proof label fell through to "Non-executable round · no proof", which
-//      is false twice: the round runs, and its proof is the exact order landing
-//      in Delta with the count verified.
+//      is false twice: the round runs, and its proof is the exact order read back
+//      out of Delta.
 //   3. It counted a null opponent time as a Lakebase win, so an unraced round
 //      arrived in the tally as a "verified win" -- and the staff roll, which
 //      says it only restates the card, inherited the same count.
@@ -75,16 +76,16 @@ const ABANDONED = row({
   remembered_result: 'TOWELED AT 45.00s · NO WINNER · MARGIN N/A',
 })
 
-/** Round 6 exactly as the server describes it: verified, and never raced. */
+/** Round 6 on an installation without its AWS lane: verified, and never raced. */
 const ROUND_SIX = row({
   session_id: 'S6',
   round_id: 'analyze_live_orders_without_slowing_checkout' as RoundId,
   round_title: 'Move live application data into the lakehouse',
-  competitor: 'Aurora/RDS',
+  competitor: 'Aurora Serverless v2',
   lakebase_ms: 1_234,
   competitor_ms: null,
   competitor_capability_gap: true,
-  remembered_result: 'LAKEBASE NATIVE CDF WIN · AWS PIPELINE NOT BUILT · MARGIN N/A',
+  remembered_result: 'LAKEBASE 1.2s · AWS LANE NOT INSTALLED',
 })
 
 const card = (entries: ScorecardEntry[]) => render(
@@ -117,7 +118,7 @@ describe('the final scorecard on a capability-gap round', () => {
   it('does not call Round 6 a non-executable round with no proof', () => {
     card([ROUND_SIX])
     expect(document.body).not.toHaveTextContent('Non-executable round · no proof')
-    expect(screen.getByText('Live order → exact Delta answer')).toBeInTheDocument()
+    expect(screen.getByText('Live checkout → exact Delta read')).toBeInTheDocument()
   })
 
   it('states the absent margin as a capability gap rather than leaving a blank', () => {

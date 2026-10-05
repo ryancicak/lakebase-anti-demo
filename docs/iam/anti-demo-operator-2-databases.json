@@ -6,6 +6,8 @@
       "Effect": "Allow",
       "Action": [
         "rds:DescribeAccountAttributes",
+        "rds:DescribeDBClusterParameterGroups",
+        "rds:DescribeDBClusterParameters",
         "rds:DescribeDBClusterSnapshots",
         "rds:DescribeDBClusters",
         "rds:DescribeDBEngineVersions",
@@ -72,8 +74,29 @@
         "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:db:adrc-*",
         "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:subgrp:lakebase-ant*",
         "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:pg:default.postgres17",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:pg:lakebase-ant*",
         "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster-pg:*",
         "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:secgrp:*"
+      ]
+    },
+    {
+      "Sid": "ManageDemoOwnedParameterGroups",
+      "Effect": "Allow",
+      "Action": [
+        "rds:AddTagsToResource",
+        "rds:CreateDBClusterParameterGroup",
+        "rds:CreateDBParameterGroup",
+        "rds:DeleteDBClusterParameterGroup",
+        "rds:DeleteDBParameterGroup",
+        "rds:ModifyDBClusterParameterGroup",
+        "rds:ModifyDBParameterGroup",
+        "rds:RemoveTagsFromResource",
+        "rds:ResetDBClusterParameterGroup",
+        "rds:ResetDBParameterGroup"
+      ],
+      "Resource": [
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:pg:lakebase-ant*",
+        "arn:aws:rds:<AWS_REGION>:<AWS_ACCOUNT_ID>:cluster-pg:lakebase-ant*"
       ]
     },
     {

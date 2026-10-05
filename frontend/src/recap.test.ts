@@ -12,6 +12,7 @@ import {
   roundNumber,
   summariseRounds,
   tally,
+  verdictFor,
 } from './recap'
 
 /**
@@ -87,6 +88,32 @@ describe('boutView', () => {
     expect(view.marginMs).toBeNull()
   })
 
+  it('reads a Round 2 lane stopped at its bound as a declared Lakebase win over a floor', () => {
+    // Ryan's rule (2026-10-03): a lane still running at its bound from the bell loses to
+    // the lane that finished, so the server declares the bout and keeps no margin.
+    const stoppage = receipt({
+      round_id: 'make_schema_change_safely',
+      round_title: 'MAKE A SCHEMA CHANGE SAFELY',
+      lakebase: { ms: 7120.0, state: 'verified', lower_bound: false, reason: null },
+      opponent_lane: {
+        ms: 720004.0,
+        state: 'failed',
+        lower_bound: true,
+        reason: 'Still running at its bound from the bell · stopped there',
+      },
+      margin_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN IS A LOWER BOUND',
+    })
+    const view = boutView(stoppage)
+
+    expect(view.kind).toBe('bounded')
+    expect(view.opponentIsLowerBound).toBe(true)
+    expect(view.marginMs).toBeNull()
+    expect(view.scoreable).toBe(true)
+    expect(summariseRounds([stoppage])[ROUND_ORDER.indexOf('make_schema_change_safely')].status)
+      .toBe('lakebase_finished')
+  })
+
   it('never lets a server-sent margin survive an unverified lane', () => {
     // Defence in depth. If the server ever regresses and sends a margin next to a
     // failed lane, the page must still not print it as measured.
@@ -121,6 +148,167 @@ describe('boutView', () => {
     expect(view.marginMs).toBeNull()
     // Null is meaningful here: there was no simultaneous start, not a zero one.
     expect(view.startSkewMs).toBeNull()
+  })
+
+  it('reads Round 4 receipts the way the server declared them', () => {
+    const roundFour = (overrides: Partial<BoutReceipt>) => receipt({
+      round_id: 'put_model_score_in_app',
+      round_title: 'PUT A MODEL SCORE IN THE APP',
+      lakebase: { ms: 31_500, state: 'verified', lower_bound: false, reason: null },
+      opponent_lane: { ms: 77_800, state: 'verified', lower_bound: false, reason: null },
+      margin_ms: 46_300,
+      start_skew_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN 46.3s',
+      ...overrides,
+    })
+
+    // Both lanes read the row: a measured race, with the server's margin.
+    const timed = boutView(roundFour({}))
+    expect(timed.kind).toBe('timed')
+    expect(timed.marginMs).toBe(46_300)
+
+    // The AWS lane ran out its whole bound. The receipt keeps it as failed with no
+    // time, and the declared outcome is what says it was a stoppage: a floor, never a margin.
+    const stoppage = roundFour({
+      opponent_lane: { ms: null, state: 'failed', lower_bound: false, reason: 'Did not deliver the row within its bound' },
+      margin_ms: null,
+    })
+    const bounded = boutView(stoppage)
+    expect(bounded.kind).toBe('bounded')
+    expect(bounded.contract.resultStatus).toBe('adjudicated_stoppage')
+    expect(bounded.marginMs).toBeNull()
+    expect(summariseRounds([stoppage])[ROUND_ORDER.indexOf('put_model_score_in_app')].status).toBe('lakebase_finished')
+
+    // Since 2026-10-03 the receipt carries the bound the lane ran out as its floor.
+    const floored = roundFour({
+      opponent_lane: { ms: 420_000, state: 'failed', lower_bound: true, reason: 'Did not deliver the row within its bound' },
+      margin_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN IS A LOWER BOUND',
+    })
+    const flooredView = boutView(floored)
+    expect(flooredView.kind).toBe('bounded')
+    expect(flooredView.opponentIsLowerBound).toBe(true)
+    expect(flooredView.contract.resultStatus).toBe('adjudicated_stoppage')
+    expect(flooredView.marginMs).toBeNull()
+    expect(summariseRounds([floored])[ROUND_ORDER.indexOf('put_model_score_in_app')].status).toBe('lakebase_finished')
+
+    // The AWS lane errored. The server declared nothing, so neither does the recap,
+    // and it is not the old score-identity guardrail either.
+    const errored = boutView(roundFour({
+      outcome: 'stopped_short',
+      opponent_lane: { ms: null, state: 'failed', lower_bound: false, reason: 'Could not be measured' },
+      margin_ms: null,
+      remembered_result: null,
+    }))
+    expect(errored.kind).toBe('unproven')
+    expect(errored.contract.formalWinner).toBeNull()
+    expect(errored.contract.resultStatus).toBe('comparison_incomplete')
+  })
+
+  it('reads Round 6 receipts the way the server declared them, as Round 4’s', () => {
+    const roundSix = (overrides: Partial<BoutReceipt>) => receipt({
+      round_id: 'analyze_live_orders_without_slowing_checkout',
+      round_title: 'ANALYZE LIVE ORDERS',
+      lakebase: { ms: 11_520, state: 'verified', lower_bound: false, reason: null },
+      opponent_lane: { ms: 74_100, state: 'verified', lower_bound: false, reason: null },
+      margin_ms: 62_580,
+      start_skew_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN 62.6s',
+      ...overrides,
+    })
+    const roundSixIndex = ROUND_ORDER.indexOf('analyze_live_orders_without_slowing_checkout')
+
+    // Both lanes read the order: a measured race, with the server's margin.
+    const timed = boutView(roundSix({}))
+    expect(timed.kind).toBe('timed')
+    expect(timed.marginMs).toBe(62_580)
+    expect(summariseRounds([roundSix({})])[roundSixIndex].status).toBe('lakebase_faster')
+
+    // The AWS lane ran out its whole bound: a declared stoppage, a floor, never a margin.
+    const stoppage = roundSix({
+      opponent_lane: { ms: null, state: 'failed', lower_bound: false, reason: 'Did not deliver the order within its bound' },
+      margin_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN IS A LOWER BOUND',
+    })
+    expect(boutView(stoppage).kind).toBe('bounded')
+    expect(boutView(stoppage).contract.resultStatus).toBe('adjudicated_stoppage')
+    expect(summariseRounds([stoppage])[roundSixIndex].status).toBe('lakebase_finished')
+
+    // Since 2026-10-03 the receipt carries the bound the lane ran out as its floor.
+    const floored = roundSix({
+      opponent_lane: { ms: 420_000, state: 'failed', lower_bound: true, reason: 'Did not deliver the order within its bound' },
+      margin_ms: null,
+      remembered_result: 'LAKEBASE WINS · MARGIN IS A LOWER BOUND',
+    })
+    expect(boutView(floored).kind).toBe('bounded')
+    expect(boutView(floored).opponentIsLowerBound).toBe(true)
+    expect(boutView(floored).marginMs).toBeNull()
+    expect(summariseRounds([floored])[roundSixIndex].status).toBe('lakebase_finished')
+
+    // The AWS lane errored. That is no result, and not v1's checkout-guardrail failure.
+    const errored = boutView(roundSix({
+      outcome: 'stopped_short',
+      opponent_lane: { ms: null, state: 'failed', lower_bound: false, reason: 'Could not be measured' },
+      margin_ms: null,
+      remembered_result: null,
+    }))
+    expect(errored.kind).toBe('unproven')
+    expect(errored.contract.formalWinner).toBeNull()
+    expect(errored.contract.resultStatus).toBe('comparison_incomplete')
+
+    // An installation without the AWS lane, and a v1 receipt before there was one, both
+    // read as Lakebase uncontested, with the lane named as not installed.
+    const alone = roundSix({
+      opponent_lane: { ms: null, state: 'not_supported', lower_bound: false, reason: 'AWS lane not installed' },
+      margin_ms: null,
+      remembered_result: 'LAKEBASE 11.5s · AWS LANE NOT INSTALLED',
+    })
+    expect(boutView(alone).kind).toBe('capability')
+    const aloneRow = summariseRounds([alone])[roundSixIndex]
+    expect(aloneRow.status).toBe('uncontested')
+    expect(verdictFor(aloneRow, 'read').laneNote).toBe('BLUE CORNER · AWS LANE NOT INSTALLED')
+  })
+
+  it('reads a raced round the server called a tie as a tie, whatever the two clocks say', () => {
+    // Rounds 4 and 6 decide by the verifiers' evidence rule: two arrivals that overlap
+    // within the reads are a tie even when one clock reads lower. The receipt keeps a
+    // margin either way, so the server's own line is what says it was a tie.
+    for (const roundId of ['put_model_score_in_app', 'analyze_live_orders_without_slowing_checkout'] as const) {
+      const tie = receipt({
+        round_id: roundId,
+        lakebase: { ms: 11_520, state: 'verified', lower_bound: false, reason: null },
+        opponent_lane: { ms: 11_900, state: 'verified', lower_bound: false, reason: null },
+        margin_ms: 380,
+        remembered_result: 'TIE · WITHIN MEASUREMENT RESOLUTION',
+      })
+      const view = boutView(tie)
+      expect(view.contract.formalWinner).toBe('tie')
+      expect(view.marginMs).toBeNull()
+      expect(summariseRounds([tie])[ROUND_ORDER.indexOf(roundId)].status).toBe('tie')
+    }
+    // Rounds 1-3 keep reading their clocks: their own verdict is the clocks.
+    const roundOne = boutView(receipt({ remembered_result: 'TIE · SOMETHING' }))
+    expect(roundOne.contract.formalWinner).toBe('lakebase')
+  })
+
+  it('names an uncontested round’s empty corner in the words that are true of it', () => {
+    const uncontested = (roundId: BoutReceipt['round_id']) => summariseRounds([receipt({
+      round_id: roundId,
+      opponent_lane: { ms: null, state: 'not_supported', lower_bound: false, reason: null },
+      margin_ms: null,
+      start_skew_ms: null,
+    })])[ROUND_ORDER.indexOf(roundId)]
+    // Round 1 against RDS has no native path to time; Rounds 4 and 6 race AWS wherever
+    // their lane is installed, so theirs was not installed here.
+    expect(verdictFor(uncontested('wake_idle_app'), 'read').laneNote).toBe(
+      'BLUE CORNER · NO EQUIVALENT NATIVE PATH',
+    )
+    expect(verdictFor(uncontested('put_model_score_in_app'), 'read').laneNote).toBe(
+      'BLUE CORNER · AWS LANE NOT INSTALLED',
+    )
+    expect(verdictFor(uncontested('analyze_live_orders_without_slowing_checkout'), 'read').laneNote).toBe(
+      'BLUE CORNER · AWS LANE NOT INSTALLED',
+    )
   })
 
   it('keeps our own unverified lane visible rather than hiding it', () => {

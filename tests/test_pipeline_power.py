@@ -377,6 +377,37 @@ def test_doctor_can_tell_a_deliberate_stop_from_a_failure(tmp_path) -> None:
     assert "FAILED" in broken.summary()
 
 
+def test_a_parked_pipeline_with_no_stop_on_record_is_at_rest(tmp_path) -> None:
+    """A fresh v1.1 install parks Round 4's pipeline before Round 4 is sealed.
+
+    Its first `cleanup --dry-run` (2026-09-29) called that "a failure rather than a
+    choice". Parked is Round 4's rest state since v1.1; an update that failed is
+    still FAILED, and a start stuck past its grace window is still a failure.
+    """
+
+    manifest = _manifest_with_round4()
+    absent = tmp_path / "absent.json"
+
+    parked = power_state(manifest, lambda identifier: {"state": "IDLE"}, marker_path=absent)
+    assert parked.stopped_deliberately is False
+    assert parked.summary().startswith("PARKED (IDLE) · $0.00/day")
+    assert pipeline_power.BELL_START_SENTENCE in parked.summary()
+    assert "failure rather than a choice" not in parked.summary()
+
+    failed = power_state(
+        manifest,
+        lambda identifier: {
+            "state": "IDLE",
+            "latest_updates": [{"update_id": "u1", "state": "FAILED"}],
+        },
+        marker_path=absent,
+    )
+    assert failed.summary().startswith("FAILED")
+
+    stuck = power_state(manifest, lambda identifier: {"state": "STARTING"}, marker_path=absent)
+    assert "failure rather than a choice" in stuck.summary()
+
+
 def test_failed_cloud_update_outranks_stale_deliberate_stop(tmp_path) -> None:
     manifest = _manifest_with_round4()
     marker = tmp_path / "stopped.json"
@@ -479,13 +510,11 @@ def test_every_state_reports_what_it_costs_per_day() -> None:
     assert "$0.00/day" in stopped.summary()
     assert f"saving up to {rate}" in stopped.summary()
     assert "/month" not in stopped.summary()
-    # What a stop costs is the restart wait, and since D20b that wait is the
-    # engine's to spend, not the operator's. A line telling an operator to run
-    # 'pipeline start' would send them to do the next arm's job for it, which is
-    # how an installation that is supposed to need no input acquires an
-    # attendant. The number stays, because a wait before the bell is worth
-    # knowing; the instruction goes.
-    assert f"roughly {pipeline_power.RESTART_SECONDS_ESTIMATE}s" in stopped.summary()
+    # Since v1.1 a stop costs a bout nothing it can see: the bell starts the
+    # pipeline, cold, as part of the race. A line telling an operator to run
+    # 'pipeline start' would have them warm a lane the next Prepare parks.
+    assert pipeline_power.BELL_START_SENTENCE in stopped.summary()
+    assert "at arm" not in stopped.summary()
     assert "no operator action needed" in stopped.summary()
     assert "refuse to arm" not in stopped.summary()
     assert "antidemo pipeline start" not in stopped.summary()
@@ -1112,15 +1141,17 @@ def test_the_session_notice_names_the_bill_and_the_arm_precondition(tmp_path) ->
     # Never claims a live reading it did not take.
     assert "RUNNING" not in joined
 
-    # Stopped: what the next arm will spend bringing it back, offered as a cost
-    # to know rather than a chore to do. Under D20b the arm starts it, so an
-    # imperative here would be an instruction to duplicate the engine's work.
+    # Stopped: since v1.1 the bell starts it, cold, as part of the race. Starting
+    # it early would only be parked again by the next Prepare, so there is
+    # nothing to offer and no command to run.
     stop(manifest, _recording_api(calls), marker_path=marker, now=lambda: now)
     warned = " ".join(
         pipeline_power.session_notice(manifest, marker_path=marker, now=lambda: now)
     )
     assert "STOPPED ON PURPOSE" in warned
-    assert "start it at arm and wait" in warned
+    assert pipeline_power.BELL_START_SENTENCE in warned
+    assert "Nothing to do before a bout" in warned
+    assert "pipeline start" not in warned
     assert "CANNOT ARM" not in warned
     assert f"${PIPELINE_USD_PER_DAY:.2f}/day" not in warned
 

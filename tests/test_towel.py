@@ -414,7 +414,7 @@ def test_universal_towel_adjudication_table(
     )
     assert result.retains_normal_result is retains_normal
     assert set(result.censored_lower_bounds_ms) == expected_censored
-    assert "Toweled" in result.public_result
+    assert "Toweled" in result.public_result or "TOWEL THROWN AT" in result.public_result
     assert "Towelled" not in result.public_result
     for lane_id, lane in result.lanes.items():
         if lane_id in expected_censored:
@@ -430,6 +430,67 @@ def test_universal_towel_adjudication_table(
         elif original[lane_id].state == LaneState.NOT_SUPPORTED:
             assert lane.state == LaneState.NOT_SUPPORTED
             assert lane.elapsed_ms is None
+
+
+def test_the_lane_that_finished_wins_over_one_the_towel_stopped() -> None:
+    # Ryan (2026-10-03): "if round 6 finishes in say 15 seconds and AWS is still running after
+    # 50 seconds and i throw the towel - Lakebase should be deemed the winner!"
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.VERIFIED, 15_000.0),
+        "competitor": _lane("competitor", LaneState.VERIFYING, 48_000.0),
+    }
+
+    result = adjudicate_towel(
+        round_id=RoundId.ANALYZE_LIVE_ORDERS, lanes=lanes, cutoff_ms=50_000.0
+    )
+
+    assert result.comparison.kind == ComparisonKind.ADJUDICATED_STOPPAGE
+    assert result.comparison.winner_lane_id == "lakebase"
+    assert result.comparison.margin is None
+    assert result.public_result == (
+        "LAKEBASE WINS · TOWEL THROWN AT 50.00s · MARGIN IS A LOWER BOUND"
+    )
+    assert result.lanes["lakebase"].elapsed_ms == 15_000.0
+    assert result.lanes["competitor"].evidence["lower_bound_ms"] == 50_000.0
+
+
+def test_a_lane_still_running_at_the_towel_is_never_handed_the_win() -> None:
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.CONNECTING, 48_000.0),
+        "competitor": _lane("competitor", LaneState.VERIFIED, 30_000.0),
+    }
+
+    result = adjudicate_towel(
+        round_id=RoundId.ANALYZE_LIVE_ORDERS, lanes=lanes, cutoff_ms=50_000.0
+    )
+
+    assert result.comparison.winner_lane_id == "competitor"
+    assert result.public_result == (
+        "OPPONENT WINS · TOWEL THROWN AT 50.00s · MARGIN IS A LOWER BOUND"
+    )
+
+
+def test_round_four_lanes_toweled_before_the_bell_are_stopped_untimed() -> None:
+    # The verifier can still be opening its connections when the towel lands; no clock has
+    # started, so nothing is censored and nobody wins.
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.SEALED, None),
+        "competitor": _lane("competitor", LaneState.SEALED, None),
+    }
+    original = deepcopy(lanes)
+
+    result = adjudicate_towel(
+        round_id=RoundId.PUT_MODEL_SCORE_IN_APP, lanes=lanes, cutoff_ms=0.0
+    )
+
+    assert lanes == original
+    assert result.comparison.kind == ComparisonKind.NOT_COMPARABLE
+    assert result.comparison.winner_lane_id is None
+    assert result.censored_lower_bounds_ms == {}
+    for lane in result.lanes.values():
+        assert lane.state == LaneState.TOWELLED
+        assert lane.elapsed_ms is None
+        assert lane.status == "Toweled before the bell · not timed"
 
 
 def test_towel_snapshot_reads_legacy_round_three_cutoff() -> None:

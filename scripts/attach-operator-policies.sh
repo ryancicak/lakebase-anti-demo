@@ -175,6 +175,10 @@ POLICY_NAMES+=("AntiDemoOperatorDatabases")
 POLICY_FILES+=("$(render "$REPO_ROOT/docs/iam/anti-demo-operator-2-databases.json")")
 POLICY_NAMES+=("AntiDemoOperatorIdentity")
 POLICY_FILES+=("$(render "$REPO_ROOT/docs/iam/anti-demo-operator-3-identity.json")")
+POLICY_NAMES+=("AntiDemoOperatorRound4")
+POLICY_FILES+=("$(render "$REPO_ROOT/docs/iam/anti-demo-operator-5-round4.json")")
+POLICY_NAMES+=("AntiDemoOperatorRound6")
+POLICY_FILES+=("$(render "$REPO_ROOT/docs/iam/anti-demo-operator-6-round6.json")")
 
 if ((INCLUDE_STATE)); then
   STATE_SRC="$REPO_ROOT/docs/iam/anti-demo-operator-4-state.json"

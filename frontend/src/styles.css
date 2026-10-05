@@ -551,6 +551,14 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .proof-title { min-width: 0; }
 .proof-header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; letter-spacing: .08em; text-transform: uppercase; }
 .proof-header h1 { margin: 0; font-size: clamp(18px, calc(1.8vw + 3px), 46px); line-height: 1.2; white-space: nowrap; text-transform: uppercase; text-shadow: .13em .13em #000; }
+/* Fit to its own column (`titleFit`): the desktop title never wraps, so a long one
+   steps down until it clears the state badge and the sound button, however long the
+   badge's label runs. Press Start 2P sets each glyph one em wide; the half glyph is
+   the text shadow. The phone layout below wraps instead. */
+@media (min-width: 701px) {
+  .proof-title { container-type: inline-size; }
+  .proof-header h1 { font-size: min(clamp(18px, calc(1.8vw + 3px), 46px), calc(100cqi / (var(--title-chars, 1) + .5))); }
+}
 .proof-state { padding: 1.25em 1.4em; border: clamp(3px, .3vw, 6px) solid var(--cream); color: var(--cream); background: #10183e; font-size: clamp(6px, .55vw, 11px); line-height: 1.2; text-transform: uppercase; box-shadow: .45em .45em #000; }
 .proof-state[data-state="running"] { color: var(--yellow); border-color: var(--yellow); }
 .proof-state[data-state="offline"] { color: #ff9888; border-color: #ff806d; background: #3a0d12; }
@@ -588,6 +596,8 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .proof-fighter .fighter-body span { font-size: clamp(4px, .36vw, 7px); }
 .lane-corner { margin: 0 0 .8em; color: var(--corner); font-size: clamp(5px, .46vw, 9px); }
 .lane-name { max-width: 36vw; margin: 0; overflow-wrap: anywhere; color: var(--cream); font-size: clamp(11px, 1.2vw, 23px); line-height: 1.35; text-shadow: .15em .15em #000; }
+/* Round 4: the integration that carries the row, under the database it reaches. */
+.lane-stack { max-width: 36vw; margin: .7em 0 0; overflow-wrap: anywhere; color: var(--corner); font-size: clamp(6px, .56vw, 11px); line-height: 1.4; }
 .lane-time { align-self: center; min-width: 72%; max-width: 94%; padding: .27em .34em .2em; border: clamp(5px, .55vw, 10px) solid var(--cream); color: var(--yellow); background: #02040e; box-shadow: .12em .12em 0 var(--corner), .22em .22em 0 #000; font-size: clamp(58px, 7.3vw, 142px); font-variant-numeric: tabular-nums; line-height: 1; text-align: center; text-shadow: .07em .07em #000; white-space: nowrap; }
 .timer-readout { display: inline-block; }
 .timer-readout[data-width="medium"] { font-size: .78em; }
@@ -606,6 +616,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .proof-lane[data-state="not_supported"] .lane-status span { color: #241d03; border-color: var(--yellow); background: var(--yellow); }
 .lane-error { display: -webkit-box; max-width: min(34vw, 560px); margin: .7em 0 0; overflow: hidden; color: #ffb1a5; font-family: ui-monospace, monospace; font-size: clamp(8px, .68vw, 13px); font-weight: 800; line-height: 1.35; text-align: center; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .proof-footer { position: relative; z-index: 2; display: grid; place-items: center; align-content: center; min-height: 0; padding: 1.6vh 4vw 2vh; border-top: clamp(5px, .52vw, 10px) solid var(--blue); color: var(--cream); background: #050817; text-align: center; box-shadow: inset 0 .55vh var(--red); }
+/* A finished bout's footer can carry more than its 33vh track on a laptop screen -- a
+   towel adds its strip under a two-line verdict -- so it scrolls rather than clipping
+   its last lines, and `safe` keeps the top in view when it does. */
+.proof-footer { overflow-y: auto; align-content: safe center; scrollbar-width: thin; }
 .proof-footer[data-capability="true"] { padding-top: 1.2vh; padding-bottom: 1.3vh; }
 .fairness { display: flex; align-items: center; gap: 1.6em; color: #b7c2e7; font-size: clamp(7px, .65vw, 12px); line-height: 1.6; text-transform: uppercase; }
 .fairness span { color: var(--yellow); font-size: .7em; }
@@ -642,6 +656,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .proof-footer:has(.ringside-meanings) .proof-actions { margin-top: .65em; }
 .final-fairness { margin: 1.4em 0 0; color: #a9b5d9; font-family: ui-monospace, monospace; font-size: clamp(7px, .6vw, 11px); font-weight: 800; }
 .proof-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 1.2em; margin-top: 1.3em; }
+/* Share and Next -- the two that end a bout -- take a row of their own under the ones
+   that look closer, in every round. Round 1's extra "Back to idle" button once put
+   them there by wrapping; Ryan liked it, so it is the layout now, not an accident. */
+.proof-actions-primary { display: flex; flex: 0 0 100%; flex-wrap: wrap; justify-content: center; gap: 1.2em; }
 .starred-redo-action { display: grid; justify-items: center; gap: .55em; }
 .starred-redo-action > small { max-width: 28em; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.4; text-transform: uppercase; }
 .proof-next, .proof-redo, .proof-replay, .proof-ringside, .proof-cost, .proof-share, .proof-towel, .proof-towel-retry { padding: .9em 1.2em; border: 3px solid var(--yellow); color: var(--yellow); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .55vw, 11px); line-height: 1; text-transform: uppercase; }
@@ -674,12 +692,6 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .towel-call p { margin: 0; color: #b7c2e7; font-family: ui-monospace, monospace; font-size: clamp(7px, .62vw, 12px); font-weight: 900; }
 .proof-towel { color: #081a10; border-color: var(--yellow); background: var(--yellow); }
 .proof-towel:disabled { cursor: wait; opacity: .72; }
-.towel-lane-results { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: clamp(8px, .8vw, 14px); width: min(850px, 88vw); margin: clamp(12px, 1.5vh, 22px) auto 0; }
-.towel-lane-results article { display: grid; gap: .65em; min-width: 0; padding: .9em 1.1em; border: 3px solid var(--blue-light); background: #050817; box-shadow: inset 0 .35em var(--blue); text-align: center; }
-.towel-lane-results article[data-corner="red"] { border-color: var(--red); box-shadow: inset 0 .35em var(--red); }
-.towel-lane-results span, .towel-lane-results small { color: #b7c2e7; font-size: clamp(6px, .5vw, 10px); line-height: 1.3; text-transform: uppercase; }
-.towel-lane-results strong { color: var(--yellow); font-size: clamp(14px, 1.5vw, 28px); line-height: 1.2; }
-.towel-lane-results small { font-family: ui-monospace, monospace; font-weight: 900; }
 /* `.cleanup-abandoned` shares every rule rather than copying them. A towel and
    a bout that ended on its own report the same abandoned tidy-up, and two rule
    sets is how they would end up looking like two different problems. */
@@ -803,6 +815,12 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .round5-arena-footer > .towel-call { margin-top: 0; }
 .round5-arena-footer > .remembered span { margin-bottom: .55em; }
 .round5-arena-footer > .remembered strong { font-size: clamp(18px, 2vw, 38px); }
+/* Clear of the commentator's hard shadow, which sat over the verdict's kicker. */
+.round5-arena-footer > .remembered { margin-top: .9vh; }
+/* A verdict sized to its length (`verdictLength`): a short one keeps the headline
+   size; a towel's long one steps down to one or two lines instead of three. */
+.proof-footer .remembered strong[data-length="medium"] { font-size: clamp(15px, 1.55vw, 30px); }
+.proof-footer .remembered strong[data-length="long"] { font-size: clamp(14px, 1.3vw, 26px); line-height: 1.45; }
 /* Round 5 two-region live lane: the big "Time to 10,000" clock and, beneath it,
    the "Hold checks" region. Both lanes always render both regions so the two
    never look asymmetric. Children stack tightly and centre instead of leaning on
@@ -930,9 +948,6 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .round4-actions button { min-height: clamp(38px, 3.2vw, 58px); padding: 0 1.4em; text-transform: uppercase; }
 .round4-redo { border: clamp(4px, .4vw, 7px) solid var(--yellow); color: #10152f; background: var(--yellow); box-shadow: .36em .36em var(--red), .58em .58em #000; font-size: clamp(6px, .58vw, 11px); }
 .round4-redo:disabled { cursor: wait; filter: saturate(.4); opacity: .7; }
-.round4-ringside, .round4-share { border: 3px solid var(--blue-light); color: var(--cream); background: #13214b; font-size: clamp(6px, .52vw, 10px); }
-.round4-share { border-color: #6bf39a; color: #6bf39a; background: #081a10; }
-.round4-next { border: 3px solid #8996c1; color: #c0c8e3; background: #10183e; font-size: clamp(6px, .52vw, 10px); }
 .round-legend { margin: .8em 0 0; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.4; text-transform: uppercase; }
 
 @media (max-height: 940px) {
@@ -1179,8 +1194,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cost-room-idle article[data-lane="rds"] b { color: #ffcf87; }
 .cost-room-unavailable { margin: 0; padding: 1em; border: 3px solid #ffb95c; color: #ffcf87; background: #2a1704; font-family: ui-monospace, monospace; font-size: clamp(8px, .7vw, 13px); font-weight: 900; line-height: 1.45; }
 .cost-room-close { padding: 1em; border: 4px solid var(--cream); color: var(--cream); background: var(--red); box-shadow: .4em .4em #000; font-size: clamp(7px, .6vw, 12px); text-transform: uppercase; }
-.proof-cost, .round4-cost { border: 3px solid #ffb95c; color: #2a1704; background: #ffb95c; }
-.round4-cost { font-size: clamp(6px, .52vw, 10px); }
+.proof-cost { border: 3px solid #ffb95c; color: #2a1704; background: #ffb95c; }
 
 /* A verified social receipt: exact run facts, never a manufactured benchmark claim. */
 .receipt-overlay { position: fixed; z-index: 45; inset: 0; display: grid; place-items: center; padding: 2vh 2vw; background: #02040ef5; }
@@ -2460,7 +2474,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    two bars. This is the sole owner of the finale grid and tile geometry. */
 .finale-screen { gap: clamp(10px, 1.6vh, 20px); padding: clamp(22px, 3vh, 34px) 4vw clamp(16px, 2.2vh, 26px); }
 .finale-header h1 { text-shadow: .09em .09em var(--red), .18em .18em #000; }
-.finale-grid { position: relative; z-index: 6; display: grid; flex: 0 0 auto; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-template-rows: minmax(0, 1fr); gap: clamp(8px, .8vw, 14px); width: min(1520px, 92vw); height: clamp(320px, 54dvh, 520px); min-height: 0; }
+.finale-grid { position: relative; z-index: 6; display: grid; flex: 0 0 auto; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-template-rows: minmax(0, 1fr); gap: clamp(8px, .8vw, 14px); width: min(1520px, 92vw); height: clamp(290px, 39dvh, 410px); min-height: 0; }
 .finale-beat {
   --finale-accent: var(--yellow); --finale-corner: #151e48; --finale-ink: #b7c2e7; --finale-rule: var(--finale-accent);
   --finale-num-bg: var(--finale-accent); --finale-num-ink: var(--navy);
@@ -2483,13 +2497,16 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
   margin: 0 calc(-1 * clamp(10px, .9vw, 16px)); padding: clamp(9px, 1.1vh, 15px) clamp(10px, .9vw, 16px) clamp(8px, 1vh, 13px);
   background: var(--finale-corner); box-shadow: inset 0 clamp(4px, .5vh, 7px) var(--finale-rule);
 }
-.finale-beat header span { width: 3.2em; height: 3.2em; color: var(--finale-num-ink); background: var(--finale-num-bg); font-size: clamp(8px, .72vw, 12px); }
+.finale-beat header span { display: grid; flex: none; place-items: center; width: 3.2em; height: 3.2em; color: var(--finale-num-ink); background: var(--finale-num-bg); font-size: clamp(8px, .72vw, 12px); line-height: 1; }
 .finale-beat header strong { color: var(--finale-ink); font-size: clamp(8px, .68vw, 12px); line-height: 1.3; }
 .finale-beat h2 { align-self: start; margin: 0; color: var(--cream); font-size: clamp(9px, .8vw, 14px); line-height: 1.4; text-transform: none; text-shadow: none; }
 .finale-beat p { align-self: start; min-height: 0; margin: 0; padding: 0; border-left: 0; color: #9aa6d0; font-family: ui-monospace, monospace; font-size: clamp(8px, .6vw, 11px); font-weight: 900; line-height: 1.5; }
 .finale-beat p em { display: block; margin-top: .5em; color: var(--yellow); font-size: .88em; font-style: normal; letter-spacing: .04em; text-transform: uppercase; }
 .finale-bars { display: grid; align-self: end; gap: clamp(5px, .6vh, 8px); min-width: 0; }
-.finale-lane { --lane-color: var(--red); display: grid; grid-template-columns: 3.2em minmax(0, 1fr); height: clamp(18px, 2.4vh, 28px); font-size: clamp(7px, .6vw, 10px); }
+.finale-lane { --lane-color: var(--red); display: grid; grid-template-columns: 3.2em minmax(0, 1fr); height: clamp(22px, 3.2vh, 36px); font-size: clamp(8px, .72vw, 12px); }
+/* A round with no clocks has nothing to draw: its lanes stay, dimmed, so the six tiles still line up. */
+.finale-beat[data-status="unrun"] .finale-lane, .finale-beat[data-status="reading"] .finale-lane,
+.finale-beat[data-status="abandoned"] .finale-lane { opacity: .4; }
 .finale-lane[data-corner="blue"] { --lane-color: var(--blue); }
 .finale-lane > b { display: grid; place-items: center; color: var(--cream); background: var(--lane-color); font-weight: 400; letter-spacing: .05em; }
 .finale-track { position: relative; display: flex; align-items: center; gap: .8em; min-width: 0; overflow: hidden; background: #111e48; box-shadow: inset 0 0 0 2px #46527c; }

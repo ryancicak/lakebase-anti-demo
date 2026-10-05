@@ -587,6 +587,7 @@ async def test_rds_restorable_window_fallback_fails_closed(invalid_case: str) ->
         ),
         _source=AsyncMock(return_value=source),
         _call=AsyncMock(return_value=response),
+        _sleep=AsyncMock(),
     )
     recovery_plan = plan(
         SafeChangeProvider.RDS,
@@ -597,6 +598,54 @@ async def test_rds_restorable_window_fallback_fails_closed(invalid_case: str) ->
 
     with pytest.raises(SafeChangeLiveConfigurationError, match="window is unavailable"):
         await adapter._restorable_window(recovery_plan)
+    # Only a moved latest bound is worth reading again; every other defect is final.
+    assert underlying._call.await_count == (3 if invalid_case == "latest_mismatch" else 1)
+
+
+async def test_rds_restorable_window_rereads_a_pair_that_straddled_a_log_upload() -> None:
+    # Release bar, 2026-10-01 04:17:10Z: RDS moved LatestRestorableTime between the
+    # instance read and the automated-backup read, and the bout refused as if AWS had
+    # no restore window at all. Both reads were right; they were a moment apart.
+    earliest = RECOVERY_AT - timedelta(hours=5)
+    before = RECOVERY_AT - timedelta(minutes=4)
+    after = RECOVERY_AT + timedelta(seconds=30)
+    arn = "arn:aws:rds:us-west-2:123456789012:db:anti-demo-rds"
+
+    def instance(latest: datetime) -> dict[str, object]:
+        return {
+            "DBInstanceArn": arn,
+            "DbiResourceId": "db-EXACTRESOURCE",
+            "EarliestRestorableTime": None,
+            "LatestRestorableTime": latest,
+        }
+
+    backups = {
+        "DBInstanceAutomatedBackups": [
+            {
+                "DBInstanceArn": arn,
+                "DBInstanceIdentifier": "anti-demo-rds",
+                "DbiResourceId": "db-EXACTRESOURCE",
+                "Region": SCOPE.aws_region,
+                "Status": "active",
+                "RestoreWindow": {"EarliestTime": earliest, "LatestTime": after},
+            }
+        ]
+    }
+    underlying = SimpleNamespace(
+        name="RDS PostgreSQL",
+        source_id="anti-demo-rds",
+        config=SimpleNamespace(account_id=SCOPE.aws_account_id, region=SCOPE.aws_region),
+        _source=AsyncMock(side_effect=[instance(before), instance(after)]),
+        _call=AsyncMock(return_value=backups),
+        _sleep=AsyncMock(),
+    )
+    adapter = RdsRecoveryAdapter(underlying)  # type: ignore[arg-type]
+    recovery_plan = plan(SafeChangeProvider.RDS, "anti-demo-rds", "adrc-ad-test-003-rds")
+
+    assert await adapter._restorable_window(recovery_plan) == (earliest, after)
+    assert underlying._source.await_count == 2
+    assert underlying._call.await_count == 2
+    underlying._sleep.assert_awaited_once_with(1.0)
 
 
 # --- Round 3 restore readiness -------------------------------------------------

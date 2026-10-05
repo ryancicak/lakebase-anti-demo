@@ -40,12 +40,14 @@ a cloud team can review and approve each one independently:
 | File | Covers | Packed size | Required |
 |---|---|---|---|
 | `anti-demo-operator-1-network.json` | EC2 discovery, security groups, the Round 5 runner instance, SSM | 2359 | yes |
-| `anti-demo-operator-2-databases.json` | RDS: Aurora Serverless v2, RDS PostgreSQL, subnet groups, RDS Proxy | 2385 | yes |
+| `anti-demo-operator-2-databases.json` | RDS: Aurora Serverless v2, RDS PostgreSQL, subnet groups, Round 6's logical-replication parameter groups, RDS Proxy | 3042 | yes |
 | `anti-demo-operator-3-identity.json` | IAM, Secrets Manager, KMS grants, STS, SQS, `iam:SimulatePrincipalPolicy`, CloudWatch reads | 5574 | yes |
 | `anti-demo-operator-4-state.json` | S3: the Terraform state bucket, the state object and its lock | 1059 | only with `--state-backend s3` |
+| `anti-demo-operator-5-round4.json` | Round 4's AWS Glue lane: its subnet, route table and S3 endpoint, its bucket, the Glue role (passed to Glue only), the two Glue jobs and connections, and the run verbs the app uses at the bell | 2676 | yes |
+| `anti-demo-operator-6-round6.json` | Round 6's AWS DMS and Glue lane: its two subnets, route table and S3 endpoint, the DMS replication instance, endpoints and tasks (DMS names these by random ID, so they are scoped to the region), its bucket, its three roles (passed to Glue and DMS only), the two Glue jobs, and DMS's account-wide `dms-vpc-role`, which it may read and create but never delete | 3667 | yes |
 
-Every one of the four is inside the limit; the largest, file 3, has 570
-characters of headroom. Attach 1, 2 and 3 — any one alone is not sufficient.
+Every one of the six is inside the limit; the largest, file 3, has 570
+characters of headroom. Attach 1, 2, 3, 5 and 6 — any one alone is not sufficient.
 File 3 is the one to watch: it is closest to the 6144 cap, so a new IAM or
 Secrets Manager grant there may force the split the other files already model.
 
@@ -56,13 +58,13 @@ file 3, the largest, reaches 5249 of 6144 — but it is not the shape to prefer.
 
 ## Rendering and attaching
 
-Files 1–3 use `<AWS_ACCOUNT_ID>` and `<AWS_REGION>` placeholders. Replace both
-before attaching:
+Files 1–3, 5 and 6 use `<AWS_ACCOUNT_ID>` and `<AWS_REGION>` placeholders. Replace
+both before attaching:
 
 ```bash
 ACCOUNT=111122223333
 REGION=us-west-2
-for f in docs/iam/anti-demo-operator-[123]-*.json; do
+for f in docs/iam/anti-demo-operator-[12356]-*.json; do
   sed -e "s/<AWS_ACCOUNT_ID>/$ACCOUNT/g" -e "s/<AWS_REGION>/$REGION/g" "$f" \
     > "/tmp/$(basename "$f")"
 done
@@ -74,6 +76,10 @@ aws iam create-policy --policy-name AntiDemoOperatorDatabases \
   --policy-document file:///tmp/anti-demo-operator-2-databases.json
 aws iam create-policy --policy-name AntiDemoOperatorIdentity \
   --policy-document file:///tmp/anti-demo-operator-3-identity.json
+aws iam create-policy --policy-name AntiDemoOperatorRound4 \
+  --policy-document file:///tmp/anti-demo-operator-5-round4.json
+aws iam create-policy --policy-name AntiDemoOperatorRound6 \
+  --policy-document file:///tmp/anti-demo-operator-6-round6.json
 ```
 
 File 4 carries a third placeholder, `<STATE_BUCKET>`, which is why the loop
@@ -100,10 +106,10 @@ blocked.
 
 ## The deployed app's own principal
 
-`anti-demo-app-runtime.json` is a fifth document, and it is not part of the
+`anti-demo-app-runtime.json` is a separate document, and it is not part of the
 operator set. It is what the app runtime IAM user holds: enough to arm and run
-Rounds 1, 2, 3 and 5, to delete what they create, and to keep the installation's
-`expires-at` lease current, and nothing more. It packs to 4411 characters, so it
+Rounds 1 to 5, to delete what they create, and to keep the installation's
+`expires-at` lease current, and nothing more. It packs to 5422 characters, so it
 needs no split.
 
 | Grants | Withholds |
@@ -139,6 +145,13 @@ Two consequences worth stating rather than discovering:
   so it cannot add a tag, change an ownership tag, or touch a per-bout artifact,
   whose `managed-by` names its round. The IAM and SQS reads are scoped to the
   installation's own role, policy, instance-profile and queue name patterns.
+  Round 4's Glue jobs and connections are tagged under the same one-key
+  condition, scoped to their name patterns. The Glue lane's S3 bucket is the one
+  exception to that condition: S3 replaces a bucket's whole tag set, so every
+  key is in the request. The grant is scoped to the `lakebase-ant*-r4-glue`
+  bucket instead, and `server/lease.py` writes back the set it read with only
+  the lease changed, and only while it still proves this installation's
+  ownership.
   An installation sealed to the runtime role gets the same reach from the
   operator policies it carries.
 
@@ -283,7 +296,7 @@ versioning is off.
 Everything above describes permissions attached to a *human's* IAM user. From the
 next fresh install there is a second thing to know about: a role called
 `anti-demo-runtime`, declared in `infra/aws/anti_demo_runtime.tf`, which carries
-these same three policies and is assumed by everyone.
+these same policies (1, 2, 3 and 5) and is assumed by everyone.
 
 ### Why it exists
 
@@ -312,7 +325,7 @@ the fortnightly sweep; installations sealed before that naming keep plain
 control role then trusts the runtime role — still exactly one principal, which is
 why the two-principal change does not disturb `round5_secret_free_topology`.
 
-The role, its three policies and its three attachments are all free. This adds
+The role, its four policies and its four attachments are all free. This adds
 **$0** to the bill.
 
 ### What it asks the operator for

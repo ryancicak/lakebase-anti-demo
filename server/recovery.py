@@ -199,6 +199,10 @@ class RecoveryLaneResult:
     ok: bool
     recovery_at: datetime | None = None
     error: str | None = None
+    #: True when the lane was still running at its bound from the bell: an unfinished
+    #: measurement, whose elapsed time is a floor. False for every other failure, which
+    #: measured nothing.
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -659,6 +663,7 @@ class RecoveryEngine:
         recovery_at: datetime | None = None
         completed_ns: int | None = None
         failure: str | None = None
+        timed_out = False
         verified_result: RecoveryLaneResult | None = None
 
         async def wait_report(status: str, wire_call: str | None = None) -> None:
@@ -683,8 +688,9 @@ class RecoveryEngine:
                 recovery_at=recovery_at,
             )
 
+        bound = asyncio.timeout(self.run_timeout_seconds)
         try:
-            async with asyncio.timeout(self.run_timeout_seconds):
+            async with bound:
                 await self._emit(
                     on_progress,
                     plan,
@@ -799,7 +805,13 @@ class RecoveryEngine:
             raise
         except Exception as exc:
             completed_ns = self._clock_ns()
-            failure = str(exc) or type(exc).__name__
+            # The lane's own bound, not a TimeoutError raised inside it, which is an error.
+            timed_out = isinstance(exc, TimeoutError) and bound.expired()
+            failure = (
+                f"Recovery lane exceeded {self.run_timeout_seconds:.0f} seconds"
+                if timed_out
+                else str(exc) or type(exc).__name__
+            )
             if stop_control is not None:
                 # Publish the authoritative terminal outcome before any cleanup or
                 # progress callback can block on the manager's session lock.
@@ -820,7 +832,11 @@ class RecoveryEngine:
                 on_progress,
                 plan,
                 RecoveryPhase.FAILED,
-                "The recovered order could not be verified",
+                (
+                    "Still running at its bound from the bell"
+                    if timed_out
+                    else "The recovered order could not be verified"
+                ),
                 started_ns,
                 elapsed_ns=completed_ns,
                 error=failure,
@@ -837,6 +853,7 @@ class RecoveryEngine:
                 ok=False,
                 recovery_at=recovery_at,
                 error=failure,
+                timed_out=timed_out,
             )
         assert verified_result is not None
         return verified_result

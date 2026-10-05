@@ -804,6 +804,73 @@ def test_cleanup_force_deletes_exact_cdf_before_owned_schemas(monkeypatch) -> No
     ]
 
 
+def test_cleanup_accepts_the_aws_lanes_history_tables_beside_the_destination(monkeypatch) -> None:
+    """v1.1's AWS lane keeps its history tables in this schema, and every uninstall refused.
+
+    Found by the release lifecycle's first full v1.1 uninstall (rc4, 2026-09-30):
+    "Cleanup refused: Round 6 destination schema has unexpected tables". They are named by
+    the lane's own rule in the installation's own schema, and go with the schema.
+    """
+
+    from server.round6_aws_lifecycle import history_table_full_name
+
+    sealed = Round6Resources.model_validate(round6_values())
+    calls: list[str] = []
+
+    class Operation:
+        def wait(self) -> None:
+            calls.append("cdf-wait")
+
+    history = [
+        {
+            "full_name": history_table_full_name(
+                sealed.destination_catalog, sealed.destination_schema, competitor
+            ),
+            "table_id": f"t-{competitor}",
+        }
+        for competitor in ("aurora", "rds")
+    ]
+    workspace = SimpleNamespace(
+        postgres=SimpleNamespace(
+            delete_cdf_config=lambda name, force: (
+                calls.append(f"cdf-delete:{name}:{force}") or Operation()
+            ),
+            list_cdf_configs=lambda parent: iter([]),
+            delete_branch=lambda name, allow_missing, purge: (
+                calls.append(f"branch:{name}:{allow_missing}:{purge}") or Operation()
+            ),
+        ),
+        tables=SimpleNamespace(
+            list=lambda **kwargs: iter(
+                [
+                    {
+                        "full_name": sealed.destination_table_full_name,
+                        "table_id": sealed.destination_table_id,
+                    },
+                    *history,
+                ]
+            )
+        ),
+        schemas=SimpleNamespace(
+            delete=lambda name, force: calls.append(f"uc-schema:{name}:{force}")
+        ),
+    )
+    manifest = SimpleNamespace(round6=sealed)
+    monkeypatch.setattr(
+        "server.round6_lifecycle._check_round6", lambda *args, **kwargs: (True, "ok", ())
+    )
+
+    async def delete_source(candidate, candidate_workspace) -> None:
+        calls.append(f"pg-schema:{candidate.source_schema}")
+
+    monkeypatch.setattr("server.round6_lifecycle._delete_source_schema", delete_source)
+
+    cleanup_round6(manifest, dry_run=False, workspace=workspace)
+
+    assert f"uc-schema:{sealed.destination_catalog}.{sealed.destination_schema}:True" in calls
+    assert f"branch:{sealed.branch_name}:False:True" in calls
+
+
 def test_cleanup_refuses_unexpected_tables_before_destroying_anything(monkeypatch) -> None:
     """A refusal that arrives after the first delete strands the environment.
 

@@ -501,6 +501,31 @@ resource "aws_security_group" "aurora_by_round" {
     }
   }
 
+  # Round 4's AWS lane writes here. Inline, like every rule on this group, so the seal stays
+  # authoritative; see server/lifecycle.py::_round_source_ingress_groups.
+  dynamic "ingress" {
+    for_each = each.key == "r4" && local.round4_glue_enabled ? [true] : []
+    content {
+      description     = "PostgreSQL from the Round 4 AWS Glue writer"
+      from_port       = 5432
+      to_port         = 5432
+      protocol        = "tcp"
+      security_groups = [aws_security_group.round4_glue[0].id]
+    }
+  }
+
+  # Round 6's AWS lane captures changes from here, the same way.
+  dynamic "ingress" {
+    for_each = each.key == "r6" && local.round6_aws_enabled ? [true] : []
+    content {
+      description     = "PostgreSQL logical replication to the Round 6 AWS DMS instance"
+      from_port       = 5432
+      to_port         = 5432
+      protocol        = "tcp"
+      security_groups = [aws_security_group.round6_dms[0].id]
+    }
+  }
+
   egress {
     description = "Stateful response and AWS service traffic"
     from_port   = 0
@@ -556,6 +581,28 @@ resource "aws_security_group" "rds_by_round" {
         aws_security_group.round5_competitor_runner.id,
         aws_security_group.round5_proxy["rds"].id,
       ]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = each.key == "r4" && local.round4_glue_enabled ? [true] : []
+    content {
+      description     = "PostgreSQL from the Round 4 AWS Glue writer"
+      from_port       = 5432
+      to_port         = 5432
+      protocol        = "tcp"
+      security_groups = [aws_security_group.round4_glue[0].id]
+    }
+  }
+
+  dynamic "ingress" {
+    for_each = each.key == "r6" && local.round6_aws_enabled ? [true] : []
+    content {
+      description     = "PostgreSQL logical replication to the Round 6 AWS DMS instance"
+      from_port       = 5432
+      to_port         = 5432
+      protocol        = "tcp"
+      security_groups = [aws_security_group.round6_dms[0].id]
     }
   }
 
