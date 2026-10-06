@@ -2297,13 +2297,12 @@ class DirectObserver:
             raise FanInProtocolError("observer_role_invalid")
         self.evidence.role_verified = True
 
-    async def open_and_preflight(self) -> None:
+    async def _connect_until(self, deadline: float) -> None:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + OBSERVER_READY_TIMEOUT_SECONDS
         while True:
             try:
                 await self._connect()
-                break
+                return
             except psycopg.OperationalError as exc:
                 if loop.time() >= deadline:
                     raise FanInProtocolError(f"{self.lane_id}_observer_connect_failed") from exc
@@ -2313,6 +2312,24 @@ class DirectObserver:
                         max(0.0, deadline - loop.time()),
                     )
                 )
+
+    def _transient(self, exc: psycopg.OperationalError) -> bool:
+        """Whether the server went away under this connection, so a new one can answer."""
+
+        sqlstate = self._safe_sqlstate(exc)
+        return (
+            (sqlstate is not None and sqlstate.startswith("08"))
+            or sqlstate in {"57P01", "57P02", "57P03"}
+            or (
+                sqlstate is None
+                and self._connection_state() in {"not_open", "closed", "broken"}
+            )
+        )
+
+    async def open_and_preflight(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + OBSERVER_READY_TIMEOUT_SECONDS
+        await self._connect_until(deadline)
         quiesce_deadline = loop.time() + OBSERVER_QUIESCE_TIMEOUT_SECONDS
         # Wait for the count to settle, not for it to vanish. A pooled lane starts with the
         # backend sessions that proving it ready created, and it is entitled to: what this
@@ -2322,21 +2339,33 @@ class DirectObserver:
         stable_readings = 0
         previous: int | None = None
         while True:
-            async with self.connection.cursor() as cursor:
-                await cursor.execute(
-                    """
-                    SELECT current_user,
-                           count(*) FILTER (
-                             WHERE usename = %s
-                               AND pid <> pg_backend_pid()
-                           )
-                    FROM pg_stat_activity
-                    """,
-                    (CLIENT_ROLE,),
-                    prepare=False,
-                )
-                row = await cursor.fetchone()
-            await self.connection.commit()
+            try:
+                async with self.connection.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        SELECT current_user,
+                               count(*) FILTER (
+                                 WHERE usename = %s
+                                   AND pid <> pg_backend_pid()
+                               )
+                        FROM pg_stat_activity
+                        """,
+                        (CLIENT_ROLE,),
+                        prepare=False,
+                    )
+                    row = await cursor.fetchone()
+                await self.connection.commit()
+            except psycopg.OperationalError as exc:
+                # A Lakebase compute shuts down a minute after its last query, and a
+                # connection that lands as it does is cut. rc24's Round 5 re-arm lost its
+                # preflight to AdminShutdown 61 s after the bout before it (2026-10-05); the
+                # same connection made again wakes the compute, as `sample` already does.
+                if not self._transient(exc) or loop.time() >= deadline:
+                    raise
+                self.evidence.reconnect_attempts += 1
+                await self.close()
+                await self._connect_until(deadline)
+                continue
             if row is None or str(row[0]) != OBSERVER_ROLE:
                 raise FanInProtocolError("observer_role_invalid")
             self.evidence.role_verified = True
@@ -2412,20 +2441,10 @@ class DirectObserver:
                             ) / 1_000_000
                         return True
                     except psycopg.OperationalError as exc:
-                        sqlstate = self._safe_sqlstate(exc)
-                        connection_state = self._connection_state()
                         self.evidence.sample_failures += 1
-                        self.evidence.last_sqlstate = sqlstate
-                        self.evidence.last_connection_state = connection_state
-                        transient = (
-                            (sqlstate is not None and sqlstate.startswith("08"))
-                            or sqlstate in {"57P01", "57P02", "57P03"}
-                            or (
-                                sqlstate is None
-                                and connection_state in {"not_open", "closed", "broken"}
-                            )
-                        )
-                        if not transient:
+                        self.evidence.last_sqlstate = self._safe_sqlstate(exc)
+                        self.evidence.last_connection_state = self._connection_state()
+                        if not self._transient(exc):
                             self.evidence.last_failure_code = "observer_operational_permanent"
                             return False
                         if attempt >= OBSERVER_SAMPLE_MAX_RETRIES:

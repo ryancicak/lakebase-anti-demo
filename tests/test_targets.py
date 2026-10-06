@@ -379,6 +379,7 @@ async def test_deployed_aurora_arm_uses_sealed_runtime_role_session(
                     "AccessKeyId": "ASIA" + "1" * 16,
                     "SecretAccessKey": "s" * 40,
                     "SessionToken": "temporary-session-token",
+                    "Expiration": datetime.now(UTC) + timedelta(hours=1),
                 }
             }
 
@@ -389,22 +390,21 @@ async def test_deployed_aurora_arm_uses_sealed_runtime_role_session(
 
     def session_factory(**kwargs):
         calls.append(kwargs)
-        return SourceSession() if "aws_access_key_id" not in kwargs else assumed
+        # The assumed session is built on the refreshable credential the role exchange made.
+        return assumed if "botocore_session" in kwargs else SourceSession()
 
     monkeypatch.setattr("server.targets.boto3.Session", session_factory)
 
     evidence = await AuroraCredentialProvider().assert_armed()
 
     assert evidence["state"] == "SCALE_ZERO"
-    assert calls == [
-        {"region_name": REGION},
-        {
-            "aws_access_key_id": "ASIA" + "1" * 16,
-            "aws_secret_access_key": "s" * 40,
-            "aws_session_token": "temporary-session-token",
-            "region_name": REGION,
-        },
-    ]
+    assert calls[0] == {"region_name": REGION}
+    assert sorted(calls[1]) == ["botocore_session", "region_name"]
+    assert calls[1]["region_name"] == REGION
+    role_credentials = calls[1]["botocore_session"].get_credentials().get_frozen_credentials()
+    assert role_credentials.access_key == "ASIA" + "1" * 16
+    assert role_credentials.token == "temporary-session-token"
+    assert len(calls) == 2
     assert assume_requests == [
         {
             "RoleArn": role_arn,

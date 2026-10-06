@@ -296,7 +296,7 @@ versioning is off.
 Everything above describes permissions attached to a *human's* IAM user. From the
 next fresh install there is a second thing to know about: a role called
 `anti-demo-runtime`, declared in `infra/aws/anti_demo_runtime.tf`, which carries
-these same policies (1, 2, 3 and 5) and is assumed by everyone.
+these same policies (1, 2, 3, 5 and 6) and is assumed by everyone.
 
 ### Why it exists
 

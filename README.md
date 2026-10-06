@@ -113,13 +113,13 @@ read [Cost and safety](#cost-and-safety) for what bills until then.
 
 ## Which version is running
 
-The app shows its release — `v1.1.0` — in the bottom-right corner of the title
+The app shows its release — `v1.1.1` — in the bottom-right corner of the title
 screen, on the staff roll's title card and on the card it holds at the end.
 `GET /api/version` says the same, plus the exact commit when `bootstrap.sh`
 deployed it:
 
 ```json
-{"version": "1.1.0", "commit": "0123456789ab", "dirty": false}
+{"version": "1.1.1", "commit": "0123456789ab", "dirty": false}
 ```
 
 `dirty` is `true` when the deployed tree had uncommitted changes. Every release
@@ -286,7 +286,7 @@ partial report rather than an all-clear.
 One of those reads, `secretsmanager:ListSecrets`, comes from the operator policy
 set in `docs/iam/` and not from the app-runtime policy, so running `--dry-run` as
 the app's own principal stops partway through on `AccessDeniedException` and marks
-its report incomplete. Attach the three required operator policies and the
+its report incomplete. Attach the operator policies in `docs/iam/` and the
 inventory is complete.
 
 ## What has been proven and what has not

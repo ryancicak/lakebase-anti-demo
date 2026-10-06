@@ -833,10 +833,25 @@ _ARMED_CARD_CANCELLED = (
     "No run started and no result was recorded."
 )
 
-#: Rounds whose towel cleanup deletes isolated AWS environments and so can race an
-#: in-flight create; their cleanup retries automatically before it reports FAILED.
+#: Rounds whose towel cleanup retries automatically before it reports FAILED. Rounds 2 and 3
+#: delete isolated AWS environments and so can race an in-flight create. Rounds 4 and 6 park
+#: a Databricks pipeline and an AWS lane, and either can refuse once: rc23's Round 4 towel lost
+#: its pipeline stop to "Please try again later" (2026-10-05), and with no retry the round
+#: stayed held until a person pressed Retry cleanup.
 _TOWEL_CLEANUP_AUTO_RETRY_ROUNDS = frozenset(
-    {RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}
+    {
+        RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
+        RoundId.RECOVER_DELETED_ORDER,
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
+)
+
+#: Rounds whose towel cleanup reports through a cooldown, which each retry starts afresh. The
+#: others settle through their engine alone, and a cooldown nobody completes would fail every
+#: retry as unverified.
+_TOWEL_COOLDOWN_ROUNDS = frozenset(
+    {RoundId.WAKE_IDLE_APP, RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}
 )
 
 #: The two honest accounts of a control action aimed at a fight card this process
@@ -10937,11 +10952,7 @@ class RunManager:
             towel.state = TowelState.CLEANING
             towel.cleanup_failure = None
             round_id = record.snapshot.round.id
-            if round_id in {
-                RoundId.WAKE_IDLE_APP,
-                RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
-                RoundId.RECOVER_DELETED_ORDER,
-            }:
+            if round_id in _TOWEL_COOLDOWN_ROUNDS:
                 record.snapshot.cooldown = self._new_towel_cooldown(record)
             record.snapshot.updated_at = datetime.now(UTC)
             snapshot = record.snapshot.model_copy(deep=True)
@@ -10995,7 +11006,8 @@ class RunManager:
             async with record.lock:
                 if record.snapshot.towel is None:
                     return
-                record.snapshot.cooldown = self._new_towel_cooldown(record)
+                if round_id in _TOWEL_COOLDOWN_ROUNDS:
+                    record.snapshot.cooldown = self._new_towel_cooldown(record)
                 record.snapshot.updated_at = datetime.now(UTC)
                 snapshot = record.snapshot.model_copy(deep=True)
             await record.event_log.publish(

@@ -11,7 +11,9 @@ from typing import Any, Protocol
 
 import boto3
 import psycopg
+from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore.session import get_session as _new_botocore_session
 
 from .aws_auth import (
     AwsAuthMode,
@@ -100,32 +102,59 @@ def _assert_aws_identity(session: boto3.Session, expected_account_id: str) -> No
         )
 
 
+#: How long each assumed runtime-role credential lasts. The session renews it before then.
+RUNTIME_ROLE_SESSION_SECONDS = 3600
+
+
 def _runtime_aws_session(
     auth_mode: AwsAuthMode,
     profile: str | None,
     region: str,
 ) -> boto3.Session:
+    """The session the app's AWS calls run as: the sealed runtime role, renewed as it expires.
+
+    A Round 4 or Round 6 lane builds its session once and keeps it for as long as its bout and
+    its cleanup last. One assumed credential used to end that after an hour: rc23's Round 4
+    towel cleanup, retried 73 minutes after its bout, failed its Glue calls with
+    ExpiredTokenException (2026-10-05). The credential now refreshes itself, through botocore's
+    own RefreshableCredentials, before it expires.
+    """
+
     source = boto3.Session(**session_arguments(auth_mode, profile, region))
     role_arn = os.environ.get("ANTI_DEMO_RUNTIME_ROLE_ARN", "").strip()
     if not role_arn:
         return source
-    response = source.client("sts", region_name=region).assume_role(
-        RoleArn=role_arn,
-        RoleSessionName="anti-demo-target",
-        DurationSeconds=3600,
+    sts = source.client("sts", region_name=region)
+
+    def assume() -> dict[str, str]:
+        response = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="anti-demo-target",
+            DurationSeconds=RUNTIME_ROLE_SESSION_SECONDS,
+        )
+        credentials = response.get("Credentials") or {}
+        if any(
+            not credentials.get(key)
+            for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
+        ):
+            raise TargetConfigurationError("STS did not return the sealed runtime role")
+        expiration = credentials.get("Expiration")
+        if not isinstance(expiration, datetime):
+            raise TargetConfigurationError("STS did not say when the runtime role expires")
+        return {
+            "access_key": credentials["AccessKeyId"],
+            "secret_key": credentials["SecretAccessKey"],
+            "token": credentials["SessionToken"],
+            "expiry_time": expiration.isoformat(),
+        }
+
+    botocore_session = _new_botocore_session()
+    # botocore offers no public setter that keeps a credential refreshable, so the session is
+    # given one the way its own credential chain would.
+    botocore_session._credentials = RefreshableCredentials.create_from_metadata(
+        metadata=assume(), refresh_using=assume, method="sts-assume-role"
     )
-    credentials = response.get("Credentials") or {}
-    if any(
-        not credentials.get(key)
-        for key in ("AccessKeyId", "SecretAccessKey", "SessionToken")
-    ):
-        raise TargetConfigurationError("STS did not return the sealed runtime role")
-    return boto3.Session(
-        aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"],
-        aws_session_token=credentials["SessionToken"],
-        region_name=region,
-    )
+    return boto3.Session(botocore_session=botocore_session, region_name=region)
 
 
 def _assert_arn_binding(arn: str, region: str, account_id: str, label: str) -> None:

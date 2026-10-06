@@ -1719,7 +1719,7 @@ SIMEOF
       actions that Terraform runs with no dry run to fall back on:${SIMULATE_DENIED}
       A denied/implicitDeny means the attached policy does not grant the action on the resource
       Terraform will create, or a permissions boundary blocks it. Attach docs/iam/ operator
-      policies 1, 2, 3 and 5 (rendered with your account and region) and re-run; docs/iam/README.md
+      policies 1, 2, 3, 5 and 6 (rendered with your account and region) and re-run; docs/iam/README.md
       has the loop. If you JUST attached them, IAM is eventually consistent -- wait ~1 minute and
       re-run before changing anything. Proven before PROVISION precisely so it is not discovered
       thirty minutes into a real apply, after the fleet is already billing.")
