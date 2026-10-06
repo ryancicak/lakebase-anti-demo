@@ -1286,6 +1286,8 @@ describe('backstage setup', () => {
     render(<App />)
 
     const competitorLane = await screen.findByLabelText('Aurora Serverless v2 result')
+    // The lane can render before the effect that opens the stream has run.
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0))
     const source = FakeEventSource.instances.at(-1)!
     act(() => source.open())
     const displayedSeconds = () => Number(
