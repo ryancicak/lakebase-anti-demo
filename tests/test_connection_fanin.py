@@ -935,6 +935,105 @@ async def test_direct_observer_waits_for_setup_sessions_to_quiesce(
     await observer.close()
 
 
+class _PreflightConnection:
+    """A direct connection whose first query can be cut the way a suspending compute cuts it."""
+
+    def __init__(self, index: int, failure: BaseException | None) -> None:
+        self.index = index
+        self.failure = failure
+        self.closed = False
+
+    def cursor(self):
+        connection = self
+
+        class Cursor:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *unused):
+                return None
+
+            async def execute(self, *unused, **kwargs):
+                assert kwargs["prepare"] is False
+                if connection.failure is not None:
+                    raise connection.failure
+
+            async def fetchone(self):
+                return (runner.OBSERVER_ROLE, 0)
+
+        return Cursor()
+
+    async def commit(self):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+
+def _preflight_observer() -> runner.DirectObserver:
+    return runner.DirectObserver(
+        "lakebase",
+        {
+            "host": "direct.example.test",
+            "port": 5432,
+            "dbname": "anti_demo",
+            "user": runner.OBSERVER_ROLE,
+            "password": "test-only",
+            "credential_sha256": SHA,
+        },
+        "anti-demo-r5-test",
+    )
+
+
+async def test_direct_observer_preflight_reconnects_when_the_compute_shuts_down_under_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # rc24, 2026-10-05: a Round 5 re-arm's observer connected 61 s after the bout before it,
+    # as Lakebase shut the idle compute down, and its first query got AdminShutdown. The
+    # worker crashed and the arm was refused, though the next connection would have answered.
+    connections: list[_PreflightConnection] = []
+    cut = runner.psycopg.errors.AdminShutdown(
+        "terminating connection due to administrator command"
+    )
+
+    async def connect(**unused):
+        connection = _PreflightConnection(len(connections), cut if not connections else None)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    monkeypatch.setattr(runner, "OBSERVER_RETRY_SECONDS", 0.0)
+    observer = _preflight_observer()
+
+    await observer.open_and_preflight()
+
+    assert len(connections) == 2
+    assert connections[0].closed is True
+    assert observer.evidence.role_verified is True
+    assert observer.evidence.preexisting == 0
+    assert observer.evidence.reconnect_attempts == 1
+    await observer.close()
+
+
+async def test_direct_observer_preflight_does_not_retry_an_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[_PreflightConnection] = []
+    cancelled = runner.psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    async def connect(**unused):
+        connection = _PreflightConnection(len(connections), cancelled)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(runner.psycopg.AsyncConnection, "connect", connect)
+    observer = _preflight_observer()
+
+    with pytest.raises(runner.psycopg.errors.QueryCanceled):
+        await observer.open_and_preflight()
+    assert len(connections) == 1
+
+
 async def test_direct_observer_names_lane_when_sessions_do_not_quiesce(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

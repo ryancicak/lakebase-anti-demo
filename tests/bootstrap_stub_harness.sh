@@ -2328,7 +2328,8 @@ case_iam_create_permission_simulation() {
   status=$?
   check "names the denied create action" "secretsmanager:CreateSecret (implicitDeny)"
   check "names the second denied action" "sqs:CreateQueue (implicitDeny)"
-  check "points at the operator policies" "policies 1, 2, 3 and 5 (rendered with your account and region)"
+  # Round 6's lane is policy 6's: its Glue role and job, its CDC bucket and dms-vpc-role.
+  check "points at the operator policies" "policies 1, 2, 3, 5 and 6 (rendered with your account and region)"
   check "fails closed at the gate" "Nothing was provisioned and nothing was written"
   check_absent "never reaches the cost estimate or provision" "What this will cost"
   if ((status != 0)); then

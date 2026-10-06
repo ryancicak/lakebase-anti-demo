@@ -6291,6 +6291,108 @@ async def test_round_two_late_towel_cleanup_heals_a_refused_reset_on_its_own() -
     assert await lease_store.current() is None
 
 
+class RefusedOnceTowelModelScoreEngine(BlockingTowelModelScoreEngine):
+    """Round 4, whose first towel settle is refused the way rc23's pipeline stop was."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refusals = 1
+
+    async def settle_and_restore_baseline(self) -> None:
+        if self.refusals:
+            self.refusals -= 1
+            self.settle_calls += 1
+            raise RuntimeError(
+                "Round 4 could not park Lakebase: The request could not be processed. "
+                "Please try again later"
+            )
+        await super().settle_and_restore_baseline()
+
+
+class RefusedOnceTowelLiveOrdersEngine(BlockingTowelLiveOrdersEngine):
+    """Round 6, whose first towel settle is refused before it touches anything."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refusals = 1
+        self.settle_calls = 0
+
+    async def settle_and_cleanup_owned(self) -> None:
+        self.settle_calls += 1
+        if self.refusals:
+            self.refusals -= 1
+            raise RuntimeError("Round 6 could not park AWS: Rate exceeded")
+        await super().settle_and_cleanup_owned()
+
+
+@pytest.mark.parametrize(
+    ("factory_kwarg", "engine_cls", "round_id", "persona", "corner", "settled_flag"),
+    [
+        pytest.param(
+            "model_score_factory",
+            RefusedOnceTowelModelScoreEngine,
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            "software_engineer",
+            Corner.SIMPLICITY,
+            "baseline_restored",
+            id="round-4",
+        ),
+        pytest.param(
+            "live_orders_factory",
+            RefusedOnceTowelLiveOrdersEngine,
+            RoundId.ANALYZE_LIVE_ORDERS,
+            "data_analyst",
+            Corner.PERFORMANCE,
+            "cleaned",
+            id="round-6",
+        ),
+    ],
+)
+async def test_rounds_four_and_six_towel_cleanup_heals_a_refusal_on_its_own(
+    factory_kwarg, engine_cls, round_id, persona, corner, settled_flag
+) -> None:
+    # rc23, 2026-10-05: Round 4's towel cleanup lost its pipeline stop to Databricks'
+    # "Please try again later", and with no retry the round stayed held, its pipeline
+    # running, until a person pressed Retry cleanup.
+    lease_store = InMemoryBoutLeaseStore()
+    engine = engine_cls()
+    manager = RunManager(
+        **{factory_kwarg: lambda *_matchup: engine},
+        lease_store=lease_store,
+    )
+    manager._cleanup_retry_initial = 0.01
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona=persona,
+            corners=[corner],
+            round_id=round_id,
+        )
+    )
+    events = manager._records[created.id].event_log
+    await manager.start_arm(created.id)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id)
+    await asyncio.wait_for(engine.run_entered.wait(), timeout=1)
+
+    await manager.start_towel(created.id)
+    finished = await wait_for_towel(manager, created.id, "ready")
+
+    assert finished.towel is not None and finished.towel.cleanup_failure is None
+    assert getattr(engine, settled_flag).is_set()
+    assert engine.settle_calls == 2
+    # These rounds report their cleanup through the engine alone, so a retry must not
+    # leave a cooldown behind that nothing completes.
+    assert finished.cooldown is None
+    assert await lease_store.current() is None
+    published_towel_states = [
+        ((event.payload.get("session") or {}).get("towel") or {}).get("state")
+        for event in events.events
+        if event.event in {"towel_update", "towel_finished"}
+    ]
+    assert "failed" not in published_towel_states
+
+
 async def test_round_three_towel_cleanup_failure_past_the_window_retries_under_retained_lease(
 ) -> None:
     lease_store = InMemoryBoutLeaseStore()
