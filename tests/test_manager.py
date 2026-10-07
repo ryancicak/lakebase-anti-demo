@@ -1834,7 +1834,9 @@ async def test_double_rung_bell_opens_exactly_one_run() -> None:
     assert settled.state == SessionState.TOWELLED
     # This is a pre-verify towel. Once both targets report IDLE/zero there is no
     # verified lane activity left to reconcile, so cleanup releases rather than
-    # pinning an impossible cooldown requirement.
+    # pinning an impossible cooldown requirement. The release comes from the
+    # cooldown the towel schedules once it reads ready, so wait for that.
+    await drain_record_operations(manager, record)
     assert await manager._lease_store.current() is None
     assert (await manager.bout_status(RoundId.WAKE_IDLE_APP)).can_start is True
     assert record.cooldown_task is None
@@ -3739,7 +3741,8 @@ async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> 
         lane.state == CooldownLaneState.CONFIRMED_ZERO
         for lane in cooldown.lanes.values()
     )
-    await asyncio.sleep(0)
+    # The cooldown reads ready before it releases the ring.
+    await drain_record_operations(manager, manager._records[created.id])
     assert await manager._lease_store.current() is None
 
 
@@ -5357,7 +5360,8 @@ async def test_round_one_automatically_rechecks_idle_while_holding_cleanup_fence
         for lanes in cooldown_states
     )
 
-    await asyncio.sleep(0)
+    # The cooldown reads ready before it releases the ring.
+    await drain_record_operations(manager, manager._records[first.id])
     assert (await manager.bout_status()).active is False
 
 
@@ -6489,6 +6493,8 @@ async def test_completed_round_two_cleanup_is_idempotent_and_consumes_no_new_fen
         await manager.start_run(created.id)
         await wait_for_state(manager, created.id, SessionState.VERIFIED)
         await wait_for_cooldown(manager, created.id, CooldownState.READY)
+        # The cooldown reads ready before it releases the ring the next arm needs.
+        await drain_record_operations(manager, manager._records[created.id])
 
     assert lease_store._generation == 2
     first_again = await manager.start_cooldown(first.id)
