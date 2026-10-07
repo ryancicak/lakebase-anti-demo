@@ -245,11 +245,19 @@ class FakePreparedTarget:
     name: str
     delay: float
     fatal: bool = False
+    #: Wait for this before starting the delay, so this lane always answers after another one.
+    after: asyncio.Event | None = None
+    #: Set once this lane has answered.
+    answered: asyncio.Event | None = None
 
     async def attempt(self, nonce: str, expected_value: str, timeout_seconds: float) -> None:
+        if self.after is not None:
+            await self.after.wait()
         await asyncio.sleep(self.delay)
         if self.fatal:
             raise FatalProbeError("The Lakebase application transaction did not verify.")
+        if self.answered is not None:
+            self.answered.set()
 
 
 @dataclass
@@ -261,6 +269,8 @@ class FakeLiveTarget:
     fatal: bool = False
     prepare_calls: int = 0
     arm_calls: int = 0
+    after: asyncio.Event | None = None
+    answered: asyncio.Event | None = None
 
     async def assert_armed(self, *, not_before=None) -> dict[str, object]:
         self.arm_calls += 1
@@ -281,7 +291,9 @@ class FakeLiveTarget:
         self.prepare_calls += 1
         if not self.eligible:
             raise AssertionError("An unsupported RDS lane must never be prepared")
-        return FakePreparedTarget(self.id, self.name, self.delay, self.fatal)
+        return FakePreparedTarget(
+            self.id, self.name, self.delay, self.fatal, after=self.after, answered=self.answered
+        )
 
 
 class FakeResolver:
@@ -289,6 +301,23 @@ class FakeResolver:
         return (
             FakeLiveTarget("lakebase", "Lakebase", 0.005),
             FakeLiveTarget("competitor", "Aurora Serverless v2", 0.025),
+        )
+
+
+class OrderedFakeResolver:
+    """FakeResolver's lanes, with Aurora's delay starting only once Lakebase has answered.
+
+    FakeResolver's two delays race on the event loop's clock alone. A runner that stalls the
+    loop past both wakes them in the same pass, and the verifier stamps both lanes within a
+    few microseconds of each other: CI's Python 3.12 job on the v1.1.1 tag read the bout as
+    "NECK AND NECK — BOTH VERIFIED" (2026-10-06). A test that asserts which lane won uses this.
+    """
+
+    def resolve(self, competitor: CompetitorId):
+        lakebase_answered = asyncio.Event()
+        return (
+            FakeLiveTarget("lakebase", "Lakebase", 0.005, answered=lakebase_answered),
+            FakeLiveTarget("competitor", "Aurora Serverless v2", 0.025, after=lakebase_answered),
         )
 
 
@@ -1805,7 +1834,9 @@ async def test_double_rung_bell_opens_exactly_one_run() -> None:
     assert settled.state == SessionState.TOWELLED
     # This is a pre-verify towel. Once both targets report IDLE/zero there is no
     # verified lane activity left to reconcile, so cleanup releases rather than
-    # pinning an impossible cooldown requirement.
+    # pinning an impossible cooldown requirement. The release comes from the
+    # cooldown the towel schedules once it reads ready, so wait for that.
+    await drain_record_operations(manager, record)
     assert await manager._lease_store.current() is None
     assert (await manager.bout_status(RoundId.WAKE_IDLE_APP)).can_start is True
     assert record.cooldown_task is None
@@ -3710,7 +3741,8 @@ async def test_round_one_towel_stops_verifier_before_zero_state_settlement() -> 
         lane.state == CooldownLaneState.CONFIRMED_ZERO
         for lane in cooldown.lanes.values()
     )
-    await asyncio.sleep(0)
+    # The cooldown reads ready before it releases the ring.
+    await drain_record_operations(manager, manager._records[created.id])
     assert await manager._lease_store.current() is None
 
 
@@ -5168,7 +5200,7 @@ async def test_manifest_readiness_gate_applies_to_create_arm_and_run() -> None:
 
 
 async def test_manager_runs_the_full_honest_state_machine() -> None:
-    manager = RunManager(resolver=FakeResolver(), verifier=make_verifier())
+    manager = RunManager(resolver=OrderedFakeResolver(), verifier=make_verifier())
     request = SessionCreate(
         competitor=CompetitorId.AURORA_SERVERLESS_V2,
         primary_persona="sre",
@@ -5328,7 +5360,8 @@ async def test_round_one_automatically_rechecks_idle_while_holding_cleanup_fence
         for lanes in cooldown_states
     )
 
-    await asyncio.sleep(0)
+    # The cooldown reads ready before it releases the ring.
+    await drain_record_operations(manager, manager._records[first.id])
     assert (await manager.bout_status()).active is False
 
 
@@ -6460,6 +6493,8 @@ async def test_completed_round_two_cleanup_is_idempotent_and_consumes_no_new_fen
         await manager.start_run(created.id)
         await wait_for_state(manager, created.id, SessionState.VERIFIED)
         await wait_for_cooldown(manager, created.id, CooldownState.READY)
+        # The cooldown reads ready before it releases the ring the next arm needs.
+        await drain_record_operations(manager, manager._records[created.id])
 
     assert lease_store._generation == 2
     first_again = await manager.start_cooldown(first.id)
