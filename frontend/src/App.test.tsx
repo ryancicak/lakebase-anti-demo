@@ -3614,6 +3614,40 @@ describe('backstage setup', () => {
     expect(screen.getByRole('button', { name: /fight card/i })).toBeInTheDocument()
   })
 
+  it('says why a refused Prepare came back from inside the pinned action bar', async () => {
+    // The bar is pinned to the bottom of the screen. The reason sat in the column
+    // just above it, and one line of it is enough to make the card taller than
+    // 1280x720: the bar then pinned over the reason, beside an enabled PREPARE.
+    const refusal = 'The fight card could not be prepared right now. Try again in a moment.'
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          json: async () => ({ detail: refusal }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(refusal)
+    expect(document.querySelector('.card-actions > .game-error')).toHaveTextContent(refusal)
+    expect(document.querySelectorAll('.game-error')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
+  })
+
   it('refreshes a transient Round 5 identity refusal back to backstage preparation', async () => {
     const warming = allReadyBoutBoard({
       survive_connection_spike: {

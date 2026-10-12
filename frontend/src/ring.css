@@ -102,6 +102,10 @@ html:has(.game-screen[data-scene="card"]) #root {
   flex: 1 1 0;
   min-width: 0;
 }
+/* Why the last press failed rides in the bar too, as a full row above the
+   buttons. Left in the column above the bar, the pinned bar covered it. */
+.game-scene.card-scene .card-actions { flex-wrap: wrap; }
+.game-scene.card-scene .card-actions .game-error { flex: 0 0 100%; min-width: 0; overflow-wrap: anywhere; }
 
 .game-scene.card-scene { display: flex; flex-direction: column; gap: clamp(5px, .65vw, 11px); }
 /* The old grid gave these children a column and a chrome of their own. In the

@@ -113,4 +113,22 @@ describe('the fight card action bar', () => {
     // background, so the reason PREPARE was locked could not be read.
     expect(ring).toMatch(/\.game-scene\.card-scene \.card-actions \.game-lock-note\s*\{/)
   })
+
+  /** Every declaration of `property` on exactly `selector`, last one winning. */
+  function finalDeclaration(selector: string, property: string): string | null {
+    let value: string | null = null
+    for (const [, selectors, body] of ring.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (!selectors.split(',').map((one) => one.trim()).includes(selector)) continue
+      value = declaration(body, property) ?? value
+    }
+    return value
+  }
+
+  it('gives a refused press its own full row in the bar, above the buttons', () => {
+    // The reason a press failed sits in the bar, which is pinned: in the column
+    // above it, the bar covered it at 1280x720. As a fourth item on the bar's one
+    // row it would squeeze the buttons, so the bar wraps and the reason takes a row.
+    expect(finalDeclaration('.game-scene.card-scene .card-actions', 'flex-wrap')).toBe('wrap')
+    expect(finalDeclaration('.game-scene.card-scene .card-actions .game-error', 'flex')).toBe('0 0 100%')
+  })
 })

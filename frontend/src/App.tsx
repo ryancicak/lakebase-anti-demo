@@ -5198,8 +5198,11 @@ function Setup(props: {
               <div className="dialogue-team" aria-label="People at ringside">{[primaryPersona, ...secondaryPersonas].map((persona) => <img src={persona.portrait} alt={persona.role} key={persona.id} />)}</div>
               <p><span>{primaryPersona.nickname} says:</span>“{selectedOpening}”</p>
             </div>
-            {props.error && <p className="game-error" role="alert">{props.error}</p>}
             <div className="card-actions">
+              {/* Why the last press failed, as the bar's own first row. In the column
+                  just above the bar, the bar pinned over it: at 1280x720 a refused
+                  Prepare came back with PREPARE enabled and its reason underneath. */}
+              {props.error && <p className="game-error" role="alert">{props.error}</p>}
               <button className="game-back" onClick={() => props.onScene('lenses')}>B · Back</button>
               {/* ONE STRIP, ONE SENTENCE, and it is the same value that greyed
                   the button out. Five separate notes stood here, each with its
