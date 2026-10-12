@@ -4539,8 +4539,9 @@ async def test_catalog_storage_probe_is_cached_single_flight_and_recovers() -> N
     first = asyncio.create_task(manager.refresh_delta_storage_readiness())
     await entered.wait()
     second = asyncio.create_task(manager.refresh_delta_storage_readiness())
+    probe = manager._delta_storage_probe_task
     release.set()
-    await asyncio.gather(first, second)
+    await asyncio.gather(first, second, probe)
 
     assert calls == 1
     assert set(manager.storage_refusals) == {
@@ -4583,20 +4584,71 @@ async def test_an_open_tab_alone_does_not_re_probe_storage_once_a_verdict_exists
         delta_storage_probe_watched=lambda: person_on,
     )
     # The first answer is read whoever is watching: nothing is advertised before it.
+    assert manager.storage_checking == {
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
     await manager.refresh_delta_storage_readiness()
+    await asyncio.sleep(0)
     assert calls == 1
+    assert manager.storage_checking == frozenset()
     # A tab left open: polls arrive, the cache is stale, and nothing is sent.
     for _ in range(5):
         await manager.refresh_delta_storage_readiness()
+        await asyncio.sleep(0)
     assert calls == 1
     # A person comes back, and the verdict is read again.
     person_on = True
     await manager.refresh_delta_storage_readiness()
+    await asyncio.sleep(0)
     assert calls == 2
     # Startup's forced read does not wait for anyone.
     person_on = False
     await manager.refresh_delta_storage_readiness(force=True)
     assert calls == 3
+
+
+async def test_a_stale_storage_verdict_answers_at_once_while_a_new_one_is_read() -> None:
+    """A stopped warehouse takes most of a minute, and the catalog must not wait for it."""
+
+    warehouse_up = asyncio.Event()
+    calls = 0
+    denied = True
+
+    async def probe() -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await warehouse_up.wait()
+        if denied:
+            raise model_score_live.DeltaStorageAccessDeniedError(
+                state="FAILED",
+                error_code="BAD_REQUEST",
+                sql_state="42000",
+                provider_category="STORAGE_ACCESS_DENIED (403/AccessDenied)",
+                provider_message="S3 403 Forbidden",
+            )
+
+    manager = RunManager(delta_storage_probe=probe, delta_storage_probe_interval_seconds=0)
+    await manager.refresh_delta_storage_readiness(force=True)
+    assert set(manager.storage_refusals) == {
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
+
+    denied = False
+    await asyncio.wait_for(manager.refresh_delta_storage_readiness(), timeout=1)
+    await asyncio.sleep(0)
+    # Re-reading, and still answering from the verdict on record while it does.
+    assert calls == 2
+    assert manager.storage_refusals and manager.storage_checking == frozenset()
+    rereading = manager._delta_storage_probe_task
+    assert rereading is not None and not rereading.done()
+
+    warehouse_up.set()
+    await rereading
+    assert manager.storage_refusals == {}
+    await manager.close()
 
 
 async def test_missing_round6_delta_history_disables_only_round_six() -> None:
@@ -4611,9 +4663,10 @@ async def test_missing_round6_delta_history_disables_only_round_six() -> None:
         delta_storage_probe_interval_seconds=0,
     )
 
-    await manager.refresh_delta_storage_readiness()
+    await manager.refresh_delta_storage_readiness(force=True)
 
     assert set(manager.storage_refusals) == {RoundId.ANALYZE_LIVE_ORDERS}
+    assert manager.storage_checking == frozenset()
     assert "missing" in manager.storage_refusals[RoundId.ANALYZE_LIVE_ORDERS].lower()
 
 

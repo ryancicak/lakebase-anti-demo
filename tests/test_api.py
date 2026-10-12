@@ -1807,23 +1807,90 @@ async def test_catalog_probes_shared_storage_before_offering_rounds_four_and_six
         base_url="http://anti-demo.test",
     ) as client:
         response = await client.get("/api/catalog")
+        for _ in range(5):
+            await asyncio.sleep(0)
         cached = await client.get("/api/catalog")
 
     assert response.status_code == 200
     assert cached.status_code == 200
     assert calls == 1
+    shared = {RoundId.PUT_MODEL_SCORE_IN_APP.value, RoundId.ANALYZE_LIVE_ORDERS.value}
+    # The first answer does not wait for the probe, and offers neither round before it.
     by_id = {item["id"]: item for item in response.json()["rounds"]}
-    assert by_id[RoundId.PUT_MODEL_SCORE_IN_APP.value]["availability"] == "unavailable"
-    assert by_id[RoundId.ANALYZE_LIVE_ORDERS.value]["availability"] == "unavailable"
+    for round_id in shared:
+        assert by_id[round_id]["availability"] == "unavailable"
+        assert by_id[round_id]["availability_reason_code"] == "storage_checking"
     assert all(
         item["availability"] == "ready"
         for round_id, item in by_id.items()
-        if round_id
-        not in {
-            RoundId.PUT_MODEL_SCORE_IN_APP.value,
-            RoundId.ANALYZE_LIVE_ORDERS.value,
-        }
+        if round_id not in shared
     )
+    # Once it has answered, the refusal it proved replaces the check.
+    cached_by_id = {item["id"]: item for item in cached.json()["rounds"]}
+    for round_id in shared:
+        assert cached_by_id[round_id]["availability"] == "unavailable"
+        assert cached_by_id[round_id].get("availability_reason_code") is None
+        assert "storage is unavailable" in cached_by_id[round_id]["availability_headline"]
+
+
+async def test_the_catalog_answers_while_a_stopped_warehouse_is_still_starting(
+    monkeypatch,
+) -> None:
+    """A visitor waited most of a minute, through "Server offline", for a cold warehouse.
+
+    The catalog is every page's first request, and it waited on the shared-storage
+    probe, which a stopped SQL warehouse took most of a minute to answer
+    (2026-10-12). It answers at once now; the board says Rounds 4 and 6 open
+    automatically, and offers them once the probe has answered.
+    """
+
+    monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)
+    monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
+    warehouse_up = asyncio.Event()
+    calls = 0
+
+    async def cold_warehouse() -> None:
+        nonlocal calls
+        calls += 1
+        await warehouse_up.wait()
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    run_manager = RunManager(
+        model_score_factory=lambda _competitor: object(),
+        connection_spike_factory=lambda competitor: object(),
+        live_orders_factory=lambda _competitor: object(),
+        delta_storage_probe=cold_warehouse,
+    )
+    api_app.state.run_manager = run_manager
+    shared = {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        catalog = await asyncio.wait_for(client.get("/api/catalog"), timeout=2)
+        board = await asyncio.wait_for(client.get("/api/bout/all"), timeout=2)
+
+        assert catalog.status_code == 200 and board.status_code == 200
+        assert calls == 1
+        rounds = board.json()["rounds"]
+        for round_id in shared:
+            assert rounds[round_id.value]["state"] == "temporarily_unavailable"
+            assert "opens automatically" in rounds[round_id.value]["detail"]
+        assert all(
+            rounds[round_id.value]["state"] == "ready"
+            for round_id in RoundId
+            if round_id not in shared
+        )
+
+        warehouse_up.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        opened = (await client.get("/api/bout/all")).json()["rounds"]
+
+    assert calls == 1
+    assert all(opened[round_id.value]["state"] == "ready" for round_id in RoundId)
+    await run_manager.close()
 
 
 async def test_catalog_storage_probe_reads_both_sealed_delta_paths(monkeypatch) -> None:

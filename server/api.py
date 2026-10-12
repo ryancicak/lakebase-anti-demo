@@ -198,6 +198,11 @@ async def version() -> dict[str, object]:
     return build_info()
 
 
+def _storage_checking(run_manager: object) -> frozenset[RoundId]:
+    checking = getattr(run_manager, "storage_checking", None)
+    return checking if isinstance(checking, frozenset) else frozenset()
+
+
 def _availability_signals(request: Request) -> round_availability.AvailabilitySignals:
     """Collect the cached live state the round-select screen has to respect.
 
@@ -254,6 +259,7 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         round6_aws_sealed=posture.round6_aws_sealed,
         grant_refusals=getattr(run_manager, "grant_refusals", None) or {},
         storage_refusals=getattr(run_manager, "storage_refusals", None) or {},
+        storage_checking=_storage_checking(run_manager),
     )
 
     gate = getattr(request.app.state, "readiness_gate", None)
@@ -551,7 +557,16 @@ def _fight_card_round_status(
             and bout.maintenance_detail == _LOST_RING_STILL_STOPPING
             else None
         )
-        reason = round5_stage_detail or round5_gate_detail or lost_ring_detail
+        # And so does a round whose shared storage has not answered its first check.
+        storage_checking_detail = (
+            getattr(availability, "availability_headline", None)
+            if getattr(availability, "availability_reason_code", None)
+            == round_availability.STORAGE_CHECKING_REASON_CODE
+            else None
+        )
+        reason = (
+            round5_stage_detail or round5_gate_detail or lost_ring_detail or storage_checking_detail
+        )
         state = (
             FightCardState.TEMPORARILY_UNAVAILABLE
             if reason is not None and "STAGE TERMINAL-BLOCKED" not in reason

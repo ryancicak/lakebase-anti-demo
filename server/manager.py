@@ -1946,44 +1946,67 @@ class RunManager:
 
         return dict(self._storage_refusals)
 
+    @property
+    def storage_checking(self) -> frozenset[RoundId]:
+        """Rounds 4 and 6 until this process has its first shared-storage verdict.
+
+        Neither is offered before their shared Delta path has answered. A refusal
+        already on record outranks this, so the same round is not named twice.
+        """
+
+        if self._delta_storage_probe is None or self._delta_storage_probe_finished_ns is not None:
+            return frozenset()
+        return frozenset(
+            round_id
+            for round_id in (RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS)
+            if round_id not in self._storage_refusals
+        )
+
     async def refresh_delta_storage_readiness(self, *, force: bool = False) -> None:
-        """Refresh the cached shared-storage verdict once, with request coalescing.
+        """Refresh the cached shared-storage verdict, with request coalescing.
 
-        Catalog and all-round status reads call this before advertising Round 4
-        or Round 6. The probe is read-only and cached so the polling fight card
-        cannot turn into a SQL warehouse keepalive. Concurrent browser polls join
-        the same task rather than issuing duplicate Statement Execution calls.
+        Catalog and all-round status reads call this and never wait for it. The
+        catalog is every page's first request, and a SQL warehouse that has
+        stopped takes most of a minute to answer the probe, which a visitor saw as
+        "Checking server", then "Server offline" (2026-10-12). They answer from
+        the verdict on record, or with Rounds 4 and 6 still checking before the
+        first one (``storage_checking``), while the read runs in the background.
+        Only ``force``, which startup passes, waits for it.
 
-        The cache alone did not do that: it lasts a minute, the warehouse stops
-        only after ten quiet minutes, and an open tab polls the catalog every
-        thirty seconds, so a tab left open kept the warehouse up all night
-        (2026-10-02). Once a verdict exists, it is re-read only while a person is
-        on the app (``delta_storage_probe_watched``).
+        The probe is read-only and cached so the polling fight card cannot turn
+        into a SQL warehouse keepalive, and concurrent polls share one task rather
+        than issuing duplicate Statement Execution calls. The cache alone did not
+        do that: it lasts a minute, the warehouse stops only after ten quiet
+        minutes, and an open tab polls the catalog every thirty seconds, so a tab
+        left open kept the warehouse up all night (2026-10-02). Once a verdict
+        exists, it is re-read only while a person is on the app
+        (``delta_storage_probe_watched``).
         """
 
         if self._closed or self._delta_storage_probe is None:
             return
-        running = self._delta_storage_probe_task
-        if running is not None and not running.done():
-            await asyncio.shield(running)
-            return
-        now = time.monotonic_ns()
-        last = self._delta_storage_probe_finished_ns
-        if not force and last is not None:
-            fresh = now - last < self._delta_storage_probe_interval_ns
-            watched = self._delta_storage_probe_watched
-            if fresh or (watched is not None and not watched()):
-                return
-        task = asyncio.create_task(
-            self._probe_delta_storage(),
-            name="round4-round6-storage-readiness",
-        )
-        self._delta_storage_probe_task = task
-        try:
+        task = self._delta_storage_probe_task
+        if task is None or task.done():
+            last = self._delta_storage_probe_finished_ns
+            if not force and last is not None:
+                fresh = time.monotonic_ns() - last < self._delta_storage_probe_interval_ns
+                watched = self._delta_storage_probe_watched
+                if fresh or (watched is not None and not watched()):
+                    return
+            task = asyncio.create_task(
+                self._probe_delta_storage(),
+                name="round4-round6-storage-readiness",
+            )
+            self._delta_storage_probe_task = task
+            task.add_done_callback(self._forget_delta_storage_probe)
+        if force:
             await asyncio.shield(task)
-        finally:
-            if task.done() and self._delta_storage_probe_task is task:
-                self._delta_storage_probe_task = None
+
+    def _forget_delta_storage_probe(self, task: asyncio.Task[None]) -> None:
+        if self._delta_storage_probe_task is task:
+            self._delta_storage_probe_task = None
+        if not task.cancelled():
+            task.exception()
 
     async def _probe_delta_storage(self) -> None:
         try:

@@ -1152,7 +1152,7 @@ function roundLockNote(
     return 'CLEANUP IN PROGRESS · OTHER ROUNDS REMAIN AVAILABLE'
   }
   if (state === 'temporarily_unavailable') {
-    return 'RESETTING · REOPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
+    return 'REOPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
   }
   const alternative = rounds.some((item) => (
     item.id !== round.id
