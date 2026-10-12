@@ -343,14 +343,14 @@ Databricks App is still serving a current seal, and you should assume it is not.
 than to a path, so every `antidemo setup`, resume and `antidemo renew` rewrites the
 manifest while the deployed app keeps serving whatever was last pushed. Check
 mode compares the manifest's hash against a local record of what was pushed and
-reports `drift` when they disagree; `./antidemo coordination-upgrade` creates
-and grants coordination tables without resetting lanes, then
-`./bootstrap.sh --deploy-only` republishes, redeploys, restarts and then
-verifies the container actually started. `--deploy-only` never touches AWS and
-never runs Terraform. A *matching* seal cannot be proven — the
-secret value is unreadable through the public API — so it fails toward
-"republish". [docs/DEPLOY.md](docs/DEPLOY.md) has the detail, including the parts
-that have never been run against a live workspace.
+reports `drift` when they disagree; `./bootstrap.sh --deploy-only` republishes,
+redeploys, restarts and then verifies the container actually started. It never
+touches AWS, never runs Terraform and never creates coordination tables, so a
+checkout that adds one runs `./antidemo coordination-upgrade` first (see
+[Upgrading from v1.1.1](docs/DEPLOY.md#upgrading-from-v111)). A *matching*
+seal cannot be proven — the secret value is unreadable through the public API —
+so it fails toward "republish". [docs/DEPLOY.md](docs/DEPLOY.md) has the detail,
+including the parts that have never been run against a live workspace.
 
 `docs/bootstrap.env.example` also lists `ANTI_DEMO_TF_BACKEND`,
 `ANTI_DEMO_TF_STATE_BUCKET` and `ANTI_DEMO_TF_STATE_KEY`, which select an opt-in
@@ -477,9 +477,9 @@ If you get *"No owned demo manifest is selected"*,
 this variable is unset — set it rather than reintroducing a default. Nothing in
 `./antidemo` sets it for you, and that is deliberate rather than an omission: the
 launcher *does* read `.env.bootstrap`, but it carries only the five AWS
-credential and region variables out of it, precisely so that a stale file cannot
-silently point a serve at another generation. So `ANTI_DEMO_MANIFEST` has to be
-exported in the shell you run from.
+credential and region variables and `ANTI_DEMO_OPERATOR_IP` out of it, precisely
+so that a stale file cannot silently point a serve at another generation. So
+`ANTI_DEMO_MANIFEST` has to be exported in the shell you run from.
 
 The `--print-env` route above is a convenience at the entry point, not a default
 inside the library — `manifest_path()` still raises, deliberately.
@@ -559,7 +559,7 @@ npm run lint          # eslint
 | Ruff | `uv run ruff check .` | `All checks passed!` |
 | Frontend tests | `npm test` | All pass; the run prints its own count and file count |
 | Typecheck | `npm run typecheck` | Clean, no output |
-| ESLint | `npm run lint` | **Failing on `main` as of 2026-08-24 21:07 CDT** — 1 error and 9 warnings, being cleared by separate work. Check `main` before assuming your change caused it |
+| ESLint | `npm run lint` | No errors. A few known `react-refresh/only-export-components` warnings print and do not fail the run; a new error is yours |
 | Copy guard | not runnable from a clone | See [The copy guard](#the-copy-guard) |
 
 **Exact test counts used to be recorded here and are not any more, deliberately.**

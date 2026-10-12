@@ -62,13 +62,6 @@ past a step hides the defect the step exists to find.
    Aurora has paused (`seconds_until_auto_pause` is 300 in `infra/aws/aurora.tf`;
    give it ten minutes), then run `./bootstrap.sh --apply --reset-ready --yes`.
    Setup racing Aurora's resume is a failure this step found just before v1.0.0.
-   An existing ready install must not be upgraded with only
-   `./bootstrap.sh --deploy-only`: that republishes the app without creating or
-   granting `anti_demo_coordination.round4_source_rebase`, and the app then
-   refuses to boot. Run `antidemo coordination-upgrade` first (creates/grants
-   coordination tables; does not reset database lanes), then `--deploy-only`.
-   `antidemo setup` on a ready install is the destructive lane-reset resume, not
-   this upgrade.
 
 ## 3. The one command
 
@@ -118,9 +111,13 @@ into a failure without the rest of the run. Each one's docstring has its usage.
 | `leftovers.py` | The leak check. Read-only. |
 | `lease_check.py` | The lease check; `--plan` adds the Terraform plan. Read-only. |
 | `gone.py` | After an uninstall, counts whatever is left. Read-only. |
-
-`leftovers.py` and `gone.py` list whole resource types across the account: IAM policies and instance profiles, SQS queues, and Glue jobs and connections, for example. The install's own policies in [docs/iam](iam/) do not grant all of those listings, so the AWS key in `.env.bootstrap` needs account-wide read access for the bar.
 | `summarize.py` | Writes `summary.md` from an evidence directory. |
+
+`leftovers.py` and `gone.py` list whole resource types across the account: IAM
+policies and instance profiles, SQS queues, and Glue jobs and connections, for
+example. The install's own policies in [docs/iam](iam/) do not grant all of those
+listings, so the AWS key in `.env.bootstrap` needs account-wide read access for
+the bar.
 
 ## 4. Reading a failure
 
@@ -175,6 +172,12 @@ With every step passed on one commit:
 2. Tag it: `git tag -a v<version> <commit> -m "v<version>"` and push the tag.
 3. Publish a GitHub release whose notes say what changed, how it was verified
    (from `summary.md`), and what is still known to be limited.
-4. If the Round 5 runner changed since the last release, say so in the upgrade
-   notes: an existing installation needs `./antidemo runner refresh` before
-   `./bootstrap.sh --deploy-only --yes`.
+4. Say in the upgrade notes what an existing installation must run before
+   `./bootstrap.sh --deploy-only --yes`: `./antidemo runner refresh` if the
+   Round 5 runner changed since the last release, and
+   `./antidemo coordination-upgrade` if the coordination schema gained a table or
+   a grant, as it does in the upgrade from v1.1.1. `--deploy-only` alone neither
+   creates nor grants coordination tables, and the app then refuses to boot;
+   `--apply --reset-ready` is not the upgrade either, because it resets both
+   database lanes. [Upgrading from v1.1.1](DEPLOY.md#upgrading-from-v111) is the
+   sequence.

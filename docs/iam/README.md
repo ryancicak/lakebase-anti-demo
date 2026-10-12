@@ -6,8 +6,9 @@ They were derived by reading `infra/aws/*.tf` and the `boto3` calls in `server/`
 — not from an AWS reference list — so every action below is traceable to a
 declared resource or an actual API call.
 
-Files 1–3 are required. File 4 is only for the opt-in S3 state backend — see
-[the fourth file](#4--terraform-state-in-s3-opt-in) before you attach it.
+Files 1, 2, 3, 5 and 6 are required. File 4 is only for the opt-in S3 state
+backend — see [the fourth file](#4--terraform-state-in-s3-opt-in) before you
+attach it.
 
 **The separation below is the intended design, and `bootstrap.sh` does not yet
 implement it.** `docs/bootstrap.env.example` offers one AWS pair, and
@@ -51,9 +52,9 @@ characters of headroom. Attach 1, 2, 3, 5 and 6 — any one alone is not suffici
 File 3 is the one to watch: it is closest to the 6144 cap, so a new IAM or
 Secrets Manager grant there may force the split the other files already model.
 
-File 4 is a separate file rather than merged into one of the other three because
+File 4 is a separate file rather than merged into one of the other five because
 the default install needs none of it: keeping it separate means a local-backend
-install grants nothing for S3 at all. Merging is safe on size — folding it into
+install grants nothing on a state bucket. Merging is safe on size — folding it into
 file 3, the largest, reaches 5249 of 6144 — but it is not the shape to prefer.
 
 ## Rendering and attaching
@@ -410,7 +411,7 @@ it does happen it is a routine scheduled operation rather than an incident, and
 the design target is "runs unattended *between* sweeps", not "survives one".
 
 1. **Recreate the IAM user** with the same name, and issue new access keys.
-   Attach files 1–3 to it as above.
+   Attach files 1, 2, 3, 5 and 6 to it as above.
 2. **Update the app's credentials** — the `aws-access-key-id` and
    `aws-secret-access-key` app resources in `app.yaml`, then restart the app.
 3. **`antidemo doctor`.** Expect `anti_demo_runtime_trust` to fail naming the bare
@@ -492,8 +493,9 @@ Give these to whoever approves the policy.
   it.
 - **Cost Explorer or the Pricing API.** `server/cost_model.py` uses static
   reviewed rates and Databricks system tables, not live AWS pricing calls.
-- **Any S3 access at all, in a default install.** State lives on disk next to
-  the manifest, so files 1–3 grant nothing for S3. File 4 is the whole of the S3
-  surface and is opt-in.
+- **Any S3 access beyond the two lane buckets, in a default install.** State
+  lives on disk next to the manifest. Files 5 and 6 grant S3 only on Round 4's
+  `lakebase-ant*-r4-glue` and Round 6's `lakebase-ant*-r6-cdc` buckets, and
+  files 1–3 grant nothing for S3. File 4, the state bucket, is opt-in.
 - **DynamoDB.** The S3 backend uses S3-native locking (`use_lockfile = true`),
   so there is no lock table to create, pay for, or fail to destroy.

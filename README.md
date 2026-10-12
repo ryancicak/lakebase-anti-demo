@@ -33,8 +33,8 @@ You need:
   create RDS, Aurora, EC2, IAM, KMS grants, and Secrets Manager entries. It is
   not enough for the account to allow it or for your console login to have it:
   bootstrap authenticates as that pair and nothing else. An administrator pair
-  already qualifies. For a least-privilege operator instead, attach the three
-  policies in [`docs/iam/`](docs/iam/README.md) with
+  already qualifies. For a least-privilege operator instead, attach the five
+  required operator policies in [`docs/iam/`](docs/iam/README.md) with
   `scripts/attach-operator-policies.sh --user <name>` first — bootstrap cannot
   grant its own permissions, because creating and attaching IAM policies is more
   privilege than the set being granted
@@ -126,6 +126,16 @@ deployed it:
 bumps the version in `pyproject.toml` and `frontend/package.json` together — a
 test holds them equal — and is tagged `v<version>` once it has passed
 [the release bar](docs/RELEASING.md).
+
+## Upgrading an existing installation
+
+Pull the new release into the checkout the installation was made from, then
+follow [Upgrading from v1.1.1](docs/DEPLOY.md#upgrading-from-v111). Coming from
+v1.1.1 that is one extra command, `./antidemo coordination-upgrade`, which
+creates and grants the coordination table this release adds, followed by the
+usual `./bootstrap.sh --deploy-only`. Do not upgrade with
+`./bootstrap.sh --apply --reset-ready`: on a ready installation it resets both
+database lanes.
 
 ## Run it locally instead
 
