@@ -5875,8 +5875,72 @@ def test_cleanup_deletes_the_scope_after_everything_that_bills() -> None:
     scope = source.index("_delete_secret_scope(manifest)")
     assert source.index("_delete_databricks_app(manifest)") < scope
     assert source.index("_destroy_after_releasing_interfaces(manifest, destroy_plan)") < scope
-    assert source.index('"delete-project"') < scope
+    assert source.index("_delete_lakebase_project(manifest, profile, project_id)") < scope
     assert "_secret_scope_survivor_lines(manifest)" in source
+
+
+def test_a_lakebase_delete_rides_out_a_transient_control_plane_error(monkeypatch) -> None:
+    # 2026-10-12: the delete's own wait failed with INTERNAL_ERROR once, and the uninstall
+    # stopped with the installation marked cleanup_failed.
+    manifest = SimpleNamespace(databricks=SimpleNamespace(profile="anti-demo", project_id="p"))
+    calls: list[str] = []
+    looked_up: list[str] = []
+
+    def flaky_run(arguments, **kwargs):
+        calls.append(arguments[2])
+        if len(calls) == 1:
+            raise RuntimeError(
+                "Error: INTERNAL_ERROR: Failed to fetch project with slug 'anti-demo-x-r5'"
+            )
+
+    def still_there(manifest, *, project_id=None, profile=None):
+        looked_up.append(f"{profile}:{project_id}")
+        return {"name": f"projects/{project_id}"}
+
+    monkeypatch.setattr("server.lifecycle._run", flaky_run)
+    monkeypatch.setattr("server.lifecycle._get_lakebase_project_or_none", still_there)
+    monkeypatch.setattr("server.lifecycle.time.sleep", lambda seconds: None)
+
+    lifecycle._delete_lakebase_project(manifest, "other-profile", "anti-demo-x-r5")
+
+    assert calls == ["delete-project", "delete-project"]
+    # Looked up through the profile the project lives in, not the manifest's own.
+    assert looked_up == ["other-profile:anti-demo-x-r5"]
+
+
+def test_a_lakebase_delete_that_landed_before_its_error_is_not_asked_again(monkeypatch) -> None:
+    manifest = SimpleNamespace(databricks=SimpleNamespace(profile="anti-demo", project_id="p"))
+    calls: list[str] = []
+
+    def failing_once(arguments, **kwargs):
+        calls.append(arguments[2])
+        raise RuntimeError("Error: TEMPORARILY_UNAVAILABLE: please try again")
+
+    monkeypatch.setattr("server.lifecycle._run", failing_once)
+    monkeypatch.setattr(
+        "server.lifecycle._get_lakebase_project_or_none", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("server.lifecycle.time.sleep", lambda seconds: None)
+
+    lifecycle._delete_lakebase_project(manifest, "anti-demo", "anti-demo-x-r5")
+
+    assert calls == ["delete-project"]
+
+
+def test_a_lakebase_delete_refused_for_good_is_raised_at_once(monkeypatch) -> None:
+    manifest = SimpleNamespace(databricks=SimpleNamespace(profile="anti-demo", project_id="p"))
+    calls: list[str] = []
+
+    def denied(arguments, **kwargs):
+        calls.append(arguments[2])
+        raise RuntimeError("Error: PERMISSION_DENIED: not the project's owner")
+
+    monkeypatch.setattr("server.lifecycle._run", denied)
+    monkeypatch.setattr("server.lifecycle.time.sleep", lambda seconds: None)
+
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        lifecycle._delete_lakebase_project(manifest, "anti-demo", "anti-demo-x-r5")
+    assert calls == ["delete-project"]
 
 
 def test_a_pipeline_that_outlived_its_synced_table_is_deleted_not_assumed_gone(

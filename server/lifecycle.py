@@ -3984,8 +3984,63 @@ def _create_lakebase(
     )
 
 
+#: How many times an uninstall asks Lakebase to delete one project. An uninstall that stops
+#: here leaves its installation `cleanup_failed`, for a human to adjudicate, over an answer the
+#: control plane gives again correctly a minute later: on 2026-10-12, just after US West 2's
+#: serverless outage, a delete's own wait failed with "INTERNAL_ERROR: Failed to fetch project".
+LAKEBASE_DELETE_ATTEMPTS = 4
+
+
+def _delete_lakebase_project(manifest: DemoManifest, profile: str, project_id: str) -> None:
+    """Purge one Lakebase project, riding out a transient control-plane error.
+
+    Deleting is idempotent, and before each retry the project is looked up: one already gone
+    is done. Any other failure is raised at once, as before.
+    """
+
+    arguments = [
+        "databricks",
+        "postgres",
+        "delete-project",
+        f"projects/{project_id}",
+        "--purge",
+        "--timeout",
+        "10m",
+        "-p",
+        profile,
+        "-o",
+        "json",
+    ]
+    for attempt in range(1, LAKEBASE_DELETE_ATTEMPTS + 1):
+        try:
+            _run(arguments, capture=True, timeout=700)
+            return
+        except RuntimeError as exc:
+            if attempt == LAKEBASE_DELETE_ATTEMPTS or not _sql_statement_error_is_transient(
+                str(exc)
+            ):
+                raise
+            backoff = min(60.0, 5.0 * 2 ** (attempt - 1))
+            print(
+                f"RETRY Lakebase project {project_id} delete hit a transient control-plane "
+                f"error (attempt {attempt}/{LAKEBASE_DELETE_ATTEMPTS}); retrying in "
+                f"{backoff:.0f}s",
+                flush=True,
+            )
+            time.sleep(backoff)
+            try:
+                if (
+                    _get_lakebase_project_or_none(manifest, project_id=project_id, profile=profile)
+                    is None
+                ):
+                    return
+            except RuntimeError:
+                # A lookup that fails the same way says nothing; the delete is asked again.
+                pass
+
+
 def _get_lakebase_project_or_none(
-    manifest: DemoManifest, *, project_id: str | None = None
+    manifest: DemoManifest, *, project_id: str | None = None, profile: str | None = None
 ) -> dict[str, Any] | None:
     project_id = project_id or manifest.databricks.project_id
     arguments = [
@@ -3994,7 +4049,7 @@ def _get_lakebase_project_or_none(
         "get-project",
         f"projects/{project_id}",
         "-p",
-        manifest.databricks.profile,
+        profile or manifest.databricks.profile,
         "-o",
         "json",
     ]
@@ -15365,23 +15420,7 @@ def cleanup(*, dry_run: bool, force_round6: str = "") -> DemoManifest:
         for profile, project_id, project in lakebase_projects:
             if project is None:
                 continue
-            _run(
-                [
-                    "databricks",
-                    "postgres",
-                    "delete-project",
-                    f"projects/{project_id}",
-                    "--purge",
-                    "--timeout",
-                    "10m",
-                    "-p",
-                    profile,
-                    "-o",
-                    "json",
-                ],
-                capture=True,
-                timeout=700,
-            )
+            _delete_lakebase_project(manifest, profile, project_id)
         if delete_detached_runtime_role:
             _delete_detached_runtime_role(manifest)
         # Last, and after the app: nothing about a scope bills, so it must never
