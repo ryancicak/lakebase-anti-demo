@@ -290,7 +290,10 @@ export ANTI_DEMO_MANIFEST="$PWD/$(ls -d .anti-demo-v*/ | sort -V | tail -1)manif
 profile, as the principal that provisioned it and owns the schema. It creates
 whichever coordination objects are missing, issues the app's runtime grants, and
 prints `COORDINATION <run id> — tables created/granted`. It runs no Terraform and
-resets neither database lane nor the Round 3 anchors. `--deploy-only` then
+resets neither database lane nor the Round 3 anchors. With Round 5 installed it
+also re-applies Round 5's resident database logins, reading the published ones
+back from AWS Secrets Manager rather than minting new ones, so it needs the
+installation's AWS key in `.env.bootstrap`, as `antidemo setup` does. `--deploy-only` then
 rebuilds `frontend/dist` from the new sources, publishes the seal, redeploys,
 restarts the app and verifies it, so run both while nobody is presenting.
 

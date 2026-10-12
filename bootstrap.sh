@@ -775,7 +775,9 @@ $3}
          ./antidemo coordination-upgrade
                                         create and grant coordination tables
                                         (including round4_source_rebase) as the
-                                        schema owner. Does not reset database
+                                        schema owner, with ANTI_DEMO_MANIFEST
+                                        exported (docs/DEPLOY.md, \"Upgrading
+                                        from v1.1.1\"). Does not reset database
                                         lanes or run Terraform.
 
          ./bootstrap.sh --deploy-only   then republish the seal and redeploy the

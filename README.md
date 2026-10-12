@@ -131,9 +131,10 @@ test holds them equal — and is tagged `v<version>` once it has passed
 
 Pull the new release into the checkout the installation was made from, then
 follow [Upgrading from v1.1.1](docs/DEPLOY.md#upgrading-from-v111). Coming from
-v1.1.1 that is one extra command, `./antidemo coordination-upgrade`, which
-creates and grants the coordination table this release adds, followed by the
-usual `./bootstrap.sh --deploy-only`. Do not upgrade with
+v1.1.1 that is one extra command, `./antidemo coordination-upgrade` with
+`ANTI_DEMO_MANIFEST` exported as that section shows, which creates and grants
+the coordination table this release adds, followed by the usual
+`./bootstrap.sh --deploy-only`. Do not upgrade with
 `./bootstrap.sh --apply --reset-ready`: on a ready installation it resets both
 database lanes.
 
