@@ -5387,6 +5387,10 @@ function Matchup({
   onCancel: () => void
 }) {
   const boutInProgress = status.includes('BOUT IN PROGRESS')
+  // A ring whose lease was lost while its work is still stopping has no owner to
+  // name, so "Who's in the ring?" could only answer "The ring just cleared". It is
+  // the hold the fight card shows as temporarily unavailable, and says so.
+  const ringHeld = boutInProgress && status.includes('RING LEASE LOST')
   const [showOwner, setShowOwner] = useState(false)
   const [inspectedBout, setInspectedBout] = useState<BoutStatus | null>(null)
   const displayedBout = inspectedBout ?? activeBout
@@ -5412,12 +5416,12 @@ function Matchup({
         <div>{personas.map((persona, index) => <img key={persona.id} src={persona.portrait} alt={`${index === 0 ? 'Primary' : 'Secondary'}: ${persona.role}`} />)}</div>
       </div>
       <div className="matchup-wait" role="status">
-        <strong className={reducedMotion || boutInProgress ? '' : 'blink'}>{boutInProgress ? 'Bout in progress' : 'Checking both corners…'}</strong>
+        <strong className={reducedMotion || boutInProgress ? '' : 'blink'}>{ringHeld ? 'Temporarily unavailable' : boutInProgress ? 'Bout in progress' : 'Checking both corners…'}</strong>
         <span>{status}</span>
         {boutInProgress && (
           <div className="bout-wait-actions">
             <button onClick={onLeave}>B · Fight card</button>
-            <button onClick={inspectBout}>Select · Who’s in the ring?</button>
+            {!ringHeld && <button onClick={inspectBout}>Select · Who’s in the ring?</button>}
           </div>
         )}
         {!boutInProgress && canCancel && (
@@ -5631,7 +5635,7 @@ function RoundFiveBurstCard({
       </section>
     )
   }
-  const target = (10_000).toLocaleString()
+  const target = (10_000).toLocaleString('en-US')
   return (
     <section className="round5-lane" data-corner={corner} aria-label={`${lane.name} 10,000-client fan-in evidence`}>
       <header><strong>{lane.name}</strong><span>{result.contractVerified ? '10K GATE + HOLD ✓' : 'NOT VERIFIED'}</span></header>
@@ -5667,13 +5671,13 @@ function RoundFiveRuntimeBurstCard({
   const name = session.round5_setup?.lanes?.[laneId]?.name
     ?? session.lanes[laneId].name
   return (
-    <section className="round5-lane" data-corner={corner} aria-label={`${name} V4 runtime evidence`}>
+    <section className="round5-lane" data-corner={corner} aria-label={`${name} live fan-in evidence`}>
       <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : lane.phase.toUpperCase()}</span></header>
       <dl>
-        <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString()} / 10,000 clients</dd></div>
-        <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString()} / 10,000 clients</dd></div>
-        <div><dt>Currently held</dt><dd>{lane.held_clients.toLocaleString()} / 10,000 clients</dd></div>
-        <div><dt>Peak held</dt><dd>{(lane.peak_held_clients ?? lane.held_clients).toLocaleString()} / 10,000 clients</dd></div>
+        <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString('en-US')} / 10,000 clients</dd></div>
+        <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString('en-US')} / 10,000 clients</dd></div>
+        <div><dt>Currently held</dt><dd>{lane.held_clients.toLocaleString('en-US')} / 10,000 clients</dd></div>
+        <div><dt>Peak held</dt><dd>{(lane.peak_held_clients ?? lane.held_clients).toLocaleString('en-US')} / 10,000 clients</dd></div>
         <div><dt>Held-connection checks</dt><dd>{lane.sampled_queries_succeeded} / {ROUND_FIVE_SAMPLED_QUERIES}</dd></div>
         <div><dt>Bell to exact 10K</dt><dd>{lane.bell_to_10000_observed_ms == null ? 'N/A' : preciseDuration(lane.bell_to_10000_observed_ms)}</dd></div>
       </dl>
@@ -5741,7 +5745,7 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
       </section>
       <div className="round5-fairness" aria-label="Round 5 fair proof contract">
         <strong>PHASE 2 FAIRNESS</strong>
-        <span>{legacy ? 'Current 10,000-client target not recorded' : `${session.fairness.target_clients_per_lane?.toLocaleString() ?? 'N/A'} target clients / lane`}</span>
+        <span>{legacy ? 'Current 10,000-client target not recorded' : `${session.fairness.target_clients_per_lane?.toLocaleString('en-US') ?? 'N/A'} target clients / lane`}</span>
         <span>{legacy ? 'Legacy scorecard decoded' : `${session.fairness.hold_seconds ?? 'N/A'}s common hold · up to ${roundFiveLoginRetryBudget(session)} retried logins / lane`}</span>
         <span>{v4 ? 'Two isolated physical runners' : 'Identical neutral runner'} · {session.fairness.runner ?? 'N/A'}</span>
         <span>TLS {session.fairness.tls ?? 'N/A'} · timeout {session.fairness.timeout ?? 'N/A'}</span>
@@ -5834,8 +5838,8 @@ function roundFiveArenaLane(
       attempts: held,
       elapsed_ms: result.timeToTargetMs ?? fallbackLane.elapsed_ms,
       status: fallbackLane.activity?.phase === 'hold'
-        ? `${held.toLocaleString()} / 10,000 clients held · ${result.sampledQueriesSucceeded ?? 0} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks so far`
-        : `${held.toLocaleString()} / 10,000 clients authenticated + held`,
+        ? `${held.toLocaleString('en-US')} / 10,000 clients held · ${result.sampledQueriesSucceeded ?? 0} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks so far`
+        : `${held.toLocaleString('en-US')} / 10,000 clients authenticated + held`,
     }
   }
   const setupState = setupLane?.state ?? 'pending'
@@ -5985,10 +5989,10 @@ function RoundFivePartialEvidence({ session }: { session: DemoSession }) {
           return (
             <article key={laneId} data-corner={laneId === 'lakebase' ? 'red' : 'blue'}>
               <strong>{name}</strong>
-              <span>{lane.clients_initiated.toLocaleString()} initiated</span>
-              <span>{lane.clients_authenticated.toLocaleString()} authenticated</span>
-              <span>{lane.held_clients.toLocaleString()} currently held</span>
-              <span>{peakHeld.toLocaleString()} peak held retained</span>
+              <span>{lane.clients_initiated.toLocaleString('en-US')} initiated</span>
+              <span>{lane.clients_authenticated.toLocaleString('en-US')} authenticated</span>
+              <span>{lane.held_clients.toLocaleString('en-US')} currently held</span>
+              <span>{peakHeld.toLocaleString('en-US')} peak held retained</span>
               <span>{lane.sampled_queries_succeeded} of {ROUND_FIVE_SAMPLED_QUERIES} held-connection checks completed</span>
               <span>Release published · {lane.release_published_observed_ms == null ? 'pending' : preciseDuration(lane.release_published_observed_ms)}</span>
               <span>Runner observed release · {lane.runner_release_observed_ms == null ? 'pending' : preciseDuration(lane.runner_release_observed_ms)}</span>
@@ -6512,6 +6516,15 @@ function Proof({
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
   const [showCostRoom, setShowCostRoom] = useState(false)
+  // A finished bout keeps the error that ended it, or a stream blip, out of the
+  // footer: the verdict already says how it ended. The refusal of something
+  // pressed here afterwards -- a re-do, a cleanup retry -- has nowhere else to
+  // appear. Both handlers clear the error before they ask, so after such a press
+  // `error` holds only that press's answer.
+  const [pressedWhenFinished, setPressedWhenFinished] = useState<string | null>(null)
+  const markFinishedPress = () => { if (complete) setPressedWhenFinished(session.id) }
+  const actionsBar = !uiReview && complete && proofNavigationAllowsExit(session)
+  const finishedPressError = complete && error !== null && pressedWhenFinished === session.id
   // Rounds 4 and 6 name their lanes by their databases, and the lanes differ by
   // the integration that moves the data, so each lane shows its stack. Without the
   // AWS lane the blue corner says so instead of borrowing Round 1's scale-to-zero
@@ -6575,7 +6588,7 @@ function Proof({
         />
       </div>
       <footer className="proof-footer" data-capability={capabilityGap}>
-        {error && !complete && <p className="proof-error" role="alert">{error}</p>}
+        {error && (!complete || (finishedPressError && !actionsBar)) && <p className="proof-error" role="alert">{error}</p>}
         {uiReview ? (
           <div className="proof-review"><strong>No measurement recorded</strong><span>{capabilityGap && !racesAwsLane ? 'UI review · RDS capability not checked live · No result' : 'UI review · No database connections · No result'}</span></div>
         ) : complete ? (
@@ -6604,15 +6617,18 @@ function Proof({
           session={session}
           uiReview={uiReview}
           disabled={!liveEvidenceConnected}
-          onTowel={onTowel}
+          onTowel={async () => { markFinishedPress(); await onTowel() }}
         />
-        {!uiReview && complete && proofNavigationAllowsExit(session) && (
+        {actionsBar && (
           <div className="proof-actions">
+            {/* In the sticky bar, so it is on screen wherever the footer is
+                scrolled: at 1280x720 the footer must scroll to reach Retry cleanup. */}
+            {finishedPressError && <p className="proof-error" role="alert">{error}</p>}
             {cleanupAllowsActions && ((session.state === 'verified' && genericRedoAllowed) || failedOwnedArtifactRound) && (
               <div className="starred-redo-action">
                 <button
                   className="proof-redo"
-                  onClick={onRedo}
+                  onClick={() => { markFinishedPress(); onRedo() }}
                   aria-label={roundOneIdleClockLive ? 'Re-do round — back to idle clock already live' : undefined}
                 >
                   B · {failedOwnedArtifactRound
@@ -8011,7 +8027,7 @@ function CooldownDetails({
   )
 }
 
-function BetweenRounds({
+export function BetweenRounds({
   session,
   competitor,
   error,
@@ -8053,6 +8069,10 @@ function BetweenRounds({
       : ready
         ? `Both ${recoveryCleanup ? 'recovery' : 'isolated'} environments removed · RING AGAIN is ready`
         : `Clocks are live · Removing only the owned ${recoveryCleanup ? 'recovery' : 'test'} environments`
+    // The server's own reason. "Waiting for each database to become idle" beside
+    // RETRY CLEANUP described a wait the server had already given up on.
+    : failed
+      ? `Reset stopped · ${(cooldown.failure ?? 'Return to idle was not confirmed').replace(/\.$/, '')} · Retry cleanup`
     : competitorCannotIdle
       ? ready
         ? 'Lakebase IDLE · RDS has no automatic scale-to-zero · RING AGAIN is ready'
@@ -8854,14 +8874,14 @@ function proofCommentary(
         const lane = runtime.lanes[laneId]
         const name = session.round5_setup?.lanes?.[laneId]?.name
           ?? session.lanes[laneId].name
-        return `${name} · ${lane.held_clients.toLocaleString()} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`
+        return `${name} · ${lane.held_clients.toLocaleString('en-US')} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`
       })
       return {
         lanes: lines,
         verdict: runtime.state === 'verified'
           ? roundFiveVerifiedVerdict(session)
           : runtime.state === 'running'
-            ? 'V4 resident fan-in live · no winner until both canonical runtime lanes verify'
+            ? '10,000-client fan-in live · no winner until both lanes verify'
             : roundFiveStoppedVerdict(session),
       }
     }
@@ -8877,8 +8897,8 @@ function proofCommentary(
         }
         const held = result.held ?? result.authenticated ?? lane.attempts
         const target = result.timeToTargetMs === null
-          ? `${held.toLocaleString()} / ${result.targetClients.toLocaleString()} clients held`
-          : `${result.targetClients.toLocaleString()} clients held at ${preciseDuration(result.timeToTargetMs)}`
+          ? `${held.toLocaleString('en-US')} / ${result.targetClients.toLocaleString('en-US')} clients held`
+          : `${result.targetClients.toLocaleString('en-US')} clients held at ${preciseDuration(result.timeToTargetMs)}`
         return `${lane.name} · ${target} · ${lane.status}`
       })
       const update = session.state === 'verified'

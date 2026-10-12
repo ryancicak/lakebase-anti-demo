@@ -144,16 +144,18 @@ function presenceCopy(status: InstallationStatus): BannerCopy | null {
           + `${status.sealed_resources} sealed resources are neither confirmed `
           + 'present nor confirmed gone.',
         instead:
-          'Fix the read, not the infrastructure. Usually a lapsed SSO session:\n'
+          'Fix the read, not the infrastructure. Refresh this installation’s AWS '
+          + 'credentials; for an SSO session that is:\n'
           + '\n'
-          + '    aws sso login --sso-session databricks-sandbox\n'
+          + '    aws sso login\n'
           + '\n'
           + 'This banner answers itself within about 30 seconds of the credentials '
           + 'coming back, with no restart.\n'
           + '\n'
-          + 'One thing to know before reaching for a workaround: a sandbox sweep '
-          + 'deletes the IAM users as well as the databases, so a real reap also '
-          + 'lands here rather than on a confirmed absence. That makes this the '
+          + 'One thing to know before reaching for a workaround: if this account has '
+          + 'automation that deletes idle resources, it deletes the IAM users as well '
+          + 'as the databases, so a real reap also lands here rather than on a '
+          + 'confirmed absence. Where such a sweep exists that makes this the '
           + 'likeliest way a genuine loss shows up — and it still is not proof of '
           + 'one. If the resources really are gone, the first sweep that succeeds '
           + 'will say so and the recovery control will appear.',

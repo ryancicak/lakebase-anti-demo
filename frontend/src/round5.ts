@@ -467,15 +467,15 @@ export function roundFiveSetupDiagnosticSummary(session: DemoSession): string | 
  */
 export function roundFiveStoppedVerdict(session: DemoSession): string {
   if (roundFiveCleanupUnsettled(session)) {
-    return 'V4 runtime stopped · cleanup must settle before the receipt is final'
+    return 'Round 5 stopped · cleanup must settle before the receipt is final'
   }
   const diagnostic = roundFiveSetupDiagnosticSummary(session)
   if (diagnostic) {
-    return `V4 runtime stopped · ${diagnostic} · no comparison declared`
+    return `Round 5 stopped · ${diagnostic} · no comparison declared`
   }
   return session.failure
-    ? `V4 runtime stopped · ${session.failure}`
-    : 'V4 runtime stopped · no comparison declared'
+    ? `Round 5 stopped · ${session.failure}`
+    : 'Round 5 stopped · no comparison declared'
 }
 
 export function roundFiveHasComparison(session: DemoSession): boolean {

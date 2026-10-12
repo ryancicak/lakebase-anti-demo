@@ -149,7 +149,7 @@ function incompleteTakeaway(session: DemoSession): string | null {
       const lane = session.round5_runtime!.lanes[laneId]
       return `${laneName(session, laneId)}: ${lane.clients_authenticated.toLocaleString('en-US')}/10,000 clients authenticated, ${lane.held_clients.toLocaleString('en-US')} currently held`
     })
-    return `The V4 resident fan-in stopped before every required check completed. ${observed.join(' · ')}. No winner or margin was declared.`
+    return `The 10,000-client fan-in stopped before every required check completed. ${observed.join(' · ')}. No winner or margin was declared.`
   }
   if (
     session.round.id === 'survive_connection_spike'

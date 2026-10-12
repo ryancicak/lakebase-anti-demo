@@ -660,6 +660,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    that look closer, in every round. Round 1's extra "Back to idle" button once put
    them there by wrapping; Ryan liked it, so it is the layout now, not an accident. */
 .proof-actions-primary { display: flex; flex: 0 0 100%; flex-wrap: wrap; justify-content: center; gap: 1.2em; }
+.proof-actions > .proof-error { flex: 0 0 100%; }
 .starred-redo-action { display: grid; justify-items: center; gap: .55em; }
 .starred-redo-action > small { max-width: 28em; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.4; text-transform: uppercase; }
 .proof-next, .proof-redo, .proof-replay, .proof-ringside, .proof-cost, .proof-share, .proof-towel, .proof-towel-retry { padding: .9em 1.2em; border: 3px solid var(--yellow); color: var(--yellow); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .55vw, 11px); line-height: 1; text-transform: uppercase; }

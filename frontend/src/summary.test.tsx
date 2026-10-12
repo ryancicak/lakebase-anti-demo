@@ -456,7 +456,7 @@ describe('reading the numbers', () => {
         roundId: 'wake_idle_app', roundNumber: '01', roundTitle: 'T', status,
         opponent: null, opponentId: null, lakebaseMs: null, opponentMs: null, lakebaseIsLowerBound: false,
         opponentIsLowerBound: false, marginMs: null, source: null, boutsOnRecord: 0,
-        stoppedShort: false, sealedAt: null,
+        stoppedShort: false, towelThrown: false, sealedAt: null,
       }))
 
     expect(labels.join(' ')).not.toContain('VERIFIED')
@@ -517,6 +517,30 @@ describe('a towel on the ledger', () => {
     expect(row).toHaveTextContent(/Towel thrown/)
   })
 
+  it('names the towel for a towel whose cleanup did not settle cleanly', async () => {
+    stubReceipts([{ ...towelled, sealing_event: 'towel_update' }])
+    render(<Summary onBack={() => {}} />)
+    await screen.findByText(/of 6 rounds have a result/i)
+    const row = document.querySelector('[data-round="analyze_live_orders_without_slowing_checkout"]')!
+    expect(row).toHaveTextContent('Towel thrown · > marks where an unfinished clock stood.')
+  })
+
+  it('does not claim a towel for a floor nobody threw one for', async () => {
+    // A Round 4 or 6 lane stopped at its bound, a finish past the bound, and a lost
+    // ring all seal a floor on events no towel is involved in.
+    for (const sealing_event of ['session_failed', 'run_finished', 'cleanup_update']) {
+      stubReceipts([{ ...towelled, sealing_event }])
+      const { unmount } = render(<Summary onBack={() => {}} />)
+      await screen.findByText(/of 6 rounds have a result/i)
+      const row = document.querySelector('[data-round="analyze_live_orders_without_slowing_checkout"]')!
+      expect(row, sealing_event).not.toHaveTextContent(/towel/i)
+      expect(row, sealing_event).toHaveTextContent('> marks where an unfinished clock stood.')
+      // The floors themselves are unchanged: still marked, still never a finish time.
+      expect(row.querySelector('.summary-time'), sealing_event).toHaveTextContent('>1.02s')
+      unmount()
+    }
+  })
+
   it('draws both floors on the finale tile, with no proportional fill', () => {
     const bars = finaleLaneBars(roundSix())
     expect(bars.lakebase).toEqual({ share: null, label: '>1.02s', lowerBound: true })
@@ -545,7 +569,7 @@ describe('verdictFor', () => {
       status: 'lakebase_faster', opponent: 'Aurora Serverless v2', opponentId: 'aurora_serverless_v2',
       lakebaseMs: 2860, opponentMs: 41200, lakebaseIsLowerBound: false, opponentIsLowerBound: false,
       marginMs: 38340, source: 'receipt', boutsOnRecord: 1,
-      stoppedShort: false, sealedAt: null, ...over,
+      stoppedShort: false, towelThrown: false, sealedAt: null, ...over,
     }
   }
 

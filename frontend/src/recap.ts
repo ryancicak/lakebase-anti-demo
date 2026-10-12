@@ -445,6 +445,12 @@ export interface RoundResult {
   lakebaseIsLowerBound: boolean
   /** True when `opponentMs` is where their clock stood, not a finish time. */
   opponentIsLowerBound: boolean
+  /**
+   * True only when the describing bout was ended by a towel. Most floors are not
+   * one: a lane stopped at its bound, a finish past it, or a lost ring all leave a
+   * clock unfinished with nobody having thrown anything.
+   */
+  towelThrown: boolean
   /** Present only when both lanes verified. */
   marginMs: number | null
   /** Which source described this round, so a caller can disclose it. */
@@ -524,6 +530,7 @@ export function summariseRounds(
       roundTitle: group.roundTitle,
       boutsOnRecord: group.bouts.length,
       stoppedShort: false,
+      towelThrown: false,
       sealedAt: null,
     }
 
@@ -576,9 +583,28 @@ export function summariseRounds(
       marginMs: bout.marginMs,
       source: 'receipt' as const,
       stoppedShort: bout.receipt.outcome === 'stopped_short',
+      towelThrown: TOWEL_SEALING_EVENTS.has(bout.receipt.sealing_event),
       sealedAt: bout.sealedAt,
     }
   })
+}
+
+/**
+ * The events only a towel seals a bout on (`server/receipts.py`). Round 5's towel
+ * settles on `cleanup_update`, which is deliberately absent: that event also seals
+ * a Round 5 cleanup nobody toweled, and "towel thrown" is a claim about a person.
+ */
+const TOWEL_SEALING_EVENTS: ReadonlySet<string> = new Set(['towel_finished', 'towel_update'])
+
+/**
+ * The note under a row whose clocks did not all finish, or null when they did.
+ * Names the towel only when there was one.
+ */
+export function lowerBoundNote(result: RoundResult): string | null {
+  if (!result.lakebaseIsLowerBound && !result.opponentIsLowerBound) return null
+  return result.towelThrown
+    ? 'Towel thrown · > marks where an unfinished clock stood.'
+    : '> marks where an unfinished clock stood.'
 }
 
 /**

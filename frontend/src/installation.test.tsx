@@ -186,11 +186,19 @@ describe('the four states are four different sentences', () => {
     expect(copy?.title).toBe('THE ACCOUNT COULD NOT BE READ')
     expect(copy?.lede).toContain('NOT a report that anything is missing')
     // The remediation is a credential, not a database.
-    expect(copy?.instead).toContain('aws sso login --sso-session databricks-sandbox')
+    expect(copy?.instead).toContain('Refresh this installation’s AWS credentials')
+    expect(copy?.instead).toContain('aws sso login')
     // And it says why this is also what a genuine sweep looks like, so the
     // refusal is not mistaken for reassurance.
     expect(copy?.instead).toContain('deletes the IAM users as well as the databases')
     expect(copy?.instead).toContain('still is not proof')
+  })
+
+  it('names no SSO session or account that only its authors have', () => {
+    // A public release: whoever reads this banner has their own SSO session
+    // name, or none, and "sandbox" describes the account this was built in.
+    const copy = bannerCopy(blind())
+    expect(copy?.instead).not.toMatch(/--sso-session|databricks-sandbox|sandbox/i)
   })
 
   it('says plainly when nobody has looked at all', () => {

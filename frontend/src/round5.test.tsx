@@ -3222,3 +3222,75 @@ it('health bars: Round 5 measures the bell runtime, never the setup clock (no V4
     6,
   )
 })
+
+/** Protocol and implementation words a room has no use for. */
+const ROUND_FIVE_JARGON = /\bV4\b|canonical runtime|resident fan-in/i
+
+it('narrates a live bell fan-in in presenter words', () => {
+  const running = withV3Runtime(runningRoundFiveSession())
+  const { container } = render(
+    <RoundFiveProof
+      session={running}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+  expect(document.body).toHaveTextContent('10,000-client fan-in live · no winner until both lanes verify')
+  expect(document.body).not.toHaveTextContent(ROUND_FIVE_JARGON)
+  for (const labelled of container.querySelectorAll('[aria-label]')) {
+    expect(labelled.getAttribute('aria-label')).not.toMatch(ROUND_FIVE_JARGON)
+  }
+})
+
+it('says a stopped bell fan-in stopped, in presenter words', () => {
+  const stopped = withV3Runtime(runningRoundFiveSession())
+  stopped.state = 'failed'
+  stopped.round5_runtime!.state = 'failed'
+  expect(roundFiveStoppedVerdict(stopped)).toMatch(/^Round 5 stopped · /)
+  expect(roundFiveStoppedVerdict(stopped)).not.toMatch(ROUND_FIVE_JARGON)
+  const replay = JSON.stringify(replayStory(stopped))
+  expect(replay).toContain('The 10,000-client fan-in stopped before every required check completed.')
+  expect(replay).not.toMatch(ROUND_FIVE_JARGON)
+})
+
+it('prints client counts in the same format as the 10,000 beside them, whatever the browser locale', () => {
+  // A browser whose own locale groups thousands with "." read "9.876 / 10,000".
+  const original = Number.prototype.toLocaleString
+  vi.spyOn(Number.prototype, 'toLocaleString').mockImplementation(function (
+    this: number,
+    locales?: Intl.LocalesArgument,
+    options?: Intl.NumberFormatOptions,
+  ) {
+    return original.call(this, locales ?? 'de-DE', options)
+  })
+  const running = withV3Runtime(runningRoundFiveSession())
+  for (const lane of Object.values(running.round5_runtime!.lanes)) {
+    lane.phase = 'holding'
+    lane.clients_initiated = 9_876
+    lane.clients_authenticated = 9_876
+    lane.held_clients = 9_876
+  }
+  render(
+    <RoundFiveProof
+      session={running}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+  expect(document.body).toHaveTextContent('9,876')
+  expect(document.body).not.toHaveTextContent('9.876')
+})

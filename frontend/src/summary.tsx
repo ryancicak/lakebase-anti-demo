@@ -20,6 +20,7 @@ import {
   type LiveRound,
   type RecordState,
   type RoundResult,
+  lowerBoundNote,
   roundsWithResult,
   summariseRounds,
   summaryDuration,
@@ -33,6 +34,7 @@ function RoundRow({ result, record }: { result: RoundResult, record: RecordState
   const opponent = result.opponentMs === null ? null : summaryDuration(result.opponentMs)
   // Only a read record permits "not run yet"; a round running here is still known.
   const unknown = record !== 'read' && result.status === 'unrun'
+  const floorNote = lowerBoundNote(result)
 
   return (
     <li
@@ -63,9 +65,7 @@ function RoundRow({ result, record }: { result: RoundResult, record: RecordState
       {result.status === 'uncontested' && (
         <p className="summary-note">One lane only — a time, not a race.</p>
       )}
-      {(result.lakebaseIsLowerBound || result.opponentIsLowerBound) && (
-        <p className="summary-note">Towel thrown · &gt; marks where an unfinished clock stood.</p>
-      )}
+      {floorNote && <p className="summary-note">{floorNote}</p>}
       {result.boutsOnRecord > 1 && (
         <p className="summary-note">
           Latest of {result.boutsOnRecord} runs.

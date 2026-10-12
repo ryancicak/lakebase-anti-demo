@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { StrictMode } from 'react'
-import App, { Finale } from './App'
+import App, { BetweenRounds, Finale } from './App'
 import { ApiError, api } from './api/client'
 import { APP_VERSION_LABEL } from './version'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
@@ -3576,6 +3576,42 @@ describe('backstage setup', () => {
       await screen.findByText(/towel cleanup failed.*recovery environments could not be safely removed/i),
     ).toBeInTheDocument()
     expect(screen.queryByText(/please wait · the current bout owns the ring/i)).not.toBeInTheDocument()
+  })
+
+  it('calls a lost ring still stopping a hold, not a bout with an owner to name', async () => {
+    // No lease row is left to describe, so "Who's in the ring?" could only open
+    // "The ring just cleared" over a refusal that says try again in a moment.
+    const refusal = 'BOUT IN PROGRESS · RING LEASE LOST · ACTIVE WORK IS STILL STOPPING · '
+      + 'TRY AGAIN IN A MOMENT · IF IT PERSISTS, RESTART THE APP'
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({ detail: refusal }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+
+    expect(await screen.findByText(refusal)).toBeInTheDocument()
+    expect(screen.getByText('Temporarily unavailable')).toBeInTheDocument()
+    expect(screen.queryByText('Bout in progress')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /who’s in the ring/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /fight card/i })).toBeInTheDocument()
   })
 
   it('refreshes a transient Round 5 identity refusal back to backstage preparation', async () => {
@@ -7363,6 +7399,69 @@ describe('backstage setup', () => {
     expect(await screen.findByText(/aws restore already in motion.*safe cleanup may take minutes/i)).toBeInTheDocument()
   })
 
+  it('says why a retry on a finished bout was refused, and only after the press', async () => {
+    // The bout is over, so the footer hid every error and a refused Retry cleanup
+    // looked like a button that did nothing.
+    const eligible = recoveryTowelSession('eligible')
+    const stopping = recoveryTowelSession('stopping')
+    const failed = recoveryTowelSession('failed')
+    const refusal = 'TOWEL CLEANUP LEASE WAS LOST · RETRY REFUSED'
+    let towelCalls = 0
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse({ ...session('draft'), round: eligible.round }))
+      }
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse({ ...session('armed'), round: eligible.round }))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(eligible))
+      if (input.endsWith('/towel')) {
+        towelCalls += 1
+        if (towelCalls === 1) return Promise.resolve(jsonResponse(stopping))
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({ detail: refusal }),
+        })
+      }
+      if (input === '/api/sessions/session-1') return Promise.resolve(jsonResponse(failed))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('radio', { name: /lockjaw lucy/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    await user.click(await screen.findByRole('button', { name: /throw in the towel/i }))
+    const source = FakeEventSource.instances.at(-1)!
+    source.emit({
+      sequence: 10,
+      event: 'towel_update',
+      occurred_at: '2026-08-18T15:11:35Z',
+      payload: { session: failed },
+    })
+    const retry = await screen.findByRole('button', { name: /retry/i })
+    // A stream blip on a finished bout before any press stays behind the verdict.
+    act(() => source.onerror?.())
+    expect(document.querySelector('.proof-error')).toBeNull()
+
+    await user.click(retry)
+    await waitFor(() => expect(towelCalls).toBe(2))
+    expect(await screen.findByText(refusal)).toBeInTheDocument()
+    // In the footer's sticky action bar: Retry cleanup is reached by scrolling the
+    // footer, which would carry a line at its top out of view.
+    expect(document.querySelector('.proof-actions > .proof-error')).toHaveTextContent(refusal)
+    expect(document.querySelectorAll('.proof-error')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /next round/i })).toBeEnabled()
+  })
+
   it('runs Round 3 through verified recovery and hides a successful redo', async () => {
     const recoveryRound = FALLBACK_CATALOG.rounds.find((round) => round.id === 'recover_deleted_order')!
     const base = session('running')
@@ -7696,5 +7795,75 @@ describe('the six-round finale when the record cannot be read', () => {
     for (const row of Array.from(rows.children)) {
       expect(row).toHaveAttribute('data-status', 'unread')
     }
+  })
+})
+
+describe('a Round 1 reset the server gave up on', () => {
+  afterEach(cleanup)
+
+  function failedReset(
+    failure: string | null,
+    competitorState: 'watching' | 'not_supported' = 'watching',
+  ): DemoSession {
+    const startedAt = '2026-08-17T00:00:00Z'
+    return {
+      ...session('verified'),
+      cooldown: {
+        mode: 'return_to_idle',
+        state: 'failed',
+        started_at: startedAt,
+        failure,
+        lanes: {
+          lakebase: {
+            id: 'lakebase', name: 'Lakebase', state: 'confirmed_zero',
+            started_at: startedAt, confirmed_at: '2026-08-17T00:05:00Z',
+            elapsed_ms: 300_000, status: 'Control plane confirmed zero',
+          },
+          competitor: {
+            id: 'competitor', name: 'Aurora Serverless v2', state: competitorState,
+            started_at: startedAt, confirmed_at: null,
+            elapsed_ms: null, status: 'Aurora writer has not produced two consecutive zero-capacity samples',
+          },
+        },
+      },
+    }
+  }
+
+  function between(current: DemoSession) {
+    return render(
+      <BetweenRounds
+        session={current}
+        competitor="Aurora Serverless v2"
+        onRingAgain={() => {}}
+        onRetryCleanup={() => {}}
+        onNextRound={() => {}}
+        onScorecard={() => {}}
+        commentaryOpen
+        onToggleCommentary={() => {}}
+      />,
+    )
+  }
+
+  it('says why it stopped, in the server’s words, beside Retry cleanup', () => {
+    const { container } = between(failedReset('Timed out waiting for return to confirmed zero.'))
+
+    const status = container.querySelector('.between-status')!
+    expect(status).toHaveTextContent(
+      'Reset stopped · Timed out waiting for return to confirmed zero · Retry cleanup',
+    )
+    expect(status).not.toHaveTextContent(/waiting for each database/i)
+    expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeEnabled()
+  })
+
+  it('still says it stopped when the server gave no reason, or the opponent cannot idle', () => {
+    const { container, unmount } = between(failedReset(null))
+    expect(container.querySelector('.between-status')).toHaveTextContent(
+      'Reset stopped · Return to idle was not confirmed · Retry cleanup',
+    )
+    unmount()
+    const rds = between(failedReset('Automatic return-to-idle cleanup lost its ring fence', 'not_supported'))
+    expect(rds.container.querySelector('.between-status')).toHaveTextContent(
+      'Reset stopped · Automatic return-to-idle cleanup lost its ring fence · Retry cleanup',
+    )
   })
 })
