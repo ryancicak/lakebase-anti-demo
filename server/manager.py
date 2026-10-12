@@ -353,6 +353,23 @@ def audience_diagnosis(error: BaseException) -> str:
     return _redacted_exception_chain(error)
 
 
+#: Packages whose exception text is a provider's own words: a botocore message names the
+#: account, role or ARN it refused, and a psycopg one the host and role.
+_PROVIDER_PACKAGES = frozenset({"boto3", "botocore", "psycopg"})
+
+
+def audience_error_text(error: BaseException) -> str:
+    """An exception as a card, a receipt or a 409 may quote it.
+
+    This server's own sentence is kept. A provider's message becomes its type and code
+    (`audience_diagnosis`); the operator log is where its words belong.
+    """
+
+    if (type(error).__module__ or "").split(".")[0] in _PROVIDER_PACKAGES:
+        return audience_diagnosis(error)
+    return str(error) or type(error).__name__
+
+
 def authorization_refusal(error: BaseException) -> BaseException | None:
     """The Databricks authorization refusal anywhere in this cause chain.
 
@@ -2341,7 +2358,7 @@ class RunManager:
                 # Only while the window is still this card's to close: a retry may
                 # already have closed it, or handed it to reconciliation.
                 towel.cost_close_failure = (
-                    str(failure) or "The bout cost window could not be closed"
+                    audience_error_text(failure) or "The bout cost window could not be closed"
                 )
 
         closing.add_done_callback(landed)
@@ -5016,7 +5033,7 @@ class RunManager:
                         _redacted_exception_chain(exc),
                     )
                     requested_towel.cost_close_failure = (
-                        str(exc) or "The bout cost window could not be closed"
+                        audience_error_text(exc) or "The bout cost window could not be closed"
                     )
             snapshot = record.snapshot.model_copy(deep=True)
             if is_round_five:
@@ -13623,7 +13640,7 @@ class RunManager:
             try:
                 closed = await self._close_towel_cost_window(record, towel, bout_id=bout_id)
             except Exception as exc:
-                failure = str(exc) or "The bout cost window could not be closed"
+                failure = audience_error_text(exc) or "The bout cost window could not be closed"
                 diagnostic = _redacted_exception_chain(exc)
             else:
                 if closed:
@@ -13861,7 +13878,7 @@ class RunManager:
                     "Automatic towel cleanup could not be verified: "
                     f"{audience_diagnosis(exc)}"
                 )
-            return str(exc) or "Automatic towel cleanup could not be verified"
+            return audience_error_text(exc) or "Automatic towel cleanup could not be verified"
         return None
 
     async def _reset_safe_change(self, record: SessionRecord) -> None:

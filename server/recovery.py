@@ -819,10 +819,13 @@ class RecoveryEngine:
             completed_ns = self._clock_ns()
             # The lane's own bound, not a TimeoutError raised inside it, which is an error.
             timed_out = isinstance(exc, TimeoutError) and bound.expired()
+            # The card and the receipt show this, so a provider's message is its type and code.
+            from .manager import audience_error_text
+
             failure = (
                 f"Recovery lane exceeded {self.run_timeout_seconds:.0f} seconds"
                 if timed_out
-                else str(exc) or type(exc).__name__
+                else audience_error_text(exc)
             )
             if stop_control is not None:
                 # Publish the authoritative terminal outcome before any cleanup or
@@ -1033,12 +1036,16 @@ class RecoveryEngine:
                     already_absent=artifact is None,
                 )
         except Exception as exc:
+            # The cooldown card shows this, so a provider's message is its type and code.
+            from .manager import audience_error_text
+
+            error = audience_error_text(exc)
             await self._emit(
                 on_progress,
                 plan,
                 RecoveryPhase.FAILED,
                 "Recovery cleanup refused or incomplete",
-                error=str(exc) or type(exc).__name__,
+                error=error,
             )
             return SafeChangeResetLaneResult(
                 lane_id=plan.lane_id,
@@ -1046,7 +1053,7 @@ class RecoveryEngine:
                 provider=plan.provider,
                 artifact_id=plan.artifact_id,
                 ok=False,
-                error=str(exc) or type(exc).__name__,
+                error=error,
                 cause=exc,
             )
 

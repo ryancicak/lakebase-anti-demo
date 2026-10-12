@@ -886,10 +886,13 @@ class SafeChangeEngine:
             completed_ns = self._clock_ns()
             # The lane's own bound, not a TimeoutError raised inside it, which is an error.
             timed_out = isinstance(exc, TimeoutError) and bound.expired()
+            # The card and the receipt show this, so a provider's message is its type and code.
+            from .manager import audience_error_text
+
             error = (
                 f"Safe-change lane exceeded {self.run_timeout_seconds:.0f} seconds"
                 if timed_out
-                else str(exc) or type(exc).__name__
+                else audience_error_text(exc)
             )
             await self._emit(
                 on_progress,
@@ -1114,10 +1117,13 @@ class SafeChangeEngine:
             async with asyncio.timeout(self.reset_timeout_seconds):
                 return await self._reset_lane_bounded(plan, on_progress)
         except Exception as exc:
+            # The cooldown card shows this, so a provider's message is its type and code.
+            from .manager import audience_error_text
+
             error = (
                 f"Reset exceeded {self.reset_timeout_seconds:.0f} seconds"
                 if isinstance(exc, TimeoutError)
-                else str(exc) or type(exc).__name__
+                else audience_error_text(exc)
             )
             await self._emit(
                 on_progress,
