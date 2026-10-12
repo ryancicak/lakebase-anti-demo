@@ -882,7 +882,8 @@ PY
   # All of it there: the refusal it always was, plus the reading.
   sb="$(reaped_sandbox '{"gone": false, "aws": {"state": "verified_present", "sealed": 13, "absent": 0, "reason": ""}, "lakebase": {"expected": 7, "absent": 0, "unreadable": 0}, "app": {"name": "lakebase-anti-demo", "state": "present", "owned": true}}')"
   ANTI_DEMO_PRESENCE_EXECUTABLE="$sb/presence" run "$sb" --apply --yes
-  check "a healthy installation is still refused" "./bootstrap.sh --deploy-only   republish the seal"
+  check "a healthy installation is still refused" "./bootstrap.sh --deploy-only   then republish the seal"
+  check "and names the coordination upgrade before the redeploy" "./antidemo coordination-upgrade"
   check_absent "without start-over advice" "remove what is left"
 
   # No reading at all: exactly the old refusal.
