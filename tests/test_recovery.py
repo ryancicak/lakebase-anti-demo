@@ -750,3 +750,81 @@ async def test_a_failed_recovery_lane_never_reaches_the_cancellation_teardown() 
     assert result.lanes["competitor"].ok is False
     assert aurora.abandon_calls == 0
     assert lakebase.abandon_calls == 0
+
+
+def block_both_recovery_waits(*adapters) -> tuple[list[asyncio.Event], asyncio.Event]:
+    """Hold every lane before its restore, so a cancel lands on both deterministically."""
+
+    keep = asyncio.Event()
+    entered: list[asyncio.Event] = []
+    for adapter in adapters:
+        started = asyncio.Event()
+        entered.append(started)
+
+        async def blocked_wait(plan, recovery_at, report, started=started):
+            del plan, recovery_at, report
+            started.set()
+            await keep.wait()
+
+        adapter.wait_recovery_point = blocked_wait
+    return entered, keep
+
+
+async def assert_both_lanes_abandoned_before_restore(
+    run: asyncio.Task, lakebase, aurora, entered, keep
+) -> None:
+    await asyncio.wait_for(asyncio.gather(*(e.wait() for e in entered)), timeout=1)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=5)
+    keep.set()
+    await asyncio.sleep(0)
+    for adapter in (lakebase, aurora):
+        assert adapter.create_calls == 0
+        assert adapter.abandon_calls == 1
+        assert adapter.provider_account == set()
+
+
+async def test_engine_cancel_with_stop_control_cancels_both_lanes_before_restore():
+    """Lease loss / close() cancel the parent without the towel's stop event."""
+
+    engine, lakebase, aurora, _, _ = build_engine()
+    entered, keep = block_both_recovery_waits(lakebase, aurora)
+    arm = await engine.arm(CompetitorId.AURORA_SERVERLESS_V2)
+    run = asyncio.create_task(engine.run(arm, stop_control=RecoveryStopControl()))
+    await assert_both_lanes_abandoned_before_restore(run, lakebase, aurora, entered, keep)
+
+
+async def test_engine_cancel_before_barrier_cancels_both_lanes(monkeypatch):
+    """Parent cancel during the pre-barrier yield must not orphan lane tasks."""
+
+    engine, lakebase, aurora, _, _ = build_engine()
+    entered = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay=0, result=None):
+        if delay == 0 and not entered.is_set():
+            entered.set()
+            await asyncio.Event().wait()
+            return result
+        return await real_sleep(delay)
+
+    monkeypatch.setattr("server.recovery.asyncio.sleep", gated_sleep)
+    arm = await engine.arm(CompetitorId.AURORA_SERVERLESS_V2)
+    run = asyncio.create_task(engine.run(arm, stop_control=RecoveryStopControl()))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    run.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(run, timeout=5)
+    assert aurora.create_calls == 0
+    assert lakebase.create_calls == 0
+    assert all(connection.closed for connection in lakebase.connections)
+    assert all(connection.closed for connection in aurora.connections)
+
+
+async def test_engine_cancel_without_stop_control_still_abandons_both_lanes():
+    engine, lakebase, aurora, _, _ = build_engine()
+    entered, keep = block_both_recovery_waits(lakebase, aurora)
+    arm = await engine.arm(CompetitorId.AURORA_SERVERLESS_V2)
+    run = asyncio.create_task(engine.run(arm))
+    await assert_both_lanes_abandoned_before_restore(run, lakebase, aurora, entered, keep)

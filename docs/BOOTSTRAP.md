@@ -301,9 +301,14 @@ not a no-op: both database lanes are reseeded and the Round 3 anchors are cleare
 so a bout in progress dies and every Round 3 recovery point taken since the last
 reset is gone. The refusal names the two ways forward:
 
-- `./bootstrap.sh --deploy-only` — republish the seal and redeploy the app. No
-  database is touched and no Terraform runs. This is the redeploy path for a
-  complete ready install.
+- `./antidemo coordination-upgrade` — create and grant coordination tables
+  (including `round4_source_rebase`) as the schema owner. This does **not**
+  reset database lanes, reseed Round 3 anchors, or run Terraform. A ready
+  install whose app cannot boot after this checkout added coordination objects
+  needs this step before deploy.
+- `./bootstrap.sh --deploy-only` — then republish the seal and redeploy the app.
+  No database is touched and no Terraform runs. Do not use this alone if the
+  checkout added coordination tables the app now requires at boot.
 - `./bootstrap.sh --apply --reset-ready` — the explicit opt-in, for an `infra/aws`
   diff to apply or lanes to return to a known state.
 
@@ -518,9 +523,11 @@ mirror of PyPI, so the two-step above applies verbatim.
 
 ## Deploying as a Databricks App
 
-`bootstrap.sh --deploy-only` publishes the seal and deploys the app, and
-`--apply --deploy-app` does it in the same run; **[docs/DEPLOY.md](DEPLOY.md) is
-the reference for both** and supersedes anything below that disagrees with it.
+`./antidemo coordination-upgrade` creates and grants coordination tables for a
+ready install without resetting lanes. Then `bootstrap.sh --deploy-only`
+publishes the seal and deploys the app, and `--apply --deploy-app` does deploy
+in the same provision run; **[docs/DEPLOY.md](DEPLOY.md) is the reference** and
+supersedes anything below that disagrees with it.
 The manual sequence is kept here because it is what the automation performs, and
 because knowing it is what makes a failed deploy debuggable:
 

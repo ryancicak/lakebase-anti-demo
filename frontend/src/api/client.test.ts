@@ -62,6 +62,21 @@ describe('session API client', () => {
     ))
   })
 
+  it('tells a request its own timeout abandoned from one that never connected', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+    await expect(api.receipts()).rejects.toMatchObject({ status: 0, timedOut: false })
+
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => (
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+      })
+    )))
+    const abandoned = expect(api.receipts()).rejects.toMatchObject({ status: 0, timedOut: true })
+    await vi.advanceTimersByTimeAsync(15_000)
+    await abandoned
+  })
+
   it('normalizes FastAPI validation arrays without object coercion', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,

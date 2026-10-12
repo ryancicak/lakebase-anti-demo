@@ -8,7 +8,9 @@ the outside world only through two lanes and one shared source.
   waited out, and the source and every destination must read the sealed baseline. If a crash
   left a destination off it, Prepare first settles (restore, carry, park), visibly.
 - **The bell** starts both integrations and commits one Delta change, all at once, and every
-  lane's verifier starts polling at the same instant. Neither lane waits for the other.
+  lane's verifier starts polling at the same instant. Neither lane waits for the other. What a
+  lane must look up or record before its start, it does before the bell, so a lane that cannot
+  refuses the bell instead of failing a bout already rung.
 - **Each clock** runs from the bell to the completion of that lane's first read that returns the
   exact expected row. Every read is the same query shape, on the same client, every
   ``POLL_SECONDS``, over a connection opened before the bell. Nothing else waits on a
@@ -163,6 +165,13 @@ class Lane(Protocol):
 
     async def open_reader(self) -> Reader:
         """Open the destination connection the verifier will poll on."""
+
+    async def before_bell(self) -> None:
+        """Look up and record what the next ``start`` needs, before any clock exists.
+
+        ``start`` then sends its start request first, so a lane's clock holds the integration
+        and nothing of the lane's own bookkeeping.
+        """
 
     async def start(self, bell: Bell) -> None:
         """Ask the integration to start from parked. Returns once the request is accepted."""
@@ -515,7 +524,9 @@ class Round4RaceEngine:
         entity = update.entity_id
 
         # Before the bell, not on either clock: open each destination connection and wake it
-        # with a verified read, so no clock contains a Lakebase or Aurora resume.
+        # with a verified read, so no clock contains a Lakebase or Aurora resume. Then each lane
+        # records what its start needs; Lakebase's is coordination round trips, which on its
+        # clock would time Lakebase alone by them.
         readers: dict[str, Reader] = {}
         try:
             for lane in self.lanes:
@@ -523,6 +534,13 @@ class Round4RaceEngine:
             woken = await asyncio.gather(*(readers[lane_id].read(entity) for lane_id in readers))
             if any(row != self.baseline for row in woken):
                 raise Round4NotArmedError("A destination left its baseline after Prepare")
+            for lane in self.lanes:
+                try:
+                    await lane.before_bell()
+                except Exception as exc:
+                    raise Round4NotArmedError(
+                        f"{lane.label} could not record its start, so the bell was not rung: {exc}"
+                    ) from exc
         except BaseException:
             await self._close_readers(readers)
             raise

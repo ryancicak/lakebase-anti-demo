@@ -23,6 +23,8 @@ from enum import StrEnum
 from typing import Any, Protocol
 from uuid import uuid4
 
+from .connection_fanin import DISPATCH_MARGIN_SECONDS, SSM_MARGIN_SECONDS
+from .connection_fanin import RUN_TIMEOUT_SECONDS as FANIN_RUN_TIMEOUT_SECONDS
 from .coordination import (
     COORDINATION_SCHEMA,
     CoordinationObjectsMissingError,
@@ -43,9 +45,14 @@ ROUND5_WARM_EVENT_TABLE = f"{COORDINATION_SCHEMA}.round5_warm_event_v4"
 ROUND5_SLOT_ORDINAL = 1
 
 PROXY_SETUP_DEADLINE_SECONDS = 30 * 60
-RUNNER_DEADLINE_SECONDS = 660
+#: The fan-in SSM window, so a capsule meets its launch margin for exactly as long as the
+#: dispatch accepts its credentials (`connection_spike_live.DISPATCH_CAPSULE_SAFETY_SECONDS`).
+RUNNER_DEADLINE_SECONDS = FANIN_RUN_TIMEOUT_SECONDS + SSM_MARGIN_SECONDS
 CONTROL_PLANE_MARGIN_SECONDS = 60
-DISPATCH_MARGIN_SECONDS = 60
+#: The bell checks the launch margin this far ahead: dispatch runs after the bell, and
+#: refuses a credential that is merely at its margin. The bell checks again once its
+#: commit answers, so this only has to cover the step from there to the dispatch.
+BELL_DISPATCH_HEADROOM_SECONDS = 5.0
 DEFAULT_CLAIM_TTL_SECONDS = 180
 DEFAULT_COORDINATOR_TTL_SECONDS = 90
 DEFAULT_RETRY_CEILING_SECONDS = 60
@@ -57,6 +64,9 @@ PROVENANCE_FRESHNESS_SECONDS = 15
 MAX_PROVENANCE_PROBE_FAILURES = 5
 PROVENANCE_PROBE_RETRY_SECONDS = 2.0
 PROVENANCE_PROBE_MIN_SLACK_SECONDS = 3.0
+#: A probe that keeps missing logs at most one strike this often; a strike that
+#: rewarms is always logged.
+PROVENANCE_PROBE_STRIKE_LOG_INTERVAL_SECONDS = 60.0
 # The 45-minute runner receipts cannot be extended in place without a fresh live
 # proxy-absence + runner attestation. Rather than slide the bound (which would
 # rest READY on stale evidence), rewarm cleanly this far ahead of the wall so the
@@ -93,7 +103,7 @@ MAX_TRANSIENT_WARM_ATTEMPTS = 8
 # provenance freshness/receipt horizons.
 WARM_ATTEMPT_TOKEN_REUSE_SECONDS = 30.0
 # Attested resident IDENTITY-change re-establishment bound. An idle READY probe
-# that reads a genuine IDENTITY_CHANGED (Patch 1 tri-state -- the resident this
+# that reads a genuine IDENTITY_CHANGED (the tri-state probe -- the resident this
 # generation's receipts attest is provably gone/replaced) forces a CLEAN, FENCED
 # rewarm (discard the stale engines/capsule/receipts + retire the old resident
 # binding, then re-PRELOAD both lanes for ONE fresh token). If the identity will
@@ -320,6 +330,23 @@ class WarmCoordinatorHeldError(RuntimeError):
 
 class WarmClaimUnavailableError(RuntimeError):
     """No current READY generation can be atomically claimed."""
+
+
+class WarmBellMarginError(WarmClaimUnavailableError):
+    """A claimed capsule aged too far to be dispatched after the bell.
+
+    ``remaining_seconds`` is the launch life the capsule had left before its dispatch
+    safety margin (negative inside it); ``armed_wait_seconds`` is how long the claim
+    had been held.
+    """
+
+    def __init__(self, *, remaining_seconds: float, armed_wait_seconds: float) -> None:
+        super().__init__(
+            "Round 5 launch credentials aged into their dispatch safety margin "
+            "before the bout could launch; prepare the bout again"
+        )
+        self.remaining_seconds = remaining_seconds
+        self.armed_wait_seconds = armed_wait_seconds
 
 
 class WarmFenceLostError(RuntimeError):
@@ -3387,12 +3414,12 @@ class Round5WarmCoordinator:
         # Optional tighter, per-claim bound the manager may register from the
         # durable armed lease deadline; the min of this and the horizon above wins.
         self._active_claim_deadlines: dict[str, datetime] = {}
-        # Blocker 2: exactly one in-flight cleanup convergence per claim_id. Both
+        # Exactly one in-flight cleanup convergence per claim_id. Both
         # the supervised loop and any manager request await the SAME coalesced task,
         # so there is a single provider reconcile+finish sequence per claim (durable
         # CAS on finish coalesces across replicas).
         self._cleanup_tasks: dict[str, asyncio.Task[Round5WarmSlot]] = {}
-        # Blocker 2: give the provider a DURABLE authority guard it must consult
+        # Give the provider a DURABLE authority guard it must consult
         # immediately before every external mutation. Cancellation of the held
         # operation is only an optimization; even if the provider swallows
         # CancelledError, a stale coordinator (owner/fence changed or lease expired)
@@ -3402,6 +3429,8 @@ class Round5WarmCoordinator:
             self.provider.authority_guard = self._authority_guard
         self._capsule: Round5LaunchCapsule | None = None
         self._provenance_probe_failures = 0
+        self._provenance_strike_logged_at: datetime | None = None
+        self._provenance_strikes_unlogged = 0
         # Bounded token mint rate (post-bout rewarm storm fix). The token this
         # process is currently trying to warm-and-attest, and when it was minted.
         # Reused across retryable WARMING retries within WARM_ATTEMPT_TOKEN_REUSE_
@@ -3444,7 +3473,7 @@ class Round5WarmCoordinator:
         self._completed_cleanups: dict[str, tuple[int, int, str | None]] = {}
         self._completed_abandons: dict[str, tuple[int, int, str | None]] = {}
         self._local_readiness_error_code: str | None = None
-        # Patch 2: a SUSTAINED resident-control outbox failure while Round 5 is IDLE
+        # A SUSTAINED resident-control outbox failure while Round 5 is IDLE
         # (no active claim) soft-degrades -- new claims are refused but the durable
         # READY capsule is NOT torn down (no freshness_lost, no _capsule clear) so
         # recovery is instant when delivery resumes. Only a failure WITH an active
@@ -3538,7 +3567,7 @@ class Round5WarmCoordinator:
         #    held (via that task's own ``_run_holding_lease`` beat) until the call
         #    actually returns -- otherwise cancelling/revoking + closing the store here
         #    would drop the fence while the AWS call runs and a replica could
-        #    acquire_coordinator and double-reconcile the same resource (Finding B).
+        #    acquire_coordinator and double-reconcile the same resource.
         async with self._lifecycle_lock:
             already_closed = self._closed
             self._closed = True
@@ -3572,7 +3601,7 @@ class Round5WarmCoordinator:
                     pending, timeout=max(0.0, deadline)
                 )
             except asyncio.CancelledError:
-                # Finding B nuance: close() ITSELF was cancelled (e.g. the SIGTERM
+                # close() ITSELF was cancelled (e.g. the SIGTERM
                 # handler cancels the close task). ``asyncio.wait`` does not cancel the
                 # tasks it awaited, and we MUST NOT cancel them or stop their
                 # heartbeats here -- an in-flight reconcile may hold a shielded AWS
@@ -4030,10 +4059,12 @@ class Round5WarmCoordinator:
                     if slot.provenance_expires_at is not None
                     else 0.0
                 )
-                if (
+                rewarm = (
                     self._provenance_probe_failures >= MAX_PROVENANCE_PROBE_FAILURES
                     or provenance_slack <= PROVENANCE_PROBE_MIN_SLACK_SECONDS
-                ):
+                )
+                self._log_provenance_strike(slot, exc, probe_now, rewarm=rewarm)
+                if rewarm:
                     self._provenance_probe_failures = 0
                     self._capsule = None
                     self._last_slot = await self.store.freshness_lost(
@@ -4059,7 +4090,7 @@ class Round5WarmCoordinator:
             if provenance_current:
                 # A CURRENT keep-alive probe proves the resident identity is stable
                 # again: reset the attested-identity-change re-establishment budget
-                # (Patch 5) and lift a prior soft-degrade / identity-reestablish
+                # and lift a prior soft-degrade / identity-reestablish
                 # marker so claims are re-admitted. This is the SOLE place the marker
                 # + budget are lifted, so the ring stays un-claimable through a churn
                 # (never handed to a resident whose identity is still changing) and
@@ -4075,7 +4106,7 @@ class Round5WarmCoordinator:
                     self._local_readiness_error_code = None
             if not provenance_current:
                 # validate_ready() returns False ONLY for an ATTESTED runner identity
-                # change (Patch 1 tri-state): a merely STALE/ABSENT heartbeat raises
+                # change (tri-state): a merely STALE/ABSENT heartbeat raises
                 # RetryableWarmError and is absorbed by the strike budget above, so a
                 # False here is a genuine identity change. A bare freshness_lost here
                 # rewarmed over the SAME stale provider engines and cleared last_error
@@ -4206,7 +4237,7 @@ class Round5WarmCoordinator:
                 ),
             )
         if slot.state == Round5WarmState.BLOCKED:
-            # Blocker 4: a BLOCKED slot that still carries a CLAIM (unsettled
+            # A BLOCKED slot that still carries a CLAIM (unsettled
             # residents/jobs) must NEVER be normalized to WARMING/READY or re-warmed
             # (prepare) over that debt. Route it into CLEANING and converge through
             # the single cleanup owner, preserving the claim/job identities.
@@ -4407,6 +4438,38 @@ class Round5WarmCoordinator:
                 now=self._clock(),
             )
             return self._coordinator_ttl.total_seconds() / 2
+
+    def _log_provenance_strike(
+        self,
+        slot: Round5WarmSlot,
+        exc: RetryableWarmError,
+        now: datetime,
+        *,
+        rewarm: bool,
+    ) -> None:
+        last = self._provenance_strike_logged_at
+        if (
+            not rewarm
+            and last is not None
+            and (now - last).total_seconds() < PROVENANCE_PROBE_STRIKE_LOG_INTERVAL_SECONDS
+        ):
+            self._provenance_strikes_unlogged += 1
+            return
+        cause = exc.__cause__
+        logger.warning(
+            "round5_ready_probe_strike installation=%s generation=%s code=%s "
+            "strikes=%d/%d cause=%s action=%s suppressed=%d",
+            self.installation_id,
+            slot.generation,
+            exc,
+            self._provenance_probe_failures,
+            MAX_PROVENANCE_PROBE_FAILURES,
+            type(cause).__name__ if cause is not None else "none",
+            "rewarm" if rewarm else "retry",
+            self._provenance_strikes_unlogged,
+        )
+        self._provenance_strike_logged_at = now
+        self._provenance_strikes_unlogged = 0
 
     async def _reestablish_capsule(self, slot: Round5WarmSlot) -> float:
         """Recover from a READY slot whose launch capsule no longer belongs (bounded).
@@ -4686,7 +4749,7 @@ class Round5WarmCoordinator:
 
     def _claimable(self, slot: Round5WarmSlot, now: datetime) -> bool:
         # ``renew_by`` is the credential REFRESH trigger, NOT the claimability cliff:
-        # the real cliff is the launch margin checked by ``_capsule_current`` (Patch 3).
+        # the real cliff is the launch margin checked by ``_capsule_current``.
         # Gating claimability on ``renew_by > now`` too made the ring un-claimable in
         # the [renew_by, launch-margin-cliff) refresh window and flashed the idle fight
         # card "Temporarily Unavailable" every keep-alive cycle. The lead-time refresh
@@ -5063,7 +5126,7 @@ class Round5WarmCoordinator:
             claim_id,
             (slot.generation, slot.coordinator_fence, slot.coordinator_owner),
         )
-        # Blocker 3: run the (possibly long) provider reconciliation UNDER the lease
+        # Run the (possibly long) provider reconciliation UNDER the lease
         # heartbeat so the coordinator lease cannot silently lapse mid-cleanup; a
         # lost fence aborts the reconcile and surfaces WarmFenceLostError.
         holder = [slot]
@@ -5113,6 +5176,37 @@ class Round5WarmCoordinator:
         self._last_slot = renewed
         return renewed
 
+    def require_dispatchable(self, claim: Round5BoutClaim) -> None:
+        """Refuse a bell whose claimed capsule could not be dispatched now.
+
+        Local and read-only, so the manager asks before it writes anything for the bell,
+        and again once the bell has committed: that commit can answer well after the bell
+        instant ``accept_bell`` checked.
+        """
+
+        self._require_dispatchable(claim, self._clock())
+
+    def _require_dispatchable(self, claim: Round5BoutClaim, now: datetime) -> None:
+        """Refuse a claim whose capsule is gone or inside its dispatch safety margin.
+
+        A claimed capsule is never refreshed, so an armed wait can age a dispatch
+        credential into its safety margin. Accepting the bell then would launch
+        the competitor and have the Lakebase dispatch refused a moment later.
+        """
+
+        capsule = self._capsule
+        if capsule is None or capsule.generation != claim.capsule_generation:
+            raise WarmFenceLostError(
+                "Round 5 no longer holds the launch capsule this claim was made with"
+            )
+        remaining = (capsule.launch_margin_cliff() - now).total_seconds()
+        # Strict: the live dispatch refuses a credential left with exactly its margin.
+        if remaining <= BELL_DISPATCH_HEADROOM_SECONDS:
+            raise WarmBellMarginError(
+                remaining_seconds=remaining,
+                armed_wait_seconds=(now - claim.claimed_at).total_seconds(),
+            )
+
     async def accept_bell(self, claim_id: str) -> BellContext:
         existing = self._bell_contexts.get(claim_id)
         if existing is not None:
@@ -5126,6 +5220,7 @@ class Round5WarmCoordinator:
             raise WarmFenceLostError("bell context belonged to a replaced server process")
         bell_id = slot.claim.bell_id
         bell_at = self._clock()
+        self._require_dispatchable(slot.claim, bell_at)
         running = await self.store.accept_bell(
             slot,
             claim_id=claim_id,
@@ -5180,6 +5275,7 @@ class Round5WarmCoordinator:
             raise WarmFenceLostError("Round 5 claim is unavailable")
         bell_id = slot.claim.bell_id
         bell_at = self._clock()
+        self._require_dispatchable(slot.claim, bell_at)
         release_event = (
             release_event_factory(bell_at)
             if release_event_factory is not None
@@ -5239,7 +5335,7 @@ class Round5WarmCoordinator:
         """Fail closed when the durable resident-control outbox cannot drain."""
 
         code = _safe_code(code)
-        # Patch 2 (claim-aware, fail-closed-but-no-flicker): a persistent outbox
+        # Claim-aware, failing closed without a flicker: a persistent outbox
         # failure is handled by the ACTIVITY state of the ring, and NEVER by clearing
         # the capsule before a durable commit.
         #   * IDLE (slot.claim is None): SOFT degrade -- refuse NEW claims/bells but
@@ -5293,7 +5389,7 @@ class Round5WarmCoordinator:
         Reads the authoritative durable slot and refuses (WarmFenceLostError) if
         this process no longer owns the coordinator lease -- another process took
         over (owner/fence changed) or the lease expired. This is the durable half
-        of Blocker 2: ``_run_holding_lease`` cancellation is advisory (a provider
+        of that guard: ``_run_holding_lease`` cancellation is advisory (a provider
         may swallow CancelledError), but a stale owner is still refused HERE,
         immediately before the external mutation, so it cannot mutate under a fence
         it no longer holds.

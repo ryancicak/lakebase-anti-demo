@@ -30,6 +30,7 @@ from server.coordination import (
     round_ring_key,
 )
 from server.manager import (
+    _LOST_RING_STILL_STOPPING,
     InvalidStateError,
     RoundStorageReadinessError,
     RunManager,
@@ -1255,8 +1256,136 @@ async def test_all_bout_statuses_keep_health_failures_unavailable(monkeypatch) -
     assert all(not item["can_start"] for item in response.json()["rounds"].values())
 
 
-async def test_double_posted_run_returns_one_bout_over_http() -> None:
-    """Two POST /run calls for one session must not open two runs.
+@pytest.mark.parametrize("round_isolation", [True, False], ids=["own-ring", "shared-ring"])
+async def test_the_fight_card_names_a_lost_ring_whose_work_is_still_stopping(
+    round_isolation: bool,
+) -> None:
+    """The ring reopens by itself once the work that lost it has stopped here.
+
+    So the tile reads TEMPORARILY UNAVAILABLE with the manager's reason, the state the
+    release bar accepts for a round it owns, and not the generic UNAVAILABLE the card
+    renders as unavailable tonight. Only the tiles on that ring change: Round 6's alone
+    with per-round rings, all six while one ring is shared.
+    """
+
+    run_manager = RunManager(
+        round_isolation=round_isolation,
+        installation_id="install-lost-ring-tile",
+        model_score_factory=lambda _competitor: object(),
+        connection_spike_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
+        lease_store=InMemoryBoutLeaseStore(),
+    )
+    created = await run_manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="data_analyst",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.ANALYZE_LIVE_ORDERS,
+        )
+    )
+    record = run_manager._records[created.id]
+    owner = BoutOperator(display_name="Owner", subject="owner-subject")
+    ring = run_manager._lease_store_for_record(record)
+    sent = time.monotonic()
+    lease = await ring.claim(
+        session_id=created.id,
+        operator=owner,
+        phase="run_committed",
+        session_state=SessionState.RUNNING,
+        round_id=RoundId.ANALYZE_LIVE_ORDERS.value,
+        round_title=record.snapshot.round.title,
+        competitor_id=record.snapshot.competitor.id.value,
+        competitor_name=record.snapshot.competitor.short_name,
+        ttl=timedelta(seconds=30),
+    )
+    record.operator = owner
+    record.snapshot.state = SessionState.RUNNING
+    run_manager._set_lease(record, lease, sent)
+    finishes = asyncio.Event()
+    run = asyncio.create_task(finishes.wait(), name=f"run-{created.id}")
+    record.task = run
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = run_manager
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        try:
+            # The row is gone without this card having released it, and its run goes on.
+            assert await ring.release(lease)
+            assert await run_manager._release_bout(record) is True
+            assert record.ring_lease_lost is True
+            ring_status = (
+                await client.get(
+                    "/api/bout", params={"round_id": RoundId.ANALYZE_LIVE_ORDERS.value}
+                )
+            ).json()
+            board = (await client.get("/api/bout/all")).json()["rounds"]
+        finally:
+            finishes.set()
+        await run
+        reopened = (await client.get("/api/bout/all")).json()["rounds"]
+
+    assert ring_status["can_start"] is False
+    assert "ACTIVE WORK IS STILL STOPPING" in ring_status["maintenance_detail"]
+    closed = (
+        {RoundId.ANALYZE_LIVE_ORDERS.value}
+        if round_isolation
+        else {round_id.value for round_id in RoundId}
+    )
+    for round_id, tile in board.items():
+        if round_id in closed:
+            assert tile["state"] == "temporarily_unavailable", round_id
+            assert tile["can_start"] is False
+            assert tile["detail"] == ring_status["maintenance_detail"]
+        else:
+            assert tile["state"] == "ready", round_id
+            assert tile["can_start"] is True
+    assert {tile["state"] for tile in reopened.values()} == {"ready"}
+    await run_manager.close()
+
+
+def test_a_catalog_refusal_still_outranks_a_ring_that_is_still_stopping() -> None:
+    """The ring reopening would not make the round runnable, so the catalog's reason stands."""
+
+    round_six = next(
+        item
+        for item in sealed_catalog(live_orders_available=True).rounds
+        if item.id == RoundId.ANALYZE_LIVE_ORDERS
+    ).model_copy(
+        update={
+            "availability": Availability.UNAVAILABLE,
+            "availability_headline": "Round 6's AWS lane is not installed",
+            "availability_reason": "Seal the Round 6 AWS lane to race it.",
+        }
+    )
+    stopping = BoutStatus(
+        scope="round",
+        round_id=RoundId.ANALYZE_LIVE_ORDERS,
+        active=False,
+        can_start=False,
+        maintenance_state="maintenance",
+        maintenance_detail=_LOST_RING_STILL_STOPPING,
+    )
+
+    status = api_module._fight_card_round_status(
+        RoundId.ANALYZE_LIVE_ORDERS,
+        round_six,
+        stopping,
+    )
+
+    assert status.state == "unavailable"
+    assert status.can_start is False
+    assert status.detail == "Round 6's AWS lane is not installed"
+
+
+async def test_cancelled_run_request_does_not_cancel_bell_handoff_over_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled POST and its retry share one manager-owned bell handoff.
 
     This exercises the real HTTP surface a double-clicked bell hits. It uses the
     in-process ASGI transport rather than TestClient on purpose: TestClient drives
@@ -1291,24 +1420,54 @@ async def test_double_posted_run_returns_one_bout_over_http() -> None:
     api_app = FastAPI()
     api_app.include_router(router)
     api_app.state.run_manager = run_manager
+    original_commit = run_manager._commit_bout
+    committed = asyncio.Event()
+    release_handoff = asyncio.Event()
+
+    async def blocked_commit(record, operator):
+        await original_commit(record, operator)
+        committed.set()
+        await release_handoff.wait()
+
+    monkeypatch.setattr(run_manager, "_commit_bout", blocked_commit)
 
     async with AsyncClient(
         transport=ASGITransport(app=api_app),
         base_url="http://anti-demo.test",
     ) as client:
-        first = await client.post(f"/api/sessions/{created.id}/run")
-        second = await client.post(f"/api/sessions/{created.id}/run")
+        first = asyncio.create_task(client.post(f"/api/sessions/{created.id}/run"))
+        await asyncio.wait_for(committed.wait(), timeout=2)
+        record = run_manager._records[created.id]
+        assert record.snapshot.state == SessionState.ARMED
+        assert record.lease is not None
+        assert record.lease.phase == "run_committed"
+
+        second_request = asyncio.create_task(
+            client.post(f"/api/sessions/{created.id}/run")
+        )
+        await asyncio.sleep(0)
+        assert not second_request.done()
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert record.bell_handoff_task is not None
+        assert not record.bell_handoff_task.done()
+
+        release_handoff.set()
+        second = await asyncio.wait_for(second_request, timeout=2)
+        duplicate = await client.post(f"/api/sessions/{created.id}/run")
 
     # The duplicate must be answered, not rejected and not run again.
-    assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["id"] == second.json()["id"] == created.id
-    assert first.json()["run_started_at"] == second.json()["run_started_at"]
+    assert duplicate.status_code == 200
+    assert second.json()["id"] == duplicate.json()["id"] == created.id
+    assert second.json()["run_started_at"] == duplicate.json()["run_started_at"]
 
     # The run task publishes run_started after the POST returns, so let it land.
     events = run_manager._records[created.id].event_log.events
     for _ in range(400):
-        if (await run_manager.get(created.id)).state.value == "running":
+        if [event.event for event in events].count("run_started") == 1:
             break
         await asyncio.sleep(0.005)
     assert (await run_manager.get(created.id)).state.value == "running"

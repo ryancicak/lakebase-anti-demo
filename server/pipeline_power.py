@@ -90,10 +90,13 @@ import asyncio
 import json
 import logging
 import os
+import threading
+import time
+import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -299,6 +302,11 @@ _INTENT_RESUMING = "resuming"
 #: wolf. See :func:`read_stop_marker`.
 _INTENT_STOP_OWED = "stop_owed"
 
+#: A committed start-generation reservation. Fire-and-forget resuming/stop/owed
+#: rows may land later; the unmatched walk ignores this intent, and the next
+#: mint's history_max includes it.
+_INTENT_GENERATION_RESERVED = "generation_reserved"
+
 #: Which marker fields each intent's timestamp and actor live in, in one place.
 #:
 #: **Shared because writing it twice already lost a due time.**
@@ -326,11 +334,19 @@ _INTENT_FIELDS: dict[str, tuple[str, str]] = {
     _INTENT_STOPPED: ("stopped_at", "stopped_by"),
     _INTENT_RESUMING: ("resumed_at", "resumed_by"),
     _INTENT_STOP_OWED: ("owed_at", "owed_by"),
+    _INTENT_GENERATION_RESERVED: ("reserved_at", "reserved_by"),
 }
 
 
 class PipelinePowerError(RuntimeError):
     """A stop or start could not be performed safely."""
+
+
+class RebaseLedgerUnavailableError(PipelinePowerError):
+    """The durable rebase ledger could not be read or written.
+
+    Repair and start must fail closed rather than resume incrementally.
+    """
 
 
 class PipelineUpdateConflictError(PipelinePowerError):
@@ -397,6 +413,11 @@ class PipelinePower:
     update_state: str = ""
     #: The control-plane update accepted for a start request, when available.
     update_id: str = ""
+    #: Whether this start requested a full refresh. CLI output must name this,
+    #: not a canned "without a full refresh" line.
+    full_refresh: bool = False
+    #: Generation the caller observed when it decided ``full_refresh``.
+    rebase_event_id: int | None = None
     stopped_at: str = ""
     stopped_by: str = ""
     #: When a resume was requested and is still settling. Distinct from both of
@@ -683,6 +704,25 @@ def _coordination_store() -> Any | None:
     )
 
 
+async def _latest_for_status(store: Any, pipeline_id: str) -> dict[str, Any] | None:
+    """Newest real power intent, else a reservation, from one history snapshot.
+
+    Separate filtered and unfiltered ``latest()`` calls can let ``stop_owed``
+    commit after the filtered reads and a reservation commit before the
+    unfiltered fallback, which would hide the overdue stop. One snapshot
+    prefers the newest non-reserved intent and falls back to a reservation
+    only when that snapshot has no real intent.
+    """
+
+    snapshot = getattr(store, "latest_for_status", None)
+    if snapshot is not None:
+        return await snapshot(pipeline_id)
+    real = await store.latest(pipeline_id)
+    if real is not None:
+        return real
+    return await store.latest(pipeline_id, skip_reserved=False)
+
+
 def _durable_ledger(pipeline_id: str) -> dict[str, Any] | None:
     """The newest coordination-table power record for this pipeline, or None.
 
@@ -716,7 +756,7 @@ def _durable_ledger(pipeline_id: str) -> dict[str, Any] | None:
     async def read() -> dict[str, Any] | None:
         installed = _durable_store
         if installed is not None:
-            return await installed.latest(pipeline_id)
+            return await _latest_for_status(installed, pipeline_id)
         store = _coordination_store()
         if store is None:
             # Nothing to ask, so the marker file was the whole record. Correct
@@ -724,7 +764,9 @@ def _durable_ledger(pipeline_id: str) -> dict[str, Any] | None:
             # this pipeline in the first place.
             return None
         try:
-            return await DurablePipelinePowerStore(store._run).latest(pipeline_id)
+            return await _latest_for_status(
+                DurablePipelinePowerStore(store._run), pipeline_id
+            )
         finally:
             with suppress(Exception):
                 await store.close()
@@ -739,7 +781,10 @@ def _durable_ledger(pipeline_id: str) -> dict[str, Any] | None:
         logger.warning(
             "Could not read durable Round 4 power records, so a stop made by the "
             "deployed app cannot be told apart from a failure here. If this "
-            "installation predates the power table, 'antidemo renew' provisions it.",
+            "installation predates the power table, run `antidemo coordination-upgrade` "
+            "as the schema owner. `antidemo setup` or `antidemo renew` on a ready "
+            "install is not that upgrade: setup resets database lanes and renew does "
+            "not provision these tables.",
             exc_info=True,
         )
         return None
@@ -860,6 +905,8 @@ def read_stop_marker(
     if payload is None:
         return None
     intent = _intent(payload)
+    if intent == _INTENT_GENERATION_RESERVED:
+        return None
     if intent == _INTENT_STOP_OWED:
         due_at = _parse_stamp(payload.get("owed_at"))
         if due_at is None:
@@ -950,7 +997,7 @@ def _accrual(
     if not running:
         return None, ""
     intent = _intent(ledger) if ledger is not None else ""
-    if intent == _INTENT_STOPPED:
+    if intent in {_INTENT_STOPPED, _INTENT_GENERATION_RESERVED}:
         return None, ""
     # An owed stop carries forward the ``resumed_at`` of the resume it
     # superseded, precisely so that scheduling a stop does not cost the accrued
@@ -1230,16 +1277,19 @@ def start(
     manifest: DemoManifest,
     api: Callable[..., dict[str, Any]],
     *,
-    full_refresh: bool = False,
+    full_refresh: bool | None = None,
+    rebase_event_id: int | None = None,
     marker_path: Path | None = None,
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     on_record: Callable[[dict[str, Any]], None] | None = None,
 ) -> PipelinePower:
     """Restart the sealed pipeline and record that a resume is in progress.
 
-    ``full_refresh`` is false for an ordinary resume. It is true only after the
-    fixed source-repair job rebuilt a missing Delta source and Managed Sync must
-    rebase its preserved destination onto that exact table.
+    ``full_refresh`` is an authoritative decision when True or False: the caller
+    already consulted the durable rebase ledger (or knows there is no store).
+    ``None`` is the only path that may resolve the ledger here, and only from a
+    thread with no running event loop -- never from ``asyncio.to_thread`` on the
+    app's shared coordination runner.
 
     The record is **rewritten, not deleted.** Deleting it was a real defect
     rather than a tidiness question: the request returns immediately and the
@@ -1253,19 +1303,20 @@ def start(
 
     pipeline_id = _sealed_pipeline_id(manifest)
     profile = manifest.databricks.profile
+    refresh = _resolved_full_refresh(full_refresh, pipeline_id)
     try:
         response = api(
             profile,
             "post",
             _require_pipeline_path(pipeline_id, f"/api/2.0/pipelines/{pipeline_id}/updates"),
-            body={"full_refresh": full_refresh},
+            body={"full_refresh": refresh},
         )
     except ResourceConflict:
         update_id = _adopt_exact_active_update(
             manifest,
             api,
             pipeline_id=pipeline_id,
-            full_refresh=full_refresh,
+            full_refresh=refresh,
         )
     else:
         update_id = str(response.get("update_id") or "") if isinstance(response, Mapping) else ""
@@ -1291,6 +1342,8 @@ def start(
         cloud_state="",
         stopped_deliberately=False,
         update_id=update_id,
+        full_refresh=refresh,
+        rebase_event_id=rebase_event_id,
         resuming_since=resumed_at,
     )
 
@@ -1322,6 +1375,55 @@ PIPELINE_POWER_TABLE = f"{COORDINATION_SCHEMA}.round4_pipeline_power"
 #: grant plan needs it, and an ``INSERT`` against a ``bigserial`` the app cannot
 #: draw from fails at the first stop rather than at review.
 PIPELINE_POWER_SEQUENCE = "round4_pipeline_power_event_id_seq"
+
+#: Durable "this pipeline still owes a full-refresh start" history. Separate from
+#: :data:`PIPELINE_POWER_TABLE` so a rebase row can never become the newest power
+#: intent, which that table's readers take by highest ``event_id``.
+ROUND4_REBASE_TABLE = f"{COORDINATION_SCHEMA}.round4_source_rebase"
+ROUND4_REBASE_SEQUENCE = "round4_source_rebase_event_id_seq"
+
+_INTENT_REBASE_OWED = "rebase_owed"
+_INTENT_REBASE_SATISFIED = "rebase_satisfied"
+
+#: Namespace for ``pg_advisory_xact_lock(hashtextextended(...))`` so owed and
+#: satisfy writers for one pipeline serialize even when a later INSERT has
+#: allocated ``event_id`` but is not yet visible under READ COMMITTED.
+#:
+#: The lock is taken in its own statement, then the INSERT runs in a second
+#: statement on the same transaction: a single-statement CTE lock+INSERT uses
+#: the snapshot from before the wait and can still CAS against a row that
+#: committed while it blocked. The Lakebase runner is autocommit, so writers
+#: open ``BEGIN``/``COMMIT`` around those two statements.
+_REBASE_LOCK_SEED = 0
+
+
+def _rebase_advisory_key(pipeline_id: str) -> str:
+    return f"round4_source_rebase:{pipeline_id}"
+
+
+async def _with_pipeline_rebase_lock(
+    cursor: Any, pipeline_id: str, write: Callable[[], Awaitable[Any]]
+) -> Any:
+    """Hold the per-pipeline rebase lock across a write with a post-lock snapshot."""
+
+    connection = getattr(cursor, "connection", None)
+    own_txn = bool(getattr(connection, "autocommit", False))
+    if own_txn:
+        await cursor.execute("BEGIN")
+    try:
+        await cursor.execute(
+            f"SELECT pg_advisory_xact_lock(hashtextextended(%s, {_REBASE_LOCK_SEED}))",
+            (_rebase_advisory_key(pipeline_id),),
+        )
+        result = await write()
+        if own_txn:
+            await cursor.execute("COMMIT")
+        return result
+    except BaseException:
+        if own_txn:
+            with suppress(Exception):
+                await cursor.execute("ROLLBACK")
+        raise
 
 #: How many rows back :meth:`DurablePipelinePowerStore.latest` reads.
 #:
@@ -1360,15 +1462,37 @@ def _marker_from_row(row: Any, pipeline_id: str) -> dict[str, Any]:
     }
 
 
-def _resume_origin(older: Any) -> str:
+def _marker_from_history_rows(
+    rows: Any,
+    pipeline_id: str,
+    *,
+    skip_reserved: bool = False,
+) -> dict[str, Any] | None:
+    """Newest marker in ``rows`` (newest first), skipping reservations if asked."""
+
+    for row in rows:
+        if skip_reserved and str(row[0]) == _INTENT_GENERATION_RESERVED:
+            continue
+        record = _marker_from_row(row, pipeline_id)
+        if _intent(record) == _INTENT_STOP_OWED:
+            origin = _resume_origin(rows, pair_key=str(record.get("run_id") or ""))
+            if origin:
+                record["resumed_at"] = origin
+        return record
+    return None
+
+
+def _resume_origin(rows: Any, *, pair_key: str = "") -> str:
     """When the billing an owed stop is about actually began, or ``""``.
 
-    ``older`` is this pipeline's rows *strictly older than* the owed stop,
-    newest first. The answer is the most recent resume that has not since been
-    cancelled by a stop, which is exactly the origin
+    ``rows`` is this pipeline's history, newest first, including a ``resuming``
+    that committed after ``stop_owed``. The answer is the most recent resume
+    that has not since been cancelled by a stop, which is exactly the origin
     :func:`owed_stop_record` carries forward on disk --- recovered here rather
     than stored twice, because the alternative is a second timestamp column and
     a coordination schema change to carry a fact the table already holds.
+    A pair key looks only at that pair, so a delayed older resume cannot date
+    a newer unmatched start, and an inverted later resume is not lost.
 
     **It is read from history rather than trusted from the record, and that is
     the stronger answer.** The carry-forward on disk only works when a local
@@ -1384,13 +1508,241 @@ def _resume_origin(older: Any) -> str:
     promise about the pipeline, not a change to it, so it interrupts nothing.
     """
 
-    for row in older:
+    for row in rows:
+        if pair_key and _power_pair_key(row) != pair_key:
+            continue
         intent = str(row[0])
         if intent == _INTENT_RESUMING:
             return row[2].astimezone(UTC).isoformat() if row[2] is not None else ""
         if intent == _INTENT_STOPPED:
             return ""
     return ""
+
+
+def _power_pair_key(row: Any) -> str:
+    """The start that produced this power row, or the bare ``run_id`` if unpaired."""
+
+    return str(row[1] or "")
+
+
+def _is_stamped_pair_key(run_id: str) -> bool:
+    """LakebaseSyncLane.start stamps ``{run_id}:{n}:{uuid.hex}``; legacy rows have no colon."""
+
+    return ":" in run_id
+
+
+_generation_lock = threading.Lock()
+_last_power_start_generation = 0
+
+
+def reset_power_start_generation() -> None:
+    """Drop the in-process clock; a new serving process starts with empty memory."""
+
+    global _last_power_start_generation
+    with _generation_lock:
+        _last_power_start_generation = 0
+
+
+def next_power_start_generation(*, observed_max: int = 0) -> int:
+    """A generation strictly above this process and any generation already on disk."""
+
+    global _last_power_start_generation
+    wall = time.time_ns()
+    with _generation_lock:
+        candidate = max(wall, observed_max + 1, _last_power_start_generation + 1)
+        _last_power_start_generation = candidate
+        return candidate
+
+
+def _pair_generation(run_id: str) -> int:
+    """Start generation from ``run_id:{n}:{token}``, or 0 for r4/legacy keys."""
+
+    parts = run_id.split(":")
+    if len(parts) >= 3 and parts[-2].isdigit():
+        return int(parts[-2])
+    return 0
+
+
+async def next_pipeline_start_generation(pipeline_id: str) -> int:
+    """Mint a generation that cannot sit below any pair a prior process left.
+
+    The newest reservation is the floor. :func:`mint_power_pair_key` commits a
+    reservation before its key is used anywhere and before the next mint reads,
+    so no generation in history is above the newest one, and the floor stays one
+    keyed row however long the history grows. A failed read plus a rolled-back
+    clock would otherwise mint below existing parks and hide the new start.
+    """
+
+    observed = 0
+    store = _durable_store
+    if store is not None and pipeline_id:
+        try:
+            newest = await store.newest_reserved_pair_key(pipeline_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not read the newest Round 4 start reservation before minting "
+                "a start generation, so this start will not use a pair that could "
+                "sit below parked rows.",
+                exc_info=True,
+            )
+            raise PipelinePowerError(
+                "Round 4 could not read pipeline power history before minting a "
+                "start generation"
+            ) from exc
+        observed = _pair_generation(newest)
+    return next_power_start_generation(observed_max=observed)
+
+
+async def mint_power_pair_key(
+    run_id: str,
+    pipeline_id: str = "",
+    *,
+    bout_token: str | None = None,
+) -> str:
+    """``{run_id}:{generation}:{token}``, reserved in history before return."""
+
+    generation = await next_pipeline_start_generation(pipeline_id)
+    token = bout_token if bout_token is not None else uuid.uuid4().hex
+    pair_key = f"{run_id}:{generation}:{token}"
+    store = _durable_store
+    if store is None or not pipeline_id:
+        return pair_key
+    try:
+        await store.append(
+            {
+                "intent": _INTENT_GENERATION_RESERVED,
+                "pipeline_id": pipeline_id,
+                "run_id": pair_key,
+                "reserved_at": datetime.now(UTC).isoformat(),
+                "reserved_by": "round4-start-generation",
+            }
+        )
+    except PipelinePowerError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Could not reserve a Round 4 pipeline start generation before the "
+            "bell starts, so this process will not mint a pair that later "
+            "history cannot see.",
+            exc_info=True,
+        )
+        raise PipelinePowerError(
+            "Round 4 could not reserve a pipeline start generation"
+        ) from exc
+    return pair_key
+
+
+#: Must stay equal to ``round4_race_live.BOUT_STOP_DUE_SECONDS``.
+STOP_OWED_DUE_SECONDS = 1800.0
+
+
+def _owed_record_from_row(row: Any, rows: Any, pipeline_id: str) -> dict[str, Any]:
+    record = _marker_from_row(row, pipeline_id)
+    origin = _resume_origin(rows, pair_key=_power_pair_key(row))
+    if origin:
+        record["resumed_at"] = origin
+    return record
+
+
+def _synthetic_owed_from_resume(row: Any, pipeline_id: str) -> dict[str, Any]:
+    """A pair-keyed resuming whose matching ``stop_owed`` never committed still owes."""
+
+    resumed = row[2].astimezone(UTC) if row[2] is not None else datetime.now(UTC)
+    due = resumed + timedelta(seconds=STOP_OWED_DUE_SECONDS)
+    return {
+        "intent": _INTENT_STOP_OWED,
+        "pipeline_id": pipeline_id,
+        "run_id": str(row[1] or ""),
+        "owed_at": due.isoformat(),
+        "owed_by": str(row[3] or ""),
+        "resumed_at": resumed.isoformat(),
+        "usd_per_day": str(row[4] or ""),
+    }
+
+
+def _unmatched_owed_stop(rows: Any, pipeline_id: str) -> dict[str, Any] | None:
+    """The unmatched ``stop_owed`` in ``rows`` (newest first), if any.
+
+    Collect every stamped ``stopped`` pair first so a delayed ``stop_owed``
+    cannot resurrect a pair that already parked. A later start — even one that
+    then parks — ends older pairs' debt, including when an older ``stop_owed``
+    commits last: a parked pair with a later start generation settles older
+    generations. Debt is the highest *unparked* generation: a delayed older
+    ``stop_owed`` must not win just because it is newest by ``event_id``, and a
+    stamped ``stopped`` for an older pair must not hide a newer unmatched start
+    just because that older park committed last. A bare CLI/legacy ``stopped``
+    settles older unkeyed debt only; its commit position cannot erase a
+    stamped start. Unkeyed same-run_id ``resuming``/``stop_owed`` stay unmatched.
+    """
+
+    settled = {
+        _power_pair_key(row)
+        for row in rows
+        if str(row[0]) == _INTENT_STOPPED and _is_stamped_pair_key(_power_pair_key(row))
+    }
+    parked_generation = max((_pair_generation(pair) for pair in settled), default=0)
+    bare_stop_covers_older = False
+    stamped_owed: dict[str, tuple[int, Any]] = {}
+    stamped_resume: dict[str, tuple[int, Any]] = {}
+    leading_unkeyed: str | None = None
+    unkeyed_owed: tuple[int, Any] | None = None
+    for index, row in enumerate(rows):
+        intent = str(row[0])
+        pair = _power_pair_key(row)
+        stamped = _is_stamped_pair_key(pair)
+        ended_by_later_park = stamped and _pair_generation(pair) < parked_generation
+        ended_unkeyed_by_stamped_park = (not stamped) and parked_generation > 0
+        if intent == _INTENT_STOPPED:
+            if not stamped:
+                bare_stop_covers_older = True
+            continue
+        if intent == _INTENT_STOP_OWED:
+            if pair in settled:
+                continue
+            if ended_by_later_park or ended_unkeyed_by_stamped_park:
+                continue
+            if bare_stop_covers_older and not stamped:
+                continue
+            if stamped:
+                stamped_owed.setdefault(pair, (index, row))
+                continue
+            if leading_unkeyed is None or leading_unkeyed == pair:
+                if unkeyed_owed is None:
+                    unkeyed_owed = (index, row)
+            continue
+        if intent != _INTENT_RESUMING:
+            continue
+        if pair in settled:
+            continue
+        if ended_by_later_park or ended_unkeyed_by_stamped_park:
+            continue
+        if stamped:
+            stamped_resume.setdefault(pair, (index, row))
+            continue
+        if bare_stop_covers_older:
+            continue
+        if leading_unkeyed is None:
+            leading_unkeyed = pair
+    best: tuple[int, int, str, int, Any] | None = None
+    for pair, (index, row) in stamped_owed.items():
+        rank = (_pair_generation(pair), -index)
+        if best is None or rank > (best[0], best[1]):
+            best = (rank[0], rank[1], "owed", index, row)
+    for pair, (index, row) in stamped_resume.items():
+        if pair in stamped_owed or pair in settled:
+            continue
+        rank = (_pair_generation(pair), -index)
+        if best is None or rank > (best[0], best[1]):
+            best = (rank[0], rank[1], "resume", index, row)
+    if best is not None:
+        _gen, _neg, kind, _index, row = best
+        if kind == "owed":
+            return _owed_record_from_row(row, rows, pipeline_id)
+        return _synthetic_owed_from_resume(row, pipeline_id)
+    if unkeyed_owed is not None:
+        _index, row = unkeyed_owed
+        return _owed_record_from_row(row, rows, pipeline_id)
+    return None
 
 
 #: The store this process records power requests to, or None when it has none.
@@ -1450,36 +1802,121 @@ class DurablePipelinePowerStore:
         """
 
         async def ensure(cursor: Any) -> None:
-            objects = await read_coordination_objects(cursor, (PIPELINE_POWER_TABLE,))
+            objects = await read_coordination_objects(
+                cursor, (PIPELINE_POWER_TABLE, ROUND4_REBASE_TABLE)
+            )
             if objects.complete:
+                await self._probe_runtime_privileges(cursor)
                 return
             try:
                 if not objects.schema_present:
                     await cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {COORDINATION_SCHEMA}")
-                await cursor.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {PIPELINE_POWER_TABLE} (
-                        event_id bigserial PRIMARY KEY,
-                        pipeline_id text NOT NULL,
-                        intent text NOT NULL,
-                        run_id text,
-                        requested_at timestamptz NOT NULL,
-                        requested_by text NOT NULL,
-                        usd_per_day text NOT NULL,
-                        written_at timestamptz NOT NULL DEFAULT clock_timestamp()
+                missing = set(objects.missing_tables)
+                if PIPELINE_POWER_TABLE in missing:
+                    await cursor.execute(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {PIPELINE_POWER_TABLE} (
+                            event_id bigserial PRIMARY KEY,
+                            pipeline_id text NOT NULL,
+                            intent text NOT NULL,
+                            run_id text,
+                            requested_at timestamptz NOT NULL,
+                            requested_by text NOT NULL,
+                            usd_per_day text NOT NULL,
+                            written_at timestamptz NOT NULL DEFAULT clock_timestamp()
+                        )
+                        """
                     )
-                    """
-                )
+                if ROUND4_REBASE_TABLE in missing:
+                    await cursor.execute(
+                        f"""
+                        CREATE TABLE IF NOT EXISTS {ROUND4_REBASE_TABLE} (
+                            event_id bigserial PRIMARY KEY,
+                            pipeline_id text NOT NULL,
+                            intent text NOT NULL,
+                            run_id text,
+                            requested_at timestamptz NOT NULL,
+                            requested_by text NOT NULL,
+                            written_at timestamptz NOT NULL DEFAULT clock_timestamp()
+                        )
+                        """
+                    )
             except psycopg.errors.InsufficientPrivilege as exc:
                 raise CoordinationObjectsMissingError(
                     f"The Round 4 pipeline power history is missing "
                     f"{objects.describe_missing()}, and this identity may not create "
-                    "it. Provision the coordination schema with an identity that owns "
-                    "it (`antidemo setup`), then grant this one the runtime privileges "
-                    "in docs/DEPLOY.md."
+                    "it. Run `antidemo coordination-upgrade` as the schema owner. "
+                    "`antidemo setup` or `antidemo renew` on a ready install is not "
+                    "that upgrade: setup resets database lanes and renew does not "
+                    "provision these tables; `./bootstrap.sh --deploy-only` does not "
+                    "create or grant them."
                 ) from exc
+            await self._probe_runtime_privileges(cursor)
 
         await self._run(ensure)
+
+    @staticmethod
+    async def _probe_runtime_privileges(cursor: Any) -> None:
+        """Confirm SELECT/INSERT and sequence USAGE without writing rows.
+
+        Catalog presence is not enough: a SELECT-only grant or a missing
+        sequence USAGE fails the first owed append, which is too late for boot.
+        ``has_table_privilege`` / ``has_sequence_privilege`` inspect ACLs for
+        the current user and do not mutate production state.
+        """
+
+        rebase_seq = f"{COORDINATION_SCHEMA}.{ROUND4_REBASE_SEQUENCE}"
+        power_seq = f"{COORDINATION_SCHEMA}.{PIPELINE_POWER_SEQUENCE}"
+        try:
+            await cursor.execute(
+                """
+                SELECT
+                    has_table_privilege(%s, 'SELECT'),
+                    has_table_privilege(%s, 'INSERT'),
+                    has_sequence_privilege(%s, 'USAGE'),
+                    has_table_privilege(%s, 'SELECT'),
+                    has_table_privilege(%s, 'INSERT'),
+                    has_sequence_privilege(%s, 'USAGE')
+                """,
+                (
+                    ROUND4_REBASE_TABLE,
+                    ROUND4_REBASE_TABLE,
+                    rebase_seq,
+                    PIPELINE_POWER_TABLE,
+                    PIPELINE_POWER_TABLE,
+                    power_seq,
+                ),
+            )
+            row = await cursor.fetchone()
+        except psycopg.errors.InsufficientPrivilege as exc:
+            raise CoordinationObjectsMissingError(
+                "The Round 4 pipeline power or rebase ledger exists but this "
+                "identity cannot inspect its privileges. Run "
+                "`antidemo coordination-upgrade` as the schema owner; "
+                "`./bootstrap.sh --deploy-only` does not create or grant them."
+            ) from exc
+        if row is None or len(row) != 6:
+            raise CoordinationObjectsMissingError(
+                "The Round 4 pipeline power/rebase privilege probe did not return "
+                "a complete answer"
+            )
+        labels = (
+            f"SELECT on {ROUND4_REBASE_TABLE}",
+            f"INSERT on {ROUND4_REBASE_TABLE}",
+            f"USAGE on {rebase_seq}",
+            f"SELECT on {PIPELINE_POWER_TABLE}",
+            f"INSERT on {PIPELINE_POWER_TABLE}",
+            f"USAGE on {power_seq}",
+        )
+        missing = [label for label, ok in zip(labels, row, strict=True) if not ok]
+        if missing:
+            raise CoordinationObjectsMissingError(
+                "The Round 4 pipeline power/rebase runtime grants are incomplete: "
+                + ", ".join(missing)
+                + ". Run `antidemo coordination-upgrade` as the schema owner "
+                "before `./bootstrap.sh --deploy-only`; that command creates and "
+                "grants coordination tables without resetting database lanes."
+            )
 
     async def append(self, record: Mapping[str, Any]) -> None:
         """Record one deliberate power request, in the file marker's own shape.
@@ -1522,7 +1959,9 @@ class DurablePipelinePowerStore:
 
         await self._run(insert)
 
-    async def latest(self, pipeline_id: str) -> dict[str, Any] | None:
+    async def latest(
+        self, pipeline_id: str, *, skip_reserved: bool = True
+    ) -> dict[str, Any] | None:
         """The newest power request for this exact pipeline, in marker shape.
 
         Keyed on ``pipeline_id`` for the reason :func:`_read_ledger` is: a
@@ -1550,14 +1989,226 @@ class DurablePipelinePowerStore:
         they disagree.
         """
 
+        rows = await self._power_history_rows(
+            pipeline_id, skip_reserved=skip_reserved
+        )
+        return _marker_from_history_rows(
+            rows, pipeline_id, skip_reserved=skip_reserved
+        )
+
+    async def latest_for_status(self, pipeline_id: str) -> dict[str, Any] | None:
+        """Newest real intent, else a reservation, from one SQL snapshot."""
+
+        return _marker_from_history_rows(
+            await self._status_snapshot_rows(pipeline_id), pipeline_id
+        )
+
+    async def _power_history_rows(
+        self,
+        pipeline_id: str,
+        *,
+        limit: int | None = _POWER_HISTORY_LOOKBACK,
+        skip_reserved: bool = False,
+    ) -> list[Any]:
+        bound = "" if limit is None else f"LIMIT {int(limit)}"
+        reserved_clause = (
+            "AND intent <> %s" if skip_reserved else ""
+        )
+        params: tuple[Any, ...] = (
+            (pipeline_id, _INTENT_GENERATION_RESERVED)
+            if skip_reserved
+            else (pipeline_id,)
+        )
+
         async def select(cursor: Any) -> Any:
             await cursor.execute(
                 f"""
                 SELECT intent, run_id, requested_at, requested_by, usd_per_day
                 FROM {PIPELINE_POWER_TABLE}
                 WHERE pipeline_id = %s
+                {reserved_clause}
                 ORDER BY event_id DESC
-                LIMIT {_POWER_HISTORY_LOOKBACK}
+                {bound}
+                """,
+                params,
+            )
+            return await cursor.fetchall()
+
+        return list(await self._run(select) or ())
+
+    async def newest_reserved_pair_key(self, pipeline_id: str) -> str:
+        """The pair key of this pipeline's newest start reservation, or ``""``."""
+
+        async def select(cursor: Any) -> Any:
+            await cursor.execute(
+                f"""
+                SELECT intent, run_id, requested_at, requested_by, usd_per_day
+                FROM {PIPELINE_POWER_TABLE}
+                WHERE pipeline_id = %s
+                AND intent = %s
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (pipeline_id, _INTENT_GENERATION_RESERVED),
+            )
+            return await cursor.fetchall()
+
+        rows = list(await self._run(select) or ())
+        return _power_pair_key(rows[0]) if rows else ""
+
+    async def _status_snapshot_rows(self, pipeline_id: str) -> list[Any]:
+        """One snapshot: non-reserved lookback, else the newest row including reserved."""
+
+        lookback = int(_POWER_HISTORY_LOOKBACK)
+
+        async def select(cursor: Any) -> Any:
+            await cursor.execute(
+                f"""
+                -- status-snapshot-prefer-real
+                WITH real AS (
+                    SELECT intent, run_id, requested_at, requested_by, usd_per_day, event_id
+                    FROM {PIPELINE_POWER_TABLE}
+                    WHERE pipeline_id = %s
+                    AND intent <> %s
+                    ORDER BY event_id DESC
+                    LIMIT {lookback}
+                )
+                SELECT intent, run_id, requested_at, requested_by, usd_per_day
+                FROM (
+                    SELECT intent, run_id, requested_at, requested_by, usd_per_day, event_id
+                    FROM real
+                    UNION ALL
+                    SELECT intent, run_id, requested_at, requested_by, usd_per_day, event_id
+                    FROM (
+                        SELECT intent, run_id, requested_at, requested_by, usd_per_day, event_id
+                        FROM {PIPELINE_POWER_TABLE}
+                        WHERE pipeline_id = %s
+                        ORDER BY event_id DESC
+                        LIMIT 1
+                    ) newest
+                    WHERE NOT EXISTS (SELECT 1 FROM real)
+                ) snap
+                ORDER BY event_id DESC
+                """,
+                (pipeline_id, _INTENT_GENERATION_RESERVED, pipeline_id),
+            )
+            return await cursor.fetchall()
+
+        return list(await self._run(select) or ())
+
+    async def unmatched_owed_stop(self, pipeline_id: str) -> dict[str, Any] | None:
+        """The unmatched owed stop, even when a same-start ``resuming`` is newest.
+
+        ``latest`` stays newest ``event_id`` for every other reader. Startup
+        recovery and the inherited snapshot use this so a ``resuming`` that
+        commits after its own ``stop_owed`` cannot hide a stop still owed. The
+        lookback bound used by :meth:`latest` does not apply here: an unmatched
+        ``stop_owed`` must still be found after more than twenty later rows.
+        """
+
+        return _unmatched_owed_stop(
+            await self._power_history_rows(pipeline_id, limit=None), pipeline_id
+        )
+
+    async def append_rebase(
+        self,
+        pipeline_id: str,
+        intent: str,
+        *,
+        run_id: str = "",
+        actor: str = "",
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> int:
+        """Append one rebase-owed or rebase-satisfied event; return its event_id."""
+
+        async def insert(cursor: Any) -> int:
+            async def write() -> int:
+                await cursor.execute(
+                    f"""
+                    INSERT INTO {ROUND4_REBASE_TABLE} (
+                        pipeline_id, intent, run_id, requested_at, requested_by
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING event_id
+                    """,
+                    (
+                        pipeline_id,
+                        intent,
+                        run_id or None,
+                        now().astimezone(UTC),
+                        actor,
+                    ),
+                )
+                row = await cursor.fetchone()
+                if row is None or row[0] is None:
+                    raise RebaseLedgerUnavailableError(
+                        "The Round 4 rebase ledger did not return an event identity"
+                    )
+                return int(row[0])
+
+            return int(await _with_pipeline_rebase_lock(cursor, pipeline_id, write))
+
+        return int(await self._run(insert))
+
+    async def satisfy_rebase(
+        self,
+        pipeline_id: str,
+        observed_event_id: int,
+        *,
+        run_id: str = "",
+        actor: str = "",
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> int | None:
+        """Append rebase_satisfied only if ``observed_event_id`` is still newest.
+
+        A later rebase_owed wins this compare-and-set, so a stale in-flight
+        start cannot clear a newer repair obligation.
+        """
+
+        async def insert(cursor: Any) -> int | None:
+            async def write() -> int | None:
+                await cursor.execute(
+                    f"""
+                    INSERT INTO {ROUND4_REBASE_TABLE} (
+                        pipeline_id, intent, run_id, requested_at, requested_by
+                    )
+                    SELECT %s, %s, %s, %s, %s
+                    WHERE (
+                        SELECT event_id FROM {ROUND4_REBASE_TABLE}
+                        WHERE pipeline_id = %s
+                        ORDER BY event_id DESC
+                        LIMIT 1
+                    ) = %s
+                    RETURNING event_id
+                    """,
+                    (
+                        pipeline_id,
+                        _INTENT_REBASE_SATISFIED,
+                        run_id or None,
+                        now().astimezone(UTC),
+                        actor,
+                        pipeline_id,
+                        observed_event_id,
+                    ),
+                )
+                row = await cursor.fetchone()
+                return int(row[0]) if row is not None and row[0] is not None else None
+
+            return await _with_pipeline_rebase_lock(cursor, pipeline_id, write)
+
+        return await self._run(insert)
+
+    async def latest_rebase(self, pipeline_id: str) -> dict[str, Any] | None:
+        """The newest rebase event for this exact pipeline, or ``None``."""
+
+        async def select(cursor: Any) -> Any:
+            await cursor.execute(
+                f"""
+                SELECT event_id, intent, run_id, requested_at, requested_by
+                FROM {ROUND4_REBASE_TABLE}
+                WHERE pipeline_id = %s
+                ORDER BY event_id DESC
+                LIMIT 1
                 """,
                 (pipeline_id,),
             )
@@ -1566,15 +2217,252 @@ class DurablePipelinePowerStore:
         rows = list(await self._run(select) or ())
         if not rows:
             return None
-        record = _marker_from_row(rows[0], pipeline_id)
-        if _intent(record) == _INTENT_STOP_OWED:
-            origin = _resume_origin(rows[1:])
-            if origin:
-                # Added beside ``owed_at``, never in place of it. Both belong to
-                # this record and the last time these two met, one overwrote the
-                # other and the stop came back due twenty minutes early.
-                record["resumed_at"] = origin
-        return record
+        row = rows[0]
+        return {
+            "event_id": int(row[0]),
+            "intent": str(row[1]),
+            "pipeline_id": pipeline_id,
+            "run_id": row[2] or "",
+            "requested_at": row[3].astimezone(UTC).isoformat() if row[3] is not None else "",
+            "requested_by": str(row[4] or ""),
+        }
+
+
+def _resolved_full_refresh(full_refresh: bool | None, pipeline_id: str) -> bool:
+    """Honor an explicit decision; resolve ``None`` only off the event loop."""
+
+    if full_refresh is not None:
+        return bool(full_refresh)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return _authoritative_rebase_owed_sync(pipeline_id)
+    raise RebaseLedgerUnavailableError(
+        "Round 4 start on a running event loop must be given an explicit "
+        "full_refresh decision; it will not read the rebase ledger itself"
+    )
+
+
+def _authoritative_rebase_owed_sync(pipeline_id: str) -> bool:
+    """Resolve rebase-owed from a thread that has no running event loop.
+
+    Used by CLI/setup when they have not already awaited the ledger. Never
+    called from ``asyncio.to_thread`` on the app loop: that would
+    ``asyncio.run`` the shared lease-store runner.
+    """
+
+    if not pipeline_id:
+        return False
+    store = _durable_store
+    if store is None:
+        return False
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 cannot read the rebase ledger from a running event loop "
+            "inside synchronous start"
+        )
+
+    async def read() -> bool:
+        record = await store.latest_rebase(pipeline_id)
+        if record is None or str(record.get("pipeline_id") or "") != pipeline_id:
+            return False
+        return str(record.get("intent") or "") == _INTENT_REBASE_OWED
+
+    try:
+        return bool(asyncio.run(read()))
+    except RebaseLedgerUnavailableError:
+        raise
+    except Exception as exc:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 could not read the durable rebase ledger, so it cannot "
+            "start incrementally"
+        ) from exc
+
+
+_TERMINAL_PIPELINE_UPDATE_STATES = frozenset({"FAILED", "CANCELED"})
+
+
+async def wait_and_settle_full_refresh(
+    pipeline_id: str,
+    update_id: str,
+    observed_event_id: int | None,
+    *,
+    inspect: Callable[[], Awaitable[tuple[str, str, bool]]],
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    timeout_seconds: float = START_WAIT_TIMEOUT_SECONDS,
+    poll_seconds: float = 3.0,
+) -> None:
+    """Watch the exact accepted update to two consecutive healthy readings.
+
+    ``inspect`` returns ``(update_id, update_state, healthy)``. Terminal
+    FAILED/CANCELED re-owes. Inspect/re-owe failures propagate.
+    """
+
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    healthy = 0
+    while True:
+        seen_id, state, is_healthy = await inspect()
+        if seen_id == update_id:
+            if state.strip().upper() in _TERMINAL_PIPELINE_UPDATE_STATES:
+                await note_rebase_owed(pipeline_id, actor="full-refresh-failed")
+                raise PipelinePowerError(
+                    f"Round 4 full-refresh update {update_id} ended {state.strip().upper()}"
+                )
+            if is_healthy:
+                healthy += 1
+                if healthy >= 2:
+                    await note_rebase_satisfied(
+                        pipeline_id,
+                        observed_event_id=observed_event_id,
+                        actor="pipeline-start",
+                    )
+                    return
+            else:
+                healthy = 0
+        else:
+            healthy = 0
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise PipelinePowerError(
+                "Round 4 full-refresh update did not reach two consecutive healthy "
+                f"readings within {timeout_seconds:.0f}s"
+            )
+        await sleep(min(poll_seconds, max(0.01, remaining)))
+
+
+@dataclass(frozen=True, slots=True)
+class RebaseSnapshot:
+    """Newest rebase row for one sealed pipeline, including its generation."""
+
+    owed: bool
+    event_id: int | None
+
+
+async def rebase_snapshot(pipeline_id: str) -> RebaseSnapshot:
+    """Newest durable rebase row, or not-owed. Read failure fails closed."""
+
+    if not pipeline_id:
+        return RebaseSnapshot(owed=False, event_id=None)
+    store = _durable_store
+    if store is None:
+        return RebaseSnapshot(owed=False, event_id=None)
+    try:
+        record = await store.latest_rebase(pipeline_id)
+    except RebaseLedgerUnavailableError:
+        raise
+    except Exception as exc:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 could not read the durable rebase ledger, so it cannot "
+            "start incrementally"
+        ) from exc
+    if record is None or str(record.get("pipeline_id") or "") != pipeline_id:
+        return RebaseSnapshot(owed=False, event_id=None)
+    event_id = record.get("event_id")
+    generation = int(event_id) if event_id is not None else None
+    owed = str(record.get("intent") or "") == _INTENT_REBASE_OWED
+    return RebaseSnapshot(owed=owed, event_id=generation)
+
+
+async def rebase_is_owed(pipeline_id: str) -> bool:
+    """Whether this sealed pipeline still owes a full-refresh Managed Sync start."""
+
+    return (await rebase_snapshot(pipeline_id)).owed
+
+
+async def note_rebase_owed(
+    pipeline_id: str, *, run_id: str = "", actor: str = "source-repair"
+) -> int:
+    """Record rebase_owed before a source repair mutates the table.
+
+    The durable append is required: the coordination ledger is the only record
+    of the obligation. A conservative owed row if the repair later fails is
+    acceptable.
+    """
+
+    if not pipeline_id:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 cannot record a rebase obligation without a sealed pipeline"
+        )
+    store = _durable_store
+    if store is None:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 cannot record a rebase obligation without a durable ledger"
+        )
+    try:
+        event_id = await store.append_rebase(
+            pipeline_id, _INTENT_REBASE_OWED, run_id=run_id, actor=actor
+        )
+    except RebaseLedgerUnavailableError:
+        raise
+    except Exception as exc:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 could not record that a source repair still owes a full "
+            "refresh; refusing the repair"
+        ) from exc
+    return int(event_id)
+
+
+async def note_rebase_satisfied(
+    pipeline_id: str,
+    *,
+    observed_event_id: int | None = None,
+    run_id: str = "",
+    actor: str = "pipeline-start",
+) -> bool:
+    """Clear rebase-owed only for the exact generation a start observed.
+
+    Does not write on mere update_id acceptance. Returns whether a satisfied
+    row was appended. A missing or stale generation leaves the newer owed row.
+    """
+
+    if not pipeline_id or observed_event_id is None:
+        return False
+    store = _durable_store
+    if store is None:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 cannot satisfy a rebase obligation without a durable ledger"
+        )
+    try:
+        written = await store.satisfy_rebase(
+            pipeline_id,
+            observed_event_id,
+            run_id=run_id,
+            actor=actor,
+        )
+    except RebaseLedgerUnavailableError:
+        raise
+    except Exception as exc:
+        raise RebaseLedgerUnavailableError(
+            "Round 4 could not record that a full-refresh update satisfied the "
+            "rebase obligation"
+        ) from exc
+    return written is not None
+
+
+async def install_cli_pipeline_power_store() -> None:
+    """Install the coordination rebase/power store for a laptop CLI process.
+
+    ``antidemo pipeline start`` is a new process with no app lifespan, and the
+    coordination ledger is the only record of a rebase owed. If this cannot
+    initialize those tables, it fails closed rather than starting incrementally.
+    """
+
+    if _durable_store is not None:
+        await _durable_store.initialize()
+        return
+    coordination = _coordination_store()
+    if coordination is None or getattr(coordination, "mode", None) != "lakebase":
+        raise RebaseLedgerUnavailableError(
+            "Round 4 CLI start has no Lakebase coordination store, so it cannot "
+            "honor a rebase owed across restart"
+        )
+    store = DurablePipelinePowerStore(coordination._run)
+    await store.initialize()
+    install_pipeline_power_store(store)
 
 
 async def record_power_request(record: Mapping[str, Any]) -> bool:
@@ -1669,9 +2557,12 @@ async def load_owed_stop_snapshot(manifest: DemoManifest) -> dict[str, Any] | No
     anyway"; a bookkeeping read that could stop the container from starting
     would be a far worse trade than the signal it delivers.
 
-    Returns the record it kept, or ``None``. Only an owed stop is kept: a
-    ``stopped`` record is the ordinary, healthy end state and a ``resuming``
-    record belongs to a start nobody is waiting on any more.
+    Returns the record it kept, or ``None``. Only an unmatched owed stop is
+    kept: a ``stopped`` record is the ordinary, healthy end state, and a
+    ``resuming`` row from a later start supersedes the previous bout's promise.
+    A ``resuming`` that is only the inverted pair of this start's ``stop_owed``
+    is not settlement -- newest ``event_id`` can be ``resuming`` while the stop
+    is still owed.
     """
 
     install_owed_stop_snapshot(None)
@@ -1682,7 +2573,8 @@ async def load_owed_stop_snapshot(manifest: DemoManifest) -> dict[str, Any] | No
         return None
     try:
         pipeline_id = _sealed_pipeline_id(manifest)
-        record = await store.latest(pipeline_id)
+        reader = getattr(store, "unmatched_owed_stop", None)
+        record = await (reader(pipeline_id) if reader is not None else store.latest(pipeline_id))
     except Exception:
         logger.warning(
             "Could not read whether a Round 4 pipeline stop was left owed by a "

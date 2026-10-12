@@ -66,7 +66,9 @@ async def _bout(manager: RunManager, competitor=CompetitorId.AURORA_SERVERLESS_V
     await manager.start_arm(created.id)
     armed = await _reach(manager, created.id, SessionState.ARMED, SessionState.FAILED)
     assert armed.state == SessionState.ARMED, armed.failure
-    await manager.start_run(created.id)
+    accepted = await manager.start_run(created.id)
+    assert accepted.state == SessionState.RUNNING
+    assert accepted.run_started_at is not None
     return await _reach(manager, created.id, SessionState.VERIFIED, SessionState.FAILED)
 
 
@@ -76,6 +78,44 @@ def _metric(snapshot, spec_id: str, lane_id: str | None = None):
         for metric in snapshot.metrics
         if metric.spec_id == spec_id and metric.lane_id == lane_id
     )
+
+
+async def test_round_six_runner_cannot_resurrect_a_queued_towel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _engine(
+        FakeLane(LAKEBASE_LANE, "Lakebase", arrives_on_read=1),
+        FakeLane(COMPETITOR_LANE, "AWS", arrives_on_read=2),
+    )
+    manager = RunManager(live_orders_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Six Owner", subject="owner-towel-race")
+    created = await manager.create(_round_six())
+    await manager.start_arm(created.id, operator)
+    await _reach(manager, created.id, SessionState.ARMED)
+
+    original_commit = manager._commit_bout
+    committed = asyncio.Event()
+    release_handoff = asyncio.Event()
+
+    async def blocked_commit(record, owner):
+        await original_commit(record, owner)
+        committed.set()
+        await release_handoff.wait()
+
+    monkeypatch.setattr(manager, "_commit_bout", blocked_commit)
+    ringing = asyncio.create_task(manager.start_run(created.id, operator))
+    await asyncio.wait_for(committed.wait(), timeout=1)
+    towelling = asyncio.create_task(manager.start_towel(created.id, operator))
+    await asyncio.sleep(0)
+    release_handoff.set()
+
+    accepted = await asyncio.wait_for(ringing, timeout=1)
+    towelled = await asyncio.wait_for(towelling, timeout=1)
+    await asyncio.sleep(0)
+    assert accepted.state == SessionState.RUNNING
+    assert towelled.state == SessionState.TOWELLED
+    assert (await manager.get(created.id)).state == SessionState.TOWELLED
+    await manager.close()
 
 
 async def test_both_lanes_race_and_the_card_shows_each_clock_and_the_verdict() -> None:

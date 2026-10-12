@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import threading
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -37,12 +38,14 @@ from .model_score_live import (
     DELTA_CONCURRENT_TRANSACTION_SQLSTATE,
     DELTA_CONFLICT_ATTEMPTS,
     DELTA_CONFLICT_RETRY_SECONDS,
+    PIPELINE_UPDATE_CANCELLED_STATES,
     PIPELINE_UPDATE_FAILED_STATES,
     LiveModelScoreAdapter,
     ModelScoreLiveConfigurationError,
     PipelineSignals,
     WorkspaceStatementExecutionError,
     build_model_score_engine,
+    pipeline_signals_are_healthy,
     read_pipeline_signals,
 )
 from .models import CompetitorId
@@ -67,6 +70,10 @@ LOGGER = logging.getLogger(__name__)
 #: How long a park or a pre-bell wait may take before Prepare names it.
 PARK_TIMEOUT_SECONDS = 300.0
 PARK_POLL_SECONDS = 3.0
+#: How long a park waits for a full-refresh update to read healthy twice before cancelling it.
+#: Settling parks once the restored row has been carried, so a healthy update needs only its two
+#: readings, PARK_POLL_SECONDS apart; one that does not get there leaves the rebase owed.
+REBASE_CONFIRM_SECONDS = 30.0
 #: A connect wide enough for an Aurora cluster resuming from zero, which Prepare pays, not a clock.
 CONNECT_TIMEOUT_SECONDS = 45
 #: Newest-update states in which the pipeline is still doing something.
@@ -174,6 +181,12 @@ class DeltaSource:
         # A missing Delta path was rebuilt by the sealed repair job: its versions start again,
         # so Lakebase's next start must rebase rather than resume.
         self.repaired = self.repaired or self._adapter.source_repaired
+        if self.repaired:
+            pipeline_id = str(
+                getattr(getattr(self._adapter, "config", None), "pipeline_id", "") or ""
+            )
+            if pipeline_id:
+                await pipeline_power.note_rebase_owed(pipeline_id)
         return row
 
     async def read(self, entity_id: str) -> ModelScoreRow | None:
@@ -258,6 +271,12 @@ class LakebaseSyncLane:
         self._sleep = sleep
         self._now = now
         self._started_update = ""
+        self._started_full_refresh = False
+        self._rebase_event_id: int | None = None
+        self._rebase_healthy_streak = 0
+        self._power_pair_key = ""
+        # The rebase decision and pair key ``before_bell`` read for the next start, used once.
+        self._reserved: tuple[pipeline_power.RebaseSnapshot, str] | None = None
 
     async def _signals(self) -> PipelineSignals:
         return await read_pipeline_signals(self._manifest, self._api, pipeline_id=self._pipeline_id)
@@ -281,6 +300,8 @@ class LakebaseSyncLane:
         await self._park(notify, stop_if_running=True)
 
     async def _park(self, notify: Notify, *, stop_if_running: bool) -> None:
+        if self._started_full_refresh:
+            await self._confirm_rebase(notify)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PARK_TIMEOUT_SECONDS
         requested = False
@@ -292,13 +313,26 @@ class LakebaseSyncLane:
             if stop_if_running and not requested and update != "STOPPING":
                 await notify("Parking Lakebase's synced-table pipeline")
                 records: list[dict[str, Any]] = []
-                try:
-                    await asyncio.to_thread(
-                        pipeline_power.stop, self._manifest, self._api, on_record=records.append
-                    )
-                finally:
-                    for record in records:
-                        self._persist(record)
+                pair_key = str(getattr(self, "_power_pair_key", "") or "")
+                mint_error: BaseException | None = None
+                if not pair_key:
+                    try:
+                        pair_key = await pipeline_power.mint_power_pair_key(
+                            str(self._manifest.run_id),
+                            str(getattr(self, "_pipeline_id", "") or ""),
+                        )
+                        self._power_pair_key = pair_key
+                    except Exception as exc:
+                        mint_error = exc
+                # A refused stop outranks a failed pair key: the pipeline may still be billing.
+                await asyncio.to_thread(
+                    pipeline_power.stop, self._manifest, self._api, on_record=records.append
+                )
+                if mint_error is not None:
+                    raise mint_error
+                for record in records:
+                    record["run_id"] = pair_key
+                    self._persist(record)
                 requested = True
             if loop.time() >= deadline:
                 raise Round4RaceError(
@@ -306,6 +340,46 @@ class LakebaseSyncLane:
                     f"({signals.describe()})"
                 )
             await self._sleep(PARK_POLL_SECONDS)
+
+    async def _confirm_rebase(self, notify: Notify) -> None:
+        """Settle the rebase a full-refresh start owes, before its park cancels the update.
+
+        The race stops watching a lane once its row verifies, which can be before the update has
+        read healthy twice, so nothing cleared the obligation and every later bell full-refreshed
+        again. Two consecutive healthy readings of the started update clear it here; a FAILED or
+        CANCELED one owes it again; anything else leaves it owed. The park goes ahead regardless.
+        """
+
+        await notify("Confirming Lakebase's full refresh before parking its pipeline")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REBASE_CONFIRM_SECONDS
+        self._rebase_healthy_streak = 0
+        try:
+            while True:
+                signals = await self._signals()
+                ended = await self._observe_start(signals)
+                if ended is not None:
+                    LOGGER.warning("Round 4 still owes Lakebase's pipeline a rebase: %s", ended)
+                    return
+                if not self._started_full_refresh:
+                    return
+                if self._parked(signals) or loop.time() >= deadline:
+                    LOGGER.warning(
+                        "Lakebase's full-refresh update did not read healthy twice before its "
+                        "park (%s), so the next bell rebases again",
+                        signals.describe(),
+                    )
+                    return
+                await self._sleep(PARK_POLL_SECONDS)
+        except Exception:  # noqa: BLE001 - the park goes ahead whatever this could not read
+            LOGGER.warning(
+                "Round 4 could not confirm Lakebase's full refresh before parking it, so the "
+                "next bell rebases again",
+                exc_info=True,
+            )
+        finally:
+            self._started_full_refresh = False
+            self._rebase_healthy_streak = 0
 
     async def open_reader(self) -> PostgresReader:
         config = self._adapter.config
@@ -347,30 +421,58 @@ class LakebaseSyncLane:
             autocommit=True,
         )
 
+    async def before_bell(self) -> None:
+        """Read whether a rebase is owed and reserve the start's pair key, off every clock."""
+
+        pipeline_id = str(getattr(self, "_pipeline_id", "") or "")
+        snapshot = (
+            await pipeline_power.rebase_snapshot(pipeline_id)
+            if pipeline_id
+            else pipeline_power.RebaseSnapshot(owed=False, event_id=None)
+        )
+        pair_key = await pipeline_power.mint_power_pair_key(
+            str(self._manifest.run_id),
+            pipeline_id,
+            bout_token=uuid.uuid4().hex,
+        )
+        self._reserved = (snapshot, pair_key)
+
     async def start(self, bell: Bell) -> None:
+        reserved, self._reserved = self._reserved, None
+        if reserved is None:
+            raise Round4RaceError("Lakebase's start was not recorded before it was asked for")
+        snapshot, pair_key = reserved
+        owed = bool(self._source.repaired) or snapshot.owed
+        observed_event_id = snapshot.event_id if snapshot.owed else None
+        self._power_pair_key = pair_key
         records: list[dict[str, Any]] = []
         try:
             started = await asyncio.to_thread(
                 pipeline_power.start,
                 self._manifest,
                 self._api,
-                full_refresh=self._source.repaired,
+                full_refresh=owed,
+                rebase_event_id=observed_event_id,
                 on_record=records.append,
             )
         finally:
             for record in records:
+                record["run_id"] = pair_key
                 self._persist(record)
         self._source.repaired = False
         self._started_update = started.update_id
+        self._started_full_refresh = owed
+        self._rebase_event_id = observed_event_id
+        self._rebase_healthy_streak = 0
         # The stop this bout owes, on record before anything can lose it.
         try:
-            self._persist(
-                pipeline_power.owed_stop_record(
-                    self._manifest,
-                    due_at=self._now() + timedelta(seconds=BOUT_STOP_DUE_SECONDS),
-                    resumed_at=started.resuming_since,
-                )
+            owed_record = pipeline_power.owed_stop_record(
+                self._manifest,
+                due_at=self._now() + timedelta(seconds=BOUT_STOP_DUE_SECONDS),
+                resumed_at=started.resuming_since,
             )
+            owed_record["run_id"] = pair_key
+            self._persist(owed_record)
         except Exception:  # noqa: BLE001 - bookkeeping never fails a bell
             LOGGER.warning("Round 4 could not record the stop its bell owes", exc_info=True)
 
@@ -378,15 +480,61 @@ class LakebaseSyncLane:
         signals = await self._signals()
         if not self._parked(signals):
             return False
+        await self.before_bell()
         await self.start(bell)
         return True
 
     async def failure(self) -> str | None:
-        signals = await self._signals()
-        if not self._started_update or signals.update_id != self._started_update:
+        return await self._observe_start(await self._signals())
+
+    async def _observe_start(self, signals: PipelineSignals) -> str | None:
+        """The started update's own failure, settling a full refresh's rebase as it goes.
+
+        Two consecutive healthy readings of that update clear the obligation, compare-and-set on
+        the owed event its start observed; a FAILED or CANCELED one owes it again.
+        """
+
+        if not self._started_update:
             return None
-        if signals.update_state.strip().upper() in PIPELINE_UPDATE_FAILED_STATES:
-            return f"Lakebase's pipeline update failed ({signals.describe()})"
+        if signals.update_id != self._started_update:
+            if getattr(self, "_started_full_refresh", False):
+                self._rebase_healthy_streak = 0
+            return None
+        state = signals.update_state.strip().upper()
+        pipeline_id = str(getattr(self, "_pipeline_id", "") or "")
+        if state in PIPELINE_UPDATE_FAILED_STATES or state in PIPELINE_UPDATE_CANCELLED_STATES:
+            self._rebase_healthy_streak = 0
+            ended = (
+                "was canceled"
+                if state in PIPELINE_UPDATE_CANCELLED_STATES
+                else "failed"
+            )
+            detail = f"Lakebase's pipeline update {ended} ({signals.describe()})"
+            if getattr(self, "_started_full_refresh", False) and pipeline_id:
+                try:
+                    await pipeline_power.note_rebase_owed(
+                        pipeline_id, actor="full-refresh-failed"
+                    )
+                except Exception as exc:
+                    return (
+                        f"{detail}; Round 4 could not re-record the rebase it still "
+                        f"owes ({type(exc).__name__}: {exc})"
+                    )
+            return detail
+        if getattr(self, "_started_full_refresh", False) and pipeline_signals_are_healthy(
+            signals
+        ):
+            self._rebase_healthy_streak = getattr(self, "_rebase_healthy_streak", 0) + 1
+            if self._rebase_healthy_streak >= 2 and pipeline_id:
+                await pipeline_power.note_rebase_satisfied(
+                    pipeline_id,
+                    observed_event_id=getattr(self, "_rebase_event_id", None),
+                )
+                self._started_full_refresh = False
+                self._rebase_healthy_streak = 0
+            return None
+        if getattr(self, "_started_full_refresh", False):
+            self._rebase_healthy_streak = 0
         return None
 
     async def evidence(self, commit: DeltaCommit, bell: Bell) -> Mapping[str, Any]:
@@ -493,6 +641,9 @@ class GlueWriterLane:
 
         material = await self._provider.connection_material()
         return await _connect(material, "lakebase-anti-demo-round4-verifier")
+
+    async def before_bell(self) -> None:
+        """Nothing: a Glue run is tagged with the bell's own bout ID."""
 
     async def start(self, bell: Bell) -> None:
         self._run_tag = bell.bout_id

@@ -463,7 +463,7 @@ async def test_failed_cleanup_writes_the_proxy_name_onto_the_towel_and_the_setup
 
     published: list[tuple[str, dict[str, Any]]] = []
 
-    async def publish(event: str, payload: dict[str, Any]) -> None:
+    async def publish(event: str, payload: dict[str, Any], **_kwargs: Any) -> None:
         published.append((event, payload))
 
     towel = SimpleNamespace(state=None, cleanup_failure=None)
@@ -475,7 +475,9 @@ async def test_failed_cleanup_writes_the_proxy_name_onto_the_towel_and_the_setup
         round5_setup=setup,
         round5_runtime=None,
         updated_at=None,
-        model_copy=lambda deep=False: SimpleNamespace(towel=towel, model_dump=lambda mode: {}),
+        model_copy=lambda deep=False: SimpleNamespace(
+            towel=towel, receipt_bout_id=None, model_dump=lambda mode: {}
+        ),
     )
     record = SimpleNamespace(
         snapshot=snapshot,

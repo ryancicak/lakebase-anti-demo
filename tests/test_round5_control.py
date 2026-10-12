@@ -1951,6 +1951,9 @@ async def test_prebell_restart_settles_claim_jobs_before_absence_proof() -> None
             calls.append((self.lane_id, job_id))
 
     class Orchestrator:
+        async def unresolved_bout_ids(self):
+            return ()
+
         async def prove_bout_absent(self, bout_id):
             assert calls == [
                 ("lakebase", "a" * 64),
@@ -2004,6 +2007,9 @@ async def test_reused_engine_second_abandon_supersedes_first_cleaned_bout() -> N
     class Orchestrator:
         def __init__(self) -> None:
             self.proved: list[str] = []
+
+        async def unresolved_bout_ids(self) -> tuple[str, ...]:
+            return ()
 
         async def prove_bout_absent(self, bout_id: str) -> None:
             self.proved.append(bout_id)

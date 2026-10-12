@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { FALLBACK_CATALOG, recommend, stopCondition } from './catalog'
+import { ROUND_FIVE_MAX_RETRIES } from './round5'
 
 describe('deterministic fight-card recommendation', () => {
   it('selects cold wake for Aurora without changing evidence by persona', () => {
@@ -42,6 +43,14 @@ describe('deterministic fight-card recommendation', () => {
     expect(stopCondition('analyze_live_orders_without_slowing_checkout')).toMatch(
       /same checkout on both sources.*cold starts AWS DMS and Glue.*first read of the exact order.*own Delta history.*every second on both lanes.*separate checkout/i,
     )
+  })
+
+  it('separates login retry budget from the 64-sample no-retry rule', () => {
+    const copy = stopCondition('survive_connection_spike', 'aurora_serverless_v2', true)
+    expect(copy).toContain(`up to ${ROUND_FIVE_MAX_RETRIES} retried logins`)
+    expect(copy).toMatch(/all 64 (verification samples|sampled queries) must succeed with no sample retries/i)
+    expect(copy).not.toMatch(/\bzero retries\b/)
+    expect(copy).not.toMatch(/64 verification samples per lane with zero retries/)
   })
 
   it('mirrors server/catalog.py for Round 6: a measured race, AWS cold at the bell', () => {

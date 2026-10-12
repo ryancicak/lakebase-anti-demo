@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import re
 from datetime import UTC, datetime, timedelta
@@ -1056,12 +1055,30 @@ class _FakePowerTable:
         if "SELECT" in sql:
             matched = [row for row in self.rows if row[0] == params[0]]
             limit = re.search(r"LIMIT\s+(\d+)", sql)
-            assert limit is not None, "the power history read must stay bounded"
+            # ``latest`` stays bounded; unmatched owed-stop recovery is allowed
+            # to read past that window so a stop_owed cannot age out of sight.
             # (pipeline_id, intent, run_id, requested_at, requested_by, usd_per_day)
             # projected to the SELECT's own column list, newest first.
-            self._result = [
+            projected = [
                 (row[1], row[2], row[3], row[4], row[5]) for row in reversed(matched)
-            ][: int(limit.group(1))]
+            ]
+            if "status-snapshot-prefer-real" in sql:
+                limits = [int(n) for n in re.findall(r"LIMIT\s+(\d+)", sql)]
+                real_limit = limits[0] if limits else 20
+                real = [
+                    row for row in projected if row[0] != "generation_reserved"
+                ][:real_limit]
+                if real:
+                    self._result = real
+                    return
+                fallback = limits[-1] if limits else 1
+                self._result = projected[:fallback]
+                return
+            if "intent <>" in " ".join(sql.split()):
+                projected = [
+                    row for row in projected if row[0] != "generation_reserved"
+                ]
+            self._result = projected[: int(limit.group(1))] if limit else projected
 
     async def fetchone(self):
         return self._result[0] if self._result else None
@@ -1248,18 +1265,12 @@ def test_the_coordination_endpoint_doctor_asks_is_the_one_serve_uses(monkeypatch
     assert pipeline_power.coordination_endpoint_for(manifest)
 
 
-async def test_a_process_that_cannot_record_pipeline_power_still_serves(caplog) -> None:
-    """Installing the power store may never be what stops the app from booting.
+async def test_a_process_that_cannot_record_pipeline_power_fails_closed() -> None:
+    """Lakebase coordination without a usable power/rebase store must not boot.
 
-    The deployed app now boots *degraded* rather than refusing when its AWS
-    credential is bad, so this line is reached on paths it previously was not,
-    and it is reached before the app can serve anything. A store install that
-    raised on a degraded boot would trade a serving app for a bookkeeping table.
-
-    Three shapes, one rule, matching `_open_receipt_store` beside it: a
-    process-local ring keeps its marker file and wants no store; a table that is
-    absent -- which is every install until setup provisions it -- gets none,
-    loudly, because that is precisely when `doctor` starts misreading stops.
+    Process-local serve still has no store. A lakebase install whose tables are
+    missing or whose initialize raises must not install ``None`` and keep going:
+    that disabled both the rebase obligation and the power history.
     """
 
     import app as app_module
@@ -1275,9 +1286,123 @@ async def test_a_process_that_cannot_record_pipeline_power_still_serves(caplog) 
         async def _run(self, operation):
             raise RuntimeError("relation round4_pipeline_power does not exist")
 
-    with caplog.at_level(logging.ERROR):
-        assert await app_module._open_pipeline_power_store(Refusing()) is None
-    assert "cannot record deliberate Round 4 pipeline stops durably" in caplog.text
+    with pytest.raises(RuntimeError, match="round4_pipeline_power"):
+        await app_module._open_pipeline_power_store(Refusing())
+
+
+class _GrantedPowerCursor:
+    """Both Round 4 coordination tables exist and this identity holds every runtime grant."""
+
+    def __init__(self) -> None:
+        self._rows: list[tuple] = []
+
+    async def execute(self, sql, params=None):
+        if "pg_class" in sql:
+            self._rows = [(name,) for name in params[1]]
+        elif "pg_namespace" in sql:
+            self._rows = [(1,)]
+        elif "has_table_privilege" in sql:
+            self._rows = [(True,) * 6]
+        else:
+            raise AssertionError(sql)
+
+    async def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self):
+        return list(self._rows)
+
+
+class _FailingCoordination:
+    """Lakebase coordination whose first ``failures`` round trips raise ``error``."""
+
+    mode = "lakebase"
+
+    def __init__(self, failures: int, error: Exception) -> None:
+        self.failures = failures
+        self.error = error
+        self.attempts = 0
+
+    async def _run(self, operation):
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise self.error
+        return await operation(_GrantedPowerCursor())
+
+
+async def test_a_transient_coordination_error_at_boot_is_retried_before_failing() -> None:
+    """A blip while the power history opens is waited out, as the lease stores' opening is."""
+
+    import psycopg
+
+    import app as app_module
+
+    attempts = app_module.STARTUP_ATTEMPTS
+    lease = _FailingCoordination(
+        attempts - 1, psycopg.OperationalError("connection to server failed: timeout expired")
+    )
+    slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    store = await app_module._open_pipeline_power_store(lease, sleep=sleep)
+
+    assert isinstance(store, pipeline_power.DurablePipelinePowerStore)
+    assert lease.attempts == attempts
+    assert slept == [0.5 * 2**n for n in range(attempts - 1)]
+
+
+async def test_a_coordination_outage_that_outlasts_the_boot_retries_fails_closed() -> None:
+    import psycopg
+
+    import app as app_module
+
+    lease = _FailingCoordination(
+        app_module.STARTUP_ATTEMPTS + 1, psycopg.OperationalError("server closed the connection")
+    )
+
+    async def sleep(_seconds: float) -> None:
+        return None
+
+    with pytest.raises(psycopg.OperationalError):
+        await app_module._open_pipeline_power_store(lease, sleep=sleep)
+    assert lease.attempts == app_module.STARTUP_ATTEMPTS
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "missing objects",
+        "refused grant",
+        "non-transient",
+    ],
+)
+async def test_missing_objects_or_refused_grants_at_boot_fail_closed_at_once(error) -> None:
+    import psycopg
+
+    import app as app_module
+    from server.coordination import CoordinationObjectsMissingError
+
+    raised = {
+        "missing objects": CoordinationObjectsMissingError(
+            "The Round 4 pipeline power history is missing round4_source_rebase"
+        ),
+        "refused grant": psycopg.errors.InsufficientPrivilege(
+            "permission denied for table round4_source_rebase"
+        ),
+        "non-transient": RuntimeError("relation round4_pipeline_power does not exist"),
+    }[error]
+    lease = _FailingCoordination(1, raised)
+    slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    with pytest.raises(type(raised)):
+        await app_module._open_pipeline_power_store(lease, sleep=sleep)
+    assert lease.attempts == 1
+    assert slept == []
 
 
 def test_power_state_still_answers_when_the_account_cannot_be_reached(tmp_path) -> None:

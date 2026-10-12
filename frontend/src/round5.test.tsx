@@ -2270,6 +2270,75 @@ it('offers an instant replay with primary fan-in and supporting setup evidence',
   expect(screen.queryByRole('dialog', { name: /ready a pooled application path/i })).not.toBeInTheDocument()
 })
 
+function roundFiveRetrySurfaces(session: DemoSession) {
+  render(
+    <RoundFiveProof
+      session={session}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen={false}
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+  fireEvent.click(screen.getByRole('button', { name: /instant replay/i }))
+  const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
+  fireEvent.click(within(replay).getByText(/view full evidence/i))
+  return {
+    replay,
+    fairness: within(replay).getByLabelText('Round 5 fair proof contract'),
+  }
+}
+
+function expectContractLoginRetryBudget(fairness: HTMLElement, replay: HTMLElement) {
+  const disclosed = `up to ${ROUND_FIVE_MAX_RETRIES} retried logins / lane`
+  expect(fairness).toHaveTextContent(disclosed)
+  expect(fairness).not.toHaveTextContent(/zero retries/i)
+  expect(fairness).not.toHaveTextContent(/up to 101 retried logins/)
+  expect(replay).toHaveTextContent(
+    `10,000 authenticated held clients / lane · ${disclosed}`,
+  )
+  expect(replay).not.toHaveTextContent(/zero retries/i)
+  expect(replay).not.toHaveTextContent(/up to 101 retried logins/)
+}
+
+it.each([
+  ['missing', undefined],
+  ['zero', 0],
+  ['fractional', 1.5],
+  ['over-budget', 101],
+  ['negative', -1],
+  ['string', '100'],
+] as const)('falls back to the contract login retry budget when max_retries is %s', (_label, maxRetries) => {
+  const session = roundFiveSession()
+  if (maxRetries === undefined) {
+    const fairness = { ...session.fairness }
+    delete fairness.max_retries
+    session.fairness = fairness
+  } else {
+    session.fairness = {
+      ...session.fairness,
+      max_retries: maxRetries as DemoSession['fairness']['max_retries'],
+    }
+  }
+  const { fairness, replay } = roundFiveRetrySurfaces(session)
+  expectContractLoginRetryBudget(fairness, replay)
+})
+
+it('shows the login retry budget, not zero retries, for a verified retried fan-in', () => {
+  const session = roundFiveSession()
+  session.fairness = { ...session.fairness, max_retries: ROUND_FIVE_MAX_RETRIES }
+  session.lanes.lakebase.evidence = { ...session.lanes.lakebase.evidence, retries: 1 }
+  session.lanes.competitor.evidence = { ...session.lanes.competitor.evidence, retries: 1 }
+
+  const { fairness, replay } = roundFiveRetrySurfaces(session)
+  expectContractLoginRetryBudget(fairness, replay)
+})
+
 it('puts the sound toggle in the header of both Round 5 layouts', () => {
   const onToggleSound = vi.fn()
   const props = {

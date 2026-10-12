@@ -7410,7 +7410,7 @@ _ROUND4_UNSETTLED_UPDATE_STATES = frozenset(
 def _round4_pipeline_signals(manifest: DemoManifest, names: dict[str, str], pipeline_id: str):
     """The pipeline and its `/database` synced table, as the power decisions read them."""
 
-    from .model_score_live import PipelineSignals
+    from .model_score_live import PipelineSignals, latest_pipeline_update_id
 
     pipeline = _round4_get_pipeline(manifest, pipeline_id)
     database = _round4_get_database_synced_table(manifest, names) or {}
@@ -7418,6 +7418,7 @@ def _round4_pipeline_signals(manifest: DemoManifest, names: dict[str, str], pipe
     return PipelineSignals(
         pipeline_state=str(pipeline.get("state") or ""),
         update_state=latest_pipeline_update_state(pipeline),
+        update_id=latest_pipeline_update_id(pipeline),
         synced_table_state=str(status.get("detailed_state") or ""),
         continuous_reported=bool(status.get("continuous_update_status")),
     )
@@ -7430,12 +7431,13 @@ def _round4_pipeline_parked(manifest: DemoManifest, pipeline_id: str) -> bool:
     return state == "IDLE" and update not in _ROUND4_ACTIVE_UPDATE_STATES
 
 
-def _round4_pipeline_verb(manifest: DemoManifest, pipeline_id: str, verb: str) -> None:
+def _round4_pipeline_verb(manifest: DemoManifest, pipeline_id: str, verb: str):
     """Issue ``stop`` or ``start`` to Round 4's pipeline, and record it when there is a seal.
 
     The power record is keyed to the sealed pipeline, and a first install seals
     Round 4 only after this has run, so until then the verb is issued on its
-    own, through the same exact-path guard.
+    own, through the same exact-path guard. A start the control plane accepts
+    still returns that ``update_id`` so the waiter can poll it.
     """
 
     from . import pipeline_power
@@ -7445,17 +7447,41 @@ def _round4_pipeline_verb(manifest: DemoManifest, pipeline_id: str, verb: str) -
         if verb == "stop":
             pipeline_power.stop(manifest, _databricks_api)
         else:
-            pipeline_power.start(manifest, _databricks_api)
-        return
+            asyncio.run(pipeline_power.install_cli_pipeline_power_store())
+            snapshot = asyncio.run(pipeline_power.rebase_snapshot(pipeline_id))
+            return pipeline_power.start(
+                manifest,
+                _databricks_api,
+                full_refresh=snapshot.owed,
+                rebase_event_id=snapshot.event_id,
+            )
+        return None
     if verb == "stop":
         path, body = f"/api/2.0/pipelines/{pipeline_id}/stop", None
     else:
         path, body = f"/api/2.0/pipelines/{pipeline_id}/updates", {"full_refresh": False}
-    _databricks_api(
+    response = _databricks_api(
         manifest.databricks.profile,
         "post",
         pipeline_power._require_pipeline_path(pipeline_id, path),
         body=body,
+    )
+    if verb == "stop":
+        return None
+    update_id = (
+        str(response.get("update_id") or "") if isinstance(response, Mapping) else ""
+    )
+    if not update_id:
+        raise RuntimeError(
+            "The Round 4 pipeline start returned no update identity, so it cannot "
+            "be polled safely"
+        )
+    return pipeline_power.PipelinePower(
+        pipeline_id=pipeline_id,
+        cloud_state="",
+        stopped_deliberately=False,
+        update_id=update_id,
+        full_refresh=False,
     )
 
 
@@ -7522,6 +7548,7 @@ def _start_round4_pipeline(
 ) -> None:
     """Start Round 4's parked pipeline and wait for a healthy continuous sync."""
 
+    from . import pipeline_power
     from .model_score_live import pipeline_signals_are_healthy
 
     deadline = time.monotonic() + _ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS
@@ -7530,15 +7557,60 @@ def _start_round4_pipeline(
             raise RuntimeError("Round 4's Managed Sync pipeline did not finish stopping")
         time.sleep(3)
     print("START Round 4 Managed Sync pipeline to carry its baseline", flush=True)
-    _round4_pipeline_verb(manifest, pipeline_id, "start")
+    started = _round4_pipeline_verb(manifest, pipeline_id, "start")
+    pending = None
+    accepted = str(getattr(started, "update_id", "") or "") if started is not None else ""
+    if accepted:
+        pending = (
+            accepted,
+            getattr(started, "rebase_event_id", None),
+            bool(getattr(started, "full_refresh", False)),
+        )
     healthy = 0
     while True:
         signals = _round4_pipeline_signals(manifest, names, pipeline_id)
-        healthy = healthy + 1 if pipeline_signals_are_healthy(signals) else 0
-        # Twice in a row: the pipeline and synced-table views disagree briefly while
-        # a stopped continuous update resumes.
-        if healthy >= 2:
-            return
+        if pending:
+            if signals.update_id != pending[0]:
+                healthy = 0
+            elif signals.update_state.strip().upper() in {"FAILED", "CANCELED"}:
+                if pending[2]:
+                    try:
+                        asyncio.run(
+                            pipeline_power.note_rebase_owed(
+                                pipeline_id, actor="full-refresh-failed"
+                            )
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Round 4's Managed Sync pipeline start ended "
+                            f"{signals.update_state} ({signals.describe()}); Round 4 "
+                            "could not re-record the rebase it still owes "
+                            f"({type(exc).__name__}: {exc})"
+                        ) from exc
+                raise RuntimeError(
+                    "Round 4's Managed Sync pipeline start ended "
+                    f"{signals.update_state} ({signals.describe()})"
+                )
+            elif pipeline_signals_are_healthy(signals):
+                healthy += 1
+            else:
+                healthy = 0
+            if healthy >= 2:
+                if pending[2]:
+                    asyncio.run(
+                        pipeline_power.note_rebase_satisfied(
+                            pipeline_id,
+                            observed_event_id=pending[1],
+                            actor="pipeline-start",
+                        )
+                    )
+                return
+        else:
+            healthy = healthy + 1 if pipeline_signals_are_healthy(signals) else 0
+            # Twice in a row: the pipeline and synced-table views disagree briefly
+            # while a stopped continuous update resumes.
+            if healthy >= 2:
+                return
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 "Round 4's Managed Sync pipeline did not reach a healthy continuous sync "
@@ -8412,7 +8484,12 @@ def _coordination_runtime_grants() -> tuple[CoordinationRuntimeGrant, ...]:
     from .connection_spike_journal import ROUND5_CREATION_JOURNAL_TABLE
     from .coordination import COORDINATION_TABLE
     from .cost_ledger import CALIBRATION_TABLE, COST_LEDGER_TABLE, RECONCILIATION_TABLE
-    from .pipeline_power import PIPELINE_POWER_SEQUENCE, PIPELINE_POWER_TABLE
+    from .pipeline_power import (
+        PIPELINE_POWER_SEQUENCE,
+        PIPELINE_POWER_TABLE,
+        ROUND4_REBASE_SEQUENCE,
+        ROUND4_REBASE_TABLE,
+    )
     from .readiness import READINESS_TABLE
     from .receipts import BOUT_RECEIPT_TABLE
     from .round5_control import (
@@ -8466,6 +8543,15 @@ def _coordination_runtime_grants() -> tuple[CoordinationRuntimeGrant, ...]:
             PIPELINE_POWER_TABLE,
             ("SELECT", "INSERT"),
             (PIPELINE_POWER_SEQUENCE,),
+        ),
+        # Rebase owed after a Round 4 Delta-source repair. Append-only and keyed
+        # by sealed pipeline_id so a cancelled, expired or failed card cannot
+        # drop it, and a foreign bout or fence cannot clear it. Separate from
+        # the power history so these rows never become the newest power intent.
+        CoordinationRuntimeGrant(
+            ROUND4_REBASE_TABLE,
+            ("SELECT", "INSERT"),
+            (ROUND4_REBASE_SEQUENCE,),
         ),
         # One mutable installation-scoped head and one append-only transition
         # stream. The runtime compare-and-swaps the head and appends events in
@@ -9210,10 +9296,12 @@ async def _grant_round4_postgres(
             if not objects.complete:
                 raise RuntimeError(
                     "The app's runtime privileges cannot be granted: the coordination "
-                    f"schema is missing {objects.describe_missing()}. Setup creates "
-                    "these in `ensure_coordination` as the schema owner, so re-run "
-                    "'antidemo setup' rather than granting by hand -- the app holds no "
-                    "CREATE and cannot make them itself."
+                    f"schema is missing {objects.describe_missing()}. Run "
+                    "`antidemo coordination-upgrade` as the schema owner. "
+                    "`antidemo setup` or `antidemo renew` on a ready install is not "
+                    "that upgrade: setup resets database lanes and renew does not "
+                    "provision these tables. The app holds no CREATE and cannot "
+                    "make these tables itself."
                 )
             for grant in grants:
                 await cursor.execute(
@@ -10524,6 +10612,30 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
     asyncio.run(initialize_table())
     save_manifest(manifest)
     return manifest
+
+
+def upgrade_coordination_runtime(manifest: DemoManifest) -> DemoManifest:
+    """Create and grant coordination tables for a ready install without resetting lanes.
+
+    ``antidemo setup`` on a ready manifest is the installer resume that reseeds
+    database lanes. This is the narrow path an installation made before the
+    rebase ledger existed needs before ``./bootstrap.sh --deploy-only``: create
+    ``round4_source_rebase`` (and any other missing coordination objects) as the
+    schema owner, then issue the documented runtime grants. It does not run
+    Terraform and does not reset Round 3 anchors or measured databases.
+    """
+
+    upgraded = ensure_coordination(manifest)
+    if upgraded.round4 is not None:
+        names = _round4_names(upgraded)
+        asyncio.run(
+            _grant_round4_postgres(
+                upgraded,
+                names,
+                upgraded.round4.app_service_principal_client_id,
+            )
+        )
+    return upgraded
 
 
 def _round5_active_journal_addons(manifest: DemoManifest) -> list[str]:

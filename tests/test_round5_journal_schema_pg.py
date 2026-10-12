@@ -5,7 +5,7 @@ deployed ``round5_creation_journal_lifecycle_state_check`` constraint did not
 admit, so PostgreSQL rejected every arm insert.  Every in-memory journal test
 passed because a fake dict-journal has no CHECK.
 
-Approach A emits only already-allowed states, so no migration is needed.  These
+The bell path emits only already-allowed states, so no migration is needed.  These
 tests run against a REAL ephemeral PostgreSQL so the schema itself is under test:
 
 * the code lifecycle enum and the DDL allow-list never drift (pure, no PG);
@@ -13,7 +13,7 @@ tests run against a REAL ephemeral PostgreSQL so the schema itself is under test
   other (a constraint-enforcing journal, unlike the fakes that let this ship);
 * the REAL journal store's guarded commit -- the exact SQL the manager ARM/bell
   path runs -- durably commits a ``create_intent`` row;
-* ``admitted_lifecycle_states`` reads the live CHECK so readiness (req #3) can
+* ``admitted_lifecycle_states`` reads the live CHECK so readiness can
   refuse ring readiness on a code<->live-DB mismatch.
 """
 
@@ -201,7 +201,7 @@ def test_journal_check_admits_every_code_state_and_rejects_others(pg_dsn) -> Non
 
 
 def test_admitted_lifecycle_states_reads_the_live_check(pg_dsn) -> None:
-    # Req #3: readiness reads the live CHECK to refuse readiness on drift.
+    # Readiness reads the live CHECK to refuse readiness on drift.
     async def read(dsn: dict) -> frozenset[str]:
         async def run(fn):
             conn = await psycopg.AsyncConnection.connect(**dsn, autocommit=True)
@@ -292,7 +292,7 @@ async def _arm_precommit(dsn: dict) -> JournalEvent:
         adapters={"rds_proxy": SimpleNamespace(create=None, inspect=None, delete=None)},
     )
     scope = CreationScope("bout-arm", 7, "d" * 64)
-    # Approach A: the bell path commits CREATE_INTENT (an admitted state) through
+    # The bell path commits CREATE_INTENT (an admitted state) through
     # the guarded lease-fence -- exactly what the manager's precommit_launch_intent
     # does via the orchestrator.
     return await coordinator.precommit_intent(scope, _proxy_spec())

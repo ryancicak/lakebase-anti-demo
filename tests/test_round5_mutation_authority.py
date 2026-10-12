@@ -1,12 +1,12 @@
-"""Round 5 swarm defects #2, #4, #5: CreateDBProxy mutation & cleanup authority.
+"""Round 5 CreateDBProxy mutation and cleanup authority.
 
-* **#2 mutation authority** -- the single timed CreateDBProxy does no remote fence
+* **Mutation authority** -- the single timed CreateDBProxy does no remote fence
   I/O after the bell, but must still refuse a stale owner: a process-local,
   non-expired bell capability keyed to the exact bout/fence, plus immutable
   operation-identity tags (the bout fence) verified exactly on inspect.
-* **#4 ambiguous AlreadyExists** -- adopt ONLY the exact owned Proxy; retry only
+* **Ambiguous AlreadyExists** -- adopt ONLY the exact owned Proxy; retry only
   after proving absence; refuse a same-name Proxy that is not our operation.
-* **#5 cleanup** -- verify ARN + operation before delete; a same-name/different-ARN
+* **Cleanup** -- verify ARN + operation before delete; a same-name/different-ARN
   Proxy is a replacement our stale cleanup must not touch; one NotFound is unknown,
   not clean (bounded repeated absence) before declaring the billable Proxy gone.
 
@@ -241,7 +241,7 @@ def _proxy_spec_and_tags(
 
 
 # --------------------------------------------------------------------------- #
-# Defect #2: local bell capability + immutable operation-identity (fence) tag
+# Local bell capability + immutable operation-identity (fence) tag
 # --------------------------------------------------------------------------- #
 
 
@@ -322,7 +322,7 @@ async def test_create_proxy_refuses_a_capability_for_a_different_fence() -> None
 
 
 # --------------------------------------------------------------------------- #
-# Defect #4: ambiguous AlreadyExists -> adopt exact / retry after absence / refuse
+# Ambiguous AlreadyExists -> adopt exact / retry after absence / refuse
 # --------------------------------------------------------------------------- #
 
 
@@ -385,7 +385,7 @@ async def test_already_exists_but_absent_retries_after_proving_absence() -> None
 
 
 # --------------------------------------------------------------------------- #
-# Defect #5: verify ARN + operation, replacement safety, bounded repeated absence
+# Verify ARN + operation, replacement safety, bounded repeated absence
 # --------------------------------------------------------------------------- #
 
 

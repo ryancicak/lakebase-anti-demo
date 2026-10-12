@@ -7,6 +7,7 @@ a fixed delay after it is started, which is exactly the shape a cold integration
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -206,6 +207,8 @@ class FakeLane:
         self.closed_readers = 0
         self.opened_readers = 0
         self.bells = []
+        self.ready_error: BaseException | None = None
+        self.events: list[str] = []
 
     async def confirm_parked(self, notify):
         if not self.parked:
@@ -215,7 +218,13 @@ class FakeLane:
         self.opened_readers += 1
         return FakeReader(self)
 
+    async def before_bell(self):
+        self.events.append(f"ready {self.lane_id}")
+        if self.ready_error is not None:
+            raise self.ready_error
+
     async def start(self, bell):
+        self.events.append(f"start {self.lane_id}")
         self.bells.append(bell)
         if self.start_error is not None:
             raise self.start_error
@@ -260,7 +269,7 @@ class StallingLane(FakeLane):
         await asyncio.Event().wait()
 
 
-def engine(source, *lanes, timeout=2.0, kick=60.0):
+def engine(source, *lanes, timeout=2.0, kick=60.0, **options):
     return Round4RaceEngine(
         source,
         lanes,
@@ -271,6 +280,7 @@ def engine(source, *lanes, timeout=2.0, kick=60.0):
         settle_timeout_seconds=2.0,
         settle_poll_seconds=0.01,
         carry_kick_seconds=kick,
+        **options,
     )
 
 
@@ -350,6 +360,55 @@ async def test_the_bell_tells_every_lane_the_version_prepare_verified():
 
     assert [bell.source_version for bell in lakebase.bells] == [arm.source_version]
     assert [bell.source_version for bell in aws.bells] == [arm.source_version]
+
+
+@pytest.mark.asyncio
+async def test_every_lane_is_readied_before_the_clock_and_started_after_it():
+    # Whatever a lane records before its start is on no clock; each clock holds only starts.
+    events: list[str] = []
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.01)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.01)
+    lakebase.events = aws.events = events
+
+    def clock_ns() -> int:
+        events.append("clock")
+        return time.monotonic_ns()
+
+    race = engine(source, lakebase, aws, clock_ns=clock_ns)
+    arm = await race.prepare(quiet)
+    events.clear()
+
+    await race.run(arm, update(), quiet)
+
+    bell = events.index("clock")
+    assert events[:bell] == [f"ready {LAKEBASE_LANE}", f"ready {COMPETITOR_LANE}"]
+    assert bell < events.index(f"start {LAKEBASE_LANE}")
+    assert bell < events.index(f"start {COMPETITOR_LANE}")
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_cannot_get_ready_refuses_the_bell_before_any_clock():
+    # Refused, not rung: no lane starts, nothing is committed and no clock is reported.
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.01)
+    lakebase.ready_error = RuntimeError("the coordination database did not answer")
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.01)
+    race = engine(source, lakebase, aws)
+    arm = await race.prepare(quiet)
+    heard: list[tuple] = []
+
+    async def progress(*event):
+        heard.append(event)
+
+    with pytest.raises(Round4NotArmedError, match="did not answer"):
+        await race.run(arm, update(), progress)
+
+    assert lakebase.started == aws.started == 0
+    assert source.commits == []
+    assert heard == []
+    assert lakebase.closed_readers == lakebase.opened_readers
+    assert aws.closed_readers == aws.opened_readers
 
 
 @pytest.mark.asyncio

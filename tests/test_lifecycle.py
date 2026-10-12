@@ -4718,9 +4718,10 @@ def test_a_fresh_install_grants_the_complete_coordination_runtime_set(monkeypatc
     # can drift without the other noticing.
     assert initialized - planned == set(), sorted(initialized - planned)
 
-    # Twelve tables, or the DDL scan is broken and proves nothing below. The
-    # final four are Round 5's warm state plus resident control outbox/inbox.
-    assert len(durable) == 12, durable
+    # Thirteen tables, or the DDL scan is broken and proves nothing below. The
+    # final four are Round 5's warm state plus resident control outbox/inbox;
+    # round4_source_rebase sits beside the pipeline power history.
+    assert len(durable) == 13, durable
 
     # Every durable coordination table is granted. This is the assertion that
     # fails when someone adds a table to a store and forgets the grant -- the

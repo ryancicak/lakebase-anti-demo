@@ -9,6 +9,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly timedOut = false,
   ) {
     super(message)
     this.name = 'ApiError'
@@ -75,6 +76,7 @@ async function request<T>(
         ? 'The API did not answer in time. The app will reconnect automatically.'
         : 'The API could not be reached. Check your connection, then try again.',
       0,
+      timedOut,
     )
   } finally {
     window.clearTimeout(timeout)

@@ -408,6 +408,52 @@ def _blocked_detail(
     )
 
 
+async def _drain_shielded_mutations(engines: list[Any]) -> bool:
+    """Wait for every adapter's shielded mutation, through any further cancels.
+
+    Returns whether every mutation is known to have settled. Each live adapter
+    bounds its own settle with the control-plane timeout, so this cannot hold the
+    fence forever; a settle that fails is logged, not raised, because the caller
+    is already propagating the reason it stopped. An adapter with no settle hook
+    cannot prove anything, so it is unsettled.
+    """
+
+    adapters: list[Any] = []
+    settled = True
+    for engine in engines:
+        for adapter in (
+            getattr(engine, "lakebase", None),
+            *getattr(engine, "competitors", {}).values(),
+        ):
+            if adapter is None:
+                continue
+            if hasattr(adapter, "settle_pending_mutations"):
+                adapters.append(adapter)
+            else:
+                settled = False
+    if not adapters:
+        return settled
+    drain = asyncio.ensure_future(
+        asyncio.gather(
+            *(adapter.settle_pending_mutations() for adapter in adapters),
+            return_exceptions=True,
+        )
+    )
+    while not drain.done():
+        try:
+            await asyncio.wait({drain})
+        except asyncio.CancelledError:
+            pass
+    for outcome in drain.result():
+        if isinstance(outcome, BaseException):
+            settled = False
+            LOGGER.warning(
+                "Startup cleanup could not confirm a shielded mutation settled: %s",
+                type(outcome).__name__,
+            )
+    return settled
+
+
 class ShowtimeReadinessGate:
     """Replica-safe startup cleanup gate; browser requests are read-only observers."""
 
@@ -1194,20 +1240,42 @@ class ShowtimeReadinessGate:
                 ) from heartbeat_task.exception()
             operation_task.result()
             return holder[0]
+        except BaseException:
+            # Stop the deletes while the heartbeat still holds the fence; the caller
+            # releases the ring only once they settled, and nothing may delete after that.
+            operation_task.cancel()
+            while not operation_task.done():
+                try:
+                    await asyncio.wait({operation_task})
+                except asyncio.CancelledError:
+                    operation_task.cancel()
+            raise
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     async def _lead_cleanup(self) -> None:
         lease = await self._claim(f"startup-cleanup-{self._manifest.run_id}")
+        settled = True
         try:
             await self._store.write(
                 lease, manifest_seal=self._seal, state="maintenance", detail=MAINTENANCE_COPY
             )
 
             async def cleanup(_authority: BoutLease) -> None:
-                await self._safe_change_factory(self._manifest).reset_all()
-                await self._recovery_factory(self._manifest).reset_all()
+                nonlocal settled
+                engines: list[Any] = []
+                try:
+                    engines.append(self._safe_change_factory(self._manifest))
+                    await engines[-1].reset_all()
+                    engines.append(self._recovery_factory(self._manifest))
+                    await engines[-1].reset_all()
+                except BaseException:
+                    # Cancelling a delete does not stop its shielded AWS call or its
+                    # Lakebase worker thread. Wait those out here, while the
+                    # heartbeat still holds the fence.
+                    settled = await _drain_shielded_mutations(engines)
+                    raise
 
             lease = await self._with_heartbeat(lease, cleanup)
             await self._lease_store.release(lease)
@@ -1227,7 +1295,14 @@ class ShowtimeReadinessGate:
                 pass
             raise exc
         finally:
-            await self._lease_store.release(lease)
+            if settled:
+                await self._lease_store.release(lease)
+            else:
+                # A delete may still land; the unrenewed row fences `main` until its TTL.
+                LOGGER.warning(
+                    "Startup cleanup stopped with a mutation unsettled; "
+                    "leaving its ring fence to expire"
+                )
 
     async def _lead_round5_cleanup(
         self,

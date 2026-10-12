@@ -108,6 +108,12 @@ LAUNCH_SKEW_SEMANTICS = "advisory_scheduling_not_fatal"
 MAX_LAUNCH_SKEW_MS = ADVISORY_LAUNCH_SKEW_MS
 CONNECT_TIMEOUT_SECONDS = 20.0
 RUN_TIMEOUT_SECONDS = 600.0
+#: What SSM adds around `RUN_TIMEOUT_SECONDS`: agent pickup, and the status and stdout
+#: propagation the server can only read afterwards.
+SSM_MARGIN_SECONDS = 60.0
+#: How much longer than that SSM window a dispatch credential must live when a bout is
+#: sent. The bell and the dispatch refuse the same credential life, so both derive it here.
+DISPATCH_MARGIN_SECONDS = 60.0
 RUNTIME_MAX_EVENT_LOOP_P99_MS = 50.0
 RAW_WALL_LAG_WARNING_MS = 50.0
 RAW_WALL_LAG_CEILING_MS = 250.0

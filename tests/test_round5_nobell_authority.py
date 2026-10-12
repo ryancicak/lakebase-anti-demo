@@ -314,7 +314,7 @@ async def test_b_active_claim_renews_by_identity_when_launch_margin_stale() -> N
     # Advance past the lapsed launch margin but WELL within the durable renewal
     # horizon, so the only thing that could stop renewal is the (reverted) margin
     # gate -- isolating the identity-vs-launch-margin distinction this test exists
-    # for. (Blocker 10's separate horizon test covers the leak bound.)
+    # for. (A separate horizon test covers the leak bound.)
     clock.advance(200)
     slot = await manager.store.read("install-one")
     assert slot is not None
@@ -880,7 +880,7 @@ async def test_j_true_baseline_drift_still_fails_closed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 1. Post-bell cleanup classification derives from durable bell truth,
+# Post-bell cleanup classification derives from durable bell truth,
 # not a stale cached CLAIMED slot: a post-bell abort MUST run setup teardown.
 # ---------------------------------------------------------------------------
 
@@ -900,7 +900,7 @@ async def test_blocker1_stale_claimed_slot_with_bell_context_is_post_bell() -> N
 
 
 # ---------------------------------------------------------------------------
-# Blocker 2. Durable authority guard: a stale coordinator is refused at the
+# Durable authority guard: a stale coordinator is refused at the
 # mutation boundary even if the provider would swallow cancellation.
 # ---------------------------------------------------------------------------
 
@@ -998,7 +998,7 @@ async def test_blocker2_coordinator_guard_refuses_after_takeover() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 3. Reject a bell whose claim has expired at the authoritative now.
+# Reject a bell whose claim has expired at the authoritative now.
 # ---------------------------------------------------------------------------
 
 
@@ -1075,7 +1075,7 @@ async def test_blocker3_concurrent_bell_and_cleanup_from_same_revision() -> None
 
 
 # ---------------------------------------------------------------------------
-# Blocker 4. The cleanup-lineage signal is episodic (cleared on N+1 READY), and
+# The cleanup-lineage signal is episodic (cleared on N+1 READY), and
 # the parser honors an explicit false while inferring only when absent.
 # ---------------------------------------------------------------------------
 
@@ -1149,7 +1149,7 @@ def test_blocker4_parser_honors_explicit_false_and_infers_when_absent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 5. A same-process self-fenced CLEANING self-drives to N+1 READY with
+# A same-process self-fenced CLEANING self-drives to N+1 READY with
 # NO manager cleanup worker and NO restart (arm setup failure / cleared active).
 # ---------------------------------------------------------------------------
 
@@ -1189,7 +1189,7 @@ async def test_blocker5_self_fenced_cleaning_self_drives_without_manager() -> No
 
 
 # ---------------------------------------------------------------------------
-# Blocker 6. The forgeable settlement-proof API and the direct CLAIMED->READY
+# The forgeable settlement-proof API and the direct CLAIMED->READY
 # fast path are GONE: no-bell abandon always fences into CLEANING (claim retained).
 # ---------------------------------------------------------------------------
 
@@ -1225,7 +1225,7 @@ async def test_blocker6_no_direct_release_token_and_abandon_fences_cleaning() ->
 
 
 # ---------------------------------------------------------------------------
-# Blocker 7. claim() wakes the supervised loop so a fresh claim is renewed
+# claim() wakes the supervised loop so a fresh claim is renewed
 # promptly instead of after a long READY sleep.
 # ---------------------------------------------------------------------------
 
@@ -1267,7 +1267,7 @@ async def test_blocker7_claim_wakes_supervised_loop_to_renew() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 10. A leaked/stuck active-id cannot renew a claim forever: renewal is
+# A leaked/stuck active-id cannot renew a claim forever: renewal is
 # bounded by a durable horizon and the claim then fences into CLEANING.
 # ---------------------------------------------------------------------------
 
@@ -1299,7 +1299,7 @@ async def test_blocker10_leaked_active_claim_is_bounded_and_fences() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 12. BLOCKED is never terminal while claim/cleanup/resident debt exists.
+# BLOCKED is never terminal while claim/cleanup/resident debt exists.
 # ---------------------------------------------------------------------------
 
 
@@ -1331,7 +1331,7 @@ def test_blocker12_blocked_not_terminal_while_debt_outstanding() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 764-follow-up Blocker 2. Concurrent cleanup convergence is COALESCED: exactly
+# Concurrent cleanup convergence is COALESCED: exactly
 # one provider reconcile+finish sequence per claim under concurrent triggers.
 # ---------------------------------------------------------------------------
 
@@ -1366,7 +1366,7 @@ async def test_b2_concurrent_converge_cleanup_is_coalesced() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 3. Per-mutation authority guard: after a takeover the NEXT external
+# Per-mutation authority guard: after a takeover the NEXT external
 # mutation is refused even mid-method (not just at the orchestration boundary).
 # ---------------------------------------------------------------------------
 
@@ -1430,7 +1430,7 @@ async def test_b3_engine_guard_refuses_reconcile_before_any_mutation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 5. The exact armed-lease deadline is honored: a long configured TTL
+# The exact armed-lease deadline is honored: a long configured TTL
 # (1800s) renews through the deadline, NOT the coarse leak-fallback horizon.
 # ---------------------------------------------------------------------------
 
@@ -1471,7 +1471,7 @@ async def test_b5_long_armed_deadline_renews_past_fallback_horizon() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 4. A claim-bearing BLOCKED never warms/preps over the debt: it routes
+# A claim-bearing BLOCKED never warms/preps over the debt: it routes
 # into CLEANING and converges, preserving the claim identities.
 # ---------------------------------------------------------------------------
 
@@ -1534,7 +1534,7 @@ async def test_b4_claim_bearing_blocked_routes_into_cleaning() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Blocker 1 / Finding 3. Durable post-bell truth: even if the local cache never
+# Durable post-bell truth: even if the local cache never
 # learned the bell, cleanup adopts the committed RUNNING slot -- and, with a
 # coordinator configured, performs NO external mutation itself (single owner).
 # ---------------------------------------------------------------------------
@@ -1730,7 +1730,7 @@ async def test_owner_converge_failure_never_strands_cleaning_silently() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Finding 2: coalescing lifetime is owned by task completion, not the caller.
+# Coalescing lifetime is owned by task completion, not the caller.
 # ---------------------------------------------------------------------------
 
 
@@ -1852,7 +1852,7 @@ async def test_f2_inherited_restart_concurrent_manager_and_loop_stays_one() -> N
 
 
 # ---------------------------------------------------------------------------
-# Finding 1: a stale cleanup lease is retired once another owner advances to N+1.
+# A stale cleanup lease is retired once another owner advances to N+1.
 # ---------------------------------------------------------------------------
 
 
@@ -1946,7 +1946,7 @@ async def test_f1_stale_cleanup_lease_retired_after_owner_advances(
 
 
 # ---------------------------------------------------------------------------
-# Finding 3: with a coordinator configured the manager performs ZERO external
+# With a coordinator configured the manager performs ZERO external
 # cleanup mutation (no settle/cancel/janitor) -- the provider is the sole janitor.
 # ---------------------------------------------------------------------------
 
@@ -2502,7 +2502,7 @@ class _CloseRecordingStore(InMemoryRound5WarmStore):
 
 
 async def test_h2_close_waits_for_inflight_converge_then_releases_and_closes() -> None:
-    """H2 / Finding B: coordinator.close() must NOT cancel an in-flight converge (a
+    """coordinator.close() must NOT cancel an in-flight converge (a
     cancel cannot stop a shielded AWS call and would drop the fence while it runs).
     It must keep the fence alive (the task's own heartbeat) and WAIT for the converge
     to actually finish, and only THEN revoke authority, release adopted engines, and
@@ -2629,7 +2629,7 @@ async def test_h2c_converge_arriving_during_close_is_refused_no_task_no_mutation
     """A converge that races an in-progress close() (after close's snapshot, while it
     is still WAITING for the in-flight blocked reconcile) is refused -- creating no
     new task and no mutation. Authority is revoked only AFTER the in-flight op
-    finishes (Finding B), never mid-flight.
+    finishes, never mid-flight.
     """
 
     clock = Clock()
@@ -2830,7 +2830,7 @@ async def test_h3_cancel_resident_lane_no_binding_uses_cancel_job_not_typeerror(
 
 
 async def test_finding_a_cancel_local_cancels_launched_bursts() -> None:
-    """Finding A: run() pops _lane_bursts into a local ``launched`` map (mirrored in
+    """run() pops _lane_bursts into a local ``launched`` map (mirrored in
     _run_burst_tasks), so cancelling only _lane_bursts left the ACTUALLY-running bursts
     alive and able to dispatch after CLEANING. cancel_local_round5_run_tasks must
     cancel the mirrored launched bursts too.
@@ -2866,7 +2866,7 @@ async def test_finding_a_cancel_local_cancels_launched_bursts() -> None:
 
 def test_finding_a_run_mirrors_bursts_into_run_burst_tasks() -> None:
     """run() must mirror the launched bursts into _run_burst_tasks so a concurrent
-    towel/abandon can reach and cancel them (structural backstop for Finding A)."""
+    towel/abandon can reach and cancel them (a structural backstop)."""
 
     import inspect
 
@@ -2887,7 +2887,7 @@ def test_finding_a_run_mirrors_bursts_into_run_burst_tasks() -> None:
 
 
 async def test_finding_b_close_holds_fence_until_inflight_reconcile_finishes() -> None:
-    """Finding B: a reconcile may hold a shielded, un-cancellable AWS call. close()
+    """A reconcile may hold a shielded, un-cancellable AWS call. close()
     must keep the coordinator fence held (heartbeat alive) and WAIT for that call to
     finish before revoking authority / releasing adoption / closing the store --
     otherwise a replica could acquire_coordinator and double-reconcile. While the
@@ -2952,7 +2952,7 @@ async def test_finding_b_close_holds_fence_until_inflight_reconcile_finishes() -
 async def test_finding_c_mark_bout_armed_lease_loss_still_fences_cleaning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Finding C: production _mark_bout_armed releases the round5/ring leases and then
+    """Production _mark_bout_armed releases the round5/ring leases and then
     raises on an armed-lease CAS failure (LeaseLostError). The arm-failure handler must
     STILL fence durable CLEANING (begin_cleanup is independent of those leases) so the
     slot never stays CLAIMED with an orphaned staged resident and a startable overlay,
@@ -3286,15 +3286,14 @@ async def test_shutdown_after_process_death_second_coordinator_converges() -> No
 
 
 # ---------------------------------------------------------------------------
-# c62affa race-audit follow-ups: A2 (post-bell janitor cancels run-popped bursts),
-# A3 (run() cancel cancels launched bursts), Finding B nuance (close() cancellation
-# does not cancel in-flight cleanup / drop the heartbeat), and the begin_cleanup
-# lifecycle-lock Low (closed-check atomic with the flag).
+# Race follow-ups: the post-bell janitor cancels run-popped bursts, run() cancel
+# cancels launched bursts, close() cancellation does not cancel in-flight cleanup or
+# drop the heartbeat, and begin_cleanup's closed-check is atomic with the flag.
 # ---------------------------------------------------------------------------
 
 
 async def test_a2_post_bell_janitor_cancels_run_burst_tasks_before_orchestrator() -> None:
-    """Finding A2: the post-bell janitor (_stop_setup_and_begin_cleanup_once, reached
+    """The post-bell janitor (_stop_setup_and_begin_cleanup_once, reached
     via _ensure_post_bell_provider_cleanup_started) must cancel the run()-popped
     _run_burst_tasks -- not only _lane_bursts (which run() has already emptied) --
     BEFORE the orchestrator begin_cleanup / Proxy delete.
@@ -3344,7 +3343,7 @@ async def test_a2_post_bell_janitor_cancels_run_burst_tasks_before_orchestrator(
 
 
 async def test_a3_run_cancel_cancels_launched_bursts_no_dispatch_after() -> None:
-    """Finding A3: cancelling run() (e.g. SIGTERM) must cancel+await the launched
+    """Cancelling run() (e.g. SIGTERM) must cancel+await the launched
     bursts in its finally rather than silently wiping the set, so no orphan burst can
     dispatch after teardown. After awaiting run(), cancel_local finds them gone.
 
@@ -3392,7 +3391,7 @@ async def test_a3_run_cancel_cancels_launched_bursts_no_dispatch_after() -> None
 
 
 async def test_b_nuance_close_cancellation_leaves_cleanup_running_and_fence_held() -> None:
-    """Finding B nuance: if close() ITSELF is cancelled (SIGTERM cancels the close
+    """If close() ITSELF is cancelled (SIGTERM cancels the close
     task), it must NOT cancel the in-flight cleanup or drop its heartbeat -- the
     cleanup keeps running with the fence held until it finishes or the process dies,
     so a replica still cannot acquire coordination.

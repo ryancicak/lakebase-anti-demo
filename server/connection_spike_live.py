@@ -21,6 +21,7 @@ from urllib.parse import unquote
 from uuid import uuid4
 
 import boto3
+import psycopg
 from botocore.config import Config
 from botocore.exceptions import (
     ConnectionClosedError,
@@ -52,10 +53,16 @@ from .connection_fanin import (
     fanin_preflight_request,
 )
 from .connection_fanin import (
+    DISPATCH_MARGIN_SECONDS as FANIN_DISPATCH_MARGIN_SECONDS,
+)
+from .connection_fanin import (
     RUN_TIMEOUT_SECONDS as FANIN_RUN_TIMEOUT_SECONDS,
 )
 from .connection_fanin import (
     RUNNER_INSTANCE_TYPE as FANIN_RUNNER_INSTANCE_TYPE,
+)
+from .connection_fanin import (
+    SSM_MARGIN_SECONDS as FANIN_SSM_MARGIN_SECONDS,
 )
 from .connection_fanin import TRUST_BUNDLE_PATH as FANIN_TRUST_BUNDLE_PATH
 from .connection_fanin import ConnectionSpikeArm as FanInArm
@@ -156,12 +163,8 @@ SETUP_SSM_TIMEOUT_SECONDS = SSM_TIMEOUT_SECONDS
 #: that constant rather than restated, so the two cannot drift into an SSM timeout that
 #: kills a bout the runner was still measuring -- a failure that arrives as "the command
 #: did not complete" and says nothing about the 10,000 clients that were up at the time.
-#:
-#: The margin covers what SSM adds around the script: agent pickup, and the status and
-#: stdout propagation the server can only read afterwards.
-FANIN_SSM_MARGIN_SECONDS = 60.0
 FANIN_SSM_TIMEOUT_SECONDS = FANIN_RUN_TIMEOUT_SECONDS + FANIN_SSM_MARGIN_SECONDS
-DISPATCH_CAPSULE_SAFETY_SECONDS = FANIN_SSM_TIMEOUT_SECONDS + 60
+DISPATCH_CAPSULE_SAFETY_SECONDS = FANIN_SSM_TIMEOUT_SECONDS + FANIN_DISPATCH_MARGIN_SECONDS
 DISPATCH_CAPSULE_REFRESH_LEAD_SECONDS = 60
 DISPATCH_CAPSULE_REFRESH_INTERVAL_SECONDS = 30
 #: How long a cancelled setup command is given to confirm it has settled.
@@ -192,12 +195,12 @@ DISPATCH_CAPSULE_REFRESH_INTERVAL_SECONDS = 30
 SETTLEMENT_TIMEOUT_SECONDS = 45.0
 SETUP_DEADLINE_SECONDS = 30 * 60.0
 PROXY_DELETION_TIMEOUT_SECONDS = 10 * 60.0
-# Swarm defect #4: how many bounded describe confirmations prove that an
+# How many bounded describe confirmations prove that an
 # ambiguous ``DBProxyAlreadyExistsFault`` was eventual consistency (our exact
 # Proxy is genuinely absent) before the create is retried.  A single describe is
 # not proof of absence.
 PROXY_CREATE_ABSENCE_CONFIRMATIONS = 3
-# Swarm defect #5: how many consecutive bounded NotFound describes prove a
+# How many consecutive bounded NotFound describes prove a
 # per-bout Proxy is *definitively* gone during cleanup.  One NotFound is unknown
 # (control-plane eventual consistency after DeleteDBProxy acceptance), never
 # clean; cleanup debt is held until this many confirmations agree.
@@ -303,7 +306,7 @@ class ConnectionSpikeLiveSourceUnavailableError(ConnectionSpikeLiveTransientErro
 class ConnectionSpikeLiveSourceUnresolvedError(ConnectionSpikeLiveSourceUnavailableError):
     """A source describe did not resolve to exactly one matching row.
 
-    Swarm finding req #4 (identity inversion).  An EMPTY describe is retried
+    An EMPTY describe is retried
     boundedly under provider eventual consistency, but -- unlike a busy-but-present
     source -- if it stays unresolved past the transient budget it is NOT a
     self-verifiable "the DB will recover" condition: the sealed source cannot be
@@ -393,7 +396,7 @@ def _require_warm_source_identity(
 
     if not source.identifier:
         # Empty/absent describe: retried boundedly under eventual consistency, but
-        # (req #4) it escalates to a TERMINAL block if it persists rather than
+        # it escalates to a TERMINAL block if it persists rather than
         # rechecking forever -- an unfindable sealed source needs operator
         # attention, unlike a present-but-busy one.  A duplicate describe never
         # reaches here (it is raised as a terminal configuration fault at read).
@@ -1080,7 +1083,7 @@ class _SetupResources:
 class _BellCapability:
     """A process-local, non-durable proof that this replica accepted the bell.
 
-    Swarm defect #2.  The single timed CreateDBProxy mutation must not perform any
+    The single timed CreateDBProxy mutation must not perform any
     remote fence I/O after the bell (that would sit on the T0 -> boto3 path), yet
     it must still refuse to run for a stale owner.  This capability is minted on
     the bell path, keyed to the exact bout and fence, with a monotonic expiry
@@ -1283,7 +1286,7 @@ class LakebaseCreationJournalStore:
     async def admitted_lifecycle_states(self) -> frozenset[str]:
         """Return the ``lifecycle_state`` values the LIVE CHECK constraint admits.
 
-        Swarm req #3: readiness uses this to refuse ring readiness (and arm) when
+        Readiness uses this to refuse ring readiness (and arm) when
         the deployed journal CHECK cannot admit a state the arm/bell/cleanup path
         emits -- the exact failure mode (code emits a state the live CHECK forbids)
         that let the 2026-09-23 arm regression ship 'green' against fake journals.
@@ -1503,17 +1506,17 @@ class LiveConnectionSpikeSetupOrchestrator:
         self._cleanup_start_lock = asyncio.Lock()
         self._cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._proxy_delete_accepted: dict[str, asyncio.Event] = {}
-        #: The proxy CREATE_INTENT committed on the bell path (swarm defect #1,
-        #: Approach A: precommit_launch_intent), keyed by bout.  ``setup()`` consumes
+        #: The proxy CREATE_INTENT committed on the bell path
+        #: (``precommit_launch_intent``), keyed by bout.  ``setup()`` consumes
         #: it so no journal write is awaited between the authoritative T0 and the
         #: boto3 CreateDBProxy request.
         self._promoted_proxy_intents: dict[str, JournalEvent] = {}
-        #: Process-local bell capabilities (swarm defect #2), keyed by bout.  Minted
+        #: Process-local bell capabilities, keyed by bout.  Minted
         #: on the bell path; checked -- with no await -- immediately before the
         #: timed CreateDBProxy mutation so a stale owner cannot mutate.
         self._bell_capabilities: dict[str, _BellCapability] = {}
-        #: A single reused worker for the timed CreateDBProxy dispatch (swarm
-        #: defect #3 + req #7).  Created ONCE and warmed before the scored window,
+        #: A single reused worker for the timed CreateDBProxy dispatch.
+        #: Created ONCE and warmed before the scored window,
         #: never inside it -- spawning a ThreadPoolExecutor (thread create + start)
         #: between T0 and the boto3 request would add uncontrolled latency to the
         #: scored bell -> CreateDBProxy delta.
@@ -1585,7 +1588,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             )
             self._require_rule_bindings(resources)
             coordinator, specs = self._coordinator(scope, warm.clients, resources)
-            # Swarm defect #1 (Approach A): ARM writes NOTHING to the creation
+            # ARM writes NOTHING to the creation
             # journal.  The timed CreateDBProxy CREATE_INTENT is made durable on the
             # BELL path (``precommit_launch_intent``), before the authoritative T0
             # and before Lakebase is released, so Lakebase can never be released
@@ -1604,7 +1607,7 @@ class LiveConnectionSpikeSetupOrchestrator:
     async def precommit_launch_intent(self, bout_id: str, fencing_token: int) -> JournalEvent:
         """Durably commit the timed CreateDBProxy CREATE_INTENT on the bell path.
 
-        Swarm defect #1 (Approach A).  Invoked on the bell path immediately before
+        Invoked on the bell path immediately before
         the authoritative T0 (and before Lakebase is released), so the durable
         create intent exists first and ``setup()`` awaits no coordination I/O
         between T0 and the boto3 CreateDBProxy request.  Writes ``CREATE_INTENT``
@@ -1647,7 +1650,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         intent = await coordinator.precommit_intent(scope, proxy_spec)
         self._promoted_proxy_intents[bout_id] = intent
         # Mint the local bell capability on the bell path, keyed to this exact
-        # bout/fence (swarm defect #2).  A duplicate /run re-promotes idempotently
+        # bout/fence.  A duplicate /run re-promotes idempotently
         # above and re-mints here with a fresh expiry, which is correct: the same
         # in-process owner is still fresh.
         self.arm_bell_capability(bout_id, fencing_token)
@@ -1658,7 +1661,7 @@ class LiveConnectionSpikeSetupOrchestrator:
     ) -> None:
         """Mint a process-local bell capability for the timed CreateDBProxy.
 
-        Swarm defect #2.  Called on the bell path.  The default TTL is the setup
+        Called on the bell path.  The default TTL is the setup
         deadline: a create that has not fired within a whole bout window of the
         bell is, by definition, a stale owner and must be refused locally.
         """
@@ -1872,12 +1875,12 @@ class LiveConnectionSpikeSetupOrchestrator:
             resources = prepared
             clients = warm.clients
 
-            # Req #7: warm the reused CreateDBProxy worker now, before the scored
+            # Warm the reused CreateDBProxy worker now, before the scored
             # window, so no ThreadPoolExecutor is created between T0 and the boto3
             # request.
             self._ensure_createproxy_executor()
 
-            # Swarm defect #1 (Approach A): the timed CreateDBProxy CREATE_INTENT is
+            # The timed CreateDBProxy CREATE_INTENT is
             # made durable on the bell path (``precommit_launch_intent``, before the
             # authoritative T0), NOT here.  ``setup()`` therefore awaits zero
             # journal/fence I/O before releasing the gate -- the first awaited call
@@ -2605,7 +2608,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             )
             values = response.get("DBInstances") or []
             if len(values) > 1:
-                # Req #4: a duplicate describe is an ambiguous identity, a terminal
+                # A duplicate describe is an ambiguous identity, a terminal
                 # configuration fault -- never a transient "unavailable" that would
                 # retry forever.  (An empty describe collapses to {} below and is
                 # handled as bounded->terminal "unresolved".)
@@ -2633,7 +2636,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         )
         values = response.get("DBClusters") or []
         if len(values) > 1:
-            # Req #4: duplicate describe -> terminal ambiguous identity, not a
+            # A duplicate describe -> terminal ambiguous identity, not a
             # transient that retries forever.
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 competitor source describe returned more than one "
@@ -3411,7 +3414,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         tags = dict(self.config.ownership_tags)
         tags["anti-demo-bout-id"] = scope.bout_id
         tags["anti-demo:bout-token"] = resources.names.token
-        # Swarm defect #2: the bout fence is an immutable operation-identity tag.
+        # The bout fence is an immutable operation-identity tag.
         # It is verified EXACTLY on inspect/adopt/cleanup (``_require_exact_tags``),
         # so a proxy created by one generation (fence N) can never be adopted by,
         # or deleted as a replacement for, a later generation (fence N+1): their
@@ -4215,7 +4218,7 @@ class LiveConnectionSpikeSetupOrchestrator:
 
         Warmed before the scored window (see ``setup()``); this creates a single
         long-lived worker once and reuses it across bouts.  It must never be
-        called for the first time between T0 and the boto3 request (req #7): thread
+        called for the first time between T0 and the boto3 request: thread
         creation there would add uncontrolled latency to the scored delta.
         """
 
@@ -4243,7 +4246,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         was delayed.  A dedicated single-thread executor removes both: the stamp
         is taken INSIDE the worker immediately before the SDK call, and no shared
         queue sits in front of it.  The executor is REUSED (warmed before the
-        scored window), never created here inside it (req #7).
+        scored window), never created here inside it.
         """
 
         loop = asyncio.get_running_loop()
@@ -4270,7 +4273,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         *,
         scope: CreationScope | None = None,
     ) -> ResourceObservation:
-        # Swarm defect #2: refuse a stale owner locally BEFORE any AWS mutation.
+        # Refuse a stale owner locally BEFORE any AWS mutation.
         # This is a pure, synchronous, in-process check (no await, no I/O), so it
         # is safe on the T0 -> boto3 path and adds nothing to the scored window.
         if scope is not None:
@@ -4296,7 +4299,7 @@ class LiveConnectionSpikeSetupOrchestrator:
         # dedicated worker in _dispatch_create_db_proxy immediately before the SDK
         # call, so a saturated default executor can neither hide nor delay it.
         resources.proxy_create_submitted_ns = self._monotonic_ns()
-        # Swarm defect #4: the happy path is a single dispatch (no extra awaits, so
+        # The happy path is a single dispatch (no extra awaits, so
         # the scored window is untouched).  Only an ambiguous AlreadyExists takes
         # the adopt/retry recovery below.
         await self._create_or_adopt_db_proxy(clients, resources, spec, create_kwargs)
@@ -4327,7 +4330,7 @@ class LiveConnectionSpikeSetupOrchestrator:
     ) -> None:
         """Issue CreateDBProxy, resolving an ambiguous AlreadyExists correctly.
 
-        Swarm defect #4.  ``CreateDBProxy`` has no client token, so a retried or
+        ``CreateDBProxy`` has no client token, so a retried or
         ambiguously-acknowledged send can surface ``DBProxyAlreadyExistsFault``.
         The only safe responses are:
 
@@ -4644,7 +4647,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             raise ConnectionSpikeLiveConfigurationError(
                 "Round 5 per-bout Proxy account or region changed"
             )
-        # Swarm defect #5: when an expected ARN is supplied (cleanup and delete
+        # When an expected ARN is supplied (cleanup and delete
         # confirmation), a Proxy that shares the deterministic name but not the
         # ARN is a *different operation* -- a generation-N+1 replacement that took
         # the name after generation N's Proxy was removed (RDS allows only one
@@ -4756,7 +4759,7 @@ class LiveConnectionSpikeSetupOrchestrator:
             # responsive-but-slow Proxy delete; do not read it as protection
             # against a hang, and do not remove the outer bound believing it is.
             #
-            # Swarm defect #5: a single NotFound is *unknown*, not clean -- the RDS
+            # A single NotFound is *unknown*, not clean -- the RDS
             # control plane can momentarily describe a just-accepted delete as gone
             # and then report it again.  Require bounded consecutive confirmations
             # of exact-operation absence before declaring the billable Proxy
@@ -6111,7 +6114,7 @@ class LiveConnectionSpikeAdapter:
                 )
             if expiration.tzinfo is None:
                 expiration = expiration.replace(tzinfo=UTC)
-            if expiration <= datetime.now(UTC) + timedelta(seconds=FANIN_SSM_TIMEOUT_SECONDS + 60):
+            if expiration <= datetime.now(UTC) + timedelta(seconds=DISPATCH_CAPSULE_SAFETY_SECONDS):
                 raise ConnectionSpikeLiveConfigurationError(
                     "Round 5 assumed credentials expire before the bounded run can settle"
                 )
@@ -7589,7 +7592,7 @@ class LiveConnectionSpikeEngine:
         # supervises them, so during a bout the burst tasks are no longer reachable
         # through ``_lane_bursts``. Mirror them here so ``cancel_local_round5_run_tasks``
         # can still cancel the ACTUALLY-running bursts on a towel/abandon -- otherwise
-        # a burst could dispatch after the slot is fenced CLEANING (Finding A).
+        # a burst could dispatch after the slot is fenced CLEANING.
         self._run_burst_tasks: set[asyncio.Task[ConnectionSpikeLaneResult]] = set()
         self._lane_stops: dict[str, ConnectionSpikeSetupLaneStop] = {}
         self._lane_progress_callback: ProgressCallback | None = None
@@ -7603,7 +7606,7 @@ class LiveConnectionSpikeEngine:
         self._bound_claim: object | None = None
         self._resident_bindings: dict[str, Round5ControlBinding] = {}
         self._durable_lakebase_release: Round5ControlEvent | None = None
-        # Blocker 2: durable authority guard the warm provider propagates. Consulted
+        # Durable authority guard the warm provider propagates. Consulted
         # immediately before this engine's external mutation boundaries so a stale
         # coordinator fence refuses the mutation even if cancellation was swallowed.
         self.authority_guard: Callable[[], Awaitable[None]] | None = None
@@ -8025,7 +8028,7 @@ class LiveConnectionSpikeEngine:
     async def precommit_launch_intent(self, bout_id: str, fencing_token: int) -> None:
         """Durably commit the CreateDBProxy CREATE_INTENT on the bell path.
 
-        Swarm defect #1 (Approach A).  The manager awaits this immediately before
+        The manager awaits this immediately before
         the authoritative bell transaction (before T0 and before Lakebase is
         released), so the durable competitor create intent always exists first and
         the post-T0 path awaits no coordination I/O.  A no-op when this
@@ -8523,7 +8526,7 @@ class LiveConnectionSpikeEngine:
         try:
             launched = {lane_id: self._lane_bursts.pop(lane_id, None) for lane_id in lane_ids}
             # Mirror the launched bursts so a concurrent towel/abandon can cancel the
-            # actually-running burst tasks (see _run_burst_tasks / Finding A).
+            # actually-running burst tasks (see _run_burst_tasks).
             self._run_burst_tasks = {
                 task for task in launched.values() if task is not None
             }
@@ -8576,7 +8579,7 @@ class LiveConnectionSpikeEngine:
             await self._report(on_progress, "verified", "Runner evidence verified")
             return result
         finally:
-            # Finding A3: on run() cancel/exit (e.g. SIGTERM cancels this task), the
+            # On run() cancel/exit (e.g. SIGTERM cancels this task), the
             # launched bursts must NOT be silently orphaned by wiping the set -- an
             # orphan could keep dispatching after teardown. Cancel+await them first,
             # then clear. On the normal success path they are already done (no-op).
@@ -8694,7 +8697,7 @@ class LiveConnectionSpikeEngine:
         async with self._cleanup_start_lock:
             if self._cleanup_bout_id is not None:
                 return
-            # Finding A2: cancel+await every in-process burst (both _lane_bursts and the
+            # Cancel+await every in-process burst (both _lane_bursts and the
             # run()-popped _run_burst_tasks) before the orchestrator begin_cleanup /
             # Proxy delete so no burst dispatches after teardown.
             await self._cancel_local_bursts()
@@ -8752,7 +8755,7 @@ class LiveConnectionSpikeEngine:
 
         staged = tuple(self._resident_bindings.items())
         if staged:
-            # Blocker 3: authority guard before beginning the settle mutations.
+            # Authority guard before beginning the settle mutations.
             await self._check_authority()
             # Observable on-success, not just on-timeout: an unstage is the exact
             # action this fix exists to perform, and the original incident was
@@ -8764,7 +8767,7 @@ class LiveConnectionSpikeEngine:
         deferred_resident_jobs: set[str] = set()
         settled_lanes: list[str] = []
         for lane_id, binding in staged:
-            # Blocker 3: authority guard before EACH resident cancel (not just at
+            # Authority guard before EACH resident cancel (not just at
             # method entry) so a fence lost between lanes aborts the next mutation.
             await self._check_authority()
             try:
@@ -8821,7 +8824,7 @@ class LiveConnectionSpikeEngine:
         if setup_task is not None and setup_task is not asyncio.current_task():
             setup_task.cancel()
             await asyncio.gather(setup_task, return_exceptions=True)
-        # Finding A2: cancel+await BOTH _lane_bursts AND the run()-popped
+        # Cancel+await BOTH _lane_bursts AND the run()-popped
         # _run_burst_tasks before any orchestrator begin_cleanup / Proxy delete, so no
         # burst can dispatch after this bout is torn down. (Snapshotting only
         # _lane_bursts missed the actually-running bursts once run() had popped them.)
@@ -8962,7 +8965,7 @@ class LiveConnectionSpikeEngine:
                 "Round 5 restart reconciliation could not prove both logical jobs settled"
             )
         bout_id = str(claim.bout_id)
-        # Blocker 3: authority guard before the provider-absence/journal mutation.
+        # Authority guard before the provider-absence/journal mutation.
         await self._check_authority()
         # Always enter reconstructive cleanup. Journal absence is not provider
         # absence: CreateDBProxy may have crossed AWS before the intent/response
@@ -8976,8 +8979,13 @@ class LiveConnectionSpikeEngine:
         ARM stages resident logical jobs before timed setup writes any per-bout
         resource journal. A restart can therefore observe CLEANING plus an empty
         journal while a resident is still PREPARED. The claim's durable job IDs
-        are the recovery intent: cancel and settle both exact jobs first, then
-        prove the (necessarily pre-bell) provider scope absent.
+        are the recovery intent: cancel and settle both exact jobs first.
+
+        A refused bell after a successful CreateDBProxy precommit is a different
+        inherited shape: CLEANING, NULL ``bell_id``, and a durable CREATE_INTENT
+        row. Absence proof must still refuse that debt; reconstructive cleanup is
+        the only path that can settle it, so this method runs it first when the
+        current bout still owns journal rows, then proves absence.
         """
 
         # Authority boundary: refuse the resident cancel/settle control dispatch
@@ -9030,9 +9038,21 @@ class LiveConnectionSpikeEngine:
                 reason_code="setup_orchestrator_unavailable",
             )
         bout_id = str(claim.bout_id)
-        # Blocker 3: authority guard before the provider-absence proof (the second
-        # external mutation phase), so a fence lost after the job cancels aborts here.
+        # Authority guard before the provider-absence / reconstruct
+        # mutation phase, so a fence lost after the job cancels aborts here.
         await self._check_authority()
+        try:
+            unresolved = tuple(await self._setup_orchestrator.unresolved_bout_ids())
+        except Exception as exc:
+            raise ConnectionSpikeCleanupError(
+                "Round 5 absence proof could not read cleanup ownership",
+                stage="journal_ownership",
+                reason_code="journal_ownership_unavailable",
+            ) from exc
+        if bout_id in unresolved:
+            # Reconstruct from the journal before proving absence. Do not skip the
+            # proof: leftover or unsafe debt must still block (current_bout_journal_debt).
+            await self.reconcile_failed_cleanup(bout_id, int(claim.bout_fence))
         await self._setup_orchestrator.prove_bout_absent(bout_id)
         self.retain_cleaned_bout(bout_id)
 
@@ -9192,11 +9212,11 @@ class LiveRound5WarmProvider:
         self._credential_generation = 0
         self._cleaned_bout_id: str | None = None
         self._requires_cleaned_bout = False
-        # Blocker 2: a durable authority guard the coordinator installs. Invoked
+        # A durable authority guard the coordinator installs. Invoked
         # immediately before every external mutation boundary so a stale owner is
         # refused even if a cancellation was swallowed. None until installed.
         self.authority_guard: Callable[[], Awaitable[None]] | None = None
-        # Finding 3: the manager ADOPTS its claimed engine (the one that holds the
+        # The manager ADOPTS its claimed engine (the one that holds the
         # ARM-staged resident bindings) into the provider, keyed by claim_id, so the
         # provider -- the SOLE cleanup janitor under the coordinator's lease/fence --
         # can cancel those staged residents itself instead of the manager doing it.
@@ -9416,6 +9436,9 @@ class LiveRound5WarmProvider:
         except Exception as exc:
             from .round5_warm import RetryableWarmError
 
+            if isinstance(exc, RetryableWarmError):
+                # The engine's own STALE/ABSENT miss: a strike, never an identity change.
+                raise
             if self._retryable(exc):
                 raise RetryableWarmError("runner_provenance_probe_retryable") from exc
             return False
@@ -9457,19 +9480,16 @@ class LiveRound5WarmProvider:
 
     @staticmethod
     def _retryable(error: BaseException) -> bool:
-        if isinstance(
-            error,
-            (
-                ConnectionSpikeLiveTransientError,
-                TimeoutError,
-                ConnectionError,
-                ConnectTimeoutError,
-                ReadTimeoutError,
-                EndpointConnectionError,
-                ConnectionClosedError,
-            ),
-        ):
-            return True
+        transient = (
+            ConnectionSpikeLiveTransientError,
+            TimeoutError,
+            ConnectionError,
+            ConnectTimeoutError,
+            ReadTimeoutError,
+            EndpointConnectionError,
+            ConnectionClosedError,
+            psycopg.OperationalError,
+        )
         if type(error).__name__ == "InvalidStateError":
             text = str(error)
             if "still active" in text or "no longer current" in text:
@@ -9478,7 +9498,7 @@ class LiveRound5WarmProvider:
         seen: set[int] = set()
         while current is not None and id(current) not in seen:
             seen.add(id(current))
-            if isinstance(current, ConnectionSpikeLiveTransientError):
+            if isinstance(current, transient):
                 return True
             if isinstance(current, ConnectionSpikeLiveOperationError) and (
                 "journal write lost its active lease fence" in str(current)
@@ -9571,7 +9591,7 @@ class LiveRound5WarmProvider:
             #   * anything else unexpected -> fail closed rather than assume it is
             #     safe to retry.
             if isinstance(exc, ConnectionSpikeLiveSourceUnresolvedError):
-                # Req #4: the sealed source did not resolve to exactly one row (an
+                # The sealed source did not resolve to exactly one row (an
                 # empty describe).  Retry boundedly for eventual consistency, but
                 # escalate to a TERMINAL block if it persists -- an unfindable
                 # source is a real problem, not a self-verifiable "the DB is busy"
@@ -9598,6 +9618,25 @@ class LiveRound5WarmProvider:
                     exc,
                 )
                 raise RetryableWarmError("warm_source_unavailable") from exc
+            if isinstance(exc, ConnectionSpikeCleanupError):
+                # A runner job whose cleanup and flock release could not be confirmed.
+                # The usual cause is a resident restarted under it: setup's re-run
+                # reconfigures both runners while this coordinator is warming, and the
+                # job dies without printing its evidence. Unconfirmed is not orphaned.
+                # The runner's resident lock refuses a second resident while an old one
+                # lives, so a fresh fenced warm is the check that settles it, retried on
+                # the bounded backoff and then on the self-verifiable recheck interval.
+                # Latching it as unexpected left Round 5 waiting for an operator after an
+                # idle installer re-run (release run rc7, 2026-10-01 08:39:57Z).
+                # Checked before ``_retryable``: a settlement wait that timed out is
+                # raised from its TimeoutError, which that cause walk would claim.
+                logger.warning(
+                    "round5_warm_runner_settlement_unconfirmed generation=%s cause=%s: %s",
+                    generation,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise RetryableWarmError("warm_runner_settlement_unconfirmed") from exc
             if self._retryable(exc):
                 logger.warning(
                     "round5_warm_provider_retryable generation=%s cause=%s: %s",
@@ -9634,23 +9673,6 @@ class LiveRound5WarmProvider:
                     raise RetryableWarmError(
                         "warm_resident_binding_transition"
                     ) from exc
-            if isinstance(exc, ConnectionSpikeCleanupError):
-                # A runner job whose cleanup and flock release could not be confirmed.
-                # The usual cause is a resident restarted under it: setup's re-run
-                # reconfigures both runners while this coordinator is warming, and the
-                # job dies without printing its evidence. Unconfirmed is not orphaned.
-                # The runner's resident lock refuses a second resident while an old one
-                # lives, so a fresh fenced warm is the check that settles it, retried on
-                # the bounded backoff and then on the self-verifiable recheck interval.
-                # Latching it as unexpected left Round 5 waiting for an operator after an
-                # idle installer re-run (release run rc7, 2026-10-01 08:39:57Z).
-                logger.warning(
-                    "round5_warm_runner_settlement_unconfirmed generation=%s cause=%s: %s",
-                    generation,
-                    type(exc).__name__,
-                    exc,
-                )
-                raise RetryableWarmError("warm_runner_settlement_unconfirmed") from exc
             logger.warning(
                 "round5_warm_baseline_unexpected generation=%s cause=%s: %s",
                 generation,
@@ -10026,7 +10048,7 @@ class LiveRound5WarmProvider:
         renew_by = min(
             control_expires - timedelta(seconds=SETUP_DEADLINE_SECONDS + 60),
             *(
-                value - timedelta(seconds=FANIN_SSM_TIMEOUT_SECONDS + 60)
+                value - timedelta(seconds=DISPATCH_CAPSULE_SAFETY_SECONDS)
                 for value in dispatch_expires.values()
             ),
         )

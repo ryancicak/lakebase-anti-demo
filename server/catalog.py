@@ -4,6 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+from .connection_fanin import MAX_RETRIES
 from .models import (
     Availability,
     CatalogResponse,
@@ -318,7 +319,9 @@ ROUNDS = [
             ),
             (
                 "Each independent lane opens exactly 10,000 authenticated retained clients, "
-                "holds them for 30 seconds, and answers 64 sparse queries with no retries. "
+                "holds them for 30 seconds, and may spend up to "
+                f"{MAX_RETRIES} retried logins during establishment. "
+                "All 64 sampled queries must succeed with no sample retries. "
                 "9,999 fails. Each lane owns a distinct physical c7i.2xlarge runner."
             ),
             (
@@ -611,7 +614,9 @@ def build_presenter_pack(
             "Lakebase stops after its included pooled endpoint verifies an exact transaction. "
             "The selected AWS managed pooling path stops only after its new RDS Proxy and "
             "exact transaction verify. Each lane then holds exactly 10,000 authenticated "
-            "clients for a 30-second hold and answers 64 sparse queries with no retries; "
+            "clients for a 30-second hold and may spend up to "
+            f"{MAX_RETRIES} retried logins during establishment. "
+            "All 64 sampled queries must succeed with no sample retries; "
             "9,999 fails. Multiplexing, fairness, and cleanup gates must all pass before any "
             "winner or margin is declared."
         )

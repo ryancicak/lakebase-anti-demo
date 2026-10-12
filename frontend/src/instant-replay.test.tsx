@@ -132,7 +132,7 @@ function verifiedSession(roundId: RoundId): DemoSession {
 
   if (roundId === 'survive_connection_spike') {
     // The fan-in protocol: exactly 10,000 authenticated clients held per lane, a
-    // 30-second hold, 64 sparse samples and zero retries. `elapsed_ms` carries the
+    // 30-second hold, 64 sparse samples, and up to 100 retried logins. `elapsed_ms` carries the
     // scored quantity here -- shared-T0 time to 10,000 -- because that is the
     // primary result, with pooled-path setup as supporting evidence.
     const fanInEvidence = (elapsedMs: number, authMethod: string) => ({

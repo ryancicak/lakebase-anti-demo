@@ -8,6 +8,7 @@ from server.catalog import (
     recommend_round,
     round_by_id,
 )
+from server.connection_fanin import MAX_RETRIES
 from server.models import (
     Availability,
     ComparisonKind,
@@ -152,10 +153,14 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
         "requires rds proxy" in claim.lower() or "rds proxy is required" in claim.lower()
         for claim in ready.non_claims
     )
-    # The exact target, stated with no room for a near miss.
+    # The exact target, stated with no room for a near miss. Login establishment
+    # may retry; the 64 sampled queries may not.
     assert "exactly 10,000 authenticated retained clients" in ready.non_claims[3]
     assert "9,999 fails" in ready.non_claims[3]
     assert "distinct physical c7i.2xlarge runner" in ready.non_claims[3]
+    assert f"up to {MAX_RETRIES} retried logins" in ready.non_claims[3]
+    assert "64 sampled queries must succeed with no sample retries" in ready.non_claims[3]
+    assert "with no retries" not in ready.non_claims[3]
     # Multiplexing is read during the hold, never inferred from the client count.
     assert "second database role on its own" in ready.non_claims[4]
     assert "never inferred from the client count" in ready.non_claims[4]
@@ -182,6 +187,9 @@ def test_round_five_catalog_supports_both_configured_rds_proxy_matchups() -> Non
     assert "exactly 10,000 authenticated" in presenter.stop_condition
     assert "9,999 fails" in presenter.stop_condition
     assert "winner or margin" in presenter.stop_condition
+    assert f"up to {MAX_RETRIES} retried logins" in presenter.stop_condition
+    assert "64 sampled queries must succeed with no sample retries" in presenter.stop_condition
+    assert "with no retries" not in presenter.stop_condition
 
 
 def test_redo_presentation_policy_is_locked_by_round() -> None:

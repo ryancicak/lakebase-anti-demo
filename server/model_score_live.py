@@ -752,6 +752,17 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
         except DeltaPathDoesNotExistError:
             if not _allow_repair or not self.config.source_repair_job_id:
                 raise
+            pipeline_id = str(self.config.pipeline_id or "")
+            if not pipeline_id:
+                raise ModelScoreLiveConfigurationError(
+                    "Round 4 cannot repair a missing Delta path without a sealed "
+                    "pipeline to record the rebase it will owe"
+                ) from None
+            # Durable rebase_owed must land before the repair job mutates the
+            # table. A later crash, cancel, or failed recheck then still starts
+            # the next bell with a full refresh. If this write cannot commit,
+            # refuse the repair rather than rebuild the path unrecorded.
+            await pipeline_power.note_rebase_owed(pipeline_id)
             if on_progress is not None:
                 await on_progress(
                     "The sealed Delta source path is missing. Running its fixed, "
@@ -1387,7 +1398,12 @@ class Round4PipelineActivation:
                 await self._sleep(max(self._poll_seconds, 0.01))
         async with self._start_lock:
             signals = await self._read_signals()
-            if self._healthy(signals) and not self._full_refresh_required:
+            snapshot = await pipeline_power.rebase_snapshot(self._pipeline_id)
+            if (
+                self._healthy(signals)
+                and not self._full_refresh_required
+                and not snapshot.owed
+            ):
                 self._last_seen_update_id = signals.update_id
                 self._started_by_arm = False
                 return
@@ -1425,11 +1441,21 @@ class Round4PipelineActivation:
             # caller's restart would name the old update, and a warm proof made on
             # that one must not count for the new.
             signals = await self._read_signals()
-            if self._healthy(signals) and not self._full_refresh_required:
+            snapshot = await pipeline_power.rebase_snapshot(self._pipeline_id)
+            if (
+                self._healthy(signals)
+                and not self._full_refresh_required
+                and not snapshot.owed
+            ):
                 return
             async with self._start_lock:
                 signals = await self._read_signals()
-                if self._healthy(signals) and not self._full_refresh_required:
+                snapshot = await pipeline_power.rebase_snapshot(self._pipeline_id)
+                if (
+                    self._healthy(signals)
+                    and not self._full_refresh_required
+                    and not snapshot.owed
+                ):
                     self._last_seen_update_id = signals.update_id
                 else:
                     self._generation += 1
@@ -1542,7 +1568,8 @@ class Round4PipelineActivation:
             self._resumed_at = str(record.get("resumed_at") or "")
             self._persist(record)
 
-        full_refresh = self._full_refresh_required
+        snapshot = await pipeline_power.rebase_snapshot(self._pipeline_id)
+        full_refresh = bool(self._full_refresh_required) or snapshot.owed
         # A towel's stop (or the idle release) returns while its update is still
         # STOPPING. Starting inside that window met a conflict, joined the dying
         # update, and failed the arm as "start failed in the control plane" (live
@@ -1552,12 +1579,15 @@ class Round4PipelineActivation:
         await self._await_update_not_stopping(signals, notify)
         attempts = 0
         while True:
+            records: list[dict[str, Any]] = []
             try:
-                requested = pipeline_power.start(
+                requested = await asyncio.to_thread(
+                    pipeline_power.start,
                     self._manifest,
                     self._api,
                     full_refresh=full_refresh,
-                    on_record=remember,
+                    rebase_event_id=snapshot.event_id,
+                    on_record=records.append,
                 )
                 break
             except pipeline_power.PipelineUpdateStoppingError:
@@ -1565,6 +1595,9 @@ class Round4PipelineActivation:
                 if attempts >= 3:
                     raise
                 await self._await_update_not_stopping(await self._read_signals(), notify)
+            finally:
+                for record in records:
+                    remember(record)
         # A refused/conflicting request made no rebase happen. Keep the request
         # latched so a later retry cannot silently downgrade a required full
         # refresh to an ordinary resume.
@@ -1578,13 +1611,22 @@ class Round4PipelineActivation:
         self._started_by_process = True
         deadline = self._clock() + self._wait_timeout_seconds
         healthy_observations = 0
+        expected_update = requested.update_id
         while True:
             await self._sleep(self._poll_seconds)
             signals = await self._read_signals()
-            if self._healthy(signals):
+            if expected_update and signals.update_id != expected_update:
+                healthy_observations = 0
+            elif self._healthy(signals):
                 healthy_observations += 1
                 if healthy_observations >= 2:
                     self._last_seen_update_id = signals.update_id
+                    if snapshot.owed and signals.update_id == requested.update_id:
+                        await pipeline_power.note_rebase_satisfied(
+                            self._pipeline_id,
+                            observed_event_id=snapshot.event_id,
+                            actor="pipeline-start",
+                        )
                     await notify("The Managed Sync pipeline is running. Verifying the baseline.")
                     return
             else:
@@ -1596,13 +1638,28 @@ class Round4PipelineActivation:
             if (
                 requested.update_id
                 and signals.update_id == requested.update_id
-                and classify_managed_sync_state(
-                    {signals.synced_table_state},
-                    signals.pipeline_state,
-                    signals.update_state,
+                and (
+                    classify_managed_sync_state(
+                        {signals.synced_table_state},
+                        signals.pipeline_state,
+                        signals.update_state,
+                    )
+                    is ManagedSyncState.FAILED
+                    or signals.update_state.strip().upper()
+                    in PIPELINE_UPDATE_CANCELLED_STATES
                 )
-                is ManagedSyncState.FAILED
             ):
+                if snapshot.owed:
+                    try:
+                        await pipeline_power.note_rebase_owed(
+                            self._pipeline_id, actor="full-refresh-failed"
+                        )
+                    except pipeline_power.RebaseLedgerUnavailableError as exc:
+                        raise ModelScoreLiveOperationError(
+                            "The Managed Sync pipeline start failed in the control "
+                            f"plane ({signals.describe()}); Round 4 also could not "
+                            f"re-record the rebase it still owes ({exc})"
+                        ) from exc
                 raise ModelScoreLiveOperationError(
                     "The Managed Sync pipeline start failed in the control plane "
                     f"({signals.describe()}); Round 4 will not wait for the timeout"
@@ -2079,18 +2136,10 @@ async def read_pipeline_signals(
         ),
     )
     status = _mapping(synced.get("data_synchronization_status"))
-    updates = pipeline.get("latest_updates")
-    newest = (
-        _mapping(updates[0])
-        if isinstance(updates, Sequence)
-        and not isinstance(updates, str | bytes)
-        and updates
-        else {}
-    )
     return PipelineSignals(
         pipeline_state=_enum_value(pipeline.get("state")),
         update_state=latest_pipeline_update_state(pipeline),
-        update_id=str(newest.get("update_id") or ""),
+        update_id=latest_pipeline_update_id(pipeline),
         synced_table_state=_enum_value(status.get("detailed_state")),
         continuous_reported=bool(_mapping(status.get("continuous_update_status"))),
     )
@@ -2455,6 +2504,25 @@ def _required_mapping(value: object, label: str) -> Mapping[str, Any]:
 
 def _enum_value(value: object) -> str:
     return str(getattr(value, "value", value) or "")
+
+
+def latest_pipeline_update_id(payload: Mapping[str, Any]) -> str:
+    """Identity of the newest pipeline update, or ``""`` when there is none.
+
+    Same newest-first walk as :func:`latest_pipeline_update_state`. Lifecycle
+    waits and live signal reads must share it, or a start can exact-match ``""``
+    and never satisfy or re-owe the accepted update.
+    """
+
+    updates = payload.get("latest_updates")
+    if not isinstance(updates, Sequence) or isinstance(updates, str | bytes):
+        return ""
+    for update in updates:
+        mapping = _mapping(update)
+        if mapping:
+            return str(mapping.get("update_id") or "")
+        return ""
+    return ""
 
 
 def latest_pipeline_update_state(payload: Mapping[str, Any]) -> str:

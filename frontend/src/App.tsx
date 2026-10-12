@@ -80,6 +80,7 @@ import {
   ROUND_FIVE_DISPLAY_TITLE,
   ROUND_FIVE_FANIN_PROTOCOL,
   ROUND_FIVE_ID,
+  ROUND_FIVE_MAX_RETRIES,
   ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS,
   ROUND_FIVE_SAMPLED_QUERIES,
   isRoundFiveFanInEvidence,
@@ -3420,11 +3421,15 @@ function App() {
   const titleMusicActiveRef = useRef(false)
   const transitionRef = useRef(0)
   const ringPendingRef = useRef(false)
-  const preparePendingRef = useRef(false)
+  const prepareTransitionRef = useRef<number | null>(null)
   /* reconcileRunStart polls on a bare timer rather than inside an effect, so it
      has no cleanup of its own and would otherwise keep reading the session for
      up to twelve seconds after the app that started it is gone. */
   const mountedRef = useRef(true)
+  // The token an unbroken run of browser history moves started from, and the token after the
+  // latest one. Any other bump ends the run for good.
+  const historyRunRef = useRef<{ from: number; to: number } | null>(null)
+  const roundChangesRef = useRef(0)
   const [ringBlocked, setRingBlocked] = useState(false)
 
   const navigate = useCallback((
@@ -3433,6 +3438,9 @@ function App() {
     mode: HistoryMode = 'push',
   ) => {
     writeBrowserView({ stage: nextStage, setupScene: nextScene }, mode)
+    // Synchronously, so a continuation resuming before the render reads where the
+    // operator is now (`mayContinuePrepare()` in runPrepareFight).
+    stageRef.current = nextStage
     setStage(nextStage)
     setSetupScene(nextScene)
   }, [])
@@ -3488,6 +3496,11 @@ function App() {
   const selectedPersonas = [primary, ...secondary]
     .map((id) => catalog.personas.find((persona) => persona.id === id))
     .filter((persona): persona is NonNullable<typeof persona> => Boolean(persona))
+  const activePersonas = session
+    ? [session.primary_persona.id, ...session.secondary_personas.map((persona) => persona.id)]
+      .map((id) => catalog.personas.find((persona) => persona.id === id))
+      .filter((persona): persona is NonNullable<typeof persona> => Boolean(persona))
+    : selectedPersonas
   const sessionId = session?.id
   const terminalCommentary = session?.state === 'verified'
     && session.round.id === 'survive_connection_spike'
@@ -3586,10 +3599,15 @@ function App() {
     }
   }, [stage, liveEvidenceConnected, session?.state, session?.towel, session?.lanes.lakebase.state, session?.lanes.competitor.state])
 
-  useEffect(() => () => {
-    mountedRef.current = false
-    stopOriginalRoundTheme()
-    stopOriginalTitleTheme()
+  useEffect(() => {
+    // StrictMode re-runs this setup after a simulated unmount; Prepare needs it true again.
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      transitionRef.current += 1
+      stopOriginalRoundTheme()
+      stopOriginalTitleTheme()
+    }
   }, [])
 
   /* What the credits roll needs, assembled once for the two screens that can
@@ -3615,11 +3633,18 @@ function App() {
     const onPopState = (event: PopStateEvent) => {
       const requested = readBrowserView(event.state)
       if (!requested) return
+      const before = transitionRef.current
       transitionRef.current += 1
+      const run = historyRunRef.current
+      historyRunRef.current = {
+        from: run !== null && run.to === before ? run.from : before,
+        to: transitionRef.current,
+      }
       const view = requiresSession(requested.stage) && !sessionRef.current
         ? { stage: 'setup' as const, setupScene: 'card' as const }
         : requested
       if (view !== requested) writeBrowserView(view, 'replace')
+      stageRef.current = view.stage
       setStage(view.stage)
       setSetupScene(view.setupScene)
     }
@@ -4061,6 +4086,8 @@ function App() {
 
   function changeSetupScene(next: SetupScene) {
     if (sound) playConfirm()
+    // Leaving the scene abandons whatever Prepare was still doing for it.
+    transitionRef.current += 1
     navigate('setup', next)
   }
 
@@ -4104,17 +4131,21 @@ function App() {
 
   async function prepareFight(selection: FightSelection) {
     // transitionRef only discards a stale continuation; it does not stop a second
-    // click from creating a second session. This ref is the actual mutex.
-    if (sessionRestorePending || preparePendingRef.current) return
-    preparePendingRef.current = true
+    // click from creating a second session. This ref is the actual mutex, held
+    // only while its own transition is current, so leaving the scene frees it.
+    const holder = prepareTransitionRef.current
+    if (sessionRestorePending || (holder !== null && holder === transitionRef.current)) return
+    // Taken at the click, so a Back pressed during the board read below wins.
+    const transition = ++transitionRef.current
+    prepareTransitionRef.current = transition
     try {
-      await runPrepareFight(selection)
+      await runPrepareFight(selection, transition)
     } finally {
-      preparePendingRef.current = false
+      if (prepareTransitionRef.current === transition) prepareTransitionRef.current = null
     }
   }
 
-  async function runPrepareFight(selection: FightSelection) {
+  async function runPrepareFight(selection: FightSelection, transition: number) {
     const selectionRecommendation = recommend(
       catalog,
       selection.competitor,
@@ -4128,15 +4159,16 @@ function App() {
         const result = await refreshBoutBoard()
         selectionRingStatus = result.board.rounds[selectionRoundId]
       } catch {
+        if (transition !== transitionRef.current) return
         setError('Round status could not be refreshed. Prepare stays locked until the board answers.')
         return
       }
+      if (transition !== transitionRef.current) return
       if (!roundCanStart(selectionRingStatus)) {
         setError(roundBoardMessage(selectionRoundId, selectionRingStatus))
         return
       }
     }
-    const transition = ++transitionRef.current
     const selectionRound = catalog.rounds.find((round) => round.id === selectionRoundId)!
     const selectedRecommendation: LocalRecommendation = {
       ...selectionRecommendation,
@@ -4167,6 +4199,17 @@ function App() {
       return
     }
     let created: DemoSession | null = null
+    // Whether this Prepare's continuation may still act: nothing newer has started, or only
+    // browser history has moved since it began and has brought the operator back to this
+    // same session's Matchup.
+    const mayContinuePrepare = () => mountedRef.current && (
+      transition === transitionRef.current
+      || (created !== null
+        && historyRunRef.current?.from === transition
+        && historyRunRef.current.to === transitionRef.current
+        && sessionRef.current?.id === created.id
+        && stageRef.current === 'matchup')
+    )
     try {
       created = await api.createSession({
         competitor: selection.competitor,
@@ -4175,40 +4218,55 @@ function App() {
         corners: selection.corners,
         round_id: selection.roundOverride,
       })
+      // An abandoned Prepare leaves its DRAFT unadopted and unarmed on the server.
+      if (transition !== transitionRef.current) return
       sessionRef.current = created
       setCommentaryOpen(true)
       setSession(created)
       navigate('matchup', 'card')
       await wait(reducedMotion ? 0 : 1100)
-      if (transition !== transitionRef.current) return
+      if (!mayContinuePrepare()) return
       const armed = await api.armSession(created.id)
+      if (!mayContinuePrepare()) return
       setSession((current) => selectRound4Session(current, armed))
-      if (armed.state === 'armed' && transition === transitionRef.current) {
-        navigate('ready', 'card', 'replace')
-      }
+      if (armed.state === 'armed') navigate('ready', 'card', 'replace')
     } catch (cause) {
       if (
         cause instanceof ApiError
         && cause.status === 409
         && cause.message.includes('ROUND 5 NOT STARTABLE')
       ) {
-        sessionRef.current = null
-        saveActiveSessionPointer(null)
+        const mayContinue = mayContinuePrepare()
+        // Once Back frees Prepare, a newer card may own the session pointer.
+        if (created !== null && sessionRef.current?.id === created.id) {
+          sessionRef.current = null
+          saveActiveSessionPointer(null)
+        }
         if (!mountedRef.current) return
         setSession((current) => current?.id === created?.id ? null : current)
-        if (transition !== transitionRef.current) return
+        if (!mayContinue) return
         navigate('setup', 'card', 'replace')
+        const refusedAt = transitionRef.current
+        const roundChangesAt = roundChangesRef.current
+        // The message is about this round, so another round chosen meanwhile silences it.
+        const stillCurrent = () => (
+          mountedRef.current
+          && transitionRef.current === refusedAt
+          && roundChangesRef.current === roundChangesAt
+        )
         try {
           const result = await refreshBoutBoard()
+          if (!stillCurrent()) return
           setError(roundBoardMessage(selectionRoundId, result.board.rounds[selectionRoundId]))
         } catch {
+          if (!stillCurrent()) return
           setError(
             'Round 5 is resetting and will reopen automatically. Other rounds remain available.',
           )
         }
         return
       }
-      if (transition !== transitionRef.current) return
+      if (!mayContinuePrepare()) return
       if (cause instanceof ApiError && cause.status === 409 && cause.message.includes('BOUT IN PROGRESS')) {
         // Keep the server's refusal verbatim. It names the round, the phase and,
         // when a towel's cleanup is what is holding the ring, why. Substituting
@@ -4225,22 +4283,25 @@ function App() {
       if (created && cause instanceof ApiError && cause.status === 0) {
         try {
           const recovered = await api.getSession(created.id)
-          if (transition !== transitionRef.current) return
-          sessionRef.current = recovered
-          setSession((current) => selectRound4Session(current, recovered))
-          if (recovered.state !== 'draft') {
-            if (recovered.state === 'failed' && !recovered.run_started_at) {
-              setError(recovered.failure ?? cause.message)
+          if (!mayContinuePrepare()) return
+          // The stream may already have delivered a newer snapshot than this read.
+          const selected = selectRound4Session(sessionRef.current, recovered) ?? recovered
+          sessionRef.current = selected
+          setSession(selected)
+          if (selected.state !== 'draft') {
+            if (selected.state === 'failed' && !selected.run_started_at) {
+              setError(selected.failure ?? cause.message)
               setSession(null)
               navigate('setup', 'card', 'replace')
             } else {
-              navigate(sessionStage(recovered), 'card', 'replace')
+              navigate(sessionStage(selected), 'card', 'replace')
             }
             return
           }
         } catch {
           // The normal setup error below remains actionable when reconciliation is unavailable.
         }
+        if (!mayContinuePrepare()) return
       }
       sessionRef.current = null
       setSession(null)
@@ -4254,6 +4315,8 @@ function App() {
   }
 
   function changeRoundOverride(id: RoundId | null) {
+    const nextRoundId = id ?? recommendation.round_id
+    if (nextRoundId !== selectedRoundId) roundChangesRef.current += 1
     setRoundOverride(id)
   }
 
@@ -4458,6 +4521,8 @@ function App() {
       && session.state !== 'failed'
     ) || !proofNavigationAllowsExit(session)) return
     const completed = session
+    // Between-screen navigation abandons an in-flight "Ring again" Prepare.
+    transitionRef.current += 1
     setError(null)
     if (isRoundSix(completed) && completed.state === 'verified') {
       navigate('finale', 'card')
@@ -4583,6 +4648,8 @@ function App() {
   }
 
   function showScorecard() {
+    // Leaving Between for the scorecard abandons an in-flight "Ring again" Prepare.
+    transitionRef.current += 1
     navigate('scorecard', 'card')
   }
 
@@ -4639,8 +4706,11 @@ function App() {
   if (stage === 'matchup') {
     return (
       <Matchup
-        competitor={opponentLabel(session?.round.id ?? selectedRoundId, selectedCompetitor.short_name)}
-        personas={selectedPersonas}
+        competitor={opponentLabel(
+          session?.round.id ?? selectedRoundId,
+          session?.competitor.short_name ?? selectedCompetitor.short_name,
+        )}
+        personas={activePersonas}
         reducedMotion={reducedMotion}
         uiReview={uiReview}
         status={armStatus}
@@ -4656,12 +4726,12 @@ function App() {
   if (stage === 'ready' && session) {
     return (
       <Ready
-        competitor={opponentLabel(session.round.id, selectedCompetitor.short_name)}
+        competitor={opponentLabel(session.round.id, session.competitor.short_name)}
         roundTitle={isRoundFive(session) ? ROUND_FIVE_DISPLAY_TITLE : session.round.title}
         competitorLaneState={session.lanes.competitor.state}
         sessionState={session.state}
         armedExpiresAt={session.armed_expires_at}
-        personas={selectedPersonas}
+        personas={activePersonas}
         sound={sound}
         onToggleSound={toggleSound}
         onRing={ring}
@@ -4704,7 +4774,7 @@ function App() {
         missedCalls={missedCalls}
         roundNumber={currentRoundIndex + 1}
         task={session.round.title}
-        competitor={selectedCompetitor.short_name}
+        competitor={session.competitor.short_name}
         error={error}
         liveEvidenceConnected={liveEvidenceConnected}
         uiReview={uiReview}
@@ -5594,6 +5664,11 @@ function roundFiveMemoryDisplay(value: number | null): string {
   return value === null ? 'N/A' : `${(value / 1024 ** 3).toFixed(2)} GiB`
 }
 
+function roundFiveLoginRetryBudget(session: DemoSession): number {
+  const budget = session.fairness.max_retries
+  return budget === ROUND_FIVE_MAX_RETRIES ? budget : ROUND_FIVE_MAX_RETRIES
+}
+
 function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
   const setupSkew = isRoundFiveSetupEvidence(session.round5_setup)
     ? session.round5_setup?.workflow_launch_skew_ms
@@ -5646,7 +5721,7 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
       <div className="round5-fairness" aria-label="Round 5 fair proof contract">
         <strong>PHASE 2 FAIRNESS</strong>
         <span>{legacy ? 'Current 10,000-client target not recorded' : `${session.fairness.target_clients_per_lane?.toLocaleString() ?? 'N/A'} target clients / lane`}</span>
-        <span>{legacy ? 'Legacy scorecard decoded' : `${session.fairness.hold_seconds ?? 'N/A'}s common hold · zero retries`}</span>
+        <span>{legacy ? 'Legacy scorecard decoded' : `${session.fairness.hold_seconds ?? 'N/A'}s common hold · up to ${roundFiveLoginRetryBudget(session)} retried logins / lane`}</span>
         <span>{v4 ? 'Two isolated physical runners' : 'Identical neutral runner'} · {session.fairness.runner ?? 'N/A'}</span>
         <span>TLS {session.fairness.tls ?? 'N/A'} · timeout {session.fairness.timeout ?? 'N/A'}</span>
       </div>
@@ -6903,7 +6978,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Legacy scorecard', code: 'Decoded successfully · current 10,000-client fan-in evidence not recorded', note: 'No current fan-in result is inferred from legacy fields.' },
         ]
       : [
-          { label: 'Exact client fan-in', code: '10,000 authenticated held clients / lane · zero retries' },
+          { label: 'Exact client fan-in', code: `10,000 authenticated held clients / lane · up to ${roundFiveLoginRetryBudget(session)} retried logins / lane` },
           { label: v4 ? 'Authoritative bell' : 'Shared release', code: v4 ? 'one server T0 → release both independent physical lane gates' : 'one monotonic T0 → alternating equal waves for both lanes', note: 'Every provider and ramp delay remains scored.' },
           { label: 'Common hold', code: `10,000 clients / lane held for at least 30s · ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks / lane` },
           { label: 'Multiplexing check', code: 'separate direct observers count dedicated-role PostgreSQL backend PIDs', note: 'This is not a transaction-throughput test.' },

@@ -224,6 +224,9 @@ class FlakyConnector(RecordingConnector):
 
 
 class FakeDatabricksRunner:
+    async def settle_pending_requests(self, timeout_seconds: float) -> None:
+        del timeout_seconds
+
     def __init__(self) -> None:
         self.events: list[str] = []
         self.commands: list[list[str]] = []

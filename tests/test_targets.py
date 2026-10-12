@@ -265,6 +265,9 @@ class FakeLakebaseRunner:
         self.endpoint = endpoint
         self.requests: list[tuple[str, str]] = []
 
+    async def settle_pending_requests(self, timeout_seconds: float) -> None:
+        del timeout_seconds
+
     async def json(self, method: str, path: str, *, body=None, timeout_seconds: float = 120.0):
         del timeout_seconds
         self.requests.append((method, path))

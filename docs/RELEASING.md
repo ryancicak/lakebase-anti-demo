@@ -62,6 +62,13 @@ past a step hides the defect the step exists to find.
    Aurora has paused (`seconds_until_auto_pause` is 300 in `infra/aws/aurora.tf`;
    give it ten minutes), then run `./bootstrap.sh --apply --reset-ready --yes`.
    Setup racing Aurora's resume is a failure this step found just before v1.0.0.
+   An existing ready install must not be upgraded with only
+   `./bootstrap.sh --deploy-only`: that republishes the app without creating or
+   granting `anti_demo_coordination.round4_source_rebase`, and the app then
+   refuses to boot. Run `antidemo coordination-upgrade` first (creates/grants
+   coordination tables; does not reset database lanes), then `--deploy-only`.
+   `antidemo setup` on a ready install is the destructive lane-reset resume, not
+   this upgrade.
 
 ## 3. The one command
 

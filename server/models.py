@@ -1542,6 +1542,10 @@ class SessionSnapshot(BaseModel):
     cost_receipt: CostReceiptSnapshot | None = None
     cooldown: CooldownSnapshot | None = None
     towel: TowelSnapshot | None = None
+    # Which arm of this card the snapshot belongs to, fresh on every arm and set
+    # before CHECKING, so a bout that never reached ARMED still has an identity.
+    # It keys the durable receipt row and is excluded from browser payloads.
+    receipt_bout_id: str | None = Field(default=None, exclude=True)
     armed_at: datetime | None = None
     armed_expires_at: datetime | None = None
     run_started_at: datetime | None = None

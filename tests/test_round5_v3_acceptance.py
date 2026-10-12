@@ -243,7 +243,7 @@ def _proxy_stamp_orchestrator():
 
     orchestrator = object.__new__(live.LiveConnectionSpikeSetupOrchestrator)
     orchestrator._monotonic_ns = time.monotonic_ns
-    # Req #7: the reused CreateDBProxy worker slot (created lazily via
+    # The reused CreateDBProxy worker slot (created lazily via
     # _ensure_createproxy_executor; __init__ is bypassed by object.__new__).
     orchestrator._createproxy_executor = None
     orchestrator.config = SimpleNamespace(
@@ -963,10 +963,13 @@ async def test_asymmetric_failure_preserves_verified_lane_evidence() -> None:
     lakebase.evidence = {"held_clients_at_gate": 10_000}
     lakebase.error = None
 
+    async def hand_off_cleanup(_record):
+        return None
+
+    manager._begin_connection_spike_cleanup_handoff = hand_off_cleanup
     await manager._finish_connection_spike_failure(
         record,
         "Aurora dispatch failed",
-        cleanup_verified=True,
     )
     failed = await manager.get(created.id)
 
@@ -1018,17 +1021,22 @@ async def test_global_failure_after_two_verified_lanes_is_terminal_once() -> Non
         lane.state = LaneState.VERIFIED
         lane.status = "independently verified"
         lane.evidence = {"held_clients_at_gate": 10_000}
+    handoffs: list[str] = []
+
+    async def hand_off_cleanup(handed):
+        handoffs.append(handed.snapshot.id)
+
+    manager._begin_connection_spike_cleanup_handoff = hand_off_cleanup
     await manager._finish_connection_spike_failure(
         record,
         "Global launch skew invalid",
-        cleanup_verified=True,
     )
     event_count = len(record.event_log.events)
     await manager._finish_connection_spike_failure(
         record,
         "late duplicate",
-        cleanup_verified=True,
     )
+    assert handoffs == [created.id]
     failed = await manager.get(created.id)
     assert failed.state == SessionState.FAILED
     assert failed.comparison is None
@@ -1061,7 +1069,6 @@ async def test_cleanup_is_not_retryable_until_a_cleanup_attempt_fails() -> None:
     await manager._finish_connection_spike_failure(
         record,
         "Aurora dispatch failed",
-        cleanup_verified=False,
     )
     in_progress = await manager.get(created.id)
     assert in_progress.round5_setup is not None
@@ -1121,7 +1128,7 @@ async def test_run_returns_one_bell_and_two_advancing_clocks_without_provider_pr
             assert bout_id and fencing_token > 0
 
         async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
-            # Required bell seam (req #6): manager calls it directly before T0.
+            # Required bell seam: manager calls it directly before T0.
             assert bout_id and fencing_token > 0
 
         async def setup(
@@ -1170,6 +1177,9 @@ async def test_run_returns_one_bell_and_two_advancing_clocks_without_provider_pr
 
         def release_claim_active(self, claim_id):
             del claim_id
+
+        def require_dispatchable(self, claim):
+            del claim
 
         async def accept_bell(self, claim_id):
             assert claim_id == "claim-one"
@@ -1303,6 +1313,9 @@ async def test_a_towel_freezes_both_clocks_at_the_towel_not_at_their_last_milest
         def release_claim_active(self, claim_id):
             del claim_id
 
+        def require_dispatchable(self, claim):
+            del claim
+
         async def accept_bell(self, claim_id):
             return BellContext(
                 bell_id="bell-one",
@@ -1373,7 +1386,7 @@ async def test_progress_terminal_inversion_is_ordered_and_late_callback_is_ignor
             assert bout_id and fencing_token > 0
 
         async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
-            # Required bell seam (req #6): manager calls it directly before T0.
+            # Required bell seam: manager calls it directly before T0.
             assert bout_id and fencing_token > 0
 
         async def setup(
@@ -1480,6 +1493,9 @@ async def test_progress_terminal_inversion_is_ordered_and_late_callback_is_ignor
 
         def release_claim_active(self, claim_id):
             del claim_id
+
+        def require_dispatchable(self, claim):
+            del claim
 
         async def accept_bell(self, claim_id):
             return BellContext(
@@ -1593,7 +1609,7 @@ async def test_v3_towel_wins_lock_before_natural_setup_return() -> None:
             assert bout_id and fencing_token > 0
 
         async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
-            # Required bell seam (req #6): manager calls it directly before T0.
+            # Required bell seam: manager calls it directly before T0.
             assert bout_id and fencing_token > 0
 
         async def setup(
@@ -1642,6 +1658,9 @@ async def test_v3_towel_wins_lock_before_natural_setup_return() -> None:
 
         def release_claim_active(self, claim_id):
             del claim_id
+
+        def require_dispatchable(self, claim):
+            del claim
 
         async def accept_bell(self, claim_id):
             return BellContext(

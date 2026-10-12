@@ -247,13 +247,25 @@ Three notes for a reviewing cloud team, spelled out in
 ## Deploying the Databricks App
 
 ```bash
+./antidemo coordination-upgrade       # create/grant coordination tables; no lane reset
 ./bootstrap.sh --deploy-only          # publish the seal, deploy, restart, verify
 ./bootstrap.sh --apply --deploy-app   # provision and deploy in one run
 ./bootstrap.sh                        # reports drift, deploys nothing (writes a local profile)
 ```
 
 `--deploy-only` never touches AWS and never runs Terraform. It skips the
-permissions preflight, the state-backend decision and the bill.
+permissions preflight, the state-backend decision and the bill. It also does
+**not** create or grant coordination tables. An existing ready install that
+predates `anti_demo_coordination.round4_source_rebase` (or has the table
+without the app's SELECT/INSERT and sequence USAGE grants) must run
+`antidemo coordination-upgrade` as the schema owner **before** the next app
+deploy. That command calls `ensure_coordination` to create missing objects and
+`_grant_round4_postgres` to issue runtime grants. It does not run Terraform and
+does not reset measured database lanes. `antidemo setup` on a ready install is
+the installer resume that *does* reseed those lanes — do not use it as the
+upgrade path. The deployed app is not allowed to CREATE on that schema; if the
+table is missing or ungranted, startup refuses rather than installing no power
+store and serving anyway. `antidemo renew` does not provision this table.
 
 ### How the deployed app gets AWS credentials, and what breaks them
 
@@ -394,7 +406,8 @@ stale seal — and a stale seal is not inert here. The app will compare it, deci
 Round 5 is available, **advertise the round as ready on the card**, and then fail
 an assume-role *after the bell*. The round is promised to the room and then dies.
 
-So a Round 5-capable redeploy is `./bootstrap.sh --deploy-only`, which
+So a Round 5-capable redeploy is `./antidemo coordination-upgrade` if this
+checkout added coordination objects, then `./bootstrap.sh --deploy-only`, which
 republishes the seal and redeploys together — not a source-only push. Run
 `./bootstrap.sh` with no flags first if you want the drift reported before you
 spend anything; it is the check described in
@@ -867,6 +880,18 @@ GRANT SELECT, INSERT ON anti_demo_coordination.round4_pipeline_power
 -- `event_id` is bigserial, so an INSERT that omits it draws from the sequence.
 GRANT USAGE, SELECT ON SEQUENCE
   anti_demo_coordination.round4_pipeline_power_event_id_seq
+  TO "<app-client-id>";
+
+-- Round 4 rebase owed after a Delta-source repair. Append-only, keyed by the
+-- sealed pipeline, so a Prepare that repairs and then never rings still leaves
+-- the next bell (including after a restart) requesting a full refresh. Separate
+-- from round4_pipeline_power so these rows cannot reorder resuming vs stop_owed.
+-- Existing installs: `antidemo coordination-upgrade` creates and grants this
+-- without resetting lanes; `./bootstrap.sh --deploy-only` does not.
+GRANT SELECT, INSERT ON anti_demo_coordination.round4_source_rebase
+  TO "<app-client-id>";
+GRANT USAGE, SELECT ON SEQUENCE
+  anti_demo_coordination.round4_source_rebase_event_id_seq
   TO "<app-client-id>";
 
 -- Round 5 automatic warm slot. The installation-scoped head is changed by

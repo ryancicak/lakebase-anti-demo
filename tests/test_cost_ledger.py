@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -378,6 +379,188 @@ def _lakebase_cost_store(cursor: _CatalogCursor) -> LakebaseCostLedgerStore:
             )
         ),
     )
+
+
+class _RecordingCursor:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    async def __aenter__(self) -> _RecordingCursor:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        self.statements.append(" ".join(sql.split()))
+
+    async def fetchone(self) -> tuple | None:
+        return None
+
+    async def fetchall(self) -> list[tuple]:
+        return []
+
+
+class _BlackHoledCursor(_RecordingCursor):
+    """Its first statement never answers. Cancelled, it does what psycopg 3.3 does: waits
+    on the same socket again, and when the kernel gives that socket up the call raises
+    OperationalError, not CancelledError."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = asyncio.Event()
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        await super().execute(sql, params)
+        self.waiting.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            raise psycopg.OperationalError(
+                "consuming input failed: server closed the connection unexpectedly"
+            ) from None
+
+
+class _RefusedCursor(_RecordingCursor):
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        await super().execute(sql, params)
+        raise psycopg.OperationalError("server closed the connection unexpectedly")
+
+
+def _lakebase_cost_store_on(
+    *cursors: _RecordingCursor,
+) -> tuple[LakebaseCostLedgerStore, list[_RecordingCursor], list[dict[str, object]]]:
+    pending = list(cursors)
+    opened: list[_RecordingCursor] = []
+    connections: list[dict[str, object]] = []
+
+    async def connect(**kwargs: object) -> _CatalogConnection:
+        connections.append(kwargs)
+        cursor = pending.pop(0)
+        opened.append(cursor)
+        return _CatalogConnection(cursor)  # type: ignore[arg-type]
+
+    store = LakebaseCostLedgerStore(
+        endpoint_name="coordination-endpoint",
+        database="anti_demo",
+        host="coordination.example",
+        user="app-service-principal",
+        connector=connect,
+        workspace_client=SimpleNamespace(
+            postgres=SimpleNamespace(
+                generate_database_credential=lambda _name: SimpleNamespace(token="tok")
+            )
+        ),
+    )
+    return store, opened, connections
+
+
+async def test_an_abandoned_cost_ledger_call_is_never_sent_again() -> None:
+    hung = _BlackHoledCursor()
+    fresh = _RecordingCursor()
+    store, opened, _connections = _lakebase_cost_store_on(hung, fresh)
+    closing = asyncio.ensure_future(
+        store.close_bout(
+            installation_id=INSTALLATION_ID,
+            bout_id="bout-1",
+            window_end=NOW,
+            terminal_outcome="towelled",
+        )
+    )
+    await asyncio.wait_for(hung.waiting.wait(), timeout=1)
+
+    closing.cancel()
+    await asyncio.wait({closing}, timeout=5)
+
+    assert closing.cancelled()
+    assert opened == [hung]
+    assert fresh.statements == []
+
+
+async def test_a_close_from_an_already_cancelled_tasks_cleanup_is_still_retried() -> None:
+    """A cancelled run's ``finally`` closes its window from the cancelled task. That close
+    is the task's own cleanup, not an abandoned call, so a refused connection is retried."""
+
+    refused = _RefusedCursor()
+    fresh = _RecordingCursor()
+    store, opened, _connections = _lakebase_cost_store_on(refused, fresh)
+    entered = asyncio.Event()
+    reached: list[str] = []
+
+    async def cancelled_then_closes() -> None:
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            try:
+                await store.close_bout(
+                    installation_id=INSTALLATION_ID,
+                    bout_id="bout-1",
+                    window_end=NOW,
+                    terminal_outcome="cancelled",
+                )
+            except KeyError:
+                reached.append("second connection")
+
+    task = asyncio.create_task(cancelled_then_closes())
+    await entered.wait()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert opened == [refused, fresh]
+    assert reached == ["second connection"]
+
+
+async def test_a_cost_ledger_call_nobody_cancelled_is_still_retried_once() -> None:
+    refused = _RefusedCursor()
+    fresh = _RecordingCursor()
+    store, opened, _connections = _lakebase_cost_store_on(refused, fresh)
+
+    with pytest.raises(KeyError, match="unknown cost bout"):
+        await store.close_bout(
+            installation_id=INSTALLATION_ID,
+            bout_id="bout-1",
+            window_end=NOW,
+            terminal_outcome="towelled",
+        )
+    assert opened == [refused, fresh]
+    assert fresh.statements
+
+
+async def test_the_cost_ledger_connection_bounds_a_silent_peer() -> None:
+    """A towel waits on this ledger; a black-holed socket must end, as on the ring's."""
+
+    store, _opened, connections = _lakebase_cost_store_on(_RecordingCursor())
+
+    with pytest.raises(KeyError, match="unknown cost bout"):
+        await store.close_bout(
+            installation_id=INSTALLATION_ID,
+            bout_id="bout-1",
+            window_end=NOW,
+            terminal_outcome="towelled",
+        )
+    (kwargs,) = connections
+    assert {
+        key: kwargs.get(key)
+        for key in (
+            "connect_timeout",
+            "keepalives",
+            "keepalives_idle",
+            "keepalives_interval",
+            "keepalives_count",
+            "tcp_user_timeout",
+        )
+    } == {
+        "connect_timeout": 15,
+        "keepalives": 1,
+        "keepalives_idle": 5,
+        "keepalives_interval": 5,
+        "keepalives_count": 3,
+        "tcp_user_timeout": 20_000,
+    }
+    server_side = ("statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout")
+    assert not set(server_side) & set(kwargs)
 
 
 async def test_a_consumer_starts_on_a_ledger_it_can_see_but_may_not_create() -> None:

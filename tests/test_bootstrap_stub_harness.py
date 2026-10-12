@@ -556,6 +556,7 @@ def test_apply_against_a_ready_install_refuses_and_names_the_redeploy_path(tmp_p
         "--apply is not a resume",
         "RESET of both database lanes",
         "./bootstrap.sh --deploy-only",
+        "./antidemo coordination-upgrade",
         "./bootstrap.sh --apply --reset-ready",
     ):
         assert phrase in refused.stderr, f"{phrase!r} missing from:\n{refused.stderr}"

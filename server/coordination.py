@@ -159,6 +159,16 @@ def _as_utc(moment: datetime) -> datetime:
 #: speaks a false accusation rather than a finding.
 PINNED_LEASE_PHASES = frozenset({"armed", "cooldown_failed"})
 
+#: Phases whose owner renews on its own fixed cadence rather than the process-wide
+#: one. Silence is judged against the slower of the two, so a healthy owner is not
+#: accused between renewals. Round 4 stop recovery renews every
+#: ``min(30, ttl / 3)`` seconds; the startup gate every 15 s.
+ROUND4_STOP_RECOVERY_HEARTBEAT_SECONDS = 30.0
+PHASE_HEARTBEAT_SECONDS: dict[str, float] = {
+    "round4_stop_recovery": ROUND4_STOP_RECOVERY_HEARTBEAT_SECONDS,
+    "startup_cleanup": 15.0,
+}
+
 
 @dataclass(frozen=True)
 class HeldLeaseDiagnosis:
@@ -193,11 +203,15 @@ def diagnose_held_lease(
     was the common case, and it told an operator the ring was probably dead at
     the one moment it was certainly alive.
     """
-    interval = lease_heartbeat_seconds() if heartbeat_seconds is None else heartbeat_seconds
+    phase = lease.phase.strip().casefold()
+    if heartbeat_seconds is None:
+        interval = max(lease_heartbeat_seconds(), PHASE_HEARTBEAT_SECONDS.get(phase, 0.0))
+    else:
+        interval = heartbeat_seconds
     observed = _as_utc(now)
     remaining = max(0, ceil((_as_utc(lease.expires_at) - observed).total_seconds()))
     heartbeat_age = max(0, floor((observed - _as_utc(lease.updated_at)).total_seconds()))
-    pinned = lease.phase.strip().casefold() in PINNED_LEASE_PHASES
+    pinned = phase in PINNED_LEASE_PHASES
     return HeldLeaseDiagnosis(
         remaining_seconds=remaining,
         heartbeat_age_seconds=heartbeat_age,
@@ -652,7 +666,13 @@ class BoutLeaseStore(Protocol):
 
     async def renew(self, lease: BoutLease, *, ttl: timedelta) -> BoutLease: ...
 
-    async def release(self, lease: BoutLease) -> bool: ...
+    async def release(self, lease: BoutLease) -> bool:
+        """Release ``lease``: True only if it was still live, never for a lapsed row.
+
+        No write revives a lapsed lease, so True also proves the ring was this
+        lease's without a break from its claim to its release.
+        """
+        ...
 
     async def current(self) -> BoutLease | None: ...
 
@@ -799,6 +819,7 @@ class InMemoryBoutLeaseStore:
                 or active.fencing_token != lease.fencing_token
                 or active.session_id != lease.session_id
                 or active.owner_subject != lease.owner_subject
+                or active.phase != lease.phase
             ):
                 return False
             self._lease = None
@@ -877,6 +898,9 @@ class LakebaseBoutLeaseStore:
             return self.host, self.user, self._cached_token
 
     async def _run(self, operation: Callable[[Any], Awaitable[T]]) -> T:
+        task = asyncio.current_task()
+        # A cleanup that runs in an already-cancelled task enters with its count raised.
+        cancels_on_entry = task.cancelling() if task is not None else 0
         last_error: BaseException | None = None
         for attempt in range(2):
             try:
@@ -890,12 +914,25 @@ class LakebaseBoutLeaseStore:
                     sslmode="require",
                     application_name="lakebase-anti-demo-coordination",
                     connect_timeout=15,
+                    # A caller's timeout cannot end a call on a black-holed socket:
+                    # psycopg waits on it again after cancelling. These bound a silent
+                    # peer, never a slow statement, which the server still answers.
+                    keepalives=1,
+                    keepalives_idle=5,
+                    keepalives_interval=5,
+                    keepalives_count=3,
+                    tcp_user_timeout=20_000,
                     autocommit=True,
                 )
                 async with connection:
                     async with connection.cursor() as cursor:
                         return await operation(cursor)
             except psycopg.OperationalError as exc:
+                if task is not None and task.cancelling() > cancels_on_entry:
+                    # psycopg meets a cancel by waiting on the same socket, and raises
+                    # this once that socket dies. Sent again, the call would land after
+                    # its caller gave up on it, say after a lease was declared lost.
+                    raise asyncio.CancelledError from exc
                 last_error = exc
                 self._cached_token = ""
                 if attempt == 0:
@@ -1248,7 +1285,9 @@ class LakebaseBoutLeaseStore:
                   AND lease_id = %s::uuid
                   AND fencing_token = %s
                   AND session_id = %s
+                  AND expires_at > clock_timestamp()
                   AND owner_subject = %s
+                  AND phase = %s
                 RETURNING fencing_token
                 """,
                 (
@@ -1257,6 +1296,7 @@ class LakebaseBoutLeaseStore:
                     lease.fencing_token,
                     lease.session_id,
                     lease.owner_subject,
+                    lease.phase,
                 ),
             )
             return await cursor.fetchone() is not None

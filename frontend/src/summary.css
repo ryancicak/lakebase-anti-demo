@@ -36,7 +36,6 @@
 }
 
 .summary-header,
-.summary-status,
 .summary-rounds,
 .summary-footer {
   position: relative;
@@ -117,7 +116,9 @@
   border-left-color: #f8d83b;
 }
 
-.summary-round[data-status="unrun"] {
+.summary-round[data-status="unrun"],
+.summary-round[data-status="reading"],
+.summary-round[data-status="unread"] {
   background: #080d24;
   box-shadow: none;
 }
@@ -186,7 +187,9 @@
 }
 
 .summary-round[data-status="no_result"] .summary-winner,
-.summary-round[data-status="unrun"] .summary-winner {
+.summary-round[data-status="unrun"] .summary-winner,
+.summary-round[data-status="reading"] .summary-winner,
+.summary-round[data-status="unread"] .summary-winner {
   color: #9aa3c4;
 }
 
@@ -243,13 +246,16 @@
   transition: background 120ms steps(2);
 }
 
-.summary-status {
-  font-family: ui-monospace, monospace;
-  font-weight: 900;
+.summary-record {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.summary-header .summary-status {
   font-size: clamp(11px, .8vw, 14px);
   line-height: 1.6;
   color: #f8d83b;
-  margin: 0;
   overflow-wrap: anywhere;
 }
 

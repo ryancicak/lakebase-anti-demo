@@ -343,9 +343,11 @@ Databricks App is still serving a current seal, and you should assume it is not.
 than to a path, so every `antidemo setup`, resume and `antidemo renew` rewrites the
 manifest while the deployed app keeps serving whatever was last pushed. Check
 mode compares the manifest's hash against a local record of what was pushed and
-reports `drift` when they disagree; `./bootstrap.sh --deploy-only` republishes,
-redeploys, restarts and then verifies the container actually started. It never
-touches AWS and never runs Terraform. A *matching* seal cannot be proven — the
+reports `drift` when they disagree; `./antidemo coordination-upgrade` creates
+and grants coordination tables without resetting lanes, then
+`./bootstrap.sh --deploy-only` republishes, redeploys, restarts and then
+verifies the container actually started. `--deploy-only` never touches AWS and
+never runs Terraform. A *matching* seal cannot be proven — the
 secret value is unreadable through the public API — so it fails toward
 "republish". [docs/DEPLOY.md](docs/DEPLOY.md) has the detail, including the parts
 that have never been run against a live workspace.

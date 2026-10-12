@@ -1058,6 +1058,7 @@ class FakePipelineApi:
         self.running = running
         self.calls: list[tuple[str, str]] = []
         self.update_bodies: list[object] = []
+        self.latest_update_id = "u1"
 
     def __call__(self, profile, method, path, *, body=None, timeout=600):
         self.calls.append((method, path))
@@ -1067,12 +1068,16 @@ class FakePipelineApi:
         if method == "post" and path.endswith("/updates"):
             self.update_bodies.append(body)
             self.running = True
+            self.latest_update_id = "update-1"
             return {"update_id": "update-1"}
         if "/pipelines/" in path:
             return {
                 "state": "RUNNING" if self.running else "IDLE",
                 "latest_updates": [
-                    {"state": "RUNNING" if self.running else "CANCELED", "update_id": "u1"}
+                    {
+                        "state": "RUNNING" if self.running else "CANCELED",
+                        "update_id": self.latest_update_id,
+                    }
                 ],
             }
         status = {
@@ -1282,6 +1287,7 @@ async def test_a_repaired_source_can_restart_after_an_older_failed_update() -> N
                 self.calls.append((method, path))
                 self.requested = True
                 self.running = True
+                self.latest_update_id = "new-update"
                 return {"update_id": "new-update"}
             if "/pipelines/" in path and not self.requested:
                 self.calls.append((method, path))
@@ -1331,9 +1337,17 @@ async def test_a_pipeline_that_never_comes_back_refuses_the_arm_rather_than_hang
 
     class NeverStarts(FakePipelineApi):
         def __call__(self, profile, method, path, *, body=None, timeout=600):
-            result = super().__call__(profile, method, path, body=body, timeout=timeout)
-            self.running = False
-            return result
+            if method == "post":
+                return super().__call__(profile, method, path, body=body, timeout=timeout)
+            if "/pipelines/" in path:
+                self.calls.append((method, path))
+                return {
+                    "state": "RUNNING",
+                    "latest_updates": [
+                        {"state": "INITIALIZING", "update_id": "update-1"}
+                    ],
+                }
+            return {"data_synchronization_status": {"detailed_state": "SYNCED_TABLE_ONLINE"}}
 
     api = NeverStarts(running=False)
     clock = iter([0.0, 0.0, 400.0, 500.0, 600.0])
@@ -2062,13 +2076,32 @@ class SlowStart(FakePipelineApi):
         if method == "post" and path.endswith("/updates"):
             self.calls.append((method, path))
             self.update_bodies.append(body)
-            self.started.set()
+            self.latest_update_id = "update-1"
             return {"update_id": "update-1"}
-        if method == "get" and "/database/synced_tables/" in path and self.started.is_set():
+        if method == "get" and "/pipelines/" in path:
+            self.calls.append((method, path))
+            if self.latest_update_id == "update-1":
+                self.started.set()
+            if self.reads_until_healthy <= 0:
+                self.running = True
+            return {
+                "state": "RUNNING" if self.running else "IDLE",
+                "latest_updates": [
+                    {
+                        "state": "RUNNING" if self.latest_update_id == "update-1" else "CANCELED",
+                        "update_id": self.latest_update_id,
+                    }
+                ],
+            }
+        if (
+            method == "get"
+            and "/database/synced_tables/" in path
+            and self.latest_update_id == "update-1"
+        ):
             if self.reads_until_healthy > 0:
                 self.reads_until_healthy -= 1
-            else:
-                self.running = True
+                return {"data_synchronization_status": {"detailed_state": "SYNCED_TABLE_ONLINE"}}
+            self.running = True
         return super().__call__(profile, method, path, body=body, timeout=timeout)
 
 

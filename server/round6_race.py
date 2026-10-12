@@ -155,8 +155,12 @@ class Lane(Protocol):
     async def read_history(self, order: LiveOrder) -> bool:
         """Whether this lane's history holds ``order`` as exactly one insert."""
 
-    async def start(self) -> None:
-        """Start the pipeline from parked. Returns once the request is accepted."""
+    async def start(self, *, on_refused: Callable[[BaseException], None] | None = None) -> None:
+        """Start the pipeline from parked. Returns once the request is accepted.
+
+        A pipeline started by several requests answers only once every one has, and hands the
+        first refusal to ``on_refused`` as soon as it comes.
+        """
 
     async def failure(self) -> str | None:
         """The pipeline's own terminal failure since its start, if it has failed."""
@@ -341,7 +345,15 @@ class Round6RaceEngine:
         progress = _ProgressRelay(on_progress)
         clock = _Clock(self._clock_ns, self._clock_ns())
         rung_at = self._now()
-        starts = {lane.lane_id: self._track(lane.start()) for lane in self.lanes}
+        refused: dict[str, BaseException] = {}
+        starts = {
+            lane.lane_id: self._track(
+                lane.start(
+                    on_refused=lambda exc, lane_id=lane.lane_id: refused.setdefault(lane_id, exc)
+                )
+            )
+            for lane in self.lanes
+        }
         commit_ack: dict[str, float] = {}
         commits = {lane.lane_id: self._track(lane.commit(order)) for lane in self.lanes}
         for lane_id, commit in commits.items():
@@ -361,6 +373,7 @@ class Round6RaceEngine:
                     order,
                     clock,
                     starts[lane.lane_id],
+                    refused,
                     commits[lane.lane_id],
                     commit_ack,
                     progress.emit,
@@ -476,6 +489,7 @@ class Round6RaceEngine:
         order: LiveOrder,
         clock: _Clock,
         start: asyncio.Future[Any],
+        refused: Mapping[str, BaseException],
         commit: asyncio.Future[Any],
         commit_ack: Mapping[str, float],
         report: Callable[[str, Round6Phase, str, float | None], None],
@@ -518,10 +532,11 @@ class Round6RaceEngine:
             while True:
                 if commit.done() and not commit.cancelled() and commit.exception() is not None:
                     return outcome(False, f"{lane.label}'s checkout did not commit", None)
-                if start.done() and not start.cancelled() and start.exception() is not None:
-                    return outcome(
-                        False, f"{lane.label} could not be started: {start.exception()}", None
-                    )
+                refusal = refused.get(lane.lane_id)
+                if refusal is None and start.done() and not start.cancelled():
+                    refusal = start.exception()
+                if refusal is not None:
+                    return outcome(False, f"{lane.label} could not be started: {refusal}", None)
                 began_ns = clock.now_ns()
                 if previous_start_ns is not None:
                     max_gap_ms = max(max_gap_ms, (began_ns - previous_start_ns) / 1_000_000)

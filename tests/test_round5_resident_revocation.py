@@ -1068,7 +1068,7 @@ def test_disposition_function_binds_exact_identity_and_is_locked_down() -> None:
 # --------------------------------------------------------------------------- #
 def test_ready_provenance_requires_all_lanes_current() -> None:
     source = inspect.getsource(LiveConnectionSpikeEngine.validate_ready_provenance)
-    # Tri-state liveness (Patch 1): every lane is classified and gathered; an ATTESTED
+    # Tri-state liveness: every lane is classified and gathered; an ATTESTED
     # identity change on any lane demotes (returns False), while a merely STALE/ABSENT
     # heartbeat raises RetryableWarmError (strike budget) rather than a false demotion.
     assert "resident_liveness" in source

@@ -1994,6 +1994,7 @@ case_deploy_failures() {
   check "detects an app that never starts" "The app did not come up"
   check "surfaces the real startup error" "InvalidStateError"
   check "names the lifespan cause" "raises inside the FastAPI lifespan"
+  check "names coordination-upgrade for a missing rebase table" "./antidemo coordination-upgrade"
   check "exits non-zero" "the deploy did not reach verified full six-round readiness"
 
   STUB_APP_MISSING=1 run "$sb" --deploy-only --yes

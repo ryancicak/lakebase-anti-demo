@@ -62,6 +62,7 @@ from server.round5_control import (
 from server.round5_warm import (
     BlockedWarmError,
     InMemoryRound5WarmStore,
+    RetryableWarmError,
     Round5Variant,
     Round5WarmCoordinator,
     Round5WarmPreparation,
@@ -2035,7 +2036,12 @@ async def test_full_process_replacement_fails_closed_then_converges(
                 assert cleaning is not None
                 assert cleaning.state == Round5WarmState.CLEANING
                 assert cleaning.generation == persisted_before_restart.generation
-                assert cleaning.last_error_code == "cleanup_reconcile_blocked"
+                if checkpoint == "armed_prebell":
+                    assert cleaning.last_error_code == "cleanup_reconcile_retryable"
+                elif checkpoint in postbell_checkpoints:
+                    assert cleaning.last_error_code == "cleanup_reconcile_blocked"
+                else:
+                    raise AssertionError(f"unexpected recovery checkpoint {checkpoint}")
                 assert cleaning.next_retry_at is not None
                 assert replacement.ring_ready is False
                 if checkpoint in postbell_checkpoints:
@@ -2671,7 +2677,7 @@ async def test_refused_bell_deferred_settlement_retains_fence_and_absence_debt(
             # Exercise the production warm-provider recovery seam too. Empty AWS
             # is deliberately not enough: exact logical jobs must report SETTLED.
             reconcile_calls_before = provider.reconcile_calls
-            with pytest.raises(BlockedWarmError):
+            with pytest.raises(RetryableWarmError):
                 await provider.reconcile(still_cleaning)
             assert provider.reconcile_calls == reconcile_calls_before + 1
 
@@ -2853,7 +2859,7 @@ async def test_timeout_success_cannot_rewarm_until_durable_jobs_settle(
             # gather(return_exceptions=True) results are ever ignored, this call
             # falsely returns True and the test fails at this boundary.
             reconcile_calls_before = provider.reconcile_calls
-            with pytest.raises(BlockedWarmError):
+            with pytest.raises(RetryableWarmError):
                 await provider.reconcile(cleaning)
             assert provider.reconcile_calls == reconcile_calls_before + 1
             # The provider (sole janitor) cancelled the ARM-staged resident on the

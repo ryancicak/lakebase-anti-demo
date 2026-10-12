@@ -165,7 +165,9 @@ def test_both_rounds_wait_for_their_branch_through_the_resend() -> None:
 
     deletes = (LakebaseRecoveryAdapter.delete_recovery, LakebaseSafeChangeAdapter.delete_isolated)
     for delete in deletes:
-        assert "await wait_lakebase_branch_gone(" in inspect.getsource(delete), delete.__qualname__
+        assert "._await_branch_gone(" in inspect.getsource(delete), delete.__qualname__
+    waiter = inspect.getsource(LakebaseSafeChangeAdapter._await_branch_gone)
+    assert "await wait_lakebase_branch_gone(" in waiter
 
 
 async def test_an_absence_probe_logs_nothing(caplog) -> None:

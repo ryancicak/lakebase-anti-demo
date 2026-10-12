@@ -18,6 +18,7 @@ from .aws_credential_probe import effective_credential_verdict
 from .catalog import catalog
 from .lifecycle import cached_installation_report, deployed_aws_posture
 from .manager import (
+    _LOST_RING_STILL_STOPPING,
     AmbiguousRingQueryError,
     InvalidStateError,
     RunManager,
@@ -541,14 +542,22 @@ def _fight_card_round_status(
             and bout.maintenance_detail.startswith("ROUND 5 NOT STARTABLE")
             else None
         )
-        round5_detail = round5_stage_detail or round5_gate_detail
+        # So does a ring the manager keeps closed while work that lost it is still
+        # stopping here: it reopens once that work ends. Only under a READY catalog,
+        # because the ring reopening would not lift a catalog refusal.
+        lost_ring_detail = (
+            bout.maintenance_detail
+            if getattr(availability, "availability", None) == Availability.READY
+            and bout.maintenance_detail == _LOST_RING_STILL_STOPPING
+            else None
+        )
+        reason = round5_stage_detail or round5_gate_detail or lost_ring_detail
         state = (
             FightCardState.TEMPORARILY_UNAVAILABLE
-            if round5_detail is not None
-            and "STAGE TERMINAL-BLOCKED" not in round5_detail
+            if reason is not None and "STAGE TERMINAL-BLOCKED" not in reason
             else FightCardState.UNAVAILABLE
         )
-        detail = round5_detail or (
+        detail = reason or (
             getattr(availability, "availability_headline", None)
             or "This round is unavailable right now."
         )

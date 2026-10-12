@@ -10,21 +10,25 @@ from types import SimpleNamespace
 import pytest
 
 import app as app_module
-from server import pipeline_power
+from server import pipeline_power, receipts
 from server.api import _fight_card_round_status
 from server.coordination import InMemoryBoutLeaseStore, round_ring_key
+from server.manager import RunManager
 from server.model_score_live import PipelineSignals
 from server.models import (
     BoutOperator,
     BoutStatus,
     CompetitorId,
+    Corner,
     RoundId,
+    SessionCreate,
     SessionState,
 )
 from server.round4_stop_recovery import (
     RECOVERY_PHASE,
     InheritedRound4StopRecovery,
 )
+from tests.test_manager import FakeResolver, make_verifier, wait_for_state
 
 INSTALLATION_ID = "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"
 PIPELINE_ID = "pipeline-1"
@@ -62,11 +66,13 @@ def _owed(due_at: datetime) -> dict[str, str]:
     }
 
 
-def _resuming(at: datetime) -> dict[str, str]:
+def _newer_bout_start(at: datetime) -> dict[str, str]:
+    """A later Round 4 bout's start, under its own pair key as the Lakebase lane stamps it."""
+
     return {
         "intent": "resuming",
         "pipeline_id": PIPELINE_ID,
-        "run_id": "run-1",
+        "run_id": f"run-1:{int(at.timestamp())}:{'b' * 32}",
         "resumed_at": at.astimezone(UTC).isoformat(),
         "resumed_by": "app-client",
     }
@@ -123,6 +129,34 @@ class PowerStore:
             self.append_failures -= 1
             raise ConnectionError("coordination transport reset")
         self.records.append(dict(record))
+
+    def _rows(self) -> list[tuple]:
+        """The records as the coordination table returns them: newest first, one stamp each."""
+
+        rows = []
+        for record in reversed(self.records):
+            stamp_field, actor_field = pipeline_power._INTENT_FIELDS[record["intent"]]
+            rows.append(
+                (
+                    record["intent"],
+                    record.get("run_id") or "",
+                    pipeline_power._parse_stamp(record.get(stamp_field)),
+                    record.get(actor_field) or "",
+                    "14.57",
+                )
+            )
+        return rows
+
+    async def _power_history_rows(self, pipeline_id: str, *, limit: int | None = None):
+        assert not self.closed
+        assert pipeline_id == PIPELINE_ID
+        rows = self._rows()
+        return rows if limit is None else rows[:limit]
+
+    async def unmatched_owed_stop(self, pipeline_id: str):
+        assert not self.closed
+        assert pipeline_id == PIPELINE_ID
+        return pipeline_power._unmatched_owed_stop(self._rows(), pipeline_id)
 
     async def close(self) -> None:
         self.closed = True
@@ -297,6 +331,7 @@ async def test_claim_then_latest_reread_are_both_load_bearing_against_a_race() -
     inner = _round4_store(root)
     events: list[str] = []
     stop_calls = 0
+    deferred = asyncio.Event()
 
     class RacingRing:
         mode = inner.mode
@@ -306,7 +341,7 @@ async def test_claim_then_latest_reread_are_both_load_bearing_against_a_race() -
             events.append("claim")
             # A newer arm lands after startup's stale pre-check but before the
             # recovery owns the ring. Only a latest read *after* this hook sees it.
-            power.records.append(_resuming(clock.now()))
+            power.records.append(_newer_bout_start(clock.now()))
             return await inner.claim(**kwargs)
 
         async def release(self, lease):
@@ -326,6 +361,10 @@ async def test_claim_then_latest_reread_are_both_load_bearing_against_a_race() -
         stop_calls += 1
         return pipeline_power.stopped_record(_manifest(), now=clock.now)
 
+    async def await_newer_window(_seconds: float) -> None:
+        deferred.set()
+        await asyncio.Event().wait()
+
     recovery = InheritedRound4StopRecovery(
         _manifest(),
         RacingRing(),  # type: ignore[arg-type]
@@ -334,19 +373,27 @@ async def test_claim_then_latest_reread_are_both_load_bearing_against_a_race() -
         read_signals=lambda: asyncio.sleep(0, result=HEALTHY),
         stop_pipeline=stop_pipeline,
         now=clock.now,
-        sleep=clock.sleep,
+        sleep=await_newer_window,
         retry_base_seconds=0,
         retry_max_seconds=0,
     )
     pipeline_power.install_owed_stop_snapshot(inherited)
-    await recovery.run()
+    task = asyncio.create_task(recovery.run())
+    await asyncio.wait_for(deferred.wait(), timeout=1)
 
-    # The first post-claim read sees the racing resume and returns before live
+    # The first post-claim read sees the racing start and returns before live
     # signals, so the immediate-pre-mutation read is intentionally not reached.
+    # The newer start owes its own stop at the end of its own redo window.
     assert events == ["claim", "latest", "release"]
     assert stop_calls == 0
     assert power.records[-1]["intent"] == "resuming"
     assert pipeline_power.owed_stop_notice(now=clock.now) is None
+    assert recovery.status.next_attempt_seconds == pytest.approx(
+        pipeline_power.STOP_OWED_DUE_SECONDS
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_latest_is_rechecked_after_slow_signals_before_any_stop() -> None:
@@ -355,17 +402,22 @@ async def test_latest_is_rechecked_after_slow_signals_before_any_stop() -> None:
     power = PowerStore(inherited)
     root = InMemoryBoutLeaseStore(clock=clock.now)
     stop_calls = 0
+    deferred = asyncio.Event()
 
     async def racing_signals() -> PipelineSignals:
-        # The first post-claim read has already returned. A newer intent lands
+        # The first post-claim read has already returned. A newer start lands
         # during the control-plane reads and must still beat stale recovery.
-        power.records.append(_resuming(clock.now()))
+        power.records.append(_newer_bout_start(clock.now()))
         return HEALTHY
 
     async def stop_pipeline() -> dict[str, str]:
         nonlocal stop_calls
         stop_calls += 1
         return pipeline_power.stopped_record(_manifest(), now=clock.now)
+
+    async def await_newer_window(_seconds: float) -> None:
+        deferred.set()
+        await asyncio.Event().wait()
 
     recovery = InheritedRound4StopRecovery(
         _manifest(),
@@ -375,15 +427,58 @@ async def test_latest_is_rechecked_after_slow_signals_before_any_stop() -> None:
         read_signals=racing_signals,
         stop_pipeline=stop_pipeline,
         now=clock.now,
-        sleep=clock.sleep,
+        sleep=await_newer_window,
         retry_base_seconds=0,
         retry_max_seconds=0,
     )
-    await recovery.run()
+    task = asyncio.create_task(recovery.run())
+    await asyncio.wait_for(deferred.wait(), timeout=1)
 
     assert power.latest_reads == 2
     assert stop_calls == 0
     assert power.records[-1]["intent"] == "resuming"
+    assert recovery.status.next_attempt_seconds == pytest.approx(
+        pipeline_power.STOP_OWED_DUE_SECONDS
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_same_start_resuming_committed_after_its_stop_owed_still_owes_the_stop() -> None:
+    """The unmatched walk is the authority; the newest event alone would call this settled."""
+
+    clock = Clock(datetime(2026, 9, 3, 18, 0, tzinfo=UTC))
+    inherited = _owed(clock.now() - timedelta(hours=1))
+    late_resume = {
+        "intent": "resuming",
+        "pipeline_id": PIPELINE_ID,
+        "run_id": inherited["run_id"],
+        "resumed_at": (clock.now() - timedelta(hours=1, minutes=30)).isoformat(),
+        "resumed_by": "app-client",
+    }
+    power = PowerStore(inherited, late_resume)
+    root = InMemoryBoutLeaseStore(clock=clock.now)
+    stop_calls = 0
+
+    async def stop_pipeline() -> dict[str, str]:
+        nonlocal stop_calls
+        stop_calls += 1
+        return pipeline_power.stopped_record(_manifest(), now=clock.now)
+
+    recovery = _recovery(
+        clock,
+        root,
+        power,
+        inherited,
+        signals=HEALTHY,
+        stop_pipeline=stop_pipeline,
+    )
+    await recovery.run()
+
+    assert stop_calls == 1
+    assert power.records[-1]["intent"] == "stopped"
+    assert recovery.status.state == "settled"
 
 
 async def test_two_replicas_share_the_fence_and_only_one_issues_stop() -> None:
@@ -857,6 +952,26 @@ async def test_runtime_shutdown_awaits_recovery_before_manager_and_stores(
 ) -> None:
     events: list[str] = []
     recovery_started = asyncio.Event()
+    receipt_started = asyncio.Event()
+    allow_receipt = asyncio.Event()
+    snapshot_manager = RunManager(resolver=FakeResolver(), verifier=make_verifier())
+    created = await snapshot_manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="software_engineer",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.WAKE_IDLE_APP,
+        )
+    )
+    await snapshot_manager.start_arm(created.id)
+    await wait_for_state(snapshot_manager, created.id, SessionState.ARMED)
+    await snapshot_manager.start_run(created.id)
+    terminal_snapshot = await wait_for_state(
+        snapshot_manager,
+        created.id,
+        SessionState.VERIFIED,
+    )
+    await snapshot_manager.close()
 
     async def recovery_task_body() -> None:
         recovery_started.set()
@@ -877,6 +992,19 @@ async def test_runtime_shutdown_awaits_recovery_before_manager_and_stores(
         async def close(self) -> None:
             events.append("manager-closed")
 
+            receipts.record_sealed_bout(
+                "run_finished",
+                {"session": terminal_snapshot.model_dump(mode="json")},
+                receipt_bout_id=terminal_snapshot.receipt_bout_id,
+            )
+            await receipt_started.wait()
+
+    class ReceiptStore:
+        async def append(self, _receipt, _snapshot) -> None:
+            receipt_started.set()
+            await allow_receipt.wait()
+            events.append("receipt-written")
+
     class Store:
         def __init__(self, name: str) -> None:
             self.name = name
@@ -886,6 +1014,22 @@ async def test_runtime_shutdown_awaits_recovery_before_manager_and_stores(
 
     monkeypatch.setattr(app_module, "unregister_serving_process", lambda _record: None)
     monkeypatch.setattr(app_module.app.state, "run_manager", Manager(), raising=False)
+    real_drain_receipts = app_module.drain_receipt_writes
+    real_install_receipt_store = app_module.install_receipt_store
+    receipt_store = ReceiptStore()
+    real_install_receipt_store(receipt_store)
+
+    async def drain_receipts() -> None:
+        await real_drain_receipts()
+        events.append("receipts-drained")
+
+    def install_receipt_store(store) -> None:
+        if store is None:
+            events.append("receipt-store-uninstalled")
+        real_install_receipt_store(store)
+
+    monkeypatch.setattr(app_module, "drain_receipt_writes", drain_receipts)
+    monkeypatch.setattr(app_module, "install_receipt_store", install_receipt_store)
     monkeypatch.setattr(
         app_module.app.state,
         "round4_stop_recovery",
@@ -900,12 +1044,23 @@ async def test_runtime_shutdown_awaits_recovery_before_manager_and_stores(
         posted_usage_task=posted_task,
         process_record=None,
         round4_stop_recovery_task=recovery_task,
+        receipt_store=receipt_store,
     )
 
-    await app_module._close_runtime(app_module.app, runtime)
+    closing = asyncio.create_task(app_module._close_runtime(app_module.app, runtime))
+    await asyncio.wait_for(receipt_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+    assert not closing.done()
+    assert "round5-closed" not in events
+    allow_receipt.set()
+    await asyncio.wait_for(closing, timeout=1)
 
     assert recovery_task.done() and recovery_task.cancelled()
     assert events[0] == "recovery-finished"
     assert events.index("recovery-finished") < events.index("manager-closed")
+    assert events.index("manager-closed") < events.index("receipts-drained")
+    assert events.index("receipt-written") < events.index("receipts-drained")
+    assert events.index("receipts-drained") < events.index("receipt-store-uninstalled")
+    assert events.index("receipt-store-uninstalled") < events.index("round5-closed")
     assert events.index("recovery-finished") < events.index("lease-closed")
     assert events[-3:] == ["round5-closed", "cost-closed", "lease-closed"]
