@@ -106,7 +106,7 @@ into a failure without the rest of the run. Each one's docstring has its usage.
 | Script | Does |
 |---|---|
 | `ready.py` | Prints the board; `--wait` waits for all six rounds READY. Read-only. |
-| `chaos.py` | One chaos phase, configured by `CHAOS_*` variables. |
+| `chaos.py` | One chaos phase, configured by `CHAOS_*` variables. Its `armed-wait` wave is not one of the bar's six: `CHAOS_SCENARIOS=armed-wait` holds each armed card `CHAOS_ARMED_WAIT_SECONDS` (150 s, inside the 180 s armed window) before the bell, as a presenter talking does. |
 | `restart.py` | The restart test. It waits for `run.sh` to redeploy, because `bootstrap.sh` fails its identity check when launched from Python. |
 | `leftovers.py` | The leak check. Read-only. |
 | `lease_check.py` | The lease check; `--plan` adds the Terraform plan. Read-only. |

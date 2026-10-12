@@ -267,7 +267,8 @@ does not reset measured database lanes. `antidemo setup` on a ready install is
 the installer resume that *does* reseed those lanes — do not use it as the
 upgrade path. The deployed app is not allowed to CREATE on that schema; if the
 table is missing or ungranted, startup refuses rather than installing no power
-store and serving anyway. `antidemo renew` does not provision this table.
+store and serving anyway. `antidemo renew` is not the upgrade either: its
+Round 5 re-seal can create this table, but it never grants it to the app.
 
 ### Upgrading from v1.1.1
 
@@ -299,7 +300,7 @@ restarts the app and verifies it, so run both while nobody is presenting.
 
 Do not reach for `./bootstrap.sh --apply --reset-ready` or `antidemo setup`
 instead: on a ready installation both reseed the database lanes.
-`antidemo renew` does not create the table. A `--deploy-only` that ran without
+`antidemo renew` never grants the table to the app. A `--deploy-only` that ran without
 the upgrade fails its readiness check, and the log lines it prints name
 `round4_source_rebase` or the missing privilege; run `coordination-upgrade`,
 then deploy again. If a release also changes the Round 5 runner,
