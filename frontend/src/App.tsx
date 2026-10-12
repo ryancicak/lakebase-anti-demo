@@ -188,6 +188,7 @@ function roundCardState(
 ): RoundCardState {
   if (status) return status.state === 'ready' ? 'available' : status.state
   if (round.availability_reason_code === 'cleanup_in_progress') return 'cleanup_in_progress'
+  if (round.availability_reason_code === 'storage_checking') return 'temporarily_unavailable'
   return round.availability === 'ready' ? 'available' : 'unavailable'
 }
 

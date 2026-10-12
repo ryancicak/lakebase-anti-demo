@@ -1833,6 +1833,29 @@ async def test_catalog_probes_shared_storage_before_offering_rounds_four_and_six
         assert "storage is unavailable" in cached_by_id[round_id]["availability_headline"]
 
 
+def test_a_lasting_refusal_outranks_the_storage_check_that_clears_itself() -> None:
+    # Before the first storage verdict, a round Databricks has already refused must say so,
+    # not "opens automatically".
+    round_four = RoundId.PUT_MODEL_SCORE_IN_APP
+    checking = frozenset({round_four, RoundId.ANALYZE_LIVE_ORDERS})
+    granted_away = round_availability.AvailabilitySignals(
+        storage_checking=checking,
+        grant_refusals={
+            round_four: round_availability.grant_refusal("PERMISSION_DENIED on a synced table")
+        },
+    )
+    refused = round_availability.refusal(round_four, granted_away)
+    assert refused is not None and refused.reason_code is None
+    assert "opens automatically" not in refused.headline
+
+    only_checking = round_availability.refusal(
+        round_four, round_availability.AvailabilitySignals(storage_checking=checking)
+    )
+    assert only_checking is not None
+    assert only_checking.reason_code == round_availability.STORAGE_CHECKING_REASON_CODE
+    assert "opens automatically" in only_checking.headline
+
+
 async def test_the_catalog_answers_while_a_stopped_warehouse_is_still_starting(
     monkeypatch,
 ) -> None:

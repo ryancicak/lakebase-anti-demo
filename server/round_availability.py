@@ -519,12 +519,6 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
     storage_refused = signals.storage_refusals.get(round_id)
     if storage_refused:
         return RoundRefusal(_STORAGE_HEADLINE, storage_refused)
-    if round_id in signals.storage_checking:
-        return RoundRefusal(
-            _STORAGE_CHECKING_HEADLINE,
-            STORAGE_CHECKING_REFUSAL,
-            STORAGE_CHECKING_REASON_CODE,
-        )
 
     grant_refused = signals.grant_refusals.get(round_id)
     if grant_refused:
@@ -580,6 +574,15 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
         # reason `InstallationPresence` has four states instead of a boolean --
         # and `/readyz` claims no lost capabilities for either of them.
         return RoundRefusal(_ABSENT_OPPONENT_HEADLINE, presence.detail)
+
+    # Last: it is the one hold here that clears by itself, so every lasting refusal
+    # above outranks it rather than reading "opens automatically" until it lifts.
+    if round_id in signals.storage_checking:
+        return RoundRefusal(
+            _STORAGE_CHECKING_HEADLINE,
+            STORAGE_CHECKING_REFUSAL,
+            STORAGE_CHECKING_REASON_CODE,
+        )
 
     return None
 
