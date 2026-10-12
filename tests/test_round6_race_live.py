@@ -405,6 +405,39 @@ class TestAwsCaptureLane:
         asyncio.run(lane.start())
         assert "The Glue run ended FAILED" in (asyncio.run(lane.failure()) or "")
 
+    def test_a_lane_failure_never_quotes_what_dms_or_glue_said(self, caplog):
+        # The failure is the card's and the receipt's; the providers' messages name hosts,
+        # roles and ARNs, so they go to the operator log alone.
+        said = "Endpoint db.cluster-x.us-west-2.rds.amazonaws.com refused arn:aws:iam::123456789012"
+
+        class Failed(FakeTask):
+            def state(self):
+                status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+                return DmsTaskState(status=status, stop_reason="STOPPED_AFTER_ERROR", failure=said)
+
+        class FailedJob(FakeJob):
+            def run(self, run_id):
+                return super().run(run_id).__class__(
+                    run_id=run_id,
+                    state="FAILED",
+                    started_on=datetime(2026, 9, 29, 12, 0, tzinfo=UTC),
+                    completed_on=None,
+                    error_message=said,
+                )
+
+        with caplog.at_level("WARNING", logger="server.round6_race_live"):
+            dms = aws_lane(Failed("running", "stopped"), FakeJob())
+            asyncio.run(dms.start())
+            assert asyncio.run(dms.failure()) is None
+            dms_failure = asyncio.run(dms.failure()) or ""
+            glue = aws_lane(FakeTask("running"), FailedJob())
+            asyncio.run(glue.start())
+            glue_failure = asyncio.run(glue.failure()) or ""
+
+        assert dms_failure == "The DMS task stopped: STOPPED_AFTER_ERROR"
+        assert glue_failure == "The Glue run ended FAILED"
+        assert "123456789012" in caplog.text and "rds.amazonaws.com" in caplog.text
+
     def test_park_parks_both_and_names_every_refusal(self):
         task, job = FakeTask(), FakeJob(park_error=RuntimeError("slot not released"))
         with pytest.raises(Round6RaceError, match="slot not released"):

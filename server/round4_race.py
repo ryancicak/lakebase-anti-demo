@@ -868,12 +868,13 @@ class Round4RaceEngine:
             ]
             if failures:
                 (_, first), *others = failures
+                from .manager import operator_diagnosis
+
                 for lane, other in others:
                     LOGGER.warning(
-                        "Round 4's %s also could not carry the restored row: %s: %s",
+                        "Round 4's %s also could not carry the restored row: %s",
                         lane.label,
-                        type(other).__name__,
-                        other,
+                        operator_diagnosis(other),
                     )
                 raise first
         finally:

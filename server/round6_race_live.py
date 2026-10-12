@@ -455,12 +455,22 @@ class AwsCaptureLane:
                 and self._clock() - self._started_at < DMS_STALE_STATUS_SECONDS
             )
             if self._dms_seen_moving or not fresh:
-                return f"The DMS task stopped: {state.failure or state.stop_reason or state.status}"
+                # This is the lane's failure on the card and in the receipt, and DMS's own
+                # failure message can name an endpoint host or an ARN, so it is logged instead.
+                if state.failure:
+                    LOGGER.warning("Round 6's DMS task stopped: %s", state.failure)
+                return f"The DMS task stopped: {state.stop_reason or state.status}"
         run_id = self._run_id
         if run_id:
             run = await asyncio.to_thread(lambda: job.run(run_id))
             if run.state in TERMINAL_STATES:
-                return f"The Glue run ended {run.state}: {run.error_message or 'no error message'}"
+                LOGGER.warning(
+                    "Round 6's Glue run %s ended %s: %s",
+                    run_id,
+                    run.state,
+                    run.error_message or "no error message",
+                )
+                return f"The Glue run ended {run.state}"
         return None
 
     async def park(self, notify: Notify) -> None:

@@ -894,6 +894,12 @@ _TOWEL_COOLDOWN_ROUNDS = frozenset(
     {RoundId.WAKE_IDLE_APP, RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}
 )
 
+#: Rounds whose towel settles through an engine that quotes its lanes' own errors: a psycopg
+#: connect names the host and role, and a DMS, Glue or IAM refusal a task or role ARN and its
+#: account. Their towel failure is the card's, the receipt's and every later claim's 409, so it
+#: carries the error's type and code alone.
+_TOWEL_LANE_ERROR_ROUNDS = frozenset({RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS})
+
 #: The two honest accounts of a control action aimed at a fight card this process
 #: does not have. Both lead with what did *not* happen, because the operator's
 #: first question at the bell is whether a bout is running somewhere and the old
@@ -7897,8 +7903,10 @@ class RunManager:
         own row already in its cleanup phase is adopted. "lost" means the fence is gone
         or another's. "unknown" means the bound ran out first: the fence is never
         renewed again, and a non-renewing background release frees the ring, or the
-        row's durable TTL does, as after a terminal settle that runs out of time.
-        Neither ever reports a lost lease over the verdict.
+        row's durable TTL does, as after a terminal settle that runs out of time, and
+        nothing reports a lost lease over the verdict. A failure that itself outlasts
+        the bound is not followed by that question, so a move that landed is then freed
+        by its TTL rather than adopted.
         """
 
         async with record.lease_lock:
@@ -13842,6 +13850,17 @@ class RunManager:
             )
             raise
         except Exception as exc:
+            if round_id in _TOWEL_LANE_ERROR_ROUNDS and not isinstance(exc, InvalidStateError):
+                logger.warning(
+                    "Towel settlement failed session=%s round=%s diagnosis=%s",
+                    record.snapshot.id,
+                    round_id.value,
+                    operator_diagnosis(exc),
+                )
+                return (
+                    "Automatic towel cleanup could not be verified: "
+                    f"{audience_diagnosis(exc)}"
+                )
             return str(exc) or "Automatic towel cleanup could not be verified"
         return None
 

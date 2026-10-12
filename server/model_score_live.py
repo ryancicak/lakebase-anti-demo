@@ -2406,9 +2406,9 @@ async def drain_power_records() -> None:
             task.result()
     if unfinished:
         LOGGER.error(
-            "%d Round 4 pipeline power record(s) did not reach the durable store before "
-            "shutdown, so a later check may not be able to tell a deliberate stop from "
-            "a failure",
+            "%d Round 4 pipeline power write(s) did not reach the durable store before "
+            "shutdown (abandoned coordination calls included), so a later check may not "
+            "be able to tell a deliberate stop from a failure",
             len(unfinished),
         )
 

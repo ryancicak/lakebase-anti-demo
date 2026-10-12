@@ -692,7 +692,15 @@ class GlueWriterLane:
             return None
         run = await asyncio.to_thread(lambda: self._job.run(run_id))
         if run.state in TERMINAL_STATES:
-            return f"The Glue run ended {run.state}: {run.error_message or 'no error message'}"
+            # This is the lane's failure on the card and in the receipt, and Glue's own
+            # message can name the role, bucket or connection, so it is logged instead.
+            LOGGER.warning(
+                "Round 4's Glue run %s ended %s: %s",
+                run_id,
+                run.state,
+                run.error_message or "no error message",
+            )
+            return f"The Glue run ended {run.state}"
         return None
 
     async def evidence(self, commit: DeltaCommit, bell: Bell) -> Mapping[str, Any]:

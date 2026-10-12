@@ -3800,11 +3800,12 @@ class Round5WarmCoordinator:
                     # The next beat, a third of a TTL later, renews again. Ending the beat
                     # here let the lease lapse under work that still owns it, and the next
                     # authority guard then aborted that work.
+                    from .manager import operator_diagnosis
+
                     logger.warning(
                         "Round 5 coordinator lease renewal failed during a held operation; "
-                        "retrying on the next beat: %s: %s",
-                        type(exc).__name__,
-                        exc,
+                        "retrying on the next beat: %s",
+                        operator_diagnosis(exc),
                     )
 
         beat_task = asyncio.create_task(beat())

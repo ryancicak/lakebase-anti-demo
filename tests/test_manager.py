@@ -78,11 +78,12 @@ from server.round4_race import (
     Round4Arm,
     Round4Phase,
     Round4RaceResult,
+    Round4SettleError,
 )
 from server.round4_race import PROTOCOL as ROUND4_PROTOCOL
 from server.round4_race import resolve as resolve_round4
 from server.round5_warm import Round5Variant, Round5WarmState, WarmStoreConflictError
-from server.round6_race import Round6Phase, Round6RaceEngine
+from server.round6_race import Round6Phase, Round6RaceEngine, Round6SettleError
 from server.round_availability import GRANT_REFUSAL_HEADLINE
 from server.safe_change import (
     SafeChangeArm,
@@ -6822,6 +6823,103 @@ async def test_rounds_four_and_six_towel_cleanup_heals_a_refusal_on_its_own(
         if event.event in {"towel_update", "towel_finished"}
     ]
     assert "failed" not in published_towel_states
+
+
+#: What a Round 4 or Round 6 settle quotes from its lanes: a psycopg connect names the host and
+#: role, and a DMS stop that overran its bound names the task ARN and so the account.
+_TOWEL_LEAKED = (
+    "ep-towel-0f00.database.us-west-2.cloud.databricks.com",
+    "c0ffee00-role",
+    "arn:aws:dms:us-west-2:123456789012:task:TOWELTASK",
+    "123456789012",
+)
+
+
+class ProviderTextTowelModelScoreEngine(BlockingTowelModelScoreEngine):
+    """Round 4, whose towel settle fails the way a park quoting its lane's error does."""
+
+    async def settle_and_restore_baseline(self) -> None:
+        self.settle_calls += 1
+        raise Round4SettleError(
+            "Round 4 could not park Lakebase: connection to server at "
+            f'"{_TOWEL_LEAKED[0]}" failed: FATAL: password authentication failed for user '
+            f'"{_TOWEL_LEAKED[1]}"'
+        )
+
+
+class ProviderTextTowelLiveOrdersEngine(BlockingTowelLiveOrdersEngine):
+    """Round 6, whose towel settle fails the way a DMS stop past its bound does."""
+
+    async def settle_and_cleanup_owned(self) -> None:
+        raise Round6SettleError(
+            f"Round 6 could not settle: AWS: The DMS task {_TOWEL_LEAKED[2]} did not stop "
+            "within 300s; it is stopping"
+        )
+
+
+@pytest.mark.parametrize(
+    ("factory_kwarg", "engine_cls", "round_id", "persona", "corner", "error_type"),
+    [
+        pytest.param(
+            "model_score_factory",
+            ProviderTextTowelModelScoreEngine,
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            "software_engineer",
+            Corner.SIMPLICITY,
+            "Round4SettleError",
+            id="round-4",
+        ),
+        pytest.param(
+            "live_orders_factory",
+            ProviderTextTowelLiveOrdersEngine,
+            RoundId.ANALYZE_LIVE_ORDERS,
+            "data_analyst",
+            Corner.PERFORMANCE,
+            "Round6SettleError",
+            id="round-6",
+        ),
+    ],
+)
+async def test_a_round_four_or_six_towel_failure_names_no_host_role_or_arn(
+    factory_kwarg, engine_cls, round_id, persona, corner, error_type
+) -> None:
+    """The towel's failure is the card's sentence, the receipt's and every later claim's 409.
+
+    A Round 4 or Round 6 settle quotes its lanes' own errors, so the towel gets the error's type
+    alone and the operator log gets the cause.
+    """
+
+    lease_store = InMemoryBoutLeaseStore()
+    engine = engine_cls()
+    manager = RunManager(
+        **{factory_kwarg: lambda *_matchup: engine},
+        lease_store=lease_store,
+    )
+    manager._towel_cleanup_retry_window = 0.0
+    request = SessionCreate(
+        competitor=CompetitorId.AURORA_SERVERLESS_V2,
+        primary_persona=persona,
+        corners=[corner],
+        round_id=round_id,
+    )
+    created = await manager.create(request)
+    await manager.start_arm(created.id)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id)
+    await asyncio.wait_for(engine.run_entered.wait(), timeout=1)
+    challenger = await manager.create(request)
+
+    await manager.start_towel(created.id)
+    failed = await wait_for_towel(manager, created.id, "failed")
+
+    failure = failed.towel.cleanup_failure if failed.towel is not None else None
+    assert failure is not None and error_type in failure
+    assert all(leaked not in failure for leaked in _TOWEL_LEAKED)
+    with pytest.raises(InvalidStateError) as refusal:
+        await manager.start_arm(challenger.id)
+    message = str(refusal.value)
+    assert "TOWEL CLEANUP FAILED" in message
+    assert all(leaked not in message for leaked in _TOWEL_LEAKED)
 
 
 async def test_round_three_towel_cleanup_failure_past_the_window_retries_under_retained_lease(
