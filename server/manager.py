@@ -343,6 +343,16 @@ def operator_diagnosis(error: BaseException) -> str:
     return diagnosis[: _DIAGNOSIS_LIMIT - 1].rstrip() + "…"
 
 
+def audience_diagnosis(error: BaseException) -> str:
+    """The cause chain as types and codes alone, for text a room or a receipt shows.
+
+    No message is quoted, this server's own included: a lane's error can carry the
+    task or role ARN it was refused on. The operator log gets `operator_diagnosis`.
+    """
+
+    return _redacted_exception_chain(error)
+
+
 def authorization_refusal(error: BaseException) -> BaseException | None:
     """The Databricks authorization refusal anywhere in this cause chain.
 

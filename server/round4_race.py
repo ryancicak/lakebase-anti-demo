@@ -538,8 +538,17 @@ class Round4RaceEngine:
                 try:
                     await lane.before_bell()
                 except Exception as exc:
+                    # The card shows this sentence, and a psycopg message names the
+                    # coordination host and role, so the cause goes to the log alone.
+                    from .manager import operator_diagnosis
+
+                    LOGGER.warning(
+                        "Round 4 %s could not record its start before the bell: %s",
+                        lane.lane_id,
+                        operator_diagnosis(exc),
+                    )
                     raise Round4NotArmedError(
-                        f"{lane.label} could not record its start, so the bell was not rung: {exc}"
+                        f"{lane.label} could not record its start, so the bell was not rung"
                     ) from exc
         except BaseException:
             await self._close_readers(readers)
@@ -711,8 +720,20 @@ class Round4RaceEngine:
                 if commit.done() and not commit.cancelled() and commit.exception() is not None:
                     return outcome(False, "the bout's Delta commit failed", None)
                 if start.done() and not start.cancelled() and start.exception() is not None:
+                    # The card and the receipt show this; a Glue or Databricks refusal can
+                    # name the account, role or pipeline, so they get its type and code.
+                    from .manager import audience_diagnosis, operator_diagnosis
+
+                    refusal = start.exception()
+                    LOGGER.warning(
+                        "Round 4 %s could not be started: %s",
+                        lane.lane_id,
+                        operator_diagnosis(refusal),
+                    )
                     return outcome(
-                        False, f"{lane.label} could not be started: {start.exception()}", None
+                        False,
+                        f"{lane.label} could not be started: {audience_diagnosis(refusal)}",
+                        None,
                     )
                 began_ns = clock.now_ns()
                 if previous_start_ns is not None:

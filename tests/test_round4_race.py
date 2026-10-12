@@ -401,9 +401,12 @@ async def test_a_lane_that_cannot_get_ready_refuses_the_bell_before_any_clock():
     async def progress(*event):
         heard.append(event)
 
-    with pytest.raises(Round4NotArmedError, match="did not answer"):
+    with pytest.raises(Round4NotArmedError, match="could not record its start") as refused:
         await race.run(arm, update(), progress)
 
+    # The card shows the refusal, so it quotes none of the cause; the chain keeps it.
+    assert "did not answer" not in str(refused.value)
+    assert refused.value.__cause__ is lakebase.ready_error
     assert lakebase.started == aws.started == 0
     assert source.commits == []
     assert heard == []
@@ -432,8 +435,40 @@ async def test_a_lane_that_cannot_start_fails_and_the_bout_declares_nothing():
     assert result.outcomes[LAKEBASE_LANE].verified
     failed = result.outcomes[COMPETITOR_LANE]
     assert not failed.verified and not failed.timed_out
-    assert "could not be started: refused" in (failed.failure or "")
+    assert failed.failure == "Competitor could not be started: RuntimeError"
     assert result.resolution.verdict is Verdict.NO_RESULT
+
+
+@pytest.mark.asyncio
+async def test_a_refused_start_shows_its_code_and_never_the_provider_message(caplog):
+    # A Glue refusal's message names the account and the role it was refused for. The
+    # card and the receipt get the error's type and code; the operator log, the rest.
+    from botocore.exceptions import ClientError
+
+    refusal = ClientError(
+        {
+            "Error": {
+                "Code": "AccessDeniedException",
+                "Message": "User: arn:aws:sts::123456789012:assumed-role/runtime is not "
+                "authorized to perform: glue:StartJobRun",
+            }
+        },
+        "StartJobRun",
+    )
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.05)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.05, start_error=refusal)
+    race = engine(source, lakebase, aws)
+
+    with caplog.at_level("WARNING", logger="server.round4_race"):
+        result = await race.run(await race.prepare(quiet), update(), quiet)
+
+    failure = result.outcomes[COMPETITOR_LANE].failure or ""
+    assert failure == (
+        "Competitor could not be started: ClientError[AccessDeniedException]@StartJobRun"
+    )
+    assert "123456789012" not in failure and "arn:" not in failure
+    assert "could not be started: ClientError[AccessDeniedException]" in caplog.text
 
 
 @pytest.mark.asyncio

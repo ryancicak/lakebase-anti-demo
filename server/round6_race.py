@@ -536,7 +536,20 @@ class Round6RaceEngine:
                 if refusal is None and start.done() and not start.cancelled():
                     refusal = start.exception()
                 if refusal is not None:
-                    return outcome(False, f"{lane.label} could not be started: {refusal}", None)
+                    # The card and the receipt show this; a DMS or Glue refusal can name the
+                    # account, role or task ARN, so they get its type and code.
+                    from .manager import audience_diagnosis, operator_diagnosis
+
+                    LOGGER.warning(
+                        "Round 6 %s could not be started: %s",
+                        lane.lane_id,
+                        operator_diagnosis(refusal),
+                    )
+                    return outcome(
+                        False,
+                        f"{lane.label} could not be started: {audience_diagnosis(refusal)}",
+                        None,
+                    )
                 began_ns = clock.now_ns()
                 if previous_start_ns is not None:
                     max_gap_ms = max(max_gap_ms, (began_ns - previous_start_ns) / 1_000_000)

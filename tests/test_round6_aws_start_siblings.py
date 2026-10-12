@@ -153,7 +153,8 @@ async def test_a_glue_refusal_is_no_result_though_dms_s_start_outlasts_the_bound
     assert not task.accepted.is_set()
     aws = result.outcomes[COMPETITOR_LANE]
     assert not aws.timed_out and aws.bound_ms is None
-    assert aws.failure == "AWS could not be started: ConcurrentRunsExceededException"
+    # The card names the refusal's type, never a provider's message, which can carry an ARN.
+    assert aws.failure == "AWS could not be started: RuntimeError"
     assert result.outcomes[LAKEBASE_LANE].verified
     assert result.resolution.verdict is Verdict.NO_RESULT
     assert result.resolution.winner is None
