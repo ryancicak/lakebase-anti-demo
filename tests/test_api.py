@@ -3185,6 +3185,18 @@ def _fixed_credential_verdict(monkeypatch, verdict: CredentialVerdict) -> None:
     monkeypatch.setattr(app_module, "CredentialSentry", Fixed)
 
 
+async def _past_startup_storage_check(served) -> None:
+    """Wait out startup's own shared-storage read, which Rounds 4 and 6 hold for.
+
+    Until it answers they read as checking, not ready, and the catalog no longer
+    waits for it, so a test about anything else waits for it here.
+    """
+
+    task = getattr(served.state, "delta_storage_readiness_task", None)
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def _deployed_app_runtime(monkeypatch, manifest) -> None:
     """Everything a deployed lifespan needs, with no cloud call behind any of it."""
 
@@ -3883,6 +3895,7 @@ async def test_a_deployed_app_with_a_broken_aws_credential_boots_and_serves(
         app.state.readiness_gate.require_ready()
         assert app.state.run_manager.model_score_available is True
         assert app.state.run_manager.live_orders_available is True
+        await _past_startup_storage_check(app)
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://anti-demo.test"
         ) as client:
@@ -4146,6 +4159,7 @@ async def test_a_sealed_network_path_does_not_offer_a_round_with_no_credential(
     _fixed_credential_verdict(monkeypatch, CredentialVerdict())
 
     async with app.router.lifespan_context(app):
+        await _past_startup_storage_check(app)
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://anti-demo.test"
         ) as client:
