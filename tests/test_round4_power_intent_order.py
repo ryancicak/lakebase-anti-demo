@@ -1669,6 +1669,43 @@ async def test_park_still_stops_when_pair_reserve_fails():
     assert round4_race_live._PENDING == set()
 
 
+@pytest.mark.parametrize("hung", ["floor read", "reservation write"])
+@pytest.mark.asyncio
+async def test_park_still_stops_when_its_pair_reserve_never_answers(hung, monkeypatch):
+    """A pair key minted before a park's stop must not hold the stop back past its bound."""
+
+    monkeypatch.setattr(round4_race_live, "PARK_LEDGER_SECONDS", 0.2)
+    table = _InvertingPowerTable()
+    store = pipeline_power.DurablePipelinePowerStore(table.run)
+    pipeline_power.install_pipeline_power_store(store)
+    never = asyncio.Event()
+    asked: list[str] = []
+    original = store.append
+
+    async def unanswered_floor(_pipeline_id):
+        asked.append(hung)
+        await never.wait()
+
+    async def unanswered_reservation(record):
+        if record.get("intent") == "generation_reserved":
+            asked.append(hung)
+            await never.wait()
+        return await original(record)
+
+    if hung == "floor read":
+        store.newest_reserved_pair_key = unanswered_floor  # type: ignore[method-assign]
+    else:
+        store.append = unanswered_reservation  # type: ignore[method-assign]
+    calls: list = []
+    lane = _lane(_manifest())
+    lane._api = _recording_api(calls)
+    with pytest.raises(TimeoutError, match="did not answer"):
+        await asyncio.wait_for(_park_now(lane, drain=False), timeout=5.0)
+    assert asked == [hung]
+    assert any(path.endswith("/stop") for _method, path, _body in calls)
+    assert "stopped" not in {row[1] for row in table.rows}
+
+
 @pytest.mark.asyncio
 async def test_a_refused_stop_is_what_a_park_reports_when_its_pair_reserve_also_failed():
     """A pipeline that may still be billing outranks the bookkeeping that failed before it."""

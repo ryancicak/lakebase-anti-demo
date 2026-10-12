@@ -353,6 +353,72 @@ async def test_a_full_refresh_that_ended_before_its_park_owes_the_rebase_again(e
     assert await pipeline_power.rebase_is_owed(pipeline_id) is True
 
 
+@pytest.mark.parametrize("hung", ["satisfied write", "re-owed write"])
+async def test_a_ledger_write_that_never_answers_cannot_hold_back_a_park_s_stop(
+    hung, monkeypatch
+) -> None:
+    """Settling a full-refresh bout confirms its update before parking it, and confirming writes
+    the rebase ledger. A write the coordination database never answers must not keep Managed Sync
+    running: the stop still goes out within the confirmation's bound, and the rebase stays owed.
+    """
+
+    monkeypatch.setattr(round4_race_live, "REBASE_CONFIRM_SECONDS", 0.5)
+    table = _install_ledger()
+    manifest = _manifest()
+    pipeline_id = manifest.round4.pipeline_id
+    await pipeline_power.note_rebase_owed(pipeline_id)
+    pipeline = _Pipeline([])
+    source = FakeSource()
+    race = _engine(
+        source, _lakebase(manifest, pipeline, _SyncedTable(pipeline, source, row_after=0.0))
+    )
+    result = await race.run(await race.prepare(quiet), update(), quiet)
+    assert result.outcomes[LAKEBASE_LANE].verified
+    assert pipeline.running
+
+    store = pipeline_power.installed_pipeline_power_store()
+    assert store is not None
+    asked: list[str] = []
+    never = asyncio.Event()
+
+    async def unanswered(*_args, **_kwargs):
+        asked.append(hung)
+        await never.wait()
+
+    if hung == "satisfied write":
+        store.satisfy_rebase = unanswered  # type: ignore[method-assign]
+    else:
+        # The started update reads CANCELED while its pipeline still runs, so the confirmation
+        # owes the rebase again before the park's stop.
+        store.append_rebase = unanswered  # type: ignore[method-assign]
+        started = pipeline.update_id
+
+        async def canceled() -> PipelineSignals:
+            if not pipeline.running:
+                return pipeline.parked()
+            return _signals(
+                "RUNNING",
+                "CANCELED",
+                "SYNCED_TABLE_ONLINE_CONTINUOUS_UPDATE",
+                continuous=True,
+                update_id=started,
+            )
+
+        race.lanes[0]._signals = canceled  # type: ignore[method-assign]
+
+    began = time.monotonic()
+    await asyncio.wait_for(race.settle(), timeout=5.0)
+    settled_in = time.monotonic() - began
+    await _drain_persists()
+
+    assert asked == [hung]
+    assert pipeline.stops == 1
+    assert not pipeline.running
+    assert settled_in < round4_race_live.REBASE_CONFIRM_SECONDS + 1.0
+    assert [row[1] for row in table.rows] == ["rebase_owed"]
+    assert await pipeline_power.rebase_is_owed(pipeline_id) is True
+
+
 async def test_one_healthy_reading_before_a_park_does_not_clear_the_rebase(monkeypatch) -> None:
     monkeypatch.setattr(round4_race_live, "REBASE_CONFIRM_SECONDS", 0.5)
     table = _install_ledger()

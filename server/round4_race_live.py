@@ -74,6 +74,9 @@ PARK_POLL_SECONDS = 3.0
 #: Settling parks once the restored row has been carried, so a healthy update needs only its two
 #: readings, PARK_POLL_SECONDS apart; one that does not get there leaves the rebase owed.
 REBASE_CONFIRM_SECONDS = 30.0
+#: How long a park waits on the coordination database for the pair key its stop is recorded under.
+#: The stop goes out either way: a pipeline left billing costs more than a stop left unrecorded.
+PARK_LEDGER_SECONDS = 30.0
 #: A connect wide enough for an Aurora cluster resuming from zero, which Prepare pays, not a clock.
 CONNECT_TIMEOUT_SECONDS = 45
 #: Newest-update states in which the pipeline is still doing something.
@@ -301,7 +304,19 @@ class LakebaseSyncLane:
 
     async def _park(self, notify: Notify, *, stop_if_running: bool) -> None:
         if self._started_full_refresh:
-            await self._confirm_rebase(notify)
+            # Confirming writes the rebase ledger, and a write that never answers must not hold
+            # back the stop below: past the bound the park goes ahead and the rebase stays owed.
+            try:
+                await _within(self._confirm_rebase(notify), REBASE_CONFIRM_SECONDS)
+            except TimeoutError:
+                LOGGER.warning(
+                    "Round 4 could not confirm Lakebase's full refresh within %.0fs, so the next "
+                    "bell rebases again",
+                    REBASE_CONFIRM_SECONDS,
+                )
+            finally:
+                self._started_full_refresh = False
+                self._rebase_healthy_streak = 0
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PARK_TIMEOUT_SECONDS
         requested = False
@@ -317,9 +332,12 @@ class LakebaseSyncLane:
                 mint_error: BaseException | None = None
                 if not pair_key:
                     try:
-                        pair_key = await pipeline_power.mint_power_pair_key(
-                            str(self._manifest.run_id),
-                            str(getattr(self, "_pipeline_id", "") or ""),
+                        pair_key = await _within(
+                            pipeline_power.mint_power_pair_key(
+                                str(self._manifest.run_id),
+                                str(getattr(self, "_pipeline_id", "") or ""),
+                            ),
+                            PARK_LEDGER_SECONDS,
                         )
                         self._power_pair_key = pair_key
                     except Exception as exc:
@@ -377,9 +395,6 @@ class LakebaseSyncLane:
                 "next bell rebases again",
                 exc_info=True,
             )
-        finally:
-            self._started_full_refresh = False
-            self._rebase_healthy_streak = 0
 
     async def open_reader(self) -> PostgresReader:
         config = self._adapter.config
@@ -736,6 +751,28 @@ def commit_entity(commit: DeltaCommit) -> str:
 
 #: Strong references to in-flight durable power writes; see ``model_score_live._PENDING_RECORDS``.
 _PENDING: set[asyncio.Task[Any]] = set()
+
+
+async def _within[T](operation: Awaitable[T], seconds: float) -> T:
+    """``operation``'s answer, or :class:`TimeoutError` once ``seconds`` have passed.
+
+    A coordination call can wait on a statement its server never answers, and its cancel is not
+    prompt either: psycopg waits on the same socket after sending one. So a call that runs out of
+    time is cancelled and left to finish on its own, never waited for.
+    """
+
+    task = asyncio.ensure_future(operation)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+    finally:
+        if not task.done():
+            task.cancel()
+            _PENDING.add(task)
+            task.add_done_callback(_PENDING.discard)
+            task.add_done_callback(lambda left: None if left.cancelled() else left.exception())
+    if not done:
+        raise TimeoutError(f"the coordination database did not answer within {seconds:.0f}s")
+    return task.result()
 
 
 def build_round4_race_engine(
