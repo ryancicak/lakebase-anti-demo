@@ -1153,7 +1153,7 @@ function roundLockNote(
     return 'CLEANUP IN PROGRESS · OTHER ROUNDS REMAIN AVAILABLE'
   }
   if (state === 'temporarily_unavailable') {
-    return 'REOPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
+    return 'OPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
   }
   const alternative = rounds.some((item) => (
     item.id !== round.id
@@ -4334,7 +4334,12 @@ function App() {
 
   function changeRoundOverride(id: RoundId | null) {
     const nextRoundId = id ?? recommendation.round_id
-    if (nextRoundId !== selectedRoundId) roundChangesRef.current += 1
+    if (nextRoundId !== selectedRoundId) {
+      roundChangesRef.current += 1
+      // The last press's reason is about the round it was pressed for. Kept, it sits
+      // in the pinned bar over the new round's PREPARE and reads as being about it.
+      setError(null)
+    }
     setRoundOverride(id)
   }
 

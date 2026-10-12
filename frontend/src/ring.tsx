@@ -1116,7 +1116,9 @@ export function FightRing(props: {
           const state = live?.state
             ?? (item.availability_reason_code === 'cleanup_in_progress'
               ? 'cleanup_in_progress'
-              : item.availability === 'ready' ? 'ready' : 'unavailable')
+              : item.availability_reason_code === 'storage_checking'
+                ? 'temporarily_unavailable'
+                : item.availability === 'ready' ? 'ready' : 'unavailable')
           const busy = state === 'bout_in_progress'
           const resetting = state === 'temporarily_unavailable' && roundFiveResetting(live)
           const cleaning = state === 'cleanup_in_progress' || resetting

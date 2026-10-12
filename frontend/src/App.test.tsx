@@ -3648,6 +3648,42 @@ describe('backstage setup', () => {
     expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
   })
 
+  it('drops a refused Prepare’s reason once another round is chosen', async () => {
+    // The reason names "this round". Picking another round is what it tells the
+    // operator to do, and left pinned in the bar it then sits over that round's
+    // enabled PREPARE as if it were about it.
+    const held = "THIS ROUND IS NOT ON TONIGHT'S CARD. Backstage is still checking this round's lakehouse storage, and it opens automatically once the check answers. The other rounds are unaffected."
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'make_schema_change_safely')
+    // The board changes between the render and the press, so Prepare's own read refuses it.
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      make_schema_change_safely: { state: 'temporarily_unavailable', can_start: false, detail: held },
+    }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(held)
+
+    // The same tile again is not another round, so the reason stays.
+    await pickRound(user, 'make_schema_change_safely')
+    expect(screen.getByRole('alert')).toHaveTextContent(held)
+
+    await pickRound(user, 'wake_idle_app')
+    expect(screen.getByRole('heading', { name: /wake this idle app/i })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(document.querySelector('.card-actions')).not.toHaveTextContent(/not on tonight/i)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
+  })
+
   it('refreshes a transient Round 5 identity refusal back to backstage preparation', async () => {
     const warming = allReadyBoutBoard({
       survive_connection_spike: {
@@ -4910,7 +4946,7 @@ describe('backstage setup', () => {
     // The reason PREPARE is locked rides in the pinned bar beside the button.
     // Below the bar, the bar drew over it.
     expect(document.querySelector('.card-actions .game-lock-note')).toHaveTextContent(
-      /reopens automatically/i,
+      /opens automatically/i,
     )
   })
 

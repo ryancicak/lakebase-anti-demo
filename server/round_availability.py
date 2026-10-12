@@ -188,10 +188,10 @@ _STORAGE_HEADLINE = (
     "It stays off the card; the other available rounds are unaffected."
 )
 
+#: Not `NOT_ON_THE_CARD`: this round is on tonight's card, a moment away.
 _STORAGE_CHECKING_HEADLINE = (
-    f"{NOT_ON_THE_CARD} Backstage is still checking this round's lakehouse "
-    "storage, and it opens automatically once the check answers. The other "
-    "rounds are unaffected."
+    "Backstage is still checking this round's lakehouse storage. It opens "
+    "automatically once the check answers; the other rounds are unaffected."
 )
 
 #: The reason code the fight card reads as an automatic, self-clearing hold.
