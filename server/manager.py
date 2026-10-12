@@ -4256,14 +4256,14 @@ class RunManager:
                 #
                 # The precommit AND bell acceptance share one compensation scope: a
                 # failure of either (refused precommit, or a bell CAS that loses the
-                # claim/broker epoch) must release the round-5 lease and the bout
-                # and ring nothing.  This is safe because Lakebase is only actually
-                # released later, by ``bind_bell`` -> ``allow_release``, which runs
-                # OUTSIDE this block after the durable commit: on every path handled
-                # here, no lane has launched, so releasing is clean.  A
-                # committed-then-failed bell leaves only an orphan CREATE_INTENT,
-                # which automatic reconciliation settles.  Idempotent for a
-                # duplicate /run.
+                # claim/broker epoch) rings nothing and hands the claim to the
+                # coordinator's durable CLEANING below.  This is safe because
+                # Lakebase is only actually released later, by ``bind_bell`` ->
+                # ``allow_release``, which runs OUTSIDE this block after the durable
+                # commit: on every path handled here, no lane has launched.  A bell
+                # refused after its precommit leaves a CREATE_INTENT under a NULL
+                # bell, which the no-bell cleanup reconstructs from the journal.
+                # Idempotent for a duplicate /run.
                 #
                 # The dispatch margin is checked before the precommit, so the usual
                 # refusal leaves no CREATE_INTENT, and again once the bell commits,
@@ -4271,6 +4271,7 @@ class RunManager:
                 precommit_launch = record.connection_spike_engine.precommit_launch_intent
                 launch_lease = record.round5_lease
                 bell_stage = "before_precommit"
+                commit_sent = 0.0
                 try:
                     self._round5_warm_coordinator.require_dispatchable(claim)
                     if launch_lease is not None:
@@ -4278,6 +4279,7 @@ class RunManager:
                             record.snapshot.id, launch_lease.fencing_token
                         )
                     bell_stage = "bell"
+                    commit_sent = time.monotonic()
                     if round5_atomic_bell:
                         main_lease = record.lease
                         cleanup_lease = record.round5_lease
@@ -4330,12 +4332,19 @@ class RunManager:
                     if isinstance(exc, WarmBellMarginError):
                         logger.warning(
                             "round5_bell_refused_dispatch_margin session=%s bout_id=%s "
-                            "stage=%s remaining_s=%.1f armed_wait_s=%.1f",
+                            "stage=%s remaining_s=%.1f armed_wait_s=%.1f commit_s=%s",
                             record.snapshot.id,
                             bout_id,
                             bell_stage,
                             exc.remaining_seconds,
                             exc.armed_wait_seconds,
+                            # How long the bell's own commit took to answer, which is
+                            # what an after_commit refusal lost its margin to.
+                            (
+                                f"{time.monotonic() - commit_sent:.1f}"
+                                if bell_stage == "after_commit"
+                                else "none"
+                            ),
                         )
                     else:
                         logger.error(

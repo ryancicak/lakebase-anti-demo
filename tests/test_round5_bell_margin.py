@@ -9,6 +9,7 @@ moment later.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -455,6 +456,7 @@ async def test_a_bell_whose_commit_outlasts_the_margin_launches_nothing(
             assert bout.manager._records[bout.session_id].lease_heartbeat_task is None
         (refusal,) = _margin_refusals(caplog)
         assert "stage=after_commit" in refusal.getMessage()
+        assert re.search(r"commit_s=\d+\.\d\b", refusal.getMessage())
 
         # Committed, so cleanup runs the post-bell teardown before the next generation.
         slot = await bout.warm.store.read(ACCEPTANCE_INSTALLATION)
@@ -491,5 +493,6 @@ async def test_a_margin_refusal_logs_one_warning_and_no_traceback(
     assert "stage=before_precommit" in message
     assert "remaining_s=-50.0" in message
     assert "armed_wait_s=120.0" in message
+    assert "commit_s=none" in message
     assert [record.getMessage() for record in records if record.levelno >= logging.ERROR] == []
     assert not [record for record in records if "runner_handoff_incomplete" in record.getMessage()]
