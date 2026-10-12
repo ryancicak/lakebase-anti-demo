@@ -828,7 +828,26 @@ class Round4RaceEngine:
             bout_id=f"settle-{uuid4().hex[:12]}", rung_at=self._now(), source_table_id=table_id
         )
         try:
-            await asyncio.gather(*(self._carry(lane, bell, say) for lane in self.lanes))
+            # Every carry ends before the park, even when another failed: one still running
+            # after it could start its lane again, through its kick or its own start.
+            carried = await asyncio.gather(
+                *(self._carry(lane, bell, say) for lane in self.lanes), return_exceptions=True
+            )
+            failures = [
+                (lane, result)
+                for lane, result in zip(self.lanes, carried, strict=True)
+                if isinstance(result, BaseException)
+            ]
+            if failures:
+                (_, first), *others = failures
+                for lane, other in others:
+                    LOGGER.warning(
+                        "Round 4's %s also could not carry the restored row: %s: %s",
+                        lane.label,
+                        type(other).__name__,
+                        other,
+                    )
+                raise first
         finally:
             await say("Parking both integrations")
             results = await asyncio.gather(

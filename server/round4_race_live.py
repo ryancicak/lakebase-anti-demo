@@ -35,6 +35,7 @@ from .aws_auth import runtime_auth_from_environment
 from .manifest import DemoManifest
 from .model_score import DeltaCommit, ModelScoreRow, ModelScoreUpdate
 from .model_score_live import (
+    _PENDING_RECORDS,
     DELTA_CONCURRENT_TRANSACTION_SQLSTATE,
     DELTA_CONFLICT_ATTEMPTS,
     DELTA_CONFLICT_RETRY_SECONDS,
@@ -749,8 +750,10 @@ def commit_entity(commit: DeltaCommit) -> str:
     return ROUND4_BASELINE_ENTITY_ID
 
 
-#: Strong references to in-flight durable power writes; see ``model_score_live._PENDING_RECORDS``.
-_PENDING: set[asyncio.Task[Any]] = set()
+#: Strong references to in-flight durable power writes. The same set as
+#: ``model_score_live._PENDING_RECORDS``, so the shutdown drain that waits for v1's waits for
+#: these too.
+_PENDING: set[asyncio.Task[Any]] = _PENDING_RECORDS
 
 
 async def _within[T](operation: Awaitable[T], seconds: float) -> T:

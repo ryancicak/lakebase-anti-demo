@@ -579,6 +579,32 @@ async def test_settle_refuses_to_overwrite_someone_else_s_row():
 
 
 @pytest.mark.asyncio
+async def test_a_carry_that_fails_never_leaves_the_other_running_past_the_last_park():
+    # A transient error opening one lane's reader used to fail the settle at once while the
+    # other lane's carry ran on. Its kick then parked and started that lane again, after the
+    # settle's own last park had already reported both integrations parked.
+    source = FakeSource()
+    lakebase = StallingLane(LAKEBASE_LANE, source, delay=0.01)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.01)
+    race = engine(source, lakebase, aws, kick=0.05)
+    await race.run(await race.prepare(quiet), update(), quiet)
+
+    async def unreachable():
+        raise RuntimeError("Secrets Manager timed out")
+
+    aws.open_reader = unreachable
+
+    with pytest.raises(RuntimeError, match="Secrets Manager timed out"):
+        await race.settle()
+    starts = lakebase.started
+    await asyncio.sleep(0.2)
+
+    assert lakebase.parked and aws.parked
+    assert lakebase.started == starts
+    assert lakebase.closed_readers == lakebase.opened_readers
+
+
+@pytest.mark.asyncio
 async def test_a_lane_that_cannot_park_fails_the_settle_by_name():
     source = FakeSource()
     lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.01)

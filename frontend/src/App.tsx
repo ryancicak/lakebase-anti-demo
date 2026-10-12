@@ -8,6 +8,8 @@ import type {
   CompetitorId,
   CooldownLaneState,
   CooldownSnapshot,
+  CostLineItem,
+  CostScope,
   CustomerCorner,
   DemoSession,
   DescentCostSnapshot,
@@ -530,6 +532,19 @@ const COST_SCOPE_LABELS = {
   installation_overhead: 'Installation overhead',
 } as const
 
+/**
+ * What a scope's known total recurs on, read from the priced lines that make it up.
+ *
+ * Only a cadence every one of them shares; a mixed or unknown one gets no suffix. Round 5's
+ * installation overhead is a monthly gp3 volume, which "one-time" misdescribed.
+ */
+function scopeTotalSuffix(lines: CostLineItem[], scope: CostScope): string {
+  const cadences = new Set(lines
+    .filter((line) => (line.scope ?? 'bout_estimate') === scope && line.subtotal_usd != null)
+    .map((line) => line.cadence))
+  return cadences.size === 1 && cadences.has('month') ? ' / month' : ''
+}
+
 function CostScopeTotal({ label, value, suffix }: { label: string; value: number | string | null | undefined; suffix: string }) {
   return (
     <div>
@@ -1020,7 +1035,7 @@ export function CostReceiptDisclosure({ session }: { session: DemoSession }) {
       <div className="cost-receipt-totals" aria-label="Cost scopes">
         <CostScopeTotal label="Bout estimate" value={receipt.known_bout_estimate_usd} suffix="" />
         <CostScopeTotal label="Monthly carrying" value={receipt.known_monthly_carrying_cost_usd} suffix=" / month" />
-        <CostScopeTotal label="Installation overhead" value={receipt.known_installation_overhead_usd} suffix=" one-time" />
+        <CostScopeTotal label="Installation overhead" value={receipt.known_installation_overhead_usd} suffix={scopeTotalSuffix(receipt.lines, 'installation_overhead')} />
       </div>
       {hasReconciliationMath && (
         <div className="cost-receipt-math" aria-label="Cost reconciliation">

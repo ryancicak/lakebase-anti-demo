@@ -3791,6 +3791,16 @@ class Round5WarmCoordinator:
                         op_task.cancel()
                         return
                     holder[0] = rebased
+                except Exception as exc:  # noqa: BLE001 - a failed renewal is not a lost fence
+                    # The next beat, a third of a TTL later, renews again. Ending the beat
+                    # here let the lease lapse under work that still owns it, and the next
+                    # authority guard then aborted that work.
+                    logger.warning(
+                        "Round 5 coordinator lease renewal failed during a held operation; "
+                        "retrying on the next beat: %s: %s",
+                        type(exc).__name__,
+                        exc,
+                    )
 
         beat_task = asyncio.create_task(beat())
         try:
