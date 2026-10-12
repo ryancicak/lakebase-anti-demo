@@ -387,6 +387,35 @@ async def test_a_session_that_cannot_be_re_minted_fails_the_rotation() -> None:
     assert adapters["competitor"]._prepared_clients.expires_at == aged
 
 
+async def test_a_failed_rotation_waits_for_the_slower_lane_before_it_answers() -> None:
+    # One lane refused at once while the other was still minting. Answering then left the
+    # slow one to install its session after a later refresh had installed a newer one.
+    aged = datetime.now(UTC) + timedelta(seconds=AGED_LIFE_SECONDS)
+    minted: list[str] = []
+    slow = _adapter(aged, minted)
+    sts_answers = asyncio.Event()
+    mint = slow._assumed_clients
+
+    async def slow_mint(context_id: str):
+        await sts_answers.wait()
+        return await mint(context_id)
+
+    slow._assumed_clients = slow_mint
+    adapters = {"lakebase": slow, "competitor": _adapter(aged, minted, fresh_life=600)}
+    provider = LiveRound5WarmProvider(SimpleNamespace(), lambda _competitor: None)
+    rotation = asyncio.create_task(
+        provider.refresh_claimed_dispatch(SimpleNamespace(generation=4), _claimed_capsule(adapters))
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not rotation.done()
+
+    sts_answers.set()
+    with pytest.raises(ConnectionSpikeLiveOperationError, match="safety margin"):
+        await rotation
+    assert slow._prepared_clients.expires_at > aged
+
+
 # ---------------------------------------------------------------------------
 # Through the real manager and HTTP route
 # ---------------------------------------------------------------------------

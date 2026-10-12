@@ -9993,14 +9993,21 @@ class LiveRound5WarmProvider:
             for engine in engines
             for lane_id, adapter in engine._lane_adapters.items()
         }
-        await asyncio.gather(
+        # Every lane's rotation ends before this answers, a failed one included: a slow
+        # lane left running could install its session after a later refresh had
+        # installed a newer one, and the capsule would then claim more life than it holds.
+        rotated = await asyncio.gather(
             *(
                 adapter.ensure_dispatch_capsule(
                     f"claim-{slot.generation}-{lane_id}-{uuid4().hex[:8]}"
                 )
                 for lane_id, adapter in adapters.values()
-            )
+            ),
+            return_exceptions=True,
         )
+        refused = next((item for item in rotated if isinstance(item, BaseException)), None)
+        if refused is not None:
+            raise refused
         dispatch_expires: dict[str, datetime] = {}
         for lane_id in ("lakebase", "competitor"):
             held = [engine._lane_adapters[lane_id].prepared_expires_at for engine in engines]
