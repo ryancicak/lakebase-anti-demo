@@ -10,6 +10,8 @@ presenter would:
     rapid-rearm-towel  towel, and arm a new bout the moment the round is READY again
     full-proof         let the bout finish
     finish-linger      let it finish and leave the result on screen; nothing may change
+    armed-wait         wait on the armed card before ringing, as a presenter talking does,
+                       then let the bout finish (not one of the release bar's waves)
 
 A scenario passes when the bout ends verified or toweled (a canceled check for
 `pre-bell-cancel`) and its round comes back READY. The run also fails if a round
@@ -26,6 +28,8 @@ Configuration is environment variables, as `run.sh` sets them:
     CHAOS_SCENARIOS       comma-separated waves (default: the release bar's six)
     CHAOS_COMPETITOR      aurora_serverless_v2 (default) or rds_postgres
     CHAOS_LINGER_SECONDS  how long `finish-linger` watches a result (default 300)
+    CHAOS_ARMED_WAIT_SECONDS  how long `armed-wait` holds the armed card (default 150,
+                          inside the 180 s armed window)
     CHAOS_DELAYS          "scenario:round_id=seconds" towel-timing overrides
     CHAOS_SKIP            "scenario:round_id" pairs to leave out
     CHAOS_YIELD_ROUNDS    rounds another actor may use during the run
@@ -102,6 +106,8 @@ for _item in os.environ.get("CHAOS_DELAYS", "").split(","):
         _key, _seconds = _item.split("=")
         _scenario, _round = _key.split(":")
         DELAYS.setdefault(_scenario, {})[_round] = float(_seconds)
+#: How long `armed-wait` leaves an armed card before ringing it.
+ARMED_WAIT_SECONDS = float(os.environ.get("CHAOS_ARMED_WAIT_SECONDS", "150"))
 TERMINAL = {"verified", "towelled", "failed"}
 #: How long a bout may take to reach a verdict. Every racing round decides its bout by its
 #: lanes' one maximum from the bell (`server/bout_limit.BOUT_TIME_LIMIT_SECONDS`, 15
@@ -614,6 +620,9 @@ class Harness:
             armed = self.wait_session(session_id, {"armed", "failed"}, 600, round_id)
             if armed.get("state") != "armed":
                 raise RuntimeError(f"arm failed: {armed.get('failure')}")
+            if scenario == "armed-wait":
+                # A presenter talks before ringing; a bell inside the window must still ring.
+                time.sleep(ARMED_WAIT_SECONDS)
             self.post(session_id, "run", timeout=600)
             running = self.wait_session(
                 session_id,
