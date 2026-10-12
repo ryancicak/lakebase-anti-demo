@@ -3,6 +3,7 @@ import type {
   LaneId,
   LaneSnapshot,
   RoundFiveRuntimeLane,
+  RoundFiveRuntimePhase,
   RoundFiveRuntimeSnapshot,
   RoundFiveSetupState,
 } from './api/types'
@@ -795,4 +796,28 @@ export function roundFiveLanePresentation(
     value: 'NOT TIMED',
     status: stillRunning ? 'RACING TO 10,000 CLIENTS' : 'NOT REACHED · NO EXACT RESULT',
   }
+}
+
+/**
+ * A Round 5 lane's phase in the room's words, rather than the server's enum.
+ * Capitals to match the card's "10K GATE + HOLD ✓", which this header also shows.
+ */
+const ROUND_FIVE_PHASE_LABELS: Record<RoundFiveRuntimePhase, string> = {
+  dispatching: 'STARTING',
+  provisioning_proxy: 'CREATING RDS PROXY',
+  verifying_proxy: 'CHECKING RDS PROXY',
+  verifying_path: 'CHECKING POOLED PATH',
+  ramping: 'RAMPING TO 10K',
+  holding: 'HOLDING 10K',
+  verified: '10K GATE + HOLD ✓',
+  failed: 'STOPPED',
+  cancelled: 'CANCELLED',
+}
+
+/** An unknown phase from a newer server still reads as words: `some_phase` is "Some Phase". */
+export function roundFivePhaseLabel(phase: string): string {
+  const known = (ROUND_FIVE_PHASE_LABELS as Record<string, string>)[phase]
+  if (known) return known
+  const words = phase.replace(/_+/g, ' ').trim().toLowerCase()
+  return words ? words.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Unknown'
 }

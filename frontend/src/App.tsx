@@ -84,6 +84,7 @@ import {
   ROUND_FIVE_FANIN_PROTOCOL,
   ROUND_FIVE_ID,
   ROUND_FIVE_MAX_RETRIES,
+  roundFivePhaseLabel,
   ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS,
   ROUND_FIVE_SAMPLED_QUERIES,
   isRoundFiveFanInEvidence,
@@ -5672,7 +5673,7 @@ function RoundFiveRuntimeBurstCard({
     ?? session.lanes[laneId].name
   return (
     <section className="round5-lane" data-corner={corner} aria-label={`${name} live fan-in evidence`}>
-      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : lane.phase.toUpperCase()}</span></header>
+      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : roundFivePhaseLabel(lane.phase)}</span></header>
       <dl>
         <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString('en-US')} / 10,000 clients</dd></div>
         <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString('en-US')} / 10,000 clients</dd></div>
@@ -7029,7 +7030,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
           { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Evidence validity (Proxy absent before the bell, CreateDBProxy the first timed post-bell AWS mutation, shared T0, exact 10,000 client connections) is what verifies a bout. Scheduling quality — launches within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other, CreateDBProxy within 100 ms of the bell — is advisory only; a miss is charged to that lane's own clock and never voids an exact result.` },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
-          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge, resident registry, lock, and cancellation owner per lane.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
+          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge per lane, which alone tracks, holds and can cancel that lane’s clients.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
         ],
         lakebase: [{ label: 'No new pool to provision', code: 'Connection pooling is built into the Lakebase endpoint.', note: 'No per-bout pooling resource is created, so no creation is journaled.' }],
         competitor: [{ label: 'Journaled per-bout build', code: 'Every RDS Proxy resource is written to the creation journal before AWS is called.', note: 'The journal is what lets an interrupted bout be cleaned up instead of leaking.' }],
@@ -8065,7 +8066,9 @@ export function BetweenRounds({
   const competitorCannotIdle = !deleting && cooldown.lanes.competitor.state === 'not_supported'
   const resetStatus = deleting
     ? failed
-      ? `Cleanup stopped · One or more ${recoveryCleanup ? 'recovery' : 'isolated'} environments could not be removed · Retry cleanup`
+      // The server's own reason, as Round 1 shows it, e.g. that the cleanup lost its
+      // ring fence; the fixed sentence stays for a failure that carries none.
+      ? `Cleanup stopped · ${(cooldown.failure ?? `One or more ${recoveryCleanup ? 'recovery' : 'isolated'} environments could not be removed`).replace(/\.$/, '')} · Retry cleanup`
       : ready
         ? `Both ${recoveryCleanup ? 'recovery' : 'isolated'} environments removed · RING AGAIN is ready`
         : `Clocks are live · Removing only the owned ${recoveryCleanup ? 'recovery' : 'test'} environments`

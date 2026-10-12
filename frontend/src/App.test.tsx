@@ -7866,4 +7866,21 @@ describe('a Round 1 reset the server gave up on', () => {
       'Reset stopped · Automatic return-to-idle cleanup lost its ring fence · Retry cleanup',
     )
   })
+
+  it('gives a Round 2 or 3 cleanup the server stopped its reason too', () => {
+    const deleting = (mode: 'delete_isolated_environment' | 'delete_recovery_environment', failure: string | null) => {
+      const base = failedReset(failure)
+      return { ...base, cooldown: { ...base.cooldown!, mode } }
+    }
+    const recovery = between(deleting('delete_recovery_environment', 'Automatic recovery cleanup lost its ring fence'))
+    expect(recovery.container.querySelector('.between-status')).toHaveTextContent(
+      'Cleanup stopped · Automatic recovery cleanup lost its ring fence · Retry cleanup',
+    )
+    recovery.unmount()
+    // No reason from the server: the fixed sentence, as before.
+    const isolated = between(deleting('delete_isolated_environment', null))
+    expect(isolated.container.querySelector('.between-status')).toHaveTextContent(
+      'Cleanup stopped · One or more isolated environments could not be removed · Retry cleanup',
+    )
+  })
 })

@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import { RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
+import { InstantReplay, RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { replayStory } from './instant-replay'
@@ -14,6 +14,7 @@ import {
   roundFiveHasComparison,
   roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFivePhaseLabel,
   roundFiveSchedulingAdvisorySummary,
   roundFiveSetupDiagnosticSummary,
   roundFiveStoppedVerdict,
@@ -3293,4 +3294,32 @@ it('prints client counts in the same format as the 10,000 beside them, whatever 
   )
   expect(document.body).toHaveTextContent('9,876')
   expect(document.body).not.toHaveTextContent('9.876')
+})
+
+it('names every Round 5 lane phase in words, never as the server enum', () => {
+  const phases = [
+    'dispatching', 'provisioning_proxy', 'verifying_proxy', 'verifying_path',
+    'ramping', 'holding', 'verified', 'failed', 'cancelled',
+  ] as const
+  for (const phase of phases) {
+    expect(roundFivePhaseLabel(phase), phase).not.toContain('_')
+  }
+  expect(roundFivePhaseLabel('provisioning_proxy')).toBe('CREATING RDS PROXY')
+  expect(roundFivePhaseLabel('verifying_path')).toBe('CHECKING POOLED PATH')
+  // A phase a newer server adds still reads as words.
+  expect(roundFivePhaseLabel('draining_idle_clients')).toBe('Draining Idle Clients')
+  expect(roundFivePhaseLabel('')).toBe('Unknown')
+})
+
+it('shows the burst card phase and the runner note in plain words', () => {
+  // Towelled while AWS was still creating the per-bout Proxy.
+  const session = screenshotTowelRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.phase = 'provisioning_proxy'
+  render(<InstantReplay session={session} roundNumber={5} onClose={vi.fn()} />)
+  const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
+  fireEvent.click(within(replay).getByText(/view full evidence/i))
+  expect(replay).toHaveTextContent('CREATING RDS PROXY')
+  expect(replay).not.toHaveTextContent(/PROVISIONING_PROXY/i)
+  expect(replay).toHaveTextContent('which alone tracks, holds and can cancel that lane’s clients')
+  expect(replay).not.toHaveTextContent(/resident registry/i)
 })
