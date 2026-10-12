@@ -13,7 +13,7 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -96,7 +96,12 @@ from .connection_spike_journal import (
     ResourceSpec,
     Round5CreationCoordinator,
 )
-from .coordination import COORDINATION_TABLE, RING_KEY, validate_ring_key
+from .coordination import (
+    _TRANSIENT_DATABRICKS_ERRORS,
+    COORDINATION_TABLE,
+    RING_KEY,
+    validate_ring_key,
+)
 from .manifest import DemoManifest, load_manifest
 from .models import CompetitorId, RoundId
 from .round5_control import (
@@ -9489,6 +9494,10 @@ class LiveRound5WarmProvider:
             EndpointConnectionError,
             ConnectionClosedError,
             psycopg.OperationalError,
+            # The coordination store's credential mint fails with these when the
+            # workspace is briefly unavailable, and that store retries exactly these.
+            # Any other Databricks answer (a denial, a bad request) still fails closed.
+            *_TRANSIENT_DATABRICKS_ERRORS,
         )
         if type(error).__name__ == "InvalidStateError":
             text = str(error)
@@ -9964,6 +9973,53 @@ class LiveRound5WarmProvider:
             broker_epoch=slot.broker_epoch,
             engines=engines,
             receipts=receipts,
+        )
+
+    async def refresh_claimed_dispatch(self, slot: object, capsule: object) -> object:
+        """Rotate the dispatch sessions of a capsule a claim is holding.
+
+        A claim keeps its capsule through the armed wait, and nothing re-prepares it,
+        so its 900 s dispatch sessions would age into their safety margin while the
+        presenter talks. This rotates only those sessions, the way setup keeps the
+        competitor's fresh (``ensure_dispatch_capsule``: no capacity rerun, no setup
+        observation, no runner STAGE), on the adapters the claimed engines dispatch
+        through. The returned capsule states the life those adapters now hold, never
+        more, so the bell refuses whatever the dispatch gate would.
+        """
+
+        engines = tuple(capsule.variant_contexts.values())
+        adapters = {
+            id(adapter): (lane_id, adapter)
+            for engine in engines
+            for lane_id, adapter in engine._lane_adapters.items()
+        }
+        await asyncio.gather(
+            *(
+                adapter.ensure_dispatch_capsule(
+                    f"claim-{slot.generation}-{lane_id}-{uuid4().hex[:8]}"
+                )
+                for lane_id, adapter in adapters.values()
+            )
+        )
+        dispatch_expires: dict[str, datetime] = {}
+        for lane_id in ("lakebase", "competitor"):
+            held = [engine._lane_adapters[lane_id].prepared_expires_at for engine in engines]
+            if any(value is None for value in held):
+                raise ConnectionSpikeLiveOperationError(
+                    "Round 5 claimed dispatch credentials were not retained"
+                )
+            dispatch_expires[lane_id] = min(value for value in held if value is not None)
+        return replace(
+            capsule,
+            dispatch_expires_at=dispatch_expires,
+            expires_at=min(capsule.control_expires_at, *dispatch_expires.values()),
+            renew_by=min(
+                capsule.control_expires_at - timedelta(seconds=SETUP_DEADLINE_SECONDS + 60),
+                *(
+                    value - timedelta(seconds=DISPATCH_CAPSULE_SAFETY_SECONDS)
+                    for value in dispatch_expires.values()
+                ),
+            ),
         )
 
     def _variant_receipt(

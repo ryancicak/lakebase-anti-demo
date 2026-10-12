@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import psycopg
 import pytest
+from databricks.sdk import errors as databricks_errors
 
 from server import round5_warm
 from server.connection_spike_live import LiveConnectionSpikeEngine, LiveRound5WarmProvider
@@ -127,6 +128,55 @@ async def test_query_canceled_counts_as_the_operational_family() -> None:
 async def test_an_unexpected_warm_error_still_fails_closed() -> None:
     with pytest.raises(BlockedWarmError) as raised:
         await _prepare_with(ValueError("unexpected"))
+    assert raised.value.code == "warm_baseline_unexpected"
+
+
+# The coordination store's credential mint raises these when the workspace is briefly
+# unavailable; the store itself retries exactly this set.
+_TRANSIENT_DATABRICKS = [
+    pytest.param(databricks_errors.InternalError("upstream request failed"), id="internal"),
+    pytest.param(
+        databricks_errors.TemporarilyUnavailable("try again later"), id="temporarily-unavailable"
+    ),
+    pytest.param(databricks_errors.DeadlineExceeded("deadline exceeded"), id="deadline"),
+    pytest.param(databricks_errors.ResourceExhausted("quota"), id="resource-exhausted"),
+]
+# A denial or a malformed request is an answer, not an outage.
+_DATABRICKS_ANSWERS = [
+    pytest.param(databricks_errors.PermissionDenied("no grant"), id="permission-denied"),
+    pytest.param(databricks_errors.Unauthenticated("expired principal"), id="unauthenticated"),
+    pytest.param(databricks_errors.BadRequest("bad request"), id="bad-request"),
+    pytest.param(databricks_errors.NotFound("no such endpoint"), id="not-found"),
+]
+
+
+@pytest.mark.parametrize("error", _TRANSIENT_DATABRICKS)
+async def test_a_transient_databricks_error_on_the_probe_is_a_strike(error: Exception) -> None:
+    provider = _provider(_ProbeEngine(error))
+    with pytest.raises(RetryableWarmError) as raised:
+        await provider.validate_ready(_SLOT, None)
+    assert raised.value.code == "runner_provenance_probe_retryable"
+
+
+@pytest.mark.parametrize("error", _TRANSIENT_DATABRICKS)
+async def test_a_transient_databricks_error_during_a_warm_is_retryable(error: Exception) -> None:
+    with pytest.raises(RetryableWarmError) as raised:
+        await _prepare_with(error)
+    assert raised.value.code == "warm_provider_retryable"
+
+
+async def test_a_wrapped_transient_databricks_error_is_retryable() -> None:
+    wrapped = RuntimeError("coordination read failed")
+    wrapped.__cause__ = databricks_errors.TemporarilyUnavailable("try again later")
+    with pytest.raises(RetryableWarmError):
+        await _prepare_with(wrapped)
+
+
+@pytest.mark.parametrize("error", _DATABRICKS_ANSWERS)
+async def test_a_databricks_answer_still_fails_closed(error: Exception) -> None:
+    assert await _provider(_ProbeEngine(error)).validate_ready(_SLOT, None) is False
+    with pytest.raises(BlockedWarmError) as raised:
+        await _prepare_with(error)
     assert raised.value.code == "warm_baseline_unexpected"
 
 

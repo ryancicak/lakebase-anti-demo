@@ -81,6 +81,11 @@ RUNNER_RECEIPT_REFRESH_MARGIN_SECONDS = 10 * 60
 # in-flight refresh republished. The lead must exceed a slow (executor-contended)
 # refresh so the launch margin never lapses during idle keep-alive.
 RUNNER_CREDENTIAL_REFRESH_LEAD_SECONDS = 60.0
+#: A held claim's dispatch-session rotation is abandoned after this long (the claim
+#: keeps the sessions it had), so a hung STS call never stalls the claim's renewal.
+CLAIM_DISPATCH_ROTATION_TIMEOUT_SECONDS = 20.0
+#: How soon a held claim retries a dispatch-session rotation that failed.
+CLAIM_DISPATCH_ROTATION_RETRY_SECONDS = 5.0
 # A retryable warm failure that persists this many consecutive attempts stops
 # being treated as transient: escalate to a DISTINCT terminal code instead of
 # retrying forever (still never first-failure BLOCKED).
@@ -4000,7 +4005,11 @@ class Round5WarmCoordinator:
                     ttl=self._claim_ttl,
                 )
                 self._last_slot = renewed
-                return max(0.1, self._claim_ttl.total_seconds() / 3)
+                # After the renewal, so a slow credential rotation never delays it.
+                rotation_due = await self._keep_claim_dispatchable(renewed)
+                return max(
+                    0.1, min(self._claim_ttl.total_seconds() / 3, rotation_due)
+                )
             # Past the durable renewal horizon (or armed-lease deadline) a lingering
             # active-id is treated as a leak: stop renewing so the claim expires and
             # fences into CLEANING rather than being kept alive forever by a stuck
@@ -4480,6 +4489,66 @@ class Round5WarmCoordinator:
         )
         self._provenance_strike_logged_at = now
         self._provenance_strikes_unlogged = 0
+
+    async def _keep_claim_dispatchable(self, slot: Round5WarmSlot) -> float:
+        """Rotate a held claim's dispatch sessions before they reach their margin.
+
+        The READY refresh never runs under a claim, and a capsule is claimed with only
+        60-180 s of launch life left on its 900 s dispatch sessions, so a presenter who
+        talked for a minute or two before ringing had the bell refused. The provider
+        rotates only those sessions, on the adapters the claimed engines dispatch
+        through, and reports the life they now hold: the claim keeps its generation,
+        runners and receipts, and the bell's margin check still refuses exactly what the
+        dispatch would. A rotation that fails or times out leaves the capsule it had.
+
+        Returns how many seconds until the next rotation is due.
+        """
+
+        rotate = getattr(self.provider, "refresh_claimed_dispatch", None)
+        capsule = self._capsule
+        if not callable(rotate) or capsule is None:
+            return self._claim_ttl.total_seconds() / 3
+        due = (
+            capsule.launch_margin_cliff() - self._clock()
+        ).total_seconds() - RUNNER_CREDENTIAL_REFRESH_LEAD_SECONDS
+        if due > 0:
+            return due
+        try:
+            async with asyncio.timeout(CLAIM_DISPATCH_ROTATION_TIMEOUT_SECONDS):
+                rotated = await rotate(slot, capsule)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Reduced to its type and code: an STS refusal's message can carry an ARN.
+            from .manager import operator_diagnosis
+
+            logger.warning(
+                "round5_claim_dispatch_rotation_failed generation=%s diagnosis=%s",
+                slot.generation,
+                operator_diagnosis(exc),
+            )
+            return CLAIM_DISPATCH_ROTATION_RETRY_SECONDS
+        if self._capsule is not capsule or (
+            rotated.generation,
+            rotated.coordinator_fence,
+            rotated.broker_epoch,
+            rotated.warm_attempt_token,
+        ) != (
+            capsule.generation,
+            capsule.coordinator_fence,
+            capsule.broker_epoch,
+            capsule.warm_attempt_token,
+        ):
+            # The capsule was replaced or withdrawn while the sessions rotated, or the
+            # rotation answered for another warm: keep what this process holds now.
+            return CLAIM_DISPATCH_ROTATION_RETRY_SECONDS
+        self._capsule = rotated
+        due = (
+            rotated.launch_margin_cliff() - self._clock()
+        ).total_seconds() - RUNNER_CREDENTIAL_REFRESH_LEAD_SECONDS
+        # A bound the dispatch sessions do not set (the control session) would leave the
+        # rotation due at once; retry on the interval rather than renewing the claim hot.
+        return due if due > 0 else CLAIM_DISPATCH_ROTATION_RETRY_SECONDS
 
     async def _reestablish_capsule(self, slot: Round5WarmSlot) -> float:
         """Recover from a READY slot whose launch capsule no longer belongs (bounded).

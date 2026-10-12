@@ -356,9 +356,10 @@ async def _armed_bout(
     wait: int,
     bell_delay: float = 0.0,
     atomic: bool = False,
+    provider_cls: type[_ShortLakebaseProvider] | None = None,
 ) -> AsyncIterator[SimpleNamespace]:
     clock = Clock()
-    provider = _ShortLakebaseProvider(clock, lakebase_seconds)
+    provider = (provider_cls or _ShortLakebaseProvider)(clock, lakebase_seconds)
     main = InMemoryBoutLeaseStore()
     round5 = InMemoryBoutLeaseStore(ring_key=ROUND5_RING_KEY)
     store = (
@@ -402,6 +403,7 @@ async def _armed_bout(
                 manager=manager,
                 clock=clock,
                 engine=provider.engines[-1],
+                provider=provider,
             )
     finally:
         await manager.close()
