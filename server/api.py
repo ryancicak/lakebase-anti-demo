@@ -411,9 +411,9 @@ async def get_catalog(request: Request) -> CatalogResponse:
         request.state.round5_cleanup_overlay_checked = True
     refresh_storage = getattr(run_manager, "refresh_delta_storage_readiness", None)
     if callable(refresh_storage):
-        # Read-only, cached, and single-flight. The first catalog answer must not
-        # advertise Rounds 4 and 6 before their shared Delta path has answered;
-        # subsequent fight-card polls normally return from the cache.
+        # Read-only, cached, single-flight, and never waited for: it re-reads in the
+        # background, and until the first read has answered Rounds 4 and 6 are held
+        # as checking rather than offered.
         await refresh_storage()
     sealed = catalog(
         model_score_available=run_manager.model_score_available,

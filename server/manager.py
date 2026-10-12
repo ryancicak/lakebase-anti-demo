@@ -1971,10 +1971,11 @@ class RunManager:
 
     @property
     def storage_checking(self) -> frozenset[RoundId]:
-        """Rounds 4 and 6 until this process has its first shared-storage verdict.
+        """Rounds 4 and 6 until this process's first shared-storage probe has finished.
 
-        Neither is offered before their shared Delta path has answered. A refusal
-        already on record outranks this, so the same round is not named twice.
+        Neither is offered before their shared Delta path has answered. A probe that
+        finishes inconclusive ends this too, as it always did: Prepare's exact storage
+        check still fails closed. A refusal on record outranks this.
         """
 
         if self._delta_storage_probe is None or self._delta_storage_probe_finished_ns is not None:
@@ -3293,12 +3294,15 @@ class RunManager:
         bout_id: str,
     ) -> SessionSnapshot:
         finalizer = asyncio.current_task()
+        cancels_on_entry = finalizer.cancelling() if finalizer is not None else 0
         try:
             if arm_task is not None:
                 try:
                     await arm_task
-                except asyncio.CancelledError:
-                    pass
+                except asyncio.CancelledError as exc:
+                    # The arm task's own cancel is what this waited for; the finalizer's
+                    # (close() cancelling it) ends it here.
+                    self._reraise_own_cancel(exc, cancels_on_entry)
 
             async with record.lock:
                 if record.snapshot.state != SessionState.CHECKING:
