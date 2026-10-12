@@ -365,6 +365,37 @@ describe('surviving a restart', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps no earlier receipt on the board when Refresh after a good read fails', async () => {
+    let failRefresh = () => {}
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve({ receipts: [receipt()] }),
+      })
+      .mockReturnValueOnce(new Promise((_resolve, reject) => {
+        failRefresh = () => reject(new Error('down'))
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<Summary onBack={() => {}} />)
+    await within(screen.getByRole('status')).findByText('1 of 6 rounds have a result.')
+    expect(document.querySelector('[data-round="wake_idle_app"]')).toHaveTextContent('2.40s')
+
+    await user.click(screen.getByRole('button', { name: /refresh/i }))
+    // The earlier answer is not the record any more once Refresh is reading it again.
+    expect(screen.getByRole('status')).toHaveTextContent('Reading the record…')
+    expectBoardRows('READING THE RECORD…')
+    expect(screen.queryByText('2.40s')).not.toBeInTheDocument()
+
+    await act(async () => { failRefresh() })
+    await expectUnreadBoard()
+    expect(screen.queryByText('2.40s')).not.toBeInTheDocument()
+    expect(screen.queryByText('LAKEBASE')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
   it.each(['fails', 'answers'])('ignores a read that %s after Refresh has replaced it', async (ending) => {
     let settleFirst = () => {}
     const fetchMock = vi.fn()
@@ -626,7 +657,8 @@ describe('house rules', () => {
   })
 
   it('wraps the failure line by its own class, whatever element carries it', () => {
-    const status = /\.summary-status\s*\{([^}]*)\}/.exec(css)
+    // Not `span.summary-status`: a rule qualified by its element stops applying when the element changes.
+    const status = /(?<![\w-])\.summary-status\s*\{([^}]*)\}/.exec(css)
     expect(status?.[1]).toMatch(/overflow-wrap:\s*anywhere/)
   })
 })
