@@ -436,6 +436,16 @@ ALLOWED: dict[str, frozenset[str]] = {
             "f0e9a6960fb22cc052486b62cf01e32dcaabacf70508a2bc087ddc25deafa81c",
         }
     ),
+    "The AWS account in Databricks' published Unity Catalog master role ARN, "
+    "`arn:aws:iam::414351767826:role/unity-catalog-prod-UCMasterRole-14S5ZJVKOTYTL`. "
+    "Databricks' own storage-credential documentation prints it, and it is the same "
+    "for every Databricks-on-AWS commercial workspace, so it names nobody's install. "
+    "It turns up in a real Terraform state only because infra/aws/variables.tf "
+    "defaults `round6_uc_master_role_arn` to it.": frozenset(
+        {
+            "414351767826",
+        }
+    ),
     "Cost-ledger micro-unit integers. These are money scaled to an integer "
     "(`2.6` becomes `260000000000000000`), so a fixture and a real receipt agree "
     "on them by arithmetic, not by one having been copied from the other.": frozenset(

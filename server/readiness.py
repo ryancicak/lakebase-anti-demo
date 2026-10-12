@@ -1056,7 +1056,7 @@ class ShowtimeReadinessGate:
             and durable.fencing_token == generation
             and durable.state == "ready"
         ):
-            # Swarm req #3: on the ONLY path that advertises ring readiness, refuse
+            # On the ONLY path that advertises ring readiness, refuse
             # it if the LIVE journal CHECK cannot admit a lifecycle state the
             # arm/bell/cleanup path emits. This is the runtime guard against
             # code<->live-DB drift (a fake journal accepts anything; the deployed
@@ -1154,7 +1154,7 @@ class ShowtimeReadinessGate:
     ) -> None:
         """Fail closed if the live journal CHECK cannot admit every emitted state.
 
-        Swarm req #3. The arm/bell/cleanup path can only durably write values from
+        The arm/bell/cleanup path can only durably write values from
         :class:`server.connection_spike_journal.LifecycleState`; if the deployed
         CHECK constraint admits fewer, an arm will be rejected by PostgreSQL and
         the ring must NOT advertise readiness. Raised as a non-retryable startup

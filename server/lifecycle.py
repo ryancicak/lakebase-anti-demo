@@ -146,8 +146,9 @@ ROUND5_JOURNAL_TABLE = "anti_demo_coordination.round5_creation_journal"
 #: sync with :class:`server.connection_spike_journal.LifecycleState`; a value in
 #: that enum but not here (or vice versa) is rejected by PostgreSQL at INSERT time
 #: -- the 2026-09-23 ``pending_launch`` arm regression, where code emitted a state
-#: the live CHECK forbade. Approach A emits only these already-allowed states, so
-#: no schema migration is ever required. The schema<->enum contract test and the
+#: the live CHECK forbade. The bell path commits the timed CREATE_INTENT
+#: (``precommit_launch_intent``) using only these already-allowed states, so no
+#: schema migration is ever required. The schema<->enum contract test and the
 #: startup readiness guard both pin this equality.
 ROUND5_JOURNAL_LIFECYCLE_STATES: tuple[str, ...] = (
     "create_intent",

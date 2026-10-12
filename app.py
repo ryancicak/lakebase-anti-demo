@@ -48,7 +48,12 @@ from server.lifecycle import (
     installation_presence_async,
     operator_ingress_drift_async,
 )
-from server.manager import InvalidStateError, RoundStorageReadinessError, RunManager
+from server.manager import (
+    InvalidStateError,
+    RoundStorageReadinessError,
+    RunManager,
+    operator_diagnosis,
+)
 from server.manifest import (
     MANIFEST_JSON_ENV,
     DemoManifest,
@@ -1993,7 +1998,13 @@ async def _open_runtime_when_manifest_settles(
                     f"STARTUP IS RETRYING AFTER THE MUTATION FINISHED · "
                     f"{type(exc).__name__.upper()} · ATTEMPT {attempts}"
                 )
-                gate.reason = f"Runtime startup is retrying a transient failure: {exc}"
+                # The reason is every control action's 409 detail, and a driver
+                # message names the coordination host and role. The traceback is
+                # in the warning below.
+                gate.reason = (
+                    "Runtime startup is retrying a transient failure: "
+                    f"{operator_diagnosis(exc)}"
+                )
                 gate.status = ReadinessStatus(
                     False,
                     "blocked" if escalated else "maintenance",
@@ -2021,7 +2032,10 @@ async def _open_runtime_when_manifest_settles(
                 "STARTUP FAILED AFTER THE MUTATION FINISHED · "
                 f"{type(exc).__name__} · AN OPERATOR MUST LOOK"
             )
-            gate.reason = f"Runtime startup failed after the mutation finished: {exc}"
+            gate.reason = (
+                "Runtime startup failed after the mutation finished: "
+                f"{operator_diagnosis(exc)}"
+            )
             gate.status = ReadinessStatus(False, "blocked", gate.detail)
             gate.round5_status = gate.status
             gate.recovery = RecoveryState(

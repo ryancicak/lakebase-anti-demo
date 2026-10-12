@@ -5055,7 +5055,7 @@ class Round5WarmCoordinator:
         return 0.0 if result.state == Round5WarmState.WARMING else 1.0
 
     async def converge_cleanup(self, claim_id: str) -> Round5WarmSlot:
-        """The SINGLE coalesced cleanup convergence for a claim (blocker 2).
+        """The SINGLE coalesced cleanup convergence for a claim.
 
         Both the supervised loop and any manager-driven request route through here,
         keyed by ``claim_id``. Concurrent callers await the SAME in-flight task, so

@@ -9574,10 +9574,15 @@ class LiveRound5WarmProvider:
             # Observability: the warm-slot public status carries only the fixed,
             # secret-free code (``warm_baseline_invalid`` / ``warm_provider_retryable``)
             # and the underlying cause was previously swallowed, so a blocked warm
-            # could not be diagnosed without a redeploy. Name the cause type and its
-            # (internal, non-secret) message at WARNING so an operator can see WHY the
-            # baseline was rejected. Provider ARNs/secrets never appear in these
-            # internal ConnectionSpikeLive* messages.
+            # could not be diagnosed without a redeploy. Name the cause at WARNING so an
+            # operator can see WHY the baseline was rejected, through
+            # ``operator_diagnosis``: it quotes this server's own messages and reduces a
+            # driver or AWS error to its type and SQLSTATE or error code, because a
+            # psycopg message names the Lakebase host and role and a botocore one can
+            # carry an ARN.
+            from .manager import operator_diagnosis
+
+            diagnosis = operator_diagnosis(exc)
             # Split at the raise site -- a bare ``except Exception -> retry`` would
             # silently retry a genuine anti-cheat/config defect forever, and a bare
             # ``-> block`` would terminally freeze a transient throttle (the
@@ -9598,10 +9603,9 @@ class LiveRound5WarmProvider:
                 # condition, and must not recheck forever.  (Subclass of
                 # SourceUnavailable, so this check MUST precede it.)
                 logger.warning(
-                    "round5_warm_source_unresolved generation=%s cause=%s: %s",
+                    "round5_warm_source_unresolved generation=%s diagnosis=%s",
                     generation,
-                    type(exc).__name__,
-                    exc,
+                    diagnosis,
                 )
                 raise RetryableWarmError("warm_source_unresolved") from exc
             if isinstance(exc, ConnectionSpikeLiveSourceUnavailableError):
@@ -9612,10 +9616,9 @@ class LiveRound5WarmProvider:
                 # apart from a generic AWS/Lakebase read failure. Never
                 # warm_baseline_invalid.
                 logger.warning(
-                    "round5_warm_source_unavailable generation=%s cause=%s: %s",
+                    "round5_warm_source_unavailable generation=%s diagnosis=%s",
                     generation,
-                    type(exc).__name__,
-                    exc,
+                    diagnosis,
                 )
                 raise RetryableWarmError("warm_source_unavailable") from exc
             if isinstance(exc, ConnectionSpikeCleanupError):
@@ -9631,26 +9634,23 @@ class LiveRound5WarmProvider:
                 # Checked before ``_retryable``: a settlement wait that timed out is
                 # raised from its TimeoutError, which that cause walk would claim.
                 logger.warning(
-                    "round5_warm_runner_settlement_unconfirmed generation=%s cause=%s: %s",
+                    "round5_warm_runner_settlement_unconfirmed generation=%s diagnosis=%s",
                     generation,
-                    type(exc).__name__,
-                    exc,
+                    diagnosis,
                 )
                 raise RetryableWarmError("warm_runner_settlement_unconfirmed") from exc
             if self._retryable(exc):
                 logger.warning(
-                    "round5_warm_provider_retryable generation=%s cause=%s: %s",
+                    "round5_warm_provider_retryable generation=%s diagnosis=%s",
                     generation,
-                    type(exc).__name__,
-                    exc,
+                    diagnosis,
                 )
                 raise RetryableWarmError("warm_provider_retryable") from exc
             if isinstance(exc, ConnectionSpikeLiveConfigurationError):
                 logger.warning(
-                    "round5_warm_baseline_invalid generation=%s cause=%s: %s",
+                    "round5_warm_baseline_invalid generation=%s diagnosis=%s",
                     generation,
-                    type(exc).__name__,
-                    exc,
+                    diagnosis,
                 )
                 raise BlockedWarmError("warm_baseline_invalid") from exc
             if isinstance(exc, Round5ResidentBindingChangedError):
@@ -9665,19 +9665,17 @@ class LiveRound5WarmProvider:
                 # genuine baseline drift and still fails closed (below).
                 if requires_cleaned_bout:
                     logger.warning(
-                        "round5_warm_resident_binding_transition generation=%s cause=%s: %s",
+                        "round5_warm_resident_binding_transition generation=%s diagnosis=%s",
                         generation,
-                        type(exc).__name__,
-                        exc,
+                        diagnosis,
                     )
                     raise RetryableWarmError(
                         "warm_resident_binding_transition"
                     ) from exc
             logger.warning(
-                "round5_warm_baseline_unexpected generation=%s cause=%s: %s",
+                "round5_warm_baseline_unexpected generation=%s diagnosis=%s",
                 generation,
-                type(exc).__name__,
-                exc,
+                diagnosis,
             )
             raise BlockedWarmError("warm_baseline_unexpected") from exc
         receipts = dict(zip(engines, warmed, strict=True))

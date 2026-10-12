@@ -21,6 +21,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any, cast
 
+import psycopg
 import pytest
 
 # Reuse the in-file coordinator/store/provider harness from the warm-slot suite.
@@ -254,6 +255,33 @@ async def test_prepare_fails_closed_on_unexpected_error() -> None:
     with pytest.raises(BlockedWarmError) as raised:
         await _prepare_with(ValueError("unexpected"))
     assert raised.value.code == "warm_baseline_unexpected"
+
+
+async def test_prepare_warnings_name_the_cause_without_quoting_driver_text(caplog) -> None:
+    # A psycopg connection failure names the Lakebase host and the role it logged in
+    # as. The warning keeps the type, and quotes only this server's own messages.
+    host = "instance-0000.database.example.invalid"
+    role = "round5-warm-role"
+    driver = psycopg.OperationalError(
+        f'connection failed: connection to server at "{host}", port 5432 failed: '
+        f'FATAL:  password authentication failed for user "{role}"'
+    )
+    with caplog.at_level("WARNING", logger="server.connection_spike_live"):
+        with pytest.raises(RetryableWarmError) as retried:
+            await _prepare_with(driver)
+        with pytest.raises(BlockedWarmError):
+            await _prepare_with(ValueError(f"unexpected reply from {host} as {role}"))
+        with pytest.raises(BlockedWarmError):
+            await _prepare_with(
+                ConnectionSpikeLiveConfigurationError("Round 5 warm source identity changed")
+            )
+    assert retried.value.code == "warm_provider_retryable"
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "round5_warm_provider_retryable generation=8 diagnosis=OperationalError" in logged
+    assert "round5_warm_baseline_unexpected generation=8 diagnosis=ValueError" in logged
+    assert "Round 5 warm source identity changed" in logged
+    assert host not in logged
+    assert role not in logged
 
 
 @pytest.mark.parametrize(
