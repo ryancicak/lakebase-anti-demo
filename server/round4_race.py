@@ -723,7 +723,14 @@ class Round4RaceEngine:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - a failed read is a negative read
-                    LOGGER.warning("Round 4 %s verifier read failed: %s", lane.lane_id, exc)
+                    # The type and SQLSTATE only: a psycopg message names the host and role.
+                    from .manager import operator_diagnosis
+
+                    LOGGER.warning(
+                        "Round 4 %s verifier read failed: %s",
+                        lane.lane_id,
+                        operator_diagnosis(exc),
+                    )
                     row = None
                 finished_ns = clock.now_ns()
                 reads += 1

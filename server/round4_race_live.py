@@ -139,7 +139,10 @@ class PostgresReader:
         except (psycopg.OperationalError, psycopg.InterfaceError) as lost:
             if self._reconnect is None:
                 raise
-            LOGGER.info("Round 4 verifier connection was lost (%s); opening a new one", lost)
+            LOGGER.info(
+                "Round 4 verifier connection was lost (%s); opening a new one",
+                type(lost).__name__,
+            )
             try:
                 await self._connection.close()
             except Exception:  # noqa: BLE001 - the connection is already gone

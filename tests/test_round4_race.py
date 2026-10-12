@@ -834,3 +834,42 @@ async def test_a_wake_opens_and_closes_each_destination_and_survives_one_that_wi
     assert lakebase.opened_readers == lakebase.closed_readers == 1
     # A wake starts nothing: both integrations stay parked, so the race stays cold.
     assert lakebase.started == aws.started == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_verifier_read_logs_its_type_and_not_the_driver_message(caplog):
+    import psycopg
+
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.05)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.05)
+    host, role = "instance-0000.database.example.invalid", "app-client-id"
+    failing = [
+        psycopg.OperationalError(
+            f'connection to server at "{host}", port 5432 failed: '
+            f'FATAL:  password authentication failed for user "{role}"'
+        )
+    ]
+
+    class FlakyReader(FakeReader):
+        async def read(self, entity_id):
+            # The wake read before the bell answers; the first read after it fails.
+            if self.lane.started and failing:
+                raise failing.pop()
+            return await super().read(entity_id)
+
+    async def open_flaky_reader():
+        lakebase.opened_readers += 1
+        return FlakyReader(lakebase)
+
+    lakebase.open_reader = open_flaky_reader
+    race = engine(source, lakebase, aws)
+    with caplog.at_level("WARNING", logger="server.round4_race"):
+        result = await race.run(await race.prepare(quiet), update(), quiet)
+
+    assert not failing, "the planted read failure never ran"
+    assert result.outcomes[LAKEBASE_LANE].verified
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "verifier read failed: OperationalError" in logged
+    assert host not in logged
+    assert role not in logged

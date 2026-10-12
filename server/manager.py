@@ -5554,9 +5554,8 @@ class RunManager:
                 )
             except Exception as exc:
                 logger.warning(
-                    "Round 5 atomic claim refused diagnosis=%s detail=%s",
-                    type(exc).__name__,
-                    str(exc),
+                    "Round 5 atomic claim refused diagnosis=%s",
+                    operator_diagnosis(exc),
                 )
                 if isinstance(
                     exc,
@@ -7900,13 +7899,12 @@ class RunManager:
                     # released, so the only honest thing left is to say so
                     # loudly enough that reconciliation has something to match.
                     logger.error(
-                        "%s settlement attempt %d/%d failed session=%s: %s: %s",
+                        "%s settlement attempt %d/%d failed session=%s diagnosis=%s",
                         label,
                         attempt,
                         self._settlement_attempts,
                         record.snapshot.id,
-                        type(exc).__name__,
-                        exc,
+                        operator_diagnosis(exc),
                     )
                     if attempt == self._settlement_attempts:
                         return
