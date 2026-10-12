@@ -3148,10 +3148,11 @@ class RunManager:
         record = await self._record(session_id)
         if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
             return await self._cancel_armed_round5(record, operator)
-        if (
-            record.bell_committed_at is not None
-            or record.snapshot.state == SessionState.RUNNING
-        ):
+        # Only RUNNING is read off the card's lock, since it can only be this bout's.
+        # Each path below checks the accepted bell under the lock: an owner re-arming
+        # the card holds it while the ring is claimed, and until then the card still
+        # carries the last bout's bell.
+        if record.snapshot.state == SessionState.RUNNING:
             raise InvalidStateError(
                 "Only an armed fight card that has not rung can be cancelled"
             )

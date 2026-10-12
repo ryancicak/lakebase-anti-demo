@@ -2958,6 +2958,122 @@ async def test_a_terminal_card_is_never_revived_by_its_committed_run(round_numbe
     await manager.close()
 
 
+class HeldClaimStore(InMemoryBoutLeaseStore):
+    """A ring whose next claim waits for ``answer`` once ``hold`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hold = False
+        self.entered = asyncio.Event()
+        self.answer = asyncio.Event()
+
+    async def claim(self, **kwargs):
+        if self.hold:
+            self.entered.set()
+            await self.answer.wait()
+        return await super().claim(**kwargs)
+
+
+async def test_a_cancel_sent_while_the_owner_rearms_a_rung_card_cancels_the_new_check() -> None:
+    """The cancel waits for the re-arm instead of answering from the last bout's bell.
+
+    The owner re-arms a Round 1 card whose last bout rang and failed. The arm holds the
+    card while it claims the ring, and until it has the card still carries that bout's
+    accepted bell, so a cancel that read it there refused a check that had not begun.
+    """
+
+    store = HeldClaimStore()
+    lakebase = FakeLiveTarget("lakebase", "Lakebase", 0.005)
+    competitor = FakeLiveTarget("competitor", "Aurora Serverless v2", 0.005, fatal=True)
+
+    class Resolver:
+        def resolve(self, _competitor: CompetitorId):
+            return lakebase, competitor
+
+    manager = RunManager(resolver=Resolver(), verifier=make_verifier(), lease_store=store)
+    manager._arm_poll = 0.001
+    created = await manager.create(_round_one())
+    await manager.start_arm(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.FAILED)
+    record = manager._records[created.id]
+    await drain_record_operations(manager, record)
+    assert record.bell_committed_at is not None
+
+    competitor.fatal = False
+    store.hold = True
+    arming = asyncio.create_task(manager.start_arm(created.id, OWNER))
+    await asyncio.wait_for(store.entered.wait(), timeout=5)
+    store.hold = False
+    cancelling = asyncio.create_task(manager.cancel_arm(created.id, OWNER))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not cancelling.done()
+
+    store.answer.set()
+    assert (await asyncio.wait_for(arming, timeout=5)).state == SessionState.CHECKING
+    cancelled = await asyncio.wait_for(cancelling, timeout=5)
+    assert cancelled.state == SessionState.FAILED
+    assert (cancelled.failure or "").startswith("Fight-card check cancelled")
+    await drain_record_operations(manager, record)
+    assert await store.current() is None
+    await manager.close()
+
+
+@pytest.mark.parametrize(
+    ("phase", "lapses_on_its_own"),
+    [
+        ("armed", True),
+        ("cooldown_failed", True),
+        ("checking", False),
+        ("run_committed", False),
+        ("cooldown", False),
+        ("towel_cleanup", False),
+    ],
+)
+async def test_only_a_fence_nothing_renews_can_lapse_without_closing_the_ring(
+    phase: str,
+    lapses_on_its_own: bool,
+) -> None:
+    """A row found gone under a lease past its TTL is a lapse only where nothing renews it.
+
+    An armed card and a failed Round 1 cooldown run no ring work, so their row simply
+    ran out. Under any other phase a bout or its cleanup may still be working, and the
+    lease is dropped as lost so the ring stays closed here until that work ends;
+    reading it as a lapse would let a second owner claim the ring under it.
+    """
+
+    store = InMemoryBoutLeaseStore()
+    manager = RunManager(resolver=FakeResolver(), verifier=make_verifier(), lease_store=store)
+    created = await manager.create(_round_one())
+    record = manager._records[created.id]
+    claimed = await store.claim(
+        session_id=created.id,
+        operator=OWNER,
+        phase="checking",
+        session_state=SessionState.CHECKING,
+        round_id=record.snapshot.round.id.value,
+        round_title=record.snapshot.round.title,
+        competitor_id=record.snapshot.competitor.id.value,
+        competitor_name=record.snapshot.competitor.short_name,
+        ttl=timedelta(seconds=60),
+    )
+    assert await store.release(claimed)
+    lapsed = dataclasses.replace(
+        claimed,
+        phase=phase,
+        expires_at=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    async with record.lease_lock:
+        record.lease = lapsed
+
+    assert await manager._release_bout(record) is True
+    assert record.lease is None
+    assert record.ring_lease_lost is (not lapses_on_its_own)
+    await manager.close()
+
+
 async def test_close_drains_committed_bell_handoff_before_cancelling_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
