@@ -3045,6 +3045,70 @@ async def test_close_discovers_and_drains_cancelled_bell_convergence(
             await asyncio.gather(closing, return_exceptions=True)
 
 
+async def test_close_during_an_outage_bell_leaves_no_fence_watcher_behind() -> None:
+    """Shutdown cancels a bell whose commit never answers, in a coordinator outage.
+
+    Its convergence, which close() drains, fails the card as unconfirmed after close()
+    collected the tasks it cancels. Nothing it starts may outlive close() or read the
+    coordinator after it.
+    """
+
+    class DarkFromTheBell(InMemoryBoutLeaseStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.outage = False
+            self.committing = asyncio.Event()
+            self.closed = False
+            self.reads_after_close = 0
+
+        async def transition(self, lease, **kwargs):
+            if kwargs["phase"] == "run_committed":
+                self.outage = True
+                self.committing.set()
+                await asyncio.Event().wait()
+            return await super().transition(lease, **kwargs)
+
+        async def current(self):
+            if self.closed:
+                self.reads_after_close += 1
+            if self.outage:
+                raise ConnectionError("coordination endpoint unreachable")
+            return await super().current()
+
+        async def release(self, lease):
+            if self.outage:
+                raise ConnectionError("coordination endpoint unreachable")
+            return await super().release(lease)
+
+    store = DarkFromTheBell()
+    manager = RunManager(
+        resolver=BeforeRunningResolver(),
+        verifier=make_verifier(),
+        lease_store=store,
+    )
+    manager._bell_handoff_timeout = 5
+    manager._shutdown_settle_timeout = 0.05
+    manager._shutdown_cleanup_timeout = 5
+    manager._terminal_release_call_timeout = 0.05
+    manager._active_lease_ttl = 0.2
+    created = await manager.create(_round_one())
+    await manager.start_arm(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.ARMED)
+    record = manager._records[created.id]
+
+    ringing = asyncio.create_task(manager.start_run(created.id, OWNER))
+    await asyncio.wait_for(store.committing.wait(), timeout=5)
+    await asyncio.wait_for(manager.close(), timeout=10)
+    store.closed = True
+    await asyncio.gather(ringing, return_exceptions=True)
+
+    assert record.snapshot.failure == _BELL_ACCEPTANCE_UNCONFIRMED
+    assert manager._unfinished_operations(record) == ()
+    # Past the armed fence's expiry, when a watcher left running would read again.
+    await asyncio.sleep(0.5)
+    assert store.reads_after_close == 0
+
+
 @pytest.mark.parametrize("round_number", [1, 6], ids=["round-1", "round-6"])
 async def test_owner_cancel_wins_while_armed_publication_is_in_flight(
     monkeypatch: pytest.MonkeyPatch,

@@ -14144,6 +14144,10 @@ class RunManager:
         ``retire`` runs once the record no longer points at ``fence``.
         """
 
+        if self._closed:
+            # Work that close() drains can still get here, after it collected the
+            # tasks it cancels. Shutdown leaves the row to its durable TTL.
+            return
         previous = record.fence_expiry_task
         if previous is not None and not previous.done():
             previous.cancel()
