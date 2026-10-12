@@ -20,12 +20,13 @@ import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from server.api import router
-from server.coordination import InMemoryBoutLeaseStore
+from server.coordination import InMemoryBoutLeaseStore, LeaseLostError
 from server.manager import (
     _ARMED_CARD_CANCELLED,
     _BELL_ACCEPTANCE_UNCONFIRMED,
@@ -54,6 +55,7 @@ from server.targets import TargetConfigurationError
 from tests.test_heartbeat_renew import JumpingClock
 from tests.test_manager import (
     BackgroundCleanupConnectionSpikeEngine,
+    FailingRecoveryEngine,
     FakeLiveTarget,
     FakeModelScoreEngine,
     FakeResolver,
@@ -4027,3 +4029,326 @@ async def test_close_discovers_and_drains_round_five_no_bell_replacement_child(
         allow_child.set()
         if not closing.done():
             await asyncio.gather(closing, return_exceptions=True)
+
+
+class CleanupFenceFault(InMemoryBoutLeaseStore):
+    """A coordination fault, once, as a finished bout moves its fence to its cleanup phase.
+
+    ``refused``: the move never lands; the coordinator turned away both of the store's
+    attempts. ``answer_lost``: it lands and only its answer is lost. ``retried_cas``: it
+    lands, its answer is lost, and the store's own retry is refused as the strict
+    compare-and-swap it is. ``outage``: the coordinator goes dark at the move, after it
+    lands if ``lands``, until ``heal()``.
+    """
+
+    def __init__(self, fault: str, *, lands: bool = False) -> None:
+        super().__init__()
+        self.fault = fault
+        self.lands = lands
+        self.tripped = asyncio.Event()
+        self.dark = False
+        self.healed = False
+        self.committed_renewals_after_heal = 0
+
+    def heal(self) -> None:
+        self.dark = False
+        self.healed = True
+
+    def _unreachable(self) -> None:
+        if self.dark:
+            raise psycopg.OperationalError("connection to the coordination endpoint timed out")
+
+    async def transition(self, lease, **kwargs):
+        if (
+            kwargs["phase"] == "cooldown"
+            and lease.phase == "run_committed"
+            and not self.tripped.is_set()
+        ):
+            self.tripped.set()
+            if self.fault == "refused":
+                raise psycopg.OperationalError("FATAL: too many connections for database")
+            if self.fault != "outage" or self.lands:
+                await super().transition(lease, **kwargs)
+            if self.fault == "answer_lost":
+                raise psycopg.OperationalError("server closed the connection unexpectedly")
+            if self.fault == "retried_cas":
+                raise LeaseLostError("RING LEASE EXPIRED · PREPARE THE FIGHT CARD AGAIN")
+            self.dark = True
+        self._unreachable()
+        return await super().transition(lease, **kwargs)
+
+    async def current(self):
+        self._unreachable()
+        return await super().current()
+
+    async def release(self, lease):
+        self._unreachable()
+        return await super().release(lease)
+
+    async def renew(self, lease, *, ttl):
+        self._unreachable()
+        renewed = await super().renew(lease, ttl=ttl)
+        if self.healed and lease.phase == "run_committed":
+            self.committed_renewals_after_heal += 1
+        return renewed
+
+
+class RaisingSafeChangeEngine(FakeSafeChangeEngine):
+    async def run(self, arm, on_progress):
+        raise RuntimeError("the isolated endpoint stopped answering")
+
+
+def _cleanup_fence_manager(
+    round_number: int, store: InMemoryBoutLeaseStore, *, fails: bool = False
+) -> tuple[RunManager, SessionCreate]:
+    if round_number == 1:
+        manager = RunManager(
+            resolver=SequencedCooldownResolver(),
+            verifier=make_verifier(),
+            lease_store=store,
+        )
+        manager._arm_poll = 0.001
+        manager._cooldown_timeout = 0.5
+        request = _round_one()
+    elif round_number == 2:
+        safe_change = RaisingSafeChangeEngine() if fails else FakeSafeChangeEngine()
+        manager = RunManager(safe_change_factory=lambda: safe_change, lease_store=store)
+        request = _round_two()
+    else:
+        recovery = FailingRecoveryEngine() if fails else TransitionRaceRecoveryEngine()
+        if not fails:
+            recovery.complete_competitor.set()
+        manager = RunManager(recovery_factory=lambda: recovery, lease_store=store)
+        request = _round_three()
+    _bounded(manager, deadline=10.0)
+    manager._terminal_release_call_timeout = 0.5
+    return manager, request
+
+
+async def _published(record: SessionRecord, event: str) -> None:
+    async def seen() -> bool:
+        return event in _events(record)
+
+    await _until(seen)
+
+
+@pytest.mark.parametrize("fault", ["refused", "answer_lost", "retried_cas"])
+@pytest.mark.parametrize("round_number", [1, 2, 3], ids=["round-1", "round-2", "round-3"])
+async def test_a_verdict_keeps_its_receipt_and_cleanup_through_a_blip_at_its_cleanup_fence(
+    round_number: int, fault: str
+) -> None:
+    """The coordinator blips as the verdict moves the ring fence to its cleanup phase.
+
+    The verdict is published and sealed, and the cleanup it owes runs under that fence:
+    the move is retried when it never landed, and adopted when only its answer was lost.
+    """
+
+    store = CleanupFenceFault(fault)
+    manager, request = _cleanup_fence_manager(round_number, store)
+    created = await manager.create(request)
+    await manager.start_arm(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, OWNER)
+    record = manager._records[created.id]
+    await _published(record, "run_finished")
+    assert store.tripped.is_set()
+    receipt = await sealed_receipt(created.id)
+    assert receipt is not None and receipt.outcome == "declared"
+
+    await _ring_freed(store)
+    await drain_record_operations(manager, record)
+    done = await manager.get(created.id)
+    assert done.state == SessionState.VERIFIED
+    assert done.cooldown is not None and done.cooldown.state == CooldownState.READY
+    assert _events(record).count("run_finished") == 1
+    assert "session_failed" not in _events(record)
+    assert record.lease is None
+    assert record.lease_heartbeat_task is None
+    await manager.close()
+
+
+@pytest.mark.parametrize("fault", ["refused", "answer_lost", "retried_cas"])
+@pytest.mark.parametrize("round_number", [2, 3], ids=["round-2", "round-3"])
+async def test_a_failed_run_keeps_its_receipt_and_cleanup_through_a_blip_at_its_cleanup_fence(
+    round_number: int, fault: str
+) -> None:
+    store = CleanupFenceFault(fault)
+    manager, request = _cleanup_fence_manager(round_number, store, fails=True)
+    created = await manager.create(request)
+    await manager.start_arm(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, OWNER)
+    record = manager._records[created.id]
+    await _published(record, "session_failed")
+    assert store.tripped.is_set()
+    receipt = await sealed_receipt(created.id)
+    assert receipt is not None and receipt.outcome == "stopped_short"
+
+    await _ring_freed(store)
+    await drain_record_operations(manager, record)
+    done = await manager.get(created.id)
+    assert done.state == SessionState.FAILED
+    assert done.cooldown is not None and done.cooldown.state == CooldownState.READY
+    assert _events(record).count("session_failed") == 1
+    assert record.lease is None
+    assert record.lease_heartbeat_task is None
+    await manager.close()
+
+
+@pytest.mark.parametrize("lands", [False, True], ids=["never-landed", "landed"])
+async def test_a_cleanup_fence_the_coordinator_never_confirms_keeps_the_verdict(
+    lands: bool,
+) -> None:
+    """The coordinator stays dark past the bound on the move to the cleanup phase.
+
+    The verdict is published and sealed all the same, and the fence is never renewed
+    again: a background release frees the ring once the coordinator answers, or the
+    row's own TTL does. Nothing turns the verdict into a lost lease afterwards, and the
+    owner's re-do then cleans up under a fence of its own.
+    """
+
+    store = CleanupFenceFault("outage", lands=lands)
+    manager, request = _cleanup_fence_manager(2, store)
+    manager._terminal_release_call_timeout = 0.2
+    created = await manager.create(request)
+    await manager.start_arm(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, OWNER)
+    record = manager._records[created.id]
+    await _published(record, "run_finished")
+    assert store.dark
+    unconfirmed = await manager.get(created.id)
+    assert unconfirmed.state == SessionState.VERIFIED
+    assert unconfirmed.cooldown is not None
+    assert unconfirmed.cooldown.state == CooldownState.FAILED
+    assert unconfirmed.cooldown.failure == (
+        "Automatic isolated-environment cleanup could not confirm its ring fence"
+    )
+    receipt = await sealed_receipt(created.id)
+    assert receipt is not None and receipt.outcome == "declared"
+    heartbeat = record.lease_heartbeat_task
+    assert heartbeat is None or heartbeat.done()
+
+    store.heal()
+    await _ring_freed(store)
+    await asyncio.sleep(1.2)  # past every lease's TTL
+    assert store.committed_renewals_after_heal == 0
+    assert await store.current() is None
+    assert (await manager.get(created.id)).state == SessionState.VERIFIED
+    assert _events(record).count("run_finished") == 1
+    assert "session_failed" not in _events(record)
+
+    await manager.start_cooldown(created.id, OWNER)
+    await drain_record_operations(manager, record)
+    redone = await manager.get(created.id)
+    assert redone.state == SessionState.VERIFIED
+    assert redone.cooldown is not None and redone.cooldown.state == CooldownState.READY
+    assert await store.current() is None
+    await manager.close()
+
+
+class OutageAtEachRelease(OutageAtTerminalRelease):
+    """Dark at the first release of ``trip_phase`` after each ``arm_trip()``, until healed."""
+
+    def arm_trip(self) -> None:
+        self.tripped.clear()
+        self.retried.clear()
+        self.release_attempts = 0
+        self.renewals_after_heal = 0
+
+
+async def test_round_one_redo_never_leaves_an_immortal_cooldown_lease() -> None:
+    """The owner's re-do after an unconfirmed return to idle meets a second outage."""
+
+    store = OutageAtEachRelease(trip_phase="cooldown")
+    manager = RunManager(
+        resolver=SequencedCooldownResolver(),
+        verifier=make_verifier(),
+        lease_store=store,
+    )
+    _bounded(manager, deadline=0.2)
+    manager._arm_poll = 0.001
+    manager._cooldown_timeout = 0.5
+    created = await manager.create(_round_one())
+    await manager.start_arm(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, OWNER)
+    await _reach(manager, created.id, SessionState.VERIFIED)
+    record = manager._records[created.id]
+
+    async def cooldown_failed() -> bool:
+        snapshot = await manager.get(created.id)
+        return snapshot.cooldown is not None and snapshot.cooldown.state == CooldownState.FAILED
+
+    await _until(cooldown_failed)
+    await drain_record_operations(manager, record)
+    await _never_renewed_after(store)
+
+    store.arm_trip()
+    await manager.start_cooldown(created.id, OWNER)
+    await asyncio.wait_for(store.tripped.wait(), timeout=5)
+    redo = record.cooldown_task
+    assert redo is not None
+    await asyncio.wait_for(asyncio.wait({redo}), timeout=5)
+    # The coordinator answers again as soon as the re-do has finished with its release.
+    await _never_renewed_after(store)
+    await drain_record_operations(manager, record)
+    assert record.lease_heartbeat_task is None
+    redone = await manager.get(created.id)
+    assert redone.state == SessionState.VERIFIED
+    assert redone.cooldown is not None
+    assert redone.cooldown.state == CooldownState.FAILED
+    assert redone.cooldown.failure == (
+        "Return to idle was verified, but ring release could not be confirmed."
+    )
+    await manager.close()
+
+
+async def test_a_lost_round_five_cleanup_lease_never_leaves_its_main_ring_renewing() -> None:
+    """A finished Round 5 card loses its cleanup lease, then cannot confirm its main release."""
+
+    main = OutageAtTerminalRelease(trip_phase="cooldown")
+    round5 = InMemoryBoutLeaseStore(ring_key="round5")
+    manager = RunManager(
+        connection_spike_factory=lambda _competitor: SuccessfulTwoPhaseConnectionSpikeEngine(
+            burst_valid=True
+        ),
+        lease_store=main,
+        round5_lease_store=round5,
+    )
+    _bounded(manager, deadline=0.2)
+    created = await manager.create(_round_five())
+    record = manager._records[created.id]
+    record.operator = OWNER
+    record.snapshot.state = SessionState.FAILED
+    record.round5_terminal_published = True
+    ttl = timedelta(seconds=manager._running_lease_ttl)
+    claim = {
+        "session_id": created.id,
+        "operator": OWNER,
+        "session_state": SessionState.FAILED,
+        "round_id": record.snapshot.round.id.value,
+        "round_title": record.snapshot.round.title,
+        "competitor_id": record.snapshot.competitor.id.value,
+        "competitor_name": record.snapshot.competitor.short_name,
+        "ttl": ttl,
+    }
+    record.lease = await manager._lease_store_for_record(record).claim(phase="cooldown", **claim)
+    record.round5_lease = await manager._round5_cleanup_store().claim(
+        phase="round5_cleanup", **claim
+    )
+    manager._start_lease_heartbeat(record, ttl)
+    manager._start_round5_lease_heartbeat(record, ttl)
+    cleanup_heartbeat = record.round5_lease_heartbeat_task
+    assert cleanup_heartbeat is not None
+
+    # The cleanup ring is taken out from under it; the main ring's release then fails,
+    # and the coordinator answers again as soon as that release has been given up on.
+    await round5.release(record.round5_lease)
+    await asyncio.wait_for(main.tripped.wait(), timeout=5)
+    await asyncio.wait_for(asyncio.wait({cleanup_heartbeat}), timeout=5)
+    await _never_renewed_after(main)
+    await drain_record_operations(manager, record)
+    assert record.lease is None
+    assert record.lease_heartbeat_task is None
+    await manager.close()

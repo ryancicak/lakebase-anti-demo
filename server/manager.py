@@ -6609,7 +6609,10 @@ class RunManager:
                     record.snapshot.id,
                 )
             else:
-                await self._release_bout(record)
+                # The bout is over, and nothing retries this release afterwards.
+                async with record.lease_lock:
+                    main = record.lease
+                await self._settle_terminal_release(record, main)
             return
 
     async def _heartbeat_lease(self, record: SessionRecord, ttl: timedelta) -> None:
@@ -7788,7 +7791,16 @@ class RunManager:
                         owned=held,
                     )
             elif mode != ResetMode.RETURN_TO_IDLE or cleanup_ready:
-                await self._release_bout(record, held)
+                # As the automatic return to idle does: nothing retries this release.
+                if await self._settle_terminal_release(record, held) != "released":
+                    async with record.lock:
+                        if cooldown is not None and record.snapshot.cooldown is cooldown:
+                            cooldown.state = CooldownState.FAILED
+                            cooldown.failure = (
+                                "Return to idle was verified, but ring release could not "
+                                "be confirmed."
+                            )
+                            record.snapshot.updated_at = datetime.now(UTC)
 
     async def _transition_bout_to_cleanup(
         self,
@@ -7845,6 +7857,96 @@ class RunManager:
             record,
             timedelta(seconds=cleanup_ttl_seconds),
         )
+
+    async def _fence_finished_bout_for_cleanup(
+        self,
+        record: SessionRecord,
+        session_state: SessionState,
+    ) -> str:
+        """Move a finished bout's fence to its cleanup phase: "fenced", "lost" or "unknown".
+
+        For Rounds 1-3, which hold ``record.lock`` from the verdict through this move,
+        so neither a towel nor a lost lease's handling interleaves. A coordinator that
+        does not answer is retried, and no attempt starts after
+        ``_terminal_release_call_timeout``. The move is a strict compare-and-swap, so
+        one that landed and lost only its answer is refused when retried, the store's
+        own retry included; the coordinator is then asked what it holds, and the bout's
+        own row already in its cleanup phase is adopted. "lost" means the fence is gone
+        or another's. "unknown" means the bound ran out first: the fence is never
+        renewed again, and a non-renewing background release frees the ring, or the
+        row's durable TTL does, as after a terminal settle that runs out of time.
+        Neither ever reports a lost lease over the verdict.
+        """
+
+        async with record.lease_lock:
+            committed = record.lease
+        store = self._lease_store_for_record(record)
+        deadline = time.monotonic() + max(0.001, self._terminal_release_call_timeout)
+        backoff = 0.01
+        first_sent: float | None = None
+        while True:
+            if first_sent is None:
+                first_sent = time.monotonic()
+            try:
+                await self._transition_bout_to_cleanup(
+                    record, session_state, expected_lease=committed
+                )
+            except InvalidStateError as exc:
+                # Only a refused compare-and-swap can have been this bout's own move.
+                if not isinstance(exc.__cause__, LeaseLostError):
+                    return "lost"
+            except Exception as exc:
+                logger.warning(
+                    "Cleanup fence move failed session=%s diagnosis=%s",
+                    record.snapshot.id,
+                    operator_diagnosis(exc),
+                )
+            else:
+                return "fenced"
+            left = deadline - time.monotonic()
+            if left > 0:
+                try:
+                    holder = await self._bounded_lease_call(store.current(), left)
+                except Exception:
+                    pass
+                else:
+                    if (
+                        holder is not None
+                        and holder.phase == "cooldown"
+                        and self._same_lease_authority(holder, committed)
+                    ):
+                        # Proven from the first attempt: whichever one landed, the row
+                        # lives at least its TTL past that.
+                        async with record.lease_lock:
+                            local = record.lease
+                            adopted = local is not None and self._same_exact_lease(
+                                local, committed
+                            )
+                            if adopted:
+                                self._set_lease(record, holder, first_sent)
+                        if not adopted:
+                            return "lost"
+                        self._start_lease_heartbeat(
+                            record, self._lease_ttl(record, holder.phase)
+                        )
+                        return "fenced"
+                    if holder is None or not self._same_exact_lease(holder, committed):
+                        return "lost"
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            await asyncio.sleep(min(backoff, left))
+            backoff = min(backoff * 2, max(0.01, self._terminal_release_backoff_cap))
+        logger.error(
+            "Cleanup fence for %s could not be confirmed within %.1fs. Its run fence is "
+            "released in the background, never renewing, until it is confirmed or the "
+            "lease expires at its durable TTL.",
+            record.snapshot.id,
+            self._terminal_release_call_timeout,
+        )
+        self._cancel_lease_heartbeat(record, committed)
+        self._retry_terminal_release_in_background(record, committed)
+        return "unknown"
 
     def _schedule_round_settlement(
         self,
@@ -13176,20 +13278,23 @@ class RunManager:
                 record.snapshot.remembered_result = None
                 record.snapshot.failure = "One or more recovered orders could not be verified."
                 self._log_lane_refusals(record, round_number=3)
-            try:
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError as exc:
+            fence = await self._fence_finished_bout_for_cleanup(record, record.snapshot.state)
+            if fence != "fenced":
                 logger.error(
-                    "Round 3 result verified but cleanup fence was lost session=%s: %s",
+                    "Round 3 result verified but cleanup fence was %s session=%s",
+                    fence,
                     record.snapshot.id,
-                    type(exc).__name__,
                 )
                 cooldown = self._new_cooldown(
                     record,
                     ResetMode.DELETE_RECOVERY_ENVIRONMENT,
                 )
                 cooldown.state = CooldownState.FAILED
-                cooldown.failure = "Automatic recovery cleanup lost its ring fence"
+                cooldown.failure = (
+                    "Automatic recovery cleanup lost its ring fence"
+                    if fence == "lost"
+                    else "Automatic recovery cleanup could not confirm its ring fence"
+                )
                 record.snapshot.cooldown = cooldown
             else:
                 record.snapshot.cooldown = self._new_cooldown(
@@ -13265,20 +13370,23 @@ class RunManager:
                     "One or more isolated schema changes could not be verified."
                 )
                 self._log_lane_refusals(record, round_number=2)
-            try:
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError as exc:
+            fence = await self._fence_finished_bout_for_cleanup(record, record.snapshot.state)
+            if fence != "fenced":
                 logger.error(
-                    "Round 2 result verified but cleanup fence was lost session=%s: %s",
+                    "Round 2 result verified but cleanup fence was %s session=%s",
+                    fence,
                     record.snapshot.id,
-                    type(exc).__name__,
                 )
                 cooldown = self._new_cooldown(
                     record,
                     ResetMode.DELETE_ISOLATED_ENVIRONMENT,
                 )
                 cooldown.state = CooldownState.FAILED
-                cooldown.failure = "Automatic isolated-environment cleanup lost its ring fence"
+                cooldown.failure = (
+                    "Automatic isolated-environment cleanup lost its ring fence"
+                    if fence == "lost"
+                    else "Automatic isolated-environment cleanup could not confirm its ring fence"
+                )
                 record.snapshot.cooldown = cooldown
             else:
                 record.snapshot.cooldown = self._new_cooldown(
@@ -13351,22 +13459,25 @@ class RunManager:
                     record.snapshot.failure = "One or more lanes could not be verified."
                 self._log_lane_refusals(record, round_number=1)
             self._cancel_idle_watch(record)
-            try:
-                # The verdict ends the timed bout, but not the round's ownership.
-                # Keep the same durable fence in a cleanup phase until both
-                # control planes prove zero. Releasing here was the hidden-wait
-                # defect: every viewer saw READY while the next arm was forced to
-                # rediscover Aurora's auto-pause floor.
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError as exc:
+            # The verdict ends the timed bout, but not the round's ownership.
+            # Keep the same durable fence in a cleanup phase until both
+            # control planes prove zero. Releasing here was the hidden-wait
+            # defect: every viewer saw READY while the next arm was forced to
+            # rediscover Aurora's auto-pause floor.
+            fence = await self._fence_finished_bout_for_cleanup(record, record.snapshot.state)
+            if fence != "fenced":
                 logger.error(
-                    "Round 1 result verified but cleanup fence was lost session=%s: %s",
+                    "Round 1 result verified but cleanup fence was %s session=%s",
+                    fence,
                     record.snapshot.id,
-                    type(exc).__name__,
                 )
                 cooldown = self._new_cooldown(record, ResetMode.RETURN_TO_IDLE)
                 cooldown.state = CooldownState.FAILED
-                cooldown.failure = "Automatic return-to-idle cleanup lost its ring fence"
+                cooldown.failure = (
+                    "Automatic return-to-idle cleanup lost its ring fence"
+                    if fence == "lost"
+                    else "Automatic return-to-idle cleanup could not confirm its ring fence"
+                )
                 record.snapshot.cooldown = cooldown
             else:
                 record.snapshot.cooldown = self._new_cooldown(
@@ -14530,12 +14641,15 @@ class RunManager:
             record.snapshot.remembered_result = None
             self._cancel_idle_watch(record)
             if cleanup_mode is not None:
-                try:
-                    await self._transition_bout_to_cleanup(record, SessionState.FAILED)
-                except InvalidStateError:
+                fence = await self._fence_finished_bout_for_cleanup(record, SessionState.FAILED)
+                if fence != "fenced":
                     cooldown = self._new_cooldown(record, cleanup_mode)
                     cooldown.state = CooldownState.FAILED
-                    cooldown.failure = "Automatic cleanup lost its ring fence"
+                    cooldown.failure = (
+                        "Automatic cleanup lost its ring fence"
+                        if fence == "lost"
+                        else "Automatic cleanup could not confirm its ring fence"
+                    )
                     record.snapshot.cooldown = cooldown
                     cleanup_mode = None
                 else:
