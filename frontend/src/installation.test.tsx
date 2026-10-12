@@ -8,7 +8,7 @@
  * signals a genuine loss is also the state that must refuse to act on it.
  */
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -412,5 +412,58 @@ describe('when the banner cannot read its own endpoint', () => {
     // Silence would render exactly like a healthy installation, which is the
     // defect this whole surface exists to refuse.
     await screen.findByText('THE INSTALLATION STATUS COULD NOT BE READ')
+  })
+
+  it('stays silent for a viewer, whose screen never carries the diagnosis', async () => {
+    // A viewer of the deployed app is shown nothing in every state, so one failed
+    // poll -- a restart's 502, a 15 s timeout -- must not paint the projected
+    // screen with a yellow "502 Bad Gateway" until the next poll answers.
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(deployedViewer()),
+        })
+        .mockResolvedValue({
+          ok: false,
+          status: 502,
+          statusText: 'Bad Gateway',
+          json: () => Promise.reject(new SyntaxError('not JSON')),
+        })
+      vi.stubGlobal('fetch', fetchMock)
+      const { container } = render(<InstallationBanner />)
+      await act(() => vi.advanceTimersByTimeAsync(0))
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      await act(() => vi.advanceTimersByTimeAsync(15_000))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(container.querySelector('.installation-banner')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still says so to an operator whose last read succeeded', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(status()),
+        })
+        .mockRejectedValue(new TypeError('Failed to fetch'))
+      vi.stubGlobal('fetch', fetchMock)
+      render(<InstallationBanner />)
+      await act(() => vi.advanceTimersByTimeAsync(0))
+      await act(() => vi.advanceTimersByTimeAsync(15_000))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(screen.getByText('THE INSTALLATION STATUS COULD NOT BE READ')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

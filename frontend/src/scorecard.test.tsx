@@ -159,6 +159,26 @@ describe('the final scorecard on a capability-gap round', () => {
   })
 })
 
+describe('the final scorecard on a round with no reset', () => {
+  it('prints no reset clock for Rounds 4, 5 and 6, which never start one', () => {
+    // These rounds carry no cooldown, so the reset row could only ever read
+    // "No executable reset contract · WATCHING LB · WATCHING OPP" -- a watch on
+    // a clock nobody started, forever.
+    const { container } = card([
+      ROUND_SIX,
+      row({ session_id: 'R4', round_id: 'put_model_score_in_app' as RoundId }),
+      row({ session_id: 'R5', round_id: 'survive_connection_spike' as RoundId }),
+    ])
+    expect(container.querySelectorAll('.scorecard-row')).toHaveLength(3)
+    expect(document.body).not.toHaveTextContent(/WATCHING|No executable reset contract/)
+  })
+
+  it('keeps the reset row for a round that has one', () => {
+    card([row()])
+    expect(screen.getByText('Delete recovery environment')).toBeInTheDocument()
+  })
+})
+
 describe('the final scorecard on a round somebody stopped', () => {
   it('prints the abandoned round in the ledger\'s own words, with no figure', () => {
     const { container } = card([ABANDONED])

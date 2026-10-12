@@ -73,13 +73,16 @@ export const ROUND_ORDER: readonly RoundId[] = [
   'analyze_live_orders_without_slowing_checkout',
 ]
 
+// The catalog's titles, for a round the record holds nothing for. A row that was
+// run prints its receipt's title, so these must be the same words or a summary
+// names the same round two ways depending on whether it ran.
 const ROUND_TITLES: Record<RoundId, string> = {
   wake_idle_app: 'WAKE THIS IDLE APP',
-  make_schema_change_safely: 'MAKE A SCHEMA CHANGE SAFELY',
-  recover_deleted_order: 'RECOVER A DELETED ORDER',
-  put_model_score_in_app: 'PUT A MODEL SCORE IN THE APP',
+  make_schema_change_safely: 'MAKE THIS SCHEMA CHANGE SAFELY',
+  recover_deleted_order: 'RECOVER THIS DELETED ORDER',
+  put_model_score_in_app: 'MOVE LAKEHOUSE DATA INTO LIVE APPLICATIONS',
   survive_connection_spike: ROUND_FIVE_DISPLAY_TITLE_UPPER,
-  analyze_live_orders_without_slowing_checkout: 'ANALYZE LIVE ORDERS',
+  analyze_live_orders_without_slowing_checkout: 'MOVE LIVE APPLICATION DATA INTO THE LAKEHOUSE',
 }
 
 export function roundNumber(roundId: RoundId): string {

@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { StrictMode } from 'react'
-import App from './App'
+import App, { Finale } from './App'
 import { ApiError, api } from './api/client'
 import { APP_VERSION_LABEL } from './version'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
@@ -4822,6 +4822,38 @@ describe('backstage setup', () => {
     expect(strip.textContent!.length).toBeLessThan(70)
   })
 
+  it('calls a round the board is holding temporarily unavailable, not "ready and cannot arm"', async () => {
+    // The hold the server now puts on a round whose lost ring is still stopping.
+    // The catalog still says `ready`, which used to be printed straight into
+    // "This round is ready and cannot arm tonight."
+    const lostRing = 'BOUT IN PROGRESS · RING LEASE LOST · ACTIVE WORK IS STILL STOPPING · '
+      + 'TRY AGAIN IN A MOMENT · IF IT PERSISTS, RESTART THE APP'
+    await fightCardFor(refusedCatalog([], OPERATOR_REASON, null), 'make_schema_change_safely', {
+      make_schema_change_safely: { state: 'temporarily_unavailable', can_start: false, detail: lostRing },
+    })
+
+    const apron = document.querySelector('.ring-refusal')!
+    expect(apron).toHaveTextContent('This round is temporarily unavailable.')
+    expect(apron).not.toHaveTextContent(/ready and cannot arm/i)
+    expect(screen.getByText('Why').parentElement).toHaveTextContent(lostRing)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    // The reason PREPARE is locked rides in the pinned bar beside the button.
+    // Below the bar, the bar drew over it.
+    expect(document.querySelector('.card-actions .game-lock-note')).toHaveTextContent(
+      /reopens automatically/i,
+    )
+  })
+
+  it('does not call a ready round the board refuses "ready"', async () => {
+    await fightCardFor(refusedCatalog([], OPERATOR_REASON, null), 'make_schema_change_safely', {
+      make_schema_change_safely: { state: 'unavailable', can_start: false, detail: 'The ring is not ready.' },
+    })
+
+    expect(document.querySelector('.ring-refusal')).toHaveTextContent(
+      'This round is unavailable and cannot arm tonight.',
+    )
+  })
+
   it('does not send the room to the round list when no round can run', async () => {
     const everyRound = FALLBACK_CATALOG.rounds.map((round) => round.id)
     await fightCardFor(refusedCatalog(everyRound, OPERATOR_REASON, AUDIENCE_HEADLINE), 'wake_idle_app')
@@ -7630,5 +7662,39 @@ describe('the ringside portrait asset', () => {
     // over the folder is the only check that notices it coming back.
     const found = Object.keys(import.meta.glob('./ryan-*.png')).sort()
     expect(found).toEqual(['./ryan-pixel-commentator.png', './ryan-pixel-portrait.png'])
+  })
+})
+
+describe('the six-round finale when the record cannot be read', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('says every row is unread rather than printing "not run yet" under the round just won', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/receipts') {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          json: async () => ({ detail: 'The receipt store is unavailable.' }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    const roundSix = FALLBACK_CATALOG.rounds.find(
+      (round) => round.id === 'analyze_live_orders_without_slowing_checkout',
+    )!
+    render(<Finale session={{ ...session('verified'), round: roundSix }} onBack={() => {}} onSummary={() => {}} />)
+
+    expect(await screen.findByText(/could not be read just now/i)).toBeInTheDocument()
+    const rows = screen.getByLabelText(/all six round summaries/i)
+    expect(rows).not.toHaveTextContent(/NOT RUN YET/)
+    expect(rows.textContent?.match(/RECORD UNREAD/g)).toHaveLength(6)
+    for (const row of Array.from(rows.children)) {
+      expect(row).toHaveAttribute('data-status', 'unread')
+    }
   })
 })

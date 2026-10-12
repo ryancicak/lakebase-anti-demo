@@ -309,6 +309,10 @@ export function InstallationBanner() {
   }, [read, running])
 
   if (readFailure) {
+    // Except to a viewer, who is shown no diagnosis in any state: silence is all
+    // a viewer ever reads here, so it asserts nothing, while a failed poll would
+    // put a yellow "502 Bad Gateway" over the projected screen until the next one.
+    if (status?.audience === 'viewer') return null
     return (
       <aside className="installation-banner" data-tone="blind" role="status">
         <h2>THE INSTALLATION STATUS COULD NOT BE READ</h2>

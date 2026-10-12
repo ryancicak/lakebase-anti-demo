@@ -47,6 +47,7 @@ import './ring.css'
 import {
   type BoutReceipt,
   type LedgerVerdict,
+  type RecordState,
   type RoundResult,
   ABANDONED_VERDICT,
   ledgerDay,
@@ -5169,9 +5170,14 @@ function Setup(props: {
               <div className="ring-apron">
                 <section className="ring-cell ring-refusal">
                   <p className="sub">
+                    {/* The board's state, not the catalog's: a round the board is
+                        holding is still `ready` in the catalog, and "This round is
+                        ready and cannot arm tonight" contradicts itself. */}
                     {selectedRoundState === 'cleanup_in_progress'
                       ? 'Cleanup in progress.'
-                      : `This round is ${selectedRound.availability} and cannot arm tonight.`}
+                      : selectedRoundState === 'temporarily_unavailable'
+                        ? 'This round is temporarily unavailable.'
+                        : `This round is ${selectedRound.availability === 'ready' ? 'unavailable' : selectedRound.availability} and cannot arm tonight.`}
                   </p>
                   <dl className="scorecard-copy">
                     <div><dt>Why</dt><dd>
@@ -5194,22 +5200,22 @@ function Setup(props: {
             {props.error && <p className="game-error" role="alert">{props.error}</p>}
             <div className="card-actions">
               <button className="game-back" onClick={() => props.onScene('lenses')}>B · Back</button>
+              {/* ONE STRIP, ONE SENTENCE, and it is the same value that greyed
+                  the button out. Five separate notes stood here, each with its
+                  own guard, and between them they left the ring's status-not-read
+                  state with no occupant at all -- a dead PREPARE and a silent
+                  screen. Rendering the refusal itself cannot reproduce that, and
+                  it costs less room than the old set did: two of those guards
+                  could be true at once, so the worst case here used to be two
+                  stacked rows of 5px type rather than one.
+
+                  Inside the pinned bar on purpose, between the two buttons: the
+                  bar never leaves the screen, so neither does the reason, and
+                  nothing it says can push either button toward the fold. */}
+              {props.uiReview && <p className="game-lock-note">VISUAL REVIEW ONLY · NOTHING WILL CONNECT OR RUN</p>}
+              {refusal && <p className="game-lock-note" role="status">{refusal}</p>}
               <button className="game-primary" disabled={!canPrepare} onClick={props.onPrepare}>{props.uiReview ? 'A · Preview fight card' : 'A · Prepare fight card'}</button>
             </div>
-            {/* ONE STRIP, ONE SENTENCE, and it is the same value that greyed
-                the button out. Five separate notes stood here, each with its
-                own guard, and between them they left the ring's status-not-read
-                state with no occupant at all -- a dead PREPARE and a silent
-                screen. Rendering the refusal itself cannot reproduce that, and
-                it costs less room than the old set did: two of those guards
-                could be true at once, so the worst case here used to be two
-                stacked rows of 5px type rather than one.
-
-                Below `.card-actions` on purpose. This strip takes its space out
-                of the ring's own flexible row, so nothing it ever says can push
-                B · BACK or A · PREPARE FIGHT CARD toward the fold. */}
-            {props.uiReview && <p className="game-lock-note">VISUAL REVIEW ONLY · NOTHING WILL CONNECT OR RUN</p>}
-            {refusal && <p className="game-lock-note" role="status">{refusal}</p>}
           </div>
         )}
         <div className="game-scanlines" aria-hidden="true" />
@@ -8115,12 +8121,15 @@ function BetweenRounds({
  * complaint that produced this screen was a scorecard you could read top to
  * bottom without ever learning who won.
  */
-function FinaleRow({ beat, result, reading, latest, opponent }: {
+function FinaleRow({ beat, result, record, latest, opponent }: {
   beat: FinaleBeat
   /** Null when the record has been read and holds nothing for this round. */
   result: RoundResult | null
-  /** True while the record is still being read, so no absence is asserted yet. */
-  reading: boolean
+  /**
+   * Whether the record has been read. Only a read record can assert an absence:
+   * while it is being read, or after the read failed, no row says "not run yet".
+   */
+  record: RecordState
   /**
    * The round this operator just finished. Lit because it is the one row whose
    * figure was produced in front of the room, which is a fact about when it was
@@ -8130,9 +8139,9 @@ function FinaleRow({ beat, result, reading, latest, opponent }: {
   /** The blue corner's chip, the fight card's own, for the lane badge. */
   opponent: { badge: string; name: string }
 }) {
-  const verdict: LedgerVerdict = verdictFor(result, reading ? 'reading' : 'read')
+  const verdict: LedgerVerdict = verdictFor(result, record)
   // A result from an earlier day says so, or the ledger reads as one sitting.
-  const day = reading || !result ? null : ledgerDay(result)
+  const day = record !== 'read' || !result ? null : ledgerDay(result)
   // The same two bars the share card draws, so the screen and the image agree.
   const bars = finaleLaneBars(result)
   // The corner this round was actually against: the ledger keeps each round's latest
@@ -8163,7 +8172,7 @@ function FinaleRow({ beat, result, reading, latest, opponent }: {
     <article
       className="finale-beat"
       data-accent={beat.accent}
-      data-status={reading ? 'reading' : result?.status ?? 'unrun'}
+      data-status={record !== 'read' ? record : result?.status ?? 'unrun'}
       data-latest={latest ? 'true' : undefined}
     >
       <header><span>{beat.number}</span><strong>{beat.title}</strong></header>
@@ -8198,7 +8207,7 @@ function FinaleRow({ beat, result, reading, latest, opponent }: {
   )
 }
 
-function Finale({ session, onBack, onSummary }: {
+export function Finale({ session, onBack, onSummary }: {
   session: DemoSession
   onBack: () => void
   /**
@@ -8354,7 +8363,7 @@ function Finale({ session, onBack, onSummary }: {
             key={beat.number}
             beat={beat}
             result={results.get(beat.roundId) ?? null}
-            reading={receipts === null}
+            record={receipts === null ? 'reading' : recordFailed ? 'unread' : 'read'}
             latest={beat.roundId === session.round.id}
             opponent={{
               badge: opponentBadge(session.competitor.id),
@@ -8420,10 +8429,11 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
             </div>
             <dl>
               <div><dt>{scorecardProofLabel(entry)}</dt><dd>{scorecardLakebaseValue(entry)} <span>LB</span> · {scorecardCompetitorValue(entry)} <span>{scorecardCompetitorLabel(entry)}</span></dd></div>
-              {/* An abandoned round finished nothing, so it had nothing to reset.
-                  Printing the reset contract's WATCHING placeholder beside it
-                  would claim a cooldown that never started. */}
-              {!scorecardIsAbandoned(entry) && (
+              {/* An abandoned round finished nothing, so it had nothing to reset,
+                  and Rounds 4 to 6 have no reset at all. Printing the reset
+                  contract's WATCHING placeholder beside either would claim a
+                  cooldown that never started. */}
+              {!scorecardIsAbandoned(entry) && scorecardResetLabel(entry) !== null && (
                 <div><dt>{scorecardResetLabel(entry)}</dt><dd>{scorecardResetValue(entry.cooldown?.lakebase_state, entry.cooldown?.lakebase_ms)} <span>LB</span> · {scorecardResetValue(entry.cooldown?.competitor_state, entry.cooldown?.competitor_ms)} <span>OPP</span></dd></div>
               )}
             </dl>
@@ -8524,11 +8534,12 @@ function scorecardProofLabel(entry: ScorecardEntry): string {
   return 'Non-executable round · no proof'
 }
 
-function scorecardResetLabel(entry: ScorecardEntry): string {
+/** Null for a round with no reset to watch, which then gets no reset row at all. */
+function scorecardResetLabel(entry: ScorecardEntry): string | null {
   if (entry.round_id === 'recover_deleted_order' || entry.cooldown?.mode === 'delete_recovery_environment') return 'Delete recovery environment'
   if (entry.round_id === 'make_schema_change_safely' || entry.cooldown?.mode === 'delete_isolated_environment') return 'Delete isolated copy'
   if (entry.round_id === 'wake_idle_app' || entry.cooldown?.mode === 'return_to_idle') return 'Return → confirmed zero'
-  return 'No executable reset contract'
+  return null
 }
 
 function shortSeconds(milliseconds: number): string {

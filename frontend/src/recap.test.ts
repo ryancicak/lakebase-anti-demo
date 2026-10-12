@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import { FALLBACK_CATALOG } from './catalog'
 import {
   type BoutReceipt,
   ROUND_ORDER,
@@ -10,6 +11,7 @@ import {
   headlineBout,
   ledgerDay,
   roundNumber,
+  roundTitle,
   summariseRounds,
   tally,
   verdictFor,
@@ -41,6 +43,21 @@ function receipt(overrides: Partial<BoutReceipt> = {}): BoutReceipt {
     ...overrides,
   }
 }
+
+describe('round titles', () => {
+  it('names a round that has not run with the same words the fight card uses', () => {
+    // A run row prints its receipt's title, which is the catalog's. The summary
+    // listed "PUT A MODEL SCORE IN THE APP" under rows nobody had run yet, beside
+    // "MOVE LAKEHOUSE DATA INTO LIVE APPLICATIONS" once someone had.
+    for (const round of FALLBACK_CATALOG.rounds) {
+      expect(roundTitle(round.id)).toBe(round.title.toUpperCase())
+    }
+    const unrun = summariseRounds([])
+    expect(unrun.map((row) => row.roundTitle)).toEqual(
+      FALLBACK_CATALOG.rounds.map((round) => round.title.toUpperCase()),
+    )
+  })
+})
 
 describe('ledger day', () => {
   it('uses UTC rather than host locale or timezone at a day boundary', () => {
@@ -379,7 +396,7 @@ describe('groupByRound', () => {
     expect(groups.slice(1).every((group) => group.unrun)).toBe(true)
     expect(groups.slice(1).every((group) => group.bouts.length === 0)).toBe(true)
     // An unrun round still carries a title, so the row is not blank.
-    expect(groups[1].roundTitle).toBe('MAKE A SCHEMA CHANGE SAFELY')
+    expect(groups[1].roundTitle).toBe('MAKE THIS SCHEMA CHANGE SAFELY')
     expect(groups[1].roundNumber).toBe('02')
   })
 
