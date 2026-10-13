@@ -37,6 +37,7 @@ from httpx import ASGITransport, AsyncClient
 
 from server import connection_spike_live as live
 from server.api import router
+from server.connection_fanin import MAX_RETRIES
 from server.connection_spike import (
     PublicSetupEvidence,
     SetupLaneObservation,
@@ -175,6 +176,35 @@ class _SuccessfulPlan(_EnginePlan):
             await on_lane_result(finalize_fanin_lane(raw_fanin_lane(lane_id)))
 
 
+class _RetriedExactPlan(_SuccessfulPlan):
+    """Exact 10,000-client lanes whose finalizer-verified proofs spent one retry."""
+
+    burst_retries = 1
+
+    def __init__(self) -> None:
+        self.after_first_result = asyncio.Event()
+        self.continue_after_first = asyncio.Event()
+        self.first_result_raised: BaseException | None = None
+
+    async def run(self, engine, on_setup_progress, on_lane_progress, on_lane_result) -> None:
+        del engine, on_setup_progress
+        await on_lane_progress(_exact_holding_progress("lakebase", 1))
+        try:
+            await on_lane_result(
+                finalize_fanin_lane({**raw_fanin_lane("lakebase"), "retries": 1})
+            )
+        except BaseException as exc:
+            self.first_result_raised = exc
+            self.after_first_result.set()
+            raise
+        self.after_first_result.set()
+        await self.continue_after_first.wait()
+        await on_lane_progress(_exact_holding_progress("competitor", 1))
+        await on_lane_result(
+            finalize_fanin_lane({**raw_fanin_lane("competitor"), "retries": 1})
+        )
+
+
 def _exact_holding_progress(lane_id: str, sequence: int) -> SimpleNamespace:
     """A holding progress event that observes exactly 10,000 held clients.
 
@@ -269,7 +299,7 @@ class _AcceptanceEngine:
         assert bout_id and fencing_token > 0
 
     async def precommit_launch_intent(self, bout_id: str, fencing_token: int) -> None:
-        # Required bell seam (req #6): the manager calls this directly on the bell
+        # Required bell seam: the manager calls this directly on the bell
         # path, before the authoritative T0.  A no-op here (the real durable
         # CREATE_INTENT write is covered by the real-PostgreSQL journal tests).
         assert bout_id and fencing_token > 0
@@ -323,8 +353,9 @@ class _AcceptanceEngine:
         del arm
         if not isinstance(self._plan, _SuccessfulPlan):
             raise AssertionError("only the successful acceptance plan reaches burst result")
+        retries = getattr(self._plan, "burst_retries", 0)
         lanes = {
-            lane_id: finalize_fanin_lane(raw_fanin_lane(lane_id))
+            lane_id: finalize_fanin_lane({**raw_fanin_lane(lane_id), "retries": retries})
             for lane_id in ("lakebase", "competitor")
         }
         for lane_id in ("lakebase", "competitor"):
@@ -469,7 +500,7 @@ class _EngineProvider(Provider):
 
 
 async def test_round5_bout_status_answers_from_round5_readiness_not_global() -> None:
-    # B3 (Finding 2): Round 5 bout_status answers from the round5-specific readiness/warm
+    # Round 5 bout_status answers from the round5-specific readiness/warm
     # signal ALONE. A global installation readiness that is NOT ready must not report
     # Round 5 unavailable when its own per-round ring/warm coordinator is healthy.
     # Mutation: restoring `and (readiness is None or readiness.ring_ready)` to the manager
@@ -872,7 +903,7 @@ async def test_arm_claim_is_o1_and_performs_no_provider_work() -> None:
 async def test_bell_failure_after_arm_releases_lease_and_ring_recovers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Finding 4(b): a bell that fails after a successful claim/promotion must
+    """A bell that fails after a successful claim/promotion must
     release the round-5 lease and bout, so the ring is not left stuck (the exact
     stuck-UNAVAILABLE shape of the 2026-09-23 incident's cascade). After the failed
     /run, a fresh session must be able to arm again."""
@@ -915,7 +946,7 @@ async def test_bell_failure_after_arm_releases_lease_and_ring_recovers(
             cleaning = await coordinator.store.read("install-acceptance")
             assert cleaning is not None and cleaning.state == Round5WarmState.CLEANING
 
-            # Finding 4(b) compensation ran: the warm claim's backstage renewal is
+            # The compensation ran: the warm claim's backstage renewal is
             # stopped (and the round-5 lease released), so the claim expires on its
             # TTL and the generation returns to READY (self-heal) instead of
             # staying stuck. WITHOUT the compensation the claim keeps being renewed
@@ -1714,6 +1745,137 @@ def test_exact_10k_gate_rejects_a_9999_and_a_partial_lane() -> None:
     exact = finalize_fanin_lane(raw_fanin_lane("lakebase"))
     exact_evidence = RunManager._round_five_evidence(exact)
     assert RunManager._round_five_lane_valid(exact, exact_evidence) is True
+
+
+@pytest.mark.parametrize("retries", (0, 1, MAX_RETRIES))
+def test_manager_gate_accepts_finalizer_verified_retry_budget(retries: int) -> None:
+    result = finalize_fanin_lane({**raw_fanin_lane("lakebase"), "retries": retries})
+    assert result.verified
+    assert "zero_failures" not in result.gates.failures
+    evidence = RunManager._round_five_evidence(result)
+    assert evidence["retries"] == retries
+    assert RunManager._round_five_lane_valid(result, evidence) is True
+
+
+def test_manager_gate_rejects_retries_101_on_otherwise_verified_evidence() -> None:
+    result = finalize_fanin_lane(raw_fanin_lane("lakebase"))
+    assert result.verified
+    evidence = {**RunManager._round_five_evidence(result), "retries": MAX_RETRIES + 1}
+    assert RunManager._round_five_lane_valid(result, evidence) is False
+
+
+@pytest.mark.parametrize(
+    "retries",
+    (
+        pytest.param(True, id="bool-true"),
+        pytest.param(False, id="bool-false"),
+        pytest.param(1.0, id="float"),
+        pytest.param(None, id="none"),
+        pytest.param("1", id="string"),
+        pytest.param(-1, id="negative"),
+        pytest.param(-100, id="negative-large"),
+    ),
+)
+def test_manager_gate_rejects_non_budget_retry_values(retries: object) -> None:
+    result = finalize_fanin_lane(raw_fanin_lane("lakebase"))
+    assert result.verified
+    evidence = {**RunManager._round_five_evidence(result), "retries": retries}
+    assert RunManager._round_five_lane_valid(result, evidence) is False
+
+
+def test_manager_gate_rejects_missing_retries_key() -> None:
+    result = finalize_fanin_lane(raw_fanin_lane("lakebase"))
+    assert result.verified
+    evidence = dict(RunManager._round_five_evidence(result))
+    del evidence["retries"]
+    assert RunManager._round_five_lane_valid(result, evidence) is False
+
+
+async def test_on_lane_result_accepts_a_retried_exact_lane_and_publishes_comparison() -> None:
+    clock = Clock()
+    provider = _EngineProvider(clock, _RetriedExactPlan)
+    coordinator = _coordinator(clock, provider)
+    await _warm_to_ready(coordinator, provider)
+    first_generation = (await coordinator.store.read("install-acceptance")).generation
+    manager = _make_manager(coordinator, clock)
+    app = _asgi(manager)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://anti-demo.test"
+        ) as client:
+            created = await client.post("/api/sessions", json=_session_body())
+            session_id = created.json()["id"]
+            await _arm_via_http(client, session_id)
+            await client.post(f"/api/sessions/{session_id}/run")
+            for _ in range(400):
+                if provider.engines and provider.engines[-1]._plan.after_first_result.is_set():
+                    break
+                await asyncio.sleep(0)
+            plan = provider.engines[-1]._plan
+            assert plan.after_first_result.is_set()
+            assert plan.first_result_raised is None
+            record = manager._records[session_id]
+            assert record.round5_ingestion_closed is False
+            plan.continue_after_first.set()
+            terminal = None
+            for _ in range(400):
+                snapshot = (await client.get(f"/api/sessions/{session_id}")).json()
+                if snapshot["state"] == SessionState.VERIFIED.value:
+                    terminal = snapshot
+                    break
+                await asyncio.sleep(0)
+            assert terminal is not None, "retried exact bout never published a comparison"
+            assert terminal.get("comparison") is not None
+            assert terminal["lanes"]["lakebase"]["state"] == LaneState.VERIFIED.value
+            assert terminal["lanes"]["competitor"]["state"] == LaneState.VERIFIED.value
+            assert provider.engines[-1]._plan.burst_retries == 1
+            assert terminal["lanes"]["lakebase"]["evidence"]["retries"] == 1
+            assert terminal["lanes"]["competitor"]["evidence"]["retries"] == 1
+            assert terminal["fairness"]["max_retries"] == MAX_RETRIES
+            for _ in range(200):
+                slot = await coordinator.store.read("install-acceptance")
+                if slot is not None and slot.generation > first_generation:
+                    break
+                await asyncio.sleep(0)
+            assert slot is not None
+            assert slot.generation == first_generation + 1
+            assert slot.state == Round5WarmState.WARMING
+    finally:
+        await manager.close()
+        await coordinator.close()
+
+
+async def test_on_lane_result_still_raises_when_the_exact_gate_fails_for_another_reason() -> None:
+    clock = Clock()
+    provider = _EngineProvider(clock, _AsymmetricFailurePlan)
+    coordinator = _coordinator(clock, provider)
+    await _warm_to_ready(coordinator, provider)
+    manager = _make_manager(coordinator, clock)
+    app = _asgi(manager)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://anti-demo.test"
+        ) as client:
+            created = await client.post("/api/sessions", json=_session_body())
+            session_id = created.json()["id"]
+            await _arm_via_http(client, session_id)
+            await client.post(f"/api/sessions/{session_id}/run")
+            terminal = None
+            for _ in range(400):
+                snapshot = (await client.get(f"/api/sessions/{session_id}")).json()
+                if snapshot["state"] == SessionState.FAILED.value:
+                    terminal = snapshot
+                    break
+                await asyncio.sleep(0)
+            assert terminal is not None, "partial sibling never failed its exact gate"
+            assert terminal.get("comparison") is None
+            assert terminal["lanes"]["lakebase"]["state"] == LaneState.VERIFIED.value
+            assert terminal["lanes"]["competitor"]["state"] == LaneState.FAILED.value
+            record = manager._records[session_id]
+            assert record.round5_ingestion_closed is True
+    finally:
+        await manager.close()
+        await coordinator.close()
 
 
 # ---------------------------------------------------------------------------

@@ -48,7 +48,12 @@ from server.lifecycle import (
     installation_presence_async,
     operator_ingress_drift_async,
 )
-from server.manager import InvalidStateError, RoundStorageReadinessError, RunManager
+from server.manager import (
+    InvalidStateError,
+    RoundStorageReadinessError,
+    RunManager,
+    operator_diagnosis,
+)
 from server.manifest import (
     MANIFEST_JSON_ENV,
     DemoManifest,
@@ -1060,7 +1065,11 @@ async def _open_receipt_store(lease_store: Any) -> DurableReceiptStore | None:
     return store
 
 
-async def _open_pipeline_power_store(lease_store: Any) -> DurablePipelinePowerStore | None:
+async def _open_pipeline_power_store(
+    lease_store: Any,
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> DurablePipelinePowerStore | None:
     """Give this process somewhere durable to record deliberate pipeline stops.
 
     The app now starts the Round 4 pipeline at arm and stops it once a bout has
@@ -1075,12 +1084,15 @@ async def _open_pipeline_power_store(lease_store: Any) -> DurablePipelinePowerSt
     `SYNCED_TABLE_ONLINE_PIPELINE_FAILED` either way -- so `doctor` reads red at
     an installation that is doing exactly what it was told.
 
-    Exactly the shape of `_open_receipt_store` above, deliberately, including
-    that every failure ends in a server that serves. That matters more here than
-    it did there: the deployed branch now boots *degraded* on a bad AWS
-    credential rather than refusing, so this line is reached under conditions it
-    previously was not, and a store install that raised on a degraded boot would
-    turn a serving app into a dead one over a bookkeeping table.
+    Lakebase coordination is the authority for both the pipeline-power history
+    and the source-rebase obligation. Missing or ungranted tables must not
+    install ``None`` and keep serving: that silently disables both, and
+    ``./bootstrap.sh --deploy-only`` never creates or grants them. Process-local
+    serve still has no store.
+
+    This runs after the startup retry loop has opened the lease stores, so a
+    transient coordination error here is retried with that loop's attempts and
+    backoff instead of ending a normal boot; anything else fails closed at once.
     """
 
     run = getattr(lease_store, "_run", None)
@@ -1089,17 +1101,23 @@ async def _open_pipeline_power_store(lease_store: Any) -> DurablePipelinePowerSt
         # whole record on a developer checkout and already works.
         return None
     store = DurablePipelinePowerStore(run)
-    try:
-        await store.initialize()
-    except Exception:
-        LOGGER.error(
-            "This process cannot record deliberate Round 4 pipeline stops durably. "
-            "It will still stop and start the pipeline, but a later `antidemo "
-            "doctor` will report a deliberate, money-saving stop as a Round 4 "
-            "failure rather than as the choice it was.",
-            exc_info=True,
-        )
-        return None
+    for attempt in range(1, STARTUP_ATTEMPTS + 1):
+        try:
+            await store.initialize()
+            break
+        except Exception as exc:
+            if attempt >= STARTUP_ATTEMPTS or not is_transient_coordination_error(exc):
+                raise
+            delay = 0.5 * (2 ** (attempt - 1))
+            LOGGER.warning(
+                "Transient %s opening the Round 4 pipeline power history; "
+                "retrying in %.1fs (%d/%d)",
+                type(exc).__name__,
+                delay,
+                attempt,
+                STARTUP_ATTEMPTS,
+            )
+            await sleep(delay)
     return store
 
 
@@ -1760,15 +1778,6 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         unregister_serving_process(runtime.process_record)
     except OSError:
         LOGGER.warning("Could not release the server launch record", exc_info=True)
-    # Before the coordination stores close, and before anything else here can
-    # raise: the last bout of a session is the one somebody just watched, and its
-    # receipt is in flight on a task that shutdown would otherwise cancel.
-    if runtime.receipt_store is not None:
-        try:
-            await drain_receipt_writes()
-        except Exception:
-            LOGGER.warning("Could not drain in-flight bout receipts", exc_info=True)
-    install_receipt_store(None)
     # This task can hold the exact Round 4 ring and can be inside the guarded
     # pipeline stop. Cancel and await it before the manager or either
     # coordination store closes; requesting cancellation without awaiting would
@@ -1805,6 +1814,15 @@ async def _close_runtime(app: FastAPI, runtime: _Runtime) -> None:
         if callable(close_manager):
             await close_manager()
     finally:
+        # RunManager.close() can itself seal a no-bell cancellation or failed
+        # cleanup. Keep the durable writer installed through that drain, then
+        # flush every receipt before any coordination store closes.
+        if runtime.receipt_store is not None:
+            try:
+                await drain_receipt_writes()
+            except Exception:
+                LOGGER.warning("Could not drain in-flight bout receipts", exc_info=True)
+        install_receipt_store(None)
         if runtime.round5_warm_coordinator is not None:
             await runtime.round5_warm_coordinator.close()
         app.state.round5_warm_coordinator = None
@@ -1980,7 +1998,13 @@ async def _open_runtime_when_manifest_settles(
                     f"STARTUP IS RETRYING AFTER THE MUTATION FINISHED · "
                     f"{type(exc).__name__.upper()} · ATTEMPT {attempts}"
                 )
-                gate.reason = f"Runtime startup is retrying a transient failure: {exc}"
+                # The reason is every control action's 409 detail, and a driver
+                # message names the coordination host and role. The traceback is
+                # in the warning below.
+                gate.reason = (
+                    "Runtime startup is retrying a transient failure: "
+                    f"{operator_diagnosis(exc)}"
+                )
                 gate.status = ReadinessStatus(
                     False,
                     "blocked" if escalated else "maintenance",
@@ -2008,7 +2032,10 @@ async def _open_runtime_when_manifest_settles(
                 "STARTUP FAILED AFTER THE MUTATION FINISHED · "
                 f"{type(exc).__name__} · AN OPERATOR MUST LOOK"
             )
-            gate.reason = f"Runtime startup failed after the mutation finished: {exc}"
+            gate.reason = (
+                "Runtime startup failed after the mutation finished: "
+                f"{operator_diagnosis(exc)}"
+            )
             gate.status = ReadinessStatus(False, "blocked", gate.detail)
             gate.round5_status = gate.status
             gate.recovery = RecoveryState(

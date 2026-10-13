@@ -772,9 +772,20 @@ $3}
 
        What you probably want:
 
-         ./bootstrap.sh --deploy-only   republish the seal and redeploy the app.
-                                        Touches no database, runs no Terraform.
-                                        This is the resume path for a ready install.
+         ./antidemo coordination-upgrade
+                                        create and grant coordination tables
+                                        (including round4_source_rebase) as the
+                                        schema owner, with ANTI_DEMO_MANIFEST
+                                        exported (docs/DEPLOY.md, \"Upgrading
+                                        from v1.1.1\"). Does not reset database
+                                        lanes or run Terraform.
+
+         ./bootstrap.sh --deploy-only   then republish the seal and redeploy the
+                                        app. Touches no database, runs no
+                                        Terraform. Do this only after
+                                        coordination-upgrade when this checkout
+                                        added coordination tables; otherwise the
+                                        app cannot boot.
 
        If a reset is genuinely what you mean -- an infra diff to apply, or lanes to
        return to a known state -- say so explicitly:
@@ -4112,6 +4123,14 @@ else
   say "  app.py raises inside the FastAPI lifespan when the manifest status is not"
   say "  READY, and the container never finishes starting. Check './antidemo doctor',"
   say "  then republish with './bootstrap.sh --deploy-only'."
+  say ""
+  say "  If the logs name round4_source_rebase or missing coordination privileges,"
+  say "  the app cannot boot until the schema owner runs:"
+  say "      ./antidemo coordination-upgrade"
+  say "  That creates and grants coordination tables without resetting lanes."
+  say "  './antidemo setup' on a ready install resets both database lanes; do not"
+  say "  use it as this repair. './bootstrap.sh --deploy-only' does not create the"
+  say "  tables."
   say ""
   say "  A SyntaxError above means the source does not parse on the runtime's Python."
   say "  Databricks Apps installs with pip on 3.11 whenever a requirements.txt is in"

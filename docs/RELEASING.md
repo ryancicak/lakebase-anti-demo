@@ -106,14 +106,18 @@ into a failure without the rest of the run. Each one's docstring has its usage.
 | Script | Does |
 |---|---|
 | `ready.py` | Prints the board; `--wait` waits for all six rounds READY. Read-only. |
-| `chaos.py` | One chaos phase, configured by `CHAOS_*` variables. |
+| `chaos.py` | One chaos phase, configured by `CHAOS_*` variables. Its `armed-wait` wave is not one of the bar's six: `CHAOS_SCENARIOS=armed-wait` holds each armed card `CHAOS_ARMED_WAIT_SECONDS` (150 s, inside the 180 s armed window) before the bell, as a presenter talking does. |
 | `restart.py` | The restart test. It waits for `run.sh` to redeploy, because `bootstrap.sh` fails its identity check when launched from Python. |
 | `leftovers.py` | The leak check. Read-only. |
 | `lease_check.py` | The lease check; `--plan` adds the Terraform plan. Read-only. |
 | `gone.py` | After an uninstall, counts whatever is left. Read-only. |
-
-`leftovers.py` and `gone.py` list whole resource types across the account: IAM policies and instance profiles, SQS queues, and Glue jobs and connections, for example. The install's own policies in [docs/iam](iam/) do not grant all of those listings, so the AWS key in `.env.bootstrap` needs account-wide read access for the bar.
 | `summarize.py` | Writes `summary.md` from an evidence directory. |
+
+`leftovers.py` and `gone.py` list whole resource types across the account: IAM
+policies and instance profiles, SQS queues, and Glue jobs and connections, for
+example. The install's own policies in [docs/iam](iam/) do not grant all of those
+listings, so the AWS key in `.env.bootstrap` needs account-wide read access for
+the bar.
 
 ## 4. Reading a failure
 
@@ -168,6 +172,12 @@ With every step passed on one commit:
 2. Tag it: `git tag -a v<version> <commit> -m "v<version>"` and push the tag.
 3. Publish a GitHub release whose notes say what changed, how it was verified
    (from `summary.md`), and what is still known to be limited.
-4. If the Round 5 runner changed since the last release, say so in the upgrade
-   notes: an existing installation needs `./antidemo runner refresh` before
-   `./bootstrap.sh --deploy-only --yes`.
+4. Say in the upgrade notes what an existing installation must run before
+   `./bootstrap.sh --deploy-only --yes`: `./antidemo runner refresh` if the
+   Round 5 runner changed since the last release, and
+   `./antidemo coordination-upgrade` if the coordination schema gained a table or
+   a grant, as it does in the upgrade from v1.1.1. `--deploy-only` alone neither
+   creates nor grants coordination tables, and the app then refuses to boot;
+   `--apply --reset-ready` is not the upgrade either, because it resets both
+   database lanes. [Upgrading from v1.1.1](DEPLOY.md#upgrading-from-v111) is the
+   sequence.

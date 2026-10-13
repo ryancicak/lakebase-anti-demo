@@ -1035,6 +1035,46 @@ def test_in_flight_proxy_delete_faults_are_retryable_not_blocked() -> None:
     )
 
 
+def test_wrapped_transport_timeouts_are_retryable_on_the_cause_chain() -> None:
+    """Outer journal_ownership_unavailable must not hide TimeoutError/ConnectionError causes."""
+
+    from botocore.exceptions import (
+        ConnectionClosedError,
+        ConnectTimeoutError,
+        EndpointConnectionError,
+        ReadTimeoutError,
+    )
+
+    from server.connection_spike_live import LiveRound5WarmProvider
+
+    provider = object.__new__(LiveRound5WarmProvider)
+    causes: tuple[BaseException, ...] = (
+        TimeoutError("journal read timed out"),
+        ConnectionError("journal closed"),
+        ConnectTimeoutError(endpoint_url="https://example.test"),
+        ReadTimeoutError(endpoint_url="https://example.test"),
+        EndpointConnectionError(endpoint_url="https://example.test"),
+        ConnectionClosedError(endpoint_url="https://example.test"),
+    )
+    for cause in causes:
+        wrapped = ConnectionSpikeCleanupError(
+            "Round 5 absence proof could not read cleanup ownership",
+            stage="journal_ownership",
+            reason_code="journal_ownership_unavailable",
+        )
+        wrapped.__cause__ = cause
+        assert provider._retryable(wrapped), type(cause).__name__
+        assert provider._retryable(cause), type(cause).__name__
+    permanent = ConnectionSpikeCleanupError(
+        "Round 5 absence proof could not read cleanup ownership",
+        stage="journal_ownership",
+        reason_code="journal_ownership_unavailable",
+    )
+    permanent.__cause__ = ValueError("journal row is corrupt")
+    assert not provider._retryable(permanent)
+    assert not provider._retryable(ValueError("journal row is corrupt"))
+
+
 def test_warm_runner_ssm_outage_is_retryable_without_hiding_identity_drift() -> None:
     with pytest.raises(ConnectionSpikeLiveTransientError, match="temporarily unavailable"):
         _require_warm_runner_online(

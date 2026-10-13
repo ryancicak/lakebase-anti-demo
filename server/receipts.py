@@ -108,6 +108,11 @@ SEALING_EVENTS = frozenset(
         "session_cancelled",
     }
 )
+# A no-bell cancellation is never evidence against a bout whose bell was
+# accepted. Manager-side fencing prevents that combination prospectively; this
+# precedence also protects receipts already racing through independent durable
+# and filesystem writers.
+RUN_RECEIPT_EVENTS = frozenset({"run_finished"})
 # Deliberately excluded: "towel_started" seals the session state but the towel is
 # still settling, and "towel_finished" follows with the settled truth. The one bout
 # that still leaves nothing is one killed between those two events.
@@ -127,8 +132,8 @@ SEALING_EVENTS = frozenset(
 #
 # These names cannot simply join SEALING_EVENTS: both are also published while
 # the towel is still moving. That matters more than it sounds, because
-# DurableReceiptStore is keyed on (session, round, sealing_event) and inserts
-# ON CONFLICT DO NOTHING -- so sealing on the first "towel_update" would durably
+# DurableReceiptStore keys each bout's row on (session, round, sealing_event) and
+# inserts ON CONFLICT DO NOTHING -- so sealing on the first "towel_update" would durably
 # record a towel mid-cleanup and then *discard* the settled truth that follows.
 # The towel's own state is the discriminator, and it is already in the payload.
 TOWEL_SETTLING_EVENTS = frozenset({"towel_update", "cleanup_update"})
@@ -662,6 +667,34 @@ def _since_floor(since: date | None) -> datetime | None:
     return None if since is None else datetime.combine(since, time.min, tzinfo=UTC)
 
 
+#: What joins a sealing event to its bout in a durable row's key: by ``receipt_bout_id``,
+#: or else by when the bout was armed. ``DurableReceiptStore.load`` matches events on them.
+_BOUT_ID_KEY_SEPARATOR = "#"
+_ARMED_AT_KEY_SEPARATOR = "@"
+
+
+def _bout_sealing_key(sealing_event: str, snapshot: SessionSnapshot) -> str:
+    """The ``sealing_event`` key of an append-only row: which event, of which bout.
+
+    One session is not always one bout. A FAILED card in any round but Round 5 can be
+    armed again, and the next bout ends on the same events as the one before it, so a
+    key of the event name alone keeps the first bout's row and drops every later one.
+    ``receipt_bout_id`` tells the bouts apart, including ones cancelled or refused
+    before ARMED. ``start_arm`` sets it fresh before CHECKING. A snapshot built
+    without it (a test, or a caller outside the manager) falls back to ``armed_at``,
+    which each round's arm sets once at ARMED. A snapshot with neither keeps the bare
+    event name, which is the shape of every legacy row. ``load`` reads no bout back out
+    of this key, but its SQL does match an event in all three shapes, by the separators.
+    """
+
+    if snapshot.receipt_bout_id is not None:
+        return f"{sealing_event}{_BOUT_ID_KEY_SEPARATOR}{snapshot.receipt_bout_id}"
+    armed_at = snapshot.armed_at
+    if armed_at is None:
+        return sealing_event
+    return f"{sealing_event}{_ARMED_AT_KEY_SEPARATOR}{_as_utc(armed_at).isoformat()}"
+
+
 class DurableReceiptStore:
     """Sealed bouts plus one bounded latest-cleanup overlay per bout.
 
@@ -814,7 +847,7 @@ class DurableReceiptStore:
                 (
                     receipt.session_id,
                     receipt.round_id.value,
-                    sealing_event,
+                    _bout_sealing_key(sealing_event, snapshot),
                     receipt.receipt,
                     receipt.run_id,
                     receipt.outcome,
@@ -830,9 +863,10 @@ class DurableReceiptStore:
         since: date | None = None,
         installation: Installation | None = None,
     ) -> list[BoutReceipt]:
-        """Every stored bout on or after ``since``, one per bout, newest last.
+        """Every stored bout on or after ``since``, one per session and round, newest last.
 
-        A declared row supplies the measured result. Any later cleanup revision
+        A declared row supplies the measured result, over a failure from any bout of
+        the same card, and otherwise the newest bout's row does. Any later cleanup revision
         supplies only the latest cleanup state, so recovery can clear an earlier
         warning without rewriting or erasing either historical row. Unreadable
         documents are skipped rather than failing the read, exactly as one
@@ -842,9 +876,38 @@ class DurableReceiptStore:
         floor = _since_floor(since)
 
         async def select(cursor: Any) -> list[Any]:
+            id_sep, at_sep = _BOUT_ID_KEY_SEPARATOR, _ARMED_AT_KEY_SEPARATOR
             await cursor.execute(
                 f"""
-                WITH ranked_receipts AS (
+                WITH annotated_receipts AS (
+                    SELECT
+                        *,
+                        FIRST_VALUE(sealing_event) OVER (
+                            PARTITION BY
+                                session_id,
+                                round_id,
+                                (
+                                    sealing_event = 'cleanup_update'
+                                    OR sealing_event LIKE 'cleanup_update:%'
+                                )
+                            ORDER BY sealed_at DESC
+                        ) AS latest_sealing_event,
+                        MAX(sealed_at) FILTER (
+                            WHERE sealing_event <> 'session_cancelled'
+                              AND sealing_event NOT LIKE 'session_cancelled{id_sep}%'
+                              AND sealing_event NOT LIKE 'session_cancelled{at_sep}%'
+                        ) OVER (
+                            PARTITION BY
+                                session_id,
+                                round_id,
+                                (
+                                    sealing_event = 'cleanup_update'
+                                    OR sealing_event LIKE 'cleanup_update:%'
+                                )
+                        ) AS latest_non_cancelled_at
+                    FROM {BOUT_RECEIPT_TABLE}
+                ),
+                ranked_receipts AS (
                     SELECT
                         document,
                         ROW_NUMBER() OVER (
@@ -867,9 +930,23 @@ class DurableReceiptStore:
                                      AND outcome = 'declared'
                                     THEN 1 ELSE 0
                                 END DESC,
+                                CASE
+                                    WHEN (
+                                         latest_sealing_event = 'session_cancelled'
+                                         OR latest_sealing_event LIKE 'session_cancelled{id_sep}%'
+                                         OR latest_sealing_event LIKE 'session_cancelled{at_sep}%'
+                                     )
+                                     AND (
+                                         sealing_event = 'run_finished'
+                                         OR sealing_event LIKE 'run_finished{id_sep}%'
+                                         OR sealing_event LIKE 'run_finished{at_sep}%'
+                                     )
+                                     AND sealed_at = latest_non_cancelled_at
+                                    THEN 1 ELSE 0
+                                END DESC,
                                 sealed_at DESC
                         ) AS revision_rank
-                    FROM {BOUT_RECEIPT_TABLE}
+                    FROM annotated_receipts
                 )
                 SELECT document
                 FROM ranked_receipts
@@ -988,7 +1065,16 @@ def _merge_receipts(
     """
 
     merged = {(item.session_id, item.round_id): item for item in fallback}
-    merged.update({(item.session_id, item.round_id): item for item in preferred})
+    for item in preferred:
+        key = (item.session_id, item.round_id)
+        existing = merged.get(key)
+        if (
+            existing is not None
+            and existing.sealing_event in RUN_RECEIPT_EVENTS
+            and item.sealing_event == "session_cancelled"
+        ):
+            continue
+        merged[key] = item
     return sorted(merged.values(), key=lambda item: item.sealed_at)
 
 
@@ -1000,12 +1086,12 @@ def receipt_path(receipt: BoutReceipt, root: Path | None = None) -> Path:
     return base / day / f"{receipt.receipt}-{receipt.round_id.value}.json"
 
 
-def _already_declared(target: Path) -> bool:
+def _stored_receipt(target: Path) -> BoutReceipt | None:
     try:
         document = json.loads(target.read_text(encoding="utf-8"))
-        return bool(document["receipt"]["outcome"] == "declared")
+        return BoutReceipt.model_validate(document["receipt"])
     except Exception:
-        return False
+        return None
 
 
 def write_receipt(
@@ -1016,15 +1102,31 @@ def write_receipt(
     """Write one receipt atomically. Raises; callers that must not fail use record_*."""
     target = receipt_path(receipt, root)
 
-    # One bout, one file, last terminal event wins -- with one exception. A bout can
+    # One bout, one file, last terminal event wins -- with two exceptions. A bout can
     # publish a second terminal event after it has already been declared, when the
     # environment fails behind it (a cleanup that will not verify, a lost lease).
     # That is a fact about the environment, not about whether the transaction
     # verified, and letting it overwrite the file would erase a proven result. The
-    # later failure still reaches the operator live and the server log.
-    if receipt.outcome != "declared" and target.exists() and _already_declared(target):
+    # later failure still reaches the operator live and the server log. Likewise,
+    # a no-bell cancellation can never replace evidence from an accepted run.
+    existing = _stored_receipt(target) if target.exists() else None
+    keep_existing = bool(
+        existing is not None
+        and (
+            (receipt.outcome != "declared" and existing.outcome == "declared")
+            or (
+                receipt.outcome != "declared"
+                and existing.sealed_at > receipt.sealed_at
+            )
+            or (
+                receipt.sealing_event == "session_cancelled"
+                and existing.sealing_event in RUN_RECEIPT_EVENTS
+            )
+        )
+    )
+    if keep_existing:
         logger.warning(
-            "Keeping the declared receipt %s; %s reported %s afterwards",
+            "Keeping the authoritative receipt %s; %s reported %s afterwards",
             target.name,
             receipt.sealing_event,
             receipt.failure or "a later failure",
@@ -1044,8 +1146,14 @@ def record_sealed_bout(
     event: str,
     payload: dict[str, object],
     root: Path | None = None,
+    *,
+    receipt_bout_id: str | None = None,
 ) -> Path | None:
     """Best-effort receipt write from a published event. Never raises.
+
+    ``receipt_bout_id`` is the publishing arm's identity. The payload's snapshot
+    cannot carry it, because browser payloads exclude it, so the event log passes it
+    alongside.
 
     Returns the file path written, or None when the event was not terminal, no
     artifact directory is selected, or the file write failed. A None return does
@@ -1068,6 +1176,8 @@ def record_sealed_bout(
         if not isinstance(session, dict):
             return None
         snapshot = SessionSnapshot.model_validate(session)
+        if receipt_bout_id is not None:
+            snapshot.receipt_bout_id = receipt_bout_id
         if not seals_bout(
             event,
             snapshot,

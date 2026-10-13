@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, expect, it, vi } from 'vitest'
-import { RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
+import { InstantReplay, RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
 import { replayStory } from './instant-replay'
@@ -14,6 +14,7 @@ import {
   roundFiveHasComparison,
   roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFivePhaseLabel,
   roundFiveSchedulingAdvisorySummary,
   roundFiveSetupDiagnosticSummary,
   roundFiveStoppedVerdict,
@@ -2270,6 +2271,75 @@ it('offers an instant replay with primary fan-in and supporting setup evidence',
   expect(screen.queryByRole('dialog', { name: /ready a pooled application path/i })).not.toBeInTheDocument()
 })
 
+function roundFiveRetrySurfaces(session: DemoSession) {
+  render(
+    <RoundFiveProof
+      session={session}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen={false}
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+  fireEvent.click(screen.getByRole('button', { name: /instant replay/i }))
+  const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
+  fireEvent.click(within(replay).getByText(/view full evidence/i))
+  return {
+    replay,
+    fairness: within(replay).getByLabelText('Round 5 fair proof contract'),
+  }
+}
+
+function expectContractLoginRetryBudget(fairness: HTMLElement, replay: HTMLElement) {
+  const disclosed = `up to ${ROUND_FIVE_MAX_RETRIES} retried logins / lane`
+  expect(fairness).toHaveTextContent(disclosed)
+  expect(fairness).not.toHaveTextContent(/zero retries/i)
+  expect(fairness).not.toHaveTextContent(/up to 101 retried logins/)
+  expect(replay).toHaveTextContent(
+    `10,000 authenticated held clients / lane · ${disclosed}`,
+  )
+  expect(replay).not.toHaveTextContent(/zero retries/i)
+  expect(replay).not.toHaveTextContent(/up to 101 retried logins/)
+}
+
+it.each([
+  ['missing', undefined],
+  ['zero', 0],
+  ['fractional', 1.5],
+  ['over-budget', 101],
+  ['negative', -1],
+  ['string', '100'],
+] as const)('falls back to the contract login retry budget when max_retries is %s', (_label, maxRetries) => {
+  const session = roundFiveSession()
+  if (maxRetries === undefined) {
+    const fairness = { ...session.fairness }
+    delete fairness.max_retries
+    session.fairness = fairness
+  } else {
+    session.fairness = {
+      ...session.fairness,
+      max_retries: maxRetries as DemoSession['fairness']['max_retries'],
+    }
+  }
+  const { fairness, replay } = roundFiveRetrySurfaces(session)
+  expectContractLoginRetryBudget(fairness, replay)
+})
+
+it('shows the login retry budget, not zero retries, for a verified retried fan-in', () => {
+  const session = roundFiveSession()
+  session.fairness = { ...session.fairness, max_retries: ROUND_FIVE_MAX_RETRIES }
+  session.lanes.lakebase.evidence = { ...session.lanes.lakebase.evidence, retries: 1 }
+  session.lanes.competitor.evidence = { ...session.lanes.competitor.evidence, retries: 1 }
+
+  const { fairness, replay } = roundFiveRetrySurfaces(session)
+  expectContractLoginRetryBudget(fairness, replay)
+})
+
 it('puts the sound toggle in the header of both Round 5 layouts', () => {
   const onToggleSound = vi.fn()
   const props = {
@@ -3152,4 +3222,104 @@ it('health bars: Round 5 measures the bell runtime, never the setup clock (no V4
       / session.round5_runtime!.lanes.competitor.bell_to_10000_observed_ms!,
     6,
   )
+})
+
+/** Protocol and implementation words a room has no use for. */
+const ROUND_FIVE_JARGON = /\bV4\b|canonical runtime|resident fan-in/i
+
+it('narrates a live bell fan-in in presenter words', () => {
+  const running = withV3Runtime(runningRoundFiveSession())
+  const { container } = render(
+    <RoundFiveProof
+      session={running}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+  expect(document.body).toHaveTextContent('10,000-client fan-in live · no winner until both lanes verify')
+  expect(document.body).not.toHaveTextContent(ROUND_FIVE_JARGON)
+  for (const labelled of container.querySelectorAll('[aria-label]')) {
+    expect(labelled.getAttribute('aria-label')).not.toMatch(ROUND_FIVE_JARGON)
+  }
+})
+
+it('says a stopped bell fan-in stopped, in presenter words', () => {
+  const stopped = withV3Runtime(runningRoundFiveSession())
+  stopped.state = 'failed'
+  stopped.round5_runtime!.state = 'failed'
+  expect(roundFiveStoppedVerdict(stopped)).toMatch(/^Round 5 stopped · /)
+  expect(roundFiveStoppedVerdict(stopped)).not.toMatch(ROUND_FIVE_JARGON)
+  const replay = JSON.stringify(replayStory(stopped))
+  expect(replay).toContain('The 10,000-client fan-in stopped before every required check completed.')
+  expect(replay).not.toMatch(ROUND_FIVE_JARGON)
+})
+
+it('prints client counts in the same format as the 10,000 beside them, whatever the browser locale', () => {
+  // A browser whose own locale groups thousands with "." read "9.876 / 10,000".
+  const original = Number.prototype.toLocaleString
+  vi.spyOn(Number.prototype, 'toLocaleString').mockImplementation(function (
+    this: number,
+    locales?: Intl.LocalesArgument,
+    options?: Intl.NumberFormatOptions,
+  ) {
+    return original.call(this, locales ?? 'de-DE', options)
+  })
+  const running = withV3Runtime(runningRoundFiveSession())
+  for (const lane of Object.values(running.round5_runtime!.lanes)) {
+    lane.phase = 'holding'
+    lane.clients_initiated = 9_876
+    lane.clients_authenticated = 9_876
+    lane.held_clients = 9_876
+  }
+  render(
+    <RoundFiveProof
+      session={running}
+      roundNumber={5}
+      error={null}
+      liveEvidenceConnected
+      uiReview={false}
+      hasNextRound
+      commentaryOpen
+      onContinue={vi.fn()}
+      onToggleCommentary={vi.fn()}
+      onHome={vi.fn()}
+    />,
+  )
+  expect(document.body).toHaveTextContent('9,876')
+  expect(document.body).not.toHaveTextContent('9.876')
+})
+
+it('names every Round 5 lane phase in words, never as the server enum', () => {
+  const phases = [
+    'dispatching', 'provisioning_proxy', 'verifying_proxy', 'verifying_path',
+    'ramping', 'holding', 'verified', 'failed', 'cancelled',
+  ] as const
+  for (const phase of phases) {
+    expect(roundFivePhaseLabel(phase), phase).not.toContain('_')
+  }
+  expect(roundFivePhaseLabel('provisioning_proxy')).toBe('CREATING RDS PROXY')
+  expect(roundFivePhaseLabel('verifying_path')).toBe('CHECKING POOLED PATH')
+  // A phase a newer server adds still reads as words.
+  expect(roundFivePhaseLabel('draining_idle_clients')).toBe('Draining Idle Clients')
+  expect(roundFivePhaseLabel('')).toBe('Unknown')
+})
+
+it('shows the burst card phase and the runner note in plain words', () => {
+  // Towelled while AWS was still creating the per-bout Proxy.
+  const session = screenshotTowelRoundFiveSession()
+  session.round5_runtime!.lanes.competitor.phase = 'provisioning_proxy'
+  render(<InstantReplay session={session} roundNumber={5} onClose={vi.fn()} />)
+  const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
+  fireEvent.click(within(replay).getByText(/view full evidence/i))
+  expect(replay).toHaveTextContent('CREATING RDS PROXY')
+  expect(replay).not.toHaveTextContent(/PROVISIONING_PROXY/i)
+  expect(replay).toHaveTextContent('which alone tracks, holds and can cancel that lane’s clients')
+  expect(replay).not.toHaveTextContent(/resident registry/i)
 })

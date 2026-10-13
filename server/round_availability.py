@@ -188,6 +188,21 @@ _STORAGE_HEADLINE = (
     "It stays off the card; the other available rounds are unaffected."
 )
 
+#: Not `NOT_ON_THE_CARD`: this round is on tonight's card, a moment away.
+_STORAGE_CHECKING_HEADLINE = (
+    "Backstage is still checking this round's lakehouse storage. It opens "
+    "automatically once the check answers; the other rounds are unaffected."
+)
+
+#: The reason code the fight card reads as an automatic, self-clearing hold.
+STORAGE_CHECKING_REASON_CODE = "storage_checking"
+
+STORAGE_CHECKING_REFUSAL = (
+    "THIS ROUND OPENS WHEN ITS STORAGE CHECK ANSWERS: the read-only probe of both "
+    "sealed Delta paths has not reported since this server started, and a stopped "
+    "SQL warehouse takes up to a minute to answer it. Nothing else waits for it."
+)
+
 _ROUND5_WARMING_HEADLINE = (
     f"{NOT_ON_THE_CARD} Round 5 is preparing backstage and will unlock "
     "automatically. The other rounds are unaffected."
@@ -369,6 +384,8 @@ class AvailabilitySignals:
     #: and the ordinary one: nothing has been refused yet.
     grant_refusals: Mapping[RoundId, str] = field(default_factory=dict)
     storage_refusals: Mapping[RoundId, str] = field(default_factory=dict)
+    #: Rounds whose shared Delta storage has not answered its first probe yet.
+    storage_checking: frozenset[RoundId] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -557,6 +574,15 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
         # reason `InstallationPresence` has four states instead of a boolean --
         # and `/readyz` claims no lost capabilities for either of them.
         return RoundRefusal(_ABSENT_OPPONENT_HEADLINE, presence.detail)
+
+    # Last: it is the one hold here that clears by itself, so every lasting refusal
+    # above outranks it rather than reading "opens automatically" until it lifts.
+    if round_id in signals.storage_checking:
+        return RoundRefusal(
+            _STORAGE_CHECKING_HEADLINE,
+            STORAGE_CHECKING_REFUSAL,
+            STORAGE_CHECKING_REASON_CODE,
+        )
 
     return None
 

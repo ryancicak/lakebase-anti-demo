@@ -76,6 +76,14 @@ html:has(.game-screen[data-scene="card"]) #root {
   min-height: 100%;
   overflow-y: auto;
 }
+/* Only the document scrolls. A body or #root that is a scroll box of its own,
+   exactly as tall as its content, never scrolls, and the sticky bar below pins
+   to the nearest one: with the WHY panel open, B · BACK and PREPARE sat under
+   the fold at both 1280x720 and 1920x1080. */
+html:has(.game-screen[data-scene="card"]) body,
+html:has(.game-screen[data-scene="card"]) #root {
+  overflow: visible;
+}
 /* Because the column now scrolls, the primary action is pinned so it is never
    the thing you have to go looking for. */
 .game-scene.card-scene .card-actions {
@@ -87,6 +95,17 @@ html:has(.game-screen[data-scene="card"]) #root {
   border-top: 3px solid #131c44;
   background: #050817f2;
 }
+/* The status strip rides in the pinned bar, between the two buttons, so the
+   reason PREPARE is locked is on screen whenever the button is. Below the bar,
+   the bar's negative bottom margin drew it underneath its own background. */
+.game-scene.card-scene .card-actions .game-lock-note {
+  flex: 1 1 0;
+  min-width: 0;
+}
+/* Why the last press failed rides in the bar too, as a full row above the
+   buttons. Left in the column above the bar, the pinned bar covered it. */
+.game-scene.card-scene .card-actions { flex-wrap: wrap; }
+.game-scene.card-scene .card-actions .game-error { flex: 0 0 100%; min-width: 0; overflow-wrap: anywhere; }
 
 .game-scene.card-scene { display: flex; flex-direction: column; gap: clamp(5px, .65vw, 11px); }
 /* The old grid gave these children a column and a chrome of their own. In the

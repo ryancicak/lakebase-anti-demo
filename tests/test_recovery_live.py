@@ -119,10 +119,14 @@ async def test_lakebase_wait_reports_exact_preflight_and_acceptance_contract() -
 
 
 async def test_lakebase_create_mutation_settles_after_towel_cancellation() -> None:
+    async def nothing_in_flight() -> None:
+        return None
+
     underlying = SimpleNamespace(
         name="Lakebase",
         source_id="projects/ad-test/branches/production/endpoints/primary",
         config=SimpleNamespace(control_timeout_seconds=1.0),
+        settle_pending_mutations=nothing_in_flight,
     )
     adapter = LakebaseRecoveryAdapter(underlying)  # type: ignore[arg-type]
     mutation_started = asyncio.Event()

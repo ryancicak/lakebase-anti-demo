@@ -29,6 +29,7 @@ from server.coordination import InMemoryBoutLeaseStore, LeaseLostError, round_ri
 from server.manager import (
     COST_LEDGER_GRANT_HEADLINE,
     AmbiguousRingQueryError,
+    CooldownWatch,
     InvalidStateError,
     RunManager,
     SessionRecord,
@@ -77,11 +78,12 @@ from server.round4_race import (
     Round4Arm,
     Round4Phase,
     Round4RaceResult,
+    Round4SettleError,
 )
 from server.round4_race import PROTOCOL as ROUND4_PROTOCOL
 from server.round4_race import resolve as resolve_round4
 from server.round5_warm import Round5Variant, Round5WarmState, WarmStoreConflictError
-from server.round6_race import Round6Phase, Round6RaceEngine
+from server.round6_race import Round6Phase, Round6RaceEngine, Round6SettleError
 from server.round_availability import GRANT_REFUSAL_HEADLINE
 from server.safe_change import (
     SafeChangeArm,
@@ -827,8 +829,18 @@ class UnreachableTerminalReleaseStore(InMemoryBoutLeaseStore):
         self.release_attempts = 0
         self.current_attempts = 0
         self.attempted = asyncio.Event()
+        self.released = asyncio.Event()
+        self.reachable = False
+
+    def heal(self) -> None:
+        self.reachable = True
 
     async def release(self, lease):
+        if self.reachable:
+            released = await super().release(lease)
+            if released:
+                self.released.set()
+            return released
         if self.phase is not None and lease.phase != self.phase:
             return await super().release(lease)
         self.release_attempts += 1
@@ -836,6 +848,8 @@ class UnreachableTerminalReleaseStore(InMemoryBoutLeaseStore):
         raise RuntimeError("the coordination endpoint is unreachable")
 
     async def current(self):
+        if self.reachable:
+            return await super().current()
         # Reachable until the settlement starts, so arming and the run itself
         # behave exactly as they do against a healthy coordinator.
         if not self.attempted.is_set():
@@ -1125,6 +1139,9 @@ class FakeSafeChangeEngine:
             lanes=lanes,
         )
 
+    async def settle_pending_mutations(self, competitor):
+        del competitor
+
     async def reset(self, competitor, on_progress):
         lanes = {}
         for lane_id, plan in self.plans.items():
@@ -1198,6 +1215,9 @@ class FailingRecoveryEngine:
     async def run(self, arm, on_progress, on_started, stop_control=None):
         await on_started()
         raise RuntimeError("recovery provider failed")
+
+    async def settle_pending_mutations(self, competitor):
+        del competitor
 
     async def reset(self, competitor, on_progress):
         lanes = {
@@ -1636,6 +1656,7 @@ class FakeRound4PipelineApi:
     def __init__(self, running: bool = True) -> None:
         self.running = running
         self.calls: list[tuple[str, str]] = []
+        self.latest_update_id = "u1"
 
     def __call__(self, profile, method, path, *, body=None, timeout=600):
         self.calls.append((method, path))
@@ -1644,12 +1665,16 @@ class FakeRound4PipelineApi:
             return {}
         if method == "post" and path.endswith("/updates"):
             self.running = True
+            self.latest_update_id = "update-1"
             return {"update_id": "update-1"}
         if "/pipelines/" in path:
             return {
                 "state": "RUNNING" if self.running else "IDLE",
                 "latest_updates": [
-                    {"state": "RUNNING" if self.running else "CANCELED", "update_id": "u1"}
+                    {
+                        "state": "RUNNING" if self.running else "CANCELED",
+                        "update_id": self.latest_update_id,
+                    }
                 ],
             }
         status = {
@@ -1826,6 +1851,10 @@ async def test_double_rung_bell_opens_exactly_one_run() -> None:
     running = await wait_for_state(manager, session_id, SessionState.RUNNING)
     assert running.run_started_at is not None
     events = record.event_log.events
+    for _ in range(400):
+        if [event.event for event in events].count("run_started") == 1:
+            break
+        await asyncio.sleep(0.005)
     assert [event.event for event in events].count("run_started") == 1
 
     # Settle the in-flight run so the test leaves no dangling task or lease.
@@ -1855,18 +1884,28 @@ async def test_bell_rung_again_after_verification_replays_the_same_result() -> N
     verified = await wait_for_state(manager, session_id, SessionState.VERIFIED)
 
     events = manager._records[session_id].event_log.events
-    event_count = len(events)
     record = manager._records[session_id]
     assert record.task is not None and record.task.done()
+    runner = record.task
+    run_events_before = [
+        event.event
+        for event in events
+        if event.event in {"run_started", "run_finished"}
+    ]
 
     replay = await manager.start_run(session_id)
 
     assert replay.state == SessionState.VERIFIED
     assert replay.run_started_at == verified.run_started_at
     assert replay.remembered_result == verified.remembered_result
-    # No second run, no second barrier, no extra events.
-    assert len(events) == event_count
-    assert [event.event for event in events].count("run_started") == 1
+    # No second runner or barrier. The Round 1 idle watch is allowed to publish
+    # cooldown events concurrently with this replay.
+    assert record.task is runner
+    assert [
+        event.event
+        for event in events
+        if event.event in {"run_started", "run_finished"}
+    ] == run_events_before == ["run_started", "run_finished"]
 
 
 def test_round_five_diagnostic_keeps_aws_code_but_redacts_provider_message() -> None:
@@ -4178,7 +4217,9 @@ async def test_round_four_clocks_start_at_the_bell_not_while_the_verifier_connec
     created = await manager.create(round_four_request())
     await manager.start_arm(created.id, operator)
     await wait_for_state(manager, created.id, SessionState.ARMED)
-    await manager.start_run(created.id, operator)
+    accepted = await manager.start_run(created.id, operator)
+    assert accepted.state == SessionState.RUNNING
+    assert accepted.run_started_at is not None
     await asyncio.wait_for(engine.waiting_for_bell.wait(), timeout=1)
     record = manager._records[created.id]
 
@@ -4195,6 +4236,41 @@ async def test_round_four_clocks_start_at_the_bell_not_while_the_verifier_connec
     engine.before_bell.set()
     await wait_for_state(manager, created.id, SessionState.VERIFIED)
     assert record.run_started_monotonic_ns == bell_ns
+
+
+async def test_round_four_runner_cannot_resurrect_a_queued_towel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = FakeModelScoreEngine()
+    manager = RunManager(model_score_factory=lambda _competitor: engine)
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-towel-race")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+
+    original_commit = manager._commit_bout
+    committed = asyncio.Event()
+    release_handoff = asyncio.Event()
+
+    async def blocked_commit(record, owner):
+        await original_commit(record, owner)
+        committed.set()
+        await release_handoff.wait()
+
+    monkeypatch.setattr(manager, "_commit_bout", blocked_commit)
+    ringing = asyncio.create_task(manager.start_run(created.id, operator))
+    await asyncio.wait_for(committed.wait(), timeout=1)
+    towelling = asyncio.create_task(manager.start_towel(created.id, operator))
+    await asyncio.sleep(0)
+    release_handoff.set()
+
+    accepted = await asyncio.wait_for(ringing, timeout=1)
+    towelled = await asyncio.wait_for(towelling, timeout=1)
+    await asyncio.sleep(0)
+    assert accepted.state == SessionState.RUNNING
+    assert towelled.state == SessionState.TOWELLED
+    assert (await manager.get(created.id)).state == SessionState.TOWELLED
+    await manager.close()
 
 
 async def test_a_round_four_towel_before_the_bell_stops_the_bout_with_nothing_timed() -> None:
@@ -4263,10 +4339,10 @@ async def test_round_four_progress_is_observational(emit_progress: bool) -> None
         record = manager._records[created.id]
         publish = record.event_log.publish
 
-        async def fail_lane_updates(event, payload):
+        async def fail_lane_updates(event, payload, **kwargs):
             if event == "lane_update":
                 raise RuntimeError("SSE observer disconnected")
-            return await publish(event, payload)
+            return await publish(event, payload, **kwargs)
 
         record.event_log.publish = fail_lane_updates
     await manager.start_run(created.id, operator)
@@ -4464,8 +4540,9 @@ async def test_catalog_storage_probe_is_cached_single_flight_and_recovers() -> N
     first = asyncio.create_task(manager.refresh_delta_storage_readiness())
     await entered.wait()
     second = asyncio.create_task(manager.refresh_delta_storage_readiness())
+    probe = manager._delta_storage_probe_task
     release.set()
-    await asyncio.gather(first, second)
+    await asyncio.gather(first, second, probe)
 
     assert calls == 1
     assert set(manager.storage_refusals) == {
@@ -4508,20 +4585,71 @@ async def test_an_open_tab_alone_does_not_re_probe_storage_once_a_verdict_exists
         delta_storage_probe_watched=lambda: person_on,
     )
     # The first answer is read whoever is watching: nothing is advertised before it.
+    assert manager.storage_checking == {
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
     await manager.refresh_delta_storage_readiness()
+    await asyncio.sleep(0)
     assert calls == 1
+    assert manager.storage_checking == frozenset()
     # A tab left open: polls arrive, the cache is stale, and nothing is sent.
     for _ in range(5):
         await manager.refresh_delta_storage_readiness()
+        await asyncio.sleep(0)
     assert calls == 1
     # A person comes back, and the verdict is read again.
     person_on = True
     await manager.refresh_delta_storage_readiness()
+    await asyncio.sleep(0)
     assert calls == 2
     # Startup's forced read does not wait for anyone.
     person_on = False
     await manager.refresh_delta_storage_readiness(force=True)
     assert calls == 3
+
+
+async def test_a_stale_storage_verdict_answers_at_once_while_a_new_one_is_read() -> None:
+    """A stopped warehouse takes most of a minute, and the catalog must not wait for it."""
+
+    warehouse_up = asyncio.Event()
+    calls = 0
+    denied = True
+
+    async def probe() -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await warehouse_up.wait()
+        if denied:
+            raise model_score_live.DeltaStorageAccessDeniedError(
+                state="FAILED",
+                error_code="BAD_REQUEST",
+                sql_state="42000",
+                provider_category="STORAGE_ACCESS_DENIED (403/AccessDenied)",
+                provider_message="S3 403 Forbidden",
+            )
+
+    manager = RunManager(delta_storage_probe=probe, delta_storage_probe_interval_seconds=0)
+    await manager.refresh_delta_storage_readiness(force=True)
+    assert set(manager.storage_refusals) == {
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        RoundId.ANALYZE_LIVE_ORDERS,
+    }
+
+    denied = False
+    await asyncio.wait_for(manager.refresh_delta_storage_readiness(), timeout=1)
+    await asyncio.sleep(0)
+    # Re-reading, and still answering from the verdict on record while it does.
+    assert calls == 2
+    assert manager.storage_refusals and manager.storage_checking == frozenset()
+    rereading = manager._delta_storage_probe_task
+    assert rereading is not None and not rereading.done()
+
+    warehouse_up.set()
+    await rereading
+    assert manager.storage_refusals == {}
+    await manager.close()
 
 
 async def test_missing_round6_delta_history_disables_only_round_six() -> None:
@@ -4536,9 +4664,10 @@ async def test_missing_round6_delta_history_disables_only_round_six() -> None:
         delta_storage_probe_interval_seconds=0,
     )
 
-    await manager.refresh_delta_storage_readiness()
+    await manager.refresh_delta_storage_readiness(force=True)
 
     assert set(manager.storage_refusals) == {RoundId.ANALYZE_LIVE_ORDERS}
+    assert manager.storage_checking == frozenset()
     assert "missing" in manager.storage_refusals[RoundId.ANALYZE_LIVE_ORDERS].lower()
 
 
@@ -4575,8 +4704,10 @@ async def test_cancelling_cooldown_drains_its_inflight_observation_tasks() -> No
         return SimpleNamespace(id=lane_id, name=lane_id, assert_armed=assert_armed)
 
     record.live_targets = (target("lakebase"), target("competitor"))
-    operation = asyncio.create_task(manager._monitor_cooldown(record))
-    await asyncio.gather(*(event.wait() for event in entered.values()))
+    operation = asyncio.create_task(
+        manager._monitor_cooldown(record, CooldownWatch(record.snapshot.cooldown, None))
+    )
+    await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered.values())), timeout=5)
     operation.cancel()
     try:
         with pytest.raises(asyncio.CancelledError):
@@ -4825,6 +4956,68 @@ async def test_initial_terminal_cancellation_waits_for_release_and_publication()
     assert [event.event for event in record.event_log.events].count("run_finished") == 1
 
 
+async def test_close_drains_round_four_terminal_publication_before_returning() -> None:
+    lease_store = RetryTerminalReleaseStore(phase="run_committed")
+    manager = RunManager(
+        model_score_factory=lambda _competitor: FakeModelScoreEngine(),
+        lease_store=lease_store,
+    )
+    manager._terminal_release_backoff_cap = 0.01
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-close-terminal")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    await asyncio.wait_for(lease_store.retry_started.wait(), timeout=1)
+    record = manager._records[created.id]
+    child = record.model_score_terminal_task
+    assert child is not None and not child.done()
+
+    closing = asyncio.create_task(manager.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+
+    lease_store.allow_success.set()
+    await asyncio.wait_for(closing, timeout=2)
+    assert child.done()
+    assert record.model_score_terminal_task is None
+    assert [event.event for event in record.event_log.events].count("run_finished") == 1
+
+
+async def test_close_drains_round_four_terminal_child_after_parent_abandons() -> None:
+    lease_store = RetryTerminalReleaseStore(phase="run_committed")
+    manager = RunManager(
+        model_score_factory=lambda _competitor: FakeModelScoreEngine(),
+        lease_store=lease_store,
+    )
+    manager._terminal_release_backoff_cap = 0.01
+    manager._terminal_publish_timeout = 0.01
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-abandoned-child")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id, operator)
+    await asyncio.wait_for(lease_store.retry_started.wait(), timeout=1)
+    record = manager._records[created.id]
+    outer = record.task
+    child = record.model_score_terminal_task
+    assert outer is not None and child is not None
+
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(outer, timeout=1)
+    assert not child.done()
+
+    closing = asyncio.create_task(manager.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    lease_store.allow_success.set()
+    await asyncio.wait_for(closing, timeout=2)
+    assert child.done()
+    assert record.model_score_terminal_task is None
+    assert [event.event for event in record.event_log.events].count("run_finished") == 1
+
+
 # Round 4's terminal publication used to answer a cancellation by calling
 # uncancel() and re-shielding, so an unreachable coordinator held the run open
 # forever.  These four hang against that version: the wait is the thing under
@@ -4885,6 +5078,15 @@ async def test_an_unreachable_coordinator_cannot_swallow_the_round_four_cancella
     assert record.model_score_terminal_task is None
     # An unprovable release is not a lease loss, so the proof still publishes.
     assert (await manager.get(created.id)).state == SessionState.VERIFIED
+    # The terminal publication is done, but its non-renewing release debt stays
+    # live. Recovery frees the ring immediately rather than waiting for TTL.
+    retry = record.terminal_release_retry_task
+    assert retry is not None and not retry.done()
+    lease_store.heal()
+    await asyncio.wait_for(lease_store.released.wait(), timeout=1)
+    assert await lease_store.current() is None
+    await asyncio.wait_for(asyncio.shield(retry), timeout=1)
+    assert record.terminal_release_retry_task is None
 
 
 async def test_the_abandoned_terminal_publication_names_what_may_have_survived(
@@ -5071,6 +5273,64 @@ async def test_the_abandoned_terminal_settlement_leaves_the_durable_lease_to_its
     assert record.lease_heartbeat_task is None
 
 
+class DeafTerminalReleaseStore(InMemoryBoutLeaseStore):
+    """A release of ``phase`` that outlasts every cancellation until its socket closes,
+    as psycopg's does on a black-holed socket."""
+
+    def __init__(self, *, phase: str) -> None:
+        super().__init__()
+        self.phase = phase
+        self.socket_closed = asyncio.Event()
+
+    async def release(self, lease):
+        if lease.phase != self.phase:
+            return await super().release(lease)
+        while not self.socket_closed.is_set():
+            try:
+                await self.socket_closed.wait()
+            except asyncio.CancelledError:
+                continue
+        raise ConnectionError("server closed the connection unexpectedly")
+
+
+async def test_the_terminal_lease_settlement_deadline_holds_against_a_deaf_release() -> None:
+    """Its deadline ends the wait even for a call that does not end when cancelled."""
+
+    lease_store = DeafTerminalReleaseStore(phase="no-such-phase")
+    manager = RunManager(
+        model_score_factory=lambda _competitor: FakeModelScoreEngine(),
+        lease_store=lease_store,
+    )
+    manager._lease_heartbeat = 10
+    manager._terminal_release_backoff_cap = 0.01
+    manager._terminal_release_call_timeout = 5.0
+    manager._terminal_settle_deadline = TERMINAL_BOUND
+    operator = BoutOperator(display_name="Round Four Owner", subject="owner-settle-deaf")
+    created = await manager.create(round_four_request())
+    await manager.start_arm(created.id, operator)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    record = manager._records[created.id]
+    expected = record.lease
+    assert expected is not None
+    async with record.lease_lock:
+        record.model_score_terminal_lease = expected
+    lease_store.phase = expected.phase
+
+    started = time.monotonic()
+    settle = asyncio.create_task(manager._settle_model_score_terminal_lease(record))
+    try:
+        done, _ = await asyncio.wait({settle}, timeout=TERMINAL_PATIENCE)
+        assert settle in done, "the settlement is still waiting on a call that will not end"
+        assert settle.result() == "unknown"
+        assert time.monotonic() - started < TERMINAL_PATIENCE / 2
+        assert record.lease is expected
+        assert record.lease_heartbeat_task is None
+    finally:
+        lease_store.socket_closed.set()
+        await asyncio.gather(settle, return_exceptions=True)
+    await manager.close()
+
+
 
 
 
@@ -5120,10 +5380,10 @@ async def test_round_four_schedules_its_restore_before_it_publishes_the_result()
     seen: list[bool] = []
     publish = record.event_log.publish
 
-    async def watching_publish(event, payload):
+    async def watching_publish(event, payload, **kwargs):
         if event == "run_finished":
             seen.append(record.settlement_task is not None)
-        return await publish(event, payload)
+        return await publish(event, payload, **kwargs)
 
     record.event_log.publish = watching_publish
     try:
@@ -5312,6 +5572,93 @@ async def test_round_one_owner_can_cancel_a_pending_arm_without_a_result() -> No
     assert repeated == cancelled
 
 
+async def test_only_the_ring_owner_can_rearm_a_cancelled_card() -> None:
+    """A retained FAILED card is still its owner's card; a new card is anyone's.
+
+    Re-arming is a control on the card, so outside Round 5 a FAILED card re-arms for
+    the operator who armed it and for nobody else. The refusal has to come before the
+    ring is claimed: accepting a second signed-in user's `POST /arm` claimed the ring
+    for them and replaced `record.operator`, after which it was the owner's own
+    controls that were refused.
+    """
+
+    resolver = HangingArmResolver()
+    manager = RunManager(resolver=resolver, verifier=make_verifier())
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    intruder = BoutOperator(display_name="Intruder", subject="intruder")
+    request = SessionCreate(
+        competitor=CompetitorId.AURORA_SERVERLESS_V2,
+        primary_persona="sre",
+        corners=[Corner.PERFORMANCE],
+        round_id=RoundId.WAKE_IDLE_APP,
+    )
+    created = await manager.create(request)
+    await manager.start_arm(created.id, owner)
+    await asyncio.wait_for(resolver.lakebase.entered.wait(), timeout=1)
+    cancelled = await manager.cancel_arm(created.id, owner)
+    assert cancelled.state == SessionState.FAILED
+
+    with pytest.raises(InvalidStateError, match="ONLY THE RING OWNER"):
+        await manager.start_arm(created.id, intruder)
+    assert (await manager.bout_status()).active is False
+    owned_by = manager._records[created.id].operator
+    assert owned_by is not None and owned_by.subject == "owner"
+    with pytest.raises(InvalidStateError, match="ONLY THE RING OWNER"):
+        await manager.cancel_arm(created.id, intruder)
+    assert await manager.cancel_arm(created.id, owner) == cancelled
+
+    # Any signed-in operator may still arm a card of their own while the ring is free.
+    theirs = await manager.create(request)
+    assert (await manager.start_arm(theirs.id, intruder)).state == SessionState.CHECKING
+    assert (await manager.cancel_arm(theirs.id, intruder)).state == SessionState.FAILED
+
+    # The owner re-arms their own FAILED card and keeps every control on it.
+    assert (await manager.start_arm(created.id, owner)).state == SessionState.CHECKING
+    status = await manager.bout_status()
+    assert status.operator is not None and status.operator.display_name == "Owner"
+    with pytest.raises(InvalidStateError, match="ONLY THE RING OWNER"):
+        await manager.cancel_arm(created.id, intruder)
+    assert (await manager.cancel_arm(created.id, owner)).state == SessionState.FAILED
+    await manager.close()
+
+
+async def test_only_the_ring_owner_can_rearm_a_card_whose_armed_window_expired() -> None:
+    """The armed window's own release leaves the card FAILED, and still the owner's."""
+
+    manager = RunManager(resolver=OrderedFakeResolver(), verifier=make_verifier())
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    intruder = BoutOperator(display_name="Intruder", subject="intruder")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.WAKE_IDLE_APP,
+        )
+    )
+    manager._armed_ttl = 0.01
+    await manager.start_arm(created.id, owner)
+    expired = await wait_for_state(manager, created.id, SessionState.FAILED)
+    assert expired.failure is not None
+    assert expired.failure.startswith("Fight card expired before the bell")
+    assert (await manager.bout_status()).active is False
+
+    with pytest.raises(InvalidStateError, match="ONLY THE RING OWNER"):
+        await manager.start_arm(created.id, intruder)
+    assert (await manager.bout_status()).active is False
+    owned_by = manager._records[created.id].operator
+    assert owned_by is not None and owned_by.subject == "owner"
+
+    manager._armed_ttl = 180
+    await manager.start_arm(created.id, owner)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    with pytest.raises(InvalidStateError, match="ONLY THE RING OWNER"):
+        await manager.start_run(created.id, intruder)
+    await manager.start_run(created.id, owner)
+    await wait_for_state(manager, created.id, SessionState.VERIFIED)
+    await manager.close()
+
+
 async def test_round_one_automatically_rechecks_idle_while_holding_cleanup_fence() -> None:
     resolver = SequencedCooldownResolver()
     manager = RunManager(resolver=resolver, verifier=make_verifier())
@@ -5369,6 +5716,7 @@ async def test_lakebase_post_close_update_can_precede_shared_cooldown_origin() -
     manager, record = await round_one_cooldown_record()
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
     lane = cooldown.lanes["lakebase"]
     provider_updated_at = cooldown.started_at - timedelta(seconds=1.81)
     assert lane.started_at < provider_updated_at < cooldown.started_at
@@ -5376,6 +5724,7 @@ async def test_lakebase_post_close_update_can_precede_shared_cooldown_origin() -
 
     changed, snapshot = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {
             "state": "IDLE",
@@ -5399,12 +5748,14 @@ async def test_confirmed_idle_lane_latches_first_terminal_evidence() -> None:
     manager, record = await round_one_cooldown_record()
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
     lane = cooldown.lanes["lakebase"]
     provider_updated_at = lane.started_at + timedelta(seconds=60)
     first_completed_at = lane.started_at + timedelta(seconds=75)
 
     changed, first = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {
             "state": "IDLE",
@@ -5421,6 +5772,7 @@ async def test_confirmed_idle_lane_latches_first_terminal_evidence() -> None:
 
     changed, duplicate = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {
             "state": "IDLE",
@@ -5433,6 +5785,7 @@ async def test_confirmed_idle_lane_latches_first_terminal_evidence() -> None:
 
     changed, stale_nonterminal = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         TargetNotArmedError("stale ACTIVE observation"),
         first_completed_at + timedelta(minutes=3),
@@ -5446,11 +5799,13 @@ async def test_lakebase_stale_update_requires_repeated_idle_dwell() -> None:
     manager._lakebase_idle_dwell = 0.001
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
     lane = cooldown.lanes["lakebase"]
     stale = lane.started_at - timedelta(minutes=10)
 
     _, first = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE", "provider_updated_at": stale.isoformat()},
         cooldown.started_at,
@@ -5464,6 +5819,7 @@ async def test_lakebase_stale_update_requires_repeated_idle_dwell() -> None:
     completed_at = cooldown.started_at + timedelta(seconds=2)
     _, second = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE", "provider_updated_at": stale.isoformat()},
         completed_at,
@@ -5479,9 +5835,11 @@ async def test_lakebase_missing_update_requires_repeated_idle_dwell() -> None:
     manager._lakebase_idle_dwell = 0.001
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
 
     _, first = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at,
@@ -5491,6 +5849,7 @@ async def test_lakebase_missing_update_requires_repeated_idle_dwell() -> None:
     await asyncio.sleep(0.002)
     _, second = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at + timedelta(seconds=2),
@@ -5500,17 +5859,48 @@ async def test_lakebase_missing_update_requires_repeated_idle_dwell() -> None:
     assert second.lanes["lakebase"].confirmation_basis == "observed_idle_dwell"
 
 
+async def test_an_idle_count_from_an_earlier_cooldown_never_counts_toward_the_next() -> None:
+    manager, record = await round_one_cooldown_record()
+    manager._lakebase_idle_dwell = 0.001
+    earlier = record.snapshot.cooldown
+    assert earlier is not None
+
+    _, first = await manager._apply_cooldown_observation(
+        record,
+        CooldownWatch(earlier, None),
+        "lakebase",
+        {"state": "IDLE"},
+        earlier.started_at,
+    )
+    assert first.lanes["lakebase"].observation_count == 1
+
+    await asyncio.sleep(0.002)
+    later = record.snapshot.cooldown = manager._new_cooldown(record, ResetMode.RETURN_TO_IDLE)
+    _, second = await manager._apply_cooldown_observation(
+        record,
+        CooldownWatch(later, None),
+        "lakebase",
+        {"state": "IDLE"},
+        later.started_at + timedelta(seconds=2),
+    )
+    lane = second.lanes["lakebase"]
+    assert lane.observation_count == 1
+    assert lane.state == CooldownLaneState.WATCHING
+
+
 async def test_lakebase_idle_cannot_vacuously_pass_without_verified_lane_activity() -> None:
     manager, record = await round_one_cooldown_record(verified_activity=False)
     manager._lakebase_idle_dwell = 0.001
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
 
     for offset in (0, 2):
         if offset:
             await asyncio.sleep(0.002)
         _, snapshot = await manager._apply_cooldown_observation(
             record,
+            watch,
             "lakebase",
             {"state": "IDLE"},
             cooldown.started_at + timedelta(seconds=offset),
@@ -5527,6 +5917,7 @@ async def test_preverify_towel_confirms_repeated_lakebase_idle_without_verified_
     manager._lakebase_idle_dwell = 0.001
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
     record.snapshot.state = SessionState.TOWELLED
     for lane in record.snapshot.lanes.values():
         lane.state = LaneState.TOWELLED
@@ -5538,6 +5929,7 @@ async def test_preverify_towel_confirms_repeated_lakebase_idle_without_verified_
 
     _, first = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at,
@@ -5547,6 +5939,7 @@ async def test_preverify_towel_confirms_repeated_lakebase_idle_without_verified_
     await asyncio.sleep(0.002)
     _, second = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at + timedelta(seconds=2),
@@ -5563,6 +5956,7 @@ async def test_partial_verify_towel_confirms_idle_when_close_timestamp_never_arr
     manager._lakebase_idle_dwell = 0.001
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
     record.snapshot.state = SessionState.TOWELLED
     record.snapshot.lanes["lakebase"].state = LaneState.VERIFIED
     record.snapshot.lanes["lakebase"].connection_closed_at = None
@@ -5574,6 +5968,7 @@ async def test_partial_verify_towel_confirms_idle_when_close_timestamp_never_arr
 
     _, first = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at,
@@ -5583,6 +5978,7 @@ async def test_partial_verify_towel_confirms_idle_when_close_timestamp_never_arr
     await asyncio.sleep(0.002)
     _, second = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at + timedelta(seconds=2),
@@ -5597,9 +5993,11 @@ async def test_lakebase_active_state_remains_waiting_and_resets_idle_dwell() -> 
     manager, record = await round_one_cooldown_record()
     cooldown = record.snapshot.cooldown
     assert cooldown is not None
+    watch = CooldownWatch(cooldown, None)
 
     _, first = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         {"state": "IDLE"},
         cooldown.started_at,
@@ -5608,6 +6006,7 @@ async def test_lakebase_active_state_remains_waiting_and_resets_idle_dwell() -> 
 
     _, active = await manager._apply_cooldown_observation(
         record,
+        watch,
         "lakebase",
         TargetNotArmedError("Lakebase endpoint is ACTIVE, not IDLE"),
         cooldown.started_at + timedelta(seconds=1),
@@ -6426,6 +6825,103 @@ async def test_rounds_four_and_six_towel_cleanup_heals_a_refusal_on_its_own(
     assert "failed" not in published_towel_states
 
 
+#: What a Round 4 or Round 6 settle quotes from its lanes: a psycopg connect names the host and
+#: role, and a DMS stop that overran its bound names the task ARN and so the account.
+_TOWEL_LEAKED = (
+    "ep-towel-0f00.database.us-west-2.cloud.databricks.com",
+    "c0ffee00-role",
+    "arn:aws:dms:us-west-2:123456789012:task:TOWELTASK",
+    "123456789012",
+)
+
+
+class ProviderTextTowelModelScoreEngine(BlockingTowelModelScoreEngine):
+    """Round 4, whose towel settle fails the way a park quoting its lane's error does."""
+
+    async def settle_and_restore_baseline(self) -> None:
+        self.settle_calls += 1
+        raise Round4SettleError(
+            "Round 4 could not park Lakebase: connection to server at "
+            f'"{_TOWEL_LEAKED[0]}" failed: FATAL: password authentication failed for user '
+            f'"{_TOWEL_LEAKED[1]}"'
+        )
+
+
+class ProviderTextTowelLiveOrdersEngine(BlockingTowelLiveOrdersEngine):
+    """Round 6, whose towel settle fails the way a DMS stop past its bound does."""
+
+    async def settle_and_cleanup_owned(self) -> None:
+        raise Round6SettleError(
+            f"Round 6 could not settle: AWS: The DMS task {_TOWEL_LEAKED[2]} did not stop "
+            "within 300s; it is stopping"
+        )
+
+
+@pytest.mark.parametrize(
+    ("factory_kwarg", "engine_cls", "round_id", "persona", "corner", "error_type"),
+    [
+        pytest.param(
+            "model_score_factory",
+            ProviderTextTowelModelScoreEngine,
+            RoundId.PUT_MODEL_SCORE_IN_APP,
+            "software_engineer",
+            Corner.SIMPLICITY,
+            "Round4SettleError",
+            id="round-4",
+        ),
+        pytest.param(
+            "live_orders_factory",
+            ProviderTextTowelLiveOrdersEngine,
+            RoundId.ANALYZE_LIVE_ORDERS,
+            "data_analyst",
+            Corner.PERFORMANCE,
+            "Round6SettleError",
+            id="round-6",
+        ),
+    ],
+)
+async def test_a_round_four_or_six_towel_failure_names_no_host_role_or_arn(
+    factory_kwarg, engine_cls, round_id, persona, corner, error_type
+) -> None:
+    """The towel's failure is the card's sentence, the receipt's and every later claim's 409.
+
+    A Round 4 or Round 6 settle quotes its lanes' own errors, so the towel gets the error's type
+    alone and the operator log gets the cause.
+    """
+
+    lease_store = InMemoryBoutLeaseStore()
+    engine = engine_cls()
+    manager = RunManager(
+        **{factory_kwarg: lambda *_matchup: engine},
+        lease_store=lease_store,
+    )
+    manager._towel_cleanup_retry_window = 0.0
+    request = SessionCreate(
+        competitor=CompetitorId.AURORA_SERVERLESS_V2,
+        primary_persona=persona,
+        corners=[corner],
+        round_id=round_id,
+    )
+    created = await manager.create(request)
+    await manager.start_arm(created.id)
+    await wait_for_state(manager, created.id, SessionState.ARMED)
+    await manager.start_run(created.id)
+    await asyncio.wait_for(engine.run_entered.wait(), timeout=1)
+    challenger = await manager.create(request)
+
+    await manager.start_towel(created.id)
+    failed = await wait_for_towel(manager, created.id, "failed")
+
+    failure = failed.towel.cleanup_failure if failed.towel is not None else None
+    assert failure is not None and error_type in failure
+    assert all(leaked not in failure for leaked in _TOWEL_LEAKED)
+    with pytest.raises(InvalidStateError) as refusal:
+        await manager.start_arm(challenger.id)
+    message = str(refusal.value)
+    assert "TOWEL CLEANUP FAILED" in message
+    assert all(leaked not in message for leaked in _TOWEL_LEAKED)
+
+
 async def test_round_three_towel_cleanup_failure_past_the_window_retries_under_retained_lease(
 ) -> None:
     lease_store = InMemoryBoutLeaseStore()
@@ -6826,6 +7322,9 @@ async def test_round_three_executes_and_resets_owned_recovery_environments() -> 
                 )
             return SimpleNamespace(launch_skew_ms=0.01, lanes=lanes, all_verified=True)
 
+        async def settle_pending_mutations(self, competitor):
+            del competitor
+
         async def reset(self, competitor, on_progress):
             lanes = {}
             for lane_id, name, provider in (
@@ -6914,10 +7413,10 @@ async def test_round_one_lane_mutations_advance_snapshot_updated_at() -> None:
     observed_updates: list[datetime] = []
     publish = record.event_log.publish
 
-    async def capture_lane_mutation(event, payload):
+    async def capture_lane_mutation(event, payload, **kwargs):
         if event == "lane_update":
             observed_updates.append(record.snapshot.updated_at)
-        return await publish(event, payload)
+        return await publish(event, payload, **kwargs)
 
     record.event_log.publish = capture_lane_mutation
     started = await manager.start_run(created.id)
@@ -7050,7 +7549,10 @@ async def test_start_state_is_revalidated_immediately_before_timing() -> None:
 
     assert failed.failure is not None
     assert "Start state changed before the bell" in failed.failure
+    # Arm, then exact pre-timing revalidation. No timed transaction began, so
+    # there is no return-to-idle watch for Lakebase to prove.
     assert resolver.lakebase.arm_calls == 2
+    assert failed.cooldown is None
     assert failed.lanes["lakebase"].elapsed_ms is None
 
 
@@ -7087,14 +7589,17 @@ async def test_expired_armed_evidence_requires_a_fresh_arm(
     assert expiry_task is not None
     await asyncio.wait_for(lease_store.release_started.wait(), timeout=1)
 
-    terminal_read = asyncio.create_task(manager.get(created.id))
-    await asyncio.sleep(0)
-    assert not terminal_read.done()
+    # The coordinator call is outside the card lock: reads stay prompt, while
+    # `armed_release_pending` refuses the bell until the exact release settles.
+    pending = await asyncio.wait_for(manager.get(created.id), timeout=0.5)
+    assert pending.state == SessionState.ARMED
+    with pytest.raises(InvalidStateError, match="being released"):
+        await manager.start_run(created.id)
     assert all(event.event != "session_failed" for event in record.event_log.events)
 
     lease_store.allow_release.set()
-    failed = await terminal_read
     await expiry_task
+    failed = await manager.get(created.id)
 
     assert failed.failure == (
         "Fight card expired before the bell. The ring was released automatically; prepare it again."
@@ -7153,7 +7658,7 @@ async def running_round_three(manager: RunManager, engine: TowelRecoveryEngine):
     return created
 
 
-# T1 · a cost-ledger write failure must not be able to stop the towel.
+# A cost-ledger write failure must not be able to stop the towel.
 async def test_towel_still_schedules_cleanup_when_the_cost_window_will_not_close() -> None:
     lease_store = InMemoryBoutLeaseStore()
     engine = TowelRecoveryEngine()
@@ -7186,7 +7691,7 @@ async def test_towel_still_schedules_cleanup_when_the_cost_window_will_not_close
     assert manager._releasable(record) is True
 
 
-# T1 · a towel stuck at `stopping` must be recoverable by throwing it again.
+# A towel stuck at `stopping` must be recoverable by throwing it again.
 async def test_towel_retry_re_enters_cleanup_for_a_towel_stranded_at_stopping() -> None:
     lease_store = InMemoryBoutLeaseStore()
     engine = TowelRecoveryEngine()
@@ -7221,7 +7726,7 @@ async def test_towel_retry_re_enters_cleanup_for_a_towel_stranded_at_stopping() 
     assert await lease_store.current() is None
 
 
-# T10 · the emergency stop is not gated on the readiness gate.
+# The emergency stop is not gated on the readiness gate.
 async def test_readiness_gate_refuses_the_arm_but_never_the_towel() -> None:
     lease_store = InMemoryBoutLeaseStore()
     engine = TowelRecoveryEngine()
@@ -7249,7 +7754,7 @@ async def test_readiness_gate_refuses_the_arm_but_never_the_towel() -> None:
         await manager.start_arm(challenger.id)
 
 
-# T2 · Round 5 cleanup that cannot yet converge MUST keep retrying automatically
+# Round 5 cleanup that cannot yet converge MUST keep retrying automatically
 # (never "stop and ask a human") and converge on its own the moment it can.
 async def test_round_five_towel_cleanup_auto_converges_without_manual_retry(monkeypatch) -> None:
     # Fast automatic retries so the durable convergence loop settles quickly.
@@ -7322,7 +7827,7 @@ async def test_round_five_towel_cleanup_auto_converges_without_manual_retry(monk
     await manager.close()
 
 
-# T6 · a refused lease transition must not have already killed the bout.
+# A refused lease transition must not have already killed the bout.
 async def test_refused_towel_transition_leaves_the_bout_running_and_stoppable() -> None:
     lease_store = RefusingTowelTransitionStore()
     engine = TowelRecoveryEngine()
@@ -7359,7 +7864,7 @@ async def test_refused_towel_transition_leaves_the_bout_running_and_stoppable() 
     assert await lease_store.current() is None
 
 
-# T4 · a run task that never observes the cooperative stop must not hold the ring.
+# A run task that never observes the cooperative stop must not hold the ring.
 async def test_towel_cancels_a_round_three_run_that_ignores_the_stop_control() -> None:
     lease_store = InMemoryBoutLeaseStore()
     engine = DeafRecoveryEngine()
@@ -7380,7 +7885,7 @@ async def test_towel_cancels_a_round_three_run_that_ignores_the_stop_control() -
     assert await lease_store.current() is None
 
 
-# T3 · a cancelled cooldown task must not strand the towel at `cleaning`.
+# A cancelled cooldown task must not strand the towel at `cleaning`.
 async def test_cancelled_towel_cleanup_lands_on_failed_and_stays_retryable() -> None:
     lease_store = InMemoryBoutLeaseStore()
     engine = TowelRecoveryEngine()
@@ -7415,7 +7920,7 @@ async def test_cancelled_towel_cleanup_lands_on_failed_and_stays_retryable() -> 
     assert await lease_store.current() is None
 
 
-# T3 · the ring refusal must name what is holding it, not just that it is held.
+# The ring refusal must name what is holding it, not just that it is held.
 async def test_a_wedged_towel_names_itself_in_the_ring_refusal() -> None:
     lease_store = InMemoryBoutLeaseStore()
     # Wedged means still failing after the automatic retry window, not one
@@ -7450,7 +7955,7 @@ async def test_a_wedged_towel_names_itself_in_the_ring_refusal() -> None:
     assert await lease_store.current() is None
 
 
-# T12 · the compensating action nothing called is gone rather than misleading.
+# The compensating action nothing called is gone rather than misleading.
 def test_towel_has_no_unreachable_compensating_lease_action() -> None:
     assert not hasattr(RunManager, "_revert_towel_transition")
 
@@ -7514,7 +8019,7 @@ async def cost_window_session(manager: RunManager):
     )
 
 
-# B1 · the bell's refusal must name the class of remedy without exposing internals.
+# The bell's refusal must name the class of remedy without exposing internals.
 async def test_a_refused_ledger_write_reaches_the_bell_as_an_audience_safe_grant() -> None:
     """The 409 an audience reads has to point at what actually refused.
 
@@ -7558,9 +8063,22 @@ async def test_a_refused_ledger_write_reaches_the_bell_as_an_audience_safe_grant
     assert "permission denied for table" not in detail
     assert "\n" not in detail and "Traceback" not in detail
 
-    # And the refusal really was a refusal: the ring went back, so the next
-    # round is armable rather than wedged behind a bout that never started.
+    # The cost write is after the durable bell, but before the physical timed
+    # transaction. It converges as an accepted-bell failure without inventing a
+    # return-to-idle watch for work that never touched either target.
     assert await manager._lease_store.current() is None
+    failed = await manager.get(created.id)
+    assert failed.state == SessionState.FAILED
+    assert failed.run_started_at is not None
+    assert failed.failure is not None
+    assert COST_LEDGER_GRANT_HEADLINE in failed.failure
+    assert "runner handoff" not in failed.failure
+    assert failed.cooldown is None
+    record = manager._records[created.id]
+    assert record.cooldown_task is None
+    receipt = await sealed_receipt(created.id)
+    assert receipt is not None
+    assert receipt.sealing_event == "session_failed"
 
     # The other direction of the same boundary: our own precondition failures
     # are still diagnosed in the operator log, but the projected banner keeps
@@ -7570,9 +8088,10 @@ async def test_a_refused_ledger_write_reaches_the_bell_as_an_audience_safe_grant
     assert "The original cost receipt is unavailable" not in mine
     assert "operator log" in mine
     assert COST_LEDGER_GRANT_HEADLINE not in mine
+    await manager.close()
 
 
-# B2 · a bout that was won must not be undone by its own tidy-up.
+# A bout that was won must not be undone by its own tidy-up.
 async def test_a_refused_cost_settlement_keeps_the_outcome_and_frees_the_record() -> None:
     """Settlement runs in a `finally`, so anything it raises REPLACES the result.
 
@@ -7640,7 +8159,7 @@ async def test_a_refused_cost_settlement_keeps_the_outcome_and_frees_the_record(
     assert reopened is not None
 
 
-# B2 · a failing tidy-up must not overwrite the reason a bout actually failed.
+# A failing tidy-up must not overwrite the reason a bout actually failed.
 async def test_a_refused_cost_settlement_does_not_mask_the_operations_own_failure() -> None:
     ledger = FailingCostLedgerStore(failures=99)
     manager = cost_window_manager(ledger)

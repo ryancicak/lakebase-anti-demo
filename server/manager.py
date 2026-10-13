@@ -11,7 +11,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Any
 from uuid import uuid4
 
@@ -137,6 +137,7 @@ from .round5_warm import (
     Round5WarmCoordinator,
     Round5WarmSlot,
     Round5WarmState,
+    WarmBellMarginError,
     WarmClaimUnavailableError,
     WarmStoreConflictError,
 )
@@ -342,6 +343,33 @@ def operator_diagnosis(error: BaseException) -> str:
     return diagnosis[: _DIAGNOSIS_LIMIT - 1].rstrip() + "…"
 
 
+def audience_diagnosis(error: BaseException) -> str:
+    """The cause chain as types and codes alone, for text a room or a receipt shows.
+
+    No message is quoted, this server's own included: a lane's error can carry the
+    task or role ARN it was refused on. The operator log gets `operator_diagnosis`.
+    """
+
+    return _redacted_exception_chain(error)
+
+
+#: Packages whose exception text is a provider's own words: a botocore message names the
+#: account, role or ARN it refused, and a psycopg one the host and role.
+_PROVIDER_PACKAGES = frozenset({"boto3", "botocore", "psycopg"})
+
+
+def audience_error_text(error: BaseException) -> str:
+    """An exception as a card, a receipt or a 409 may quote it.
+
+    This server's own sentence is kept. A provider's message becomes its type and code
+    (`audience_diagnosis`); the operator log is where its words belong.
+    """
+
+    if (type(error).__module__ or "").split(".")[0] in _PROVIDER_PACKAGES:
+        return audience_diagnosis(error)
+    return str(error) or type(error).__name__
+
+
 def authorization_refusal(error: BaseException) -> BaseException | None:
     """The Databricks authorization refusal anywhere in this cause chain.
 
@@ -509,6 +537,21 @@ _ROUND_FOUR_CONDITION = "both integrations cold start at the bell"
 #: The least time between two fight-card wakes of one matchup's destinations. Aurora pauses
 #: after five idle minutes, so a fight card left open and asking every minute keeps it awake.
 ROUND4_WAKE_INTERVAL_SECONDS = 60.0
+#: One unrenewed fence's expiry check's read; below the 15 s close() waits for record work.
+FENCE_EXPIRY_READ_SECONDS = 10.0
+
+
+def _margin_floor_clause(winner_elapsed_ms: float | None, bound_seconds: float) -> str:
+    """The loser was still running at its bound from the bell and the winner delivered at its
+    own time, so only the bound less that time is proven."""
+
+    if winner_elapsed_ms is None:
+        return "so the margin is a lower bound and is not a measurement"
+    # Rounded down: printing a floor rounded up would claim more than is proven. In
+    # decimal, so binary float noise cannot take a cent off what is proven.
+    proven = Decimal(str(bound_seconds)) - Decimal(str(winner_elapsed_ms)) / 1000
+    floor_seconds = max(Decimal(0), proven).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+    return f"so the margin is at least {floor_seconds} s and is not a measurement"
 
 
 def _round_four_comparison(
@@ -576,14 +619,15 @@ def _round_four_comparison(
     if resolution.verdict is Verdict.LOWER_BOUND and resolution.winner:
         winner = resolution.winner
         loser = COMPETITOR_LANE if winner == LAKEBASE_LANE else LAKEBASE_LANE
+        floor = _margin_floor_clause(result.outcomes[winner].elapsed_ms, LANE_TIMEOUT_SECONDS)
         return (
             ComparisonSnapshot(
                 kind=ComparisonKind.ADJUDICATED_STOPPAGE,
                 winner_lane_id=winner,
                 detail=(
                     f"{names[winner]} put the exact row in the application; {names[loser]} "
-                    f"did not within {LANE_TIMEOUT_SECONDS:.0f} s of the bell, so the margin "
-                    f"is at least that and is not a measurement; {_ROUND_FOUR_CONDITION}."
+                    f"did not within {LANE_TIMEOUT_SECONDS:.0f} s of the bell, {floor}; "
+                    f"{_ROUND_FOUR_CONDITION}."
                 ),
             ),
             True,
@@ -707,14 +751,18 @@ def _round_six_comparison(
     if resolution.verdict is Verdict.LOWER_BOUND and resolution.winner:
         winner = resolution.winner
         loser = COMPETITOR_LANE if winner == LAKEBASE_LANE else LAKEBASE_LANE
+        floor = _margin_floor_clause(
+            result.outcomes[winner].elapsed_ms,
+            ROUND6_LANE_TIMEOUT_SECONDS,
+        )
         return (
             ComparisonSnapshot(
                 kind=ComparisonKind.ADJUDICATED_STOPPAGE,
                 winner_lane_id=winner,
                 detail=(
                     f"{names[winner]} put the exact order in the lakehouse; {names[loser]} did "
-                    f"not within {ROUND6_LANE_TIMEOUT_SECONDS:.0f} s of the bell, so the margin "
-                    f"is at least that and is not a measurement; {_ROUND_SIX_CONDITION}."
+                    f"not within {ROUND6_LANE_TIMEOUT_SECONDS:.0f} s of the bell, {floor}; "
+                    f"{_ROUND_SIX_CONDITION}."
                 ),
             ),
             True,
@@ -832,6 +880,15 @@ _ARMED_CARD_CANCELLED = (
     "Fight card released by the ring owner before the bell. "
     "No run started and no result was recorded."
 )
+_LOST_RING_STILL_STOPPING = (
+    "BOUT IN PROGRESS · RING LEASE LOST · ACTIVE WORK IS STILL STOPPING · "
+    "TRY AGAIN IN A MOMENT · IF IT PERSISTS, RESTART THE APP"
+)
+_LAST_BOUT_STILL_SETTLING = "THIS CARD'S LAST BOUT IS STILL SETTLING · TRY AGAIN IN A MOMENT"
+_BELL_ACCEPTANCE_UNCONFIRMED = (
+    "Bell acceptance could not be confirmed during a coordinator outage; "
+    "the ring is left to its durable expiry."
+)
 
 #: Rounds whose towel cleanup retries automatically before it reports FAILED. Rounds 2 and 3
 #: delete isolated AWS environments and so can race an in-flight create. Rounds 4 and 6 park
@@ -853,6 +910,12 @@ _TOWEL_CLEANUP_AUTO_RETRY_ROUNDS = frozenset(
 _TOWEL_COOLDOWN_ROUNDS = frozenset(
     {RoundId.WAKE_IDLE_APP, RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}
 )
+
+#: Rounds whose towel settles through an engine that quotes its lanes' own errors: a psycopg
+#: connect names the host and role, and a DMS, Glue or IAM refusal a task or role ARN and its
+#: account. Their towel failure is the card's, the receipt's and every later claim's 409, so it
+#: carries the error's type and code alone.
+_TOWEL_LANE_ERROR_ROUNDS = frozenset({RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS})
 
 #: The two honest accounts of a control action aimed at a fight card this process
 #: does not have. Both lead with what did *not* happen, because the operator's
@@ -977,7 +1040,21 @@ class EventLog:
         """The oldest sequence still servable, or ``next_sequence`` when empty."""
         return self.evicted + 1
 
-    async def publish(self, event: str, payload: dict[str, object]) -> RunEvent:
+    async def publish(
+        self,
+        event: str,
+        payload: dict[str, object],
+        *,
+        receipt_bout_id: str | None = None,
+    ) -> RunEvent:
+        """Append an event and wake its subscribers, then seal a receipt if it ends one.
+
+        ``receipt_bout_id`` is the published snapshot's own attempt identity, which
+        its JSON excludes. Every sealing publisher passes it from the snapshot it
+        built, so a publish that lands after a re-arm still keys its own attempt.
+        It goes to the receipt hook only, never into the event.
+        """
+
         async with self.condition:
             item = RunEvent.now(self.next_sequence, event, payload)
             self.events.append(item)
@@ -990,7 +1067,7 @@ class EventLog:
         # the serialised snapshot already in the payload, so one hook covers all of
         # them without any round needing to know receipts exist. Deliberately
         # outside the condition: no disk I/O while subscribers are blocked.
-        record_sealed_bout(event, payload)
+        record_sealed_bout(event, payload, receipt_bout_id=receipt_bout_id)
         return item
 
     async def stream(self, after_sequence: int = 0) -> AsyncIterator[RunEvent]:
@@ -1038,13 +1115,40 @@ class EventLog:
 
 
 @dataclass
+class CooldownWatch:
+    """One watch of a Round 1 cooldown, bound to what it was started for.
+
+    ``cooldown`` is the exact snapshot it observes and ``owned`` the lease it began under.
+    A card's next bout installs a new cooldown, and can hold a new lease, while an earlier
+    watch is still waiting on a control plane, so a watch acts only while the record still
+    shows that very cooldown and holds no lease but ``owned``.
+    """
+
+    cooldown: CooldownSnapshot
+    owned: BoutLease | None
+    # Consecutive Lakebase IDLE observations, timed in the process monotonic domain and
+    # counted for this watch alone. The public snapshot carries only their count and
+    # wall-clock upper bound; a raw monotonic value must never cross the API boundary.
+    idle_observations: dict[str, tuple[int, int]] = field(default_factory=dict)
+
+
+@dataclass
 class SessionRecord:
     snapshot: SessionSnapshot
     event_log: EventLog = field(default_factory=EventLog)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     lease_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     task: asyncio.Task[None] | None = None
+    arm_task_bout_id: str | None = None
+    # One shielded CHECKING-cancel finalizer per immutable arm attempt. A prior
+    # attempt may still be publishing its receipt after this card is re-armed.
+    checking_cancel_tasks: dict[str, asyncio.Task[SessionSnapshot]] = field(
+        default_factory=dict
+    )
     cooldown_task: asyncio.Task[None] | None = None
+    # Round 1's automatic idle watch while it runs in ``cooldown_task``: the one task
+    # in that slot that ``RunManager._ring_work`` does not count.
+    idle_watch_task: asyncio.Task[None] | None = None
     live_targets: tuple[LiveTarget, LiveTarget] | None = None
     safe_change_engine: SafeChangeEngine | None = None
     safe_change_arm: SafeChangeArm | None = None
@@ -1059,6 +1163,29 @@ class SessionRecord:
     model_score_terminal_published: bool = False
     model_score_terminal_task: asyncio.Task[None] | None = None
     model_score_terminal_lease: BoutLease | None = None
+    # One (registration token, fence) entry per `_settle_terminal_release` still
+    # running, so concurrent settles of one fence each hold it and each removes
+    # only its own. Like Round 4's terminal lease, a loss of exactly such a fence
+    # is those settles' to decide, and the last to exit stops its heartbeat.
+    terminal_release_settles: list[tuple[object, BoutLease]] = field(default_factory=list)
+    # The non-renewing release retry left behind when a settle ran out of time.
+    terminal_release_retry_task: asyncio.Task[None] | None = None
+    terminal_release_retry_lease: BoutLease | None = None
+    # The same retry for a finished bout's Round 5 cleanup lease.
+    round5_release_retry_task: asyncio.Task[None] | None = None
+    round5_release_retry_lease: BoutLease | None = None
+    # Forgets an unrenewed fence once its row expires: a Round 1 cooldown failure's, or
+    # the armed fence of a bell whose acceptance could not be confirmed.
+    fence_expiry_task: asyncio.Task[None] | None = None
+    # The lease row a failed Round 1 cooldown fences the ring with, from the
+    # moment it fails until the durable row is gone.
+    cooldown_failure_fence: BoutLease | None = None
+    # An armed card's no-bell release is being settled outside `record.lock`;
+    # until it finishes, the bell may not ring.
+    armed_release_pending: bool = False
+    # The owner's cancel that started such a release, by the arm attempt it releases:
+    # pressing cancel again joins it rather than being refused.
+    armed_owner_release: tuple[str | None, asyncio.Task[bool]] | None = None
     connection_spike_engine: object | None = None
     connection_spike_arm: object | None = None
     connection_spike_setup_result: object | None = None
@@ -1076,6 +1203,32 @@ class SessionRecord:
     live_orders_pending_order: LiveOrder | None = None
     live_orders_guardrail_order: LiveOrder | None = None
     settlement_task: asyncio.Task[None] | None = None
+    # The HTTP/request task never owns the accepted-bell handoff. One manager
+    # task carries an immutable arm identity from the durable lease transition
+    # through RUNNING projection and runner publication; duplicate bells for
+    # that identity join it and caller cancellation cannot tear it down.
+    bell_handoff_task: asyncio.Task[SessionSnapshot] | None = None
+    bell_handoff_bout_id: str | None = None
+    # Set under record.lock immediately before the durable bell CAS. This
+    # distinguishes a handoff that owns acceptance ambiguity from a task merely
+    # registered before it got the lock; cancel wins the latter race.
+    bell_commit_attempted_bout_id: str | None = None
+    # When that commit's request was sent: a run_committed row adopted after its
+    # answer was lost is provably live from here, not from when it was read.
+    bell_commit_sent_at: float | None = None
+    # The same for the CHECKING -> ARMED commit, whose row is adopted the same way.
+    arm_commit_sent_at: float | None = None
+    # A cancelled handoff can need coordinator/receipt I/O to classify an
+    # ambiguous bell. Keep that child manager-owned as well: shutdown may cancel
+    # the handoff that created it and must still drain this task before stores
+    # close.
+    bell_convergence_task: asyncio.Task[None] | None = None
+    # Immutable process-local authority that Rounds 1-3 crossed the accepted-bell
+    # boundary. Their runner publishes its timed start asynchronously, so the
+    # snapshot can lag behind the durable ``run_committed`` lease. Cancellation
+    # and late callbacks must consult this fact, not infer a no-bell arm from an
+    # ARMED projection. Cleared only when a new arm identity is allocated.
+    bell_committed_at: datetime | None = None
     run_started_monotonic_ns: int | None = None
     # Measurement-clock reading taken when a Round 5 setup lane last advanced
     # its published `setup_elapsed_ms`, keyed by lane id. Pairing the two lets a
@@ -1103,10 +1256,6 @@ class SessionRecord:
     round5_ingestion_closed: bool = False
     round5_callback_epoch: int = 0
     round5_terminal_published: bool = False
-    # Consecutive Lakebase IDLE observations are timed in the process monotonic
-    # domain. The public snapshot carries only their count and wall-clock upper
-    # bound; a raw monotonic value must never cross the API boundary.
-    cooldown_idle_observations: dict[str, tuple[int, int]] = field(default_factory=dict)
     towel_generation: int = 0
     towel_stop_event: asyncio.Event | None = None
     armed_at_monotonic: float | None = None
@@ -1114,9 +1263,29 @@ class SessionRecord:
     lease_heartbeat_task: asyncio.Task[None] | None = None
     lease_heartbeat_lease: BoutLease | None = None
     lease: BoutLease | None = None
+    # The confirmed write a lease came from, and the monotonic time until which that
+    # write provably keeps it live (``RunManager._proven_until``).
+    lease_proof: tuple[BoutLease, float] | None = None
+    # Renews abandoned on sockets that never answered, by the fence each renewed. No
+    # renew of a fence starts beside its own unanswered one, so a black hole holds at
+    # most one per fence, and a newer fence is never held up by an older one's.
+    abandoned_renewals: dict[tuple[str, int], asyncio.Future[Any]] = field(default_factory=dict)
+    # The renew the heartbeat is waiting on, by fence. It runs as its own task, so
+    # stopping the heartbeat abandons it too, or it could still be sent after the stop.
+    renewal_in_flight: tuple[tuple[str, int], asyncio.Future[Any]] | None = None
+    # Set when the ring lease is lost, lapses or is taken instead of released; cleared
+    # once this record claims the ring again. The row can lapse before
+    # ``RunManager._ring_work`` has finished, so until then this process does not
+    # claim that ring.
+    ring_lease_lost: bool = False
     round5_lease_heartbeat_task: asyncio.Task[None] | None = None
     round5_lease_heartbeat_lease: BoutLease | None = None
     round5_lease: BoutLease | None = None
+    round5_lease_proof: tuple[BoutLease, float] | None = None
+    round5_abandoned_renewals: dict[tuple[str, int], asyncio.Future[Any]] = field(
+        default_factory=dict
+    )
+    round5_renewal_in_flight: tuple[tuple[str, int], asyncio.Future[Any]] | None = None
     round5_warm_slot: Round5WarmSlot | None = None
     round5_launch_capsule: Round5LaunchCapsule | None = None
     round5_bell_context: BellContext | None = None
@@ -1198,6 +1367,14 @@ class RunManager:
         # enum, plus the one Round 5 cleanup ring, so this holds at most seven
         # entries no matter how many bouts the installation runs.
         self._scoped_lease_stores: dict[str, BoutLeaseStore] = {}
+        # Calls given up on at a deadline: heartbeat renews and towel transitions, which
+        # are cancelled, and a towel's cost-window close, which is left to land. Each
+        # may still hold a coordinator connection, so close() waits for them, within
+        # its settle window.
+        self._abandoned_calls: set[asyncio.Future[Any]] = set()
+        # Every unfinished heartbeat. One that lost its lease leaves its record's slot
+        # while it still stops the bout, and close() stops it from here.
+        self._heartbeat_tasks: set[asyncio.Task[None]] = set()
         self._resolver = resolver or TargetResolver()
         self._verifier = verifier or NeutralVerifier()
         self._safe_change_factory = safe_change_factory or self._build_safe_change_engine
@@ -1294,6 +1471,18 @@ class RunManager:
         self._terminal_release_call_timeout = float(
             os.environ.get("ANTI_DEMO_TERMINAL_RELEASE_CALL_TIMEOUT_SECONDS", "5")
         )
+        # A towel closes its cost window holding record.lock, which every read of the
+        # card and the lease's loss handling also take; it waits this long for the
+        # ledger, then lets the close land without it.
+        self._cost_close_wait = float(os.environ.get("ANTI_DEMO_COST_CLOSE_WAIT_SECONDS", "2"))
+        # The bell handoff is shielded from its HTTP waiter because an accepted
+        # durable bell must finish independently of a disconnected client. That
+        # shield must not make a coordinator or cost-ledger outage immortal:
+        # the handoff owns record.lock while it establishes the run, so every
+        # control for the card would otherwise queue behind it forever.
+        self._bell_handoff_timeout = float(
+            os.environ.get("ANTI_DEMO_BELL_HANDOFF_TIMEOUT_SECONDS", "30")
+        )
         self._terminal_release_backoff_cap = float(
             os.environ.get("ANTI_DEMO_TERMINAL_RELEASE_BACKOFF_CAP_SECONDS", "1")
         )
@@ -1304,9 +1493,10 @@ class RunManager:
         self._terminal_publish_timeout = float(
             os.environ.get("ANTI_DEMO_TERMINAL_PUBLISH_TIMEOUT_SECONDS", "5")
         )
-        # The overall ceiling on that publication's own lease retry. Bounding
-        # only the waiter would leave this loop running for the life of the
-        # process, because it swallows every store failure by design.
+        # The overall ceiling on that publication's own lease retry, and on every
+        # other finished bout's terminal release retry. Bounding only the waiter
+        # would leave such a loop running for the life of the process, because
+        # it swallows every store failure by design.
         self._terminal_settle_deadline = float(
             os.environ.get("ANTI_DEMO_TERMINAL_SETTLE_DEADLINE_SECONDS", "30")
         )
@@ -1779,44 +1969,68 @@ class RunManager:
 
         return dict(self._storage_refusals)
 
+    @property
+    def storage_checking(self) -> frozenset[RoundId]:
+        """Rounds 4 and 6 until this process's first shared-storage probe has finished.
+
+        Neither is offered before their shared Delta path has answered. A probe that
+        finishes inconclusive ends this too, as it always did: Prepare's exact storage
+        check still fails closed. A refusal on record outranks this.
+        """
+
+        if self._delta_storage_probe is None or self._delta_storage_probe_finished_ns is not None:
+            return frozenset()
+        return frozenset(
+            round_id
+            for round_id in (RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS)
+            if round_id not in self._storage_refusals
+        )
+
     async def refresh_delta_storage_readiness(self, *, force: bool = False) -> None:
-        """Refresh the cached shared-storage verdict once, with request coalescing.
+        """Refresh the cached shared-storage verdict, with request coalescing.
 
-        Catalog and all-round status reads call this before advertising Round 4
-        or Round 6. The probe is read-only and cached so the polling fight card
-        cannot turn into a SQL warehouse keepalive. Concurrent browser polls join
-        the same task rather than issuing duplicate Statement Execution calls.
+        Catalog and all-round status reads call this and never wait for it. The
+        catalog is every page's first request, and a SQL warehouse that has
+        stopped takes most of a minute to answer the probe, which a visitor saw as
+        "Checking server", then "Server offline" (2026-10-12). They answer from
+        the verdict on record, or with Rounds 4 and 6 still checking before the
+        first one (``storage_checking``), while the read runs in the background.
+        Only ``force``, which startup passes, waits for it.
 
-        The cache alone did not do that: it lasts a minute, the warehouse stops
-        only after ten quiet minutes, and an open tab polls the catalog every
-        thirty seconds, so a tab left open kept the warehouse up all night
-        (2026-10-02). Once a verdict exists, it is re-read only while a person is
-        on the app (``delta_storage_probe_watched``).
+        The probe is read-only and cached so the polling fight card cannot turn
+        into a SQL warehouse keepalive, and concurrent polls share one task rather
+        than issuing duplicate Statement Execution calls. The cache alone did not
+        do that: it lasts a minute, the warehouse stops only after ten quiet
+        minutes, and an open tab polls the catalog every thirty seconds, so a tab
+        left open kept the warehouse up all night (2026-10-02). Once a verdict
+        exists, it is re-read only while a person is on the app
+        (``delta_storage_probe_watched``).
         """
 
         if self._closed or self._delta_storage_probe is None:
             return
-        running = self._delta_storage_probe_task
-        if running is not None and not running.done():
-            await asyncio.shield(running)
-            return
-        now = time.monotonic_ns()
-        last = self._delta_storage_probe_finished_ns
-        if not force and last is not None:
-            fresh = now - last < self._delta_storage_probe_interval_ns
-            watched = self._delta_storage_probe_watched
-            if fresh or (watched is not None and not watched()):
-                return
-        task = asyncio.create_task(
-            self._probe_delta_storage(),
-            name="round4-round6-storage-readiness",
-        )
-        self._delta_storage_probe_task = task
-        try:
+        task = self._delta_storage_probe_task
+        if task is None or task.done():
+            last = self._delta_storage_probe_finished_ns
+            if not force and last is not None:
+                fresh = time.monotonic_ns() - last < self._delta_storage_probe_interval_ns
+                watched = self._delta_storage_probe_watched
+                if fresh or (watched is not None and not watched()):
+                    return
+            task = asyncio.create_task(
+                self._probe_delta_storage(),
+                name="round4-round6-storage-readiness",
+            )
+            self._delta_storage_probe_task = task
+            task.add_done_callback(self._forget_delta_storage_probe)
+        if force:
             await asyncio.shield(task)
-        finally:
-            if task.done() and self._delta_storage_probe_task is task:
-                self._delta_storage_probe_task = None
+
+    def _forget_delta_storage_probe(self, task: asyncio.Task[None]) -> None:
+        if self._delta_storage_probe_task is task:
+            self._delta_storage_probe_task = None
+        if not task.cancelled():
+            task.exception()
 
     async def _probe_delta_storage(self) -> None:
         try:
@@ -2073,9 +2287,82 @@ class RunManager:
             window_end=ended_at,
             terminal_outcome=outcome,
         )
-        record.cost_bout_id = None
-        record.cost_bout_started_at = None
-        record.cost_bout_kind = None
+        # A towel's close can land after the card has moved on to a newer bout.
+        if record.cost_bout_id == bout_id:
+            record.cost_bout_id = None
+            record.cost_bout_started_at = None
+            record.cost_bout_kind = None
+
+    async def _close_towel_cost_window(
+        self,
+        record: SessionRecord,
+        towel: TowelSnapshot,
+        *,
+        bout_id: str,
+    ) -> bool:
+        """Close the cost window a towel ended; False if the ledger has not answered.
+
+        Callers hold ``record.lock``, so the ledger gets ``_cost_close_wait`` and no
+        more. An unanswered close lands on its own and reports on the towel. Every
+        attempt ends the window at the towel, so attempts never disagree.
+        """
+
+        closing = asyncio.ensure_future(
+            self._close_cost_bout(
+                record,
+                bout_id=bout_id,
+                ended_at=towel.requested_at,
+                outcome=SessionState.TOWELLED.value,
+            )
+        )
+        try:
+            await asyncio.wait({closing}, timeout=max(0.001, self._cost_close_wait))
+        finally:
+            if not closing.done():
+                self._let_towel_cost_close_land(record, towel, closing, bout_id=bout_id)
+        if not closing.done():
+            return False
+        closing.result()
+        return True
+
+    def _let_towel_cost_close_land(
+        self,
+        record: SessionRecord,
+        towel: TowelSnapshot,
+        closing: asyncio.Future[None],
+        *,
+        bout_id: str,
+    ) -> None:
+        logger.warning(
+            "Towel cost window close unanswered after %.1fs session=%s; it lands on its own",
+            self._cost_close_wait,
+            record.snapshot.id,
+        )
+        self._abandoned_calls.add(closing)
+
+        def landed(done: asyncio.Future[None]) -> None:
+            self._abandoned_calls.discard(done)
+            if done.cancelled():
+                return
+            failure = done.exception()
+            if failure is not None:
+                logger.error(
+                    "Towel could not close the cost window session=%s diagnostic=%s",
+                    record.snapshot.id,
+                    _redacted_exception_chain(failure),
+                )
+            if record.snapshot.towel is not towel:
+                return
+            if failure is None:
+                towel.cost_close_failure = None
+            elif record.cost_bout_id == bout_id:
+                # Only while the window is still this card's to close: a retry may
+                # already have closed it, or handed it to reconciliation.
+                towel.cost_close_failure = (
+                    audience_error_text(failure) or "The bout cost window could not be closed"
+                )
+
+        closing.add_done_callback(landed)
 
     async def _run_cost_bout(
         self,
@@ -2096,7 +2383,10 @@ class RunManager:
                 outcome = state.value if state in terminal_states else "cancelled"
                 if record.cost_bout_kind == "redo" and record.snapshot.redo is not None:
                     outcome = f"redo_{record.snapshot.redo.state.value}"
-                ended_at = record.snapshot.updated_at
+                towel = record.snapshot.towel
+                # Every close of a towelled window ends it at the towel, as the towel's
+                # own close does; towel cleanup moves ``updated_at`` on before this runs.
+                ended_at = towel.requested_at if towel is not None else record.snapshot.updated_at
                 if ended_at <= (record.cost_bout_started_at or ended_at):
                     ended_at = datetime.now(UTC)
                 try:
@@ -2178,6 +2468,56 @@ class RunManager:
         if self._closed:
             raise InvalidStateError("The server is restarting; refresh in a moment")
 
+    async def _drain_armed_release_for_shutdown(self, record: SessionRecord) -> bool:
+        """Drain a no-bell finalizer; cancel only an idle expiry timer."""
+
+        operation = record.armed_expiry_task
+        if not record.armed_release_pending:
+            self._cancel_armed_expiry(record, force=True)
+            return True
+        if (
+            operation is None
+            or operation is asyncio.current_task()
+            or operation.done()
+        ):
+            return operation is None or operation.done()
+
+        done, _ = await asyncio.wait(
+            {operation},
+            timeout=max(0.001, self._shutdown_cleanup_timeout),
+        )
+        if operation not in done:
+            operation.cancel()
+            done, _ = await asyncio.wait(
+                {operation},
+                timeout=max(0.001, self._shutdown_settle_timeout),
+            )
+        if operation in done:
+            try:
+                operation.result()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Round 5 converts cancellation into a separately tracked durable
+        # no-bell finalizer. It can be installed only after the parent catches
+        # CancelledError, so discover it after draining the original task.
+        replacement = record.armed_expiry_task
+        if (
+            replacement is not None
+            and replacement is not operation
+            and replacement is not asyncio.current_task()
+            and not replacement.done()
+        ):
+            replacement_done, _ = await asyncio.wait(
+                {replacement},
+                timeout=max(0.001, self._shutdown_cleanup_timeout),
+            )
+            if replacement not in replacement_done:
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+        current = record.armed_expiry_task
+        return current is None or current.done()
+
     async def close(self) -> None:
         """Settle active work before the coordinator connection is closed.
 
@@ -2186,10 +2526,11 @@ class RunManager:
         is deliberately left to expire so startup reconciliation runs before the
         next bout.
 
-        All eight tasks in :meth:`_unfinished_operations` are accounted for here,
-        in three different ways, and the difference is deliberate rather than an
-        oversight. ``armed_expiry_task`` goes first, on its own, because it is a
-        timer and cancelling it settles nothing. The four in the wait set below are
+        All tasks in :meth:`_unfinished_operations` are accounted for here, in
+        different ways deliberately. An idle ``armed_expiry_task`` is only a timer
+        and is cancelled, but once it owns ``armed_release_pending`` it is the
+        no-bell finalizer and is drained before shutdown proceeds (including a
+        Round 5 replacement child). The operations in the wait set below are
         cancelled and waited on, because whether they finished decides whether this
         record may clean and release its ring. The two heartbeats are cancelled
         further down, after the release attempts and *before* the scoped stores are
@@ -2225,8 +2566,43 @@ class RunManager:
 
             settled: dict[str, bool] = {}
             for record in records:
-                self._cancel_armed_expiry(record)
-                # Finding A3: cancelling record.task alone does NOT stop the lane bursts
+                armed_release_settled = await self._drain_armed_release_for_shutdown(
+                    record
+                )
+                # A checking cancel owns its no-bell receipt just as an armed
+                # cancel does. Give already-running finalizers a bounded grace
+                # period before the ordinary cancellation sweep.
+                checking_finalizers = {
+                    task
+                    for task in record.checking_cancel_tasks.values()
+                    if task is not asyncio.current_task() and not task.done()
+                }
+                if checking_finalizers:
+                    await asyncio.wait(
+                        checking_finalizers,
+                        timeout=max(0.001, self._shutdown_cleanup_timeout),
+                    )
+                # A bell handoff owns the ambiguity-sensitive durable transition.
+                # Let it publish RUNNING and install the runner before shutdown
+                # starts cancelling ordinary background work. Cancelling it first
+                # could land between the lease-store commit and local projection,
+                # which is exactly the stranded ARMED state this task prevents.
+                handoff = record.bell_handoff_task
+                if (
+                    handoff is not None
+                    and handoff is not asyncio.current_task()
+                    and not handoff.done()
+                ):
+                    done, _ = await asyncio.wait(
+                        {handoff},
+                        timeout=max(0.001, self._shutdown_settle_timeout),
+                    )
+                    for operation in done:
+                        try:
+                            operation.result()
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                # Cancelling record.task alone does NOT stop the lane bursts
                 # that run() popped into its launched map -- an orphaned burst could
                 # keep dispatching. Explicitly cancel the engine's local run tasks
                 # (both _lane_bursts and _run_burst_tasks) before the coordinator is
@@ -2251,10 +2627,16 @@ class RunManager:
                     operation
                     for operation in (
                         record.task,
+                        record.bell_handoff_task,
+                        record.bell_convergence_task,
+                        *record.checking_cancel_tasks.values(),
                         record.cooldown_task,
                         record.connection_spike_cleanup_task,
                         record.connection_spike_cleanup_retry_task,
                         record.settlement_task,
+                        record.terminal_release_retry_task,
+                        record.round5_release_retry_task,
+                        record.fence_expiry_task,
                     )
                     if operation is not None
                     and operation is not asyncio.current_task()
@@ -2262,19 +2644,71 @@ class RunManager:
                 }
                 for operation in operations:
                     operation.cancel()
-                if not operations:
-                    settled[record.snapshot.id] = True
-                    continue
-                done, pending = await asyncio.wait(
-                    operations,
-                    timeout=max(0.001, self._shutdown_settle_timeout),
-                )
+                if operations:
+                    done, pending = await asyncio.wait(
+                        operations,
+                        timeout=max(0.001, self._shutdown_settle_timeout),
+                    )
+                else:
+                    done, pending = set(), set()
                 for operation in done:
                     try:
                         operation.result()
                     except (asyncio.CancelledError, Exception):
                         pass
-                settled[record.snapshot.id] = not pending
+                # Cancellation of the handoff can install its convergence child
+                # after the operation snapshot above. Discover that handoff just
+                # as the armed-release drain discovers a Round 5 replacement.
+                convergence = record.bell_convergence_task
+                convergence_settled = True
+                if (
+                    convergence is not None
+                    and convergence is not asyncio.current_task()
+                    and not convergence.done()
+                ):
+                    done_convergence, _ = await asyncio.wait(
+                        {convergence},
+                        timeout=max(0.001, self._shutdown_cleanup_timeout),
+                    )
+                    convergence_settled = convergence in done_convergence
+                    if not convergence_settled:
+                        convergence.cancel()
+                        done_convergence, _ = await asyncio.wait(
+                            {convergence},
+                            timeout=max(0.001, self._shutdown_settle_timeout),
+                        )
+                        convergence_settled = convergence in done_convergence
+                # Round 4 installs this shielded terminal publisher from inside
+                # record.task. Cancelling the parent can therefore create the
+                # child after the operation snapshot, and the child is the work
+                # that seals run_finished. Drain it while the receipt and lease
+                # stores are still installed; if it exceeds its publication
+                # budget, cancel and settle it so no write survives store close.
+                model_terminal = record.model_score_terminal_task
+                model_terminal_settled = True
+                if (
+                    model_terminal is not None
+                    and model_terminal is not asyncio.current_task()
+                    and not model_terminal.done()
+                ):
+                    done_terminal, _ = await asyncio.wait(
+                        {model_terminal},
+                        timeout=max(0.001, self._terminal_publish_timeout),
+                    )
+                    model_terminal_settled = model_terminal in done_terminal
+                    if not model_terminal_settled:
+                        model_terminal.cancel()
+                        done_terminal, _ = await asyncio.wait(
+                            {model_terminal},
+                            timeout=max(0.001, self._shutdown_settle_timeout),
+                        )
+                        model_terminal_settled = model_terminal in done_terminal
+                settled[record.snapshot.id] = (
+                    armed_release_settled
+                    and all(operation.done() for operation in pending)
+                    and convergence_settled
+                    and model_terminal_settled
+                )
 
             cleanup_results: dict[str, bool] = {}
             for record in records:
@@ -2292,6 +2726,20 @@ class RunManager:
                 if current is None or not self._same_exact_lease(local_lease, current):
                     continue
                 if not settled.get(record.snapshot.id, False):
+                    continue
+                fence = record.cooldown_failure_fence
+                if local_lease.phase == "cooldown_failed" or (
+                    fence is not None and self._same_lease_authority(local_lease, fence)
+                ):
+                    # Unconfirmed-idle targets stay fenced until the durable TTL.
+                    logger.warning(
+                        "Shutdown left the Round 1 cooldown failure fence to its durable TTL "
+                        "session=%s lease_id=%s phase=%s expires_at=%s",
+                        record.snapshot.id,
+                        local_lease.lease_id,
+                        local_lease.phase,
+                        local_lease.expires_at.isoformat(),
+                    )
                     continue
                 cleanup_ok = await self._cleanup_for_shutdown(record)
                 cleanup_results[record.snapshot.id] = cleanup_ok
@@ -2330,7 +2778,7 @@ class RunManager:
                             "Shutdown could not confirm release of the exact Round 5 lease"
                         )
 
-            # The ninth task, and the one that is owned by no record at all.
+            # The twelfth task, and the one that is owned by no record at all.
             # A settled Round 4 bout leaves a delayed pipeline release keyed by
             # pipeline in `model_score_live._ACTIVATIONS`, so none of the
             # per-record accounting above can see it -- and cancelling it
@@ -2339,11 +2787,29 @@ class RunManager:
             # nothing anywhere recording that one was owed.
             await self._release_pipelines_for_shutdown()
 
+            heartbeats = {
+                task
+                for task in self._heartbeat_tasks
+                if task is not asyncio.current_task() and not task.done()
+            }
             for record in records:
                 # A failed cleanup stays fenced only until its durable TTL. No
                 # process-local heartbeat may survive manager shutdown.
                 self._cancel_lease_heartbeat(record)
                 self._cancel_round5_lease_heartbeat(record)
+            for heartbeat in heartbeats:
+                heartbeat.cancel()
+            # An abandoned call may still hold a coordinator connection: one settle
+            # window for the heartbeats to stop and for the calls given up on.
+            settle_until = time.monotonic() + max(0.001, self._shutdown_settle_timeout)
+            if heartbeats:
+                await asyncio.wait(heartbeats, timeout=max(0.001, self._shutdown_settle_timeout))
+            abandoned = {call for call in self._abandoned_calls if not call.done()}
+            if abandoned:
+                await asyncio.wait(
+                    abandoned,
+                    timeout=max(0.001, settle_until - time.monotonic()),
+                )
 
             for store in self._scoped_lease_stores.values():
                 try:
@@ -2401,12 +2867,13 @@ class RunManager:
                 await engine.reset(record.snapshot.competitor.id)
             return True
 
+        task = asyncio.current_task()
+        cancels_on_entry = task.cancelling() if task is not None else 0
         try:
             async with asyncio.timeout(max(0.001, self._shutdown_cleanup_timeout)):
                 return await cleanup()
         except (asyncio.CancelledError, Exception) as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                raise
+            self._reraise_own_cancel(exc, cancels_on_entry)
             logger.error(
                 "Shutdown cleanup was not verified for round=%s: %s",
                 record.snapshot.round.id,
@@ -2662,9 +3129,12 @@ class RunManager:
 
     @staticmethod
     def _revalidated_snapshot(snapshot: SessionSnapshot) -> SessionSnapshot:
-        return SessionSnapshot.model_validate(
+        revalidated = SessionSnapshot.model_validate(
             snapshot.model_dump(mode="python")
         )
+        # Excluded from every dump, so the round trip would otherwise drop it.
+        revalidated.receipt_bout_id = snapshot.receipt_bout_id
+        return revalidated
 
     @staticmethod
     def _advance_round5_revision_locked(record: SessionRecord) -> int:
@@ -2735,11 +3205,32 @@ class RunManager:
         record = await self._record(session_id)
         if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
             return await self._cancel_armed_round5(record, operator)
+        # Only RUNNING is read off the card's lock, since it can only be this bout's.
+        # Each path below checks the accepted bell under the lock: an owner re-arming
+        # the card holds it while the ring is claimed, and until then the card still
+        # carries the last bout's bell.
+        if record.snapshot.state == SessionState.RUNNING:
+            raise InvalidStateError(
+                "Only an armed fight card that has not rung can be cancelled"
+            )
         if record.snapshot.state == SessionState.ARMED or (
             record.snapshot.state == SessionState.FAILED
             and record.snapshot.failure == _ARMED_CARD_CANCELLED
         ):
             return await self._cancel_armed_card(record, operator)
+        return await self._cancel_checking_card(record, operator)
+
+    async def _cancel_checking_card(
+        self,
+        record: SessionRecord,
+        operator: BoutOperator,
+    ) -> SessionSnapshot:
+        """Finish a Round 1 checking cancellation independently of its HTTP caller."""
+
+        message = (
+            "Fight-card check cancelled by the ring owner. "
+            "No run started and no result was recorded."
+        )
         async with record.lock:
             if (
                 record.snapshot.state == SessionState.FAILED
@@ -2748,67 +3239,131 @@ class RunManager:
             ):
                 self._assert_operator(record.operator, operator)
                 return record.snapshot.model_copy(deep=True)
-            if record.snapshot.round.id != RoundId.WAKE_IDLE_APP:
-                raise InvalidStateError("Only a Round 1 start-state check can be cancelled")
-            if record.snapshot.state != SessionState.CHECKING:
-                raise InvalidStateError("Only a fight card that is still checking can be cancelled")
-            if record.snapshot.run_started_at is not None:
-                raise InvalidStateError("A bout cannot be cancelled after the run has started")
-            async with record.lease_lock:
-                expected_lease = record.lease
-                if (
-                    expected_lease is None
-                    or expected_lease.session_id != record.snapshot.id
-                    or expected_lease.phase != "checking"
-                ):
-                    raise InvalidStateError("The checking ring lease is no longer available")
-                self._assert_operator(expected_lease.operator, operator)
-            arm_task = record.task
-            if arm_task is not None and not arm_task.done():
-                arm_task.cancel()
-
-        if arm_task is not None:
-            try:
-                await arm_task
-            except asyncio.CancelledError:
-                pass
-
-        message = (
-            "Fight-card check cancelled by the ring owner. "
-            "No run started and no result was recorded."
-        )
-        async with record.lock:
-            if record.snapshot.state != SessionState.CHECKING:
-                raise InvalidStateError("The fight card finished checking before cancellation")
-            async with record.lease_lock:
-                current_lease = record.lease
-                if current_lease is None or not self._same_exact_lease(
-                    current_lease, expected_lease
-                ):
-                    raise InvalidStateError("The checking ring lease changed before cancellation")
-            if not await self._release_bout(record):
-                raise InvalidStateError(
-                    "Ring release could not be confirmed; cancellation is still pending"
+            bout_id = record.snapshot.receipt_bout_id
+            if bout_id is None:
+                raise InvalidStateError("The checking attempt identity is unavailable")
+            finalizer = record.checking_cancel_tasks.get(bout_id)
+            if finalizer is not None and not finalizer.done():
+                self._assert_operator(record.operator, operator)
+            else:
+                if record.snapshot.round.id != RoundId.WAKE_IDLE_APP:
+                    raise InvalidStateError("Only a Round 1 start-state check can be cancelled")
+                if record.snapshot.state != SessionState.CHECKING:
+                    raise InvalidStateError(
+                        "Only a fight card that is still checking can be cancelled"
+                    )
+                if record.snapshot.run_started_at is not None:
+                    raise InvalidStateError("A bout cannot be cancelled after the run has started")
+                async with record.lease_lock:
+                    expected_lease = record.lease
+                    if (
+                        expected_lease is None
+                        or expected_lease.session_id != record.snapshot.id
+                        or expected_lease.phase != "checking"
+                    ):
+                        raise InvalidStateError("The checking ring lease is no longer available")
+                    self._assert_operator(expected_lease.operator, operator)
+                arm_task = record.task
+                if arm_task is not None and not arm_task.done():
+                    arm_task.cancel()
+                finalizer = asyncio.create_task(
+                    self._finalize_checking_cancel(
+                        record,
+                        arm_task,
+                        expected_lease,
+                        message,
+                        bout_id,
+                    ),
+                    name=f"checking-cancel-{record.snapshot.id}-{bout_id}",
                 )
-            record.snapshot.state = SessionState.FAILED
-            record.snapshot.failure = message
-            record.snapshot.remembered_result = None
-            record.snapshot.metrics = []
-            record.snapshot.comparison = None
-            record.snapshot.updated_at = datetime.now(UTC)
-            record.armed_at_monotonic = None
-            if record.task is arm_task:
-                record.task = None
-            snapshot = self._revalidated_snapshot(record.snapshot)
-        await record.event_log.publish(
-            "session_cancelled",
-            {
-                "state": SessionState.FAILED,
-                "message": message,
-                "session": snapshot.model_dump(mode="json"),
-            },
-        )
-        return snapshot
+                record.checking_cancel_tasks[bout_id] = finalizer
+
+                def clear_unstarted(done: asyncio.Task[SessionSnapshot]) -> None:
+                    if record.checking_cancel_tasks.get(bout_id) is done:
+                        record.checking_cancel_tasks.pop(bout_id, None)
+
+                finalizer.add_done_callback(clear_unstarted)
+        return await asyncio.shield(finalizer)
+
+    async def _finalize_checking_cancel(
+        self,
+        record: SessionRecord,
+        arm_task: asyncio.Task[None] | None,
+        expected_lease: BoutLease,
+        message: str,
+        bout_id: str,
+    ) -> SessionSnapshot:
+        finalizer = asyncio.current_task()
+        cancels_on_entry = finalizer.cancelling() if finalizer is not None else 0
+        try:
+            if arm_task is not None:
+                try:
+                    await arm_task
+                except asyncio.CancelledError as exc:
+                    # The arm task's own cancel is what this waited for; the finalizer's
+                    # (close() cancelling it) ends it here.
+                    self._reraise_own_cancel(exc, cancels_on_entry)
+
+            async with record.lock:
+                if record.snapshot.state != SessionState.CHECKING:
+                    if (
+                        record.snapshot.state == SessionState.FAILED
+                        and record.snapshot.failure == message
+                    ):
+                        return self._revalidated_snapshot(record.snapshot)
+                    raise InvalidStateError(
+                        "The fight card finished checking before cancellation"
+                    )
+                async with record.lease_lock:
+                    current_lease = record.lease
+                    if current_lease is not None and not self._same_exact_lease(
+                        current_lease, expected_lease
+                    ):
+                        raise InvalidStateError(
+                            "The checking ring lease changed before cancellation"
+                        )
+            # A cancelled check's own release may already have cleared the lease;
+            # otherwise this bounded settle is the finalizer's, never its caller's.
+            if (
+                current_lease is not None
+                and await self._settle_terminal_release(record, current_lease) == "lost"
+            ):
+                raise InvalidStateError(
+                    "The checking ring lease changed before cancellation"
+                )
+            async with record.lock:
+                if record.snapshot.state != SessionState.CHECKING:
+                    if (
+                        record.snapshot.state == SessionState.FAILED
+                        and record.snapshot.failure == message
+                    ):
+                        return self._revalidated_snapshot(record.snapshot)
+                    raise InvalidStateError(
+                        "The fight card finished checking before cancellation"
+                    )
+                record.snapshot.state = SessionState.FAILED
+                record.snapshot.failure = message
+                record.snapshot.remembered_result = None
+                record.snapshot.metrics = []
+                record.snapshot.comparison = None
+                record.snapshot.updated_at = datetime.now(UTC)
+                record.armed_at_monotonic = None
+                if record.task is arm_task:
+                    record.task = None
+                snapshot = self._revalidated_snapshot(record.snapshot)
+            await record.event_log.publish(
+                "session_cancelled",
+                {
+                    "state": SessionState.FAILED,
+                    "message": message,
+                    "session": snapshot.model_dump(mode="json"),
+                },
+                receipt_bout_id=snapshot.receipt_bout_id,
+            )
+            return snapshot
+        finally:
+            if record.checking_cancel_tasks.get(bout_id) is finalizer:
+                record.checking_cancel_tasks.pop(bout_id, None)
 
     async def _cancel_armed_card(
         self,
@@ -2820,7 +3375,9 @@ class RunManager:
         The armed-window expiry's release, worded as the owner's choice and published as
         a cancellation, as Round 1's pre-arm cancel is: the browser goes back to the card
         without reporting an error, and the record keeps an abandoned attempt that never
-        reaches the scoreboard. A second press returns the released card.
+        reaches the scoreboard. A second press, or a browser's retry of a press whose
+        answer it lost, waits for the release still settling and returns the released
+        card.
         """
 
         async with record.lock:
@@ -2839,14 +3396,56 @@ class RunManager:
                 raise InvalidStateError(
                     "Only an armed fight card that has not rung can be cancelled"
                 )
-            armed_at = record.armed_at_monotonic
-            self._cancel_armed_expiry(record)
-        if not await self._abandon_armed_bout(
-            record,
-            armed_at,
-            message=_ARMED_CARD_CANCELLED,
-            event="session_cancelled",
-        ):
+            if record.bell_commit_attempted_bout_id == record.snapshot.receipt_bout_id:
+                raise InvalidStateError(
+                    "Only an armed fight card that has not rung can be cancelled"
+                )
+            async with record.lease_lock:
+                armed_lease = record.lease
+                if (
+                    record.bell_committed_at is not None
+                    or (
+                        armed_lease is not None
+                        and (
+                            armed_lease.session_id != record.snapshot.id
+                            or armed_lease.phase not in {"checking", "armed"}
+                        )
+                    )
+                ):
+                    raise InvalidStateError(
+                        "Only an armed fight card that has not rung can be cancelled"
+                    )
+            if record.armed_release_pending:
+                release_task = self._owner_release_in_flight_locked(record)
+                if release_task is None:
+                    raise InvalidStateError(
+                        "The fight card changed before it could be cancelled"
+                    )
+            else:
+                armed_at = record.armed_at_monotonic
+                # Reserve the card before dropping its lock, so the bell cannot cross
+                # between this decision and `_abandon_armed_bout` taking the lock.
+                # The release replaces the timer in its slot and is shielded below:
+                # a disconnected caller must not leave an ARMED card with no expiry.
+                self._cancel_armed_expiry(record, force=True)
+                record.armed_release_pending = True
+                arm_task = self._current_arm_task_locked(record)
+                if arm_task is not None:
+                    arm_task.cancel()
+                release_task = asyncio.create_task(
+                    self._abandon_after_arm_stops(
+                        record,
+                        arm_task,
+                        armed_at,
+                        message=_ARMED_CARD_CANCELLED,
+                        event="session_cancelled",
+                        release_reserved=True,
+                    ),
+                    name=f"armed-owner-release-{record.snapshot.id}",
+                )
+                record.armed_expiry_task = release_task
+                self._register_owner_release(record, release_task)
+        if not await asyncio.shield(release_task):
             raise InvalidStateError("The fight card changed before it could be cancelled")
         async with record.lock:
             return self._revalidated_snapshot(record.snapshot)
@@ -2872,14 +3471,123 @@ class RunManager:
                 raise InvalidStateError(
                     "Only an armed Round 5 fight card that has not rung can be cancelled"
                 )
-            armed_at = record.armed_at_monotonic
-            self._cancel_armed_expiry(record)
-        if not await self._abandon_armed_bout(record, armed_at):
+            if record.armed_release_pending:
+                release_task = self._owner_release_in_flight_locked(record)
+                if release_task is None:
+                    raise InvalidStateError(
+                        "The Round 5 fight card changed before it could be cancelled"
+                    )
+            else:
+                armed_at = record.armed_at_monotonic
+                self._cancel_armed_expiry(record, force=True)
+                record.armed_release_pending = True
+                arm_task = self._current_arm_task_locked(record)
+                if arm_task is not None:
+                    arm_task.cancel()
+                release_task = asyncio.create_task(
+                    self._abandon_after_arm_stops(
+                        record,
+                        arm_task,
+                        armed_at,
+                        release_reserved=True,
+                    ),
+                    name=f"round5-armed-owner-release-{record.snapshot.id}",
+                )
+                record.armed_expiry_task = release_task
+                self._register_owner_release(record, release_task)
+        if not await asyncio.shield(release_task):
             raise InvalidStateError(
                 "The Round 5 fight card changed before it could be cancelled"
             )
         async with record.lock:
             return self._revalidated_snapshot(record.snapshot)
+
+    @staticmethod
+    def _register_owner_release(record: SessionRecord, task: asyncio.Task[bool]) -> None:
+        """Note ``task`` as the owner's release of this arm; called under ``record.lock``."""
+
+        record.armed_owner_release = (record.snapshot.receipt_bout_id, task)
+
+        def forget(done: asyncio.Task[bool]) -> None:
+            if record.armed_owner_release is not None and record.armed_owner_release[1] is done:
+                record.armed_owner_release = None
+
+        task.add_done_callback(forget)
+
+    @staticmethod
+    def _owner_release_in_flight_locked(record: SessionRecord) -> asyncio.Task[bool] | None:
+        """The owner's release of this arm, while it still holds the no-bell reservation.
+
+        Called under ``record.lock``. A reservation held by anything else, the armed
+        window's expiry or a bell's convergence, means the card changed under the cancel.
+        """
+
+        if record.armed_owner_release is None:
+            return None
+        bout_id, task = record.armed_owner_release
+        if (
+            not record.armed_release_pending
+            or bout_id != record.snapshot.receipt_bout_id
+            or task is not record.armed_expiry_task
+            or task.done()
+        ):
+            return None
+        return task
+
+    @staticmethod
+    def _current_arm_task_locked(
+        record: SessionRecord,
+    ) -> asyncio.Task[None] | None:
+        task = record.task
+        if (
+            task is None
+            or task.done()
+            or task is asyncio.current_task()
+            or record.arm_task_bout_id != record.snapshot.receipt_bout_id
+            or task.get_name() != f"arm-{record.snapshot.id}"
+        ):
+            return None
+        return task
+
+    @staticmethod
+    def _committed_run_active_locked(record: SessionRecord) -> bool:
+        """Whether a non-Round-5 callback still belongs to its accepted bell.
+
+        ``bell_committed_at`` is immutable for the arm. An ARMED state with that
+        commitment is only a lagging publication and is repaired to RUNNING; a
+        terminal state is authoritative and is never revived by a late callback.
+        """
+
+        committed_at = record.bell_committed_at
+        if committed_at is None:
+            return False
+        if record.snapshot.state == SessionState.ARMED:
+            record.snapshot.state = SessionState.RUNNING
+        if record.snapshot.state != SessionState.RUNNING:
+            return False
+        if record.snapshot.run_started_at is None:
+            record.snapshot.run_started_at = committed_at
+        return record.snapshot.run_started_at == committed_at
+
+    async def _abandon_after_arm_stops(
+        self,
+        record: SessionRecord,
+        arm_task: asyncio.Task[None] | None,
+        armed_at_monotonic: float,
+        *,
+        message: str = "Fight card expired before the bell.",
+        event: str = "session_failed",
+        release_reserved: bool,
+    ) -> bool:
+        if arm_task is not None:
+            await asyncio.gather(arm_task, return_exceptions=True)
+        return await self._abandon_armed_bout(
+            record,
+            armed_at_monotonic,
+            message=message,
+            event=event,
+            release_reserved=release_reserved,
+        )
 
     async def start_arm(
         self,
@@ -2931,6 +3639,22 @@ class RunManager:
                 raise InvalidStateError(f"Cannot arm a session in state {record.snapshot.state}")
             if is_connection_spike and record.snapshot.state == SessionState.FAILED:
                 raise InvalidStateError("Round 5 requires a clean baseline and a new bout")
+            if record.snapshot.state == SessionState.FAILED:
+                # A DRAFT is anyone's to arm, but a retained FAILED card still has
+                # its owner. Refused before the claim, so neither the ring nor
+                # `record.operator` ever passes to someone else.
+                self._assert_operator(record.operator, bout_operator)
+            if (
+                record.snapshot.round.id
+                in {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+                and record.settlement_task is not None
+                and not record.settlement_task.done()
+            ):
+                raise InvalidStateError(
+                    _LOST_RING_STILL_STOPPING
+                    if record.ring_lease_lost
+                    else _LAST_BOUT_STILL_SETTLING
+                )
             await self._claim_bout(record, bout_operator)
             if is_connection_spike and self._round5_prearm_guard is not None:
                 async with record.lease_lock:
@@ -3013,7 +3737,15 @@ class RunManager:
                 record.round5_bell_context = None
             record.operator = bout_operator
             self._reset_outcome(record.snapshot)
+            self._cancel_idle_watch(record)
+            record.snapshot.receipt_bout_id = uuid4().hex
+            arm_bout_id = record.snapshot.receipt_bout_id
             record.armed_at_monotonic = None
+            record.armed_release_pending = False
+            record.bell_committed_at = None
+            record.bell_commit_attempted_bout_id = None
+            record.bell_commit_sent_at = None
+            record.arm_commit_sent_at = None
             record.safe_change_arm = None
             record.recovery_arm = None
             record.recovery_stop_control = None
@@ -3061,30 +3793,31 @@ class RunManager:
                 if record.snapshot.round.id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY:
                     record.live_targets = None
                     record.safe_change_engine = None
-                    operation = self._arm_safe_change(record)
+                    operation = self._arm_safe_change(record, arm_bout_id)
                 elif record.snapshot.round.id == RoundId.RECOVER_DELETED_ORDER:
                     record.live_targets = None
                     record.recovery_engine = None
-                    operation = self._arm_recovery(record)
+                    operation = self._arm_recovery(record, arm_bout_id)
                 elif is_model_score:
                     record.live_targets = None
-                    operation = self._arm_model_score(record)
+                    operation = self._arm_model_score(record, arm_bout_id)
                 elif is_connection_spike:
                     record.live_targets = None
-                    operation = self._arm_connection_spike(record)
+                    operation = self._arm_connection_spike(record, arm_bout_id)
                 elif is_live_orders:
                     record.live_targets = None
-                    operation = self._arm_live_orders(record)
+                    operation = self._arm_live_orders(record, arm_bout_id)
                 else:
                     record.live_targets = self._resolver.resolve(record.snapshot.competitor.id)
                     record.safe_change_engine = None
-                    operation = self._arm(record)
+                    operation = self._arm(record, arm_bout_id)
             except Exception:
                 if is_connection_spike:
                     await self._release_round5_lease(record)
                 await self._release_bout(record)
                 raise
             record.task = asyncio.create_task(operation, name=f"arm-{session_id}")
+            record.arm_task_bout_id = arm_bout_id
             result = (
                 self._public_snapshot_locked(record)
                 if is_connection_spike
@@ -3100,7 +3833,359 @@ class RunManager:
         self._require_open()
         self._readiness_check()
         record = await self._record(session_id)
+        # The handoff itself holds record.lock across its durability-sensitive
+        # awaits. Read its immutable registration first so a duplicate request
+        # joins the same task instead of waiting for the lock and starting a
+        # second (even if ultimately idempotent) handoff after it completes.
+        effective_operator = operator or record.operator
+        self._assert_operator(record.operator, effective_operator)
+        bout_id = record.snapshot.receipt_bout_id
+        handoff = record.bell_handoff_task
+        if handoff is not None and not handoff.done():
+            if record.bell_handoff_bout_id != bout_id:
+                raise InvalidStateError("A different bell handoff is still running")
+            return await asyncio.shield(handoff)
         async with record.lock:
+            effective_operator = operator or record.operator
+            self._assert_operator(record.operator, effective_operator)
+            bout_id = record.snapshot.receipt_bout_id
+            handoff = record.bell_handoff_task
+            if handoff is not None and not handoff.done():
+                if record.bell_handoff_bout_id != bout_id:
+                    raise InvalidStateError("A different bell handoff is still running")
+            else:
+                handoff = asyncio.create_task(
+                    self._complete_bell_handoff(
+                        record,
+                        bout_id,
+                        effective_operator,
+                    ),
+                    name=f"bell-handoff-{session_id}-{bout_id}",
+                )
+                record.bell_handoff_task = handoff
+                record.bell_handoff_bout_id = bout_id
+                handoff.add_done_callback(
+                    lambda completed, owned_record=record: self._bell_handoff_done(
+                        owned_record,
+                        completed,
+                    )
+                )
+        return await asyncio.shield(handoff)
+
+    @staticmethod
+    def _bell_handoff_done(
+        record: SessionRecord,
+        completed: asyncio.Task[SessionSnapshot],
+    ) -> None:
+        if record.bell_handoff_task is completed:
+            record.bell_handoff_task = None
+            record.bell_handoff_bout_id = None
+        if not completed.cancelled():
+            # Retrieve an exception even when the only request waiter was
+            # cancelled. A retry still receives it by awaiting the same task.
+            completed.exception()
+
+    async def _complete_bell_handoff(
+        self,
+        record: SessionRecord,
+        bout_id: str,
+        operator: BoutOperator | None,
+    ) -> SessionSnapshot:
+        started = time.monotonic()
+        commit_attempted = asyncio.Event()
+        try:
+            handoff = self._perform_bell_handoff(
+                record,
+                bout_id,
+                operator,
+                commit_attempted=commit_attempted,
+            )
+            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+                # Round 5 owns a separate, durable cleanup protocol. Generic
+                # handoff cancellation cannot safely substitute for it midway
+                # through atomic bell acceptance.
+                result = await handoff
+            else:
+                result = await asyncio.wait_for(
+                    handoff,
+                    timeout=max(0.001, self._bell_handoff_timeout),
+                )
+        except TimeoutError:
+            elapsed = time.monotonic() - started
+            logger.error(
+                "Bell handoff timed out session=%s bout_id=%s outcome=runner_handoff_incomplete "
+                "elapsed_s=%.1f",
+                record.snapshot.id,
+                bout_id,
+                elapsed,
+            )
+            await self._run_bell_handoff_convergence(
+                record,
+                bout_id,
+                bell_acceptance_unknown=commit_attempted.is_set(),
+            )
+            raise InvalidStateError(
+                _BELL_ACCEPTANCE_UNCONFIRMED
+                if record.snapshot.receipt_bout_id == bout_id
+                and record.snapshot.failure == _BELL_ACCEPTANCE_UNCONFIRMED
+                else "The accepted bell could not complete its runner handoff."
+            ) from None
+        except asyncio.CancelledError:
+            elapsed = time.monotonic() - started
+            logger.error(
+                "Bell handoff cancelled session=%s bout_id=%s "
+                "outcome=runner_handoff_incomplete elapsed_s=%.1f",
+                record.snapshot.id,
+                bout_id,
+                elapsed,
+            )
+            convergence = self._start_bell_handoff_convergence(
+                record,
+                bout_id,
+                bell_acceptance_unknown=commit_attempted.is_set(),
+            )
+            await abandon_on_cancel(
+                lambda: asyncio.shield(convergence),
+                identifier=f"bell handoff convergence for session {record.snapshot.id}",
+                timeout_seconds=self._terminal_settle_deadline,
+                remedy=(
+                    "verify the durable ring lease and bout receipt before another bout"
+                ),
+            )
+            raise
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            # The Round 5 bell already logged its margin refusal, once, as a warning.
+            if not isinstance(exc.__cause__, WarmBellMarginError):
+                logger.error(
+                    "Bell handoff failed session=%s bout_id=%s "
+                    "outcome=runner_handoff_incomplete elapsed_s=%.1f diagnosis=%s",
+                    record.snapshot.id,
+                    bout_id,
+                    elapsed,
+                    operator_diagnosis(exc),
+                    exc_info=True,
+                )
+            await self._run_bell_handoff_convergence(
+                record,
+                bout_id,
+                bell_acceptance_unknown=commit_attempted.is_set(),
+                failure_message=(
+                    str(exc) if isinstance(exc, InvalidStateError) else None
+                ),
+            )
+            if (
+                not isinstance(exc, InvalidStateError)
+                and record.snapshot.receipt_bout_id == bout_id
+                and record.snapshot.failure == _BELL_ACCEPTANCE_UNCONFIRMED
+            ):
+                raise InvalidStateError(_BELL_ACCEPTANCE_UNCONFIRMED) from exc
+            raise
+        logger.info(
+            "Bell handoff completed session=%s bout_id=%s outcome=running elapsed_s=%.1f",
+            record.snapshot.id,
+            bout_id,
+            time.monotonic() - started,
+        )
+        return result
+
+    def _start_bell_handoff_convergence(
+        self,
+        record: SessionRecord,
+        bout_id: str,
+        *,
+        bell_acceptance_unknown: bool,
+        failure_message: str | None = None,
+    ) -> asyncio.Task[None]:
+        existing = record.bell_convergence_task
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._converge_cancelled_bell_handoff(
+                record,
+                bout_id,
+                bell_acceptance_unknown=bell_acceptance_unknown,
+                failure_message=failure_message,
+            ),
+            name=f"bell-convergence-{record.snapshot.id}-{bout_id}",
+        )
+        record.bell_convergence_task = task
+
+        def completed(done: asyncio.Task[None]) -> None:
+            if record.bell_convergence_task is done:
+                record.bell_convergence_task = None
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(completed)
+        return task
+
+    async def _run_bell_handoff_convergence(
+        self,
+        record: SessionRecord,
+        bout_id: str,
+        *,
+        bell_acceptance_unknown: bool,
+        failure_message: str | None = None,
+    ) -> None:
+        task = self._start_bell_handoff_convergence(
+            record,
+            bout_id,
+            bell_acceptance_unknown=bell_acceptance_unknown,
+            failure_message=failure_message,
+        )
+        await asyncio.shield(task)
+
+    async def _converge_cancelled_bell_handoff(
+        self,
+        record: SessionRecord,
+        bout_id: str,
+        *,
+        bell_acceptance_unknown: bool = False,
+        failure_message: str | None = None,
+    ) -> None:
+        """Turn an uncertain accepted non-Round-5 bell into an ordinary failed run."""
+
+        if bell_acceptance_unknown:
+            async with record.lease_lock:
+                local = record.lease
+            durable_known = False
+            durable: BoutLease | None = None
+            if local is not None and local.phase == "armed":
+                resolve_deadline = time.monotonic() + max(
+                    0.001, self._terminal_release_call_timeout
+                )
+                while not durable_known:
+                    remaining = resolve_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        durable = await self._bounded_lease_call(
+                            self._lease_store_for_record(record).current(),
+                            max(0.001, remaining),
+                        )
+                    except Exception:
+                        remaining = resolve_deadline - time.monotonic()
+                        if remaining > 0:
+                            await asyncio.sleep(min(0.05, remaining))
+                    else:
+                        durable_known = True
+                if (
+                    durable is not None
+                    and durable.phase == "run_committed"
+                    and self._same_lease_authority(durable, local)
+                ):
+                    adopted = False
+                    async with record.lease_lock:
+                        current_local = record.lease
+                        if (
+                            current_local is not None
+                            and self._same_exact_lease(current_local, local)
+                        ):
+                            self._adopt_lease(record, durable, record.bell_commit_sent_at)
+                            adopted = True
+                    if adopted:
+                        self._start_lease_heartbeat(
+                            record,
+                            timedelta(seconds=self._running_lease_ttl),
+                        )
+                elif durable_known and (
+                    durable is None
+                    or (
+                        durable.phase == "armed"
+                        and self._same_lease_authority(durable, local)
+                    )
+                ):
+                    if durable is None:
+                        async with record.lease_lock:
+                            current_local = record.lease
+                            if (
+                                current_local is not None
+                                and self._same_exact_lease(current_local, local)
+                            ):
+                                self._lose_ring_lease(record)
+                    armed_at = record.armed_at_monotonic
+                    if armed_at is not None:
+                        await self._abandon_armed_bout(
+                            record,
+                            armed_at,
+                            message=(
+                                "The bell handoff timed out before durable acceptance; "
+                                "the ring was released."
+                            ),
+                        )
+                    return
+                elif durable_known:
+                    await self._handle_lost_lease(record, local)
+                    return
+            if (
+                not durable_known
+                and local is not None
+                and local.phase == "armed"
+                and record.snapshot.round.id != RoundId.SURVIVE_CONNECTION_SPIKE
+            ):
+                message = _BELL_ACCEPTANCE_UNCONFIRMED
+                async with record.lock:
+                    if (
+                        record.snapshot.receipt_bout_id != bout_id
+                        or record.snapshot.state != SessionState.ARMED
+                    ):
+                        return
+                    self._cancel_armed_expiry(record)
+                    record.snapshot.state = SessionState.FAILED
+                    record.snapshot.failure = message
+                    record.snapshot.remembered_result = None
+                    record.snapshot.updated_at = datetime.now(UTC)
+                    record.armed_at_monotonic = None
+                    snapshot = record.snapshot.model_copy(deep=True)
+                    self._forget_fence_at_expiry(record, local, "Unconfirmed bell's armed fence")
+                await record.event_log.publish(
+                    "session_failed",
+                    {
+                        "state": SessionState.FAILED,
+                        "message": message,
+                        "session": snapshot.model_dump(mode="json"),
+                    },
+                    receipt_bout_id=snapshot.receipt_bout_id,
+                )
+                return
+
+        should_fail = False
+        async with record.lock:
+            lease = record.lease
+            if (
+                record.snapshot.receipt_bout_id == bout_id
+                and record.snapshot.round.id != RoundId.SURVIVE_CONNECTION_SPIKE
+                and record.snapshot.state == SessionState.ARMED
+                and lease is not None
+                and lease.session_id == record.snapshot.id
+                and lease.phase == "run_committed"
+            ):
+                committed_at = record.bell_committed_at or datetime.now(UTC)
+                record.bell_committed_at = committed_at
+                record.snapshot.state = SessionState.RUNNING
+                record.snapshot.run_started_at = committed_at
+                record.snapshot.updated_at = committed_at
+                should_fail = True
+        if should_fail:
+            await self._fail(
+                record,
+                failure_message
+                or "The accepted bell could not complete its runner handoff.",
+            )
+
+    async def _perform_bell_handoff(
+        self,
+        record: SessionRecord,
+        bout_id: str,
+        operator: BoutOperator | None,
+        *,
+        commit_attempted: asyncio.Event,
+    ) -> SessionSnapshot:
+        session_id = record.snapshot.id
+        async with record.lock:
+            if record.snapshot.receipt_bout_id != bout_id:
+                raise InvalidStateError("The fight card changed before the bell could ring")
             effective_operator = operator or record.operator
             self._assert_operator(record.operator, effective_operator)
             if (
@@ -3132,6 +4217,8 @@ class RunManager:
                 raise InvalidStateError("A session operation is already running")
             if record.snapshot.state != SessionState.ARMED:
                 raise InvalidStateError("The session must be armed before the bell can ring")
+            if record.armed_release_pending:
+                raise InvalidStateError("The fight card is being released and cannot ring")
             is_safe_change = record.snapshot.round.id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY
             is_recovery = record.snapshot.round.id == RoundId.RECOVER_DELETED_ORDER
             is_model_score = record.snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP
@@ -3180,6 +4267,8 @@ class RunManager:
                 )
             )
             if not round5_atomic_bell:
+                record.bell_commit_attempted_bout_id = bout_id
+                commit_attempted.set()
                 await self._commit_bout(record, operator or record.operator)
             cost_started_at = datetime.now(UTC)
             cost_bout_id: str | None = None
@@ -3198,7 +4287,6 @@ class RunManager:
                         operator_diagnosis(exc),
                         exc_info=True,
                     )
-                    await self._release_bout(record)
                     raise InvalidStateError(
                         cost_window_refusal(
                             "The bout cost window could not be opened before the bell.",
@@ -3214,37 +4302,44 @@ class RunManager:
                     raise InvalidStateError(
                         "Round 5 warm claim is unavailable"
                     )
-                # Swarm defect #1 (Approach A) + finding 4(b): durably commit the
-                # timed CreateDBProxy CREATE_INTENT BEFORE the authoritative bell
-                # transaction captures T0 and before Lakebase is released, so the
-                # competitor's create record always exists first.  This is the only
-                # coordination write ordered ahead of the bell for the timed lane;
-                # after T0 the competitor path awaits no journal I/O before boto3
-                # CreateDBProxy.
+                # Durably commit the timed CreateDBProxy CREATE_INTENT BEFORE the
+                # authoritative bell transaction captures T0 and before Lakebase is
+                # released, so the competitor's create record always exists first.
+                # This is the only coordination write ordered ahead of the bell for
+                # the timed lane; after T0 the competitor path awaits no journal I/O
+                # before boto3 CreateDBProxy.
                 #
                 # ``precommit_launch_intent`` is a REQUIRED bell-seam method on the
-                # Round 5 engine (req #6), invoked directly -- not an optional
-                # getattr hook whose absence would silently no-op the durability
-                # guarantee.  It self-no-ops only when the engine has no timed
-                # setup.
+                # Round 5 engine, invoked directly -- not an optional getattr hook
+                # whose absence would silently no-op the durability guarantee.  It
+                # self-no-ops only when the engine has no timed setup.
                 #
                 # The precommit AND bell acceptance share one compensation scope: a
                 # failure of either (refused precommit, or a bell CAS that loses the
-                # claim/broker epoch) must release the round-5 lease and the bout
-                # and ring nothing.  This is safe because Lakebase is only actually
-                # released later, by ``bind_bell`` -> ``allow_release``, which runs
-                # OUTSIDE this block after the durable commit: on every path handled
-                # here, no lane has launched, so releasing is clean.  A
-                # committed-then-failed bell leaves only an orphan CREATE_INTENT,
-                # which automatic reconciliation settles.  Idempotent for a
-                # duplicate /run.
+                # claim/broker epoch) rings nothing and hands the claim to the
+                # coordinator's durable CLEANING below.  This is safe because
+                # Lakebase is only actually released later, by ``bind_bell`` ->
+                # ``allow_release``, which runs OUTSIDE this block after the durable
+                # commit: on every path handled here, no lane has launched.  A bell
+                # refused after its precommit leaves a CREATE_INTENT under a NULL
+                # bell, which the no-bell cleanup reconstructs from the journal.
+                # Idempotent for a duplicate /run.
+                #
+                # The dispatch margin is checked before the precommit, so the usual
+                # refusal leaves no CREATE_INTENT, and again once the bell commits,
+                # because the commit can take longer than the margin the bell had left.
                 precommit_launch = record.connection_spike_engine.precommit_launch_intent
                 launch_lease = record.round5_lease
+                bell_stage = "before_precommit"
+                commit_sent = 0.0
                 try:
+                    self._round5_warm_coordinator.require_dispatchable(claim)
                     if launch_lease is not None:
                         await precommit_launch(
                             record.snapshot.id, launch_lease.fencing_token
                         )
+                    bell_stage = "bell"
+                    commit_sent = time.monotonic()
                     if round5_atomic_bell:
                         main_lease = record.lease
                         cleanup_lease = record.round5_lease
@@ -3252,6 +4347,7 @@ class RunManager:
                             raise InvalidStateError(
                                 "Round 5 bell leases are unavailable"
                             )
+                        sent = time.monotonic()
                         (
                             context,
                             committed_main,
@@ -3269,8 +4365,15 @@ class RunManager:
                                 None,
                             ),
                         )
-                        record.lease = committed_main
-                        record.round5_lease = committed_cleanup
+                        bell_stage = "after_commit"
+                        self._set_lease(record, committed_main, sent)
+                        self._set_lease(record, committed_cleanup, sent, round5=True)
+                        if self._bell_proof_lapsed(record):
+                            # The committed-then-failed path below: nothing launched.
+                            raise InvalidStateError(
+                                "FIGHT CARD EXPIRED · PREPARE IT AGAIN BEFORE RINGING THE BELL"
+                            )
+                        self._round5_warm_coordinator.require_dispatchable(claim)
                         self._start_lease_heartbeat(
                             record,
                             timedelta(seconds=self._running_lease_ttl),
@@ -3283,13 +4386,33 @@ class RunManager:
                         context = await self._round5_warm_coordinator.accept_bell(
                             claim.claim_id
                         )
+                        bell_stage = "after_commit"
+                        self._round5_warm_coordinator.require_dispatchable(claim)
                 except Exception as exc:
-                    logger.error(
-                        "Round 5 bell failed before RUNNING session=%s diagnosis=%s",
-                        record.snapshot.id,
-                        operator_diagnosis(exc),
-                        exc_info=True,
-                    )
+                    if isinstance(exc, WarmBellMarginError):
+                        logger.warning(
+                            "round5_bell_refused_dispatch_margin session=%s bout_id=%s "
+                            "stage=%s remaining_s=%.1f armed_wait_s=%.1f commit_s=%s",
+                            record.snapshot.id,
+                            bout_id,
+                            bell_stage,
+                            exc.remaining_seconds,
+                            exc.armed_wait_seconds,
+                            # How long the bell's own commit took to answer, which is
+                            # what an after_commit refusal lost its margin to.
+                            (
+                                f"{time.monotonic() - commit_sent:.1f}"
+                                if bell_stage == "after_commit"
+                                else "none"
+                            ),
+                        )
+                    else:
+                        logger.error(
+                            "Round 5 bell failed before RUNNING session=%s diagnosis=%s",
+                            record.snapshot.id,
+                            operator_diagnosis(exc),
+                            exc_info=True,
+                        )
                     # A refused bell ALWAYS enters durable CLEANING and converges
                     # through the coordinator's single owner (provider reconcile on
                     # the adopted engine). The manager performs no external cleanup
@@ -3361,10 +4484,12 @@ class RunManager:
                         await self._release_bout(record)
                     if isinstance(exc, InvalidStateError):
                         raise
+                    if isinstance(exc, WarmBellMarginError):
+                        raise InvalidStateError(str(exc)) from exc
                     raise InvalidStateError(
                         "Round 5 bell could not start; nothing was launched."
                     ) from exc
-                # Blocker 1: the accept_bell transaction has COMMITTED, so record the
+                # The accept_bell transaction has COMMITTED, so record the
                 # durable post-bell truth (bell context + authoritative RUNNING slot)
                 # BEFORE bind_bell. If bind_bell -- or any later step -- raises, a
                 # subsequent cleanup still classifies as post-bell and runs the
@@ -3420,6 +4545,20 @@ class RunManager:
                     lane.activity = LaneActivity(
                         phase=record.snapshot.round5_runtime.lanes[lane_id].phase
                     )
+            elif not is_connection_spike:
+                # The durable lease has crossed ARMED -> RUN_COMMITTED and the
+                # cost window accepted. Publish that accepted bell synchronously,
+                # before the runner gets its first scheduling turn. The physical
+                # lane clock remains ``run_started_monotonic_ns`` and is captured
+                # by each runner at its existing exact boundary. Rounds 4 and 6
+                # replace this provisional wall-clock timestamp when their
+                # physical engine bell rings, but they must not return ARMED
+                # after durable acceptance.
+                committed_at = datetime.now(UTC)
+                record.bell_committed_at = committed_at
+                record.snapshot.state = SessionState.RUNNING
+                record.snapshot.run_started_at = committed_at
+                record.snapshot.updated_at = committed_at
             self._cancel_armed_expiry(record)
             record.towel_stop_event = asyncio.Event()
             if is_recovery:
@@ -3562,6 +4701,7 @@ class RunManager:
             await record.event_log.publish(
                 "cleanup_update",
                 {"session": snapshot.model_dump(mode="json")},
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
             # Only WAKE the durable auto-convergence worker; never start a second
             # concurrent reconcile racing it. The worker keeps retrying the
@@ -3625,6 +4765,7 @@ class RunManager:
                     await record.event_log.publish(
                         "towel_update",
                         {"session": snapshot.model_dump(mode="json")},
+                        receipt_bout_id=snapshot.receipt_bout_id,
                     )
                     record.cooldown_task = asyncio.create_task(
                         self._complete_towel(record, wait_for_run=False),
@@ -3689,6 +4830,12 @@ class RunManager:
                     # Round 4 or 6 before its bell: the engine was still reading each
                     # source's baseline, so every lane is sealed, nothing was timed and
                     # nothing is censored. The towel stops the bout all the same.
+                    cutoff_ms = 0.0
+                elif record.bell_committed_at is not None:
+                    # Rounds 1-3 publish RUNNING as soon as the durable bell is
+                    # accepted. A towel can therefore beat the runner to its
+                    # physical measurement boundary; that is a zero-duration
+                    # committed run, not an unstarted arm and not a refusal.
                     cutoff_ms = 0.0
                 else:
                     raise InvalidStateError("The live bout clock has not started")
@@ -3879,11 +5026,8 @@ class RunManager:
                 # expiry, and the open cost window kept the record unreleasable.
                 # The ledger row is worth a lot less than any of those.
                 try:
-                    await self._close_cost_bout(
-                        record,
-                        bout_id=cost_bout_id,
-                        ended_at=requested_at,
-                        outcome=SessionState.TOWELLED.value,
+                    await self._close_towel_cost_window(
+                        record, requested_towel, bout_id=cost_bout_id
                     )
                 except Exception as exc:
                     logger.error(
@@ -3893,7 +5037,7 @@ class RunManager:
                         _redacted_exception_chain(exc),
                     )
                     requested_towel.cost_close_failure = (
-                        str(exc) or "The bout cost window could not be closed"
+                        audience_error_text(exc) or "The bout cost window could not be closed"
                     )
             snapshot = record.snapshot.model_copy(deep=True)
             if is_round_five:
@@ -3958,18 +5102,18 @@ class RunManager:
                         record.round2_fencing_token if owns_artifacts else None
                     ),
                 )
-                record.snapshot.cooldown = self._new_cooldown(record, reset_mode)
-                started_at = record.snapshot.cooldown.started_at
+                cooldown = record.snapshot.cooldown = self._new_cooldown(record, reset_mode)
+                started_at = cooldown.started_at
                 record.snapshot.updated_at = started_at
                 reset_operation = (
                     self._reset_safe_change(record)
                     if is_safe_change
                     else self._reset_recovery(record)
                     if is_recovery
-                    else self._monitor_cooldown(record)
+                    else self._monitor_cooldown(record, CooldownWatch(cooldown, record.lease))
                 )
                 record.cooldown_task = asyncio.create_task(
-                    self._hold_bout_during_reset(record, reset_operation),
+                    self._hold_bout_during_reset(record, reset_operation, record.lease),
                     name=f"cooldown-{record.snapshot.id}",
                 )
             return record.snapshot.model_copy(deep=True)
@@ -3980,7 +5124,6 @@ class RunManager:
         reset_mode: ResetMode,
     ) -> CooldownSnapshot:
         started_at = datetime.now(UTC)
-        record.cooldown_idle_observations.clear()
         owns_artifacts = reset_mode in {
             ResetMode.DELETE_ISOLATED_ENVIRONMENT,
             ResetMode.DELETE_RECOVERY_ENVIRONMENT,
@@ -4068,8 +5211,8 @@ class RunManager:
             and self._round5_readiness_status is not None
         ):
             # Round 5 bout_status answers from the round5-specific readiness/warm
-            # signal ALONE -- never gated on the installation-wide ``readiness``
-            # (Finding 2). Requiring the global ring to be ready first coupled Round 5
+            # signal ALONE -- never gated on the installation-wide ``readiness``.
+            # Requiring the global ring to be ready first coupled Round 5
             # availability to unrelated installation/other-round startup state, so a
             # global blip could report Round 5 unavailable even though its own
             # per-round ring/warm coordinator was healthy.
@@ -4157,9 +5300,19 @@ class RunManager:
                 competitor=lease.competitor_name,
                 round5_start=round5_start,
             )
+        can_start = bool(readiness_fields.get("ring_ready", True))
+        if can_start and self._lost_ring_still_stopping(store.ring_key):
+            # The lost row is gone, but a claim of this ring is refused here until
+            # the work that lost it has stopped.
+            readiness_fields = {
+                **readiness_fields,
+                "maintenance_state": "maintenance",
+                "maintenance_detail": _LOST_RING_STILL_STOPPING,
+            }
+            can_start = False
         return BoutStatus(
             active=False,
-            can_start=bool(readiness_fields.get("ring_ready", True)),
+            can_start=can_start,
             **status_scope,
             **readiness_fields,
             round5_start=round5_start,
@@ -4258,7 +5411,7 @@ class RunManager:
         return record.event_log.first_retained_sequence
 
     @staticmethod
-    def _unfinished_operations(record: SessionRecord) -> tuple[asyncio.Task[None], ...]:
+    def _unfinished_operations(record: SessionRecord) -> tuple[asyncio.Task[Any], ...]:
         """Every background task this record still owns.
 
         The settlement task is the one that makes this necessary rather than
@@ -4272,6 +5425,9 @@ class RunManager:
             operation
             for operation in (
                 record.task,
+                record.bell_handoff_task,
+                record.bell_convergence_task,
+                *record.checking_cancel_tasks.values(),
                 record.cooldown_task,
                 record.connection_spike_cleanup_task,
                 record.settlement_task,
@@ -4279,6 +5435,9 @@ class RunManager:
                 record.armed_expiry_task,
                 record.lease_heartbeat_task,
                 record.round5_lease_heartbeat_task,
+                record.terminal_release_retry_task,
+                record.round5_release_retry_task,
+                record.fence_expiry_task,
             )
             if operation is not None and not operation.done()
         )
@@ -4409,6 +5568,9 @@ class RunManager:
         phase: str = "checking",
         expected_previous_token: int | None = None,
     ) -> None:
+        stopping = self._unstopped_ring_work(record, claimed=False)
+        if stopping:
+            raise self._unstopped_ring_work_refusal(record, stopping)
         ttl = timedelta(
             seconds=(
                 self._running_lease_ttl if phase == "redo_committed" else self._active_lease_ttl
@@ -4426,6 +5588,7 @@ class RunManager:
             )
             and phase == "checking"
         ):
+            sent = time.monotonic()
             try:
                 (
                     warm_slot,
@@ -4451,9 +5614,8 @@ class RunManager:
                 )
             except Exception as exc:
                 logger.warning(
-                    "Round 5 atomic claim refused diagnosis=%s detail=%s",
-                    type(exc).__name__,
-                    str(exc),
+                    "Round 5 atomic claim refused diagnosis=%s",
+                    operator_diagnosis(exc),
                 )
                 if isinstance(
                     exc,
@@ -4465,10 +5627,16 @@ class RunManager:
                 ):
                     raise InvalidStateError(self._round5_start_refusal()) from exc
                 raise
-            record.lease = main_lease
-            record.round5_lease = cleanup_lease
+            self._set_lease(record, main_lease, sent)
+            self._set_lease(record, cleanup_lease, sent, round5=True)
             record.round5_warm_slot = warm_slot
             record.round5_launch_capsule = capsule
+            # Checked again now both rows are won: the claim may have waited out a loss.
+            stopping = self._unstopped_ring_work(record, claimed=True)
+            if stopping:
+                await self._give_back_round5_claim(record)
+                raise self._unstopped_ring_work_refusal(record, stopping)
+            record.ring_lease_lost = False
             self._start_lease_heartbeat(record, ttl)
             self._start_round5_lease_heartbeat(record, ttl)
             return
@@ -4495,6 +5663,7 @@ class RunManager:
                 expected_previous_token=expected_previous_token,
             )
 
+        sent = time.monotonic()
         try:
             lease = await claim(self._lease_store_for_record(record))
         except LeaseHeldError as exc:
@@ -4503,16 +5672,28 @@ class RunManager:
             raise InvalidStateError(detail) from exc
         except LeaseLostError as exc:
             raise InvalidStateError(str(exc)) from exc
-        record.lease = lease
+        self._set_lease(record, lease, sent)
+        cleanup_lease: BoutLease | None = None
         if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+            sent = time.monotonic()
             try:
-                record.round5_lease = await claim(self._round5_cleanup_store())
+                cleanup_lease = await claim(self._round5_cleanup_store())
             except LeaseHeldError as exc:
                 await self._release_bout(record)
                 raise InvalidStateError(self._round5_start_refusal()) from exc
             except LeaseLostError as exc:
                 await self._release_bout(record)
                 raise InvalidStateError(str(exc)) from exc
+            self._set_lease(record, cleanup_lease, sent, round5=True)
+        # Checked again now the rows are won: a claim may have waited out a loss.
+        stopping = self._unstopped_ring_work(record, claimed=True)
+        if stopping:
+            await self._give_back_claim(record, lease)
+            if cleanup_lease is not None:
+                await self._give_back_claim(record, cleanup_lease, round5=True)
+            raise self._unstopped_ring_work_refusal(record, stopping)
+        record.ring_lease_lost = False
+        if cleanup_lease is not None:
             self._start_round5_lease_heartbeat(record, ttl)
         if record.snapshot.round.id in {
             RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
@@ -4520,6 +5701,222 @@ class RunManager:
         }:
             record.round2_fencing_token = lease.fencing_token
         self._start_lease_heartbeat(record, ttl)
+
+    @staticmethod
+    def _ring_work(record: SessionRecord) -> list[asyncio.Task[Any]]:
+        """``record``'s unfinished tasks that can act on what its ring lease fences.
+
+        A loss cancels some of them and lets others, such as Round 5's backstage
+        cleanup, run to the end; either way the ring stays closed here until they
+        finish. Any task that touches the round's sources or artifacts belongs here.
+        Round 1's idle watch does not: it only reads both control planes, and the only
+        lease it acts on is the one it began under, by exact fence, which a lost ring
+        no longer holds. It is known by the record's own reference to it, so every
+        other task in its slot, a towel or artifact cleanup, still counts.
+        """
+
+        return [
+            task
+            for task in (
+                record.task,
+                record.cooldown_task,
+                record.bell_handoff_task,
+                record.bell_convergence_task,
+                record.model_score_terminal_task,
+                record.settlement_task,
+                record.connection_spike_cleanup_task,
+                record.connection_spike_cleanup_retry_task,
+            )
+            if task is not None and not task.done() and task is not record.idle_watch_task
+        ]
+
+    def _unstopped_ring_work(
+        self,
+        record: SessionRecord,
+        *,
+        claimed: bool,
+    ) -> list[asyncio.Task[Any]]:
+        """The work on ``record``'s ring that still runs here without its authority.
+
+        Always the ring work of every record that lost the ring, the claimer's own
+        included: the heartbeat gives a lease up before it expires, but the row then
+        expires on its own clock whether or not that work has stopped. Once a claim
+        has won the row, also any other local holder of the ring that still has work
+        running; it lost the ring too and has not noticed yet. Across replicas the
+        early loss is the only fence; here the ring waits for the work. There is no
+        timed escape: a claim made beside work that may still write would be the
+        second owner this exists to prevent, and a restart's shutdown stops the work
+        instead.
+        """
+
+        ring_key = self._lease_store_for_record(record).ring_key
+        current = asyncio.current_task()
+        unstopped: list[asyncio.Task[Any]] = []
+        for other in tuple(self._records.values()):
+            if self._lease_store_for_record(other).ring_key != ring_key:
+                continue
+            if other.ring_lease_lost or (
+                claimed and other is not record and other.lease is not None
+            ):
+                unstopped.extend(task for task in self._ring_work(other) if task is not current)
+        return unstopped
+
+    def _lost_ring_still_stopping(self, ring_key: str) -> bool:
+        """Whether work that lost ``ring_key`` still runs here, so a claim of it is refused."""
+
+        return any(
+            other.ring_lease_lost
+            and self._lease_store_for_record(other).ring_key == ring_key
+            and self._ring_work(other)
+            for other in tuple(self._records.values())
+        )
+
+    @staticmethod
+    def _lose_ring_lease(record: SessionRecord) -> None:
+        """Forget a ring lease that was lost, lapsed or taken; held under ``lease_lock``.
+
+        Whatever ring work still runs lost its fence with it, so the ring stays closed
+        here until that work has finished. A confirmed release is not this: the work
+        holding the fence makes it once done with it, and what outlives it either
+        carries its own fence, as Round 5's run and cleanup do, or is settlement,
+        which the next arm of its round waits for.
+        """
+
+        record.lease = None
+        record.ring_lease_lost = True
+
+    def _lose_absent_ring_lease(self, record: SessionRecord, lease: BoutLease) -> None:
+        """Drop ``lease`` as lost: its row is gone and no release of it was confirmed.
+
+        Held under ``lease_lock``. The row may have lapsed under ring work that still
+        runs, and another replica can claim the ring at once, so the alarm checks now.
+        """
+
+        self._log_lease_lost(
+            record, lease, "row_absent", self._lease_proven_until(lease, record.lease_proof)
+        )
+        self._lose_ring_lease(record)
+        self._alarm_if_ring_work_outlives(record, time.monotonic())
+
+    def _expired_on_its_own(self, record: SessionRecord, lease: BoutLease) -> bool:
+        """Whether ``lease``'s row, found gone, simply reached its own end.
+
+        Nothing renews an armed card's row or a failed Round 1 cooldown's fence, and no
+        ring work runs under either: each ends at its TTL. Once this process can no
+        longer prove the row live, its absence is that expiry and not a loss.
+        """
+
+        return lease.phase in {"armed", "cooldown_failed"} and time.monotonic() >= (
+            self._lease_proven_until(lease, record.lease_proof)
+        )
+
+    @staticmethod
+    def _unstopped_ring_work_refusal(
+        record: SessionRecord,
+        stopping: list[asyncio.Task[Any]],
+    ) -> InvalidStateError:
+        logger.warning(
+            "Ring claim refused while lost-lease work is still stopping session=%s tasks=%s",
+            record.snapshot.id,
+            ",".join(task.get_name() for task in stopping),
+        )
+        return InvalidStateError(_LOST_RING_STILL_STOPPING)
+
+    async def _give_back_claim(
+        self,
+        record: SessionRecord,
+        lease: BoutLease,
+        *,
+        round5: bool = False,
+    ) -> None:
+        """Release a claim that won its row but must not be used, never renewing it."""
+
+        store = self._round5_cleanup_store() if round5 else self._lease_store_for_record(record)
+        until = time.monotonic() + max(0.001, self._terminal_release_call_timeout)
+        released = await self._release_exact_fence_once(
+            record, store, lease, until, round5=round5
+        )
+        if released != "released":
+            self._retry_terminal_release_in_background(record, lease, round5=round5)
+
+    async def _give_back_round5_claim(self, record: SessionRecord) -> None:
+        """Give back a won Round 5 claim: its warm slot and both rings, renewing none."""
+
+        main, cleanup = record.lease, record.round5_lease
+        coordinator = self._round5_warm_coordinator
+        warm_slot = record.round5_warm_slot
+        claim = warm_slot.claim if warm_slot is not None else None
+        if coordinator is not None and claim is not None:
+            # Stopped first, so the claim lapses on its own if it cannot be returned.
+            stop_renewing = getattr(coordinator, "release_claim_active", None)
+            if callable(stop_renewing):
+                stop_renewing(claim.claim_id)
+            returned = getattr(coordinator, "return_unstarted_claim", None)
+            if callable(returned):
+                call = asyncio.ensure_future(
+                    returned(
+                        claim.claim_id,
+                        main_store=self._lease_store_for_record(record),
+                        main_lease=main,
+                        cleanup_store=self._round5_cleanup_store(),
+                        cleanup_lease=cleanup,
+                    )
+                )
+                try:
+                    await asyncio.wait(
+                        {call}, timeout=max(0.001, self._terminal_release_call_timeout)
+                    )
+                finally:
+                    answered = call.done()
+                    if not answered:
+                        self._abandon_lease_call(call)
+                if answered and not call.cancelled() and call.exception() is None:
+                    record.round5_warm_slot = call.result()
+                    if await self._forget_rings_the_warm_store_returned(record, main, cleanup):
+                        return
+                else:
+                    logger.warning(
+                        "Round 5 claim given back without returning its warm slot "
+                        "session=%s; the claim lapses on its own",
+                        record.snapshot.id,
+                    )
+        if main is not None:
+            await self._give_back_claim(record, main)
+        if cleanup is not None:
+            await self._give_back_claim(record, cleanup, round5=True)
+
+    async def _forget_rings_the_warm_store_returned(
+        self,
+        record: SessionRecord,
+        main: BoutLease | None,
+        cleanup: BoutLease | None,
+    ) -> bool:
+        """Drop ``main`` and ``cleanup`` once returning their unstarted claim released both.
+
+        The production warm store returns the claim and clears both ring rows, by their
+        exact fences, in one transaction, so the rows are gone because of it and not
+        lost. That transaction does not check expiry, so it proves no unbroken hold:
+        only a record with no ring work running takes it as a plain clear. True if so.
+        """
+
+        store = getattr(self._round5_warm_coordinator, "store", None)
+        if not callable(getattr(store, "return_unstarted_with_leases", None)):
+            return False
+        current = asyncio.current_task()
+        if any(task is not current for task in self._ring_work(record)):
+            return False
+        async with record.lease_lock:
+            local = record.lease
+            if main is not None and local is not None and self._same_exact_lease(local, main):
+                record.lease = None
+            local = record.round5_lease
+            if cleanup is not None and local is not None and self._same_exact_lease(local, cleanup):
+                record.round5_lease = None
+        if main is not None:
+            self._cancel_lease_heartbeat(record, main)
+        if cleanup is not None:
+            self._cancel_round5_lease_heartbeat(record, cleanup)
+        return True
 
     def _describe_ring_holder(self, exc: LeaseHeldError) -> str:
         """Say why the ring is held, not just that it is.
@@ -4585,7 +5982,8 @@ class RunManager:
                 self._assert_operator(round5_lease.operator, actual)
             try:
                 if round5_lease is not None:
-                    record.round5_lease = await self._round5_cleanup_store().transition(
+                    sent = time.monotonic()
+                    committed_round5 = await self._round5_cleanup_store().transition(
                         round5_lease,
                         operator=actual,
                         expected_phase="armed",
@@ -4593,9 +5991,11 @@ class RunManager:
                         session_state=SessionState.RUNNING,
                         ttl=timedelta(seconds=self._running_lease_ttl),
                     )
+                    self._set_lease(record, committed_round5, sent, round5=True)
                 # This is the atomic, fenced ARMED -> RUN_COMMITTED handoff. No other
                 # app replica can claim the ring between the bell and live preparation.
-                record.lease = await self._lease_store_for_record(record).transition(
+                sent = record.bell_commit_sent_at = time.monotonic()
+                committed = await self._lease_store_for_record(record).transition(
                     lease,
                     operator=actual,
                     expected_phase="armed",
@@ -4603,6 +6003,7 @@ class RunManager:
                     session_state=SessionState.RUNNING,
                     ttl=timedelta(seconds=self._running_lease_ttl),
                 )
+                self._set_lease(record, committed, sent)
                 if record.snapshot.round.id in {
                     RoundId.MAKE_SCHEMA_CHANGE_SAFELY,
                     RoundId.RECOVER_DELETED_ORDER,
@@ -4610,7 +6011,9 @@ class RunManager:
                     record.round2_fencing_token = record.lease.fencing_token
             except LeaseLostError as exc:
                 transition_error = exc
-        if transition_error is not None:
+        # A lapsed commit is refused too. Convergence fails that card; Round 5, which
+        # it skips, gives its rows back below.
+        if transition_error is not None or self._bell_proof_lapsed(record):
             if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
                 await self._release_round5_lease(record)
                 await self._release_bout(record)
@@ -4627,6 +6030,30 @@ class RunManager:
                 timedelta(seconds=self._running_lease_ttl),
             )
 
+    def _bell_proof_lapsed(self, record: SessionRecord) -> bool:
+        """Whether the bell's commit answered too late to prove its leases still fence.
+
+        A run must never start under such a lease; its heartbeat would declare it lost
+        at once, after the run had already begun.
+        """
+
+        _, margin = self._heartbeat_cadence(timedelta(seconds=self._running_lease_ttl))
+        now = time.monotonic()
+        lapsed = any(
+            held is not None and self._lease_proven_until(held, proof) - margin <= now
+            for held, proof in (
+                (record.lease, record.lease_proof),
+                (record.round5_lease, record.round5_lease_proof),
+            )
+        )
+        if lapsed:
+            logger.warning(
+                "Bell refused: its commit was answered after its lease could be proven "
+                "live session=%s",
+                record.snapshot.id,
+            )
+        return lapsed
+
     async def _retain_connection_spike_cleanup_lease(
         self,
         record: SessionRecord,
@@ -4641,7 +6068,8 @@ class RunManager:
                 self._assert_operator(lease.operator, operator)
                 if lease.phase != "round5_cleanup":
                     try:
-                        record.round5_lease = await self._round5_cleanup_store().transition(
+                        sent = time.monotonic()
+                        retained = await self._round5_cleanup_store().transition(
                             lease,
                             operator=operator,
                             expected_phase=lease.phase,
@@ -4651,13 +6079,16 @@ class RunManager:
                         )
                     except LeaseLostError:
                         record.round5_lease = None
+                    else:
+                        self._set_lease(record, retained, sent, round5=True)
                 else:
                     record.round5_lease = lease
         if record.round5_lease is None and not allow_claim:
             raise InvalidStateError("ROUND 5 CLEANUP AUTHORITY CHANGED")
         if record.round5_lease is None:
             try:
-                record.round5_lease = await self._round5_cleanup_store().claim(
+                sent = time.monotonic()
+                claimed = await self._round5_cleanup_store().claim(
                     session_id=record.snapshot.id,
                     operator=operator,
                     phase="round5_cleanup",
@@ -4672,6 +6103,7 @@ class RunManager:
                 raise InvalidStateError(
                     "ROUND 5 BACKSTAGE CLEANUP AUTHORITY IS HELD BY ANOTHER WORKER"
                 ) from exc
+            self._set_lease(record, claimed, sent, round5=True)
         self._start_round5_lease_heartbeat(
             record,
             timedelta(seconds=self._running_lease_ttl),
@@ -4687,8 +6119,16 @@ class RunManager:
             if lease is None or lease.session_id != record.snapshot.id:
                 raise InvalidStateError("RING LEASE EXPIRED · TOWEL CLEANUP REFUSED")
             self._assert_operator(lease.operator, operator)
-            try:
-                record.lease = await self._lease_store_for_record(record).transition(
+            # Awaited under both locks the heartbeat needs to declare this lease lost,
+            # so never past the moment it must: a towel stalled on the coordinator
+            # cannot keep the run going beyond its lease.
+            _, margin = self._heartbeat_cadence(self._lease_ttl(record, lease.phase))
+            sent = time.monotonic()
+            left = self._lease_proven_until(lease, record.lease_proof) - margin - sent
+            if left <= 0:
+                raise InvalidStateError("RING LEASE UNCONFIRMED · TOWEL CLEANUP REFUSED")
+            transition = asyncio.ensure_future(
+                self._lease_store_for_record(record).transition(
                     lease,
                     operator=operator,
                     expected_phase="run_committed",
@@ -4696,8 +6136,25 @@ class RunManager:
                     session_state=SessionState.RUNNING,
                     ttl=timedelta(seconds=self._running_lease_ttl),
                 )
+            )
+            try:
+                await asyncio.wait({transition}, timeout=left)
+            finally:
+                answered = transition.done()
+                if not answered:
+                    self._abandon_lease_call(transition)
+            if not answered:
+                logger.warning(
+                    "Towel transition abandoned reason=timeout session=%s phase=%s",
+                    record.snapshot.id,
+                    lease.phase,
+                )
+                raise InvalidStateError("RING LEASE UNCONFIRMED · TOWEL CLEANUP REFUSED")
+            try:
+                towel = transition.result()
             except LeaseLostError as exc:
                 raise InvalidStateError("RING LEASE CHANGED · TOWEL CLEANUP REFUSED") from exc
+            self._set_lease(record, towel, sent)
         self._start_lease_heartbeat(
             record,
             timedelta(seconds=self._running_lease_ttl),
@@ -4735,7 +6192,8 @@ class RunManager:
                 if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
                     if round5_lease is None:
                         raise LeaseLostError("ROUND 5 CLEANUP AUTHORITY EXPIRED")
-                    record.round5_lease = await self._round5_cleanup_store().transition(
+                    sent = time.monotonic()
+                    armed_round5 = await self._round5_cleanup_store().transition(
                         round5_lease,
                         operator=record.operator or round5_lease.operator,
                         expected_phase="checking",
@@ -4743,7 +6201,9 @@ class RunManager:
                         session_state=SessionState.ARMED,
                         ttl=ttl,
                     )
-                record.lease = await self._lease_store_for_record(record).transition(
+                    self._set_lease(record, armed_round5, sent, round5=True)
+                sent = record.arm_commit_sent_at = time.monotonic()
+                armed = await self._lease_store_for_record(record).transition(
                     lease,
                     operator=record.operator or lease.operator,
                     expected_phase="checking",
@@ -4751,6 +6211,7 @@ class RunManager:
                     session_state=SessionState.ARMED,
                     ttl=ttl,
                 )
+                self._set_lease(record, armed, sent)
             except LeaseLostError as exc:
                 transition_error = exc
         if transition_error is not None:
@@ -4758,7 +6219,7 @@ class RunManager:
                 await self._release_round5_lease(record)
                 await self._release_bout(record)
             raise InvalidStateError(str(transition_error)) from transition_error
-        # Blocker 5: register the AUTHORITATIVE armed-lease deadline with the warm
+        # Register the AUTHORITATIVE armed-lease deadline with the warm
         # coordinator so it renews the pre-bell claim through exactly this deadline
         # (honoring a long configured arm TTL, e.g. 1800s) and stops after -- not the
         # coarse leak-fallback horizon, which now applies ONLY when no armed deadline
@@ -4774,7 +6235,7 @@ class RunManager:
             )
             if callable(setter) and claim is not None:
                 setter(claim.claim_id, expires_at)
-            # Finding 3: hand the claimed engine (now holding the ARM-staged resident
+            # Hand the claimed engine (now holding the ARM-staged resident
             # bindings) to the coordinator/provider so the provider -- the sole
             # cleanup janitor -- can cancel those residents itself. The manager does
             # no external cleanup mutation of its own when a coordinator is present.
@@ -4806,6 +6267,53 @@ class RunManager:
             self._storage_refusals.pop(RoundId.PUT_MODEL_SCORE_IN_APP, None)
             self._storage_refusals.pop(RoundId.ANALYZE_LIVE_ORDERS, None)
 
+    async def _publish_armed_if_current(
+        self,
+        record: SessionRecord,
+        *,
+        arm_bout_id: str,
+        armed_at_monotonic: float,
+        snapshot: SessionSnapshot,
+        payload: dict[str, object],
+    ) -> bool:
+        """Commit and publish one arm only while its card is still current."""
+
+        armed_expires_at = snapshot.armed_expires_at
+        assert armed_expires_at is not None
+        await self._mark_bout_armed(record, armed_expires_at)
+        async with record.lock:
+            if (
+                record.snapshot.state != SessionState.ARMED
+                or record.snapshot.receipt_bout_id != arm_bout_id
+                or record.armed_at_monotonic != armed_at_monotonic
+                or record.armed_release_pending
+            ):
+                return False
+            # Scheduling and publication are serialized with no-bell cancellation.
+            # Thus cancellation either suppresses both, or follows an already
+            # visible armed event; it can never be followed by stale arm output.
+            self._schedule_armed_expiry(record, armed_at_monotonic)
+            await record.event_log.publish("armed", payload)
+            return True
+
+    async def _arm_attempt_was_cancelled(
+        self,
+        record: SessionRecord,
+        arm_bout_id: str,
+    ) -> bool:
+        async with record.lock:
+            if record.snapshot.receipt_bout_id != arm_bout_id:
+                return True
+            return record.armed_release_pending or (
+                record.snapshot.state == SessionState.FAILED
+                and record.snapshot.run_started_at is None
+                and record.snapshot.failure is not None
+                and (
+                    record.snapshot.failure == _ARMED_CARD_CANCELLED
+                    or record.snapshot.failure.startswith("Fight-card check cancelled")
+                )
+            )
+
     def _cancel_lease_heartbeat(
         self,
         record: SessionRecord,
@@ -4819,16 +6327,51 @@ class RunManager:
         task = record.lease_heartbeat_task
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
+            self._abandon_renewal_in_flight(record)
         record.lease_heartbeat_task = None
         record.lease_heartbeat_lease = None
 
+    def _abandon_renewal_in_flight(self, record: SessionRecord, *, round5: bool = False) -> None:
+        prefix = "round5_" if round5 else ""
+        in_flight = getattr(record, f"{prefix}renewal_in_flight")
+        setattr(record, f"{prefix}renewal_in_flight", None)
+        if in_flight is not None and not in_flight[1].done():
+            self._abandon_renewal(record, *in_flight, round5=round5)
+
+    def _abandon_renewal(
+        self,
+        record: SessionRecord,
+        fence: tuple[str, int],
+        renewal: asyncio.Future[Any],
+        *,
+        round5: bool = False,
+    ) -> None:
+        abandoned = record.round5_abandoned_renewals if round5 else record.abandoned_renewals
+        if abandoned.get(fence) is renewal:
+            return
+        abandoned[fence] = renewal
+        self._abandon_lease_call(renewal)
+
+        def forget(done: asyncio.Future[Any]) -> None:
+            if abandoned.get(fence) is done:
+                del abandoned[fence]
+
+        renewal.add_done_callback(forget)
+
     def _start_lease_heartbeat(self, record: SessionRecord, ttl: timedelta) -> None:
         self._cancel_lease_heartbeat(record)
-        record.lease_heartbeat_task = asyncio.create_task(
-            self._heartbeat_lease(record, ttl),
-            name=f"lease-heartbeat-{record.snapshot.id}",
+        record.lease_heartbeat_task = self._track_heartbeat(
+            asyncio.create_task(
+                self._heartbeat_lease(record, ttl),
+                name=f"lease-heartbeat-{record.snapshot.id}",
+            )
         )
         record.lease_heartbeat_lease = record.lease
+
+    def _track_heartbeat(self, task: asyncio.Task[None]) -> asyncio.Task[None]:
+        self._heartbeat_tasks.add(task)
+        task.add_done_callback(self._heartbeat_tasks.discard)
+        return task
 
     def _cancel_round5_lease_heartbeat(
         self,
@@ -4843,6 +6386,7 @@ class RunManager:
         task = record.round5_lease_heartbeat_task
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
+            self._abandon_renewal_in_flight(record, round5=True)
         record.round5_lease_heartbeat_task = None
         record.round5_lease_heartbeat_lease = None
 
@@ -4852,44 +6396,232 @@ class RunManager:
         ttl: timedelta,
     ) -> None:
         self._cancel_round5_lease_heartbeat(record)
-        record.round5_lease_heartbeat_task = asyncio.create_task(
-            self._heartbeat_round5_lease(record, ttl),
-            name=f"round5-lease-heartbeat-{record.snapshot.id}",
+        record.round5_lease_heartbeat_task = self._track_heartbeat(
+            asyncio.create_task(
+                self._heartbeat_round5_lease(record, ttl),
+                name=f"round5-lease-heartbeat-{record.snapshot.id}",
+            )
         )
         record.round5_lease_heartbeat_lease = record.round5_lease
+
+    def _heartbeat_cadence(self, ttl: timedelta) -> tuple[float, float]:
+        """How often a lease of ``ttl`` renews, and how long before expiry it is lost.
+
+        Loss is declared that long before the lease expires, so the run is stopped
+        while its row still fences the ring. Capped so the first renew still fits.
+        """
+
+        interval = min(self._lease_heartbeat, max(0.25, ttl.total_seconds() / 3))
+        return interval, min(interval, max(0.0, ttl.total_seconds() - interval) / 2)
+
+    @staticmethod
+    def _proven_until(lease: BoutLease, sent: float) -> float:
+        """The monotonic time before which the write that returned ``lease`` cannot lapse.
+
+        ``sent`` is when that write's request left. The coordinator applied the TTL on
+        its own clock after that, and the TTL it applied is the difference of two of
+        its own stamps, so the row lives at least that long past ``sent`` however far
+        the coordinator's clock runs ahead of this one.
+        """
+
+        return sent + (lease.expires_at - lease.updated_at).total_seconds()
+
+    def _set_lease(
+        self,
+        record: SessionRecord,
+        lease: BoutLease,
+        sent: float,
+        *,
+        round5: bool = False,
+    ) -> None:
+        proof = (lease, self._proven_until(lease, sent))
+        if round5:
+            record.round5_lease, record.round5_lease_proof = lease, proof
+        else:
+            record.lease, record.lease_proof = lease, proof
+
+    def _adopt_lease(self, record: SessionRecord, holder: BoutLease, sent: float | None) -> None:
+        """Install a row adopted after its write's answer was lost, proven from that write."""
+
+        if sent is None:
+            record.lease = holder
+        else:
+            self._set_lease(record, holder, sent)
+
+    @staticmethod
+    def _lease_proven_until(
+        lease: BoutLease,
+        proof: tuple[BoutLease, float] | None,
+    ) -> float:
+        if proof is not None and proof[0] == lease:
+            return proof[1]
+        # No confirmed write here vouches for this lease, as for one installed by
+        # hand. Its stamped expiry read against this clock is the only bound left.
+        return time.monotonic() + (lease.expires_at - datetime.now(UTC)).total_seconds()
+
+    async def _renew_within(
+        self,
+        record: SessionRecord,
+        store: BoutLeaseStore,
+        lease: BoutLease,
+        ttl: timedelta,
+        proven_until: float,
+        margin: float,
+        *,
+        round5: bool = False,
+    ) -> tuple[tuple[BoutLease, float] | None, str | None]:
+        """Renew ``lease`` once, never waiting past ``proven_until - margin``.
+
+        Returns the renewed lease with its proof, or why the lease is lost
+        (``"lease_lost"``, ``"timeout"`` or ``"deadline"``), or neither while it is
+        too early to tell.
+        """
+
+        abandoned = record.round5_abandoned_renewals if round5 else record.abandoned_renewals
+        in_flight = "round5_renewal_in_flight" if round5 else "renewal_in_flight"
+        fence = (lease.lease_id, lease.fencing_token)
+        sent = time.monotonic()
+        left = proven_until - margin - sent
+        if left <= 0:
+            return None, "deadline"
+        pending = abandoned.get(fence)
+        if pending is not None and not pending.done():
+            return None, None
+        renewal = asyncio.ensure_future(store.renew(lease, ttl=ttl))
+        setattr(record, in_flight, (fence, renewal))
+        try:
+            # Only the deadline bounds it: a slow coordinator that answers in time
+            # proves the lease live, and a renew cut short may still have landed.
+            await asyncio.wait({renewal}, timeout=left)
+        finally:
+            current = getattr(record, in_flight)
+            if current is not None and current[1] is renewal:
+                setattr(record, in_flight, None)
+            answered = renewal.done()
+            if not answered:
+                self._abandon_renewal(record, fence, renewal, round5=round5)
+        if not answered:
+            logger.warning(
+                "Ring lease renew abandoned lease=%s reason=timeout session=%s phase=%s "
+                "remaining_seconds=%.1f",
+                "round5" if round5 else "main",
+                record.snapshot.id,
+                lease.phase,
+                max(0.0, proven_until - time.monotonic()),
+            )
+            return None, "timeout"
+        try:
+            renewed = renewal.result()
+        except LeaseLostError:
+            return None, "lease_lost"
+        except Exception:
+            # A transient coordinator outage must not create two owners. The
+            # existing database expiry remains authoritative; fail only once
+            # this replica can no longer prove its lease is still live.
+            if time.monotonic() >= proven_until - margin:
+                return None, "deadline"
+            return None, None
+        return (renewed, self._proven_until(renewed, sent)), None
+
+    def _abandon_lease_call(self, call: asyncio.Future[Any]) -> None:
+        # Abandoned rather than awaited: psycopg meets a cancellation by waiting on
+        # the same, possibly black-holed, socket again.
+        if call in self._abandoned_calls:
+            return
+        call.cancel()
+        self._abandoned_calls.add(call)
+
+        def forget(done: asyncio.Future[Any]) -> None:
+            self._abandoned_calls.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        call.add_done_callback(forget)
+
+    async def _bounded_lease_call(
+        self, operation: Awaitable[Any], timeout_seconds: float
+    ) -> Any:
+        """``operation``'s answer, or TimeoutError once ``timeout_seconds`` pass without one.
+
+        Unlike ``asyncio.wait_for``, a call that has not answered by then is abandoned
+        (see ``_abandon_lease_call``), not awaited while it unwinds, so it cannot hold its
+        caller past the deadline that set ``timeout_seconds``.
+        """
+
+        call = asyncio.ensure_future(operation)
+        try:
+            await asyncio.wait({call}, timeout=timeout_seconds)
+        finally:
+            answered = call.done()
+            if not answered:
+                self._abandon_lease_call(call)
+        if not answered:
+            raise TimeoutError
+        return call.result()
+
+    @staticmethod
+    def _log_lease_lost(
+        record: SessionRecord,
+        lease: BoutLease,
+        reason: str,
+        proven_until: float,
+        *,
+        round5: bool = False,
+    ) -> None:
+        logger.warning(
+            "Ring lease declared lost lease=%s reason=%s session=%s phase=%s "
+            "lease_id=%s fence=%s remaining_seconds=%.1f",
+            "round5" if round5 else "main",
+            reason,
+            record.snapshot.id,
+            lease.phase,
+            lease.lease_id,
+            lease.fencing_token,
+            max(0.0, proven_until - time.monotonic()),
+        )
 
     async def _heartbeat_round5_lease(
         self,
         record: SessionRecord,
         ttl: timedelta,
     ) -> None:
-        interval = min(self._lease_heartbeat, max(0.25, ttl.total_seconds() / 3))
+        interval, margin = self._heartbeat_cadence(ttl)
+        store = self._round5_cleanup_store()
+        pause = interval
         while True:
             try:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(pause)
             except asyncio.CancelledError:
                 return
-            lost: BoutLease | None = None
             async with record.lease_lock:
                 lease = record.round5_lease
-                if lease is None or lease.phase == "armed":
+                proof = record.round5_lease_proof
+            if lease is None or lease.phase == "armed":
+                return
+            proven_until = self._lease_proven_until(lease, proof)
+            renewed, lost = await self._renew_within(
+                record, store, lease, ttl, proven_until, margin, round5=True
+            )
+            pause = (
+                interval
+                if renewed is not None
+                else min(interval, max(0.0, proven_until - margin - time.monotonic()))
+            )
+            async with record.lease_lock:
+                current = record.round5_lease
+                if current is None:
                     return
-                try:
-                    renewed = await self._round5_cleanup_store().renew(lease, ttl=ttl)
-                except LeaseLostError:
-                    lost = lease
-                except Exception:
-                    if datetime.now(UTC) >= lease.expires_at:
-                        lost = lease
-                else:
-                    if record.round5_lease == lease:
-                        record.round5_lease = renewed
-            if lost is None:
-                continue
+                if not self._same_exact_lease(current, lease):
+                    continue
+                if renewed is not None:
+                    record.round5_lease, record.round5_lease_proof = renewed[0], renewed
+                if lost is None:
+                    continue
+            self._log_lease_lost(record, current, lost, proven_until, round5=True)
             failure_message: str | None = None
             async with record.lock:
                 async with record.lease_lock:
-                    if record.round5_lease != lost:
+                    if record.round5_lease != current:
                         return
                     record.round5_lease = None
                     record.round5_lease_heartbeat_task = None
@@ -4913,54 +6645,109 @@ class RunManager:
                     and not task.done()
                 ):
                     task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
+                    await self._wait_stopped(task)
                 await self._finish_connection_spike_failure(
                     record,
                     failure_message,
-                    cleanup_verified=False,
+                )
+            elif any(task is not asyncio.current_task() for task in self._ring_work(record)):
+                # Backstage cleanup holds the main ring until it ends, then releases it
+                # itself, claiming a fresh cleanup lease first if it still needs one.
+                logger.warning(
+                    "Round 5 cleanup lease lost while backstage cleanup still runs "
+                    "session=%s; the main ring stays held until that cleanup ends",
+                    record.snapshot.id,
                 )
             else:
-                await self._release_bout(record)
+                # The bout is over, and nothing retries this release afterwards.
+                async with record.lease_lock:
+                    main = record.lease
+                await self._settle_terminal_release(record, main)
             return
 
     async def _heartbeat_lease(self, record: SessionRecord, ttl: timedelta) -> None:
-        interval = min(self._lease_heartbeat, max(0.25, ttl.total_seconds() / 3))
+        interval, margin = self._heartbeat_cadence(ttl)
+        store = self._lease_store_for_record(record)
+        pause = interval
         while True:
             try:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(pause)
             except asyncio.CancelledError:
                 return
-            lost_lease: BoutLease | None = None
+            # Renewed outside lease_lock: a renew can hang, and the towel and a read
+            # of the card both wait on that lock.
             async with record.lease_lock:
                 lease = record.lease
-                if lease is None or lease.phase == "armed":
-                    return
-                try:
-                    renewed = await self._lease_store_for_record(record).renew(lease, ttl=ttl)
-                except LeaseLostError:
-                    lost_lease = lease
-                except Exception:
-                    # A transient coordinator outage must not create two owners. The
-                    # existing database expiry remains authoritative; fail only once
-                    # this replica can no longer prove its lease is still live.
-                    if datetime.now(UTC) >= lease.expires_at:
-                        lost_lease = lease
-                else:
-                    if record.lease == lease:
-                        record.lease = renewed
-            if lost_lease is not None:
-                async with record.lease_lock:
-                    terminal_lease = record.model_score_terminal_lease
-                    if terminal_lease is not None and self._same_exact_lease(
-                        terminal_lease,
-                        lost_lease,
-                    ):
-                        # A release/current probe for this exact fence is already
-                        # authoritative. It may have removed the coordinator row
-                        # before its response reached us.
-                        return
-                await self._handle_lost_lease(record, lost_lease)
+                proof = record.lease_proof
+            if lease is None or lease.phase == "armed":
                 return
+            proven_until = self._lease_proven_until(lease, proof)
+            renewed, lost = await self._renew_within(
+                record, store, lease, ttl, proven_until, margin
+            )
+            pause = (
+                interval
+                if renewed is not None
+                else min(interval, max(0.0, proven_until - margin - time.monotonic()))
+            )
+            async with record.lease_lock:
+                current = record.lease
+                if current is None:
+                    return
+                if not self._same_exact_lease(current, lease):
+                    # A towel or handoff moved the fence during the renew; whatever
+                    # the renew answered, a refusal included, was about the old one.
+                    continue
+                if renewed is not None:
+                    record.lease, record.lease_proof = renewed[0], renewed
+                if lost is None:
+                    continue
+                if self._terminal_release_owns(record, current):
+                    # A release/current probe for this exact fence is already
+                    # authoritative. It may have removed the coordinator row
+                    # before its response reached us.
+                    return
+            self._log_lease_lost(record, current, lost, proven_until)
+            self._alarm_if_ring_work_outlives(record, proven_until)
+            await self._handle_lost_lease(record, current)
+            return
+
+    def _alarm_if_ring_work_outlives(self, record: SessionRecord, proven_until: float) -> None:
+        """Log an error if work that lost the ring still runs once the lost row can lapse.
+
+        From then another replica may claim the ring, and nothing fences that work off
+        from its new owner. The task raising the alarm is not counted: it is the one
+        handling the loss, and when it is ring work, it is the work giving the ring up.
+        Raised by Round 4's terminal publication, neither is its run, which only awaits
+        that publication.
+        """
+
+        raised_by = asyncio.current_task()
+        handling = {raised_by}
+        if raised_by is not None and raised_by is record.model_score_terminal_task:
+            handling.add(record.task)
+
+        def check() -> None:
+            if not record.ring_lease_lost or record.lease is not None:
+                return
+            running = [task for task in self._ring_work(record) if task not in handling]
+            if running:
+                logger.error(
+                    "Ring lease may have lapsed while work that lost it still runs "
+                    "session=%s tasks=%s; another replica can claim the ring meanwhile",
+                    record.snapshot.id,
+                    ",".join(task.get_name() for task in running),
+                )
+
+        asyncio.get_running_loop().call_later(max(0.0, proven_until - time.monotonic()), check)
+
+    @staticmethod
+    async def _wait_stopped(task: asyncio.Task[Any]) -> None:
+        """Wait for a cancelled ``task`` to end; cancelling the waiter ends only the wait."""
+
+        await asyncio.wait({task})
+        if not task.cancelled():
+            task.exception()
 
     async def _handle_lost_lease(self, record: SessionRecord, lease: BoutLease) -> None:
         message = "Ring lease lost; active work was stopped before another bout can begin."
@@ -4968,15 +6755,11 @@ class RunManager:
         round5_failure_pending = False
         async with record.lock:
             async with record.lease_lock:
-                terminal_lease = record.model_score_terminal_lease
-                if terminal_lease is not None and self._same_exact_lease(
-                    terminal_lease,
-                    lease,
-                ):
+                if self._terminal_release_owns(record, lease):
                     return
                 if record.lease != lease:
                     return
-                record.lease = None
+                self._lose_ring_lease(record)
                 record.lease_heartbeat_task = None
                 record.lease_heartbeat_lease = None
             is_model_score = record.snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP
@@ -5004,6 +6787,7 @@ class RunManager:
                 await record.event_log.publish(
                     "towel_update",
                     {"session": snapshot.model_dump(mode="json")},
+                    receipt_bout_id=snapshot.receipt_bout_id,
                 )
                 return
             if is_model_score and record.model_score_terminal_published:
@@ -5039,6 +6823,20 @@ class RunManager:
                 record.snapshot.failure = message
                 record.snapshot.remembered_result = None
             record.snapshot.updated_at = datetime.now(UTC)
+            # Scheduled under the lock that set FAILED, so no re-arm can slip in
+            # between the card failing and its settlement existing.
+            if record.snapshot.round.id == RoundId.PUT_MODEL_SCORE_IN_APP:
+                self._schedule_round_settlement(
+                    record,
+                    getattr(record.model_score_engine, "settle_and_restore_baseline", None),
+                    label="Round 4",
+                )
+            elif record.snapshot.round.id == RoundId.ANALYZE_LIVE_ORDERS:
+                self._schedule_round_settlement(
+                    record,
+                    getattr(record.live_orders_engine, "settle_and_cleanup_owned", None),
+                    label="Round 6",
+                )
             task = record.task
             cooldown_task = record.cooldown_task
             snapshot = record.snapshot.model_copy(deep=True)
@@ -5054,16 +6852,16 @@ class RunManager:
                         "message": message,
                         "session": snapshot.model_dump(mode="json"),
                     },
+                    receipt_bout_id=snapshot.receipt_bout_id,
                 )
                 round5_terminal_event_published = True
         if round5_failure_pending:
             if task and task is not asyncio.current_task() and not task.done():
                 task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+                await self._wait_stopped(task)
             await self._finish_connection_spike_failure(
                 record,
                 message,
-                cleanup_verified=False,
             )
             return
         cleanup_ok = True
@@ -5106,6 +6904,7 @@ class RunManager:
                     await record.event_log.publish(
                         "cleanup_update",
                         {"session": snapshot.model_dump(mode="json")},
+                        receipt_bout_id=snapshot.receipt_bout_id,
                     )
         for operation in (task, cooldown_task):
             if is_connection_spike and operation is task:
@@ -5121,23 +6920,73 @@ class RunManager:
                     "message": message,
                     "session": snapshot.model_dump(mode="json"),
                 },
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
 
-    async def _release_bout(self, record: SessionRecord) -> bool:
-        self._cancel_lease_heartbeat(record)
+    def _lease_moved_on(self, record: SessionRecord, owned: BoutLease | None) -> bool:
+        """Whether the record now holds a fence claimed after ``owned``."""
+
+        local = record.lease
+        return (
+            owned is not None
+            and local is not None
+            and not self._same_lease_authority(local, owned)
+        )
+
+    async def _release_bout(
+        self,
+        record: SessionRecord,
+        owned: BoutLease | None = None,
+    ) -> bool:
+        """Release the record's lease; with ``owned``, only a fence of that authority.
+
+        Work that outlives its bout passes the fence it ran under. A newer claim's
+        fence is then left alone, heartbeat included, and the caller's is reported
+        gone, which it is. A lease the coordinator no longer holds without having
+        confirmed this release is reported released too, but dropped as lost (see
+        ``_lose_absent_ring_lease``) unless its row ran out on its own (see
+        ``_expired_on_its_own``).
+        """
+
+        if owned is None:
+            self._cancel_lease_heartbeat(record)
         store = self._lease_store_for_record(record)
         async with record.lease_lock:
             lease = record.lease
-            if lease is None:
+            if lease is None or self._lease_moved_on(record, owned):
                 return True
+            if owned is not None:
+                self._cancel_lease_heartbeat(record)
             try:
                 released = await store.release(lease)
             except Exception:
                 released = False
+            lost = False
             if not released:
                 try:
-                    released = await store.current() is None
+                    holder = await store.current()
                 except Exception:
+                    holder = lease
+                if holder is None:
+                    released = True
+                    lost = not self._expired_on_its_own(record, lease)
+                elif (
+                    lease.phase == "checking"
+                    and holder.phase == "armed"
+                    and self._same_lease_authority(holder, lease)
+                    and record.snapshot.state == SessionState.CHECKING
+                ):
+                    # The CHECKING -> ARMED CAS committed but its response was
+                    # lost. This is still our pre-bell fence, not another
+                    # holder. Adopt its exact phase and release that row; never
+                    # generalize this to RUN_COMMITTED, which is bell authority.
+                    self._adopt_lease(record, holder, record.arm_commit_sent_at)
+                    lease = holder
+                    try:
+                        released = await store.release(holder)
+                    except Exception:
+                        released = False
+                else:
                     released = False
             if released:
                 current = record.lease
@@ -5145,33 +6994,36 @@ class RunManager:
                     current.lease_id == lease.lease_id
                     and current.fencing_token == lease.fencing_token
                 ):
-                    record.lease = None
+                    if lost:
+                        self._lose_absent_ring_lease(record, current)
+                    else:
+                        record.lease = None
                 return True
         current = record.lease
         if current is not None and (
             current.lease_id == lease.lease_id and current.fencing_token == lease.fencing_token
         ):
-            ttl_seconds = (
-                self._running_lease_ttl
-                if lease.phase in {
-                    "run_committed",
-                    "redo_committed",
-                    "towel_cleanup",
-                    "cooldown",
-                }
-                or lease.phase == "cleanup_retry"
-                else self._active_lease_ttl
-            )
-            if (
-                lease.phase == "cooldown"
-                and record.snapshot.round.id == RoundId.WAKE_IDLE_APP
-            ):
-                ttl_seconds = max(
-                    ttl_seconds,
-                    self._cooldown_timeout + self._active_lease_ttl,
-                )
-            self._start_lease_heartbeat(record, timedelta(seconds=ttl_seconds))
+            self._start_lease_heartbeat(record, self._lease_ttl(record, lease.phase))
         return False
+
+    def _lease_ttl(self, record: SessionRecord, phase: str) -> timedelta:
+        ttl_seconds = (
+            self._running_lease_ttl
+            if phase in {
+                "run_committed",
+                "redo_committed",
+                "towel_cleanup",
+                "cooldown",
+            }
+            or phase == "cleanup_retry"
+            else self._active_lease_ttl
+        )
+        if phase == "cooldown" and record.snapshot.round.id == RoundId.WAKE_IDLE_APP:
+            ttl_seconds = max(
+                ttl_seconds,
+                self._cooldown_timeout + self._active_lease_ttl,
+            )
+        return timedelta(seconds=ttl_seconds)
 
     # _abandon_round5_warm_claim (direct pre-bell return-to-READY) was removed:
     # every no-bell abandon now enters CLEANING via _begin_round5_warm_cleanup and
@@ -5226,6 +7078,8 @@ class RunManager:
                 released = False
             if not released:
                 try:
+                    # Gone is released, never lost, on this ring: it is only released once
+                    # no Round 5 work runs under it, so none can have outlived its row.
                     released = await store.current() is None
                 except Exception:
                     released = False
@@ -5244,13 +7098,32 @@ class RunManager:
         return False
 
     @staticmethod
-    def _same_exact_lease(left: BoutLease, right: BoutLease) -> bool:
+    def _same_lease_authority(left: BoutLease, right: BoutLease) -> bool:
         return (
             left.lease_id == right.lease_id
             and left.fencing_token == right.fencing_token
             and left.session_id == right.session_id
             and left.owner_subject == right.owner_subject
+        )
+
+    @classmethod
+    def _same_exact_lease(cls, left: BoutLease, right: BoutLease) -> bool:
+        return (
+            cls._same_lease_authority(left, right)
             and left.phase == right.phase
+        )
+
+    @classmethod
+    def _terminal_release_owns(cls, record: SessionRecord, lease: BoutLease) -> bool:
+        terminal = record.model_score_terminal_lease
+        if terminal is not None and cls._same_exact_lease(terminal, lease):
+            return True
+        return cls._terminal_settle_active(record, lease)
+
+    @classmethod
+    def _terminal_settle_active(cls, record: SessionRecord, lease: BoutLease) -> bool:
+        return any(
+            cls._same_exact_lease(held, lease) for _, held in record.terminal_release_settles
         )
 
     async def _settle_model_score_terminal_lease(
@@ -5262,11 +7135,11 @@ class RunManager:
         Every store failure below is swallowed on purpose: a coordinator that is
         briefly unreachable must not turn a good proof into a reported lease
         loss. That tolerance has no natural end, though, so it gets an overall
-        deadline. Past it the answer is ``"unknown"`` -- the lease is neither
-        released nor declared lost, the heartbeat stops so the durable TTL can
-        expire it, and startup reconciliation settles it before the next bout.
-        That is the same outcome ``close()`` documents for a settlement that
-        cannot be proved, reached sooner rather than avoided.
+        deadline, which no coordinator call outlives. Past it the answer is
+        ``"unknown"`` -- the lease is neither released nor declared lost, the
+        heartbeat stops so the durable TTL can expire it, while a non-renewing
+        background retry releases it sooner if the coordinator recovers. That is
+        the same bounded ownership handoff as the other terminal paths.
         """
         store = self._lease_store_for_record(record)
         async with record.lease_lock:
@@ -5275,6 +7148,11 @@ class RunManager:
         if expected is None:
             return "lost"
         deadline = time.monotonic() + max(0.0, self._terminal_settle_deadline)
+        call_timeout = max(0.001, self._terminal_release_call_timeout)
+
+        def call_window() -> float:
+            return max(0.001, min(call_timeout, deadline - time.monotonic()))
+
         backoff = 0.01
         while True:
             outcome: str | None = None
@@ -5290,9 +7168,8 @@ class RunManager:
                 outcome = "lost"
             else:
                 try:
-                    released = await asyncio.wait_for(
-                        store.release(expected),
-                        timeout=max(0.001, self._terminal_release_call_timeout),
+                    released = await self._bounded_lease_call(
+                        store.release(expected), call_window()
                     )
                 except Exception:
                     released = False
@@ -5309,10 +7186,7 @@ class RunManager:
                         stop_expected_heartbeat = True
                 if outcome is None and not released:
                     try:
-                        current = await asyncio.wait_for(
-                            store.current(),
-                            timeout=max(0.001, self._terminal_release_call_timeout),
-                        )
+                        current = await self._bounded_lease_call(store.current(), call_window())
                     except Exception:
                         current_known = False
                         current = None
@@ -5325,10 +7199,12 @@ class RunManager:
                             stop_expected_heartbeat = True
                         elif not self._same_exact_lease(local, expected):
                             outcome = "lost"
-                        elif current_known and (
-                            current is None or not self._same_exact_lease(current, expected)
-                        ):
-                            record.lease = None
+                        elif current_known and current is None:
+                            self._lose_absent_ring_lease(record, local)
+                            outcome = "lost"
+                            stop_expected_heartbeat = True
+                        elif current_known and not self._same_exact_lease(current, expected):
+                            self._lose_ring_lease(record)
                             outcome = "lost"
                             stop_expected_heartbeat = True
             if outcome is not None:
@@ -5341,11 +7217,11 @@ class RunManager:
                 logger.error(
                     "Round 4 terminal lease settlement for %s could neither release "
                     "nor disprove the ring lease within %.1fs. The durable lease is "
-                    "left to expire so startup reconciliation settles it before the "
-                    "next bout.",
+                    "retried without renewal until it is released or expires.",
                     record.snapshot.id,
                     self._terminal_settle_deadline,
                 )
+                self._retry_terminal_release_in_background(record, expected)
                 return "unknown"
             await asyncio.sleep(backoff)
             backoff = min(
@@ -5452,18 +7328,498 @@ class RunManager:
                 ):
                     record.model_score_terminal_lease = None
 
-    async def _confirm_terminal_release(self, record: SessionRecord) -> bool:
-        if await self._release_bout(record):
-            return True
-        record.snapshot.failure = "Ring release could not be confirmed; final state is pending."
-        record.snapshot.remembered_result = None
-        record.snapshot.updated_at = datetime.now(UTC)
-        return False
+    async def _settle_terminal_release(
+        self,
+        record: SessionRecord,
+        expected: BoutLease | None,
+    ) -> str:
+        """Release the fence a bout finished under: "released", "lost" or "unknown".
+
+        For the terminal paths that nothing retries afterwards: Round 6's two
+        finishes, ``_fail`` (including Round 5's failure after verified cleanup),
+        Round 1's automatic return to idle and Round 1's owner cancel of a check.
+        ``_release_bout`` keeps an unconfirmed lease heartbeating so that the
+        towel's retry still holds the ring; on these paths no retry was coming,
+        so that heartbeat renewed a finished bout's ring for the life of the
+        process.
+
+        Here ``expected`` is retried, bounded by ``_terminal_settle_deadline``,
+        which is absolute: no wait outlives it and no call starts after it. The
+        heartbeat lives exactly as long as some settle of ``expected`` runs (see
+        ``_ensure_terminal_heartbeat``) and leaves a loss of this exact fence to
+        those settles, as Round 4's terminal settle does: a release may have
+        removed the row before its answer was lost. "released" means the
+        coordinator holds no lease for that fence any more; unless it confirmed
+        this release, the bout still finishes, but the ring stays closed here
+        while the bout's ring work runs. "lost" means the record no longer holds
+        that fence, or the coordinator names another holder, which is then
+        reported as a lost lease; either way the bout is not this caller's to
+        finish.
+        "unknown" means the deadline passed first: the heartbeat stops and the
+        caller finishes while a non-renewing background retry keeps releasing
+        the fence until it is released, moves on, or expires at its durable TTL.
+        Cancelled, the last settle of the fence stops the heartbeat and leaves
+        the lease to that TTL. Never called holding ``record.lock``, so a towel
+        or a read of the card does not wait out the retry.
+        """
+
+        if expected is None:
+            return "released"
+        store = self._lease_store_for_record(record)
+        deadline = time.monotonic() + max(0.0, self._terminal_settle_deadline)
+        backoff = 0.01
+        outcome: str | None = None
+        registration = (object(), expected)
+        record.terminal_release_settles.append(registration)
+        working = expected
+        try:
+            async with record.lease_lock:
+                self._ensure_terminal_heartbeat(record, expected)
+            while outcome is None:
+                async with record.lease_lock:
+                    local = record.lease
+                if (
+                    local is not None
+                    and working.phase == "checking"
+                    and local.phase == "armed"
+                    and self._same_lease_authority(local, working)
+                    and record.bell_committed_at is None
+                ):
+                    # `_release_exact_fence_once` may have adopted the pre-bell
+                    # successor after a lost CHECKING→ARMED answer. Retry that
+                    # exact armed row; the original checking copy would look
+                    # like a lost fence and `_fail` would abandon the card.
+                    working = local
+                    async with record.lease_lock:
+                        self._ensure_terminal_heartbeat(record, working)
+                outcome = await self._release_exact_fence_once(
+                    record, store, working, deadline
+                )
+                if outcome is None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        outcome = "unknown"
+                    else:
+                        await asyncio.sleep(min(backoff, left))
+                        backoff = min(
+                            backoff * 2,
+                            max(0.01, self._terminal_release_backoff_cap),
+                        )
+        finally:
+            record.terminal_release_settles = [
+                entry for entry in record.terminal_release_settles if entry is not registration
+            ]
+            last = not self._terminal_settle_active(record, expected)
+            # The last settle of this fence to exit, however it exits, ends the
+            # heartbeat it ran under. Only that exact fence's: a newer lease's
+            # heartbeat is not this settle's to stop. After a lost CHECKING→ARMED
+            # answer the settle may have adopted the successor; stop that
+            # heartbeat too so it cannot outlive the bout.
+            if last:
+                self._cancel_lease_heartbeat(record, expected)
+                if working is not expected:
+                    self._cancel_lease_heartbeat(record, working)
+        async with record.lease_lock:
+            local = record.lease
+        if (
+            local is not None
+            and working.phase == "checking"
+            and local.phase == "armed"
+            and self._same_lease_authority(local, working)
+            and record.bell_committed_at is None
+        ):
+            # Adoption can finish inside `_release_exact_fence_once` on the
+            # same pass that then returns taken/unknown. `working` still names
+            # checking until this refresh; the stale copy would skip lost-lease
+            # handling and `_fail` would abandon an ARMED card.
+            working = local
+        if outcome == "unknown":
+            logger.error(
+                "Terminal ring release for %s could not be confirmed within %.1fs. "
+                "Its release is retried in the background, never renewing, until "
+                "it is confirmed or the lease expires at its durable TTL.",
+                record.snapshot.id,
+                self._terminal_settle_deadline,
+            )
+            # Whatever a sibling settle still running goes on to do, including
+            # being cancelled, this release is still owed. Retry the fence the
+            # settle actually held: after a lost CHECKING→ARMED answer that is
+            # the adopted armed row, not the stale checking copy.
+            self._retry_terminal_release_in_background(record, working)
+            return "unknown"
+        if not last:
+            # A sibling settle of this fence is still running; it owns the lost
+            # lease report.
+            return "lost" if outcome == "taken" else outcome
+        if outcome == "taken":
+            if local is not None and self._same_exact_lease(local, working):
+                await self._handle_lost_lease(record, local)
+            return "lost"
+        return outcome
+
+    async def _settle_round5_release(
+        self,
+        record: SessionRecord,
+        expected: BoutLease | None,
+    ) -> str:
+        """Release a finished bout's Round 5 cleanup lease: "released", "lost" or "unknown".
+
+        For a bout whose cleanup already verified, so the lease no longer fences any
+        backstage work and is not renewed while its release is retried. Bounded by
+        the same absolute ``_terminal_settle_deadline``, with every coordinator call
+        outside ``lease_lock`` and the record checked for exactly ``expected``
+        around them. "unknown" leaves a non-renewing background retry, as the main
+        ring's settle does. Never called holding ``record.lock``.
+        """
+
+        # As in `_release_round5_lease`: stop backstage renewal of the warm claim
+        # so it can expire and return the generation to READY/WARMING.
+        coordinator = self._round5_warm_coordinator
+        warm_slot = record.round5_warm_slot
+        if coordinator is not None and warm_slot is not None and warm_slot.claim is not None:
+            coordinator.release_claim_active(warm_slot.claim.claim_id)
+        if expected is None:
+            return "released"
+        self._cancel_round5_lease_heartbeat(record, expected)
+        store = self._round5_cleanup_store()
+        deadline = time.monotonic() + max(0.0, self._terminal_settle_deadline)
+        backoff = 0.01
+        outcome: str | None = None
+        while outcome is None:
+            outcome = await self._release_exact_fence_once(
+                record, store, expected, deadline, round5=True
+            )
+            if outcome is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    outcome = "unknown"
+                else:
+                    await asyncio.sleep(min(backoff, left))
+                    backoff = min(backoff * 2, max(0.01, self._terminal_release_backoff_cap))
+        if outcome == "released":
+            self._round5_durable_cleanup_blocked = False
+        elif outcome == "taken":
+            async with record.lease_lock:
+                local = record.round5_lease
+                if local is not None and self._same_exact_lease(local, expected):
+                    record.round5_lease = None
+            outcome = "lost"
+        elif outcome == "unknown":
+            logger.error(
+                "Round 5 cleanup lease release for %s could not be confirmed within %.1fs. "
+                "Its release is retried in the background, never renewing, until it "
+                "is confirmed or the lease expires at its durable TTL.",
+                record.snapshot.id,
+                self._terminal_settle_deadline,
+            )
+            self._retry_terminal_release_in_background(record, expected, round5=True)
+        return outcome
+
+    def _ensure_terminal_heartbeat(self, record: SessionRecord, expected: BoutLease) -> None:
+        """Renew ``expected`` for as long as a settle of it runs; call under ``lease_lock``.
+
+        A settle normally inherits the bout's heartbeat. One that starts after a
+        cancelled settle stopped it restarts it, so the fence it still retries is
+        not left to lapse mid-retry. A live heartbeat is never replaced: the
+        record's lease, and so its heartbeat, may already be a newer fence's. The
+        last settle of ``expected`` to exit stops it.
+        """
+
+        local = record.lease
+        if local is None or not self._same_exact_lease(local, expected):
+            return
+        heartbeat = record.lease_heartbeat_task
+        if heartbeat is not None and not heartbeat.done():
+            return
+        self._start_lease_heartbeat(record, self._lease_ttl(record, local.phase))
+
+    async def _release_exact_fence_once(
+        self,
+        record: SessionRecord,
+        store: BoutLeaseStore,
+        expected: BoutLease,
+        until: float,
+        *,
+        round5: bool = False,
+    ) -> str | None:
+        """One release of ``expected`` whose every wait ends by monotonic ``until``.
+
+        "released" (the coordinator holds no lease for it any more), "taken" (the
+        coordinator names another holder), "lost" (the record no longer holds this
+        fence), "unknown" (no time was left for the next wait), or None to try
+        again. The coordinator calls run outside ``lease_lock``, so a towel moving
+        this fence is never queued behind them: a release matches the phase as well
+        as the fence, so a towel's row cannot be released by this stale copy, and
+        the record is checked for exactly ``expected`` before and after.
+
+        Only a release the coordinator confirmed is known to be this one. A main
+        ring row found gone without that may have lapsed under ring work that still
+        runs, so its fence is dropped as lost (see ``_lose_absent_ring_lease``),
+        unless it is a fence nothing renews that has run out on its own (see
+        ``_expired_on_its_own``).
+        """
+
+        call_timeout = max(0.001, self._terminal_release_call_timeout)
+        held = await self._check_exact_lease(record, expected, until, round5=round5)
+        if held != "held":
+            return held
+        left = until - time.monotonic()
+        if left <= 0:
+            return "unknown"
+        try:
+            released = await self._bounded_lease_call(
+                store.release(expected), min(call_timeout, left)
+            )
+        except Exception:
+            released = False
+        if not released:
+            left = until - time.monotonic()
+            if left <= 0:
+                return "unknown"
+            try:
+                holder = await self._bounded_lease_call(
+                    store.current(), min(call_timeout, left)
+                )
+            except Exception:
+                return None
+            if holder is not None and self._same_exact_lease(holder, expected):
+                return None
+            if (
+                not round5
+                and holder is not None
+                and expected.phase == "checking"
+                and holder.phase == "armed"
+                and self._same_lease_authority(holder, expected)
+                and record.bell_committed_at is None
+            ):
+                # The arm CAS can commit and lose only its response. Adopt that
+                # exact pre-bell successor while local authority still matches,
+                # then release it with the phase-fenced operation. A later
+                # RUN_COMMITTED phase is deliberately excluded.
+                adopted = False
+                async with record.lease_lock:
+                    local = record.lease
+                    if (
+                        local is not None
+                        and self._same_exact_lease(local, expected)
+                        and record.bell_committed_at is None
+                    ):
+                        self._adopt_lease(record, holder, record.arm_commit_sent_at)
+                        adopted = True
+                if adopted:
+                    return await self._release_exact_fence_once(
+                        record,
+                        store,
+                        holder,
+                        until,
+                    )
+            if holder is not None:
+                held = await self._check_exact_lease(record, expected, until, round5=round5)
+                return "taken" if held == "held" else held
+        held = await self._check_exact_lease(
+            record, expected, until, clear=True, lost=not released, round5=round5
+        )
+        return "released" if held == "held" else held
+
+    async def _check_exact_lease(
+        self,
+        record: SessionRecord,
+        expected: BoutLease,
+        until: float,
+        *,
+        clear: bool = False,
+        lost: bool = False,
+        round5: bool = False,
+    ) -> str:
+        """"held", "lost", or "unknown" when ``lease_lock`` was not free by ``until``.
+
+        With ``clear`` a held lease is dropped in the same critical section, and with
+        ``lost`` too a main ring lease is dropped as lost (see ``_lose_absent_ring_lease``)
+        unless its row ran out on its own (see ``_expired_on_its_own``).
+        ``round5`` checks the Round 5 cleanup lease instead of the main ring's.
+        """
+
+        left = until - time.monotonic()
+        if left <= 0:
+            return "unknown"
+        try:
+            await asyncio.wait_for(record.lease_lock.acquire(), timeout=left)
+        except TimeoutError:
+            return "unknown"
+        try:
+            local = record.round5_lease if round5 else record.lease
+            if local is None or not self._same_exact_lease(local, expected):
+                return "lost"
+            if clear:
+                if round5:
+                    record.round5_lease = None
+                elif lost and not self._expired_on_its_own(record, local):
+                    self._lose_absent_ring_lease(record, local)
+                else:
+                    record.lease = None
+            return "held"
+        finally:
+            record.lease_lock.release()
+
+    def _retry_terminal_release_in_background(
+        self,
+        record: SessionRecord,
+        expected: BoutLease,
+        *,
+        round5: bool = False,
+    ) -> None:
+        if self._closed:
+            return
+        if (
+            not round5
+            and expected.phase == "checking"
+            and record.bell_committed_at is None
+        ):
+            local = record.lease
+            if (
+                local is not None
+                and local.phase == "armed"
+                and self._same_lease_authority(local, expected)
+            ):
+                expected = local
+        slot = "round5_release_retry" if round5 else "terminal_release_retry"
+        previous: asyncio.Task[None] | None = getattr(record, f"{slot}_task")
+        if previous is not None and not previous.done():
+            running: BoutLease | None = getattr(record, f"{slot}_lease")
+            if running is not None and self._same_exact_lease(running, expected):
+                return
+            # A retry of an older fence would only find it gone; this one is owed.
+            previous.cancel()
+        setattr(record, f"{slot}_lease", expected)
+
+        async def retry_and_forget() -> None:
+            try:
+                await self._retry_terminal_release(record, expected, round5=round5)
+            finally:
+                current = asyncio.current_task()
+                if getattr(record, f"{slot}_task") is current:
+                    setattr(record, f"{slot}_task", None)
+                    setattr(record, f"{slot}_lease", None)
+
+        task = asyncio.create_task(
+            retry_and_forget(),
+            name=f"{slot.replace('_', '-')}-{record.snapshot.id}",
+        )
+        setattr(record, f"{slot}_task", task)
+
+        def forget_unstarted(done: asyncio.Task[None]) -> None:
+            # A task cancelled before its coroutine is first entered cannot run
+            # the `finally` above; keep that shutdown-only edge from retaining it.
+            if getattr(record, f"{slot}_task") is done:
+                setattr(record, f"{slot}_task", None)
+                setattr(record, f"{slot}_lease", None)
+
+        task.add_done_callback(forget_unstarted)
+
+    async def _retry_terminal_release(
+        self,
+        record: SessionRecord,
+        expected: BoutLease,
+        *,
+        round5: bool = False,
+    ) -> None:
+        """Keep releasing a finished bout's fence after its settle ran out of time.
+
+        The bout has already finished and published; this only shortens how long
+        its ring stays held when the coordinator recovers before the TTL. It never
+        renews, so it ends by the lease's own ``expires_at`` at the latest, and it
+        stops as soon as the record no longer holds exactly ``expected``. With
+        ``round5`` the fence is the Round 5 cleanup lease, on its own ring.
+        """
+
+        store = self._round5_cleanup_store() if round5 else self._lease_store_for_record(record)
+        working = expected
+        async with record.lease_lock:
+            local = record.round5_lease if round5 else record.lease
+            if (
+                not round5
+                and local is not None
+                and working.phase == "checking"
+                and local.phase == "armed"
+                and self._same_lease_authority(local, working)
+                and record.bell_committed_at is None
+            ):
+                working = local
+        if local is None or not self._same_exact_lease(local, working):
+            return
+        context = (
+            "round5" if round5 else "main",
+            record.snapshot.id,
+            local.phase,
+            local.lease_id,
+            local.fencing_token,
+            local.expires_at.isoformat(),
+        )
+        until = time.monotonic() + max(
+            0.0, (local.expires_at - datetime.now(UTC)).total_seconds()
+        )
+        logger.warning(
+            "Retrying terminal ring release in the background "
+            "ring=%s session=%s phase=%s lease_id=%s fence=%s expires_at=%s",
+            *context,
+        )
+        backoff = 0.01
+        outcome: str | None = None
+        while outcome is None:
+            async with record.lease_lock:
+                local = record.round5_lease if round5 else record.lease
+            if (
+                not round5
+                and local is not None
+                and working.phase == "checking"
+                and local.phase == "armed"
+                and self._same_lease_authority(local, working)
+                and record.bell_committed_at is None
+            ):
+                working = local
+            outcome = await self._release_exact_fence_once(
+                record, store, working, until, round5=round5
+            )
+            if outcome is None:
+                left = until - time.monotonic()
+                if left <= 0:
+                    outcome = "unknown"
+                else:
+                    await asyncio.sleep(min(backoff, left))
+                    backoff = min(
+                        backoff * 2,
+                        max(0.01, self._terminal_release_backoff_cap),
+                    )
+        if round5 and outcome == "released":
+            self._round5_durable_cleanup_blocked = False
+        if outcome in {"taken", "unknown"}:
+            # Expired, or named as another's: either way no longer this record's.
+            async with record.lease_lock:
+                if round5:
+                    local = record.round5_lease
+                    if local is not None and self._same_exact_lease(local, working):
+                        record.round5_lease = None
+                else:
+                    local = record.lease
+                    if (
+                        local is not None
+                        and self._same_exact_lease(local, working)
+                        and not self._terminal_release_owns(record, local)
+                    ):
+                        self._lose_ring_lease(record)
+        log = logger.info if outcome in {"released", "lost"} else logger.warning
+        log(
+            "Background terminal ring release ended outcome=%s "
+            "ring=%s session=%s phase=%s lease_id=%s fence=%s expires_at=%s",
+            outcome,
+            *context,
+        )
 
     async def _hold_bout_during_reset(
         self,
         record: SessionRecord,
         operation: Awaitable[None],
+        held: BoutLease | None,
     ) -> None:
         try:
             await operation
@@ -5477,14 +7833,24 @@ class RunManager:
                 ResetMode.DELETE_RECOVERY_ENVIRONMENT,
             }
             if owns_artifacts:
-                released = cleanup_ready and await self._release_bout(record)
+                released = cleanup_ready and await self._release_bout(record, held)
                 if not released:
                     await self._auto_cleanup_owned_artifacts(
                         record,
                         recovery=mode == ResetMode.DELETE_RECOVERY_ENVIRONMENT,
+                        owned=held,
                     )
             elif mode != ResetMode.RETURN_TO_IDLE or cleanup_ready:
-                await self._release_bout(record)
+                # As the automatic return to idle does: nothing retries this release.
+                if await self._settle_terminal_release(record, held) != "released":
+                    async with record.lock:
+                        if cooldown is not None and record.snapshot.cooldown is cooldown:
+                            cooldown.state = CooldownState.FAILED
+                            cooldown.failure = (
+                                "Return to idle was verified, but ring release could not "
+                                "be confirmed."
+                            )
+                            record.snapshot.updated_at = datetime.now(UTC)
 
     async def _transition_bout_to_cleanup(
         self,
@@ -5525,7 +7891,8 @@ class RunManager:
                         "ROUND 5 ARTIFACT LEASE CHANGED · CLEANUP REMAINS FENCED"
                     )
             try:
-                record.lease = await self._lease_store_for_record(record).transition(
+                sent = time.monotonic()
+                cooldown = await self._lease_store_for_record(record).transition(
                     lease,
                     operator=record.operator or lease.operator,
                     expected_phase=expected_phase,
@@ -5535,10 +7902,103 @@ class RunManager:
                 )
             except LeaseLostError as exc:
                 raise InvalidStateError("RING LEASE CHANGED · CLEANUP REMAINS FENCED") from exc
+            self._set_lease(record, cooldown, sent)
         self._start_lease_heartbeat(
             record,
             timedelta(seconds=cleanup_ttl_seconds),
         )
+
+    async def _fence_finished_bout_for_cleanup(
+        self,
+        record: SessionRecord,
+        session_state: SessionState,
+    ) -> str:
+        """Move a finished bout's fence to its cleanup phase: "fenced", "lost" or "unknown".
+
+        For Rounds 1-3, which hold ``record.lock`` from the verdict through this move,
+        so neither a towel nor a lost lease's handling interleaves. A coordinator that
+        does not answer is retried, and no attempt starts after
+        ``_terminal_release_call_timeout``. The move is a strict compare-and-swap, so
+        one that landed and lost only its answer is refused when retried, the store's
+        own retry included; the coordinator is then asked what it holds, and the bout's
+        own row already in its cleanup phase is adopted. "lost" means the fence is gone
+        or another's. "unknown" means the bound ran out first: the fence is never
+        renewed again, and a non-renewing background release frees the ring, or the
+        row's durable TTL does, as after a terminal settle that runs out of time, and
+        nothing reports a lost lease over the verdict. A failure that itself outlasts
+        the bound is not followed by that question, so a move that landed is then freed
+        by its TTL rather than adopted.
+        """
+
+        async with record.lease_lock:
+            committed = record.lease
+        store = self._lease_store_for_record(record)
+        deadline = time.monotonic() + max(0.001, self._terminal_release_call_timeout)
+        backoff = 0.01
+        first_sent: float | None = None
+        while True:
+            if first_sent is None:
+                first_sent = time.monotonic()
+            try:
+                await self._transition_bout_to_cleanup(
+                    record, session_state, expected_lease=committed
+                )
+            except InvalidStateError as exc:
+                # Only a refused compare-and-swap can have been this bout's own move.
+                if not isinstance(exc.__cause__, LeaseLostError):
+                    return "lost"
+            except Exception as exc:
+                logger.warning(
+                    "Cleanup fence move failed session=%s diagnosis=%s",
+                    record.snapshot.id,
+                    operator_diagnosis(exc),
+                )
+            else:
+                return "fenced"
+            left = deadline - time.monotonic()
+            if left > 0:
+                try:
+                    holder = await self._bounded_lease_call(store.current(), left)
+                except Exception:
+                    pass
+                else:
+                    if (
+                        holder is not None
+                        and holder.phase == "cooldown"
+                        and self._same_lease_authority(holder, committed)
+                    ):
+                        # Proven from the first attempt: whichever one landed, the row
+                        # lives at least its TTL past that.
+                        async with record.lease_lock:
+                            local = record.lease
+                            adopted = local is not None and self._same_exact_lease(
+                                local, committed
+                            )
+                            if adopted:
+                                self._set_lease(record, holder, first_sent)
+                        if not adopted:
+                            return "lost"
+                        self._start_lease_heartbeat(
+                            record, self._lease_ttl(record, holder.phase)
+                        )
+                        return "fenced"
+                    if holder is None or not self._same_exact_lease(holder, committed):
+                        return "lost"
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            await asyncio.sleep(min(backoff, left))
+            backoff = min(backoff * 2, max(0.01, self._terminal_release_backoff_cap))
+        logger.error(
+            "Cleanup fence for %s could not be confirmed within %.1fs. Its run fence is "
+            "released in the background, never renewing, until it is confirmed or the "
+            "lease expires at its durable TTL.",
+            record.snapshot.id,
+            self._terminal_release_call_timeout,
+        )
+        self._cancel_lease_heartbeat(record, committed)
+        self._retry_terminal_release_in_background(record, committed)
+        return "unknown"
 
     def _schedule_round_settlement(
         self,
@@ -5603,13 +8063,12 @@ class RunManager:
                     # released, so the only honest thing left is to say so
                     # loudly enough that reconciliation has something to match.
                     logger.error(
-                        "%s settlement attempt %d/%d failed session=%s: %s: %s",
+                        "%s settlement attempt %d/%d failed session=%s diagnosis=%s",
                         label,
                         attempt,
                         self._settlement_attempts,
                         record.snapshot.id,
-                        type(exc).__name__,
-                        exc,
+                        operator_diagnosis(exc),
                     )
                     if attempt == self._settlement_attempts:
                         return
@@ -5631,7 +8090,7 @@ class RunManager:
         if current is not None and not current.done():
             return
         record.cooldown_task = asyncio.create_task(
-            self._auto_cleanup_owned_artifacts(record, recovery=recovery),
+            self._auto_cleanup_owned_artifacts(record, recovery=recovery, owned=record.lease),
             name=f"auto-artifact-cleanup-{record.snapshot.id}",
         )
 
@@ -5640,6 +8099,7 @@ class RunManager:
         record: SessionRecord,
         *,
         recovery: bool,
+        owned: BoutLease | None = None,
     ) -> None:
         task = asyncio.current_task()
         delay = max(0.1, self._cleanup_retry_initial)
@@ -5649,33 +8109,26 @@ class RunManager:
             # Let the verified/failed receipt event reach the room first.
             await asyncio.sleep(0)
             while not self._closed:
+                if self._lease_moved_on(record, owned):
+                    return
                 if not cleanup_complete:
                     if recovery:
-                        engine = record.recovery_engine
-                        if engine is None:
+                        if record.recovery_engine is None:
                             return
-                        settle = getattr(engine, "settle_pending_mutations", None)
-                        try:
-                            if settle is not None:
-                                await settle(record.snapshot.competitor.id)
-                        except Exception as exc:
-                            logger.error(
-                                "Recovery cleanup settlement is pending session=%s: %s",
-                                record.snapshot.id,
-                                type(exc).__name__,
-                            )
                     operation = (
                         self._reset_recovery(record)
                         if recovery
                         else self._reset_safe_change(record)
                     )
                     await operation
+                    if self._lease_moved_on(record, owned):
+                        return
                     async with record.lock:
                         cooldown = record.snapshot.cooldown
                         cleanup_complete = bool(
                             cooldown is not None and cooldown.state == CooldownState.READY
                         )
-                if cleanup_complete and await self._release_bout(record):
+                if cleanup_complete and await self._release_bout(record, owned):
                     async with record.lock:
                         cooldown = record.snapshot.cooldown
                         if cooldown is not None:
@@ -5722,30 +8175,49 @@ class RunManager:
                 record.cooldown_task = None
 
     def _schedule_round_one_cooldown(self, record: SessionRecord) -> None:
-        if self._closed or record.live_targets is None:
+        cooldown = record.snapshot.cooldown
+        if self._closed or record.live_targets is None or cooldown is None:
             return
         current = record.cooldown_task
         if current is not None and not current.done():
-            return
-        record.cooldown_task = asyncio.create_task(
-            self._run_automatic_round_one_cooldown(record),
+            if current is not record.idle_watch_task:
+                return
+            # Each caller has just ended a bout under a fresh cooldown, so a watch still
+            # running is an earlier cooldown's, which it can no longer act on.
+            current.cancel()
+        record.cooldown_task = record.idle_watch_task = asyncio.create_task(
+            self._run_automatic_round_one_cooldown(record, CooldownWatch(cooldown, record.lease)),
             name=f"auto-idle-watch-{record.snapshot.id}",
         )
 
-    async def _run_automatic_round_one_cooldown(self, record: SessionRecord) -> None:
+    async def _run_automatic_round_one_cooldown(
+        self,
+        record: SessionRecord,
+        watch: CooldownWatch,
+    ) -> None:
+        """Watch Round 1 return to idle, then release the lease the watch began under.
+
+        The watch acts on no other cooldown and no other lease. Once the record shows
+        another cooldown or holds another lease, the card may have been armed again, and
+        what it shows and holds is the newer bout's.
+        """
+
         task = asyncio.current_task()
         try:
             await asyncio.sleep(0)
-            await self._monitor_cooldown(record)
+            await self._monitor_cooldown(record, watch)
             async with record.lock:
-                cooldown = record.snapshot.cooldown
-                ready = bool(cooldown is not None and cooldown.state == CooldownState.READY)
-            if ready and not await self._release_bout(record):
+                async with record.lease_lock:
+                    held = record.lease
+                ready = bool(
+                    self._watch_is_current(record, watch)
+                    and watch.cooldown.state == CooldownState.READY
+                )
+            if ready and await self._settle_terminal_release(record, held) != "released":
                 async with record.lock:
-                    cooldown = record.snapshot.cooldown
-                    if cooldown is not None:
-                        cooldown.state = CooldownState.FAILED
-                        cooldown.failure = (
+                    if self._watch_is_current(record, watch):
+                        watch.cooldown.state = CooldownState.FAILED
+                        watch.cooldown.failure = (
                             "Return to idle was verified, but ring release could not be confirmed."
                         )
                         record.snapshot.updated_at = datetime.now(UTC)
@@ -5754,9 +8226,37 @@ class RunManager:
         finally:
             if record.cooldown_task is task:
                 record.cooldown_task = None
+            if record.idle_watch_task is task:
+                record.idle_watch_task = None
 
-    def _cancel_armed_expiry(self, record: SessionRecord) -> None:
+    def _watch_is_current(self, record: SessionRecord, watch: CooldownWatch) -> bool:
+        """Whether ``watch`` may still act on ``record``; called under ``record.lock``."""
+
+        if record.snapshot.cooldown is not watch.cooldown:
+            return False
+        lease = record.lease
+        return lease is None or (
+            watch.owned is not None and self._same_exact_lease(lease, watch.owned)
+        )
+
+    @staticmethod
+    def _cancel_idle_watch(record: SessionRecord) -> None:
+        """Stop the record's idle watch, its cooldown being replaced; held under ``record.lock``.
+
+        Not awaited, so the lock is not held across its unwinding. A watch whose cooldown
+        is gone acts on nothing in any case; this only stops it polling sooner.
+        """
+
+        watch = record.idle_watch_task
+        if watch is not None and not watch.done():
+            watch.cancel()
+
+    def _cancel_armed_expiry(self, record: SessionRecord, *, force: bool = False) -> None:
         task = record.armed_expiry_task
+        if record.armed_release_pending and not force:
+            # The window already expired and its release is being settled; only
+            # the timer was this call's to cancel.
+            return
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
         record.armed_expiry_task = None
@@ -5790,6 +8290,7 @@ class RunManager:
         *,
         message: str | None = None,
         event: str = "session_failed",
+        release_reserved: bool = False,
     ) -> bool:
         """Release an armed fight card that never rang.
 
@@ -5806,38 +8307,204 @@ class RunManager:
             "Fight card expired before the bell. The ring was released automatically; "
             "prepare it again."
         )
-        cleanup_pending = False
+        is_round_five = False
+        round_five_operator: BoutOperator | None = None
+        owns_reservation = False
+        arm_bout_id: str | None = None
         async with record.lock:
             if (
                 record.snapshot.state != SessionState.ARMED
                 or record.armed_at_monotonic != armed_at_monotonic
+                or record.bell_committed_at is not None
             ):
+                if (
+                    release_reserved
+                    and record.armed_expiry_task is asyncio.current_task()
+                ):
+                    record.armed_release_pending = False
+                    record.armed_expiry_task = None
                 return False
-            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
-                # A no-bell abandon ALWAYS enters CLEANING (retaining the claim). The
-                # AUTHORITATIVE convergence -- exact durable SETTLED of the claim jobs
-                # + provider/journal absence + finish_cleanup_and_rewarm to N+1 -- is
-                # the coordinator's SINGLE owner (converge_cleanup on the retry worker;
-                # the manager no longer reconciles independently). The provider
-                # janitor settles staged residents during convergence; the manager
-                # performs no external cleanup mutation when a coordinator exists.
+            handoff = record.bell_handoff_task
+            if (
+                handoff is not None
+                and not handoff.done()
+                and record.bell_commit_attempted_bout_id
+                == record.snapshot.receipt_bout_id
+                and asyncio.current_task() is not record.bell_convergence_task
+            ):
+                # A bell for this attempt owns the ARMED/run_committed
+                # ambiguity. Expiry or owner-cancel queued behind it must not
+                # race a stale ARMED release and erase the local authority that
+                # convergence needs to adopt the durable committed phase.
+                if (
+                    release_reserved
+                    and record.armed_expiry_task is asyncio.current_task()
+                ):
+                    # Owner-cancel reserved the no-bell slot before discovering
+                    # the in-flight bell. Hand ownership back to convergence;
+                    # otherwise its later durable-ARMED path sees a permanently
+                    # reserved slot and neither path can settle the card.
+                    record.armed_release_pending = False
+                    record.armed_expiry_task = None
+                return False
+            if release_reserved:
+                if not record.armed_release_pending:
+                    return False
+            else:
+                if record.armed_release_pending:
+                    if asyncio.current_task() is not record.bell_convergence_task:
+                        return False
+                    # Convergence can arrive before the owner-cancel task has
+                    # observed the in-flight handoff and relinquished its
+                    # reservation. Transfer the slot atomically; that older
+                    # task will then fail its ownership check and return.
+                    record.armed_expiry_task = asyncio.current_task()
+                    owns_reservation = True
+                    arm_bout_id = record.snapshot.receipt_bout_id
+                else:
+                    # Atomically reserves every no-bell path before any coordinator or
+                    # provider await. `start_run` checks this under the same card lock.
+                    record.armed_release_pending = True
+                    owns_reservation = True
+                    arm_bout_id = record.snapshot.receipt_bout_id
+            is_round_five = (
+                record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+            )
+            if is_round_five:
+                round_five_operator = record.operator
+            else:
+                async with record.lease_lock:
+                    armed_lease = record.lease
+                    if (
+                        armed_lease is not None
+                        and (
+                            armed_lease.session_id != record.snapshot.id
+                            or armed_lease.phase not in {"checking", "armed"}
+                        )
+                    ):
+                        record.armed_release_pending = False
+                        return False
+
+        if is_round_five:
+            async def bounded_step(label: str, operation):
+                try:
+                    async with asyncio.timeout(
+                        max(0.001, self._terminal_release_call_timeout)
+                    ):
+                        return await operation
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Round 5 no-bell %s did not complete session=%s diagnostic=%s",
+                        label,
+                        record.snapshot.id,
+                        _redacted_exception_chain(exc),
+                    )
+                    return None
+
+            try:
+                # A no-bell abandon ALWAYS enters CLEANING. All external work is
+                # outside `record.lock`, so reads/SSE remain prompt while it stalls.
                 if self._round5_warm_coordinator is None:
-                    await self._cleanup_connection_spike(record)
+                    await bounded_step(
+                        "provider cleanup",
+                        self._cleanup_connection_spike(record),
+                    )
+                if round_five_operator is not None:
+                    await bounded_step(
+                        "cleanup-fence retention",
+                        self._retain_connection_spike_cleanup_lease(
+                            record,
+                            round_five_operator,
+                        ),
+                    )
+                await bounded_step(
+                    "durable cleanup transition",
+                    self._begin_round5_warm_cleanup(record),
+                )
+            except asyncio.CancelledError:
+                # Cancellation means the I/O answer is unknown, never that cleanup
+                # is no longer owed. A tracked child records the debt before this
+                # task propagates cancellation.
+                finalizer = asyncio.create_task(
+                    self._finalize_round5_no_bell_abandon(
+                        record,
+                        armed_at_monotonic,
+                    ),
+                    name=f"round5-cancelled-no-bell-{record.snapshot.id}",
+                )
+                record.armed_expiry_task = finalizer
+                try:
+                    await asyncio.shield(finalizer)
+                finally:
+                    raise
+            return await self._finalize_round5_no_bell_abandon(
+                record,
+                armed_at_monotonic,
+            )
+
+        try:
+            if await self._settle_terminal_release(record, armed_lease) == "lost":
+                return False
+            async with record.lock:
+                if (
+                    record.snapshot.state != SessionState.ARMED
+                    or record.armed_at_monotonic != armed_at_monotonic
+                ):
+                    return False
+                record.snapshot.state = SessionState.FAILED
+                record.snapshot.failure = message
+                record.snapshot.remembered_result = None
+                record.snapshot.updated_at = datetime.now(UTC)
+                record.armed_at_monotonic = None
+                snapshot = record.snapshot.model_copy(deep=True)
+        finally:
+            async with record.lock:
+                owns_slot = record.armed_expiry_task is asyncio.current_task()
+                owns_same_bout = (
+                    owns_reservation
+                    and record.snapshot.receipt_bout_id == arm_bout_id
+                )
+                if owns_slot or owns_same_bout:
+                    expiry_task = record.armed_expiry_task
+                    if (
+                        expiry_task is not None
+                        and expiry_task is not asyncio.current_task()
+                        and not expiry_task.done()
+                    ):
+                        expiry_task.cancel()
+                    record.armed_release_pending = False
+                    record.armed_expiry_task = None
+        await record.event_log.publish(
+            event,
+            {
+                "state": SessionState.FAILED,
+                "message": message,
+                "session": snapshot.model_dump(mode="json"),
+            },
+            receipt_bout_id=snapshot.receipt_bout_id,
+        )
+        return True
+
+    async def _finalize_round5_no_bell_abandon(
+        self,
+        record: SessionRecord,
+        armed_at_monotonic: float,
+    ) -> bool:
+        """Record one terminal Round 5 cleanup debt after no-bell I/O stops."""
+
+        task = asyncio.current_task()
+        message = _ROUND_FIVE_CLEANUP_PENDING
+        try:
+            async with record.lock:
+                if (
+                    record.snapshot.state != SessionState.ARMED
+                    or record.armed_at_monotonic != armed_at_monotonic
+                ):
+                    return False
                 record.snapshot.metrics = []
                 record.snapshot.comparison = None
-                if record.snapshot.round5_setup is not None:
-                    record.snapshot.round5_setup.state = RoundFiveSetupState.FAILED
-                    record.snapshot.round5_setup.failure = "The clean per-bout baseline expired"
-                if record.operator is not None:
-                    try:
-                        await self._retain_connection_spike_cleanup_lease(
-                            record,
-                            record.operator,
-                        )
-                    except InvalidStateError:
-                        pass
-                await self._begin_round5_warm_cleanup(record)
-                message = _ROUND_FIVE_CLEANUP_PENDING
                 setup = record.snapshot.round5_setup
                 if setup is not None:
                     setup.state = RoundFiveSetupState.CLEANUP_FAILED
@@ -5851,55 +8518,29 @@ class RunManager:
                 record.snapshot.remembered_result = None
                 record.snapshot.updated_at = datetime.now(UTC)
                 record.armed_at_monotonic = None
-                record.armed_expiry_task = None
                 for lane in record.snapshot.lanes.values():
                     lane.state = LaneState.FAILED
                     lane.status = message
                     lane.error = message
                     lane.activity = LaneActivity(phase="cleanup_failed")
                 snapshot = record.snapshot.model_copy(deep=True)
-                cleanup_pending = True
-            if not cleanup_pending:
-                if not await self._confirm_terminal_release(record):
-                    record.armed_expiry_task = None
-                    return False
-                if (
-                    record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
-                    and not await self._release_round5_lease(record)
-                ):
-                    record.armed_expiry_task = None
-                    return False
-                record.snapshot.state = SessionState.FAILED
-                record.snapshot.failure = message
-                record.snapshot.remembered_result = None
-                if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
-                    record.snapshot.metrics = []
-                    record.snapshot.comparison = None
-                    if record.snapshot.round5_setup is not None:
-                        record.snapshot.round5_setup.state = RoundFiveSetupState.FAILED
-                        record.snapshot.round5_setup.downstream_validated = False
-                        record.snapshot.round5_setup.failure = (
-                            "Setup or downstream verification did not complete"
-                        )
-                record.snapshot.updated_at = datetime.now(UTC)
-                record.armed_at_monotonic = None
-                record.armed_expiry_task = None
-                snapshot = record.snapshot.model_copy(deep=True)
-        await record.event_log.publish(
-            # Round 5's no-bell release keeps its cleanup record, whoever asked for it.
-            "session_failed" if cleanup_pending else event,
-            {
-                "state": SessionState.FAILED,
-                "message": message,
-                "session": snapshot.model_dump(mode="json"),
-            },
-        )
-        if cleanup_pending:
-            # The invariant: retryable cleanup always has both an owed notice and
-            # a live convergence worker. This call is outside ``record.lock``
-            # because it publishes its own cleanup snapshot under that lock.
+            await record.event_log.publish(
+                "session_failed",
+                {
+                    "state": SessionState.FAILED,
+                    "message": message,
+                    "session": snapshot.model_dump(mode="json"),
+                },
+                receipt_bout_id=snapshot.receipt_bout_id,
+            )
+            # Retryable cleanup always has both an owed notice and a live
+            # convergence worker, even when the initiating task was cancelled.
             await self._mark_connection_spike_cleanup_pending(record)
-        return True
+            return True
+        finally:
+            record.armed_release_pending = False
+            if record.armed_expiry_task is task:
+                record.armed_expiry_task = None
 
     def _arm_refusal(
         self,
@@ -5971,9 +8612,12 @@ class RunManager:
         error: BaseException,
         *,
         round_number: int,
+        arm_bout_id: str,
     ) -> None:
         """Fail an arm without discarding what refused it."""
 
+        if await self._arm_attempt_was_cancelled(record, arm_bout_id):
+            return
         await self._fail(
             record,
             self._arm_refusal(record, summary, error, round_number=round_number),
@@ -6119,7 +8763,7 @@ class RunManager:
             winner,
         )
 
-    async def _arm(self, record: SessionRecord) -> None:
+    async def _arm(self, record: SessionRecord, arm_bout_id: str) -> None:
         assert record.live_targets is not None
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         loop = asyncio.get_running_loop()
@@ -6191,13 +8835,12 @@ class RunManager:
                         snapshot = record.snapshot.model_copy(deep=True)
                         armed_at_monotonic = record.armed_at_monotonic
                     assert armed_at_monotonic is not None
-                    armed_expires_at = snapshot.armed_expires_at
-                    assert armed_expires_at is not None
-                    await self._mark_bout_armed(record, armed_expires_at)
-                    self._schedule_armed_expiry(record, armed_at_monotonic)
-                    await record.event_log.publish(
-                        "armed",
-                        {
+                    await self._publish_armed_if_current(
+                        record,
+                        arm_bout_id=arm_bout_id,
+                        armed_at_monotonic=armed_at_monotonic,
+                        snapshot=snapshot,
+                        payload={
                             "state": SessionState.ARMED,
                             "evidence": {
                                 record.live_targets[index].id: check
@@ -6222,6 +8865,7 @@ class RunManager:
                 "The start state could not be verified.",
                 exc,
                 round_number=1,
+                arm_bout_id=arm_bout_id,
             )
         except Exception as exc:
             await self._fail_arm(
@@ -6229,9 +8873,14 @@ class RunManager:
                 "The start state could not be verified.",
                 exc,
                 round_number=1,
+                arm_bout_id=arm_bout_id,
             )
 
-    async def _arm_safe_change(self, record: SessionRecord) -> None:
+    async def _arm_safe_change(
+        self,
+        record: SessionRecord,
+        arm_bout_id: str,
+    ) -> None:
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         try:
             engine = self._safe_change_factory()
@@ -6266,14 +8915,13 @@ class RunManager:
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
-            armed_expires_at = snapshot.armed_expires_at
-            assert armed_expires_at is not None
-            await self._mark_bout_armed(record, armed_expires_at)
-            self._schedule_armed_expiry(record, armed_at_monotonic)
             evidence = {lane_id: dict(lane.evidence) for lane_id, lane in arm.lanes.items()}
-            await record.event_log.publish(
-                "armed",
-                {
+            await self._publish_armed_if_current(
+                record,
+                arm_bout_id=arm_bout_id,
+                armed_at_monotonic=armed_at_monotonic,
+                snapshot=snapshot,
+                payload={
                     "state": SessionState.ARMED,
                     "evidence": evidence,
                     "session": snapshot.model_dump(mode="json"),
@@ -6285,6 +8933,7 @@ class RunManager:
                 "The isolated-change start state could not be verified.",
                 exc,
                 round_number=2,
+                arm_bout_id=arm_bout_id,
             )
         except Exception as exc:
             await self._fail_arm(
@@ -6292,9 +8941,14 @@ class RunManager:
                 "The isolated-change start state could not be verified.",
                 exc,
                 round_number=2,
+                arm_bout_id=arm_bout_id,
             )
 
-    async def _arm_recovery(self, record: SessionRecord) -> None:
+    async def _arm_recovery(
+        self,
+        record: SessionRecord,
+        arm_bout_id: str,
+    ) -> None:
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         try:
             engine = self._recovery_factory()
@@ -6341,12 +8995,12 @@ class RunManager:
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
-            assert snapshot.armed_expires_at is not None
-            await self._mark_bout_armed(record, snapshot.armed_expires_at)
-            self._schedule_armed_expiry(record, armed_at_monotonic)
-            await record.event_log.publish(
-                "armed",
-                {
+            await self._publish_armed_if_current(
+                record,
+                arm_bout_id=arm_bout_id,
+                armed_at_monotonic=armed_at_monotonic,
+                snapshot=snapshot,
+                payload={
                     "state": SessionState.ARMED,
                     "evidence": {
                         lane_id: dict(lane.evidence) for lane_id, lane in arm.lanes.items()
@@ -6360,6 +9014,7 @@ class RunManager:
                 "The recovery start state could not be verified.",
                 exc,
                 round_number=3,
+                arm_bout_id=arm_bout_id,
             )
         except Exception as exc:
             await self._fail_arm(
@@ -6367,9 +9022,14 @@ class RunManager:
                 "The recovery start state could not be verified.",
                 exc,
                 round_number=3,
+                arm_bout_id=arm_bout_id,
             )
 
-    async def _arm_model_score(self, record: SessionRecord) -> None:
+    async def _arm_model_score(
+        self,
+        record: SessionRecord,
+        arm_bout_id: str,
+    ) -> None:
         """Round 4's Prepare: both lanes parked and every destination at its baseline.
 
         Starts nothing. Both integrations stay parked until the bell, because
@@ -6443,12 +9103,12 @@ class RunManager:
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
-            assert snapshot.armed_expires_at is not None
-            await self._mark_bout_armed(record, snapshot.armed_expires_at)
-            self._schedule_armed_expiry(record, armed_at_monotonic)
-            await record.event_log.publish(
-                "armed",
-                {
+            await self._publish_armed_if_current(
+                record,
+                arm_bout_id=arm_bout_id,
+                armed_at_monotonic=armed_at_monotonic,
+                snapshot=snapshot,
+                payload={
                     "state": SessionState.ARMED,
                     "evidence": {
                         lane_id: lane.evidence for lane_id, lane in snapshot.lanes.items()
@@ -6462,6 +9122,7 @@ class RunManager:
                 "Round 4 could not confirm both lanes parked at their baseline.",
                 exc,
                 round_number=4,
+                arm_bout_id=arm_bout_id,
             )
         except Exception as exc:
             await self._fail_arm(
@@ -6469,6 +9130,7 @@ class RunManager:
                 "Round 4 could not confirm both lanes parked at their baseline.",
                 exc,
                 round_number=4,
+                arm_bout_id=arm_bout_id,
             )
 
     async def _await_prior_round4_settlement(
@@ -6559,13 +9221,14 @@ class RunManager:
             returned = getattr(coordinator, "return_unstarted_claim", None)
             if not callable(returned):
                 return False
+            main, cleanup = record.lease, record.round5_lease
             try:
                 record.round5_warm_slot = await returned(
                     claim.claim_id,
                     main_store=self._lease_store_for_record(record),
-                    main_lease=record.lease,
+                    main_lease=main,
                     cleanup_store=self._round5_cleanup_store(),
-                    cleanup_lease=record.round5_lease,
+                    cleanup_lease=cleanup,
                 )
             except Exception:
                 logger.error(
@@ -6573,11 +9236,16 @@ class RunManager:
                     exc_info=True,
                 )
                 return False
+            await self._forget_rings_the_warm_store_returned(record, main, cleanup)
         await self._release_round5_lease(record)
         await self._release_bout(record)
         return True
 
-    async def _arm_connection_spike(self, record: SessionRecord) -> None:
+    async def _arm_connection_spike(
+        self,
+        record: SessionRecord,
+        arm_bout_id: str,
+    ) -> None:
         await record.event_log.publish("arm_started", {"state": SessionState.CHECKING})
         factory = self._connection_spike_factory
         capsule = record.round5_launch_capsule
@@ -6680,17 +9348,19 @@ class RunManager:
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
-            assert snapshot.armed_expires_at is not None
-            await self._mark_bout_armed(record, snapshot.armed_expires_at)
-            self._schedule_armed_expiry(record, armed_at_monotonic)
-            await record.event_log.publish(
-                "armed",
-                {
+            await self._publish_armed_if_current(
+                record,
+                arm_bout_id=arm_bout_id,
+                armed_at_monotonic=armed_at_monotonic,
+                snapshot=snapshot,
+                payload={
                     "state": SessionState.ARMED,
                     "session": snapshot.model_dump(mode="json"),
                 },
             )
         except Exception as exc:
+            if await self._arm_attempt_was_cancelled(record, arm_bout_id):
+                return
             message = self._arm_refusal(
                 record,
                 "The Round 5 start state could not be verified.",
@@ -6718,7 +9388,6 @@ class RunManager:
                 await self._finish_connection_spike_failure(
                     record,
                     message,
-                    cleanup_verified=False,
                 )
             else:
                 cleanup_ok = await self._cleanup_connection_spike(record)
@@ -6728,10 +9397,13 @@ class RunManager:
                     await self._finish_connection_spike_failure(
                         record,
                         message,
-                        cleanup_verified=False,
                     )
 
-    async def _arm_live_orders(self, record: SessionRecord) -> None:
+    async def _arm_live_orders(
+        self,
+        record: SessionRecord,
+        arm_bout_id: str,
+    ) -> None:
         """Round 6's Prepare: the AWS pipeline parked and every source at its baseline.
 
         Starts nothing. DMS and Glue stay parked until the bell, because the AWS lane's
@@ -6804,12 +9476,15 @@ class RunManager:
                 snapshot = record.snapshot.model_copy(deep=True)
                 armed_at_monotonic = record.armed_at_monotonic
             assert armed_at_monotonic is not None
-            assert snapshot.armed_expires_at is not None
-            await self._mark_bout_armed(record, snapshot.armed_expires_at)
-            self._schedule_armed_expiry(record, armed_at_monotonic)
-            await record.event_log.publish(
-                "armed",
-                {"state": SessionState.ARMED, "session": snapshot.model_dump(mode="json")},
+            await self._publish_armed_if_current(
+                record,
+                arm_bout_id=arm_bout_id,
+                armed_at_monotonic=armed_at_monotonic,
+                snapshot=snapshot,
+                payload={
+                    "state": SessionState.ARMED,
+                    "session": snapshot.model_dump(mode="json"),
+                },
             )
         except Exception as exc:
             await self._fail_arm(
@@ -6817,6 +9492,7 @@ class RunManager:
                 "Round 6 could not confirm its pipelines at rest and its sources at baseline.",
                 exc,
                 round_number=6,
+                arm_bout_id=arm_bout_id,
             )
 
     async def _await_prior_round6_settlement(
@@ -7420,7 +10096,6 @@ class RunManager:
                 await self._finish_connection_spike_failure(
                     record,
                     message,
-                    cleanup_verified=False,
                 )
                 return
         else:
@@ -7481,7 +10156,6 @@ class RunManager:
             await self._finish_connection_spike_failure(
                 record,
                 message,
-                cleanup_verified=False,
             )
             return
         await self._finish_connection_spike(record, result)
@@ -7502,6 +10176,8 @@ class RunManager:
             await self._fail(record, "Round 6 must be prepared again.")
             return
         async with record.lock:
+            if not self._committed_run_active_locked(record):
+                return
             started_at = datetime.now(UTC)
             record.snapshot.state = SessionState.RUNNING
             record.snapshot.run_started_at = started_at
@@ -7602,7 +10278,12 @@ class RunManager:
         async with record.lock:
             if record.snapshot.towel is not None or record.round5_terminal_published:
                 return
-            if not await self._confirm_terminal_release(record):
+            async with record.lease_lock:
+                terminal_lease = record.lease
+        if await self._settle_terminal_release(record, terminal_lease) == "lost":
+            return
+        async with record.lock:
+            if record.snapshot.towel is not None or record.round5_terminal_published:
                 return
             measured = self._apply_live_orders_result(record.snapshot, result)
             record.snapshot.state = SessionState.VERIFIED if measured else SessionState.FAILED
@@ -7621,6 +10302,7 @@ class RunManager:
             await record.event_log.publish(
                 "run_finished",
                 {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
         else:
             self._log_lane_refusals(record, round_number=6)
@@ -7631,6 +10313,7 @@ class RunManager:
                     "message": snapshot.failure,
                     "session": snapshot.model_dump(mode="json"),
                 },
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
         self._schedule_round_settlement(
             record,
@@ -7739,7 +10422,12 @@ class RunManager:
         async with record.lock:
             if record.snapshot.towel is not None:
                 return
-            if not await self._confirm_terminal_release(record):
+            async with record.lease_lock:
+                terminal_lease = record.lease
+        if await self._settle_terminal_release(record, terminal_lease) == "lost":
+            return
+        async with record.lock:
+            if record.snapshot.towel is not None:
                 return
             for lane in record.snapshot.lanes.values():
                 if lane.state in {LaneState.NOT_SUPPORTED, LaneState.VERIFIED}:
@@ -7771,6 +10459,7 @@ class RunManager:
                 "message": message,
                 "session": snapshot.model_dump(mode="json"),
             },
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         self._schedule_round_settlement(
             record,
@@ -7799,7 +10488,7 @@ class RunManager:
                 else None
             )
             if coordinator is not None and claim_id is not None:
-                # Finding A + H3: cancel ALL local in-process work (setup task, the
+                # Cancel ALL local in-process work (setup task, the
                 # lane bursts still parked in _lane_bursts AND the ones run() popped
                 # into its launched map, plus the in-flight run task itself) BEFORE
                 # begin_cleanup makes the slot CLEANING visible and wakes the loop --
@@ -7832,7 +10521,7 @@ class RunManager:
                 # Retain the cleanup lease BEST EFFORT before begin_cleanup: on
                 # success the round5_cleanup phase is retained so a begin_cleanup CAS
                 # conflict can be retried under that authority by the convergence
-                # worker. Finding C: a retain FAILURE (e.g. _mark_bout_armed already
+                # worker. A retain FAILURE (e.g. _mark_bout_armed already
                 # lost/released the lease on a LeaseLostError) must NOT skip
                 # begin_cleanup -- otherwise the slot stays CLAIMED with an orphaned
                 # staged resident. So swallow retain failures and fence CLEANING
@@ -7906,6 +10595,7 @@ class RunManager:
             await record.event_log.publish(
                 "cleanup_update",
                 {"session": snapshot.model_dump(mode="json")},
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
 
     async def _round5_proof_authority_is_current(
@@ -8236,6 +10926,7 @@ class RunManager:
                 await record.event_log.publish(
                     "cleanup_update",
                     {"session": snapshot.model_dump(mode="json")},
+                    receipt_bout_id=snapshot.receipt_bout_id,
                 )
         finally:
             # Never leave a stalled cleanup waiting on a human, even if publishing
@@ -8322,6 +11013,7 @@ class RunManager:
                     # from an in-progress cleanup snapshot with the same shape.
                     "cleanup_settled": True,
                 },
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
         # The one place a Proxy is proved gone. Every surface that was warning
         # about it stops here, together, so `/readyz` cannot keep naming a
@@ -8346,7 +11038,6 @@ class RunManager:
             await self._finish_connection_spike_failure(
                 record,
                 "Round 5 proof authority changed; no comparison was declared.",
-                cleanup_verified=False,
             )
             return
         async with record.lock:
@@ -8639,12 +11330,12 @@ class RunManager:
                 await record.event_log.publish(
                     "run_finished",
                     {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
+                    receipt_bout_id=snapshot.receipt_bout_id,
                 )
         if not authority_committed:
             await self._finish_connection_spike_failure(
                 record,
                 "Round 5 proof authority changed; no comparison was declared.",
-                cleanup_verified=False,
             )
             return
         await self._begin_connection_spike_cleanup_handoff(record)
@@ -8768,6 +11459,7 @@ class RunManager:
                 "message": message,
                 "session": snapshot.model_dump(mode="json"),
             },
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         return True
 
@@ -8775,20 +11467,13 @@ class RunManager:
         self,
         record: SessionRecord,
         message: str,
-        *,
-        cleanup_verified: bool,
     ) -> None:
         async with record.lock:
             published = await self._publish_connection_spike_failure_locked(
                 record,
                 message,
             )
-        if not published:
-            return
-        if cleanup_verified:
-            await self._release_bout(record)
-            await self._release_round5_lease(record)
-        else:
+        if published:
             await self._begin_connection_spike_cleanup_handoff(record)
 
     async def _retry_connection_spike_cleanup(
@@ -8797,7 +11482,7 @@ class RunManager:
         engine: object,
     ) -> bool:
         await self._refresh_round5_slot_from_durable(record)
-        # Finding 1: if the durable head proves THIS claim's cleanup already
+        # If the durable head proves THIS claim's cleanup already
         # completed and the generation advanced (finished by another owner or the
         # supervised loop), the stale local claim/cleanup lease must be retired --
         # rather than begin_cleanup-ing a claim that no longer exists (WarmFenceLost)
@@ -8996,7 +11681,7 @@ class RunManager:
     async def _refresh_round5_slot_from_durable(self, record: SessionRecord) -> None:
         """Refresh the cached warm slot from durable truth for cleanup classification.
 
-        Blocker 1: cleanup's pre/post-bell classification must be derivable from the
+        Cleanup's pre/post-bell classification must be derivable from the
         COMMITTED store keyed by this claim, not only a local cache that a crash
         between accept_bell and the local update could have left stale. Best-effort
         and same-claim only (never clobbers across generations).
@@ -9024,7 +11709,7 @@ class RunManager:
     async def _cleanup_connection_spike(self, record: SessionRecord) -> bool:
         # Adopt durable post-bell truth before classifying pre/post-bell cleanup.
         await self._refresh_round5_slot_from_durable(record)
-        # Finding 3: when a warm coordinator is configured it (via converge_cleanup ->
+        # When a warm coordinator is configured it (via converge_cleanup ->
         # provider.reconcile on the ADOPTED claimed engine) is the SOLE external
         # cleanup janitor -- staged-resident cancel, per-bout Proxy delete, journal
         # absence. The manager therefore performs NO external mutation here: it only
@@ -9319,7 +12004,7 @@ class RunManager:
                 and cls._round_five_count(evidence.get("terminal_failures")) == 0
                 and isinstance(failure_codes, Mapping)
                 and not any(failure_codes.values())
-                and cls._round_five_count(evidence.get("retries")) == 0
+                and 0 <= cls._round_five_count(evidence.get("retries")) <= ROUND5_MAX_RETRIES
                 and cls._round_five_count(evidence.get("disconnected_during_hold"))
                 == 0
                 and cls._round_five_number(evidence.get("time_to_target_ms"))
@@ -9877,6 +12562,8 @@ class RunManager:
             return
 
         async with record.lock:
+            if not self._committed_run_active_locked(record):
+                return
             started_at = datetime.now(UTC)
             record.snapshot.state = SessionState.RUNNING
             record.snapshot.run_started_at = started_at
@@ -10034,6 +12721,7 @@ class RunManager:
             await record.event_log.publish(
                 "run_finished",
                 {"state": SessionState.VERIFIED, "session": snapshot.model_dump(mode="json")},
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
             return
         self._log_lane_refusals(record, round_number=4)
@@ -10044,6 +12732,7 @@ class RunManager:
                 "message": snapshot.failure,
                 "session": snapshot.model_dump(mode="json"),
             },
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
 
     async def _finish_model_score_failure(
@@ -10090,6 +12779,7 @@ class RunManager:
                 "message": message,
                 "session": snapshot.model_dump(mode="json"),
             },
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         self._schedule_round_settlement(
             record,
@@ -10127,6 +12817,7 @@ class RunManager:
                 "message": message,
                 "session": snapshot.model_dump(mode="json"),
             },
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         # The bout's row and running lanes are still owed their settlement.
         self._schedule_round_settlement(
@@ -10230,7 +12921,10 @@ class RunManager:
 
     async def _run(self, record: SessionRecord) -> None:
         assert record.live_targets is not None
-        await record.event_log.publish("run_preparing", {"state": SessionState.ARMED})
+        await record.event_log.publish(
+            "run_preparing",
+            {"state": record.snapshot.state},
+        )
         loop = asyncio.get_running_loop()
         if (
             record.armed_at_monotonic is None
@@ -10281,11 +12975,10 @@ class RunManager:
             return
 
         async with record.lock:
-            started_at = datetime.now(UTC)
-            record.snapshot.state = SessionState.RUNNING
-            record.snapshot.run_started_at = started_at
+            if not self._committed_run_active_locked(record):
+                return
             record.run_started_monotonic_ns = self._clock_ns()
-            record.snapshot.updated_at = started_at
+            record.snapshot.updated_at = datetime.now(UTC)
             for target in eligible_targets:
                 lane = record.snapshot.lanes[target.id]
                 lane.state = LaneState.CONNECTING
@@ -10308,7 +13001,10 @@ class RunManager:
 
         async def on_lane_event(lane_id: str, state: str, payload: dict[str, object]) -> None:
             async with record.lock:
-                if record.snapshot.towel is not None:
+                if (
+                    record.snapshot.towel is not None
+                    or not self._committed_run_active_locked(record)
+                ):
                     return
                 lane = record.snapshot.lanes[lane_id]
                 lane.state = LaneState(state)
@@ -10362,7 +13058,10 @@ class RunManager:
         if engine is None or arm is None:
             await self._fail(record, "The isolated-change proof must be armed again.")
             return
-        await record.event_log.publish("run_preparing", {"state": SessionState.ARMED})
+        await record.event_log.publish(
+            "run_preparing",
+            {"state": record.snapshot.state},
+        )
 
         phase_states = {
             SafeChangePhase.PREFLIGHT: LaneState.SEALED,
@@ -10378,17 +13077,17 @@ class RunManager:
         async def on_progress(progress: SafeChangeProgress) -> None:
             started_snapshot: SessionSnapshot | None = None
             async with record.lock:
-                if record.snapshot.towel is not None:
+                if (
+                    record.snapshot.towel is not None
+                    or not self._committed_run_active_locked(record)
+                ):
                     return
                 if (
                     progress.phase not in {SafeChangePhase.PREFLIGHT, SafeChangePhase.ARMED}
-                    and record.snapshot.state != SessionState.RUNNING
+                    and record.run_started_monotonic_ns is None
                 ):
-                    started_at = datetime.now(UTC)
-                    record.snapshot.state = SessionState.RUNNING
-                    record.snapshot.run_started_at = started_at
                     record.run_started_monotonic_ns = self._clock_ns()
-                    record.snapshot.updated_at = started_at
+                    record.snapshot.updated_at = datetime.now(UTC)
                     for candidate in record.snapshot.lanes.values():
                         candidate.state = LaneState.CONNECTING
                         candidate.status = "Creating isolated environment"
@@ -10465,7 +13164,10 @@ class RunManager:
         if engine is None or arm is None:
             await self._fail(record, "The point-in-time recovery proof must be armed again.")
             return
-        await record.event_log.publish("run_preparing", {"state": SessionState.ARMED})
+        await record.event_log.publish(
+            "run_preparing",
+            {"state": record.snapshot.state},
+        )
         phase_states = {
             RecoveryPhase.PREPARING_INCIDENT: LaneState.SEALED,
             RecoveryPhase.DELETING_INCIDENT: LaneState.CONNECTING,
@@ -10482,10 +13184,9 @@ class RunManager:
 
         async def on_started() -> None:
             async with record.lock:
-                started_at = datetime.now(UTC)
-                record.snapshot.state = SessionState.RUNNING
-                record.snapshot.run_started_at = started_at
-                record.snapshot.updated_at = started_at
+                if not self._committed_run_active_locked(record):
+                    return
+                record.snapshot.updated_at = datetime.now(UTC)
                 record.run_started_monotonic_ns = (
                     stop_control.started_ns
                     if stop_control is not None and stop_control.started_ns is not None
@@ -10511,7 +13212,10 @@ class RunManager:
 
         async def on_progress(progress: RecoveryProgress) -> None:
             async with record.lock:
-                if stop_control is not None and stop_control.event.is_set():
+                if (
+                    (stop_control is not None and stop_control.event.is_set())
+                    or not self._committed_run_active_locked(record)
+                ):
                     return
                 lane = record.snapshot.lanes[progress.lane_id]
                 lane.state = phase_states[progress.phase]
@@ -10591,6 +13295,8 @@ class RunManager:
             {lane_id: lane.timed_out for lane_id, lane in result.lanes.items()},
         )
         async with record.lock:
+            if not self._committed_run_active_locked(record):
+                return
             record.snapshot.fairness = FairnessSnapshot(launch_skew_ms=result.launch_skew_ms)
             for lane_id, lane_result in result.lanes.items():
                 lane = record.snapshot.lanes[lane_id]
@@ -10624,20 +13330,23 @@ class RunManager:
                 record.snapshot.remembered_result = None
                 record.snapshot.failure = "One or more recovered orders could not be verified."
                 self._log_lane_refusals(record, round_number=3)
-            try:
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError as exc:
+            fence = await self._fence_finished_bout_for_cleanup(record, record.snapshot.state)
+            if fence != "fenced":
                 logger.error(
-                    "Round 3 result verified but cleanup fence was lost session=%s: %s",
+                    "Round 3 result verified but cleanup fence was %s session=%s",
+                    fence,
                     record.snapshot.id,
-                    type(exc).__name__,
                 )
                 cooldown = self._new_cooldown(
                     record,
                     ResetMode.DELETE_RECOVERY_ENVIRONMENT,
                 )
                 cooldown.state = CooldownState.FAILED
-                cooldown.failure = "Automatic recovery cleanup lost its ring fence"
+                cooldown.failure = (
+                    "Automatic recovery cleanup lost its ring fence"
+                    if fence == "lost"
+                    else "Automatic recovery cleanup could not confirm its ring fence"
+                )
                 record.snapshot.cooldown = cooldown
             else:
                 record.snapshot.cooldown = self._new_cooldown(
@@ -10651,6 +13360,7 @@ class RunManager:
         await record.event_log.publish(
             "run_finished",
             {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         if cleanup_owned:
             self._schedule_owned_artifact_cleanup(record, recovery=True)
@@ -10669,7 +13379,10 @@ class RunManager:
             {lane_id: lane.timed_out for lane_id, lane in result.lanes.items()},
         )
         async with record.lock:
-            if record.snapshot.towel is not None:
+            if (
+                record.snapshot.towel is not None
+                or not self._committed_run_active_locked(record)
+            ):
                 return
             record.snapshot.fairness = FairnessSnapshot(launch_skew_ms=result.launch_skew_ms)
             for lane_id, lane_result in result.lanes.items():
@@ -10709,20 +13422,23 @@ class RunManager:
                     "One or more isolated schema changes could not be verified."
                 )
                 self._log_lane_refusals(record, round_number=2)
-            try:
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError as exc:
+            fence = await self._fence_finished_bout_for_cleanup(record, record.snapshot.state)
+            if fence != "fenced":
                 logger.error(
-                    "Round 2 result verified but cleanup fence was lost session=%s: %s",
+                    "Round 2 result verified but cleanup fence was %s session=%s",
+                    fence,
                     record.snapshot.id,
-                    type(exc).__name__,
                 )
                 cooldown = self._new_cooldown(
                     record,
                     ResetMode.DELETE_ISOLATED_ENVIRONMENT,
                 )
                 cooldown.state = CooldownState.FAILED
-                cooldown.failure = "Automatic isolated-environment cleanup lost its ring fence"
+                cooldown.failure = (
+                    "Automatic isolated-environment cleanup lost its ring fence"
+                    if fence == "lost"
+                    else "Automatic isolated-environment cleanup could not confirm its ring fence"
+                )
                 record.snapshot.cooldown = cooldown
             else:
                 record.snapshot.cooldown = self._new_cooldown(
@@ -10736,6 +13452,7 @@ class RunManager:
         await record.event_log.publish(
             "run_finished",
             {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         if cleanup_owned:
             self._schedule_owned_artifact_cleanup(record, recovery=False)
@@ -10743,7 +13460,10 @@ class RunManager:
     async def _finish(self, record: SessionRecord, result: VerificationResult) -> None:
         cleanup_owned = False
         async with record.lock:
-            if record.snapshot.towel is not None:
+            if (
+                record.snapshot.towel is not None
+                or not self._committed_run_active_locked(record)
+            ):
                 return
             record.snapshot.fairness = FairnessSnapshot(launch_skew_ms=result.launch_skew_ms)
             for lane_id, lane_result in result.lanes.items():
@@ -10790,22 +13510,26 @@ class RunManager:
                 else:
                     record.snapshot.failure = "One or more lanes could not be verified."
                 self._log_lane_refusals(record, round_number=1)
-            try:
-                # The verdict ends the timed bout, but not the round's ownership.
-                # Keep the same durable fence in a cleanup phase until both
-                # control planes prove zero. Releasing here was the hidden-wait
-                # defect: every viewer saw READY while the next arm was forced to
-                # rediscover Aurora's auto-pause floor.
-                await self._transition_bout_to_cleanup(record, record.snapshot.state)
-            except InvalidStateError as exc:
+            self._cancel_idle_watch(record)
+            # The verdict ends the timed bout, but not the round's ownership.
+            # Keep the same durable fence in a cleanup phase until both
+            # control planes prove zero. Releasing here was the hidden-wait
+            # defect: every viewer saw READY while the next arm was forced to
+            # rediscover Aurora's auto-pause floor.
+            fence = await self._fence_finished_bout_for_cleanup(record, record.snapshot.state)
+            if fence != "fenced":
                 logger.error(
-                    "Round 1 result verified but cleanup fence was lost session=%s: %s",
+                    "Round 1 result verified but cleanup fence was %s session=%s",
+                    fence,
                     record.snapshot.id,
-                    type(exc).__name__,
                 )
                 cooldown = self._new_cooldown(record, ResetMode.RETURN_TO_IDLE)
                 cooldown.state = CooldownState.FAILED
-                cooldown.failure = "Automatic return-to-idle cleanup lost its ring fence"
+                cooldown.failure = (
+                    "Automatic return-to-idle cleanup lost its ring fence"
+                    if fence == "lost"
+                    else "Automatic return-to-idle cleanup could not confirm its ring fence"
+                )
                 record.snapshot.cooldown = cooldown
             else:
                 record.snapshot.cooldown = self._new_cooldown(
@@ -10819,6 +13543,7 @@ class RunManager:
         await record.event_log.publish(
             "run_finished",
             {"state": snapshot.state, "session": snapshot.model_dump(mode="json")},
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         if cleanup_owned:
             self._schedule_round_one_cooldown(record)
@@ -10894,6 +13619,7 @@ class RunManager:
         await record.event_log.publish(
             "towel_update",
             {"session": snapshot.model_dump(mode="json")},
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
 
     async def _settle_towel_cost_window(self, record: SessionRecord) -> None:
@@ -10902,11 +13628,12 @@ class RunManager:
         ``start_towel`` refuses to let the ledger stop it, so a close failure
         there is recorded and deferred to here, and retried on every cleanup
         attempt -- including an operator's retry click. This runs only on the
-        path that is about to release the ring, and if the close still fails at
-        that point there is nothing left to retry against: the record would
-        otherwise be pinned forever by ``_releasable``'s open-cost-bout check,
-        which is a memory leak reached through the towel. So the local pointer
-        is dropped and the ledger row is left to reconciliation, said out loud.
+        path that is about to release the ring, and if the close still fails or
+        goes unanswered at that point there is nothing left to retry against:
+        the record would otherwise be pinned forever by ``_releasable``'s
+        open-cost-bout check, which is a memory leak reached through the towel.
+        So the local pointer is dropped and the ledger row is left to
+        reconciliation, said out loud.
         """
 
         async with record.lock:
@@ -10915,28 +13642,28 @@ class RunManager:
             if bout_id is None or towel is None:
                 return
             try:
-                await self._close_cost_bout(
-                    record,
-                    bout_id=bout_id,
-                    ended_at=datetime.now(UTC),
-                    outcome=SessionState.TOWELLED.value,
-                )
+                closed = await self._close_towel_cost_window(record, towel, bout_id=bout_id)
             except Exception as exc:
-                logger.error(
-                    "Towel cleanup could not close the cost window session=%s "
-                    "diagnostic=%s; abandoning it to reconciliation",
-                    record.snapshot.id,
-                    _redacted_exception_chain(exc),
-                )
-                record.cost_bout_id = None
-                record.cost_bout_started_at = None
-                record.cost_bout_kind = None
-                towel.cost_close_failure = (
-                    f"{str(exc) or 'The bout cost window could not be closed'} · "
-                    "the open ledger window was left for reconciliation"
-                )
-                return
-            towel.cost_close_failure = None
+                failure = audience_error_text(exc) or "The bout cost window could not be closed"
+                diagnostic = _redacted_exception_chain(exc)
+            else:
+                if closed:
+                    towel.cost_close_failure = None
+                    return
+                failure = "The bout cost window close went unanswered"
+                diagnostic = f"unanswered after {self._cost_close_wait:.1f}s"
+            logger.error(
+                "Towel cleanup could not close the cost window session=%s "
+                "diagnostic=%s; abandoning it to reconciliation",
+                record.snapshot.id,
+                diagnostic,
+            )
+            record.cost_bout_id = None
+            record.cost_bout_started_at = None
+            record.cost_bout_kind = None
+            towel.cost_close_failure = (
+                f"{failure} · the open ledger window was left for reconciliation"
+            )
 
     async def _complete_towel(
         self,
@@ -10953,12 +13680,14 @@ class RunManager:
             towel.cleanup_failure = None
             round_id = record.snapshot.round.id
             if round_id in _TOWEL_COOLDOWN_ROUNDS:
+                self._cancel_idle_watch(record)
                 record.snapshot.cooldown = self._new_towel_cooldown(record)
             record.snapshot.updated_at = datetime.now(UTC)
             snapshot = record.snapshot.model_copy(deep=True)
         await record.event_log.publish(
             "towel_update",
             {"session": snapshot.model_dump(mode="json")},
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
 
         if round_id == RoundId.SURVIVE_CONNECTION_SPIKE:
@@ -11013,6 +13742,7 @@ class RunManager:
             await record.event_log.publish(
                 "towel_update",
                 {"session": snapshot.model_dump(mode="json")},
+                receipt_bout_id=snapshot.receipt_bout_id,
             )
 
         if settlement_error is None:
@@ -11043,6 +13773,7 @@ class RunManager:
         await record.event_log.publish(
             event,
             {"session": snapshot.model_dump(mode="json")},
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         if settlement_error is None and round_id == RoundId.WAKE_IDLE_APP:
             if record.cooldown_task is asyncio.current_task():
@@ -11098,9 +13829,6 @@ class RunManager:
                     current = record.snapshot.towel
                     if current is not None and isinstance(outcome, RecoveryStoppedResult):
                         current.restore_started = current.restore_started or outcome.restore_started
-                settle = getattr(engine, "settle_pending_mutations", None)
-                if settle is not None:
-                    await settle(record.snapshot.competitor.id)
                 await self._reset_recovery(record)
             elif round_id == RoundId.PUT_MODEL_SCORE_IN_APP:
                 engine = record.model_score_engine
@@ -11143,7 +13871,18 @@ class RunManager:
             )
             raise
         except Exception as exc:
-            return str(exc) or "Automatic towel cleanup could not be verified"
+            if round_id in _TOWEL_LANE_ERROR_ROUNDS and not isinstance(exc, InvalidStateError):
+                logger.warning(
+                    "Towel settlement failed session=%s round=%s diagnosis=%s",
+                    record.snapshot.id,
+                    round_id.value,
+                    operator_diagnosis(exc),
+                )
+                return (
+                    "Automatic towel cleanup could not be verified: "
+                    f"{audience_diagnosis(exc)}"
+                )
+            return audience_error_text(exc) or "Automatic towel cleanup could not be verified"
         return None
 
     async def _reset_safe_change(self, record: SessionRecord) -> None:
@@ -11242,6 +13981,51 @@ class RunManager:
             {"cooldown": snapshot.model_dump(mode="json")},
         )
 
+    @staticmethod
+    def _reraise_own_cancel(exc: BaseException, cancels_on_entry: int) -> None:
+        """Re-raise ``exc`` when this task was cancelled since entry, not a child's cancel.
+
+        Counted from entry because cleanup also runs from a cancelled task's
+        ``finally``, whose count is already raised.
+        """
+
+        task = asyncio.current_task()
+        if (
+            isinstance(exc, asyncio.CancelledError)
+            and task is not None
+            and task.cancelling() > cancels_on_entry
+        ):
+            raise exc
+
+    async def _fail_recovery_cooldown(
+        self,
+        record: SessionRecord,
+        exc: BaseException,
+        failure: str,
+    ) -> None:
+        logger.error(
+            "Recovery cleanup did not finish session=%s failure=%s diagnosis=%s",
+            record.snapshot.id,
+            failure,
+            operator_diagnosis(exc),
+        )
+        async with record.lock:
+            current = record.snapshot.cooldown
+            if current is None:
+                return
+            current.state = CooldownState.FAILED
+            current.failure = failure
+            for lane in current.lanes.values():
+                if lane.state == CooldownLaneState.WATCHING:
+                    lane.state = CooldownLaneState.FAILED
+                    lane.status = "Owned recovery environment was not removed"
+                    lane.activity = LaneActivity(phase="failed", wire_call=None)
+            snapshot = current.model_copy(deep=True)
+        await record.event_log.publish(
+            "cooldown_update",
+            {"cooldown": snapshot.model_dump(mode="json")},
+        )
+
     async def _reset_recovery(self, record: SessionRecord) -> None:
         engine = record.recovery_engine
         cooldown = record.snapshot.cooldown
@@ -11279,26 +14063,30 @@ class RunManager:
                 {"cooldown": snapshot.model_dump(mode="json")},
             )
 
+        task = asyncio.current_task()
+        cancels_on_entry = task.cancelling() if task is not None else 0
+        # A cancelled lane's shielded create can still land after reset
+        # inspects, so absence is only provable once nothing is in flight.
+        try:
+            await engine.settle_pending_mutations(record.snapshot.competitor.id)
+        except (Exception, asyncio.CancelledError) as exc:
+            self._reraise_own_cancel(exc, cancels_on_entry)
+            await self._fail_recovery_cooldown(
+                record,
+                exc,
+                "A recovery mutation is still unresolved; nothing was reset.",
+            )
+            return
         try:
             result = await engine.reset(record.snapshot.competitor.id, on_progress)
         except RecoveryResetError as exc:
             result = exc.result
-        except Exception:
-            async with record.lock:
-                current = record.snapshot.cooldown
-                if current is None:
-                    return
-                current.state = CooldownState.FAILED
-                current.failure = "Recovery environments could not be safely removed."
-                for lane in current.lanes.values():
-                    if lane.state == CooldownLaneState.WATCHING:
-                        lane.state = CooldownLaneState.FAILED
-                        lane.status = "Owned recovery environment was not removed"
-                        lane.activity = LaneActivity(phase="failed", wire_call=None)
-                snapshot = current.model_copy(deep=True)
-            await record.event_log.publish(
-                "cooldown_update",
-                {"cooldown": snapshot.model_dump(mode="json")},
+        except (Exception, asyncio.CancelledError) as exc:
+            self._reraise_own_cancel(exc, cancels_on_entry)
+            await self._fail_recovery_cooldown(
+                record,
+                exc,
+                "Recovery environments could not be safely removed.",
             )
             return
 
@@ -11338,12 +14126,15 @@ class RunManager:
             {"cooldown": snapshot.model_dump(mode="json")},
         )
 
-    async def _monitor_cooldown(self, record: SessionRecord) -> None:
-        if record.live_targets is None or record.snapshot.cooldown is None:
-            return
+    async def _monitor_cooldown(self, record: SessionRecord, watch: CooldownWatch) -> None:
+        cooldown = watch.cooldown
+        async with record.lock:
+            if record.live_targets is None or not self._watch_is_current(record, watch):
+                return
+            snapshot = cooldown.model_copy(deep=True)
         await record.event_log.publish(
             "cooldown_started",
-            {"cooldown": record.snapshot.cooldown.model_dump(mode="json")},
+            {"cooldown": snapshot.model_dump(mode="json")},
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._cooldown_timeout
@@ -11353,32 +14144,37 @@ class RunManager:
                 0.001,
                 min(self._cooldown_poll_timeout, remaining),
             )
-            tasks = [
-                asyncio.create_task(
-                    self._observe_cooldown_target(
-                        target,
-                        record.snapshot.cooldown.lanes[target.id].started_at,
-                        poll_timeout,
+            async with record.lock:
+                targets = record.live_targets
+                if targets is None or not self._watch_is_current(record, watch):
+                    return
+                tasks = [
+                    asyncio.create_task(
+                        self._observe_cooldown_target(
+                            target,
+                            cooldown.lanes[target.id].started_at,
+                            poll_timeout,
+                        )
                     )
-                )
-                for target in record.live_targets
-                # A confirmed lane owns an immutable stop result. Continuing to
-                # poll it used to publish a later `confirmed_at`/`elapsed_ms`
-                # every cycle while the other lane was still active.
-                if (
-                    record.snapshot.cooldown.lanes[target.id].state
-                    != CooldownLaneState.CONFIRMED_ZERO
-                )
-            ]
+                    for target in targets
+                    # A confirmed lane owns an immutable stop result. Continuing to
+                    # poll it used to publish a later `confirmed_at`/`elapsed_ms`
+                    # every cycle while the other lane was still active.
+                    if cooldown.lanes[target.id].state != CooldownLaneState.CONFIRMED_ZERO
+                ]
             try:
                 for task in asyncio.as_completed(tasks):
                     target, check, completed_at = await task
-                    changed, snapshot = await self._apply_cooldown_observation(
+                    applied = await self._apply_cooldown_observation(
                         record,
+                        watch,
                         target.id,
                         check,
                         completed_at,
                     )
+                    if applied is None:
+                        return
+                    changed, snapshot = applied
                     if changed:
                         await record.event_log.publish(
                             "cooldown_update",
@@ -11391,8 +14187,7 @@ class RunManager:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
             async with record.lock:
-                cooldown = record.snapshot.cooldown
-                if cooldown is None:
+                if not self._watch_is_current(record, watch):
                     return
                 terminal = {
                     CooldownLaneState.CONFIRMED_ZERO,
@@ -11413,8 +14208,7 @@ class RunManager:
             await asyncio.sleep(min(self._arm_poll, max(0.0, deadline - loop.time())))
 
         async with record.lock:
-            cooldown = record.snapshot.cooldown
-            if cooldown is None:
+            if not self._watch_is_current(record, watch):
                 return
             cooldown.state = CooldownState.FAILED
             cooldown.failure = "Timed out waiting for return to confirmed zero."
@@ -11431,51 +14225,174 @@ class RunManager:
                     )
             record.snapshot.updated_at = datetime.now(UTC)
             snapshot = cooldown.model_copy(deep=True)
+            registered = None
+            owned = watch.owned
+            if owned is not None and owned.phase == "cooldown":
+                # `_watch_is_current` already read this lease under `record.lock`.
+                # Do not await another lock after FAILED and before registering
+                # the fence: shutdown can cancel the watch at any suspension.
+                registered = record.lease
+                if registered is not None:
+                    # Registered with FAILED: shutdown may cancel anything after
+                    # this assignment and must still keep this row.
+                    record.cooldown_failure_fence = registered
         await record.event_log.publish(
             "cooldown_update",
             {"cooldown": snapshot.model_dump(mode="json")},
         )
-        await self._pin_round_one_cooldown_failure(record)
+        await self._pin_round_one_cooldown_failure(record, watch, registered)
 
-    async def _pin_round_one_cooldown_failure(self, record: SessionRecord) -> None:
-        """Publish a finite durable failure fence and stop renewing it.
+    async def _pin_round_one_cooldown_failure(
+        self,
+        record: SessionRecord,
+        watch: CooldownWatch,
+        registered: BoutLease | None,
+    ) -> None:
+        """Publish a finite durable failure fence on the watch's lease and stop renewing it.
 
         A terminal observation timeout has no owned artifact to clean, but it
-        must not flash READY immediately either. Transitioning the existing row
-        to `cooldown_failed` keeps this round unavailable across replicas for one
-        ordinary active-lease TTL. The heartbeat is cancelled whether the
-        transition succeeds or not, so a coordinator fault degrades to the
-        existing row's finite expiry instead of an immortal cooldown lease.
+        must not flash READY immediately either. Transitioning the watch's own
+        cooldown row to `cooldown_failed` keeps this round unavailable across
+        replicas for one ordinary active-lease TTL. Its heartbeat is stopped
+        first, whether the transition then succeeds or not, so a coordinator fault
+        degrades to the existing row's finite expiry instead of an immortal
+        cooldown lease, and no renew answered after the row moved reads as a lost
+        lease. The transition itself runs off ``lease_lock``, as a renew does.
+        Only the cooldown lease the watch began under is pinned, and only while
+        the watch may still act: by then the card may show a newer bout's
+        cooldown or hold its lease, which are not this watch's to touch, so
+        ``registered``, the fence set when the cooldown failed, is then let go.
         """
 
-        expected: BoutLease | None
-        async with record.lease_lock:
-            expected = record.lease
-            if (
-                expected is not None
-                and expected.session_id == record.snapshot.id
-                and expected.phase == "cooldown"
-            ):
-                try:
-                    record.lease = await self._lease_store_for_record(record).transition(
-                        expected,
-                        operator=record.operator or expected.operator,
-                        expected_phase="cooldown",
-                        phase="cooldown_failed",
-                        session_state=record.snapshot.state,
-                        ttl=timedelta(seconds=self._active_lease_ttl),
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "Round 1 cooldown failure fence could not be persisted "
-                        "session=%s diagnostic=%s",
-                        record.snapshot.id,
-                        _redacted_exception_chain(exc),
-                    )
-        if expected is None:
-            self._cancel_lease_heartbeat(record)
+        owned = watch.owned
+        if owned is None or owned.phase != "cooldown":
+            return
+        async with record.lock:
+            if not self._watch_is_current(record, watch):
+                if registered is not None and record.cooldown_failure_fence is registered:
+                    record.cooldown_failure_fence = None
+                return
+            async with record.lease_lock:
+                local = record.lease
+        self._cancel_lease_heartbeat(record, owned)
+        if local is None:
+            if registered is not None and record.cooldown_failure_fence is registered:
+                record.cooldown_failure_fence = None
+            return
+        fence = local
+        record.cooldown_failure_fence = fence
+        try:
+            sent = time.monotonic()
+            pinned = await self._lease_store_for_record(record).transition(
+                local,
+                operator=record.operator or local.operator,
+                expected_phase="cooldown",
+                phase="cooldown_failed",
+                session_state=record.snapshot.state,
+                ttl=timedelta(seconds=self._active_lease_ttl),
+            )
+        except Exception as exc:
+            logger.error(
+                "Round 1 cooldown failure fence could not be persisted "
+                "session=%s diagnostic=%s",
+                record.snapshot.id,
+                _redacted_exception_chain(exc),
+            )
         else:
-            self._cancel_lease_heartbeat(record, expected)
+            async with record.lease_lock:
+                current = record.lease
+                if current is not None and self._same_exact_lease(current, local):
+                    self._set_lease(record, pinned, sent)
+                    fence = pinned
+        self._forget_cooldown_fence_at_expiry(record, fence)
+
+    def _forget_cooldown_fence_at_expiry(self, record: SessionRecord, fence: BoutLease) -> None:
+        """Drop the record's pointer to a pinned cooldown failure once its row is gone."""
+
+        record.cooldown_failure_fence = fence
+
+        def retire() -> None:
+            if record.cooldown_failure_fence is fence:
+                record.cooldown_failure_fence = None
+
+        self._forget_fence_at_expiry(record, fence, "Round 1 cooldown fence", retire)
+
+    def _forget_fence_at_expiry(
+        self,
+        record: SessionRecord,
+        fence: BoutLease,
+        what: str,
+        retire: Callable[[], None] = lambda: None,
+    ) -> None:
+        """Drop the record's pointer to ``fence`` once the store no longer holds it.
+
+        For a fence nothing renews or releases: a pinned cooldown failure, or the armed
+        fence of a bell whose acceptance could not be confirmed. Without this the
+        pointer outlives its row and the record can never be released. The store
+        is asked rather than the local clock: its ``expires_at`` is on the store's
+        clock, and a transition whose answer was lost leaves a local copy whose
+        expiry is not the row's. Only the exact unrenewed fence is forgotten: a
+        newer bout's lease, or one a retry is renewing again, is left alone.
+        ``retire`` runs once the record no longer points at ``fence``.
+        """
+
+        if self._closed:
+            # Work that close() drains can still get here, after it collected the
+            # tasks it cancels. Shutdown leaves the row to its durable TTL.
+            return
+        previous = record.fence_expiry_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        store = self._lease_store_for_record(record)
+        poll = max(0.01, self._active_lease_ttl)
+
+        def still_unrenewed() -> bool:
+            local = record.lease
+            return (
+                local is not None
+                and self._same_exact_lease(local, fence)
+                and record.lease_heartbeat_lease is None
+            )
+
+        async def forget() -> None:
+            # The local estimate only times the first look; after that the store is
+            # asked once per lease TTL, so skew or an outage cannot become a hot loop.
+            left = (fence.expires_at - datetime.now(UTC)).total_seconds()
+            delay = max(0.01, min(poll, left))
+            try:
+                while True:
+                    await asyncio.sleep(delay)
+                    delay = poll
+                    async with record.lease_lock:
+                        if not still_unrenewed():
+                            retire()
+                            return
+                    try:
+                        async with asyncio.timeout(FENCE_EXPIRY_READ_SECONDS):
+                            held = await store.current()
+                    except Exception as exc:
+                        logger.warning(
+                            "%s check could not read the ring session=%s diagnosis=%s",
+                            what,
+                            record.snapshot.id,
+                            operator_diagnosis(exc),
+                        )
+                        continue
+                    if held is not None and self._same_lease_authority(held, fence):
+                        continue
+                    async with record.lease_lock:
+                        if still_unrenewed():
+                            record.lease = None
+                        retire()
+                    return
+            finally:
+                if record.fence_expiry_task is asyncio.current_task():
+                    record.fence_expiry_task = None
+
+        record.fence_expiry_task = asyncio.create_task(
+            forget(),
+            name=f"fence-expiry-{record.snapshot.id}",
+        )
 
     @staticmethod
     async def _observe_cooldown_target(
@@ -11493,15 +14410,18 @@ class RunManager:
     async def _apply_cooldown_observation(
         self,
         record: SessionRecord,
+        watch: CooldownWatch,
         target_id: str,
         check: dict[str, object] | Exception,
         completed_at: datetime,
-    ) -> tuple[bool, CooldownSnapshot]:
+    ) -> tuple[bool, CooldownSnapshot] | None:
+        """Apply one control-plane answer to the watch's cooldown; None once it may not act."""
+
         changed = False
         async with record.lock:
-            cooldown = record.snapshot.cooldown
-            if cooldown is None:
-                raise InvalidStateError("The Round 1 re-do clock is no longer active")
+            if not self._watch_is_current(record, watch):
+                return None
+            cooldown = watch.cooldown
             lane = cooldown.lanes[target_id]
             if lane.state == CooldownLaneState.CONFIRMED_ZERO:
                 # A task may have been launched just before another observation
@@ -11574,13 +14494,13 @@ class RunManager:
                     )
                     assign("provider_updated_at", provider_updated_at)
                     now_ns = time.monotonic_ns()
-                    previous = record.cooldown_idle_observations.get(target_id)
+                    previous = watch.idle_observations.get(target_id)
                     if previous is None:
                         observation_count, first_observed_ns = 1, now_ns
                     else:
                         prior_count, first_observed_ns = previous
                         observation_count = prior_count + 1
-                    record.cooldown_idle_observations[target_id] = (
+                    watch.idle_observations[target_id] = (
                         observation_count,
                         first_observed_ns,
                     )
@@ -11704,7 +14624,7 @@ class RunManager:
                 assign("activity", activity)
                 assign("status", status)
             elif isinstance(check, TargetNotArmedError):
-                record.cooldown_idle_observations.pop(target_id, None)
+                watch.idle_observations.pop(target_id, None)
                 assign("observation_count", 0)
                 assign("confirmation_basis", None)
                 assign("provider_updated_at", None)
@@ -11759,41 +14679,47 @@ class RunManager:
                 return
             self._cancel_armed_expiry(record)
             async with record.lease_lock:
-                lease_phase = record.lease.phase if record.lease is not None else None
+                terminal_lease = record.lease
+                round5_lease = record.round5_lease
+            lease_phase = terminal_lease.phase if terminal_lease is not None else None
             if lease_phase == "run_committed":
                 if record.snapshot.round.id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY:
                     cleanup_mode = ResetMode.DELETE_ISOLATED_ENVIRONMENT
                 elif record.snapshot.round.id == RoundId.RECOVER_DELETED_ORDER:
                     cleanup_mode = ResetMode.DELETE_RECOVERY_ENVIRONMENT
-            if cleanup_mode is None and not await self._confirm_terminal_release(record):
-                return
-            if (
-                cleanup_mode is None
-                and record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
-                and not await self._release_round5_lease(record)
-            ):
-                record.snapshot.failure = (
-                    "Round 5 cleanup authority release could not be confirmed."
-                )
-                record.snapshot.updated_at = datetime.now(UTC)
+        if (
+            cleanup_mode is None
+            and await self._settle_terminal_release(record, terminal_lease) == "lost"
+        ):
+            return
+        if cleanup_mode is None and record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+            # Its cleanup verified before `_fail`, so the cleanup lease guards nothing
+            # left; whether its release is confirmed or still retried, the bout fails.
+            await self._settle_round5_release(record, round5_lease)
+        async with record.lock:
+            if record.snapshot.towel is not None:
                 return
             record.snapshot.state = SessionState.FAILED
             record.snapshot.failure = message
             record.snapshot.remembered_result = None
+            self._cancel_idle_watch(record)
             if cleanup_mode is not None:
-                try:
-                    await self._transition_bout_to_cleanup(record, SessionState.FAILED)
-                except InvalidStateError:
+                fence = await self._fence_finished_bout_for_cleanup(record, SessionState.FAILED)
+                if fence != "fenced":
                     cooldown = self._new_cooldown(record, cleanup_mode)
                     cooldown.state = CooldownState.FAILED
-                    cooldown.failure = "Automatic cleanup lost its ring fence"
+                    cooldown.failure = (
+                        "Automatic cleanup lost its ring fence"
+                        if fence == "lost"
+                        else "Automatic cleanup could not confirm its ring fence"
+                    )
                     record.snapshot.cooldown = cooldown
                     cleanup_mode = None
                 else:
                     record.snapshot.cooldown = self._new_cooldown(record, cleanup_mode)
             elif (
                 record.snapshot.round.id == RoundId.WAKE_IDLE_APP
-                and record.snapshot.run_started_at is not None
+                and record.run_started_monotonic_ns is not None
                 and record.live_targets is not None
             ):
                 record.snapshot.cooldown = self._new_cooldown(
@@ -11811,6 +14737,7 @@ class RunManager:
                 "message": message,
                 "session": snapshot.model_dump(mode="json"),
             },
+            receipt_bout_id=snapshot.receipt_bout_id,
         )
         if cleanup_mode == ResetMode.DELETE_ISOLATED_ENVIRONMENT:
             self._schedule_owned_artifact_cleanup(record, recovery=False)

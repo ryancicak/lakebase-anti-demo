@@ -18,6 +18,7 @@ from .aws_credential_probe import effective_credential_verdict
 from .catalog import catalog
 from .lifecycle import cached_installation_report, deployed_aws_posture
 from .manager import (
+    _LOST_RING_STILL_STOPPING,
     AmbiguousRingQueryError,
     InvalidStateError,
     RunManager,
@@ -197,6 +198,11 @@ async def version() -> dict[str, object]:
     return build_info()
 
 
+def _storage_checking(run_manager: object) -> frozenset[RoundId]:
+    checking = getattr(run_manager, "storage_checking", None)
+    return checking if isinstance(checking, frozenset) else frozenset()
+
+
 def _availability_signals(request: Request) -> round_availability.AvailabilitySignals:
     """Collect the cached live state the round-select screen has to respect.
 
@@ -253,6 +259,7 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         round6_aws_sealed=posture.round6_aws_sealed,
         grant_refusals=getattr(run_manager, "grant_refusals", None) or {},
         storage_refusals=getattr(run_manager, "storage_refusals", None) or {},
+        storage_checking=_storage_checking(run_manager),
     )
 
     gate = getattr(request.app.state, "readiness_gate", None)
@@ -404,9 +411,9 @@ async def get_catalog(request: Request) -> CatalogResponse:
         request.state.round5_cleanup_overlay_checked = True
     refresh_storage = getattr(run_manager, "refresh_delta_storage_readiness", None)
     if callable(refresh_storage):
-        # Read-only, cached, and single-flight. The first catalog answer must not
-        # advertise Rounds 4 and 6 before their shared Delta path has answered;
-        # subsequent fight-card polls normally return from the cache.
+        # Read-only, cached, single-flight, and never waited for: it re-reads in the
+        # background, and until the first read has answered Rounds 4 and 6 are held
+        # as checking rather than offered.
         await refresh_storage()
     sealed = catalog(
         model_score_available=run_manager.model_score_available,
@@ -541,14 +548,31 @@ def _fight_card_round_status(
             and bout.maintenance_detail.startswith("ROUND 5 NOT STARTABLE")
             else None
         )
-        round5_detail = round5_stage_detail or round5_gate_detail
+        # So does a ring the manager keeps closed while work that lost it is still
+        # stopping here: it reopens once that work ends. Only under a READY catalog,
+        # because the ring reopening would not lift a catalog refusal.
+        lost_ring_detail = (
+            bout.maintenance_detail
+            if getattr(availability, "availability", None) == Availability.READY
+            and bout.maintenance_detail == _LOST_RING_STILL_STOPPING
+            else None
+        )
+        # And so does a round whose shared storage has not answered its first check.
+        storage_checking_detail = (
+            getattr(availability, "availability_headline", None)
+            if getattr(availability, "availability_reason_code", None)
+            == round_availability.STORAGE_CHECKING_REASON_CODE
+            else None
+        )
+        reason = (
+            round5_stage_detail or round5_gate_detail or lost_ring_detail or storage_checking_detail
+        )
         state = (
             FightCardState.TEMPORARILY_UNAVAILABLE
-            if round5_detail is not None
-            and "STAGE TERMINAL-BLOCKED" not in round5_detail
+            if reason is not None and "STAGE TERMINAL-BLOCKED" not in reason
             else FightCardState.UNAVAILABLE
         )
-        detail = round5_detail or (
+        detail = reason or (
             getattr(availability, "availability_headline", None)
             or "This round is unavailable right now."
         )

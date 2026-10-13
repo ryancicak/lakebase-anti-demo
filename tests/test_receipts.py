@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import logging
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import psycopg
 import pytest
+from databricks.sdk.errors.platform import PermissionDenied
 from fastapi.testclient import TestClient
 
 from server import receipts as receipts_module
@@ -15,6 +17,7 @@ from server.api import router
 from server.coordination import CoordinationObjectsMissingError
 from server.manager import EventLog, RunManager
 from server.models import (
+    BoutOperator,
     ComparisonKind,
     ComparisonSnapshot,
     CompetitorId,
@@ -45,8 +48,16 @@ from server.receipts import (
     record_sealed_bout,
     write_receipt,
 )
+from server.targets import TargetConfigurationError
 from server.verifier import NeutralVerifier, RetryPolicy
-from tests.test_manager import FakeResolver, wait_for_state
+from tests.test_manager import (
+    FailingArmTarget,
+    FakeLiveTarget,
+    FakeResolver,
+    HangingArmResolver,
+    drain_record_operations,
+    wait_for_state,
+)
 
 
 def make_verifier() -> NeutralVerifier:
@@ -152,13 +163,54 @@ class FakeCoordinationCursor:
                 new_failure = json.loads(params[7])["receipt"].get("cleanup_failure")
                 if current[6] <= params[6] and current_failure != new_failure:
                     self.rows[key] = params
-        elif statement.startswith("WITH ranked_receipts AS"):
+        elif statement.startswith("WITH annotated_receipts AS"):
             best: dict[tuple[str, str, bool], tuple] = {}
+            latest_event: dict[tuple[str, str, bool], str] = {}
+            latest_non_cancelled_at: dict[tuple[str, str, bool], datetime] = {}
+            for row in self.rows.values():
+                is_cleanup = str(row[2]).startswith("cleanup_update")
+                key = (row[0], row[1], is_cleanup)
+                current = max(
+                    (
+                        candidate
+                        for candidate in self.rows.values()
+                        if (
+                            candidate[0],
+                            candidate[1],
+                            str(candidate[2]).startswith("cleanup_update"),
+                        )
+                        == key
+                    ),
+                    key=lambda candidate: candidate[6],
+                )
+                latest_event[key] = str(current[2])
+                non_cancelled = [
+                    candidate
+                    for candidate in self.rows.values()
+                    if (
+                        candidate[0],
+                        candidate[1],
+                        str(candidate[2]).startswith("cleanup_update"),
+                    )
+                    == key
+                    and not str(candidate[2]).startswith("session_cancelled")
+                ]
+                if non_cancelled:
+                    latest_non_cancelled_at[key] = max(
+                        candidate[6] for candidate in non_cancelled
+                    )
             for row in self.rows.values():
                 is_cleanup = str(row[2]).startswith("cleanup_update")
                 key = (row[0], row[1], is_cleanup)
                 rank = (
                     row[6] if is_cleanup else row[5] == "declared",
+                    (
+                        False
+                        if is_cleanup
+                        else latest_event[key].startswith("session_cancelled")
+                        and str(row[2]).startswith("run_finished")
+                        and row[6] == latest_non_cancelled_at[key]
+                    ),
                     row[6],
                 )
                 current = best.get(key)
@@ -167,6 +219,13 @@ class FakeCoordinationCursor:
                         current[6]
                         if is_cleanup
                         else current[5] == "declared"
+                    ),
+                    (
+                        False
+                        if is_cleanup
+                        else latest_event[key].startswith("session_cancelled")
+                        and str(current[2]).startswith("run_finished")
+                        and current[6] == latest_non_cancelled_at[key]
                     ),
                     current[6],
                 ) if current is not None else None
@@ -595,6 +654,129 @@ async def test_a_later_environment_failure_does_not_erase_a_declared_result(
     assert json.loads(redeclared.read_text())["receipt"]["outcome"] == "declared"
 
 
+async def test_a_later_cancellation_cannot_replace_a_run_receipt_on_disk(
+    tmp_path: Path,
+) -> None:
+    """An accepted bell is stronger evidence than cancel-arm."""
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.state = SessionState.FAILED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.failure = "The accepted run stopped short."
+    snapshot.lanes["competitor"].state = LaneState.FAILED
+    run = derive_receipt(snapshot, "run_finished")
+    assert run.outcome == "stopped_short"
+    target = write_receipt(run, snapshot, tmp_path)
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+    write_receipt(cancellation, cancelled, tmp_path)
+
+    document = json.loads(target.read_text())
+    assert document["receipt"]["sealing_event"] == "run_finished"
+    assert document["receipt"]["failure"] == run.failure
+
+
+async def test_a_later_cancellation_cannot_replace_a_durable_run_receipt() -> None:
+    """The durable reader applies the same run-over-cancel authority as disk."""
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.state = SessionState.FAILED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.failure = "The accepted run stopped short."
+    snapshot.lanes["competitor"].state = LaneState.FAILED
+    run = derive_receipt(snapshot, "run_finished")
+    assert run.outcome == "stopped_short"
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    await store.append(run, snapshot)
+    await store.append(cancellation, cancelled)
+
+    found = await store.load()
+    assert [item.sealing_event for item in found] == ["run_finished"]
+    assert found[0].failure == run.failure
+
+
+async def test_a_newer_accepted_failure_replaces_an_older_stopped_run_in_both_stores(
+    tmp_path: Path,
+) -> None:
+    """Run-over-cancel precedence must not hide a later accepted bout."""
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.state = SessionState.FAILED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.failure = "The first accepted run stopped short."
+    snapshot.lanes["competitor"].state = LaneState.FAILED
+    run = derive_receipt(snapshot, "run_finished")
+
+    later = snapshot.model_copy(deep=True)
+    later.receipt_bout_id = "later-accepted-bout"
+    later.updated_at += timedelta(seconds=1)
+    later.failure = "The later accepted run failed."
+    failure = derive_receipt(later, "session_failed")
+
+    target = write_receipt(run, snapshot, tmp_path)
+    write_receipt(failure, later, tmp_path)
+    assert json.loads(target.read_text())["receipt"]["sealing_event"] == "session_failed"
+
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    await store.append(run, snapshot)
+    await store.append(failure, later)
+    found = await store.load()
+    assert [item.sealing_event for item in found] == ["session_failed"]
+    assert found[0].failure == failure.failure
+
+    cancelled = later.model_copy(deep=True)
+    cancelled.receipt_bout_id = "later-no-bell-cancel"
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "The third bout was cancelled before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+    write_receipt(cancellation, cancelled, tmp_path)
+    await store.append(cancellation, cancelled)
+
+    assert json.loads(target.read_text())["receipt"]["sealing_event"] == "session_cancelled"
+    found = await store.load()
+    assert [item.sealing_event for item in found] == ["session_cancelled"]
+    assert found[0].failure == cancellation.failure
+
+
+async def test_a_late_older_file_write_cannot_clobber_a_newer_attempt(
+    tmp_path: Path,
+) -> None:
+    snapshot = await verified_round_one_snapshot()
+    snapshot.state = SessionState.FAILED
+    snapshot.run_started_at = None
+    snapshot.failure = "First attempt cancelled."
+    older = derive_receipt(snapshot, "session_cancelled")
+
+    newer_snapshot = snapshot.model_copy(deep=True)
+    newer_snapshot.receipt_bout_id = "newer-cancelled-attempt"
+    newer_snapshot.updated_at += timedelta(seconds=1)
+    newer_snapshot.failure = "Second attempt cancelled."
+    newer = derive_receipt(newer_snapshot, "session_cancelled")
+
+    target = write_receipt(newer, newer_snapshot, tmp_path)
+    write_receipt(older, snapshot, tmp_path)
+    stored = json.loads(target.read_text())["receipt"]
+    assert datetime.fromisoformat(stored["sealed_at"]) == newer.sealed_at
+    assert stored["failure"] == newer.failure
+
+
 async def test_a_write_failure_cannot_fail_a_bout(tmp_path: Path, caplog) -> None:
     """The load-bearing guarantee: a souvenir must never take a bout down with it."""
     snapshot = await verified_round_one_snapshot()
@@ -971,6 +1153,576 @@ async def test_recording_the_same_terminal_event_twice_is_one_row() -> None:
     assert [item.session_id for item in await store.load()] == [snapshot.id]
 
 
+async def failed_then_verified_round_one_bouts() -> tuple[SessionSnapshot, SessionSnapshot]:
+    """One card's two bouts: one that rang and did not verify, then its re-arm that did.
+
+    Built directly rather than by two arms, so neither carries an attempt identity
+    and the durable key tells them apart by ``armed_at`` alone.
+    """
+
+    verified = await verified_round_one_snapshot()
+    verified.receipt_bout_id = None
+    assert verified.armed_at is not None and verified.run_started_at is not None
+    earlier = timedelta(minutes=5)
+    failed = verified.model_copy(deep=True)
+    failed.state = SessionState.FAILED
+    failed.armed_at = verified.armed_at - earlier
+    failed.run_started_at = verified.run_started_at - earlier
+    failed.updated_at = verified.updated_at - earlier
+    failed.remembered_result = None
+    failed.comparison = None
+    failed.metrics = []
+    failed.failure = "One or more lanes could not be verified."
+    failed.lanes["lakebase"].state = LaneState.FAILED
+    return failed, verified
+
+
+async def test_a_rearmed_bout_that_verifies_is_kept_over_the_failed_bout_before_it() -> None:
+    """One session, two bouts, one terminal event name: the verified bout is the receipt.
+
+    A FAILED card in any round but Round 5 can be armed again, and its next bout seals
+    the same `run_finished` the failed one did. A key of session, round and event alone
+    made the verified receipt collide with the stopped-short one, and `ON CONFLICT DO
+    NOTHING` kept the first.
+    """
+
+    failed, verified = await failed_then_verified_round_one_bouts()
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    stopped_short = derive_receipt(failed, "run_finished")
+    declared = derive_receipt(verified, "run_finished")
+    assert (stopped_short.session_id, stopped_short.round_id) == (
+        declared.session_id,
+        declared.round_id,
+    )
+    assert (stopped_short.outcome, declared.outcome) == ("stopped_short", "declared")
+
+    await store.append(stopped_short, failed)
+    await store.append(declared, verified)
+
+    found = await store.load()
+    assert [(item.session_id, item.outcome) for item in found] == [(verified.id, "declared")]
+    assert found[0].remembered_result == declared.remembered_result
+    assert found[0].sealed_at == declared.sealed_at
+
+    # Both bouts stay on the record, and each one's terminal event is still one row.
+    await store.append(stopped_short, failed)
+    await store.append(declared, verified)
+    assert len(cursor.rows) == 2
+    assert [item.outcome for item in await store.load()] == ["declared"]
+
+
+class FailsItsFirstBoutResolver:
+    """Round 1 lanes whose first bout fails at the bell and whose next one verifies.
+
+    The opponent's lane is the one that fails: Round 1 gives the ring back only after
+    a verified Lakebase lane has proved its return to idle.
+    """
+
+    def __init__(self) -> None:
+        self.bouts = 0
+
+    def resolve(self, competitor: CompetitorId):
+        self.bouts += 1
+        return (
+            FakeLiveTarget("lakebase", "Lakebase", 0.005),
+            FakeLiveTarget("competitor", "Aurora Serverless v2", 0.025, fatal=self.bouts == 1),
+        )
+
+
+async def test_a_card_rearmed_after_a_failed_bout_reports_its_verified_receipt(
+    monkeypatch,
+) -> None:
+    """The same, driven through RunManager on the deployed shape: no artifact directory.
+
+    The owner arms and rings a Round 1 card that fails, then arms and rings the same
+    card again and it verifies. Both bouts seal `run_finished` for one session and one
+    round, and `/api/receipts` has to answer with the verified one.
+    """
+
+    from fastapi import FastAPI
+
+    deployed_shaped_runtime(monkeypatch)
+    cursor = FakeCoordinationCursor(table_present=True)
+    install_receipt_store(durable_store(cursor))
+
+    manager = RunManager(resolver=FailsItsFirstBoutResolver(), verifier=make_verifier())
+    manager._arm_poll = 0.001
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="software_engineer",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.WAKE_IDLE_APP,
+        )
+    )
+    for outcome in (SessionState.FAILED, SessionState.VERIFIED):
+        await manager.start_arm(created.id, owner)
+        await wait_for_state(manager, created.id, SessionState.ARMED)
+        await manager.start_run(created.id, owner)
+        await wait_for_state(manager, created.id, outcome)
+        # Round 1 holds the ring through its return to idle, so the re-arm waits it out.
+        await drain_record_operations(manager, manager._records[created.id])
+    await manager.close()
+    await drain_receipt_writes()
+
+    sealed = sorted(
+        (document["receipt"]["sealing_event"], document["receipt"]["outcome"])
+        for document in (json.loads(row[7]) for row in cursor.rows.values())
+    )
+    assert sealed == [("run_finished", "declared"), ("run_finished", "stopped_short")]
+    # Each bout's row is keyed on its own arm, never on a fallback.
+    assert all(key[2].startswith("run_finished#") for key in cursor.rows)
+
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app) as client:
+        receipts = client.get("/api/receipts").json()["receipts"]
+    assert [(item["session_id"], item["outcome"]) for item in receipts] == [
+        (created.id, "declared")
+    ]
+
+
+def round_one_card() -> SessionCreate:
+    return SessionCreate(
+        competitor=CompetitorId.AURORA_SERVERLESS_V2,
+        primary_persona="software_engineer",
+        corners=[Corner.PERFORMANCE],
+        round_id=RoundId.WAKE_IDLE_APP,
+    )
+
+
+def stored_receipts(cursor: FakeCoordinationCursor) -> list[dict[str, object]]:
+    return [json.loads(row[7])["receipt"] for row in cursor.rows.values()]
+
+
+async def test_two_cancelled_checks_of_one_card_are_two_receipts(monkeypatch) -> None:
+    """Re-arms that end before ARMED have no `armed_at`, and are still two bouts.
+
+    The owner arms the same Round 1 card twice and cancels each fight-card check.
+    Both seal `session_cancelled` with `armed_at` unset, so a key that falls back to
+    the bare event name kept the first cancellation and dropped the second.
+    """
+
+    deployed_shaped_runtime(monkeypatch)
+    cursor = FakeCoordinationCursor(table_present=True)
+    install_receipt_store(durable_store(cursor))
+    resolver = HangingArmResolver()
+    manager = RunManager(resolver=resolver, verifier=make_verifier())
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(round_one_card())
+
+    attempts: list[str | None] = []
+    cancelled: list[SessionSnapshot] = []
+    for _ in range(2):
+        await manager.start_arm(created.id, owner)
+        await resolver.lakebase.entered.wait()
+        attempts.append(manager._records[created.id].snapshot.receipt_bout_id)
+        cancelled.append(await manager.cancel_arm(created.id, owner))
+    await manager.close()
+    await drain_receipt_writes()
+
+    assert [snapshot.armed_at for snapshot in cancelled] == [None, None]
+    assert None not in attempts and len(set(attempts)) == 2
+    assert sorted(key[2] for key in cursor.rows) == sorted(
+        f"session_cancelled#{attempt}" for attempt in attempts
+    )
+    assert sorted(item["sealing_event"] for item in stored_receipts(cursor)) == [
+        "session_cancelled",
+        "session_cancelled",
+    ]
+    found = await durable_store(cursor).load()
+    assert [(item.session_id, item.sealed_at) for item in found] == [
+        (created.id, cancelled[-1].updated_at)
+    ]
+
+
+async def test_a_cancellation_published_after_a_rearm_keeps_its_own_attempt(
+    monkeypatch,
+) -> None:
+    """A late terminal publish belongs to the arm that produced it, not the current one.
+
+    `cancel_arm` publishes after it lets go of the record lock, so the owner can re-arm
+    the card before the first cancellation's receipt is sealed. Here that publish is
+    held until the second attempt has been armed and cancelled. Taking the identity
+    from record-wide state at publish time gave the late row the second attempt's key,
+    and `ON CONFLICT DO NOTHING` dropped one of the two cancellations.
+    """
+
+    deployed_shaped_runtime(monkeypatch)
+    cursor = FakeCoordinationCursor(table_present=True)
+    install_receipt_store(durable_store(cursor))
+    resolver = HangingArmResolver()
+    manager = RunManager(resolver=resolver, verifier=make_verifier())
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(round_one_card())
+    record = manager._records[created.id]
+
+    publish = record.event_log.publish
+    held = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_the_first_cancellation(event, payload, **kwargs):
+        if event == "session_cancelled" and not held.is_set():
+            held.set()
+            await release.wait()
+        return await publish(event, payload, **kwargs)
+
+    monkeypatch.setattr(record.event_log, "publish", hold_the_first_cancellation)
+
+    await manager.start_arm(created.id, owner)
+    await resolver.lakebase.entered.wait()
+    first_attempt = record.snapshot.receipt_bout_id
+    first_cancel = asyncio.create_task(manager.cancel_arm(created.id, owner))
+    await held.wait()
+
+    resolver.lakebase.entered.clear()
+    await manager.start_arm(created.id, owner)
+    await resolver.lakebase.entered.wait()
+    second_attempt = record.snapshot.receipt_bout_id
+    second = await asyncio.wait_for(
+        manager.cancel_arm(created.id, owner),
+        timeout=2,
+    )
+
+    release.set()
+    first = await asyncio.wait_for(first_cancel, timeout=2)
+    await manager.close()
+    await drain_receipt_writes()
+
+    assert None not in (first_attempt, second_attempt)
+    assert first_attempt != second_attempt
+    assert first.updated_at < second.updated_at
+    assert sorted(key[2] for key in cursor.rows) == sorted(
+        [f"session_cancelled#{first_attempt}", f"session_cancelled#{second_attempt}"]
+    )
+    sealed_at = {
+        key[2]: datetime.fromisoformat(json.loads(row[7])["receipt"]["sealed_at"])
+        for key, row in cursor.rows.items()
+    }
+    assert sealed_at == {
+        f"session_cancelled#{first_attempt}": first.updated_at,
+        f"session_cancelled#{second_attempt}": second.updated_at,
+    }
+    found = await durable_store(cursor).load()
+    assert [(item.session_id, item.sealed_at) for item in found] == [
+        (created.id, second.updated_at)
+    ]
+    assert record.checking_cancel_tasks == {}
+
+
+_RECEIPT_EVENTS = SEALING_EVENTS | TOWEL_SETTLING_EVENTS
+
+
+def _possible_events(
+    expr: ast.expr,
+    scope: ast.AST | None,
+    parents: dict[ast.AST, ast.AST],
+    seen: frozenset[str] = frozenset(),
+) -> set[str] | None:
+    """Every event name ``expr`` can evaluate to, or None when that cannot be proven.
+
+    Literals, conditional expressions of them, and local names bound only by plain
+    assignments in the enclosing function are resolved. Anything else -- a parameter,
+    a loop target, a call, an attribute -- is unproven, so its publisher has to bind.
+    """
+
+    if isinstance(expr, ast.Constant):
+        return {expr.value} if isinstance(expr.value, str) else None
+    if isinstance(expr, ast.IfExp):
+        body = _possible_events(expr.body, scope, parents, seen)
+        orelse = _possible_events(expr.orelse, scope, parents, seen)
+        return None if body is None or orelse is None else body | orelse
+    if not isinstance(expr, ast.Name) or scope is None or expr.id in seen:
+        return None
+    values: set[str] = set()
+    bound = False
+    for node in ast.walk(scope):
+        if isinstance(node, ast.arg) and node.arg == expr.id:
+            return None
+        if not (isinstance(node, ast.Name) and node.id == expr.id):
+            continue
+        if not isinstance(node.ctx, ast.Store):
+            continue
+        binder = parents[node]
+        if isinstance(binder, ast.Assign) and node in binder.targets:
+            value = binder.value
+        elif isinstance(binder, ast.AnnAssign) and binder.value is not None:
+            value = binder.value
+        else:
+            return None
+        resolved = _possible_events(value, scope, parents, seen | {expr.id})
+        if resolved is None:
+            return None
+        values |= resolved
+        bound = True
+    return values if bound else None
+
+
+def unbound_receipt_publishes(source: str) -> tuple[list[str], int]:
+    """Publishers that may seal a receipt without binding their snapshot's attempt.
+
+    Returns the problems and how many sealing publishers were proven correct. A
+    publisher is exempt only when every event it can publish is a proven literal that
+    seals nothing; otherwise it must carry ``"session": X.model_dump(...)`` and pass
+    ``receipt_bout_id=X.receipt_bout_id`` from that same ``X``.
+    """
+
+    tree = ast.parse(source)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    problems: list[str] = []
+    checked = 0
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "publish"
+        ):
+            continue
+        where = f"manager.py:{node.lineno}"
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        event = node.args[0] if node.args else keywords.get("event")
+        payload = node.args[1] if len(node.args) > 1 else keywords.get("payload")
+        if event is None:
+            problems.append(f"{where} publishes an event this check cannot find")
+            continue
+        scope = parents.get(node)
+        while scope is not None and not isinstance(
+            scope, ast.FunctionDef | ast.AsyncFunctionDef
+        ):
+            scope = parents.get(scope)
+        events = _possible_events(event, scope, parents)
+        if events is not None and not events & _RECEIPT_EVENTS:
+            continue
+        label = sorted(events & _RECEIPT_EVENTS) if events is not None else "an unproven event"
+        session = None
+        if isinstance(payload, ast.Dict):
+            for key, value in zip(payload.keys, payload.values, strict=True):
+                if isinstance(key, ast.Constant) and key.value == "session":
+                    session = value
+        if not (
+            isinstance(session, ast.Call)
+            and isinstance(session.func, ast.Attribute)
+            and session.func.attr == "model_dump"
+        ):
+            problems.append(f"{where} may publish {label} without a session snapshot dump")
+            continue
+        snapshot = ast.unparse(session.func.value)
+        bound = keywords.get("receipt_bout_id")
+        if bound is None or ast.unparse(bound) != f"{snapshot}.receipt_bout_id":
+            problems.append(
+                f"{where} may publish {label} without receipt_bout_id={snapshot}.receipt_bout_id"
+            )
+            continue
+        checked += 1
+    return problems, checked
+
+
+def manager_source() -> str:
+    from server import manager as manager_module
+
+    return Path(manager_module.__file__).read_text()
+
+
+def test_every_manager_sealing_publish_binds_the_attempt_of_the_snapshot_it_sends() -> None:
+    """No sealing publisher in the manager may leave the attempt identity to a fallback.
+
+    A sealing event published without ``receipt_bout_id`` would be keyed on ``armed_at``
+    or the bare event name, which is the collision this identity exists to prevent, and
+    nothing at runtime would say so. The identity also has to come from the very
+    snapshot the payload carries, so a delayed publish cannot pick up a later arm's.
+    """
+
+    problems, checked = unbound_receipt_publishes(manager_source())
+    assert problems == []
+    assert checked >= 25
+
+
+def test_the_publish_check_fails_a_computed_sealing_event_that_does_not_bind() -> None:
+    """Mutate the manager's own computed, session-less publishers to seal, and be caught.
+
+    The cooldown publishers pick between two non-sealing names and carry no session,
+    which is the one shape the check may exempt. Turn one branch into
+    ``session_failed`` and the same publisher must now be reported.
+    """
+
+    tree = ast.parse(manager_source())
+    mutated: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "publish"
+            and node.args
+            and isinstance(node.args[0], ast.IfExp)
+            and isinstance(node.args[0].orelse, ast.Constant)
+            and not node.keywords
+        ):
+            node.args[0].orelse = ast.Constant("session_failed")
+            mutated.append(node.lineno)
+    assert mutated, "the manager no longer has a computed session-less publisher to mutate"
+
+    problems, _ = unbound_receipt_publishes(ast.unparse(tree))
+    assert len(problems) == len(mutated)
+    assert all("['session_failed'] without a session snapshot dump" in item for item in problems)
+
+
+def test_the_publish_check_fails_a_sealing_publisher_that_drops_its_binding() -> None:
+    tree = ast.parse(manager_source())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "publish"
+            and any(keyword.arg == "receipt_bout_id" for keyword in node.keywords)
+        ):
+            node.keywords = [k for k in node.keywords if k.arg != "receipt_bout_id"]
+            break
+    else:
+        raise AssertionError("no bound sealing publisher to mutate")
+
+    problems, _ = unbound_receipt_publishes(ast.unparse(tree))
+    assert len(problems) == 1 and "without receipt_bout_id=" in problems[0]
+
+
+@pytest.mark.parametrize(
+    ("body", "flagged"),
+    [
+        # Proven to publish only names that seal nothing: exempt.
+        ('event = "cooldown_update"\n    await log.publish(event, {})', False),
+        ('await log.publish("a" if ready else "cooldown_update", {})', False),
+        # Could seal, with no session: flagged however the name is computed.
+        ('event = "session_failed"\n    await log.publish(event, {})', True),
+        (
+            'event = "arm_started"\n    event = "run_finished"\n    await log.publish(event, {})',
+            True,
+        ),
+        ('await log.publish("x" if ready else "towel_update", {})', True),
+        ("await log.publish(name_for(ready), {})", True),
+        ("for event in names:\n        await log.publish(event, {})", True),
+        ('await log.publish(event="session_cancelled", payload={})', True),
+        # Bound to a different snapshot than the one it sends: flagged.
+        (
+            'await log.publish("run_finished", {"session": a.model_dump(mode="json")},'
+            " receipt_bout_id=b.receipt_bout_id)",
+            True,
+        ),
+        # Correctly bound: proven.
+        (
+            'await log.publish("run_finished", {"session": a.model_dump(mode="json")},'
+            " receipt_bout_id=a.receipt_bout_id)",
+            False,
+        ),
+    ],
+)
+def test_the_publish_check_only_exempts_proven_non_sealing_events(body, flagged) -> None:
+    source = f"async def publisher(log, ready, names):\n    {body}\n"
+    problems, _ = unbound_receipt_publishes(source)
+    assert bool(problems) is flagged, problems
+
+
+def test_a_parameter_event_name_is_unproven() -> None:
+    source = "async def publisher(log, event):\n    await log.publish(event, {})\n"
+    problems, _ = unbound_receipt_publishes(source)
+    assert problems == [
+        "manager.py:2 may publish an unproven event without a session snapshot dump"
+    ]
+
+
+class RefusesEachArmDifferentlyResolver:
+    """Round 1 lanes whose start state is refused before ARMED, for a new reason each arm."""
+
+    def __init__(self) -> None:
+        self.refusals = iter(
+            [
+                TargetConfigurationError("Lakebase project is not configured"),
+                PermissionDenied("User does not have USE on project 'lakebase'"),
+            ]
+        )
+
+    def resolve(self, competitor: CompetitorId):
+        error = next(self.refusals)
+        return (
+            FailingArmTarget("lakebase", "Lakebase", error),
+            FailingArmTarget("competitor", "Aurora Serverless v2", error),
+        )
+
+
+async def test_two_failed_arms_of_one_card_keep_the_latest_refusal(monkeypatch) -> None:
+    """Two pre-ARM `session_failed` bouts with different facts: the latest one answers."""
+
+    deployed_shaped_runtime(monkeypatch)
+    cursor = FakeCoordinationCursor(table_present=True)
+    install_receipt_store(durable_store(cursor))
+    manager = RunManager(resolver=RefusesEachArmDifferentlyResolver(), verifier=make_verifier())
+    manager._arm_poll = 0.001
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(round_one_card())
+
+    failed: list[SessionSnapshot] = []
+    for _ in range(2):
+        await manager.start_arm(created.id, owner)
+        failed.append(await wait_for_state(manager, created.id, SessionState.FAILED))
+        await drain_record_operations(manager, manager._records[created.id])
+    await manager.close()
+    await drain_receipt_writes()
+
+    assert [snapshot.armed_at for snapshot in failed] == [None, None]
+    assert failed[0].failure != failed[1].failure
+    stored = stored_receipts(cursor)
+    assert sorted(item["sealing_event"] for item in stored) == ["session_failed", "session_failed"]
+    assert all(key[2].startswith("session_failed#") for key in cursor.rows)
+    assert {item["failure"] for item in stored} == {failed[0].failure, failed[1].failure}
+    found = await durable_store(cursor).load()
+    assert [(item.session_id, item.failure) for item in found] == [
+        (created.id, failed[1].failure)
+    ]
+
+
+async def test_one_attempts_terminal_event_is_one_row_however_often_it_is_written() -> None:
+    """The attempt identity keys the row, so a rewrite of one attempt is still one row."""
+
+    failed, _ = await failed_then_verified_round_one_bouts()
+    failed.armed_at = None
+    failed.run_started_at = None
+    first = failed.model_copy(deep=True, update={"receipt_bout_id": "attempt-one"})
+    second = failed.model_copy(
+        deep=True,
+        update={
+            "receipt_bout_id": "attempt-two",
+            "updated_at": failed.updated_at + timedelta(minutes=1),
+            "failure": "The start state could not be verified.",
+        },
+    )
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    for snapshot in (first, second, first, second):
+        await store.append(derive_receipt(snapshot, "session_failed"), snapshot)
+
+    assert len(cursor.rows) == 2
+    found = await store.load()
+    assert [(item.failure, item.sealed_at) for item in found] == [
+        (second.failure, second.updated_at)
+    ]
+
+
+async def test_the_attempt_identity_never_reaches_a_published_snapshot() -> None:
+    resolver = HangingArmResolver()
+    manager = RunManager(resolver=resolver, verifier=make_verifier())
+    owner = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(round_one_card())
+    await manager.start_arm(created.id, owner)
+    await resolver.lakebase.entered.wait()
+    cancelled = await manager.cancel_arm(created.id, owner)
+    await manager.close()
+
+    assert manager._records[created.id].snapshot.receipt_bout_id is not None
+    assert "receipt_bout_id" not in cancelled.model_dump(mode="json")
+    for event in manager._records[created.id].event_log.events:
+        assert "receipt_bout_id" not in json.dumps(event.payload)
+
+
 async def test_durable_auto_cleanup_failure_then_recovery_folds_clean() -> None:
     snapshot = await verified_round_one_snapshot()
     cursor = FakeCoordinationCursor()
@@ -1095,6 +1847,41 @@ async def test_a_bout_held_in_both_stores_is_reported_once(tmp_path: Path, monke
     found = await load_receipts_async()
 
     assert [item.session_id for item in found] == [older.id, snapshot.id]
+
+
+async def test_a_run_receipt_on_disk_outranks_a_later_durable_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Each store keeps a run over a later cancel of the same card, and so must the merge.
+
+    Here the run reached only the disk and the cancellation only the durable table,
+    so neither store saw both and only the merge can apply that authority.
+    """
+
+    snapshot = await verified_round_one_snapshot()
+    # Away from the receipt the harness's own verified bout just wrote.
+    monkeypatch.setenv("ANTI_DEMO_ARTIFACT_ROOT", str(tmp_path))
+    snapshot.state = SessionState.FAILED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.failure = "The accepted run stopped short."
+    snapshot.lanes["competitor"].state = LaneState.FAILED
+    run = derive_receipt(snapshot, "run_finished")
+    write_receipt(run, snapshot, receipts_root())
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+    store = durable_store(FakeCoordinationCursor())
+    await store.append(cancellation, cancelled)
+    install_receipt_store(store)
+
+    found = await load_receipts_async()
+
+    assert [item.sealing_event for item in found] == ["run_finished"]
+    assert found[0].failure == run.failure
 
 
 async def test_a_broken_durable_read_still_shows_what_is_on_disk(

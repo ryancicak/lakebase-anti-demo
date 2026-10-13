@@ -30,6 +30,7 @@ from server.coordination import (
     round_ring_key,
 )
 from server.manager import (
+    _LOST_RING_STILL_STOPPING,
     InvalidStateError,
     RoundStorageReadinessError,
     RunManager,
@@ -1255,8 +1256,136 @@ async def test_all_bout_statuses_keep_health_failures_unavailable(monkeypatch) -
     assert all(not item["can_start"] for item in response.json()["rounds"].values())
 
 
-async def test_double_posted_run_returns_one_bout_over_http() -> None:
-    """Two POST /run calls for one session must not open two runs.
+@pytest.mark.parametrize("round_isolation", [True, False], ids=["own-ring", "shared-ring"])
+async def test_the_fight_card_names_a_lost_ring_whose_work_is_still_stopping(
+    round_isolation: bool,
+) -> None:
+    """The ring reopens by itself once the work that lost it has stopped here.
+
+    So the tile reads TEMPORARILY UNAVAILABLE with the manager's reason, the state the
+    release bar accepts for a round it owns, and not the generic UNAVAILABLE the card
+    renders as unavailable tonight. Only the tiles on that ring change: Round 6's alone
+    with per-round rings, all six while one ring is shared.
+    """
+
+    run_manager = RunManager(
+        round_isolation=round_isolation,
+        installation_id="install-lost-ring-tile",
+        model_score_factory=lambda _competitor: object(),
+        connection_spike_factory=lambda: object(),
+        live_orders_factory=lambda _competitor: object(),
+        lease_store=InMemoryBoutLeaseStore(),
+    )
+    created = await run_manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="data_analyst",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.ANALYZE_LIVE_ORDERS,
+        )
+    )
+    record = run_manager._records[created.id]
+    owner = BoutOperator(display_name="Owner", subject="owner-subject")
+    ring = run_manager._lease_store_for_record(record)
+    sent = time.monotonic()
+    lease = await ring.claim(
+        session_id=created.id,
+        operator=owner,
+        phase="run_committed",
+        session_state=SessionState.RUNNING,
+        round_id=RoundId.ANALYZE_LIVE_ORDERS.value,
+        round_title=record.snapshot.round.title,
+        competitor_id=record.snapshot.competitor.id.value,
+        competitor_name=record.snapshot.competitor.short_name,
+        ttl=timedelta(seconds=30),
+    )
+    record.operator = owner
+    record.snapshot.state = SessionState.RUNNING
+    run_manager._set_lease(record, lease, sent)
+    finishes = asyncio.Event()
+    run = asyncio.create_task(finishes.wait(), name=f"run-{created.id}")
+    record.task = run
+    api_app = FastAPI()
+    api_app.include_router(router)
+    api_app.state.run_manager = run_manager
+
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        try:
+            # The row is gone without this card having released it, and its run goes on.
+            assert await ring.release(lease)
+            assert await run_manager._release_bout(record) is True
+            assert record.ring_lease_lost is True
+            ring_status = (
+                await client.get(
+                    "/api/bout", params={"round_id": RoundId.ANALYZE_LIVE_ORDERS.value}
+                )
+            ).json()
+            board = (await client.get("/api/bout/all")).json()["rounds"]
+        finally:
+            finishes.set()
+        await run
+        reopened = (await client.get("/api/bout/all")).json()["rounds"]
+
+    assert ring_status["can_start"] is False
+    assert "ACTIVE WORK IS STILL STOPPING" in ring_status["maintenance_detail"]
+    closed = (
+        {RoundId.ANALYZE_LIVE_ORDERS.value}
+        if round_isolation
+        else {round_id.value for round_id in RoundId}
+    )
+    for round_id, tile in board.items():
+        if round_id in closed:
+            assert tile["state"] == "temporarily_unavailable", round_id
+            assert tile["can_start"] is False
+            assert tile["detail"] == ring_status["maintenance_detail"]
+        else:
+            assert tile["state"] == "ready", round_id
+            assert tile["can_start"] is True
+    assert {tile["state"] for tile in reopened.values()} == {"ready"}
+    await run_manager.close()
+
+
+def test_a_catalog_refusal_still_outranks_a_ring_that_is_still_stopping() -> None:
+    """The ring reopening would not make the round runnable, so the catalog's reason stands."""
+
+    round_six = next(
+        item
+        for item in sealed_catalog(live_orders_available=True).rounds
+        if item.id == RoundId.ANALYZE_LIVE_ORDERS
+    ).model_copy(
+        update={
+            "availability": Availability.UNAVAILABLE,
+            "availability_headline": "Round 6's AWS lane is not installed",
+            "availability_reason": "Seal the Round 6 AWS lane to race it.",
+        }
+    )
+    stopping = BoutStatus(
+        scope="round",
+        round_id=RoundId.ANALYZE_LIVE_ORDERS,
+        active=False,
+        can_start=False,
+        maintenance_state="maintenance",
+        maintenance_detail=_LOST_RING_STILL_STOPPING,
+    )
+
+    status = api_module._fight_card_round_status(
+        RoundId.ANALYZE_LIVE_ORDERS,
+        round_six,
+        stopping,
+    )
+
+    assert status.state == "unavailable"
+    assert status.can_start is False
+    assert status.detail == "Round 6's AWS lane is not installed"
+
+
+async def test_cancelled_run_request_does_not_cancel_bell_handoff_over_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled POST and its retry share one manager-owned bell handoff.
 
     This exercises the real HTTP surface a double-clicked bell hits. It uses the
     in-process ASGI transport rather than TestClient on purpose: TestClient drives
@@ -1291,24 +1420,54 @@ async def test_double_posted_run_returns_one_bout_over_http() -> None:
     api_app = FastAPI()
     api_app.include_router(router)
     api_app.state.run_manager = run_manager
+    original_commit = run_manager._commit_bout
+    committed = asyncio.Event()
+    release_handoff = asyncio.Event()
+
+    async def blocked_commit(record, operator):
+        await original_commit(record, operator)
+        committed.set()
+        await release_handoff.wait()
+
+    monkeypatch.setattr(run_manager, "_commit_bout", blocked_commit)
 
     async with AsyncClient(
         transport=ASGITransport(app=api_app),
         base_url="http://anti-demo.test",
     ) as client:
-        first = await client.post(f"/api/sessions/{created.id}/run")
-        second = await client.post(f"/api/sessions/{created.id}/run")
+        first = asyncio.create_task(client.post(f"/api/sessions/{created.id}/run"))
+        await asyncio.wait_for(committed.wait(), timeout=2)
+        record = run_manager._records[created.id]
+        assert record.snapshot.state == SessionState.ARMED
+        assert record.lease is not None
+        assert record.lease.phase == "run_committed"
+
+        second_request = asyncio.create_task(
+            client.post(f"/api/sessions/{created.id}/run")
+        )
+        await asyncio.sleep(0)
+        assert not second_request.done()
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert record.bell_handoff_task is not None
+        assert not record.bell_handoff_task.done()
+
+        release_handoff.set()
+        second = await asyncio.wait_for(second_request, timeout=2)
+        duplicate = await client.post(f"/api/sessions/{created.id}/run")
 
     # The duplicate must be answered, not rejected and not run again.
-    assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json()["id"] == second.json()["id"] == created.id
-    assert first.json()["run_started_at"] == second.json()["run_started_at"]
+    assert duplicate.status_code == 200
+    assert second.json()["id"] == duplicate.json()["id"] == created.id
+    assert second.json()["run_started_at"] == duplicate.json()["run_started_at"]
 
     # The run task publishes run_started after the POST returns, so let it land.
     events = run_manager._records[created.id].event_log.events
     for _ in range(400):
-        if (await run_manager.get(created.id)).state.value == "running":
+        if [event.event for event in events].count("run_started") == 1:
             break
         await asyncio.sleep(0.005)
     assert (await run_manager.get(created.id)).state.value == "running"
@@ -1648,23 +1807,113 @@ async def test_catalog_probes_shared_storage_before_offering_rounds_four_and_six
         base_url="http://anti-demo.test",
     ) as client:
         response = await client.get("/api/catalog")
+        for _ in range(5):
+            await asyncio.sleep(0)
         cached = await client.get("/api/catalog")
 
     assert response.status_code == 200
     assert cached.status_code == 200
     assert calls == 1
+    shared = {RoundId.PUT_MODEL_SCORE_IN_APP.value, RoundId.ANALYZE_LIVE_ORDERS.value}
+    # The first answer does not wait for the probe, and offers neither round before it.
     by_id = {item["id"]: item for item in response.json()["rounds"]}
-    assert by_id[RoundId.PUT_MODEL_SCORE_IN_APP.value]["availability"] == "unavailable"
-    assert by_id[RoundId.ANALYZE_LIVE_ORDERS.value]["availability"] == "unavailable"
+    for round_id in shared:
+        assert by_id[round_id]["availability"] == "unavailable"
+        assert by_id[round_id]["availability_reason_code"] == "storage_checking"
     assert all(
         item["availability"] == "ready"
         for round_id, item in by_id.items()
-        if round_id
-        not in {
-            RoundId.PUT_MODEL_SCORE_IN_APP.value,
-            RoundId.ANALYZE_LIVE_ORDERS.value,
-        }
+        if round_id not in shared
     )
+    # Once it has answered, the refusal it proved replaces the check.
+    cached_by_id = {item["id"]: item for item in cached.json()["rounds"]}
+    for round_id in shared:
+        assert cached_by_id[round_id]["availability"] == "unavailable"
+        assert cached_by_id[round_id].get("availability_reason_code") is None
+        assert "storage is unavailable" in cached_by_id[round_id]["availability_headline"]
+
+
+def test_a_lasting_refusal_outranks_the_storage_check_that_clears_itself() -> None:
+    # Before the first storage verdict, a round Databricks has already refused must say so,
+    # not "opens automatically".
+    round_four = RoundId.PUT_MODEL_SCORE_IN_APP
+    checking = frozenset({round_four, RoundId.ANALYZE_LIVE_ORDERS})
+    granted_away = round_availability.AvailabilitySignals(
+        storage_checking=checking,
+        grant_refusals={
+            round_four: round_availability.grant_refusal("PERMISSION_DENIED on a synced table")
+        },
+    )
+    refused = round_availability.refusal(round_four, granted_away)
+    assert refused is not None and refused.reason_code is None
+    assert "opens automatically" not in refused.headline
+
+    only_checking = round_availability.refusal(
+        round_four, round_availability.AvailabilitySignals(storage_checking=checking)
+    )
+    assert only_checking is not None
+    assert only_checking.reason_code == round_availability.STORAGE_CHECKING_REASON_CODE
+    assert "opens automatically" in only_checking.headline
+
+
+async def test_the_catalog_answers_while_a_stopped_warehouse_is_still_starting(
+    monkeypatch,
+) -> None:
+    """A visitor waited most of a minute, through "Server offline", for a cold warehouse.
+
+    The catalog is every page's first request, and it waited on the shared-storage
+    probe, which a stopped SQL warehouse took most of a minute to answer
+    (2026-10-12). It answers at once now; the board says Rounds 4 and 6 open
+    automatically, and offers them once the probe has answered.
+    """
+
+    monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)
+    monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
+    warehouse_up = asyncio.Event()
+    calls = 0
+
+    async def cold_warehouse() -> None:
+        nonlocal calls
+        calls += 1
+        await warehouse_up.wait()
+
+    api_app = FastAPI()
+    api_app.include_router(router)
+    run_manager = RunManager(
+        model_score_factory=lambda _competitor: object(),
+        connection_spike_factory=lambda competitor: object(),
+        live_orders_factory=lambda _competitor: object(),
+        delta_storage_probe=cold_warehouse,
+    )
+    api_app.state.run_manager = run_manager
+    shared = {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}
+    async with AsyncClient(
+        transport=ASGITransport(app=api_app),
+        base_url="http://anti-demo.test",
+    ) as client:
+        catalog = await asyncio.wait_for(client.get("/api/catalog"), timeout=2)
+        board = await asyncio.wait_for(client.get("/api/bout/all"), timeout=2)
+
+        assert catalog.status_code == 200 and board.status_code == 200
+        assert calls == 1
+        rounds = board.json()["rounds"]
+        for round_id in shared:
+            assert rounds[round_id.value]["state"] == "temporarily_unavailable"
+            assert "opens automatically" in rounds[round_id.value]["detail"]
+        assert all(
+            rounds[round_id.value]["state"] == "ready"
+            for round_id in RoundId
+            if round_id not in shared
+        )
+
+        warehouse_up.set()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        opened = (await client.get("/api/bout/all")).json()["rounds"]
+
+    assert calls == 1
+    assert all(opened[round_id.value]["state"] == "ready" for round_id in RoundId)
+    await run_manager.close()
 
 
 async def test_catalog_storage_probe_reads_both_sealed_delta_paths(monkeypatch) -> None:
@@ -2936,6 +3185,18 @@ def _fixed_credential_verdict(monkeypatch, verdict: CredentialVerdict) -> None:
     monkeypatch.setattr(app_module, "CredentialSentry", Fixed)
 
 
+async def _past_startup_storage_check(served) -> None:
+    """Wait out startup's own shared-storage read, which Rounds 4 and 6 hold for.
+
+    Until it answers they read as checking, not ready, and the catalog no longer
+    waits for it, so a test about anything else waits for it here.
+    """
+
+    task = getattr(served.state, "delta_storage_readiness_task", None)
+    if task is not None:
+        await asyncio.gather(task, return_exceptions=True)
+
+
 def _deployed_app_runtime(monkeypatch, manifest) -> None:
     """Everything a deployed lifespan needs, with no cloud call behind any of it."""
 
@@ -3634,6 +3895,7 @@ async def test_a_deployed_app_with_a_broken_aws_credential_boots_and_serves(
         app.state.readiness_gate.require_ready()
         assert app.state.run_manager.model_score_available is True
         assert app.state.run_manager.live_orders_available is True
+        await _past_startup_storage_check(app)
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://anti-demo.test"
         ) as client:
@@ -3897,6 +4159,7 @@ async def test_a_sealed_network_path_does_not_offer_a_round_with_no_credential(
     _fixed_credential_verdict(monkeypatch, CredentialVerdict())
 
     async with app.router.lifespan_context(app):
+        await _past_startup_storage_check(app)
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://anti-demo.test"
         ) as client:

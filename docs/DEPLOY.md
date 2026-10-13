@@ -127,10 +127,11 @@ exist and still bill, and only their ownership tags identify them.
 > `infra/aws/versions.tf` still declares `backend "local" {}`. A backend *type*
 > cannot come from `-backend-config`, only its arguments can, so the S3 type has
 > to come from `infra/aws/backend_override.tf` — and the only thing that writes
-> that file is `_terraform_init` in `server/lifecycle.py` (1154-1186), whose four
-> call sites all either apply or destroy: `_complete_provision` (7113),
-> `reconcile_infrastructure` (7434), `_renew_locked` (8007) and `cleanup` (9494).
-> `doctor` (8797) is not among them. So no read-only command in this tree arms
+> that file is `_terraform_init` in `server/lifecycle.py`, and every one of its
+> call sites either applies or destroys: `_complete_provision`,
+> `reconcile_infrastructure`, `_renew_locked`, `cleanup`, the Round 4 and Round 6
+> AWS reseals and the operator-address rebind (`_follow_operator_address`).
+> `doctor` is not among them. So no read-only command in this tree arms
 > the override for a hand-run `init`, and `backend_override.tf.example` explicitly
 > forbids creating it by hand. What is missing is a read-only step that reads
 > `terraform-backend.json`, writes or removes `backend_override.tf`, and exits
@@ -139,8 +140,8 @@ exist and still bill, and only their ownership tags identify them.
 > Step 3 writes `terraform-backend.json` *before* the migration is proven, and
 > that record is what `antidemo cleanup` reads. If step 4 then fails, cleanup
 > initialises against an S3 key holding no state while the real state sits in the
-> local file it never reads. It no longer reports a clean teardown on that: the
-> empty-state branch (9557-9604) cross-checks the account by tag and refuses
+> local file it never reads. It no longer reports a clean teardown on that:
+> `cleanup`'s empty-state branch cross-checks the account by tag and refuses
 > under `--yes`. But that cross-check is account-side only, so it reaches exactly
 > as far as the tag read does — residue that is untagged, reads as `retiring`, or
 > sits outside the manifest's region is not caught by it. The local
@@ -213,11 +214,12 @@ sequence is trustworthy:
 ### IAM
 
 `docs/iam/anti-demo-operator-4-state.json` — five statements, 1059 characters,
-against the 6144-character limit. It is a fourth file rather than a merge into
-the existing three: the permissions are only needed on the opt-in path, and
-keeping them separate means the default install grants nothing for S3 at all.
-Merging is also safe — folding it into the largest of the three reaches 5249 of
-the limit — but it grants S3 access to installations that will never use it.
+against the 6144-character limit. It is a separate file rather than a merge into
+one of the five required ones: the permissions are only needed on the opt-in
+path, and keeping them separate means the default install grants nothing on a
+state bucket. Merging is also safe — folding it into the largest file, the
+third, reaches 5249 of the limit — but it grants S3 access to installations that
+will never use it.
 
 It was drafted with four statements and 927 characters, under a name
 (`iam-addendum-s3-state.json`) that was never committed — the draft was adopted
@@ -247,13 +249,62 @@ Three notes for a reviewing cloud team, spelled out in
 ## Deploying the Databricks App
 
 ```bash
+./antidemo coordination-upgrade       # upgrades only: create/grant coordination tables; no lane reset
 ./bootstrap.sh --deploy-only          # publish the seal, deploy, restart, verify
 ./bootstrap.sh --apply --deploy-app   # provision and deploy in one run
 ./bootstrap.sh                        # reports drift, deploys nothing (writes a local profile)
 ```
 
 `--deploy-only` never touches AWS and never runs Terraform. It skips the
-permissions preflight, the state-backend decision and the bill.
+permissions preflight, the state-backend decision and the bill. It also does
+**not** create or grant coordination tables. An existing ready install that
+predates `anti_demo_coordination.round4_source_rebase` (or has the table
+without the app's SELECT/INSERT and sequence USAGE grants) must run
+`antidemo coordination-upgrade` as the schema owner **before** the next app
+deploy. That command calls `ensure_coordination` to create missing objects and
+`_grant_round4_postgres` to issue runtime grants. It does not run Terraform and
+does not reset measured database lanes. `antidemo setup` on a ready install is
+the installer resume that *does* reseed those lanes — do not use it as the
+upgrade path. The deployed app is not allowed to CREATE on that schema; if the
+table is missing or ungranted, startup refuses rather than installing no power
+store and serving anyway. `antidemo renew` is not the upgrade either: its
+Round 5 re-seal can create this table, but it never grants it to the app.
+
+### Upgrading from v1.1.1
+
+This release adds one table to the coordination schema,
+`anti_demo_coordination.round4_source_rebase`, and the app refuses to start
+without it and its grants. The app holds no `CREATE` there and `--deploy-only`
+creates nothing, so an existing installation takes one extra step before the
+usual redeploy. From the checkout the installation was made from, the one
+holding its `.env.bootstrap` and `.anti-demo-v*/` directory:
+
+```bash
+git pull                     # or check out the release tag
+uv sync --locked             # a no-op unless uv.lock changed
+export ANTI_DEMO_MANIFEST="$PWD/$(ls -d .anti-demo-v*/ | sort -V | tail -1)manifest.json"
+./antidemo coordination-upgrade
+./bootstrap.sh --deploy-only
+```
+
+`coordination-upgrade` connects through the installation's own Databricks
+profile, as the principal that provisioned it and owns the schema. It creates
+whichever coordination objects are missing, issues the app's runtime grants, and
+prints `COORDINATION <run id> — tables created/granted`. It runs no Terraform and
+resets neither database lane nor the Round 3 anchors. With Round 5 installed it
+also re-applies Round 5's resident database logins, reading the published ones
+back from AWS Secrets Manager rather than minting new ones, so it needs the
+installation's AWS key in `.env.bootstrap`, as `antidemo setup` does. `--deploy-only` then
+rebuilds `frontend/dist` from the new sources, publishes the seal, redeploys,
+restarts the app and verifies it, so run both while nobody is presenting.
+
+Do not reach for `./bootstrap.sh --apply --reset-ready` or `antidemo setup`
+instead: on a ready installation both reseed the database lanes.
+`antidemo renew` never grants the table to the app. A `--deploy-only` that ran without
+the upgrade fails its readiness check, and the log lines it prints name
+`round4_source_rebase` or the missing privilege; run `coordination-upgrade`,
+then deploy again. If a release also changes the Round 5 runner,
+`--deploy-only` refuses until `./antidemo runner refresh` has run, and says so.
 
 ### How the deployed app gets AWS credentials, and what breaks them
 
@@ -394,7 +445,8 @@ stale seal — and a stale seal is not inert here. The app will compare it, deci
 Round 5 is available, **advertise the round as ready on the card**, and then fail
 an assume-role *after the bell*. The round is promised to the room and then dies.
 
-So a Round 5-capable redeploy is `./bootstrap.sh --deploy-only`, which
+So a Round 5-capable redeploy is `./antidemo coordination-upgrade` if this
+checkout added coordination objects, then `./bootstrap.sh --deploy-only`, which
 republishes the seal and redeploys together — not a source-only push. Run
 `./bootstrap.sh` with no flags first if you want the drift reported before you
 spend anything; it is the check described in
@@ -454,14 +506,16 @@ mismatched one, and it fails toward "republish", which is the cheap direction.
 
 ### What the deploy does
 
-1. **Refuses if the seal is not servable.** `app.py:108` raises
-   `InvalidStateError` inside the FastAPI lifespan when the manifest status is
-   not `ready`, and `app.py:112` when the seal is older than v2. That raise means
+1. **Refuses if the seal is not servable.** `_load_ready_manifest` in `app.py`
+   raises `InvalidStateError` inside the FastAPI lifespan when the manifest status
+   is not `ready`, and when the seal is older than v2. That raise means
    the container never starts — while the deploy still reports success. Checking
    it locally first costs nothing and is the single most useful guard here.
 2. **Refuses if `frontend/dist` is missing**, which makes the app answer 503 on
-   every page. It does not build for you: `npm run build` overwrites the
-   directory a locally running server is serving from.
+   every page. The local-environment step that runs first builds it whenever a
+   source is newer; with `--skip-install` nothing builds it, and the deploy step
+   itself never does, because `npm run build` overwrites the directory a locally
+   running server is serving from.
 3. **Reads the required resource keys out of `app.yaml`.** Whatever `valueFrom:`
    names, the deploy binds — the list is not duplicated in `bootstrap.sh`, so
    adding or removing a binding there needs no change here. A key it does not
@@ -869,6 +923,18 @@ GRANT USAGE, SELECT ON SEQUENCE
   anti_demo_coordination.round4_pipeline_power_event_id_seq
   TO "<app-client-id>";
 
+-- Round 4 rebase owed after a Delta-source repair. Append-only, keyed by the
+-- sealed pipeline, so a Prepare that repairs and then never rings still leaves
+-- the next bell (including after a restart) requesting a full refresh. Separate
+-- from round4_pipeline_power so these rows cannot reorder resuming vs stop_owed.
+-- Existing installs: `antidemo coordination-upgrade` creates and grants this
+-- without resetting lanes; `./bootstrap.sh --deploy-only` does not.
+GRANT SELECT, INSERT ON anti_demo_coordination.round4_source_rebase
+  TO "<app-client-id>";
+GRANT USAGE, SELECT ON SEQUENCE
+  anti_demo_coordination.round4_source_rebase_event_id_seq
+  TO "<app-client-id>";
+
 -- Round 5 automatic warm slot. The installation-scoped head is changed by
 -- fenced compare-and-swap; every transition appends immutable evidence beside it.
 GRANT SELECT, INSERT, UPDATE ON anti_demo_coordination.round5_warm_slot_v4
@@ -946,8 +1012,8 @@ grep against it: `bootstrap.sh` looks for `terraform-backend.json` in
 Without it, `_terraform_init` hardcodes `-backend-config=path=<state>`, which is
 a local-backend argument; the S3 backend rejects an unknown argument outright.
 
-`_terraform_init` (now around `server/lifecycle.py:396`, and covered by five
-tests in `tests/test_lifecycle.py` that run no Terraform command) reads:
+`_terraform_init` (in `server/lifecycle.py`, and covered by five tests in
+`tests/test_lifecycle.py` that run no Terraform command) reads:
 
 ```python
 BACKEND_RECORD_NAME = "terraform-backend.json"

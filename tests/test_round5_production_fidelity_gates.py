@@ -812,7 +812,7 @@ async def test_close_clears_idle_adopted_engines_and_never_mutates_registry_afte
 
 
 async def test_close_does_not_prematurely_clear_a_claim_with_in_flight_cleanup() -> None:
-    """Landed shutdown contract (Finding B): an adopted engine whose claim is
+    """Landed shutdown contract: an adopted engine whose claim is
     CURRENTLY CLEANING with an in-flight provider.reconcile must NOT be released out
     from under that reconcile, and the store must NOT be closed while it runs.
     close() keeps the fence alive and WAITS for the reconcile to actually finish,

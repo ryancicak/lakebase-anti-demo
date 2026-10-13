@@ -67,7 +67,7 @@ class FakeLane:
         self.history_reads += 1
         return self.arrives_on_read is not None and self.history_reads >= self.arrives_on_read
 
-    async def start(self):
+    async def start(self, *, on_refused=None):
         self.events.append("start")
         self.started = True
 

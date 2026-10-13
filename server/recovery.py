@@ -542,59 +542,71 @@ class RecoveryEngine:
             )
             for plan in plans
         }
-        await asyncio.sleep(0)
-        started_ns = self._clock_ns()
-        holder["started_ns"] = started_ns
-        if stop_control is not None:
-            stop_control.started_ns = started_ns
+        stop_wait: asyncio.Task[bool] | None = None
+        started_ns = 0
         try:
+            await asyncio.sleep(0)
+            started_ns = self._clock_ns()
+            holder["started_ns"] = started_ns
+            if stop_control is not None:
+                stop_control.started_ns = started_ns
             if on_started is not None:
                 await on_started()
-        except BaseException:
-            for task in tasks.values():
-                task.cancel()
-            await asyncio.gather(*tasks.values(), return_exceptions=True)
-            await asyncio.gather(*(self._close(source) for source in sources.values()))
-            raise
-        barrier.set()
-        if stop_control is not None:
-            stop_wait = asyncio.create_task(stop_control.event.wait())
-            pending = set(tasks.values())
-            while pending and not stop_control.event.is_set():
-                done, _ = await asyncio.wait(
-                    [*pending, stop_wait],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                pending.difference_update(task for task in done if task is not stop_wait)
-            if stop_control.event.is_set():
-                for task in tasks.values():
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            barrier.set()
+            if stop_control is not None:
+                stop_wait = asyncio.create_task(stop_control.event.wait())
+                pending = set(tasks.values())
+                while pending and not stop_control.event.is_set():
+                    done, _ = await asyncio.wait(
+                        [*pending, stop_wait],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    pending.difference_update(task for task in done if task is not stop_wait)
+                if stop_control.event.is_set():
+                    for task in tasks.values():
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    stop_wait.cancel()
+                    await asyncio.gather(stop_wait, return_exceptions=True)
+                    stop_wait = None
+                    cutoff_ns = stop_control.cutoff_ns or self._clock_ns()
+                    first_actions = list(stop_control.first_action_ns.values())
+                    launch_skew_ms = (
+                        (max(first_actions) - min(first_actions)) / 1_000_000
+                        if len(first_actions) > 1
+                        else 0.0
+                    )
+                    return RecoveryStoppedResult(
+                        competitor=arm.competitor,
+                        started_ns=started_ns,
+                        cutoff_ns=cutoff_ns,
+                        launch_skew_ms=launch_skew_ms,
+                        contract_sha256=self.contract.sha256,
+                        lanes=dict(stop_control.completed_lanes),
+                        active_lane=stop_control.active_lane,
+                        restore_started=(
+                            stop_control.active_lane in stop_control.restore_started_lanes
+                        ),
+                    )
                 stop_wait.cancel()
                 await asyncio.gather(stop_wait, return_exceptions=True)
-                cutoff_ns = stop_control.cutoff_ns or self._clock_ns()
-                first_actions = list(stop_control.first_action_ns.values())
-                launch_skew_ms = (
-                    (max(first_actions) - min(first_actions)) / 1_000_000
-                    if len(first_actions) > 1
-                    else 0.0
-                )
-                return RecoveryStoppedResult(
-                    competitor=arm.competitor,
-                    started_ns=started_ns,
-                    cutoff_ns=cutoff_ns,
-                    launch_skew_ms=launch_skew_ms,
-                    contract_sha256=self.contract.sha256,
-                    lanes=dict(stop_control.completed_lanes),
-                    active_lane=stop_control.active_lane,
-                    restore_started=(
-                        stop_control.active_lane in stop_control.restore_started_lanes
-                    ),
-                )
-            stop_wait.cancel()
-            await asyncio.gather(stop_wait, return_exceptions=True)
-        lanes = await asyncio.gather(*tasks.values())
+                stop_wait = None
+            lanes = await asyncio.gather(*tasks.values())
+        except BaseException:
+            for task in tasks.values():
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *(self._close(source) for source in sources.values()),
+                return_exceptions=True,
+            )
+            raise
+        finally:
+            if stop_wait is not None and not stop_wait.done():
+                stop_wait.cancel()
+                await asyncio.gather(stop_wait, return_exceptions=True)
         completed_ns = self._clock_ns()
         first = [lane.first_action_ns for lane in lanes]
         return RecoveryRunResult(
@@ -807,10 +819,13 @@ class RecoveryEngine:
             completed_ns = self._clock_ns()
             # The lane's own bound, not a TimeoutError raised inside it, which is an error.
             timed_out = isinstance(exc, TimeoutError) and bound.expired()
+            # The card and the receipt show this, so a provider's message is its type and code.
+            from .manager import audience_error_text
+
             failure = (
                 f"Recovery lane exceeded {self.run_timeout_seconds:.0f} seconds"
                 if timed_out
-                else str(exc) or type(exc).__name__
+                else audience_error_text(exc)
             )
             if stop_control is not None:
                 # Publish the authoritative terminal outcome before any cleanup or
@@ -1021,12 +1036,16 @@ class RecoveryEngine:
                     already_absent=artifact is None,
                 )
         except Exception as exc:
+            # The cooldown card shows this, so a provider's message is its type and code.
+            from .manager import audience_error_text
+
+            error = audience_error_text(exc)
             await self._emit(
                 on_progress,
                 plan,
                 RecoveryPhase.FAILED,
                 "Recovery cleanup refused or incomplete",
-                error=str(exc) or type(exc).__name__,
+                error=error,
             )
             return SafeChangeResetLaneResult(
                 lane_id=plan.lane_id,
@@ -1034,7 +1053,7 @@ class RecoveryEngine:
                 provider=plan.provider,
                 artifact_id=plan.artifact_id,
                 ok=False,
-                error=str(exc) or type(exc).__name__,
+                error=error,
                 cause=exc,
             )
 

@@ -83,3 +83,52 @@ describe('the fight card status strip', () => {
     expect(declaration(body, 'overflow-wrap')).toBe('anywhere')
   })
 })
+
+describe('the fight card action bar', () => {
+  const ring = readFileSync(join(import.meta.dirname, 'ring.css'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+
+  /** The overflow the last rule naming `selector` leaves it with, as the cascade would. */
+  function finalOverflowY(selector: string): string | null {
+    let value: string | null = null
+    for (const [, selectors, body] of ring.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (!selectors.split(',').map((one) => one.trim()).includes(selector)) continue
+      value = declaration(body, 'overflow') ?? declaration(body, 'overflow-y') ?? value
+    }
+    return value
+  }
+
+  it('lets only the document scroll, so the sticky bar pins to the screen', () => {
+    // A body or #root with overflow of its own is a scroll box exactly as tall as
+    // its content. It never scrolls, and the sticky bar pinned to it instead of
+    // the viewport: with the WHY panel open, B · BACK and PREPARE sat below the
+    // fold at both 1280x720 and 1920x1080.
+    for (const box of ['body', '#root']) {
+      expect(finalOverflowY(`html:has(.game-screen[data-scene="card"]) ${box}`), box).toBe('visible')
+    }
+  })
+
+  it('carries the status strip inside the bar', () => {
+    // Below the bar, the bar's negative bottom margin drew it under the bar's own
+    // background, so the reason PREPARE was locked could not be read.
+    expect(ring).toMatch(/\.game-scene\.card-scene \.card-actions \.game-lock-note\s*\{/)
+  })
+
+  /** Every declaration of `property` on exactly `selector`, last one winning. */
+  function finalDeclaration(selector: string, property: string): string | null {
+    let value: string | null = null
+    for (const [, selectors, body] of ring.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+      if (!selectors.split(',').map((one) => one.trim()).includes(selector)) continue
+      value = declaration(body, property) ?? value
+    }
+    return value
+  }
+
+  it('gives a refused press its own full row in the bar, above the buttons', () => {
+    // The reason a press failed sits in the bar, which is pinned: in the column
+    // above it, the bar covered it at 1280x720. As a fourth item on the bar's one
+    // row it would squeeze the buttons, so the bar wraps and the reason takes a row.
+    expect(finalDeclaration('.game-scene.card-scene .card-actions', 'flex-wrap')).toBe('wrap')
+    expect(finalDeclaration('.game-scene.card-scene .card-actions .game-error', 'flex')).toBe('0 0 100%')
+  })
+})

@@ -344,6 +344,9 @@ class BoundRecoveryEngine:
             lanes=lanes,
         )
 
+    async def settle_pending_mutations(self, competitor):
+        del competitor
+
     async def reset(self, competitor, on_progress):
         return SafeChangeResetResult(
             competitor=competitor,

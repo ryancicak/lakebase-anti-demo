@@ -590,7 +590,7 @@ async def test_runner_reboot_invalidates_ready_before_claim_or_bell() -> None:
     assert manager.ring_ready
 
     # An ATTESTED runner identity change (reboot) surfaces as validate_ready -> False
-    # (Patch 1 tri-state: IDENTITY_CHANGED, distinct from a merely STALE/ABSENT beat),
+    # (tri-state: IDENTITY_CHANGED, distinct from a merely STALE/ABSENT beat),
     # and must fail closed AT ONCE -- this is the case that legitimately demotes.
     provider.provenance_current = False
     assert await manager.run_one_cycle() == 0.0
@@ -703,7 +703,7 @@ async def test_retryable_refresh_stays_ready_then_escalates_when_margin_lost() -
     slot = await manager.store.read("install-one")
     assert slot is not None
     # Stays READY and keeps the capsule (in-place retry), NOT torn down to WARMING.
-    # Patch 3: it also stays CLAIMABLE across this window -- renew_by is only the
+    # It also stays CLAIMABLE across this window -- renew_by is only the
     # refresh trigger, not the claimability cliff, so a transient refresh failure past
     # renew_by (while the launch margin still holds) must NOT flash the idle fight card
     # Temporarily Unavailable. Mutation: reintroducing `renew_by > now` to _claimable
@@ -724,7 +724,7 @@ async def test_retryable_refresh_stays_ready_then_escalates_when_margin_lost() -
 
 
 async def test_idle_keepalive_soak_stays_claimable_across_credential_cliffs() -> None:
-    # Time-accelerated idle soak (Fix C / Patch 3): drive the keep-alive across MANY
+    # Time-accelerated idle soak: drive the keep-alive across MANY
     # credential launch-margin cliffs, renew_by walls, and provenance windows, and
     # assert the idle ring is claimable on EVERY cycle -- i.e., zero "Temporarily
     # Unavailable" flickers. The refresh fires with lead before the true cliff, so the
@@ -755,7 +755,7 @@ async def test_idle_keepalive_soak_stays_claimable_across_credential_cliffs() ->
 
 
 async def test_stale_attestation_is_strike_not_identity_change() -> None:
-    # Patch 1 / F: a STALE or ABSENT resident heartbeat surfaces as RetryableWarmError
+    # A STALE or ABSENT resident heartbeat surfaces as RetryableWarmError
     # (validate_ready), which the coordinator absorbs with the provenance strike budget
     # -- idle READY and claimability persist. Only after the budget is exhausted does a
     # persistent miss demote. Mutation: mapping stale attestation to an instant
@@ -780,7 +780,7 @@ async def test_stale_attestation_is_strike_not_identity_change() -> None:
 
 
 async def test_persistent_delivery_failure_while_idle_soft_degrades_without_teardown() -> None:
-    # Patch 2: a sustained outbox failure while Round 5 is IDLE (no active claim) must
+    # A sustained outbox failure while Round 5 is IDLE (no active claim) must
     # SOFT-degrade -- refuse new claims but keep the durable READY slot and the
     # in-memory capsule intact (no freshness_lost, no WARMING rewarm). Mutation:
     # hard-demoting on idle (freshness_lost / _capsule=None) tears down a ring that had
@@ -815,7 +815,7 @@ async def test_persistent_delivery_failure_while_idle_soft_degrades_without_tear
 
 
 async def test_delivery_failure_during_active_bout_does_not_touch_warm_slot() -> None:
-    # Patch 2: while a bout is ACTIVE the warm slot is CLAIMED (never READY), so
+    # While a bout is ACTIVE the warm slot is CLAIMED (never READY), so
     # invalidate_readiness is a no-op on the warm slot -- it must not soft-degrade or
     # rewarm a ring that a live bout owns; the active bout fails through its own
     # control-delivery path. Mutation: an unconditional freshness_lost here would

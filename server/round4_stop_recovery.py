@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from . import pipeline_power
 from .coordination import (
+    ROUND4_STOP_RECOVERY_HEARTBEAT_SECONDS,
     BoutLeaseStore,
     LeaseHeldError,
     is_transient_coordination_error,
@@ -269,7 +270,10 @@ class InheritedRound4StopRecovery:
     async def _heartbeat(self, holder: list[Any]) -> None:
         """Keep ownership current for a slow control-plane or coordination call."""
 
-        interval = max(0.1, min(30.0, self._lease_ttl.total_seconds() / 3))
+        interval = max(
+            0.1,
+            min(ROUND4_STOP_RECOVERY_HEARTBEAT_SECONDS, self._lease_ttl.total_seconds() / 3),
+        )
         while True:
             await asyncio.sleep(interval)
             holder[0] = await self._ring_store.renew(
@@ -324,6 +328,10 @@ class InheritedRound4StopRecovery:
             )
 
         self._validate_stopped_record(stopped, pipeline_id)
+        settled_run_id = str(self._record.get("run_id") or "")
+        if settled_run_id:
+            stopped = dict(stopped)
+            stopped["run_id"] = settled_run_id
         # Await the append. A fire-and-forget write would let `/readyz` clear
         # before the authority the next replica reads contains the repayment.
         await self._power_store.append(stopped)
@@ -341,22 +349,32 @@ class InheritedRound4StopRecovery:
 
         newest = await self._power_store.latest(pipeline_id)
         if newest is None:
-            raise Round4StopRecoveryRefusedError(
-                "the durable power history returned no newest event"
-            )
-        if str(newest.get("pipeline_id") or "") != pipeline_id:
+            # ``latest(skip_reserved=True)`` can still be empty when every
+            # remaining row is a reservation that mint-then-crash left behind.
+            # Unmatched debt includes those rows, so it is the authority below.
+            # An actually empty history still refuses.
+            if not await self._power_store._power_history_rows(pipeline_id, limit=1):
+                raise Round4StopRecoveryRefusedError(
+                    "the durable power history returned no newest event"
+                )
+        elif str(newest.get("pipeline_id") or "") != pipeline_id:
             raise Round4StopRecoveryRefusedError(
                 "the newest durable power event does not name the sealed pipeline"
             )
-        if pipeline_power._intent(newest) != pipeline_power._INTENT_STOP_OWED:
-            # A newer start or stop superseded the inherited event while this
-            # process was waiting to claim. It is the authoritative answer.
+        # Newest event_id may be an inverted ``resuming`` or a delayed
+        # ``stop_owed`` for a pair that already parked. Debt is always the
+        # unmatched walk, never ``latest()`` alone.
+        owed = await self._power_store.unmatched_owed_stop(pipeline_id)
+        if (
+            not isinstance(owed, dict)
+            or pipeline_power._intent(owed) != pipeline_power._INTENT_STOP_OWED
+        ):
             pipeline_power.install_owed_stop_snapshot(None)
             return "settled"
 
-        self._record = dict(newest)
-        pipeline_power.install_owed_stop_snapshot(newest)
-        if self._seconds_until_due(newest) > 0:
+        self._record = dict(owed)
+        pipeline_power.install_owed_stop_snapshot(owed)
+        if self._seconds_until_due(owed) > 0:
             return "deferred"
         return None
 

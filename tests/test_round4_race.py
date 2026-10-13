@@ -7,6 +7,7 @@ a fixed delay after it is started, which is exactly the shape a cold integration
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -206,6 +207,8 @@ class FakeLane:
         self.closed_readers = 0
         self.opened_readers = 0
         self.bells = []
+        self.ready_error: BaseException | None = None
+        self.events: list[str] = []
 
     async def confirm_parked(self, notify):
         if not self.parked:
@@ -215,7 +218,13 @@ class FakeLane:
         self.opened_readers += 1
         return FakeReader(self)
 
+    async def before_bell(self):
+        self.events.append(f"ready {self.lane_id}")
+        if self.ready_error is not None:
+            raise self.ready_error
+
     async def start(self, bell):
+        self.events.append(f"start {self.lane_id}")
         self.bells.append(bell)
         if self.start_error is not None:
             raise self.start_error
@@ -260,7 +269,7 @@ class StallingLane(FakeLane):
         await asyncio.Event().wait()
 
 
-def engine(source, *lanes, timeout=2.0, kick=60.0):
+def engine(source, *lanes, timeout=2.0, kick=60.0, **options):
     return Round4RaceEngine(
         source,
         lanes,
@@ -271,6 +280,7 @@ def engine(source, *lanes, timeout=2.0, kick=60.0):
         settle_timeout_seconds=2.0,
         settle_poll_seconds=0.01,
         carry_kick_seconds=kick,
+        **options,
     )
 
 
@@ -353,6 +363,58 @@ async def test_the_bell_tells_every_lane_the_version_prepare_verified():
 
 
 @pytest.mark.asyncio
+async def test_every_lane_is_readied_before_the_clock_and_started_after_it():
+    # Whatever a lane records before its start is on no clock; each clock holds only starts.
+    events: list[str] = []
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.01)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.01)
+    lakebase.events = aws.events = events
+
+    def clock_ns() -> int:
+        events.append("clock")
+        return time.monotonic_ns()
+
+    race = engine(source, lakebase, aws, clock_ns=clock_ns)
+    arm = await race.prepare(quiet)
+    events.clear()
+
+    await race.run(arm, update(), quiet)
+
+    bell = events.index("clock")
+    assert events[:bell] == [f"ready {LAKEBASE_LANE}", f"ready {COMPETITOR_LANE}"]
+    assert bell < events.index(f"start {LAKEBASE_LANE}")
+    assert bell < events.index(f"start {COMPETITOR_LANE}")
+
+
+@pytest.mark.asyncio
+async def test_a_lane_that_cannot_get_ready_refuses_the_bell_before_any_clock():
+    # Refused, not rung: no lane starts, nothing is committed and no clock is reported.
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.01)
+    lakebase.ready_error = RuntimeError("the coordination database did not answer")
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.01)
+    race = engine(source, lakebase, aws)
+    arm = await race.prepare(quiet)
+    heard: list[tuple] = []
+
+    async def progress(*event):
+        heard.append(event)
+
+    with pytest.raises(Round4NotArmedError, match="could not record its start") as refused:
+        await race.run(arm, update(), progress)
+
+    # The card shows the refusal, so it quotes none of the cause; the chain keeps it.
+    assert "did not answer" not in str(refused.value)
+    assert refused.value.__cause__ is lakebase.ready_error
+    assert lakebase.started == aws.started == 0
+    assert source.commits == []
+    assert heard == []
+    assert lakebase.closed_readers == lakebase.opened_readers
+    assert aws.closed_readers == aws.opened_readers
+
+
+@pytest.mark.asyncio
 async def test_prepare_refuses_a_source_row_this_demo_did_not_write():
     source = FakeSource(row=ModelScoreRow("customer-0001", 0.5, "someone-else", "theirs"))
     race = engine(source, FakeLane(LAKEBASE_LANE, source, delay=0.01))
@@ -373,8 +435,40 @@ async def test_a_lane_that_cannot_start_fails_and_the_bout_declares_nothing():
     assert result.outcomes[LAKEBASE_LANE].verified
     failed = result.outcomes[COMPETITOR_LANE]
     assert not failed.verified and not failed.timed_out
-    assert "could not be started: refused" in (failed.failure or "")
+    assert failed.failure == "Competitor could not be started: RuntimeError"
     assert result.resolution.verdict is Verdict.NO_RESULT
+
+
+@pytest.mark.asyncio
+async def test_a_refused_start_shows_its_code_and_never_the_provider_message(caplog):
+    # A Glue refusal's message names the account and the role it was refused for. The
+    # card and the receipt get the error's type and code; the operator log, the rest.
+    from botocore.exceptions import ClientError
+
+    refusal = ClientError(
+        {
+            "Error": {
+                "Code": "AccessDeniedException",
+                "Message": "User: arn:aws:sts::123456789012:assumed-role/runtime is not "
+                "authorized to perform: glue:StartJobRun",
+            }
+        },
+        "StartJobRun",
+    )
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.05)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.05, start_error=refusal)
+    race = engine(source, lakebase, aws)
+
+    with caplog.at_level("WARNING", logger="server.round4_race"):
+        result = await race.run(await race.prepare(quiet), update(), quiet)
+
+    failure = result.outcomes[COMPETITOR_LANE].failure or ""
+    assert failure == (
+        "Competitor could not be started: ClientError[AccessDeniedException]@StartJobRun"
+    )
+    assert "123456789012" not in failure and "arn:" not in failure
+    assert "could not be started: ClientError[AccessDeniedException]" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -517,6 +611,32 @@ async def test_settle_refuses_to_overwrite_someone_else_s_row():
 
     with pytest.raises(Round4SettleError):
         await race.settle()
+
+
+@pytest.mark.asyncio
+async def test_a_carry_that_fails_never_leaves_the_other_running_past_the_last_park():
+    # A transient error opening one lane's reader used to fail the settle at once while the
+    # other lane's carry ran on. Its kick then parked and started that lane again, after the
+    # settle's own last park had already reported both integrations parked.
+    source = FakeSource()
+    lakebase = StallingLane(LAKEBASE_LANE, source, delay=0.01)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.01)
+    race = engine(source, lakebase, aws, kick=0.05)
+    await race.run(await race.prepare(quiet), update(), quiet)
+
+    async def unreachable():
+        raise RuntimeError("Secrets Manager timed out")
+
+    aws.open_reader = unreachable
+
+    with pytest.raises(RuntimeError, match="Secrets Manager timed out"):
+        await race.settle()
+    starts = lakebase.started
+    await asyncio.sleep(0.2)
+
+    assert lakebase.parked and aws.parked
+    assert lakebase.started == starts
+    assert lakebase.closed_readers == lakebase.opened_readers
 
 
 @pytest.mark.asyncio
@@ -749,3 +869,42 @@ async def test_a_wake_opens_and_closes_each_destination_and_survives_one_that_wi
     assert lakebase.opened_readers == lakebase.closed_readers == 1
     # A wake starts nothing: both integrations stay parked, so the race stays cold.
     assert lakebase.started == aws.started == 0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_verifier_read_logs_its_type_and_not_the_driver_message(caplog):
+    import psycopg
+
+    source = FakeSource()
+    lakebase = FakeLane(LAKEBASE_LANE, source, delay=0.05)
+    aws = FakeLane(COMPETITOR_LANE, source, delay=0.05)
+    host, role = "instance-0000.database.example.invalid", "app-client-id"
+    failing = [
+        psycopg.OperationalError(
+            f'connection to server at "{host}", port 5432 failed: '
+            f'FATAL:  password authentication failed for user "{role}"'
+        )
+    ]
+
+    class FlakyReader(FakeReader):
+        async def read(self, entity_id):
+            # The wake read before the bell answers; the first read after it fails.
+            if self.lane.started and failing:
+                raise failing.pop()
+            return await super().read(entity_id)
+
+    async def open_flaky_reader():
+        lakebase.opened_readers += 1
+        return FlakyReader(lakebase)
+
+    lakebase.open_reader = open_flaky_reader
+    race = engine(source, lakebase, aws)
+    with caplog.at_level("WARNING", logger="server.round4_race"):
+        result = await race.run(await race.prepare(quiet), update(), quiet)
+
+    assert not failing, "the planted read failure never ran"
+    assert result.outcomes[LAKEBASE_LANE].verified
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "verifier read failed: OperationalError" in logged
+    assert host not in logged
+    assert role not in logged

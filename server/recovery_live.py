@@ -43,13 +43,17 @@ from .safe_change_live import (
     build_safe_change_engine,
     create_lakebase_resource,
     lakebase_resource_path,
-    wait_lakebase_branch_gone,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 _CONTRACT_TAG = "anti-demo-contract"
 _CONTRACT_VALUE = "recovery-v1"
+
+
+def _retrieve_outcome(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def lakebase_source_branch_time(recovery_at: datetime) -> str:
@@ -107,27 +111,40 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
     async def _run_mutation(self, operation: Awaitable[Any]) -> Any:
         task = asyncio.create_task(operation)
         self._pending_mutations.add(task)
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if task.done():
-                self._pending_mutations.discard(task)
+        # A cancelled caller leaves the create running; its outcome is read by
+        # settle_pending_mutations. `wait`, not `shield`, which would report that
+        # outcome as unhandled.
+        task.add_done_callback(_retrieve_outcome)
+        # Kept tracked if this caller is cancelled, even when the create has already
+        # finished: its outcome then reaches no one but settle_pending_mutations.
+        await asyncio.wait({task})
+        self._pending_mutations.discard(task)
+        return task.result()
 
     async def settle_pending_mutations(self) -> None:
         tracked = list(self._pending_mutations)
-        if not tracked:
-            return
         try:
+            # One bound for both waits, not one each.
             async with asyncio.timeout(self.adapter.config.control_timeout_seconds):
-                await asyncio.gather(*(asyncio.shield(task) for task in tracked))
+                if tracked:
+                    await asyncio.wait(tracked)
+                # The tasks above are whole recovery creates; the runner holds every
+                # single request, including a delete, whose thread can outlive its caller.
+                # It is settled even when a create failed, before that failure is raised.
+                await self.adapter.settle_pending_mutations()
+                for task in tracked:
+                    if task.cancelled():
+                        raise SafeChangeControlPlaneError(
+                            "Lakebase mutation was cancelled; cleanup cannot report success"
+                        )
+                    if (error := task.exception()) is not None:
+                        raise error
         except TimeoutError as exc:
             raise SafeChangeControlPlaneError(
                 "Lakebase mutation is still unresolved; cleanup cannot report success"
             ) from exc
         finally:
-            self._pending_mutations.difference_update(
-                task for task in tracked if task.done()
-            )
+            self._pending_mutations.difference_update(task for task in tracked if task.done())
 
     async def connect_source(self, plan: RecoveryPlan):
         return await self.adapter.connect_source(self._source_plan(plan))
@@ -335,28 +352,17 @@ class LakebaseRecoveryAdapter(_RecoveryAdapterBase):
             return
         self._assert_owned(plan, current)
         branch_name = f"{self.adapter._project}/branches/{plan.artifact_id}"
-        await self.adapter._runner.run(
-            "DELETE",
-            lakebase_resource_path(branch_name),
-            timeout_seconds=self.adapter.config.control_timeout_seconds,
-        )
-        await report(
-            "Waiting for the owned Lakebase recovery branch deletion",
-            f"GET {LAKEBASE_API_ROOT}/<branch>",
-        )
 
         async def still_present() -> bool:
             return await self.inspect_recovery(plan) is not None
 
-        await wait_lakebase_branch_gone(
-            self.adapter._runner,
-            branch_name,
-            still_present,
-            clock=self.adapter._clock,
-            sleep=self.adapter._sleep,
-            config=self.adapter.config,
-            still_exists="Lakebase recovery branch still exists",
+        still_exists = "Lakebase recovery branch still exists"
+        await self.adapter._send_branch_delete(branch_name, still_present, still_exists)
+        await report(
+            "Waiting for the owned Lakebase recovery branch deletion",
+            f"GET {LAKEBASE_API_ROOT}/<branch>",
         )
+        await self.adapter._await_branch_gone(branch_name, still_present, still_exists)
 
     async def abandon_recovery(self, plan: RecoveryPlan) -> None:
         """Issue branch deletion for a cancelled lane without waiting for it.

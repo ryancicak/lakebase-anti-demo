@@ -8,6 +8,8 @@ import type {
   CompetitorId,
   CooldownLaneState,
   CooldownSnapshot,
+  CostLineItem,
+  CostScope,
   CustomerCorner,
   DemoSession,
   DescentCostSnapshot,
@@ -45,6 +47,7 @@ import './ring.css'
 import {
   type BoutReceipt,
   type LedgerVerdict,
+  type RecordState,
   type RoundResult,
   ABANDONED_VERDICT,
   ledgerDay,
@@ -80,6 +83,8 @@ import {
   ROUND_FIVE_DISPLAY_TITLE,
   ROUND_FIVE_FANIN_PROTOCOL,
   ROUND_FIVE_ID,
+  ROUND_FIVE_MAX_RETRIES,
+  roundFivePhaseLabel,
   ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS,
   ROUND_FIVE_SAMPLED_QUERIES,
   isRoundFiveFanInEvidence,
@@ -183,6 +188,7 @@ function roundCardState(
 ): RoundCardState {
   if (status) return status.state === 'ready' ? 'available' : status.state
   if (round.availability_reason_code === 'cleanup_in_progress') return 'cleanup_in_progress'
+  if (round.availability_reason_code === 'storage_checking') return 'temporarily_unavailable'
   return round.availability === 'ready' ? 'available' : 'unavailable'
 }
 
@@ -528,6 +534,19 @@ const COST_SCOPE_LABELS = {
   required_monthly_carrying_cost: 'Monthly carrying',
   installation_overhead: 'Installation overhead',
 } as const
+
+/**
+ * What a scope's known total recurs on, read from the priced lines that make it up.
+ *
+ * Only a cadence every one of them shares; a mixed or unknown one gets no suffix. Round 5's
+ * installation overhead is a monthly gp3 volume, which "one-time" misdescribed.
+ */
+function scopeTotalSuffix(lines: CostLineItem[], scope: CostScope): string {
+  const cadences = new Set(lines
+    .filter((line) => (line.scope ?? 'bout_estimate') === scope && line.subtotal_usd != null)
+    .map((line) => line.cadence))
+  return cadences.size === 1 && cadences.has('month') ? ' / month' : ''
+}
 
 function CostScopeTotal({ label, value, suffix }: { label: string; value: number | string | null | undefined; suffix: string }) {
   return (
@@ -1019,7 +1038,7 @@ export function CostReceiptDisclosure({ session }: { session: DemoSession }) {
       <div className="cost-receipt-totals" aria-label="Cost scopes">
         <CostScopeTotal label="Bout estimate" value={receipt.known_bout_estimate_usd} suffix="" />
         <CostScopeTotal label="Monthly carrying" value={receipt.known_monthly_carrying_cost_usd} suffix=" / month" />
-        <CostScopeTotal label="Installation overhead" value={receipt.known_installation_overhead_usd} suffix=" one-time" />
+        <CostScopeTotal label="Installation overhead" value={receipt.known_installation_overhead_usd} suffix={scopeTotalSuffix(receipt.lines, 'installation_overhead')} />
       </div>
       {hasReconciliationMath && (
         <div className="cost-receipt-math" aria-label="Cost reconciliation">
@@ -1134,7 +1153,7 @@ function roundLockNote(
     return 'CLEANUP IN PROGRESS · OTHER ROUNDS REMAIN AVAILABLE'
   }
   if (state === 'temporarily_unavailable') {
-    return 'RESETTING · REOPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
+    return 'OPENS AUTOMATICALLY · OTHER ROUNDS REMAIN AVAILABLE'
   }
   const alternative = rounds.some((item) => (
     item.id !== round.id
@@ -3420,11 +3439,15 @@ function App() {
   const titleMusicActiveRef = useRef(false)
   const transitionRef = useRef(0)
   const ringPendingRef = useRef(false)
-  const preparePendingRef = useRef(false)
+  const prepareTransitionRef = useRef<number | null>(null)
   /* reconcileRunStart polls on a bare timer rather than inside an effect, so it
      has no cleanup of its own and would otherwise keep reading the session for
      up to twelve seconds after the app that started it is gone. */
   const mountedRef = useRef(true)
+  // The token an unbroken run of browser history moves started from, and the token after the
+  // latest one. Any other bump ends the run for good.
+  const historyRunRef = useRef<{ from: number; to: number } | null>(null)
+  const roundChangesRef = useRef(0)
   const [ringBlocked, setRingBlocked] = useState(false)
 
   const navigate = useCallback((
@@ -3433,6 +3456,9 @@ function App() {
     mode: HistoryMode = 'push',
   ) => {
     writeBrowserView({ stage: nextStage, setupScene: nextScene }, mode)
+    // Synchronously, so a continuation resuming before the render reads where the
+    // operator is now (`mayContinuePrepare()` in runPrepareFight).
+    stageRef.current = nextStage
     setStage(nextStage)
     setSetupScene(nextScene)
   }, [])
@@ -3488,6 +3514,11 @@ function App() {
   const selectedPersonas = [primary, ...secondary]
     .map((id) => catalog.personas.find((persona) => persona.id === id))
     .filter((persona): persona is NonNullable<typeof persona> => Boolean(persona))
+  const activePersonas = session
+    ? [session.primary_persona.id, ...session.secondary_personas.map((persona) => persona.id)]
+      .map((id) => catalog.personas.find((persona) => persona.id === id))
+      .filter((persona): persona is NonNullable<typeof persona> => Boolean(persona))
+    : selectedPersonas
   const sessionId = session?.id
   const terminalCommentary = session?.state === 'verified'
     && session.round.id === 'survive_connection_spike'
@@ -3586,10 +3617,15 @@ function App() {
     }
   }, [stage, liveEvidenceConnected, session?.state, session?.towel, session?.lanes.lakebase.state, session?.lanes.competitor.state])
 
-  useEffect(() => () => {
-    mountedRef.current = false
-    stopOriginalRoundTheme()
-    stopOriginalTitleTheme()
+  useEffect(() => {
+    // StrictMode re-runs this setup after a simulated unmount; Prepare needs it true again.
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      transitionRef.current += 1
+      stopOriginalRoundTheme()
+      stopOriginalTitleTheme()
+    }
   }, [])
 
   /* What the credits roll needs, assembled once for the two screens that can
@@ -3615,11 +3651,18 @@ function App() {
     const onPopState = (event: PopStateEvent) => {
       const requested = readBrowserView(event.state)
       if (!requested) return
+      const before = transitionRef.current
       transitionRef.current += 1
+      const run = historyRunRef.current
+      historyRunRef.current = {
+        from: run !== null && run.to === before ? run.from : before,
+        to: transitionRef.current,
+      }
       const view = requiresSession(requested.stage) && !sessionRef.current
         ? { stage: 'setup' as const, setupScene: 'card' as const }
         : requested
       if (view !== requested) writeBrowserView(view, 'replace')
+      stageRef.current = view.stage
       setStage(view.stage)
       setSetupScene(view.setupScene)
     }
@@ -4061,6 +4104,8 @@ function App() {
 
   function changeSetupScene(next: SetupScene) {
     if (sound) playConfirm()
+    // Leaving the scene abandons whatever Prepare was still doing for it.
+    transitionRef.current += 1
     navigate('setup', next)
   }
 
@@ -4104,17 +4149,21 @@ function App() {
 
   async function prepareFight(selection: FightSelection) {
     // transitionRef only discards a stale continuation; it does not stop a second
-    // click from creating a second session. This ref is the actual mutex.
-    if (sessionRestorePending || preparePendingRef.current) return
-    preparePendingRef.current = true
+    // click from creating a second session. This ref is the actual mutex, held
+    // only while its own transition is current, so leaving the scene frees it.
+    const holder = prepareTransitionRef.current
+    if (sessionRestorePending || (holder !== null && holder === transitionRef.current)) return
+    // Taken at the click, so a Back pressed during the board read below wins.
+    const transition = ++transitionRef.current
+    prepareTransitionRef.current = transition
     try {
-      await runPrepareFight(selection)
+      await runPrepareFight(selection, transition)
     } finally {
-      preparePendingRef.current = false
+      if (prepareTransitionRef.current === transition) prepareTransitionRef.current = null
     }
   }
 
-  async function runPrepareFight(selection: FightSelection) {
+  async function runPrepareFight(selection: FightSelection, transition: number) {
     const selectionRecommendation = recommend(
       catalog,
       selection.competitor,
@@ -4128,15 +4177,16 @@ function App() {
         const result = await refreshBoutBoard()
         selectionRingStatus = result.board.rounds[selectionRoundId]
       } catch {
+        if (transition !== transitionRef.current) return
         setError('Round status could not be refreshed. Prepare stays locked until the board answers.')
         return
       }
+      if (transition !== transitionRef.current) return
       if (!roundCanStart(selectionRingStatus)) {
         setError(roundBoardMessage(selectionRoundId, selectionRingStatus))
         return
       }
     }
-    const transition = ++transitionRef.current
     const selectionRound = catalog.rounds.find((round) => round.id === selectionRoundId)!
     const selectedRecommendation: LocalRecommendation = {
       ...selectionRecommendation,
@@ -4167,6 +4217,17 @@ function App() {
       return
     }
     let created: DemoSession | null = null
+    // Whether this Prepare's continuation may still act: nothing newer has started, or only
+    // browser history has moved since it began and has brought the operator back to this
+    // same session's Matchup.
+    const mayContinuePrepare = () => mountedRef.current && (
+      transition === transitionRef.current
+      || (created !== null
+        && historyRunRef.current?.from === transition
+        && historyRunRef.current.to === transitionRef.current
+        && sessionRef.current?.id === created.id
+        && stageRef.current === 'matchup')
+    )
     try {
       created = await api.createSession({
         competitor: selection.competitor,
@@ -4175,40 +4236,55 @@ function App() {
         corners: selection.corners,
         round_id: selection.roundOverride,
       })
+      // An abandoned Prepare leaves its DRAFT unadopted and unarmed on the server.
+      if (transition !== transitionRef.current) return
       sessionRef.current = created
       setCommentaryOpen(true)
       setSession(created)
       navigate('matchup', 'card')
       await wait(reducedMotion ? 0 : 1100)
-      if (transition !== transitionRef.current) return
+      if (!mayContinuePrepare()) return
       const armed = await api.armSession(created.id)
+      if (!mayContinuePrepare()) return
       setSession((current) => selectRound4Session(current, armed))
-      if (armed.state === 'armed' && transition === transitionRef.current) {
-        navigate('ready', 'card', 'replace')
-      }
+      if (armed.state === 'armed') navigate('ready', 'card', 'replace')
     } catch (cause) {
       if (
         cause instanceof ApiError
         && cause.status === 409
         && cause.message.includes('ROUND 5 NOT STARTABLE')
       ) {
-        sessionRef.current = null
-        saveActiveSessionPointer(null)
+        const mayContinue = mayContinuePrepare()
+        // Once Back frees Prepare, a newer card may own the session pointer.
+        if (created !== null && sessionRef.current?.id === created.id) {
+          sessionRef.current = null
+          saveActiveSessionPointer(null)
+        }
         if (!mountedRef.current) return
         setSession((current) => current?.id === created?.id ? null : current)
-        if (transition !== transitionRef.current) return
+        if (!mayContinue) return
         navigate('setup', 'card', 'replace')
+        const refusedAt = transitionRef.current
+        const roundChangesAt = roundChangesRef.current
+        // The message is about this round, so another round chosen meanwhile silences it.
+        const stillCurrent = () => (
+          mountedRef.current
+          && transitionRef.current === refusedAt
+          && roundChangesRef.current === roundChangesAt
+        )
         try {
           const result = await refreshBoutBoard()
+          if (!stillCurrent()) return
           setError(roundBoardMessage(selectionRoundId, result.board.rounds[selectionRoundId]))
         } catch {
+          if (!stillCurrent()) return
           setError(
             'Round 5 is resetting and will reopen automatically. Other rounds remain available.',
           )
         }
         return
       }
-      if (transition !== transitionRef.current) return
+      if (!mayContinuePrepare()) return
       if (cause instanceof ApiError && cause.status === 409 && cause.message.includes('BOUT IN PROGRESS')) {
         // Keep the server's refusal verbatim. It names the round, the phase and,
         // when a towel's cleanup is what is holding the ring, why. Substituting
@@ -4225,22 +4301,25 @@ function App() {
       if (created && cause instanceof ApiError && cause.status === 0) {
         try {
           const recovered = await api.getSession(created.id)
-          if (transition !== transitionRef.current) return
-          sessionRef.current = recovered
-          setSession((current) => selectRound4Session(current, recovered))
-          if (recovered.state !== 'draft') {
-            if (recovered.state === 'failed' && !recovered.run_started_at) {
-              setError(recovered.failure ?? cause.message)
+          if (!mayContinuePrepare()) return
+          // The stream may already have delivered a newer snapshot than this read.
+          const selected = selectRound4Session(sessionRef.current, recovered) ?? recovered
+          sessionRef.current = selected
+          setSession(selected)
+          if (selected.state !== 'draft') {
+            if (selected.state === 'failed' && !selected.run_started_at) {
+              setError(selected.failure ?? cause.message)
               setSession(null)
               navigate('setup', 'card', 'replace')
             } else {
-              navigate(sessionStage(recovered), 'card', 'replace')
+              navigate(sessionStage(selected), 'card', 'replace')
             }
             return
           }
         } catch {
           // The normal setup error below remains actionable when reconciliation is unavailable.
         }
+        if (!mayContinuePrepare()) return
       }
       sessionRef.current = null
       setSession(null)
@@ -4254,6 +4333,13 @@ function App() {
   }
 
   function changeRoundOverride(id: RoundId | null) {
+    const nextRoundId = id ?? recommendation.round_id
+    if (nextRoundId !== selectedRoundId) {
+      roundChangesRef.current += 1
+      // The last press's reason is about the round it was pressed for. Kept, it sits
+      // in the pinned bar over the new round's PREPARE and reads as being about it.
+      setError(null)
+    }
     setRoundOverride(id)
   }
 
@@ -4458,6 +4544,8 @@ function App() {
       && session.state !== 'failed'
     ) || !proofNavigationAllowsExit(session)) return
     const completed = session
+    // Between-screen navigation abandons an in-flight "Ring again" Prepare.
+    transitionRef.current += 1
     setError(null)
     if (isRoundSix(completed) && completed.state === 'verified') {
       navigate('finale', 'card')
@@ -4583,6 +4671,8 @@ function App() {
   }
 
   function showScorecard() {
+    // Leaving Between for the scorecard abandons an in-flight "Ring again" Prepare.
+    transitionRef.current += 1
     navigate('scorecard', 'card')
   }
 
@@ -4639,8 +4729,11 @@ function App() {
   if (stage === 'matchup') {
     return (
       <Matchup
-        competitor={opponentLabel(session?.round.id ?? selectedRoundId, selectedCompetitor.short_name)}
-        personas={selectedPersonas}
+        competitor={opponentLabel(
+          session?.round.id ?? selectedRoundId,
+          session?.competitor.short_name ?? selectedCompetitor.short_name,
+        )}
+        personas={activePersonas}
         reducedMotion={reducedMotion}
         uiReview={uiReview}
         status={armStatus}
@@ -4656,12 +4749,12 @@ function App() {
   if (stage === 'ready' && session) {
     return (
       <Ready
-        competitor={opponentLabel(session.round.id, selectedCompetitor.short_name)}
+        competitor={opponentLabel(session.round.id, session.competitor.short_name)}
         roundTitle={isRoundFive(session) ? ROUND_FIVE_DISPLAY_TITLE : session.round.title}
         competitorLaneState={session.lanes.competitor.state}
         sessionState={session.state}
         armedExpiresAt={session.armed_expires_at}
-        personas={selectedPersonas}
+        personas={activePersonas}
         sound={sound}
         onToggleSound={toggleSound}
         onRing={ring}
@@ -4704,7 +4797,7 @@ function App() {
         missedCalls={missedCalls}
         roundNumber={currentRoundIndex + 1}
         task={session.round.title}
-        competitor={selectedCompetitor.short_name}
+        competitor={session.competitor.short_name}
         error={error}
         liveEvidenceConnected={liveEvidenceConnected}
         uiReview={uiReview}
@@ -5084,9 +5177,14 @@ function Setup(props: {
               <div className="ring-apron">
                 <section className="ring-cell ring-refusal">
                   <p className="sub">
+                    {/* The board's state, not the catalog's: a round the board is
+                        holding is still `ready` in the catalog, and "This round is
+                        ready and cannot arm tonight" contradicts itself. */}
                     {selectedRoundState === 'cleanup_in_progress'
                       ? 'Cleanup in progress.'
-                      : `This round is ${selectedRound.availability} and cannot arm tonight.`}
+                      : selectedRoundState === 'temporarily_unavailable'
+                        ? 'This round is temporarily unavailable.'
+                        : `This round is ${selectedRound.availability === 'ready' ? 'unavailable' : selectedRound.availability} and cannot arm tonight.`}
                   </p>
                   <dl className="scorecard-copy">
                     <div><dt>Why</dt><dd>
@@ -5106,25 +5204,28 @@ function Setup(props: {
               <div className="dialogue-team" aria-label="People at ringside">{[primaryPersona, ...secondaryPersonas].map((persona) => <img src={persona.portrait} alt={persona.role} key={persona.id} />)}</div>
               <p><span>{primaryPersona.nickname} says:</span>“{selectedOpening}”</p>
             </div>
-            {props.error && <p className="game-error" role="alert">{props.error}</p>}
             <div className="card-actions">
+              {/* Why the last press failed, as the bar's own first row. In the column
+                  just above the bar, the bar pinned over it: at 1280x720 a refused
+                  Prepare came back with PREPARE enabled and its reason underneath. */}
+              {props.error && <p className="game-error" role="alert">{props.error}</p>}
               <button className="game-back" onClick={() => props.onScene('lenses')}>B · Back</button>
+              {/* ONE STRIP, ONE SENTENCE, and it is the same value that greyed
+                  the button out. Five separate notes stood here, each with its
+                  own guard, and between them they left the ring's status-not-read
+                  state with no occupant at all -- a dead PREPARE and a silent
+                  screen. Rendering the refusal itself cannot reproduce that, and
+                  it costs less room than the old set did: two of those guards
+                  could be true at once, so the worst case here used to be two
+                  stacked rows of 5px type rather than one.
+
+                  Inside the pinned bar on purpose, between the two buttons: the
+                  bar never leaves the screen, so neither does the reason, and
+                  nothing it says can push either button toward the fold. */}
+              {props.uiReview && <p className="game-lock-note">VISUAL REVIEW ONLY · NOTHING WILL CONNECT OR RUN</p>}
+              {refusal && <p className="game-lock-note" role="status">{refusal}</p>}
               <button className="game-primary" disabled={!canPrepare} onClick={props.onPrepare}>{props.uiReview ? 'A · Preview fight card' : 'A · Prepare fight card'}</button>
             </div>
-            {/* ONE STRIP, ONE SENTENCE, and it is the same value that greyed
-                the button out. Five separate notes stood here, each with its
-                own guard, and between them they left the ring's status-not-read
-                state with no occupant at all -- a dead PREPARE and a silent
-                screen. Rendering the refusal itself cannot reproduce that, and
-                it costs less room than the old set did: two of those guards
-                could be true at once, so the worst case here used to be two
-                stacked rows of 5px type rather than one.
-
-                Below `.card-actions` on purpose. This strip takes its space out
-                of the ring's own flexible row, so nothing it ever says can push
-                B · BACK or A · PREPARE FIGHT CARD toward the fold. */}
-            {props.uiReview && <p className="game-lock-note">VISUAL REVIEW ONLY · NOTHING WILL CONNECT OR RUN</p>}
-            {refusal && <p className="game-lock-note" role="status">{refusal}</p>}
           </div>
         )}
         <div className="game-scanlines" aria-hidden="true" />
@@ -5296,6 +5397,10 @@ function Matchup({
   onCancel: () => void
 }) {
   const boutInProgress = status.includes('BOUT IN PROGRESS')
+  // A ring whose lease was lost while its work is still stopping has no owner to
+  // name, so "Who's in the ring?" could only answer "The ring just cleared". It is
+  // the hold the fight card shows as temporarily unavailable, and says so.
+  const ringHeld = boutInProgress && status.includes('RING LEASE LOST')
   const [showOwner, setShowOwner] = useState(false)
   const [inspectedBout, setInspectedBout] = useState<BoutStatus | null>(null)
   const displayedBout = inspectedBout ?? activeBout
@@ -5321,12 +5426,12 @@ function Matchup({
         <div>{personas.map((persona, index) => <img key={persona.id} src={persona.portrait} alt={`${index === 0 ? 'Primary' : 'Secondary'}: ${persona.role}`} />)}</div>
       </div>
       <div className="matchup-wait" role="status">
-        <strong className={reducedMotion || boutInProgress ? '' : 'blink'}>{boutInProgress ? 'Bout in progress' : 'Checking both corners…'}</strong>
+        <strong className={reducedMotion || boutInProgress ? '' : 'blink'}>{ringHeld ? 'Temporarily unavailable' : boutInProgress ? 'Bout in progress' : 'Checking both corners…'}</strong>
         <span>{status}</span>
         {boutInProgress && (
           <div className="bout-wait-actions">
             <button onClick={onLeave}>B · Fight card</button>
-            <button onClick={inspectBout}>Select · Who’s in the ring?</button>
+            {!ringHeld && <button onClick={inspectBout}>Select · Who’s in the ring?</button>}
           </div>
         )}
         {!boutInProgress && canCancel && (
@@ -5540,7 +5645,7 @@ function RoundFiveBurstCard({
       </section>
     )
   }
-  const target = (10_000).toLocaleString()
+  const target = (10_000).toLocaleString('en-US')
   return (
     <section className="round5-lane" data-corner={corner} aria-label={`${lane.name} 10,000-client fan-in evidence`}>
       <header><strong>{lane.name}</strong><span>{result.contractVerified ? '10K GATE + HOLD ✓' : 'NOT VERIFIED'}</span></header>
@@ -5576,13 +5681,13 @@ function RoundFiveRuntimeBurstCard({
   const name = session.round5_setup?.lanes?.[laneId]?.name
     ?? session.lanes[laneId].name
   return (
-    <section className="round5-lane" data-corner={corner} aria-label={`${name} V4 runtime evidence`}>
-      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : lane.phase.toUpperCase()}</span></header>
+    <section className="round5-lane" data-corner={corner} aria-label={`${name} live fan-in evidence`}>
+      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : roundFivePhaseLabel(lane.phase)}</span></header>
       <dl>
-        <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString()} / 10,000 clients</dd></div>
-        <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString()} / 10,000 clients</dd></div>
-        <div><dt>Currently held</dt><dd>{lane.held_clients.toLocaleString()} / 10,000 clients</dd></div>
-        <div><dt>Peak held</dt><dd>{(lane.peak_held_clients ?? lane.held_clients).toLocaleString()} / 10,000 clients</dd></div>
+        <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString('en-US')} / 10,000 clients</dd></div>
+        <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString('en-US')} / 10,000 clients</dd></div>
+        <div><dt>Currently held</dt><dd>{lane.held_clients.toLocaleString('en-US')} / 10,000 clients</dd></div>
+        <div><dt>Peak held</dt><dd>{(lane.peak_held_clients ?? lane.held_clients).toLocaleString('en-US')} / 10,000 clients</dd></div>
         <div><dt>Held-connection checks</dt><dd>{lane.sampled_queries_succeeded} / {ROUND_FIVE_SAMPLED_QUERIES}</dd></div>
         <div><dt>Bell to exact 10K</dt><dd>{lane.bell_to_10000_observed_ms == null ? 'N/A' : preciseDuration(lane.bell_to_10000_observed_ms)}</dd></div>
       </dl>
@@ -5592,6 +5697,11 @@ function RoundFiveRuntimeBurstCard({
 
 function roundFiveMemoryDisplay(value: number | null): string {
   return value === null ? 'N/A' : `${(value / 1024 ** 3).toFixed(2)} GiB`
+}
+
+function roundFiveLoginRetryBudget(session: DemoSession): number {
+  const budget = session.fairness.max_retries
+  return budget === ROUND_FIVE_MAX_RETRIES ? budget : ROUND_FIVE_MAX_RETRIES
 }
 
 function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
@@ -5645,8 +5755,8 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
       </section>
       <div className="round5-fairness" aria-label="Round 5 fair proof contract">
         <strong>PHASE 2 FAIRNESS</strong>
-        <span>{legacy ? 'Current 10,000-client target not recorded' : `${session.fairness.target_clients_per_lane?.toLocaleString() ?? 'N/A'} target clients / lane`}</span>
-        <span>{legacy ? 'Legacy scorecard decoded' : `${session.fairness.hold_seconds ?? 'N/A'}s common hold · zero retries`}</span>
+        <span>{legacy ? 'Current 10,000-client target not recorded' : `${session.fairness.target_clients_per_lane?.toLocaleString('en-US') ?? 'N/A'} target clients / lane`}</span>
+        <span>{legacy ? 'Legacy scorecard decoded' : `${session.fairness.hold_seconds ?? 'N/A'}s common hold · up to ${roundFiveLoginRetryBudget(session)} retried logins / lane`}</span>
         <span>{v4 ? 'Two isolated physical runners' : 'Identical neutral runner'} · {session.fairness.runner ?? 'N/A'}</span>
         <span>TLS {session.fairness.tls ?? 'N/A'} · timeout {session.fairness.timeout ?? 'N/A'}</span>
       </div>
@@ -5738,8 +5848,8 @@ function roundFiveArenaLane(
       attempts: held,
       elapsed_ms: result.timeToTargetMs ?? fallbackLane.elapsed_ms,
       status: fallbackLane.activity?.phase === 'hold'
-        ? `${held.toLocaleString()} / 10,000 clients held · ${result.sampledQueriesSucceeded ?? 0} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks so far`
-        : `${held.toLocaleString()} / 10,000 clients authenticated + held`,
+        ? `${held.toLocaleString('en-US')} / 10,000 clients held · ${result.sampledQueriesSucceeded ?? 0} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks so far`
+        : `${held.toLocaleString('en-US')} / 10,000 clients authenticated + held`,
     }
   }
   const setupState = setupLane?.state ?? 'pending'
@@ -5889,10 +5999,10 @@ function RoundFivePartialEvidence({ session }: { session: DemoSession }) {
           return (
             <article key={laneId} data-corner={laneId === 'lakebase' ? 'red' : 'blue'}>
               <strong>{name}</strong>
-              <span>{lane.clients_initiated.toLocaleString()} initiated</span>
-              <span>{lane.clients_authenticated.toLocaleString()} authenticated</span>
-              <span>{lane.held_clients.toLocaleString()} currently held</span>
-              <span>{peakHeld.toLocaleString()} peak held retained</span>
+              <span>{lane.clients_initiated.toLocaleString('en-US')} initiated</span>
+              <span>{lane.clients_authenticated.toLocaleString('en-US')} authenticated</span>
+              <span>{lane.held_clients.toLocaleString('en-US')} currently held</span>
+              <span>{peakHeld.toLocaleString('en-US')} peak held retained</span>
               <span>{lane.sampled_queries_succeeded} of {ROUND_FIVE_SAMPLED_QUERIES} held-connection checks completed</span>
               <span>Release published · {lane.release_published_observed_ms == null ? 'pending' : preciseDuration(lane.release_published_observed_ms)}</span>
               <span>Runner observed release · {lane.runner_release_observed_ms == null ? 'pending' : preciseDuration(lane.runner_release_observed_ms)}</span>
@@ -6416,6 +6526,15 @@ function Proof({
   const [showShareReceipt, setShowShareReceipt] = useState(false)
   const [showInstantReplay, setShowInstantReplay] = useState(false)
   const [showCostRoom, setShowCostRoom] = useState(false)
+  // A finished bout keeps the error that ended it, or a stream blip, out of the
+  // footer: the verdict already says how it ended. The refusal of something
+  // pressed here afterwards -- a re-do, a cleanup retry -- has nowhere else to
+  // appear. Both handlers clear the error before they ask, so after such a press
+  // `error` holds only that press's answer.
+  const [pressedWhenFinished, setPressedWhenFinished] = useState<string | null>(null)
+  const markFinishedPress = () => { if (complete) setPressedWhenFinished(session.id) }
+  const actionsBar = !uiReview && complete && proofNavigationAllowsExit(session)
+  const finishedPressError = complete && error !== null && pressedWhenFinished === session.id
   // Rounds 4 and 6 name their lanes by their databases, and the lanes differ by
   // the integration that moves the data, so each lane shows its stack. Without the
   // AWS lane the blue corner says so instead of borrowing Round 1's scale-to-zero
@@ -6479,7 +6598,7 @@ function Proof({
         />
       </div>
       <footer className="proof-footer" data-capability={capabilityGap}>
-        {error && !complete && <p className="proof-error" role="alert">{error}</p>}
+        {error && (!complete || (finishedPressError && !actionsBar)) && <p className="proof-error" role="alert">{error}</p>}
         {uiReview ? (
           <div className="proof-review"><strong>No measurement recorded</strong><span>{capabilityGap && !racesAwsLane ? 'UI review · RDS capability not checked live · No result' : 'UI review · No database connections · No result'}</span></div>
         ) : complete ? (
@@ -6508,15 +6627,18 @@ function Proof({
           session={session}
           uiReview={uiReview}
           disabled={!liveEvidenceConnected}
-          onTowel={onTowel}
+          onTowel={async () => { markFinishedPress(); await onTowel() }}
         />
-        {!uiReview && complete && proofNavigationAllowsExit(session) && (
+        {actionsBar && (
           <div className="proof-actions">
+            {/* In the sticky bar, so it is on screen wherever the footer is
+                scrolled: at 1280x720 the footer must scroll to reach Retry cleanup. */}
+            {finishedPressError && <p className="proof-error" role="alert">{error}</p>}
             {cleanupAllowsActions && ((session.state === 'verified' && genericRedoAllowed) || failedOwnedArtifactRound) && (
               <div className="starred-redo-action">
                 <button
                   className="proof-redo"
-                  onClick={onRedo}
+                  onClick={() => { markFinishedPress(); onRedo() }}
                   aria-label={roundOneIdleClockLive ? 'Re-do round — back to idle clock already live' : undefined}
                 >
                   B · {failedOwnedArtifactRound
@@ -6903,7 +7025,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Legacy scorecard', code: 'Decoded successfully · current 10,000-client fan-in evidence not recorded', note: 'No current fan-in result is inferred from legacy fields.' },
         ]
       : [
-          { label: 'Exact client fan-in', code: '10,000 authenticated held clients / lane · zero retries' },
+          { label: 'Exact client fan-in', code: `10,000 authenticated held clients / lane · up to ${roundFiveLoginRetryBudget(session)} retried logins / lane` },
           { label: v4 ? 'Authoritative bell' : 'Shared release', code: v4 ? 'one server T0 → release both independent physical lane gates' : 'one monotonic T0 → alternating equal waves for both lanes', note: 'Every provider and ramp delay remains scored.' },
           { label: 'Common hold', code: `10,000 clients / lane held for at least 30s · ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks / lane` },
           { label: 'Multiplexing check', code: 'separate direct observers count dedicated-role PostgreSQL backend PIDs', note: 'This is not a transaction-throughput test.' },
@@ -6917,7 +7039,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
           { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Evidence validity (Proxy absent before the bell, CreateDBProxy the first timed post-bell AWS mutation, shared T0, exact 10,000 client connections) is what verifies a bout. Scheduling quality — launches within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other, CreateDBProxy within 100 ms of the bell — is advisory only; a miss is charged to that lane's own clock and never voids an exact result.` },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
-          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge, resident registry, lock, and cancellation owner per lane.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
+          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge per lane, which alone tracks, holds and can cancel that lane’s clients.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
         ],
         lakebase: [{ label: 'No new pool to provision', code: 'Connection pooling is built into the Lakebase endpoint.', note: 'No per-bout pooling resource is created, so no creation is journaled.' }],
         competitor: [{ label: 'Journaled per-bout build', code: 'Every RDS Proxy resource is written to the creation journal before AWS is called.', note: 'The journal is what lets an interrupted bout be cleaned up instead of leaking.' }],
@@ -7915,7 +8037,7 @@ function CooldownDetails({
   )
 }
 
-function BetweenRounds({
+export function BetweenRounds({
   session,
   competitor,
   error,
@@ -7953,10 +8075,16 @@ function BetweenRounds({
   const competitorCannotIdle = !deleting && cooldown.lanes.competitor.state === 'not_supported'
   const resetStatus = deleting
     ? failed
-      ? `Cleanup stopped · One or more ${recoveryCleanup ? 'recovery' : 'isolated'} environments could not be removed · Retry cleanup`
+      // The server's own reason, as Round 1 shows it, e.g. that the cleanup lost its
+      // ring fence; the fixed sentence stays for a failure that carries none.
+      ? `Cleanup stopped · ${(cooldown.failure ?? `One or more ${recoveryCleanup ? 'recovery' : 'isolated'} environments could not be removed`).replace(/\.$/, '')} · Retry cleanup`
       : ready
         ? `Both ${recoveryCleanup ? 'recovery' : 'isolated'} environments removed · RING AGAIN is ready`
         : `Clocks are live · Removing only the owned ${recoveryCleanup ? 'recovery' : 'test'} environments`
+    // The server's own reason. "Waiting for each database to become idle" beside
+    // RETRY CLEANUP described a wait the server had already given up on.
+    : failed
+      ? `Reset stopped · ${(cooldown.failure ?? 'Return to idle was not confirmed').replace(/\.$/, '')} · Retry cleanup`
     : competitorCannotIdle
       ? ready
         ? 'Lakebase IDLE · RDS has no automatic scale-to-zero · RING AGAIN is ready'
@@ -8025,12 +8153,15 @@ function BetweenRounds({
  * complaint that produced this screen was a scorecard you could read top to
  * bottom without ever learning who won.
  */
-function FinaleRow({ beat, result, reading, latest, opponent }: {
+function FinaleRow({ beat, result, record, latest, opponent }: {
   beat: FinaleBeat
   /** Null when the record has been read and holds nothing for this round. */
   result: RoundResult | null
-  /** True while the record is still being read, so no absence is asserted yet. */
-  reading: boolean
+  /**
+   * Whether the record has been read. Only a read record can assert an absence:
+   * while it is being read, or after the read failed, no row says "not run yet".
+   */
+  record: RecordState
   /**
    * The round this operator just finished. Lit because it is the one row whose
    * figure was produced in front of the room, which is a fact about when it was
@@ -8040,9 +8171,9 @@ function FinaleRow({ beat, result, reading, latest, opponent }: {
   /** The blue corner's chip, the fight card's own, for the lane badge. */
   opponent: { badge: string; name: string }
 }) {
-  const verdict: LedgerVerdict = verdictFor(result, reading ? 'reading' : 'read')
+  const verdict: LedgerVerdict = verdictFor(result, record)
   // A result from an earlier day says so, or the ledger reads as one sitting.
-  const day = reading || !result ? null : ledgerDay(result)
+  const day = record !== 'read' || !result ? null : ledgerDay(result)
   // The same two bars the share card draws, so the screen and the image agree.
   const bars = finaleLaneBars(result)
   // The corner this round was actually against: the ledger keeps each round's latest
@@ -8073,7 +8204,7 @@ function FinaleRow({ beat, result, reading, latest, opponent }: {
     <article
       className="finale-beat"
       data-accent={beat.accent}
-      data-status={reading ? 'reading' : result?.status ?? 'unrun'}
+      data-status={record !== 'read' ? record : result?.status ?? 'unrun'}
       data-latest={latest ? 'true' : undefined}
     >
       <header><span>{beat.number}</span><strong>{beat.title}</strong></header>
@@ -8108,7 +8239,7 @@ function FinaleRow({ beat, result, reading, latest, opponent }: {
   )
 }
 
-function Finale({ session, onBack, onSummary }: {
+export function Finale({ session, onBack, onSummary }: {
   session: DemoSession
   onBack: () => void
   /**
@@ -8264,7 +8395,7 @@ function Finale({ session, onBack, onSummary }: {
             key={beat.number}
             beat={beat}
             result={results.get(beat.roundId) ?? null}
-            reading={receipts === null}
+            record={receipts === null ? 'reading' : recordFailed ? 'unread' : 'read'}
             latest={beat.roundId === session.round.id}
             opponent={{
               badge: opponentBadge(session.competitor.id),
@@ -8330,10 +8461,11 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
             </div>
             <dl>
               <div><dt>{scorecardProofLabel(entry)}</dt><dd>{scorecardLakebaseValue(entry)} <span>LB</span> · {scorecardCompetitorValue(entry)} <span>{scorecardCompetitorLabel(entry)}</span></dd></div>
-              {/* An abandoned round finished nothing, so it had nothing to reset.
-                  Printing the reset contract's WATCHING placeholder beside it
-                  would claim a cooldown that never started. */}
-              {!scorecardIsAbandoned(entry) && (
+              {/* An abandoned round finished nothing, so it had nothing to reset,
+                  and Rounds 4 to 6 have no reset at all. Printing the reset
+                  contract's WATCHING placeholder beside either would claim a
+                  cooldown that never started. */}
+              {!scorecardIsAbandoned(entry) && scorecardResetLabel(entry) !== null && (
                 <div><dt>{scorecardResetLabel(entry)}</dt><dd>{scorecardResetValue(entry.cooldown?.lakebase_state, entry.cooldown?.lakebase_ms)} <span>LB</span> · {scorecardResetValue(entry.cooldown?.competitor_state, entry.cooldown?.competitor_ms)} <span>OPP</span></dd></div>
               )}
             </dl>
@@ -8434,11 +8566,12 @@ function scorecardProofLabel(entry: ScorecardEntry): string {
   return 'Non-executable round · no proof'
 }
 
-function scorecardResetLabel(entry: ScorecardEntry): string {
+/** Null for a round with no reset to watch, which then gets no reset row at all. */
+function scorecardResetLabel(entry: ScorecardEntry): string | null {
   if (entry.round_id === 'recover_deleted_order' || entry.cooldown?.mode === 'delete_recovery_environment') return 'Delete recovery environment'
   if (entry.round_id === 'make_schema_change_safely' || entry.cooldown?.mode === 'delete_isolated_environment') return 'Delete isolated copy'
   if (entry.round_id === 'wake_idle_app' || entry.cooldown?.mode === 'return_to_idle') return 'Return → confirmed zero'
-  return 'No executable reset contract'
+  return null
 }
 
 function shortSeconds(milliseconds: number): string {
@@ -8753,14 +8886,14 @@ function proofCommentary(
         const lane = runtime.lanes[laneId]
         const name = session.round5_setup?.lanes?.[laneId]?.name
           ?? session.lanes[laneId].name
-        return `${name} · ${lane.held_clients.toLocaleString()} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`
+        return `${name} · ${lane.held_clients.toLocaleString('en-US')} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`
       })
       return {
         lanes: lines,
         verdict: runtime.state === 'verified'
           ? roundFiveVerifiedVerdict(session)
           : runtime.state === 'running'
-            ? 'V4 resident fan-in live · no winner until both canonical runtime lanes verify'
+            ? '10,000-client fan-in live · no winner until both lanes verify'
             : roundFiveStoppedVerdict(session),
       }
     }
@@ -8776,8 +8909,8 @@ function proofCommentary(
         }
         const held = result.held ?? result.authenticated ?? lane.attempts
         const target = result.timeToTargetMs === null
-          ? `${held.toLocaleString()} / ${result.targetClients.toLocaleString()} clients held`
-          : `${result.targetClients.toLocaleString()} clients held at ${preciseDuration(result.timeToTargetMs)}`
+          ? `${held.toLocaleString('en-US')} / ${result.targetClients.toLocaleString('en-US')} clients held`
+          : `${result.targetClients.toLocaleString('en-US')} clients held at ${preciseDuration(result.timeToTargetMs)}`
         return `${lane.name} · ${target} · ${lane.status}`
       })
       const update = session.state === 'verified'

@@ -489,6 +489,7 @@ class _FakeCursor:
     def __init__(self, rows: list[tuple | None]) -> None:
         self._rows = rows
         self.statements: list[str] = []
+        self.parameters: list[tuple] = []
         self._pending: tuple | None = None
 
     async def __aenter__(self) -> _FakeCursor:
@@ -497,8 +498,9 @@ class _FakeCursor:
     async def __aexit__(self, *_exc: object) -> None:
         return None
 
-    async def execute(self, sql: str, _params: tuple = ()) -> None:
+    async def execute(self, sql: str, params: tuple = ()) -> None:
         self.statements.append(" ".join(sql.split()))
+        self.parameters.append(params)
         self._pending = self._rows.pop(0)
 
     async def fetchone(self) -> tuple | None:
@@ -653,6 +655,256 @@ async def test_cleanup_reclaim_does_not_compare_independent_fence_domains(
     assert "(lease_id IS NULL OR expires_at <= clock_timestamp())" in statement
     assert "owner_subject = 'round5-cleanup-recovery'" in statement
     assert "fencing_token = fencing_token + 1" in statement
+
+
+async def test_a_release_of_a_stale_phase_cannot_free_the_fence_that_moved_on() -> None:
+    """A transition keeps the lease id and fence token, so a release must match phase too."""
+
+    store = InMemoryBoutLeaseStore()
+    owner = operator("operator@example.com", "user-a")
+    committed = await claim(store, "session-a", owner)
+    towel = await store.transition(
+        committed,
+        operator=owner,
+        expected_phase=committed.phase,
+        phase="towel_cleanup",
+        session_state=SessionState.RUNNING,
+        ttl=timedelta(minutes=30),
+    )
+    assert (towel.lease_id, towel.fencing_token) == (committed.lease_id, committed.fencing_token)
+
+    assert await store.release(committed) is False
+    assert await store.current() == towel
+    assert await store.release(towel) is True
+    assert await store.current() is None
+
+
+async def test_the_lakebase_release_is_fenced_on_phase() -> None:
+    cursor = _FakeCursor([None])
+    store = LakebaseBoutLeaseStore(
+        endpoint_name="coordination-endpoint",
+        database="anti_demo",
+        host="coordination.example",
+        user="service-principal",
+        connector=lambda **_kwargs: _ready(_FakeConnection(cursor)),
+        workspace_client=SimpleNamespace(
+            postgres=SimpleNamespace(
+                generate_database_credential=lambda _name: SimpleNamespace(
+                    token="coordination-token"
+                )
+            )
+        ),
+    )
+    now = datetime(2026, 8, 20, 19, 0, tzinfo=UTC)
+    stale = BoutLease(
+        lease_id="00000000-0000-0000-0000-000000000001",
+        fencing_token=7,
+        session_id="session-a",
+        operator=operator("operator@example.com", "user-a"),
+        owner_subject="user-a",
+        phase="run_committed",
+        session_state=SessionState.RUNNING,
+        round_id="wake_idle_app",
+        round_title="Wake an idle app",
+        competitor_id="aurora_serverless_v2",
+        competitor_name="Aurora Serverless v2",
+        started_at=now,
+        updated_at=now,
+        expires_at=now + timedelta(minutes=30),
+    )
+
+    assert await store.release(stale) is False
+    (statement,) = cursor.statements
+    assert statement.startswith("UPDATE anti_demo_coordination.ring_lease SET lease_id = NULL")
+    assert "AND owner_subject = %s AND phase = %s RETURNING" in statement
+    assert cursor.parameters[0][-1] == "run_committed"
+
+
+async def test_the_lakebase_coordination_connection_bounds_a_silent_peer() -> None:
+    """A cancelled call cannot end on a black-holed socket; the kernel must close it."""
+
+    connections: list[dict[str, object]] = []
+
+    def connect(**kwargs: object):
+        connections.append(kwargs)
+        return _ready(_FakeConnection(_FakeCursor([None])))
+
+    store = LakebaseBoutLeaseStore(
+        endpoint_name="coordination-endpoint",
+        database="anti_demo",
+        host="coordination.example",
+        user="service-principal",
+        connector=connect,
+        workspace_client=SimpleNamespace(
+            postgres=SimpleNamespace(
+                generate_database_credential=lambda _name: SimpleNamespace(
+                    token="coordination-token"
+                )
+            )
+        ),
+    )
+
+    assert await store.current() is None
+    (kwargs,) = connections
+    assert {
+        key: kwargs.get(key)
+        for key in (
+            "connect_timeout",
+            "keepalives",
+            "keepalives_idle",
+            "keepalives_interval",
+            "keepalives_count",
+            "tcp_user_timeout",
+        )
+    } == {
+        "connect_timeout": 15,
+        "keepalives": 1,
+        "keepalives_idle": 5,
+        "keepalives_interval": 5,
+        "keepalives_count": 3,
+        "tcp_user_timeout": 20_000,
+    }
+    # Server-side timeouts are deliberately not sent: they would bound the statement,
+    # not a silent peer, and depend on the endpoint accepting startup options.
+    server_side = ("statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout")
+    assert not set(server_side) & set(kwargs)
+    assert not any(name in str(kwargs.get("options") or "") for name in server_side)
+
+
+class _BlackHoledCursor(_FakeCursor):
+    """Its first statement never answers. Cancelled, it does what psycopg 3.3 does: waits
+    on the same socket again, and when the kernel gives that socket up the call raises
+    OperationalError, not CancelledError."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.waiting = asyncio.Event()
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        self.statements.append(" ".join(sql.split()))
+        self.waiting.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            raise psycopg.OperationalError(
+                "consuming input failed: server closed the connection unexpectedly"
+            ) from None
+
+
+class _RefusedCursor(_FakeCursor):
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        self.statements.append(" ".join(sql.split()))
+        raise psycopg.OperationalError("server closed the connection unexpectedly")
+
+
+def _lakebase_store_on(
+    *cursors: _FakeCursor,
+) -> tuple[LakebaseBoutLeaseStore, list[_FakeCursor]]:
+    pending = list(cursors)
+    opened: list[_FakeCursor] = []
+
+    def connect(**_kwargs: object):
+        cursor = pending.pop(0)
+        opened.append(cursor)
+        return _ready(_FakeConnection(cursor))
+
+    store = LakebaseBoutLeaseStore(
+        endpoint_name="coordination-endpoint",
+        database="anti_demo",
+        host="coordination.example",
+        user="service-principal",
+        connector=connect,
+        workspace_client=SimpleNamespace(
+            postgres=SimpleNamespace(
+                generate_database_credential=lambda _name: SimpleNamespace(
+                    token="coordination-token"
+                )
+            )
+        ),
+    )
+    return store, opened
+
+
+async def test_an_abandoned_coordination_call_is_never_sent_again() -> None:
+    """A renew the heartbeat gave up on must not land after the lease was declared lost.
+
+    Retried on a fresh connection, it could hold a row this process already gave up for
+    one more TTL.
+    """
+
+    hung = _BlackHoledCursor()
+    fresh = _FakeCursor([None])
+    store, opened = _lakebase_store_on(hung, fresh)
+    now = datetime.now(UTC)
+    lease = _lease_at(updated_at=now, expires_at=now + timedelta(seconds=90))
+    renew = asyncio.ensure_future(store.renew(lease, ttl=timedelta(seconds=90)))
+    await asyncio.wait_for(hung.waiting.wait(), timeout=1)
+
+    renew.cancel()
+    await asyncio.wait({renew}, timeout=5)
+
+    assert renew.cancelled()
+    assert opened == [hung]
+    assert fresh.statements == []
+
+
+async def test_a_call_from_an_already_cancelled_tasks_cleanup_is_still_retried() -> None:
+    """Cleanup in a cancelled task's ``finally`` is that task's own work, not an abandoned
+    call: a refused first connection is retried like any other."""
+
+    refused = _RefusedCursor([])
+    fresh = _FakeCursor([None])
+    store, opened = _lakebase_store_on(refused, fresh)
+    entered = asyncio.Event()
+    seen: list[object] = []
+
+    async def cancelled_then_cleans_up() -> None:
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            seen.append(await store.current())
+
+    task = asyncio.create_task(cancelled_then_cleans_up())
+    await entered.wait()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert opened == [refused, fresh]
+    assert seen == [None]
+
+
+async def test_a_call_nobody_cancelled_is_still_retried_once_on_a_fresh_connection() -> None:
+    refused = _RefusedCursor([])
+    fresh = _FakeCursor([None])
+    store, opened = _lakebase_store_on(refused, fresh)
+
+    assert await store.current() is None
+    assert opened == [refused, fresh]
+
+
+class _LapsedRowCursor(_FakeCursor):
+    """The row still names the lease but lapsed on the database's clock, so only the
+    expiry check keeps an UPDATE from matching it."""
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        await super().execute(sql, params)
+        if "expires_at > clock_timestamp()" not in self.statements[-1]:
+            self._pending = (params[2],)
+
+
+async def test_the_lakebase_release_never_confirms_a_lapsed_row() -> None:
+    """As for a renew, the database's clock decides: a lapsed row released anyway would
+    read as the bout giving its ring up while its work may still run."""
+
+    cursor = _LapsedRowCursor([None])
+    store, _opened = _lakebase_store_on(cursor)
+    now = datetime.now(UTC)
+    lease = _lease_at(updated_at=now, expires_at=now + timedelta(seconds=90))
+
+    assert await store.release(lease) is False
+    assert len(cursor.statements) == 1
 
 
 def test_no_lease_store_exposes_a_force_or_steal_path() -> None:

@@ -23,6 +23,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping
+from functools import partial
 from typing import Any
 
 import psycopg
@@ -137,7 +138,7 @@ class LakebaseFeedLane:
             and history.lsn >= 0
         )
 
-    async def start(self) -> None:
+    async def start(self, *, on_refused: Callable[[BaseException], None] | None = None) -> None:
         return None
 
     async def failure(self) -> str | None:
@@ -396,22 +397,51 @@ class AwsCaptureLane:
         )
         return await self._statements.execute(statement, parameters)
 
-    async def start(self) -> None:
-        """Start DMS and Glue at once. Returns once both have accepted, not once they run."""
+    async def start(self, *, on_refused: Callable[[BaseException], None] | None = None) -> None:
+        """Start DMS and Glue at once. Returns once both have accepted, not once they run.
+
+        The first refusal goes to ``on_refused`` as soon as it comes, and is the one raised.
+        """
 
         self._started_at = self._clock()
         self._dms_seen_moving = False
         task, job = await asyncio.to_thread(lambda: self._pipeline)
-        (kind, _), (run_id, _) = await asyncio.gather(
-            asyncio.to_thread(task.start),
-            asyncio.to_thread(lambda: job.start({})),
-        )
+        refusals: list[tuple[str, BaseException]] = []
+
+        def answered(pipeline: str, request: asyncio.Future[Any]) -> None:
+            refusal = None if request.cancelled() else request.exception()
+            if refusal is None:
+                return
+            refusals.append((pipeline, refusal))
+            if on_refused is not None and len(refusals) == 1:
+                on_refused(refusal)
+
+        dms_start = asyncio.ensure_future(asyncio.to_thread(task.start))
+        glue_start = asyncio.ensure_future(asyncio.to_thread(lambda: job.start({})))
+        dms_start.add_done_callback(partial(answered, f"DMS task {self._lane.task_arn}"))
+        glue_start.add_done_callback(partial(answered, f"Glue job {self._lane.job_name}"))
+        # Settling waits on this start alone before it parks, so it answers only once both
+        # starts have: answering at the first refusal would let the other be accepted after
+        # the park.
+        dms, glue = await asyncio.gather(dms_start, glue_start, return_exceptions=True)
+        if not isinstance(glue, BaseException):
+            self._run_id = glue[0]
+        if refusals:
+            (_, first), *others = refusals
+            for pipeline, other in others:
+                LOGGER.warning(
+                    "Round 6's %s also refused to start: %s: %s",
+                    pipeline,
+                    type(other).__name__,
+                    other,
+                )
+            raise first
+        kind, _ = dms
         if kind == "already-running":
             # Prepare parks the task, so a running one at the bell means AWS started warm.
             LOGGER.warning(
                 "Round 6's DMS task %s was already running at the bell", self._lane.task_arn
             )
-        self._run_id = run_id
 
     async def failure(self) -> str | None:
         task, job = await asyncio.to_thread(lambda: self._pipeline)
@@ -425,12 +455,22 @@ class AwsCaptureLane:
                 and self._clock() - self._started_at < DMS_STALE_STATUS_SECONDS
             )
             if self._dms_seen_moving or not fresh:
-                return f"The DMS task stopped: {state.failure or state.stop_reason or state.status}"
+                # This is the lane's failure on the card and in the receipt, and DMS's own
+                # failure message can name an endpoint host or an ARN, so it is logged instead.
+                if state.failure:
+                    LOGGER.warning("Round 6's DMS task stopped: %s", state.failure)
+                return f"The DMS task stopped: {state.stop_reason or state.status}"
         run_id = self._run_id
         if run_id:
             run = await asyncio.to_thread(lambda: job.run(run_id))
             if run.state in TERMINAL_STATES:
-                return f"The Glue run ended {run.state}: {run.error_message or 'no error message'}"
+                LOGGER.warning(
+                    "Round 6's Glue run %s ended %s: %s",
+                    run_id,
+                    run.state,
+                    run.error_message or "no error message",
+                )
+                return f"The Glue run ended {run.state}"
         return None
 
     async def park(self, notify: Notify) -> None:

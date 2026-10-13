@@ -8,7 +8,9 @@ the outside world only through two lanes and one shared source.
   waited out, and the source and every destination must read the sealed baseline. If a crash
   left a destination off it, Prepare first settles (restore, carry, park), visibly.
 - **The bell** starts both integrations and commits one Delta change, all at once, and every
-  lane's verifier starts polling at the same instant. Neither lane waits for the other.
+  lane's verifier starts polling at the same instant. Neither lane waits for the other. What a
+  lane must look up or record before its start, it does before the bell, so a lane that cannot
+  refuses the bell instead of failing a bout already rung.
 - **Each clock** runs from the bell to the completion of that lane's first read that returns the
   exact expected row. Every read is the same query shape, on the same client, every
   ``POLL_SECONDS``, over a connection opened before the bell. Nothing else waits on a
@@ -163,6 +165,13 @@ class Lane(Protocol):
 
     async def open_reader(self) -> Reader:
         """Open the destination connection the verifier will poll on."""
+
+    async def before_bell(self) -> None:
+        """Look up and record what the next ``start`` needs, before any clock exists.
+
+        ``start`` then sends its start request first, so a lane's clock holds the integration
+        and nothing of the lane's own bookkeeping.
+        """
 
     async def start(self, bell: Bell) -> None:
         """Ask the integration to start from parked. Returns once the request is accepted."""
@@ -515,7 +524,9 @@ class Round4RaceEngine:
         entity = update.entity_id
 
         # Before the bell, not on either clock: open each destination connection and wake it
-        # with a verified read, so no clock contains a Lakebase or Aurora resume.
+        # with a verified read, so no clock contains a Lakebase or Aurora resume. Then each lane
+        # records what its start needs; Lakebase's is coordination round trips, which on its
+        # clock would time Lakebase alone by them.
         readers: dict[str, Reader] = {}
         try:
             for lane in self.lanes:
@@ -523,6 +534,22 @@ class Round4RaceEngine:
             woken = await asyncio.gather(*(readers[lane_id].read(entity) for lane_id in readers))
             if any(row != self.baseline for row in woken):
                 raise Round4NotArmedError("A destination left its baseline after Prepare")
+            for lane in self.lanes:
+                try:
+                    await lane.before_bell()
+                except Exception as exc:
+                    # The card shows this sentence, and a psycopg message names the
+                    # coordination host and role, so the cause goes to the log alone.
+                    from .manager import operator_diagnosis
+
+                    LOGGER.warning(
+                        "Round 4 %s could not record its start before the bell: %s",
+                        lane.lane_id,
+                        operator_diagnosis(exc),
+                    )
+                    raise Round4NotArmedError(
+                        f"{lane.label} could not record its start, so the bell was not rung"
+                    ) from exc
         except BaseException:
             await self._close_readers(readers)
             raise
@@ -693,8 +720,20 @@ class Round4RaceEngine:
                 if commit.done() and not commit.cancelled() and commit.exception() is not None:
                     return outcome(False, "the bout's Delta commit failed", None)
                 if start.done() and not start.cancelled() and start.exception() is not None:
+                    # The card and the receipt show this; a Glue or Databricks refusal can
+                    # name the account, role or pipeline, so they get its type and code.
+                    from .manager import audience_diagnosis, operator_diagnosis
+
+                    refusal = start.exception()
+                    LOGGER.warning(
+                        "Round 4 %s could not be started: %s",
+                        lane.lane_id,
+                        operator_diagnosis(refusal),
+                    )
                     return outcome(
-                        False, f"{lane.label} could not be started: {start.exception()}", None
+                        False,
+                        f"{lane.label} could not be started: {audience_diagnosis(refusal)}",
+                        None,
                     )
                 began_ns = clock.now_ns()
                 if previous_start_ns is not None:
@@ -705,7 +744,14 @@ class Round4RaceEngine:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - a failed read is a negative read
-                    LOGGER.warning("Round 4 %s verifier read failed: %s", lane.lane_id, exc)
+                    # The type and SQLSTATE only: a psycopg message names the host and role.
+                    from .manager import operator_diagnosis
+
+                    LOGGER.warning(
+                        "Round 4 %s verifier read failed: %s",
+                        lane.lane_id,
+                        operator_diagnosis(exc),
+                    )
                     row = None
                 finished_ns = clock.now_ns()
                 reads += 1
@@ -810,7 +856,27 @@ class Round4RaceEngine:
             bout_id=f"settle-{uuid4().hex[:12]}", rung_at=self._now(), source_table_id=table_id
         )
         try:
-            await asyncio.gather(*(self._carry(lane, bell, say) for lane in self.lanes))
+            # Every carry ends before the park, even when another failed: one still running
+            # after it could start its lane again, through its kick or its own start.
+            carried = await asyncio.gather(
+                *(self._carry(lane, bell, say) for lane in self.lanes), return_exceptions=True
+            )
+            failures = [
+                (lane, result)
+                for lane, result in zip(self.lanes, carried, strict=True)
+                if isinstance(result, BaseException)
+            ]
+            if failures:
+                (_, first), *others = failures
+                from .manager import operator_diagnosis
+
+                for lane, other in others:
+                    LOGGER.warning(
+                        "Round 4's %s also could not carry the restored row: %s",
+                        lane.label,
+                        operator_diagnosis(other),
+                    )
+                raise first
         finally:
             await say("Parking both integrations")
             results = await asyncio.gather(

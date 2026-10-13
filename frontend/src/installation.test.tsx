@@ -8,7 +8,7 @@
  * signals a genuine loss is also the state that must refuse to act on it.
  */
 
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -186,11 +186,19 @@ describe('the four states are four different sentences', () => {
     expect(copy?.title).toBe('THE ACCOUNT COULD NOT BE READ')
     expect(copy?.lede).toContain('NOT a report that anything is missing')
     // The remediation is a credential, not a database.
-    expect(copy?.instead).toContain('aws sso login --sso-session databricks-sandbox')
+    expect(copy?.instead).toContain('Refresh this installation’s AWS credentials')
+    expect(copy?.instead).toContain('aws sso login')
     // And it says why this is also what a genuine sweep looks like, so the
     // refusal is not mistaken for reassurance.
     expect(copy?.instead).toContain('deletes the IAM users as well as the databases')
     expect(copy?.instead).toContain('still is not proof')
+  })
+
+  it('names no SSO session or account that only its authors have', () => {
+    // A public release: whoever reads this banner has their own SSO session
+    // name, or none, and "sandbox" describes the account this was built in.
+    const copy = bannerCopy(blind())
+    expect(copy?.instead).not.toMatch(/--sso-session|databricks-sandbox|sandbox/i)
   })
 
   it('says plainly when nobody has looked at all', () => {
@@ -412,5 +420,58 @@ describe('when the banner cannot read its own endpoint', () => {
     // Silence would render exactly like a healthy installation, which is the
     // defect this whole surface exists to refuse.
     await screen.findByText('THE INSTALLATION STATUS COULD NOT BE READ')
+  })
+
+  it('stays silent for a viewer, whose screen never carries the diagnosis', async () => {
+    // A viewer of the deployed app is shown nothing in every state, so one failed
+    // poll -- a restart's 502, a 15 s timeout -- must not paint the projected
+    // screen with a yellow "502 Bad Gateway" until the next poll answers.
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(deployedViewer()),
+        })
+        .mockResolvedValue({
+          ok: false,
+          status: 502,
+          statusText: 'Bad Gateway',
+          json: () => Promise.reject(new SyntaxError('not JSON')),
+        })
+      vi.stubGlobal('fetch', fetchMock)
+      const { container } = render(<InstallationBanner />)
+      await act(() => vi.advanceTimersByTimeAsync(0))
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      await act(() => vi.advanceTimersByTimeAsync(15_000))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(container.querySelector('.installation-banner')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('still says so to an operator whose last read succeeded', async () => {
+    vi.useFakeTimers()
+    try {
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          json: () => Promise.resolve(status()),
+        })
+        .mockRejectedValue(new TypeError('Failed to fetch'))
+      vi.stubGlobal('fetch', fetchMock)
+      render(<InstallationBanner />)
+      await act(() => vi.advanceTimersByTimeAsync(0))
+      await act(() => vi.advanceTimersByTimeAsync(15_000))
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(screen.getByText('THE INSTALLATION STATUS COULD NOT BE READ')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

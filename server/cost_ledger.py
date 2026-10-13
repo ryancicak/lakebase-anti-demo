@@ -558,6 +558,9 @@ class LakebaseCostLedgerStore:
             return self.host, self.user, self._cached_token
 
     async def _run(self, operation: Callable[[Any], Awaitable[T]]) -> T:
+        task = asyncio.current_task()
+        # A cancelled run's ``finally`` closes its window from a task already cancelled.
+        cancels_on_entry = task.cancelling() if task is not None else 0
         last_error: BaseException | None = None
         for attempt in range(2):
             try:
@@ -571,11 +574,22 @@ class LakebaseCostLedgerStore:
                     sslmode="require",
                     application_name="lakebase-anti-demo-cost-ledger",
                     connect_timeout=15,
+                    # A towel waits on this ledger. As on the coordination store's
+                    # connection, these end a silent peer, never a slow statement.
+                    keepalives=1,
+                    keepalives_idle=5,
+                    keepalives_interval=5,
+                    keepalives_count=3,
+                    tcp_user_timeout=20_000,
                 )
                 async with connection:
                     async with connection.cursor() as cursor:
                         return await operation(cursor)
             except psycopg.OperationalError as exc:
+                if task is not None and task.cancelling() > cancels_on_entry:
+                    # A call cancelled while out fails here once its socket dies; it is
+                    # not sent again after its caller gave up on it.
+                    raise asyncio.CancelledError from exc
                 last_error = exc
                 self._cached_token = ""
                 if attempt == 0:

@@ -29,6 +29,9 @@ from pathlib import Path
 import psycopg
 import pytest
 
+from server.receipts import DurableReceiptStore, derive_receipt
+from tests.test_receipts import failed_then_verified_round_one_bouts
+
 pytestmark = pytest.mark.skipif(
     shutil.which("initdb") is None or shutil.which("pg_ctl") is None,
     reason="requires a local PostgreSQL (initdb/pg_ctl on PATH)",
@@ -234,3 +237,109 @@ def test_definer_function_cannot_touch_a_declaration_row(pg):
         )
         assert cur.fetchone()[0] == "keep-me"  # untouched by the cleanup upsert
         conn.rollback()
+
+
+async def test_app_role_keeps_a_rearmed_bouts_declaration_over_its_failed_first_bout(pg):
+    """A re-armed card's verified bout survives the failed bout before it, without UPDATE.
+
+    A FAILED card in any round but Round 5 can be armed again, so one session seals
+    `run_finished` twice. As the app login, both rows have to land and the store's own
+    read has to answer with the bout that verified; repeating either write is a no-op.
+    """
+
+    failed, verified = await failed_then_verified_round_one_bouts()
+    stopped_short = derive_receipt(failed, "run_finished")
+    declared = derive_receipt(verified, "run_finished")
+    _, app = pg
+    async with await psycopg.AsyncConnection.connect(**app) as conn:
+
+        async def run(operation):
+            async with conn.cursor() as cursor:
+                return await operation(cursor)
+
+        store = DurableReceiptStore(run)
+        for receipt, snapshot in ((stopped_short, failed), (declared, verified)) * 2:
+            await store.append(receipt, snapshot)
+
+        found = await store.load()
+        assert [(item.session_id, item.outcome) for item in found] == [(verified.id, "declared")]
+        assert found[0].sealed_at == declared.sealed_at
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"SELECT outcome FROM {TABLE} WHERE session_id=%s ORDER BY outcome",
+                (verified.id,),
+            )
+            assert [row[0] for row in await cur.fetchall()] == ["declared", "stopped_short"]
+        await conn.rollback()
+
+
+async def test_app_role_keeps_each_pre_arm_attempt_of_one_card(pg):
+    """Two attempts cancelled before ARMED have no `armed_at`, and both rows still land."""
+
+    failed, _ = await failed_then_verified_round_one_bouts()
+    failed.armed_at = None
+    failed.run_started_at = None
+    first = failed.model_copy(deep=True, update={"receipt_bout_id": "attempt-one"})
+    second = failed.model_copy(
+        deep=True,
+        update={
+            "receipt_bout_id": "attempt-two",
+            "updated_at": failed.updated_at + timedelta(minutes=1),
+        },
+    )
+    _, app = pg
+    async with await psycopg.AsyncConnection.connect(**app) as conn:
+
+        async def run(operation):
+            async with conn.cursor() as cursor:
+                return await operation(cursor)
+
+        store = DurableReceiptStore(run)
+        for snapshot in (first, second) * 2:
+            await store.append(derive_receipt(snapshot, "session_cancelled"), snapshot)
+
+        found = await store.load()
+        assert [(item.session_id, item.sealed_at) for item in found] == [
+            (second.id, second.updated_at)
+        ]
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"SELECT count(*) FROM {TABLE} WHERE session_id=%s", (second.id,)
+            )
+            assert (await cur.fetchone())[0] == 2
+        await conn.rollback()
+
+
+async def test_app_role_keeps_an_accepted_run_over_a_later_no_bell_cancel(pg):
+    """Execute run-over-cancel receipt ranking in PostgreSQL, not a fake cursor."""
+
+    failed, _ = await failed_then_verified_round_one_bouts()
+    failed.receipt_bout_id = "accepted-run"
+    failed.run_started_at = failed.updated_at - timedelta(seconds=1)
+    stopped = derive_receipt(failed, "run_finished")
+    cancelled = failed.model_copy(
+        deep=True,
+        update={
+            "receipt_bout_id": "later-no-bell-cancel",
+            "run_started_at": None,
+            "updated_at": failed.updated_at + timedelta(minutes=1),
+            "failure": "The later attempt was cancelled before the bell.",
+        },
+    )
+    no_bell = derive_receipt(cancelled, "session_cancelled")
+    _, app = pg
+    async with await psycopg.AsyncConnection.connect(**app) as conn:
+
+        async def run(operation):
+            async with conn.cursor() as cursor:
+                return await operation(cursor)
+
+        store = DurableReceiptStore(run)
+        await store.append(stopped, failed)
+        await store.append(no_bell, cancelled)
+
+        found = await store.load()
+        assert [(item.sealing_event, item.sealed_at) for item in found] == [
+            ("run_finished", stopped.sealed_at)
+        ]
+        await conn.rollback()

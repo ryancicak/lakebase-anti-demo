@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { cleanup, render, screen, within } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -254,17 +254,184 @@ describe('surviving a restart', () => {
     const fetchMock = stubReceipts([receipt()])
     render(<Summary onBack={() => {}} />)
 
-    await screen.findByText(/1 of 6 rounds have a result/i)
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/1 of 6 rounds have a result/i))
     expect(fetchMock).toHaveBeenCalledWith('/api/receipts', expect.anything())
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/sessions')))
       .toBe(false)
   })
 
+  it('counts an empty record as read, with every round not run yet', async () => {
+    stubReceipts([])
+    render(<Summary onBack={() => {}} />)
+
+    await within(screen.getByRole('status')).findByText('0 of 6 rounds have a result.')
+    const board = screen.getByRole('list', { name: /result for each of the six rounds/i })
+    expect(within(board).getAllByRole('listitem')).toHaveLength(6)
+    expect(within(board).getAllByText('NOT RUN YET')).toHaveLength(6)
+  })
+
+  function expectBoardRows(text: string) {
+    const board = screen.getByRole('list', { name: /result for each of the six rounds/i })
+    const rows = within(board).getAllByRole('listitem')
+    expect(rows).toHaveLength(6)
+    for (const row of rows) {
+      expect(row).toHaveTextContent(text)
+      expect(row).not.toHaveTextContent('NOT RUN YET')
+    }
+  }
+
+  // A failed read is not an empty record.
+  async function expectUnreadBoard() {
+    await within(screen.getByRole('status')).findByText('Record unread · no count until it can be read.')
+    expectBoardRows('RECORD UNREAD')
+    expect(screen.queryByText(/0 of 6 rounds have a result/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/rounds have a result/i)).not.toBeInTheDocument()
+  }
+
   it('says so plainly when the record cannot be read', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down')))
     render(<Summary onBack={() => {}} />)
 
-    expect(await screen.findByRole('status')).toHaveTextContent(/could not be reached/i)
+    const detail = await screen.findByText('The record could not be reached. Select Refresh to try again.')
+    // One live region: the detail is read out as part of the record line.
+    expect(screen.getByRole('status')).toContainElement(detail)
+    expect(document.querySelectorAll('[role="status"], [aria-live]')).toHaveLength(1)
+  })
+
+  it('tells the operator to Refresh after a read that timed out', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubGlobal('fetch', vi.fn().mockImplementation((_url: string, init?: RequestInit) => (
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        })
+      )))
+      render(<Summary onBack={() => {}} />)
+      // The copy says 15 s, so the read must still be pending a millisecond short of that.
+      await act(async () => { await vi.advanceTimersByTimeAsync(14_999) })
+      expect(screen.getByRole('status')).toHaveTextContent('Reading the record…')
+      await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    } finally {
+      vi.useRealTimers()
+    }
+    const status = screen.getByRole('status')
+    await within(status).findByText('The record did not answer within 15 s. Select Refresh to try again.')
+    expect(status).not.toHaveTextContent(/could not be reached|reconnect automatically/i)
+    await expectUnreadBoard()
+  })
+
+  it('never prints NOT RUN YET or a zero count when the read is rejected', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down')))
+    render(<Summary onBack={() => {}} />)
+    await expectUnreadBoard()
+  })
+
+  it('never prints NOT RUN YET or a zero count when the read returns 503', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      statusText: 'Service Unavailable',
+      json: () => Promise.resolve({}),
+    }))
+    render(<Summary onBack={() => {}} />)
+    await expectUnreadBoard()
+    // A server answer keeps its own text; only a lost connection is told to Refresh.
+    expect(screen.getByRole('status')).toHaveTextContent('503 Service Unavailable')
+    expect(screen.getByRole('status')).not.toHaveTextContent(/select refresh to try again/i)
+  })
+
+  it('never prints NOT RUN YET while the record is still being read', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})))
+    render(<Summary onBack={() => {}} />)
+    expect(await screen.findByRole('status')).toHaveTextContent('Reading the record…')
+    expectBoardRows('READING THE RECORD…')
+  })
+
+  it('goes back to reading when Refresh follows a failed read', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error('down'))
+      .mockReturnValueOnce(new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<Summary onBack={() => {}} />)
+    await expectUnreadBoard()
+
+    const status = screen.getByRole('status')
+    await user.click(screen.getByRole('button', { name: /refresh/i }))
+    expect(await screen.findByRole('status')).toHaveTextContent('Reading the record…')
+    expect(screen.getByRole('status')).toBe(status)
+    expect(screen.queryByText(/could not be reached/i)).not.toBeInTheDocument()
+    expectBoardRows('READING THE RECORD…')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps no earlier receipt on the board when Refresh after a good read fails', async () => {
+    let failRefresh = () => {}
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: () => Promise.resolve({ receipts: [receipt()] }),
+      })
+      .mockReturnValueOnce(new Promise((_resolve, reject) => {
+        failRefresh = () => reject(new Error('down'))
+      }))
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<Summary onBack={() => {}} />)
+    await within(screen.getByRole('status')).findByText('1 of 6 rounds have a result.')
+    expect(document.querySelector('[data-round="wake_idle_app"]')).toHaveTextContent('2.40s')
+
+    await user.click(screen.getByRole('button', { name: /refresh/i }))
+    // The earlier answer is not the record any more once Refresh is reading it again.
+    expect(screen.getByRole('status')).toHaveTextContent('Reading the record…')
+    expectBoardRows('READING THE RECORD…')
+    expect(screen.queryByText('2.40s')).not.toBeInTheDocument()
+
+    await act(async () => { failRefresh() })
+    await expectUnreadBoard()
+    expect(screen.queryByText('2.40s')).not.toBeInTheDocument()
+    expect(screen.queryByText('LAKEBASE')).not.toBeInTheDocument()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['fails', 'answers'])('ignores a read that %s after Refresh has replaced it', async (ending) => {
+    let settleFirst = () => {}
+    const fetchMock = vi.fn()
+      .mockReturnValueOnce(new Promise((resolve, reject) => {
+        settleFirst = ending === 'fails'
+          ? () => reject(new Error('down'))
+          : () => resolve({
+            ok: true,
+            status: 200,
+            statusText: 'OK',
+            json: () => Promise.resolve({ receipts: [receipt()] }),
+          })
+      }))
+      .mockReturnValueOnce(new Promise(() => {}))
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<Summary onBack={() => {}} />)
+
+    await user.click(screen.getByRole('button', { name: /refresh/i }))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      settleFirst()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+
+    expect(screen.getByRole('status')).toHaveTextContent('Reading the record…')
+    expectBoardRows('READING THE RECORD…')
+  })
+
+  it('still marks a live round as running when the record is unread', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('down')))
+    render(<Summary live={{ roundId: 'wake_idle_app', running: true }} onBack={() => {}} />)
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent(/record unread/i))
+    const row = document.querySelector('[data-round="wake_idle_app"]')
+    expect(row).toHaveTextContent('RUNNING NOW')
+    expect(row).not.toHaveTextContent('NOT RUN YET')
   })
 })
 
@@ -289,7 +456,7 @@ describe('reading the numbers', () => {
         roundId: 'wake_idle_app', roundNumber: '01', roundTitle: 'T', status,
         opponent: null, opponentId: null, lakebaseMs: null, opponentMs: null, lakebaseIsLowerBound: false,
         opponentIsLowerBound: false, marginMs: null, source: null, boutsOnRecord: 0,
-        stoppedShort: false, sealedAt: null,
+        stoppedShort: false, towelThrown: false, sealedAt: null,
       }))
 
     expect(labels.join(' ')).not.toContain('VERIFIED')
@@ -350,6 +517,30 @@ describe('a towel on the ledger', () => {
     expect(row).toHaveTextContent(/Towel thrown/)
   })
 
+  it('names the towel for a towel whose cleanup did not settle cleanly', async () => {
+    stubReceipts([{ ...towelled, sealing_event: 'towel_update' }])
+    render(<Summary onBack={() => {}} />)
+    await screen.findByText(/of 6 rounds have a result/i)
+    const row = document.querySelector('[data-round="analyze_live_orders_without_slowing_checkout"]')!
+    expect(row).toHaveTextContent('Towel thrown · > marks where an unfinished clock stood.')
+  })
+
+  it('does not claim a towel for a floor nobody threw one for', async () => {
+    // A Round 4 or 6 lane stopped at its bound, a finish past the bound, and a lost
+    // ring all seal a floor on events no towel is involved in.
+    for (const sealing_event of ['session_failed', 'run_finished', 'cleanup_update']) {
+      stubReceipts([{ ...towelled, sealing_event }])
+      const { unmount } = render(<Summary onBack={() => {}} />)
+      await screen.findByText(/of 6 rounds have a result/i)
+      const row = document.querySelector('[data-round="analyze_live_orders_without_slowing_checkout"]')!
+      expect(row, sealing_event).not.toHaveTextContent(/towel/i)
+      expect(row, sealing_event).toHaveTextContent('> marks where an unfinished clock stood.')
+      // The floors themselves are unchanged: still marked, still never a finish time.
+      expect(row.querySelector('.summary-time'), sealing_event).toHaveTextContent('>1.02s')
+      unmount()
+    }
+  })
+
   it('draws both floors on the finale tile, with no proportional fill', () => {
     const bars = finaleLaneBars(roundSix())
     expect(bars.lakebase).toEqual({ share: null, label: '>1.02s', lowerBound: true })
@@ -378,7 +569,7 @@ describe('verdictFor', () => {
       status: 'lakebase_faster', opponent: 'Aurora Serverless v2', opponentId: 'aurora_serverless_v2',
       lakebaseMs: 2860, opponentMs: 41200, lakebaseIsLowerBound: false, opponentIsLowerBound: false,
       marginMs: 38340, source: 'receipt', boutsOnRecord: 1,
-      stoppedShort: false, sealedAt: null, ...over,
+      stoppedShort: false, towelThrown: false, sealedAt: null, ...over,
     }
   }
 
@@ -487,6 +678,12 @@ describe('house rules', () => {
     expect(css).toContain('overflow-x: hidden')
     const wrapping = [...css.matchAll(/overflow-wrap:\s*anywhere/g)]
     expect(wrapping.length).toBeGreaterThanOrEqual(8)
+  })
+
+  it('wraps the failure line by its own class, whatever element carries it', () => {
+    // Not `span.summary-status`: a rule qualified by its element stops applying when the element changes.
+    const status = /(?<![\w-])\.summary-status\s*\{([^}]*)\}/.exec(css)
+    expect(status?.[1]).toMatch(/overflow-wrap:\s*anywhere/)
   })
 })
 

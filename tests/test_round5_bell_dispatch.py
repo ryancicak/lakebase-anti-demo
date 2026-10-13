@@ -1,4 +1,4 @@
-"""Round 5 timed CreateDBProxy dispatch honesty (bell/proxy defect #3).
+"""Round 5 timed CreateDBProxy dispatch honesty.
 
 The single scored mutation of the competitor lane -- CreateDBProxy -- must be
 issued on a DEDICATED worker whose request-boundary timestamp is taken inside the
@@ -45,7 +45,7 @@ def _fake_self() -> SimpleNamespace:
     ns = SimpleNamespace(_monotonic_ns=lambda: next(counter), _createproxy_executor=None)
 
     def _ensure() -> ThreadPoolExecutor:
-        # Req #7: the orchestrator REUSES one worker (warmed before the scored
+        # The orchestrator REUSES one worker (warmed before the scored
         # window), never creating a ThreadPoolExecutor inside it.
         executor = LiveConnectionSpikeSetupOrchestrator._ensure_createproxy_executor(ns)
         if executor not in _EXECUTORS:
@@ -57,7 +57,7 @@ def _fake_self() -> SimpleNamespace:
 
 
 async def test_dispatch_reuses_one_worker_across_calls() -> None:
-    # Req #7: two dispatches must share the same reused executor (no per-call
+    # Two dispatches must share the same reused executor (no per-call
     # ThreadPoolExecutor creation inside the scored window).
     resources = SimpleNamespace(proxy_create_requested_ns=None)
     clients = SimpleNamespace(rds=_RecordingRds())

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -37,6 +38,7 @@ from .lifecycle import (
     reset,
     resume,
     setup,
+    upgrade_coordination_runtime,
 )
 from .manifest import apply_manifest_environment, load_manifest, manifest_path
 from .process_registry import (
@@ -709,6 +711,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Validate the selected Round 1 opponent",
     )
 
+    coordination_upgrade = subparsers.add_parser(
+        "coordination-upgrade",
+        help=(
+            "Create and grant coordination tables for a ready install without "
+            "resetting database lanes"
+        ),
+    )
+    del coordination_upgrade
+
     serve_parser = subparsers.add_parser("serve", help="Run the local orchestrator and UI")
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", default=8000, type=int)
@@ -762,8 +773,10 @@ def _parser() -> argparse.ArgumentParser:
         choices=("stop", "start", "status"),
         help=(
             "stop: end the continuous update and stop the meter. start: resume "
-            "it without a full refresh. status: say which state it is in and "
-            "what that costs per day. None of these touch the synced table."
+            "it, honoring a durable full refresh if a source repair still owes "
+            "one, and wait until that update is healthy. status: say which "
+            "state it is in and what that costs per day. None of these touch "
+            "the synced table."
         ),
     )
 
@@ -897,17 +910,59 @@ def _pipeline_power(action: str) -> int:
         print(f"STOPPED {power.pipeline_id} · {power.summary()}")
         return 0
     with _mutating("antidemo pipeline start"):
-        power = start(manifest, _databricks_api)
-    # Two measurements now stand behind RESTART_SECONDS_ESTIMATE -- 19.2 s and
-    # 25.1 s to a fully healthy continuous sync, taken 2026-08-24 -- and this
-    # still offers scale rather than promising a number. Two samples on one
-    # installation are a scale, not a distribution, and the error that costs
-    # something is the optimistic one: an operator told "19s" who waits two
-    # minutes for a cold start would reasonably conclude the start had failed.
-    # So the estimate stays deliberately above what was observed, the cold case
-    # is still named, and the reading is still where the answer comes from.
+        from .model_score_live import pipeline_signals_are_healthy, read_pipeline_signals
+        from .pipeline_power import (
+            START_WAIT_TIMEOUT_SECONDS,
+            PipelinePowerError,
+            _sealed_pipeline_id,
+            install_cli_pipeline_power_store,
+            rebase_snapshot,
+            wait_and_settle_full_refresh,
+        )
+
+        asyncio.run(install_cli_pipeline_power_store())
+        pipeline_id = _sealed_pipeline_id(manifest)
+        snapshot = asyncio.run(rebase_snapshot(pipeline_id))
+        power = start(
+            manifest,
+            _databricks_api,
+            full_refresh=snapshot.owed,
+            rebase_event_id=snapshot.event_id,
+        )
+        if power.full_refresh:
+
+            async def inspect() -> tuple[str, str, bool]:
+                signals = await read_pipeline_signals(
+                    manifest, _databricks_api, pipeline_id=pipeline_id
+                )
+                return (
+                    signals.update_id,
+                    signals.update_state,
+                    pipeline_signals_are_healthy(signals),
+                )
+
+            try:
+                asyncio.run(
+                    wait_and_settle_full_refresh(
+                        pipeline_id,
+                        power.update_id,
+                        snapshot.event_id,
+                        inspect=inspect,
+                        timeout_seconds=START_WAIT_TIMEOUT_SECONDS,
+                        poll_seconds=3.0,
+                    )
+                )
+            except PipelinePowerError as exc:
+                print(
+                    f"STARTED {power.pipeline_id} · full refresh {power.update_id} "
+                    f"did not stay healthy: {exc}"
+                )
+                return 1
+    refresh_clause = (
+        "full refresh" if power.full_refresh else "without a full refresh"
+    )
     print(
-        f"STARTED {power.pipeline_id} · resuming without a full refresh · roughly "
+        f"STARTED {power.pipeline_id} · resuming {refresh_clause} · roughly "
         f"{RESTART_SECONDS_ESTIMATE}s, and a cold start can take minutes · "
         f"'antidemo pipeline status' says when it reads RUNNING"
     )
@@ -1137,6 +1192,14 @@ def main() -> int:
             )
             for line in deployed_renew_followup(manifest):
                 print(line)
+            return 0
+        if args.command == "coordination-upgrade":
+            with _mutating("antidemo coordination-upgrade"):
+                manifest = upgrade_coordination_runtime(load_manifest())
+            print(
+                f"COORDINATION {manifest.run_id} — tables created/granted; "
+                "next is ./bootstrap.sh --deploy-only if the app needs republishing"
+            )
             return 0
         if args.command == "doctor":
             # Doctor writes no manifest, but it does restore the owned Round 4

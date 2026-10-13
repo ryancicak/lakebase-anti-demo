@@ -144,16 +144,18 @@ function presenceCopy(status: InstallationStatus): BannerCopy | null {
           + `${status.sealed_resources} sealed resources are neither confirmed `
           + 'present nor confirmed gone.',
         instead:
-          'Fix the read, not the infrastructure. Usually a lapsed SSO session:\n'
+          'Fix the read, not the infrastructure. Refresh this installation’s AWS '
+          + 'credentials; for an SSO session that is:\n'
           + '\n'
-          + '    aws sso login --sso-session databricks-sandbox\n'
+          + '    aws sso login\n'
           + '\n'
           + 'This banner answers itself within about 30 seconds of the credentials '
           + 'coming back, with no restart.\n'
           + '\n'
-          + 'One thing to know before reaching for a workaround: a sandbox sweep '
-          + 'deletes the IAM users as well as the databases, so a real reap also '
-          + 'lands here rather than on a confirmed absence. That makes this the '
+          + 'One thing to know before reaching for a workaround: if this account has '
+          + 'automation that deletes idle resources, it deletes the IAM users as well '
+          + 'as the databases, so a real reap also lands here rather than on a '
+          + 'confirmed absence. Where such a sweep exists that makes this the '
           + 'likeliest way a genuine loss shows up — and it still is not proof of '
           + 'one. If the resources really are gone, the first sweep that succeeds '
           + 'will say so and the recovery control will appear.',
@@ -309,6 +311,10 @@ export function InstallationBanner() {
   }, [read, running])
 
   if (readFailure) {
+    // Except to a viewer, who is shown no diagnosis in any state: silence is all
+    // a viewer ever reads here, so it asserts nothing, while a failed poll would
+    // put a yellow "502 Bad Gateway" over the projected screen until the next one.
+    if (status?.audience === 'viewer') return null
     return (
       <aside className="installation-banner" data-tone="blind" role="status">
         <h2>THE INSTALLATION STATUS COULD NOT BE READ</h2>

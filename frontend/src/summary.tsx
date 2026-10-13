@@ -18,27 +18,39 @@ import { ApiError, api } from './api/client'
 import {
   type BoutReceipt,
   type LiveRound,
+  type RecordState,
   type RoundResult,
+  lowerBoundNote,
   roundsWithResult,
   summariseRounds,
   summaryDuration,
+  verdictFor,
   winnerLabel,
 } from './recap'
 import './summary.css'
 
-function RoundRow({ result }: { result: RoundResult }) {
+function RoundRow({ result, record }: { result: RoundResult, record: RecordState }) {
   const lakebase = result.lakebaseMs === null ? null : summaryDuration(result.lakebaseMs)
   const opponent = result.opponentMs === null ? null : summaryDuration(result.opponentMs)
+  // Only a read record permits "not run yet"; a round running here is still known.
+  const unknown = record !== 'read' && result.status === 'unrun'
+  const floorNote = lowerBoundNote(result)
 
   return (
-    <li className="summary-round" data-status={result.status} data-round={result.roundId}>
+    <li
+      className="summary-round"
+      data-status={unknown ? record : result.status}
+      data-round={result.roundId}
+    >
       <div className="summary-round-head">
         <b>{result.roundNumber}</b>
         <strong>{result.roundTitle}</strong>
       </div>
 
       <div className="summary-result">
-        <span className="summary-winner">{winnerLabel(result)}</span>
+        <span className="summary-winner">
+          {unknown ? verdictFor(result, record).outcome : winnerLabel(result)}
+        </span>
         {/* A lane that never finished gets a floor, never a finish time: either lane. */}
         {lakebase && (
           <span className="summary-time">{result.lakebaseIsLowerBound ? '>' : ''}{lakebase}</span>
@@ -53,9 +65,7 @@ function RoundRow({ result }: { result: RoundResult }) {
       {result.status === 'uncontested' && (
         <p className="summary-note">One lane only — a time, not a race.</p>
       )}
-      {(result.lakebaseIsLowerBound || result.opponentIsLowerBound) && (
-        <p className="summary-note">Towel thrown · &gt; marks where an unfinished clock stood.</p>
-      )}
+      {floorNote && <p className="summary-note">{floorNote}</p>}
       {result.boutsOnRecord > 1 && (
         <p className="summary-note">
           Latest of {result.boutsOnRecord} runs.
@@ -87,14 +97,22 @@ export function Summary({ live = null, onBack }: SummaryProps) {
       .catch((cause: unknown) => {
         if (!current) return
         // The board is on disk either way; only this read failed.
-        setFailure(cause instanceof ApiError
-          ? cause.message
-          : 'The rounds you ran could not be read just now.')
-        setReceipts([])
+        // The client's timeout copy promises a reconnect, but this screen reads
+        // again only on Refresh.
+        setFailure(!(cause instanceof ApiError)
+          ? 'The rounds you ran could not be read just now.'
+          : cause.timedOut
+            ? 'The record did not answer within 15 s. Select Refresh to try again.'
+            : cause.status === 0
+              ? 'The record could not be reached. Select Refresh to try again.'
+              : cause.message)
       })
     return () => { current = false }
   }, [attempt])
 
+  const record: RecordState = failure !== null
+    ? 'unread'
+    : receipts === null ? 'reading' : 'read'
   const results = summariseRounds(receipts ?? [], live)
   const withResult = roundsWithResult(results)
 
@@ -103,17 +121,22 @@ export function Summary({ live = null, onBack }: SummaryProps) {
       <header className="summary-header">
         <p>Final bell</p>
         <h1>The rounds you ran</h1>
-        <span>
-          {receipts === null
-            ? 'Reading the record…'
-            : `${withResult} of ${results.length} rounds have a result.`}
-        </span>
+        <div className="summary-record" role="status">
+          <span>
+            {record === 'reading'
+              ? 'Reading the record…'
+              : record === 'unread'
+                ? 'Record unread · no count until it can be read.'
+                : `${withResult} of ${results.length} rounds have a result.`}
+          </span>
+          {failure && <span className="summary-status">{failure}</span>}
+        </div>
       </header>
 
-      {failure && <p className="summary-status" role="status">{failure}</p>}
-
       <ol className="summary-rounds" aria-label="Result for each of the six rounds">
-        {results.map((result) => <RoundRow key={result.roundId} result={result} />)}
+        {results.map((result) => (
+          <RoundRow key={result.roundId} result={result} record={record} />
+        ))}
       </ol>
 
       <footer className="summary-footer">
@@ -126,7 +149,11 @@ export function Summary({ live = null, onBack }: SummaryProps) {
           <button
             type="button"
             className="finale-summary"
-            onClick={() => setAttempt((count) => count + 1)}
+            onClick={() => {
+              setReceipts(null)
+              setFailure(null)
+              setAttempt((count) => count + 1)
+            }}
           >
             Select · Refresh
           </button>

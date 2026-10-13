@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Render, create and attach the three required operator policies from docs/iam/.
+# Render, create and attach the five required operator policies from docs/iam/
+# (files 1, 2, 3, 5 and 6), plus the remote-state one when --state-bucket is given.
 #
 # `bootstrap.sh` cannot do this itself: creating and attaching IAM policies needs
 # iam:CreatePolicy and iam:AttachUserPolicy, which is strictly more privilege than

@@ -21,6 +21,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any, cast
 
+import psycopg
 import pytest
 
 # Reuse the in-file coordinator/store/provider harness from the warm-slot suite.
@@ -135,7 +136,7 @@ def test_each_identity_field_mismatch_is_terminal(override: dict[str, object]) -
 
 
 def test_empty_describe_is_unresolved_bounded_then_terminal() -> None:
-    # Req #4: a describe that returned no matching row collapses every field to "".
+    # A describe that returned no matching row collapses every field to "".
     # It is classified as UNRESOLVED -- retried boundedly under eventual
     # consistency, but escalating to a TERMINAL block if it persists (an unfindable
     # source needs an operator), never a self-verifiable recheck forever.
@@ -157,7 +158,7 @@ def test_empty_describe_is_unresolved_bounded_then_terminal() -> None:
 
 
 def test_present_but_busy_source_is_unavailable_not_unresolved() -> None:
-    # Req #4: a present-but-non-available source (identity intact) stays the
+    # A present-but-non-available source (identity intact) stays the
     # self-verifiable "unavailable" taxonomy, NOT the terminal-escalating
     # "unresolved" one -- a busy DB recovers on its own.
     with pytest.raises(ConnectionSpikeLiveSourceUnavailableError) as raised:
@@ -166,7 +167,7 @@ def test_present_but_busy_source_is_unavailable_not_unresolved() -> None:
 
 
 def test_unresolved_persistent_escalation_is_terminal_not_self_verifiable() -> None:
-    # Req #4: the persistent unresolved block is TERMINAL (operator attention),
+    # The persistent unresolved block is TERMINAL (operator attention),
     # unlike the self-verifiable persistent unavailable (busy DB) block, so an
     # unfindable source does not recheck forever.
     assert "warm_source_unresolved_persistent" not in SELF_VERIFIABLE_BLOCK_CODES
@@ -227,7 +228,7 @@ async def test_prepare_maps_source_unavailable_to_retryable_taxonomy() -> None:
 
 
 async def test_prepare_maps_source_unresolved_to_distinct_retryable_code() -> None:
-    # Req #4: an empty/unresolved describe maps to its OWN retryable code, whose
+    # An empty/unresolved describe maps to its OWN retryable code, whose
     # persistent escalation is terminal (not the self-verifiable unavailable one).
     with pytest.raises(RetryableWarmError) as raised:
         await _prepare_with(
@@ -256,19 +257,54 @@ async def test_prepare_fails_closed_on_unexpected_error() -> None:
     assert raised.value.code == "warm_baseline_unexpected"
 
 
+async def test_prepare_warnings_name_the_cause_without_quoting_driver_text(caplog) -> None:
+    # A psycopg connection failure names the Lakebase host and the role it logged in
+    # as. The warning keeps the type, and quotes only this server's own messages.
+    host = "instance-0000.database.example.invalid"
+    role = "round5-warm-role"
+    driver = psycopg.OperationalError(
+        f'connection failed: connection to server at "{host}", port 5432 failed: '
+        f'FATAL:  password authentication failed for user "{role}"'
+    )
+    with caplog.at_level("WARNING", logger="server.connection_spike_live"):
+        with pytest.raises(RetryableWarmError) as retried:
+            await _prepare_with(driver)
+        with pytest.raises(BlockedWarmError):
+            await _prepare_with(ValueError(f"unexpected reply from {host} as {role}"))
+        with pytest.raises(BlockedWarmError):
+            await _prepare_with(
+                ConnectionSpikeLiveConfigurationError("Round 5 warm source identity changed")
+            )
+    assert retried.value.code == "warm_provider_retryable"
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "round5_warm_provider_retryable generation=8 diagnosis=OperationalError" in logged
+    assert "round5_warm_baseline_unexpected generation=8 diagnosis=ValueError" in logged
+    assert "Round 5 warm source identity changed" in logged
+    assert host not in logged
+    assert role not in logged
+
+
 @pytest.mark.parametrize(
-    "message",
+    ("message", "cause"),
     [
-        "Round 5 runner omitted cleanup or flock-release evidence",
-        "Round 5 runner cancellation did not confirm cleanup and flock release within 45s",
+        ("Round 5 runner omitted cleanup or flock-release evidence", None),
+        # Raised from the TimeoutError that ended the settlement wait.
+        (
+            "Round 5 runner cancellation did not confirm cleanup and flock release within 45s",
+            TimeoutError(),
+        ),
     ],
 )
-async def test_prepare_maps_unconfirmed_runner_settlement_to_retryable(message: str) -> None:
+async def test_prepare_maps_unconfirmed_runner_settlement_to_retryable(
+    message: str, cause: BaseException | None
+) -> None:
     # Release run rc7, 2026-10-01 08:39:57Z: setup's idle re-run reconfigured both
     # runners mid-warm, the job died without printing its cleanup evidence, and the
     # fail-closed fallthrough latched Round 5 for an operator.
+    error = ConnectionSpikeCleanupError(message)
+    error.__cause__ = cause
     with pytest.raises(RetryableWarmError) as raised:
-        await _prepare_with(ConnectionSpikeCleanupError(message))
+        await _prepare_with(error)
     assert raised.value.code == "warm_runner_settlement_unconfirmed"
 
 

@@ -268,7 +268,8 @@ class DmsCaptureTask:
                     if _error_code(error) != "InvalidResourceStateFault":
                         raise
                 stop_sent = True
-                say(f"Stopping the DMS task {self.task_arn}")
+                # On the card: the ARN carries the account, so the task is not named.
+                say("Stopping the DMS task")
             if self._clock() >= deadline:
                 raise DmsLaneError(
                     f"The DMS task {self.task_arn} did not stop within "

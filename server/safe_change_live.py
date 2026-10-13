@@ -136,6 +136,10 @@ class DatabricksRunner(Protocol):
         timeout_seconds: float,
     ) -> None: ...
 
+    async def settle_pending_requests(self, timeout_seconds: float) -> None:
+        """Return once no mutation sent here can still land; raise past the bound."""
+        ...
+
 
 def _control_plane_failure(error: DatabricksError) -> ControlPlaneCommandError:
     """Classify a control-plane refusal without repeating what it said.
@@ -222,6 +226,24 @@ def _is_create(method: str, path: str) -> bool:
     return method == "POST" and re.search(r"[?&](branch|endpoint)_id=", path) is not None
 
 
+def _log_abandoned_failure(request_line: str, error: BaseException) -> None:
+    # Nobody is awaiting this answer any more, so this is its only record.
+    LOGGER.warning(
+        "Databricks control-plane mutation %s failed after its caller gave up: %s %s",
+        request_line,
+        getattr(error, "error_code", "") or type(error).__name__,
+        error,
+    )
+
+
+def _changes_artifacts(method: str, path: str) -> bool:
+    """A request that can create, change or delete a Lakebase resource.
+
+    Minting a credential is a POST that changes nothing a reset inspects."""
+
+    return method != "GET" and not path.split("?", 1)[0].endswith("/credentials")
+
+
 class DatabricksRestRunner:
     """The Lakebase control plane over the SDK that is actually installed.
 
@@ -250,6 +272,9 @@ class DatabricksRestRunner:
         self._api: Callable[..., dict[str, Any]] | None = None
         self._lock = asyncio.Lock()
         self._sleep = sleep
+        self._mutations_in_flight: set[asyncio.Future[Any]] = set()
+        # Unfinished mutations whose caller gave up, with their request line.
+        self._abandoned_mutations: dict[asyncio.Future[Any], str] = {}
 
     def _build_workspace(self) -> Any:
         from databricks.sdk import WorkspaceClient
@@ -324,8 +349,25 @@ class DatabricksRestRunner:
                 # than the killed subprocess it replaces, because every mutation
                 # below is an asynchronous control-plane operation whose outcome
                 # the adapter proves by polling the resource rather than by the
-                # request returning.
-                result = await asyncio.to_thread(api, self._profile, method, path, body=payload)
+                # request returning. A mutation's thread is tracked so that
+                # `settle_pending_requests` can wait it out.
+                request = asyncio.ensure_future(
+                    asyncio.to_thread(api, self._profile, method, path, body=payload)
+                )
+                mutation = _changes_artifacts(method, path)
+                if mutation:
+                    self._mutations_in_flight.add(request)
+                request.add_done_callback(self._request_done)
+                try:
+                    # `wait`, not `shield`: either leaves the thread's future running
+                    # when this caller is cancelled, but `shield` then reports its
+                    # failure as unhandled, while `_request_done` is its handler.
+                    await asyncio.wait({request})
+                except BaseException:
+                    if mutation:
+                        self._abandon(request, f"{method} {path}")
+                    raise
+                result = request.result()
         except TimeoutError as exc:
             raise ControlPlaneCommandError(
                 "Databricks control-plane request timed out"
@@ -349,6 +391,42 @@ class DatabricksRestRunner:
                 "Databricks control-plane request returned an unexpected JSON shape"
             )
         return result
+
+    def _abandon(self, request: asyncio.Future[Any], request_line: str) -> None:
+        """Record that nobody will read this mutation's answer.
+
+        Its failure is logged once: by `_request_done` if it is still running, or
+        here if it finished before this caller's cancel was delivered.
+        """
+
+        if not request.done():
+            self._abandoned_mutations[request] = request_line
+        elif not request.cancelled() and (error := request.exception()) is not None:
+            _log_abandoned_failure(request_line, error)
+
+    def _request_done(self, request: asyncio.Future[Any]) -> None:
+        self._mutations_in_flight.discard(request)
+        request_line = self._abandoned_mutations.pop(request, None)
+        if request.cancelled():
+            return
+        # Retrieved for every request, so an abandoned read's failure is not unhandled.
+        error = request.exception()
+        if error is not None and request_line is not None:
+            _log_abandoned_failure(request_line, error)
+
+    async def settle_pending_requests(self, timeout_seconds: float) -> None:
+        """Wait until no mutation this runner sent is still running in its thread."""
+
+        pending = [request for request in self._mutations_in_flight if not request.done()]
+        if not pending:
+            return
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.wait(pending)
+        except TimeoutError as exc:
+            raise ControlPlaneCommandError(
+                "A Lakebase control-plane mutation is still in flight"
+            ) from exc
 
     async def json(
         self,
@@ -678,6 +756,78 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
         self._sleep = sleep
         self._clock = clock
         self._project, self._source_branch, _ = _lakebase_endpoint_parts(self.source_id)
+        # Owned branches a DELETE was sent for and whose absence is not yet confirmed,
+        # with each one's presence probe and failure text.
+        self._deletes_awaiting_absence: dict[
+            str, tuple[Callable[[], Awaitable[bool]], str]
+        ] = {}
+
+    async def settle_pending_mutations(self) -> None:
+        """Wait out control-plane mutations whose caller stopped waiting for them.
+
+        A DELETE is accepted before the branch goes, so a delete whose caller was
+        cancelled before absence was confirmed is waited out to absence here.
+        """
+
+        unsettled = "A Lakebase control-plane mutation is still in flight"
+        try:
+            async with asyncio.timeout(self.config.control_timeout_seconds):
+                await self._runner.settle_pending_requests(self.config.control_timeout_seconds)
+                unsettled = "Lakebase branch deletion is still unconfirmed"
+                for branch_name, (still_present, still_exists) in list(
+                    self._deletes_awaiting_absence.items()
+                ):
+                    await self._await_branch_gone(branch_name, still_present, still_exists)
+        except TimeoutError as exc:
+            raise SafeChangeControlPlaneError(
+                f"{unsettled}; cleanup cannot report success"
+            ) from exc
+
+    async def _send_branch_delete(
+        self,
+        branch_name: str,
+        still_present: Callable[[], Awaitable[bool]],
+        still_exists: str,
+    ) -> None:
+        """Send an owned branch's DELETE, recorded for settle until absence is proved.
+
+        Recorded before it goes out, so a cancel or timeout at any point leaves it to
+        settle. Only a 404 proves the branch is already gone across both this runner's
+        retries and retries hidden inside the SDK. Every other answer may follow an
+        earlier DELETE whose response was lost and whose mutation can still land.
+        """
+
+        self._deletes_awaiting_absence[branch_name] = (still_present, still_exists)
+        try:
+            await self._runner.run(
+                "DELETE",
+                lakebase_resource_path(branch_name),
+                timeout_seconds=self.config.control_timeout_seconds,
+            )
+        except ControlPlaneCommandError as exc:
+            if isinstance(exc.__cause__, NotFound):
+                self._deletes_awaiting_absence.pop(branch_name, None)
+            raise
+
+    async def _await_branch_gone(
+        self,
+        branch_name: str,
+        still_present: Callable[[], Awaitable[bool]],
+        still_exists: str,
+    ) -> None:
+        """Wait for an owned branch's DELETE to land, recorded until absence is confirmed."""
+
+        self._deletes_awaiting_absence[branch_name] = (still_present, still_exists)
+        await wait_lakebase_branch_gone(
+            self._runner,
+            branch_name,
+            still_present,
+            clock=self._clock,
+            sleep=self._sleep,
+            config=self.config,
+            still_exists=still_exists,
+        )
+        self._deletes_awaiting_absence.pop(branch_name, None)
 
     def _assert_plan(self, plan: SafeChangePlan) -> None:
         if plan.provider != self.provider or plan.source_id != self.source_id:
@@ -1044,28 +1194,17 @@ class LakebaseSafeChangeAdapter(SafeChangeAdapter):
             return
         self._assert_owned_artifact(plan, current)
         branch_name = f"{self._project}/branches/{plan.artifact_id}"
-        await self._runner.run(
-            "DELETE",
-            lakebase_resource_path(branch_name),
-            timeout_seconds=self.config.control_timeout_seconds,
-        )
-        await report(
-            "Waiting for the owned Lakebase branch deletion",
-            f"GET {LAKEBASE_API_ROOT}/<branch>",
-        )
 
         async def still_present() -> bool:
             return await self.inspect_artifact(plan) is not None
 
-        await wait_lakebase_branch_gone(
-            self._runner,
-            branch_name,
-            still_present,
-            clock=self._clock,
-            sleep=self._sleep,
-            config=self.config,
-            still_exists="Lakebase isolated branch still exists after deletion",
+        still_exists = "Lakebase isolated branch still exists after deletion"
+        await self._send_branch_delete(branch_name, still_present, still_exists)
+        await report(
+            "Waiting for the owned Lakebase branch deletion",
+            f"GET {LAKEBASE_API_ROOT}/<branch>",
         )
+        await self._await_branch_gone(branch_name, still_present, still_exists)
 
     async def abandon_isolated(self, plan: SafeChangePlan) -> None:
         """Issue branch deletion for a cancelled lane without waiting for it.

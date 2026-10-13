@@ -299,11 +299,18 @@ but it is not what "run the installer again" sounds like.
 A complete seal is manifest v6 or newer with Round 6 present. There the reset is
 not a no-op: both database lanes are reseeded and the Round 3 anchors are cleared,
 so a bout in progress dies and every Round 3 recovery point taken since the last
-reset is gone. The refusal names the two ways forward:
+reset is gone. The refusal names the ways forward: upgrade and redeploy, or an
+explicit reset. [Upgrading from v1.1.1](DEPLOY.md#upgrading-from-v111) has the
+whole upgrade sequence.
 
-- `./bootstrap.sh --deploy-only` — republish the seal and redeploy the app. No
-  database is touched and no Terraform runs. This is the redeploy path for a
-  complete ready install.
+- `./antidemo coordination-upgrade` — create and grant coordination tables
+  (including `round4_source_rebase`) as the schema owner. This does **not**
+  reset database lanes, reseed Round 3 anchors, or run Terraform. A ready
+  install whose app cannot boot after this checkout added coordination objects
+  needs this step before deploy.
+- `./bootstrap.sh --deploy-only` — then republish the seal and redeploy the app.
+  No database is touched and no Terraform runs. Do not use this alone if the
+  checkout added coordination tables the app now requires at boot.
 - `./bootstrap.sh --apply --reset-ready` — the explicit opt-in, for an `infra/aws`
   diff to apply or lanes to return to a known state.
 
@@ -519,19 +526,20 @@ mirror of PyPI, so the two-step above applies verbatim.
 ## Deploying as a Databricks App
 
 `bootstrap.sh --deploy-only` publishes the seal and deploys the app, and
-`--apply --deploy-app` does it in the same run; **[docs/DEPLOY.md](DEPLOY.md) is
-the reference for both** and supersedes anything below that disagrees with it.
-The manual sequence is kept here because it is what the automation performs, and
-because knowing it is what makes a failed deploy debuggable:
+`--apply --deploy-app` does deploy in the same provision run;
+**[docs/DEPLOY.md](DEPLOY.md) is the reference** and supersedes anything below
+that disagrees with it. An existing install upgrading to a release that adds
+coordination tables runs `./antidemo coordination-upgrade` first, which creates
+and grants them without resetting lanes; see
+[Upgrading from v1.1.1](DEPLOY.md#upgrading-from-v111).
 
 When a change touches any file under the Round 5 runner contract, refresh that
 sealed runner before deploying the app:
 
 ```bash
+export ANTI_DEMO_MANIFEST="$PWD/$(ls -d .anti-demo-v*/ | sort -V | tail -1)manifest.json"
 ./antidemo runner refresh
-env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE \
-  ANTI_DEMO_MANIFEST="$PWD/.anti-demo-v10/manifest.json" \
-  ./bootstrap.sh --deploy-only --yes
+env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE ./bootstrap.sh --deploy-only --yes
 ```
 
 `runner refresh` holds the generation lock and both Round 5 rings, verifies the
@@ -606,9 +614,10 @@ supported configuration: it is how you run `--deploy-only` without republishing
 whatever AWS credential your shell happens to be carrying.
 
 Only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
-`AWS_REGION` and `AWS_DEFAULT_REGION` are carried. Everything else in the file
-is the manifest's business at run time; a launcher that also exported
-`ANTI_DEMO_MANIFEST` could silently point a serve at another generation.
+`AWS_REGION`, `AWS_DEFAULT_REGION` and `ANTI_DEMO_OPERATOR_IP` are carried.
+Everything else in the file is the manifest's business at run time; a launcher
+that also exported `ANTI_DEMO_MANIFEST` could silently point a serve at another
+generation.
 
 Set `ANTI_DEMO_ENV_FILE` to read from somewhere other than `.env.bootstrap` in
 the repository root. Like `bootstrap.sh --env-file`, `./antidemo` reads exactly
@@ -740,38 +749,42 @@ unverified.
 
 ## The databases are reachable from the internet
 
-Every database this installs is created with a public endpoint. All four Aurora
-Serverless v2 writers and all three RDS PostgreSQL instances set
-`publicly_accessible = true` — `infra/aws/aurora.tf:45` and `:97`,
-`infra/aws/rds.tf:28` and `:70` — so each one has a public DNS name and a public
-IPv4 address, and each of those addresses is separately billable. That is a
-design decision, not a default that slipped through, and it is stated here
-because a stranger cloning this repository provisions it in their own account.
+Every database this installs is created with a public endpoint. All six Aurora
+Serverless v2 writers and all five RDS PostgreSQL instances set
+`publicly_accessible = true` — `infra/aws/aurora.tf:117` and
+`infra/aws/rds.tf:78`, and `aurora.tf:49` and `rds.tf:28` on a legacy install —
+so each one has a public DNS name and a public IPv4 address, and each of those
+addresses is separately billable. That is a design decision, not a default that
+slipped through, and it is stated here because a stranger cloning this
+repository provisions it in their own account.
 
 ### What actually restricts access
 
-One security group per database — on a current install that is four Aurora and
-three RDS, from the `for_each` blocks `aurora_by_round` and `rds_by_round` in
+One security group per database — on a current install that is six Aurora and
+five RDS, from the `for_each` blocks `aurora_by_round` and `rds_by_round` in
 `infra/aws/network.tf`, plus two `count`-gated blocks that only exist on a legacy
 single-pair install. All four blocks are the same shape, and the whole inbound
 surface is TCP 5432:
 
 | Rule | Source | Where in `network.tf` |
 |---|---|---|
-| PostgreSQL 5432 | `var.operator_cidr` — your public `/32` | `251-257` and `302-308` (legacy: `99-105`, `151-157`) |
+| PostgreSQL 5432 | `var.operator_cidr` — your public `/32` | `482-488` and `565-571` (legacy: `101-107`, `157-163`) |
 | PostgreSQL 5432 | `var.serverless_egress_cidrs` — the Databricks-published serverless egress prefixes, when sealed | the same blocks, admitted by `concat()` on the one `cidr_blocks` list |
-| PostgreSQL 5432 | security-group *reference* to the Round 5 runner, Round 5 only | `259-268` and `310-319` (legacy: `107-113`, `159-165`) |
+| PostgreSQL 5432 | security-group *references* to the Round 5 competitor runner and the Round 5 Proxy, Round 5 only | `490-502` and `573-585` (legacy: `109-118`, `165-174`) |
+| PostgreSQL 5432 | security-group *reference* to the Round 4 AWS Glue writer, Round 4 only, when its AWS lane is built | `506-515` and `587-596` |
+| PostgreSQL 5432 | security-group *reference* to the Round 6 AWS DMS instance, Round 6 only, when its AWS lane is built | `518-527` and `598-607` |
 
 There is no other port, no other protocol, and **no `0.0.0.0/0` inbound rule
-anywhere**. Egress is open (`-1` to `0.0.0.0/0`, e.g. `network.tf:270-276`),
-which is what carries stateful responses and AWS service traffic. The runner's
-own group has **no ingress rules at all** (`network.tf:185-192`) — it is
-outbound-only, and it reaches the databases by being named as a source in theirs.
+anywhere**. Egress is open (`-1` to `0.0.0.0/0`, e.g. `network.tf:529-535`),
+which is what carries stateful responses and AWS service traffic. The runners'
+own groups have **no ingress rules at all** (`round5_runner` and
+`round5_competitor_runner` in `network.tf`) — they are outbound-only, and they
+reach the databases by being named as a source in theirs.
 
 Two constraints are enforced rather than advised. `operator_cidr` must be an
-explicit `/32` — `variables.tf:71-82` rejects every other netmask — and
+explicit `/32` — `variables.tf:90-96` rejects every other netmask — and
 `serverless_egress_cidrs` must be distinct `/24`-or-narrower prefixes, with
-`variables.tf:90-96` refusing a `/16` in front of a live database in the same
+`variables.tf:105-110` refusing a `/16` in front of a live database in the same
 words `server/manifest.py` does. The ingress blocks are **inline** on purpose: an
 inline `ingress` makes Terraform authoritative over the group's entire rule set,
 so a rule added by hand or by another tool is revoked on the next apply. Moving
@@ -851,11 +864,11 @@ Two commands name it, both read-only:
 ./antidemo doctor               # 'operator_cidr' line, probes directly
 ```
 
-`/readyz` is the third surface and the one a monitor would watch. The detector it
-needs is in place (`server.lifecycle.operator_ingress_drift_async`, which folds
-into the existing `degraded` / `degraded_detail` / `degraded_capabilities`
-vocabulary), but the `app.py` wiring has not landed — that file was held by
-another change. Until it does, `/readyz` says nothing about ingress.
+`/readyz` is the third surface and the one a monitor would watch. It runs the
+same cached detector (`server.lifecycle.operator_ingress_drift_async`) and folds
+drift into the existing `degraded` / `degraded_detail` / `degraded_capabilities`
+vocabulary: the status reads `degraded`, never `not_ready`, because only the
+rounds that connect straight to Aurora or RDS are lost.
 
 The fix is `./antidemo setup`, which re-detects the address, rewrites the manifest
 and re-applies the security groups. It is the only thing that performs the

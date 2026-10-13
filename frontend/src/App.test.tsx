@@ -3,7 +3,8 @@ import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
-import App from './App'
+import { StrictMode } from 'react'
+import App, { BetweenRounds, Finale } from './App'
 import { ApiError, api } from './api/client'
 import { APP_VERSION_LABEL } from './version'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
@@ -1918,6 +1919,1009 @@ describe('backstage setup', () => {
     expect(screen.getByText('Doctor Drift says:').parentElement).not.toHaveTextContent(/model output become usable by the application/i)
   })
 
+  describe('Back while Prepare is still working (AF-4a, AF-4b, AF-4c)', () => {
+    async function reachCard(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(screen.getByRole('button', { name: /press start/i }))
+      await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+      await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+      await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+      return screen.findByRole('button', { name: /prepare fight card/i })
+    }
+
+    function stubPrepare(create?: Promise<ReturnType<typeof jsonResponse>>) {
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return create ?? Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const calls = (pattern: (url: string, init?: RequestInit) => boolean) => (
+        fetchMock.mock.calls.filter(([url, init]) => pattern(String(url), init))
+      )
+      return {
+        creates: () => calls((url, init) => url === '/api/sessions' && init?.method === 'POST'),
+        arms: () => calls((url) => url.endsWith('/arm')),
+      }
+    }
+
+    function stubBetween(create?: Promise<unknown>) {
+      const startedAt = '2026-08-17T00:00:00Z'
+      const finished: DemoSession = {
+        ...session('verified'),
+        id: 'finished-1',
+        remembered_result: 'LAKEBASE WINS BY 0.45s',
+        cooldown: {
+          mode: 'return_to_idle',
+          state: 'ready',
+          started_at: startedAt,
+          failure: null,
+          lanes: {
+            lakebase: {
+              id: 'lakebase', name: 'Lakebase', state: 'confirmed_zero',
+              started_at: startedAt, confirmed_at: startedAt, elapsed_ms: 1_000,
+              status: 'Control plane confirmed zero',
+            },
+            competitor: {
+              id: 'competitor', name: 'Aurora Serverless v2', state: 'confirmed_zero',
+              started_at: startedAt, confirmed_at: startedAt, elapsed_ms: 1_000,
+              status: 'Control plane confirmed zero',
+            },
+          },
+        },
+      }
+      window.sessionStorage.setItem('lakebase-anti-demo:active-session:v1', JSON.stringify({
+        id: finished.id, stage: 'between', resumeStage: 'between',
+      }))
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === `/api/sessions/${finished.id}`) return Promise.resolve(jsonResponse(finished))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return create ?? Promise.resolve(jsonResponse({ ...session('draft'), id: 'again-1' }))
+        }
+        if (input.endsWith('/arm')) {
+          return Promise.resolve(jsonResponse({ ...session('armed'), id: 'again-1' }))
+        }
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      return fetchMock
+    }
+
+    function holdNextBoardRead() {
+      const board = deferred<AllBoutStatus>()
+      let hold = false
+      vi.mocked(api.allBoutStatuses).mockImplementation(() => (
+        hold ? board.promise : Promise.resolve(allReadyBoutBoard())
+      ))
+      return {
+        arm: () => { hold = true },
+        stop: () => { hold = false },
+        release: () => board.resolve(allReadyBoutBoard()),
+      }
+    }
+
+    async function settle() {
+      for (let step = 0; step < 5; step += 1) {
+        await act(async () => { await Promise.resolve() })
+      }
+    }
+
+    it('browser Back during the click-time board read cancels Prepare (FE-4a)', async () => {
+      const requests = stubPrepare()
+      const board = holdNextBoardRead()
+      const user = userEvent.setup()
+      render(<App />)
+      const prepare = await reachCard(user)
+      board.arm()
+      await user.click(prepare)
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/lenses'))
+      board.release()
+      await settle()
+      expect(requests.creates()).toHaveLength(0)
+      expect(requests.arms()).toHaveLength(0)
+      expect(window.location.hash).toBe('#setup/lenses')
+      expect(screen.queryByRole('button', { name: /ring the bell/i })).not.toBeInTheDocument()
+    })
+
+    it('in-app Back during the click-time board read cancels Prepare (FE-4b1)', async () => {
+      const requests = stubPrepare()
+      const board = holdNextBoardRead()
+      const user = userEvent.setup()
+      render(<App />)
+      const prepare = await reachCard(user)
+      board.arm()
+      await user.click(prepare)
+      await user.click(screen.getByRole('button', { name: /^B · Back$/ }))
+      board.release()
+      await settle()
+      expect(requests.creates()).toHaveLength(0)
+      expect(requests.arms()).toHaveLength(0)
+      expect(window.location.hash).toBe('#setup/lenses')
+      expect(screen.queryByRole('button', { name: /ring the bell/i })).not.toBeInTheDocument()
+    })
+
+    it('in-app Back while the session is being created never arms it (FE-4b2)', async () => {
+      const create = deferred<ReturnType<typeof jsonResponse>>()
+      const requests = stubPrepare(create.promise)
+      const user = userEvent.setup()
+      render(<App />)
+      await user.click(await reachCard(user))
+      await waitFor(() => expect(requests.creates()).toHaveLength(1))
+      await user.click(screen.getByRole('button', { name: /^B · Back$/ }))
+      create.resolve(jsonResponse(session('draft')))
+      await settle()
+      expect(requests.arms()).toHaveLength(0)
+      expect(window.location.hash).toBe('#setup/lenses')
+      expect(screen.queryByRole('button', { name: /ring the bell/i })).not.toBeInTheDocument()
+    })
+
+    it('browser Back while the session is being created stays where Back went (FE-4c)', async () => {
+      const create = deferred<ReturnType<typeof jsonResponse>>()
+      const requests = stubPrepare(create.promise)
+      const user = userEvent.setup()
+      render(<App />)
+      await user.click(await reachCard(user))
+      await waitFor(() => expect(requests.creates()).toHaveLength(1))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/lenses'))
+      create.resolve(jsonResponse(session('draft')))
+      await settle()
+      expect(requests.arms()).toHaveLength(0)
+      expect(window.location.hash).toBe('#setup/lenses')
+    })
+
+    it('Prepare after Back then Forward runs while the abandoned read is still out', async () => {
+      const requests = stubPrepare()
+      const board = holdNextBoardRead()
+      const user = userEvent.setup()
+      render(<App />)
+      const prepare = await reachCard(user)
+      board.arm()
+      await user.click(prepare)
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/lenses'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      board.stop()
+      await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(requests.creates()).toHaveLength(1)
+      board.release()
+      await settle()
+      expect(requests.creates()).toHaveLength(1)
+      expect(requests.arms()).toHaveLength(1)
+    })
+
+    it('a second click while Prepare is still working creates nothing more', async () => {
+      const requests = stubPrepare()
+      const board = holdNextBoardRead()
+      const user = userEvent.setup()
+      render(<App />)
+      const prepare = await reachCard(user)
+      board.arm()
+      await user.click(prepare)
+      fireEvent.click(prepare)
+      board.release()
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      await settle()
+      expect(requests.creates()).toHaveLength(1)
+    })
+
+    it('a second click while the session is being created creates nothing more', async () => {
+      const create = deferred<ReturnType<typeof jsonResponse>>()
+      const requests = stubPrepare(create.promise)
+      const user = userEvent.setup()
+      render(<App />)
+      const prepare = await reachCard(user)
+      fireEvent.click(prepare)
+      await waitFor(() => expect(requests.creates()).toHaveLength(1))
+      fireEvent.click(prepare)
+      await settle()
+      expect(requests.creates()).toHaveLength(1)
+      create.resolve(jsonResponse(session('draft')))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(requests.creates()).toHaveLength(1)
+    })
+
+    async function abandonFirstArmThenPrepareAgain(
+      firstArm: Promise<unknown>,
+      firstRead?: Promise<unknown>,
+    ) {
+      let creates = 0
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          creates += 1
+          return Promise.resolve(jsonResponse({ ...session('draft'), id: `session-${creates}` }))
+        }
+        if (input === '/api/sessions/session-1/arm') return firstArm
+        if (input === '/api/sessions/session-1' && firstRead) return firstRead
+        if (input === '/api/sessions/session-2/arm') {
+          return Promise.resolve(jsonResponse({ ...session('armed'), id: 'session-2' }))
+        }
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        '/api/sessions/session-1/arm',
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(activeSessionId()).toBe('session-2')
+    }
+
+    function activeSessionId() {
+      const pointer = window.sessionStorage.getItem('lakebase-anti-demo:active-session:v1')
+      return pointer === null ? null : JSON.parse(pointer).id
+    }
+
+    it('an abandoned Prepare whose arm answers late leaves the newer card alone', async () => {
+      const firstArm = deferred<ReturnType<typeof jsonResponse>>()
+      await abandonFirstArmThenPrepareAgain(firstArm.promise)
+      firstArm.resolve(jsonResponse({ ...session('armed'), id: 'session-1' }))
+      await settle()
+      expect(activeSessionId()).toBe('session-2')
+      expect(screen.getByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('an abandoned Prepare refused late as Round 5 leaves the newer card alone', async () => {
+      const firstArm = deferred<unknown>()
+      await abandonFirstArmThenPrepareAgain(firstArm.promise)
+      firstArm.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await settle()
+      expect(activeSessionId()).toBe('session-2')
+      expect(screen.getByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('a create refused late as Round 5 after Prepare again leaves the newer card alone', async () => {
+      const firstCreate = deferred<unknown>()
+      let creates = 0
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          creates += 1
+          return creates === 1
+            ? firstCreate.promise
+            : Promise.resolve(jsonResponse({ ...session('draft'), id: 'session-2' }))
+        }
+        if (input === '/api/sessions/session-2/arm') {
+          return Promise.resolve(jsonResponse({ ...session('armed'), id: 'session-2' }))
+        }
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(creates).toBe(1))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).not.toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(activeSessionId()).toBe('session-2')
+      firstCreate.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await settle()
+      expect(activeSessionId()).toBe('session-2')
+      expect(screen.getByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('a stale lost-arm read does not erase the armed snapshot the stream delivered', async () => {
+      const read = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return Promise.reject(new TypeError('connection reset'))
+        if (input === `/api/sessions/${session('draft').id}`) return read.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        `/api/sessions/${session('draft').id}`,
+        expect.anything(),
+      ))
+      const armed = { ...session('armed'), updated_at: '2099-01-01T00:00:02Z' }
+      act(() => FakeEventSource.instances.at(-1)!.emit({
+        sequence: 1,
+        event: 'armed',
+        occurred_at: armed.updated_at,
+        payload: { state: 'armed', evidence: {}, session: armed },
+      }))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      read.resolve(jsonResponse(session('draft')))
+      await settle()
+      expect(window.location.hash).toBe('#ready')
+      expect(screen.getByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('an abandoned Round 5 refusal reports nothing on the newer card', async () => {
+      const board = deferred<ReturnType<typeof allReadyBoutBoard>>()
+      let holdNextBoard = false
+      let boardHeld = false
+      vi.mocked(api.allBoutStatuses).mockImplementation(() => {
+        if (!holdNextBoard) return Promise.resolve(allReadyBoutBoard())
+        holdNextBoard = false
+        boardHeld = true
+        return board.promise
+      })
+      let creates = 0
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          creates += 1
+          return Promise.resolve(jsonResponse({ ...session('draft'), id: `session-${creates}` }))
+        }
+        if (input === '/api/sessions/session-1/arm') {
+          holdNextBoard = true
+          return Promise.resolve({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+          })
+        }
+        if (input === '/api/sessions/session-2/arm') {
+          return Promise.resolve(jsonResponse({ ...session('armed'), id: 'session-2' }))
+        }
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(boardHeld).toBe(true))
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      const popped = new Promise<void>((resolve) => {
+        window.addEventListener('popstate', () => resolve(), { once: true })
+      })
+      await act(async () => {
+        window.history.back()
+        await popped
+      })
+      fireEvent.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      board.resolve(allReadyBoutBoard())
+      await settle()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('a lost arm whose reconciliation fails after Prepare again leaves the newer card alone', async () => {
+      const firstRead = deferred<unknown>()
+      let arms = 0
+      let creates = 0
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          creates += 1
+          return Promise.resolve(jsonResponse({ ...session('draft'), id: `session-${creates}` }))
+        }
+        if (input === '/api/sessions/session-1/arm') {
+          arms += 1
+          return Promise.reject(new TypeError('connection reset'))
+        }
+        if (input === '/api/sessions/session-1') return firstRead.promise
+        if (input === '/api/sessions/session-2/arm') {
+          return Promise.resolve(jsonResponse({ ...session('armed'), id: 'session-2' }))
+        }
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/sessions/session-1', expect.anything()))
+      expect(arms).toBe(1)
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      firstRead.reject(new TypeError('still offline'))
+      await settle()
+      expect(activeSessionId()).toBe('session-2')
+      expect(screen.getByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('Back then Forward to the same Matchup while it arms still reaches the bell', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      arm.resolve(jsonResponse(session('armed')))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+    })
+
+    it('keeps the armed session opponent after editing the next card during Back/Forward', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(screen.getByRole('button', { name: /next opponent/i }))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      expect(document.querySelector('.matchup-lockup')).toHaveTextContent(/aurora serverless v2/i)
+      expect(document.querySelector('.matchup-lockup')).not.toHaveTextContent(/rds postgresql/i)
+      arm.resolve(jsonResponse(session('armed')))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(document.querySelector('.ready-match')).toHaveTextContent(/aurora serverless v2/i)
+      expect(document.querySelector('.ready-match')).not.toHaveTextContent(/rds postgresql/i)
+      act(() => FakeEventSource.instances.at(-1)!.emit({
+        sequence: 10,
+        event: 'run_started',
+        occurred_at: '2026-08-17T00:00:01Z',
+        payload: {
+          state: 'running',
+          lanes: ['lakebase', 'competitor'],
+          session: session('running'),
+        },
+      }))
+      const opponentLane = await screen.findByLabelText(/aurora serverless v2 result/i)
+      expect(opponentLane).toHaveTextContent('AUR')
+      expect(opponentLane).not.toHaveTextContent('RDS')
+    })
+
+    it('keeps the armed session personas after editing lenses during Back/Forward', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const dba = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'dba')!
+      const sessionWithLens = (state: DemoSession['state']): DemoSession => ({
+        ...session(state),
+        secondary_personas: [dba],
+      })
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(sessionWithLens('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.back())
+      await screen.findByRole('heading', { name: /add up to two lenses/i })
+      await user.click(screen.getByRole('button', { name: /backfill bill/i }))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      expect(screen.getByAltText('Primary: SRE')).toBeInTheDocument()
+      expect(screen.getByAltText('Secondary: DBA')).toBeInTheDocument()
+      expect(screen.queryByAltText('Secondary: Data Engineer')).not.toBeInTheDocument()
+      arm.resolve(jsonResponse(sessionWithLens('armed')))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(document.querySelector('.ready-ringside')).toHaveTextContent(/Leads · SRE/i)
+      expect(document.querySelector('.ready-ringside')).toHaveTextContent(/Lens · DBA/i)
+      expect(document.body).not.toHaveTextContent(/Lens · Data Engineer/i)
+    })
+
+    it('Next round during a Ring again board read abandons the old Prepare', async () => {
+      const fetchMock = stubBetween()
+      const user = userEvent.setup()
+      render(<App />)
+      const again = await screen.findByRole('button', { name: /ring again/i })
+      await waitFor(() => expect(again).toBeEnabled())
+      const board = deferred<AllBoutStatus>()
+      vi.mocked(api.allBoutStatuses).mockImplementation(() => board.promise)
+      await user.click(again)
+      await user.click(screen.getByRole('button', { name: /B · Next round/i }))
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      board.resolve(allReadyBoutBoard())
+      await settle()
+      expect(fetchMock).not.toHaveBeenCalledWith(
+        '/api/sessions',
+        expect.objectContaining({ method: 'POST' }),
+      )
+      expect(window.location.hash).toBe('#setup/card')
+    })
+
+    it('Scorecard during a Ring again create does not arm the abandoned card', async () => {
+      const create = deferred<unknown>()
+      const fetchMock = stubBetween(create.promise)
+      const user = userEvent.setup()
+      render(<App />)
+      const again = await screen.findByRole('button', { name: /ring again/i })
+      await waitFor(() => expect(again).toBeEnabled())
+      await user.click(again)
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        '/api/sessions',
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      await user.click(screen.getByRole('button', { name: /Select · Scorecard/i }))
+      await waitFor(() => expect(window.location.hash).toBe('#scorecard'))
+      create.resolve(jsonResponse({ ...session('draft'), id: 'again-1' }))
+      await settle()
+      expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/arm'))).toBe(false)
+      expect(window.location.hash).toBe('#scorecard')
+    })
+
+    it('a Round 5 refusal after Back then Forward to the same Matchup still explains itself', async () => {
+      const arm = deferred<unknown>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard(Object.fromEntries(
+        FALLBACK_CATALOG.rounds.map((round) => [
+          round.id,
+          { state: 'temporarily_unavailable', can_start: false },
+        ]),
+      )))
+      arm.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      expect(await screen.findByRole('alert')).toHaveTextContent(/round 5 is resetting/i)
+    })
+
+    it('a Round 5 refusal after Back then Forward whose board read fails still explains itself', async () => {
+      const arm = deferred<unknown>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      vi.mocked(api.allBoutStatuses).mockRejectedValue(new Error('board unreachable'))
+      arm.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      expect(await screen.findByRole('alert')).toHaveTextContent(/round 5 is resetting/i)
+    })
+
+    it('a Round 5 refusal whose board read lands after another round is chosen stays quiet', async () => {
+      const arm = deferred<unknown>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      const board = deferred<AllBoutStatus>()
+      vi.mocked(api.allBoutStatuses).mockImplementation(() => board.promise)
+      arm.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /^Round 2 ·/i }))
+      board.reject(new Error('board unreachable'))
+      await settle()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    })
+
+    it('a Round 5 refusal whose successful board read lands after another round stays quiet', async () => {
+      const arm = deferred<unknown>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      await user.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      const board = deferred<AllBoutStatus>()
+      vi.mocked(api.allBoutStatuses).mockImplementation(() => board.promise)
+      arm.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /^Round 2 ·/i }))
+      board.resolve(allReadyBoutBoard({
+        wake_idle_app: {
+          state: 'temporarily_unavailable',
+          can_start: false,
+          detail: 'Old round is still resetting',
+        },
+      }))
+      await settle()
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    })
+
+    it('a Round 5 refusal stays explained when its selected tile is clicked again', async () => {
+      const arm = deferred<unknown>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      await user.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      const board = deferred<AllBoutStatus>()
+      vi.mocked(api.allBoutStatuses).mockImplementation(() => board.promise)
+      arm.resolve({
+        ok: false,
+        status: 409,
+        statusText: 'Conflict',
+        json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+      })
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /^Round 1 ·/i }))
+      board.reject(new Error('board unreachable'))
+      await settle()
+      expect(screen.getByRole('alert')).toHaveTextContent(/round 5 is resetting/i)
+    })
+
+    it('a create refused as Round 5 while an armed card is still the session leaves that card', async () => {
+      let creates = 0
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          creates += 1
+          if (creates === 1) return Promise.resolve(jsonResponse(session('draft')))
+          return Promise.resolve({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            json: async () => ({ detail: 'ROUND 5 NOT STARTABLE · STAGE REWARMING' }),
+          })
+        }
+        if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      const popped = new Promise<void>((resolve) => {
+        window.addEventListener('popstate', () => resolve(), { once: true })
+      })
+      await act(async () => {
+        window.history.back()
+        await popped
+      })
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      fireEvent.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+      await waitFor(() => expect(creates).toBe(2))
+      await settle()
+      act(() => window.history.forward())
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(window.location.hash).toBe('#ready')
+    })
+
+    it('Choose another round revokes Forward\'s claim on Matchup while the cancel is out', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const cancel = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        if (input.endsWith('/cancel-arm')) return cancel.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      act(() => FakeEventSource.instances.at(-1)!.emit({
+        sequence: 1,
+        event: 'arm_started',
+        occurred_at: '2099-01-01T00:00:01Z',
+        payload: { state: 'checking' },
+      }))
+      fireEvent.click(await screen.findByRole('button', { name: /choose another round/i }))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        '/api/sessions/session-1/cancel-arm',
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      arm.resolve(jsonResponse({ ...session('armed'), updated_at: '2099-01-01T00:00:02Z' }))
+      await settle()
+      expect(window.location.hash).toMatch(/^#matchup/)
+    })
+
+    it('a later Forward does not hand Matchup back to a Prepare abandoned by Choose another round', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const cancel = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        if (input.endsWith('/cancel-arm')) return cancel.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      act(() => FakeEventSource.instances.at(-1)!.emit({
+        sequence: 1,
+        event: 'arm_started',
+        occurred_at: '2099-01-01T00:00:01Z',
+        payload: { state: 'checking' },
+      }))
+      fireEvent.click(await screen.findByRole('button', { name: /choose another round/i }))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        '/api/sessions/session-1/cancel-arm',
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      arm.resolve(jsonResponse({ ...session('armed'), updated_at: '2099-01-01T00:00:02Z' }))
+      await settle()
+      expect(window.location.hash).toMatch(/^#matchup/)
+    })
+
+    it('a re-entered Prepare whose session the stream has failed does not resume', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      act(() => window.history.back())
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      act(() => window.history.forward())
+      await waitFor(() => expect(window.location.hash).toMatch(/^#matchup/))
+      const failed = {
+        ...session('failed'),
+        updated_at: '2099-01-01T00:00:01Z',
+        failure: 'Start-state check failed.',
+      }
+      act(() => FakeEventSource.instances.at(-1)!.emit({
+        sequence: 1,
+        event: 'session_failed',
+        occurred_at: failed.updated_at,
+        payload: { state: 'failed', message: 'Start-state check failed.', session: failed },
+      }))
+      await waitFor(() => expect(window.location.hash).toBe('#setup/card'))
+      arm.resolve(jsonResponse({ ...session('armed'), updated_at: '2099-01-01T00:00:02Z' }))
+      await settle()
+      expect(window.location.hash).toBe('#setup/card')
+      expect(screen.queryByRole('button', { name: /ring the bell/i })).not.toBeInTheDocument()
+    })
+
+    it('an uninterrupted Prepare reaches the bell under StrictMode', async () => {
+      const requests = stubPrepare()
+      const user = userEvent.setup()
+      render(<StrictMode><App /></StrictMode>)
+      fireEvent.click(await reachCard(user))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(requests.arms()).toHaveLength(1)
+    })
+
+    it('a create answering after the app unmounts changes no history', async () => {
+      const create = deferred<ReturnType<typeof jsonResponse>>()
+      const requests = stubPrepare(create.promise)
+      const user = userEvent.setup()
+      const view = render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(requests.creates()).toHaveLength(1))
+      const hash = window.location.hash
+      const depth = window.history.length
+      view.unmount()
+      create.resolve(jsonResponse(session('draft')))
+      await act(async () => { for (let step = 0; step < 5; step += 1) await Promise.resolve() })
+      expect(window.location.hash).toBe(hash)
+      expect(window.history.length).toBe(depth)
+      expect(requests.arms()).toHaveLength(0)
+    })
+
+    it('an arm answering after the app unmounts changes no history', async () => {
+      const arm = deferred<ReturnType<typeof jsonResponse>>()
+      const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+        if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+        if (input === '/api/sessions' && init?.method === 'POST') {
+          return Promise.resolve(jsonResponse(session('draft')))
+        }
+        if (input.endsWith('/arm')) return arm.promise
+        throw new Error(`Unexpected request: ${input}`)
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      vi.stubGlobal('EventSource', FakeEventSource)
+      const user = userEvent.setup()
+      const view = render(<App />)
+      fireEvent.click(await reachCard(user))
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/arm$/),
+        expect.objectContaining({ method: 'POST' }),
+      ))
+      const hash = window.location.hash
+      const depth = window.history.length
+      view.unmount()
+      arm.resolve(jsonResponse(session('armed')))
+      await settle()
+      expect(window.location.hash).toBe(hash)
+      expect(window.history.length).toBe(depth)
+    })
+
+    it('an uninterrupted Prepare still lands on the bell', async () => {
+      const requests = stubPrepare()
+      const user = userEvent.setup()
+      render(<App />)
+      await user.click(await reachCard(user))
+      expect(await screen.findByRole('button', { name: /ring the bell/i })).toBeInTheDocument()
+      expect(requests.creates()).toHaveLength(1)
+      expect(requests.arms()).toHaveLength(1)
+    })
+  })
+
   it('rings one bell when the start control is double-clicked', async () => {
     const run = deferred<ReturnType<typeof jsonResponse>>()
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
@@ -2572,6 +3576,112 @@ describe('backstage setup', () => {
       await screen.findByText(/towel cleanup failed.*recovery environments could not be safely removed/i),
     ).toBeInTheDocument()
     expect(screen.queryByText(/please wait · the current bout owns the ring/i)).not.toBeInTheDocument()
+  })
+
+  it('calls a lost ring still stopping a hold, not a bout with an owner to name', async () => {
+    // No lease row is left to describe, so "Who's in the ring?" could only open
+    // "The ring just cleared" over a refusal that says try again in a moment.
+    const refusal = 'BOUT IN PROGRESS · RING LEASE LOST · ACTIVE WORK IS STILL STOPPING · '
+      + 'TRY AGAIN IN A MOMENT · IF IT PERSISTS, RESTART THE APP'
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({ detail: refusal }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+
+    expect(await screen.findByText(refusal)).toBeInTheDocument()
+    expect(screen.getByText('Temporarily unavailable')).toBeInTheDocument()
+    expect(screen.queryByText('Bout in progress')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /who’s in the ring/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /fight card/i })).toBeInTheDocument()
+  })
+
+  it('says why a refused Prepare came back from inside the pinned action bar', async () => {
+    // The bar is pinned to the bottom of the screen. The reason sat in the column
+    // just above it, and one line of it is enough to make the card taller than
+    // 1280x720: the bar then pinned over the reason, beside an enabled PREPARE.
+    const refusal = 'The fight card could not be prepared right now. Try again in a moment.'
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          json: async () => ({ detail: refusal }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(refusal)
+    expect(document.querySelector('.card-actions > .game-error')).toHaveTextContent(refusal)
+    expect(document.querySelectorAll('.game-error')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
+  })
+
+  it('drops a refused Prepare’s reason once another round is chosen', async () => {
+    // The reason names "this round". Picking another round is what it tells the
+    // operator to do, and left pinned in the bar it then sits over that round's
+    // enabled PREPARE as if it were about it.
+    const held = "THIS ROUND IS NOT ON TONIGHT'S CARD. Backstage is still checking this round's lakehouse storage, and it opens automatically once the check answers. The other rounds are unaffected."
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'make_schema_change_safely')
+    // The board changes between the render and the press, so Prepare's own read refuses it.
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      make_schema_change_safely: { state: 'temporarily_unavailable', can_start: false, detail: held },
+    }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(held)
+
+    // The same tile again is not another round, so the reason stays.
+    await pickRound(user, 'make_schema_change_safely')
+    expect(screen.getByRole('alert')).toHaveTextContent(held)
+
+    await pickRound(user, 'wake_idle_app')
+    expect(screen.getByRole('heading', { name: /wake this idle app/i })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(document.querySelector('.card-actions')).not.toHaveTextContent(/not on tonight/i)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
   })
 
   it('refreshes a transient Round 5 identity refusal back to backstage preparation', async () => {
@@ -3816,6 +4926,38 @@ describe('backstage setup', () => {
     expect(strip).toHaveTextContent(/unavailable tonight · change round to pick one that can run/i)
     expect(strip).not.toHaveTextContent(/TCP 5432/)
     expect(strip.textContent!.length).toBeLessThan(70)
+  })
+
+  it('calls a round the board is holding temporarily unavailable, not "ready and cannot arm"', async () => {
+    // The hold the server now puts on a round whose lost ring is still stopping.
+    // The catalog still says `ready`, which used to be printed straight into
+    // "This round is ready and cannot arm tonight."
+    const lostRing = 'BOUT IN PROGRESS · RING LEASE LOST · ACTIVE WORK IS STILL STOPPING · '
+      + 'TRY AGAIN IN A MOMENT · IF IT PERSISTS, RESTART THE APP'
+    await fightCardFor(refusedCatalog([], OPERATOR_REASON, null), 'make_schema_change_safely', {
+      make_schema_change_safely: { state: 'temporarily_unavailable', can_start: false, detail: lostRing },
+    })
+
+    const apron = document.querySelector('.ring-refusal')!
+    expect(apron).toHaveTextContent('This round is temporarily unavailable.')
+    expect(apron).not.toHaveTextContent(/ready and cannot arm/i)
+    expect(screen.getByText('Why').parentElement).toHaveTextContent(lostRing)
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    // The reason PREPARE is locked rides in the pinned bar beside the button.
+    // Below the bar, the bar drew over it.
+    expect(document.querySelector('.card-actions .game-lock-note')).toHaveTextContent(
+      /opens automatically/i,
+    )
+  })
+
+  it('does not call a ready round the board refuses "ready"', async () => {
+    await fightCardFor(refusedCatalog([], OPERATOR_REASON, null), 'make_schema_change_safely', {
+      make_schema_change_safely: { state: 'unavailable', can_start: false, detail: 'The ring is not ready.' },
+    })
+
+    expect(document.querySelector('.ring-refusal')).toHaveTextContent(
+      'This round is unavailable and cannot arm tonight.',
+    )
   })
 
   it('does not send the room to the round list when no round can run', async () => {
@@ -6327,6 +7469,69 @@ describe('backstage setup', () => {
     expect(await screen.findByText(/aws restore already in motion.*safe cleanup may take minutes/i)).toBeInTheDocument()
   })
 
+  it('says why a retry on a finished bout was refused, and only after the press', async () => {
+    // The bout is over, so the footer hid every error and a refused Retry cleanup
+    // looked like a button that did nothing.
+    const eligible = recoveryTowelSession('eligible')
+    const stopping = recoveryTowelSession('stopping')
+    const failed = recoveryTowelSession('failed')
+    const refusal = 'TOWEL CLEANUP LEASE WAS LOST · RETRY REFUSED'
+    let towelCalls = 0
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse({ ...session('draft'), round: eligible.round }))
+      }
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse({ ...session('armed'), round: eligible.round }))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(eligible))
+      if (input.endsWith('/towel')) {
+        towelCalls += 1
+        if (towelCalls === 1) return Promise.resolve(jsonResponse(stopping))
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          statusText: 'Conflict',
+          json: async () => ({ detail: refusal }),
+        })
+      }
+      if (input === '/api/sessions/session-1') return Promise.resolve(jsonResponse(failed))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('radio', { name: /lockjaw lucy/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    await user.click(await screen.findByRole('button', { name: /throw in the towel/i }))
+    const source = FakeEventSource.instances.at(-1)!
+    source.emit({
+      sequence: 10,
+      event: 'towel_update',
+      occurred_at: '2026-08-18T15:11:35Z',
+      payload: { session: failed },
+    })
+    const retry = await screen.findByRole('button', { name: /retry/i })
+    // A stream blip on a finished bout before any press stays behind the verdict.
+    act(() => source.onerror?.())
+    expect(document.querySelector('.proof-error')).toBeNull()
+
+    await user.click(retry)
+    await waitFor(() => expect(towelCalls).toBe(2))
+    expect(await screen.findByText(refusal)).toBeInTheDocument()
+    // In the footer's sticky action bar: Retry cleanup is reached by scrolling the
+    // footer, which would carry a line at its top out of view.
+    expect(document.querySelector('.proof-actions > .proof-error')).toHaveTextContent(refusal)
+    expect(document.querySelectorAll('.proof-error')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /next round/i })).toBeEnabled()
+  })
+
   it('runs Round 3 through verified recovery and hides a successful redo', async () => {
     const recoveryRound = FALLBACK_CATALOG.rounds.find((round) => round.id === 'recover_deleted_order')!
     const base = session('running')
@@ -6626,5 +7831,126 @@ describe('the ringside portrait asset', () => {
     // over the folder is the only check that notices it coming back.
     const found = Object.keys(import.meta.glob('./ryan-*.png')).sort()
     expect(found).toEqual(['./ryan-pixel-commentator.png', './ryan-pixel-portrait.png'])
+  })
+})
+
+describe('the six-round finale when the record cannot be read', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('says every row is unread rather than printing "not run yet" under the round just won', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/receipts') {
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          statusText: 'Service Unavailable',
+          json: async () => ({ detail: 'The receipt store is unavailable.' }),
+        })
+      }
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    const roundSix = FALLBACK_CATALOG.rounds.find(
+      (round) => round.id === 'analyze_live_orders_without_slowing_checkout',
+    )!
+    render(<Finale session={{ ...session('verified'), round: roundSix }} onBack={() => {}} onSummary={() => {}} />)
+
+    expect(await screen.findByText(/could not be read just now/i)).toBeInTheDocument()
+    const rows = screen.getByLabelText(/all six round summaries/i)
+    expect(rows).not.toHaveTextContent(/NOT RUN YET/)
+    expect(rows.textContent?.match(/RECORD UNREAD/g)).toHaveLength(6)
+    for (const row of Array.from(rows.children)) {
+      expect(row).toHaveAttribute('data-status', 'unread')
+    }
+  })
+})
+
+describe('a Round 1 reset the server gave up on', () => {
+  afterEach(cleanup)
+
+  function failedReset(
+    failure: string | null,
+    competitorState: 'watching' | 'not_supported' = 'watching',
+  ): DemoSession {
+    const startedAt = '2026-08-17T00:00:00Z'
+    return {
+      ...session('verified'),
+      cooldown: {
+        mode: 'return_to_idle',
+        state: 'failed',
+        started_at: startedAt,
+        failure,
+        lanes: {
+          lakebase: {
+            id: 'lakebase', name: 'Lakebase', state: 'confirmed_zero',
+            started_at: startedAt, confirmed_at: '2026-08-17T00:05:00Z',
+            elapsed_ms: 300_000, status: 'Control plane confirmed zero',
+          },
+          competitor: {
+            id: 'competitor', name: 'Aurora Serverless v2', state: competitorState,
+            started_at: startedAt, confirmed_at: null,
+            elapsed_ms: null, status: 'Aurora writer has not produced two consecutive zero-capacity samples',
+          },
+        },
+      },
+    }
+  }
+
+  function between(current: DemoSession) {
+    return render(
+      <BetweenRounds
+        session={current}
+        competitor="Aurora Serverless v2"
+        onRingAgain={() => {}}
+        onRetryCleanup={() => {}}
+        onNextRound={() => {}}
+        onScorecard={() => {}}
+        commentaryOpen
+        onToggleCommentary={() => {}}
+      />,
+    )
+  }
+
+  it('says why it stopped, in the server’s words, beside Retry cleanup', () => {
+    const { container } = between(failedReset('Timed out waiting for return to confirmed zero.'))
+
+    const status = container.querySelector('.between-status')!
+    expect(status).toHaveTextContent(
+      'Reset stopped · Timed out waiting for return to confirmed zero · Retry cleanup',
+    )
+    expect(status).not.toHaveTextContent(/waiting for each database/i)
+    expect(screen.getByRole('button', { name: /retry cleanup/i })).toBeEnabled()
+  })
+
+  it('still says it stopped when the server gave no reason, or the opponent cannot idle', () => {
+    const { container, unmount } = between(failedReset(null))
+    expect(container.querySelector('.between-status')).toHaveTextContent(
+      'Reset stopped · Return to idle was not confirmed · Retry cleanup',
+    )
+    unmount()
+    const rds = between(failedReset('Automatic return-to-idle cleanup lost its ring fence', 'not_supported'))
+    expect(rds.container.querySelector('.between-status')).toHaveTextContent(
+      'Reset stopped · Automatic return-to-idle cleanup lost its ring fence · Retry cleanup',
+    )
+  })
+
+  it('gives a Round 2 or 3 cleanup the server stopped its reason too', () => {
+    const deleting = (mode: 'delete_isolated_environment' | 'delete_recovery_environment', failure: string | null) => {
+      const base = failedReset(failure)
+      return { ...base, cooldown: { ...base.cooldown!, mode } }
+    }
+    const recovery = between(deleting('delete_recovery_environment', 'Automatic recovery cleanup lost its ring fence'))
+    expect(recovery.container.querySelector('.between-status')).toHaveTextContent(
+      'Cleanup stopped · Automatic recovery cleanup lost its ring fence · Retry cleanup',
+    )
+    recovery.unmount()
+    // No reason from the server: the fixed sentence, as before.
+    const isolated = between(deleting('delete_isolated_environment', null))
+    expect(isolated.container.querySelector('.between-status')).toHaveTextContent(
+      'Cleanup stopped · One or more isolated environments could not be removed · Retry cleanup',
+    )
   })
 })

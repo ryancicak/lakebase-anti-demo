@@ -660,6 +660,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    that look closer, in every round. Round 1's extra "Back to idle" button once put
    them there by wrapping; Ryan liked it, so it is the layout now, not an accident. */
 .proof-actions-primary { display: flex; flex: 0 0 100%; flex-wrap: wrap; justify-content: center; gap: 1.2em; }
+.proof-actions > .proof-error { flex: 0 0 100%; }
 .starred-redo-action { display: grid; justify-items: center; gap: .55em; }
 .starred-redo-action > small { max-width: 28em; color: var(--yellow); font-size: clamp(5px, .42vw, 8px); line-height: 1.4; text-transform: uppercase; }
 .proof-next, .proof-redo, .proof-replay, .proof-ringside, .proof-cost, .proof-share, .proof-towel, .proof-towel-retry { padding: .9em 1.2em; border: 3px solid var(--yellow); color: var(--yellow); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .55vw, 11px); line-height: 1; text-transform: uppercase; }
@@ -1417,9 +1418,10 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .finale-corners li > span { color: var(--cream); }
 /* A round with no winner states that and stops. Dimmed rather than struck
    through or blanked: an empty cell reads as a number somebody lost. */
-.finale-beat[data-status="unrun"], .finale-beat[data-status="reading"] { background: #080d24; }
+.finale-beat[data-status="unrun"], .finale-beat[data-status="reading"], .finale-beat[data-status="unread"] { background: #080d24; }
 .finale-beat[data-status="unrun"] .finale-win b,
 .finale-beat[data-status="reading"] .finale-win b,
+.finale-beat[data-status="unread"] .finale-win b,
 .finale-beat[data-status="abandoned"] .finale-win b,
 .finale-beat[data-status="no_result"] .finale-win b { color: #8e9ac6; font-size: clamp(9px, .74vw, 13px); text-shadow: none; }
 .finale-footer { position: relative; z-index: 6; display: flex; align-items: center; justify-content: flex-end; gap: clamp(8px, 1vh, 12px) 2vw; width: min(1520px, 92vw); }
@@ -2505,7 +2507,7 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .finale-bars { display: grid; align-self: end; gap: clamp(5px, .6vh, 8px); min-width: 0; }
 .finale-lane { --lane-color: var(--red); display: grid; grid-template-columns: 3.2em minmax(0, 1fr); height: clamp(22px, 3.2vh, 36px); font-size: clamp(8px, .72vw, 12px); }
 /* A round with no clocks has nothing to draw: its lanes stay, dimmed, so the six tiles still line up. */
-.finale-beat[data-status="unrun"] .finale-lane, .finale-beat[data-status="reading"] .finale-lane,
+.finale-beat[data-status="unrun"] .finale-lane, .finale-beat[data-status="reading"] .finale-lane, .finale-beat[data-status="unread"] .finale-lane,
 .finale-beat[data-status="abandoned"] .finale-lane { opacity: .4; }
 .finale-lane[data-corner="blue"] { --lane-color: var(--blue); }
 .finale-lane > b { display: grid; place-items: center; color: var(--cream); background: var(--lane-color); font-weight: 400; letter-spacing: .05em; }
