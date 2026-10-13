@@ -270,9 +270,24 @@ table is missing or ungranted, startup refuses rather than installing no power
 store and serving anyway. `antidemo renew` is not the upgrade either: its
 Round 5 re-seal can create this table, but it never grants it to the app.
 
+### Upgrading from v1.2.0
+
+v1.2.1 changes neither the coordination schema nor the Round 5 runner, so the
+usual redeploy is the whole upgrade. From the checkout the installation was made
+from, while nobody is presenting:
+
+```bash
+git pull                     # or check out the release tag
+uv sync --locked             # a no-op unless uv.lock changed
+./bootstrap.sh --deploy-only
+```
+
+An installation still on v1.1.1 follows [the v1.1.1 steps](#upgrading-from-v111)
+instead; they end in this same redeploy.
+
 ### Upgrading from v1.1.1
 
-This release adds one table to the coordination schema,
+v1.2.0 added one table to the coordination schema,
 `anti_demo_coordination.round4_source_rebase`, and the app refuses to start
 without it and its grants. The app holds no `CREATE` there and `--deploy-only`
 creates nothing, so an existing installation takes one extra step before the
