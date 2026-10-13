@@ -274,6 +274,31 @@ describe('CapacityDisclosure · what the summary is willing to claim', () => {
 })
 
 /**
+ * Extract one top-level function's body by name, tolerating an `export ` prefix.
+ * Slices from the function declaration to just before the next top-level function.
+ * Throws if the start marker is not found.
+ */
+function extractFunctionBody(source: string, functionName: string): string {
+  const start = source.indexOf(`function ${functionName}`)
+  if (start === -1) {
+    throw new Error(`Function '${functionName}' not found in source`)
+  }
+
+  const fromFunctionStart = source.slice(start)
+  // Find the next top-level function declaration (could have `export ` prefix or not).
+  // Search for a newline followed by optional `export` and then `function`.
+  const nextFunctionPattern = /\n(?:export\s+)?function\s+/
+  const nextMatch = fromFunctionStart.slice(functionName.length).search(nextFunctionPattern)
+  if (nextMatch === -1) {
+    // No next function found; return to the end of the file
+    return fromFunctionStart
+  }
+
+  // Return from the function start to just before the newline of the next function
+  return fromFunctionStart.slice(0, functionName.length + nextMatch)
+}
+
+/**
  * A disclosure nobody can reach discloses nothing. Neither component is
  * rendered by an existing test harness, so guard the call sites directly.
  */
@@ -281,22 +306,28 @@ describe('wiring', () => {
   const source = readFileSync(resolve(process.cwd(), 'src/App.tsx'), 'utf8')
 
   it('keeps capacity in Instant Replay and out of the presenter cue', () => {
-    const replay = source.slice(source.indexOf('function InstantReplay'))
-    const body = replay.slice(0, replay.indexOf('\nfunction '))
-    expect(body).toContain('<CapacityDisclosure session={session} embedded />')
-    const cue = source.slice(source.indexOf('function RingsideTake'))
-    expect(cue.slice(0, cue.indexOf('\nfunction '))).not.toContain('<CapacityDisclosure')
+    const replay = extractFunctionBody(source, 'InstantReplay')
+    expect(replay).toContain('<CapacityDisclosure session={session} embedded />')
+    const cue = extractFunctionBody(source, 'RingsideTake')
+    expect(cue).not.toContain('<CapacityDisclosure')
   })
 
   it('keeps the idle-policy floor in cooldown details', () => {
-    const details = source.slice(source.indexOf('function CooldownDetails'))
-    const body = details.slice(0, details.indexOf('\nfunction BetweenRounds'))
+    const body = extractFunctionBody(source, 'CooldownDetails')
     expect(body).toContain("<IdlePolicyFloor competitorCannotIdle={competitor.state === 'not_supported'}")
   })
 
   it('keeps the idle-policy floor off the projected cooldown screen', () => {
-    const projected = source.slice(source.indexOf('function BetweenRounds'))
-    const body = projected.slice(0, projected.indexOf('\n/**'))
+    const body = extractFunctionBody(source, 'BetweenRounds')
     expect(body).not.toContain('<IdlePolicyFloor')
+  })
+
+  it('the helper correctly finds function boundaries even with export prefix', () => {
+    // BetweenRounds is exported, so the old test's search for '\nfunction BetweenRounds'
+    // would never match and would run to end-of-file (vacuous). The robust helper finds it.
+    const body = extractFunctionBody(source, 'BetweenRounds')
+    expect(body).toContain('function BetweenRounds')
+    // Ensure we're not leaking into the next function (Finale)
+    expect(body).not.toContain('\nfunction Finale')
   })
 })

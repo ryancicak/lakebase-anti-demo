@@ -4821,7 +4821,7 @@ describe('backstage setup', () => {
     refused: string[],
     reason: string,
     headline: string | null,
-    reasonCode: 'cleanup_in_progress' | null = null,
+    reasonCode: 'cleanup_in_progress' | 'storage_checking' | null = null,
   ) {
     return {
       ...FALLBACK_CATALOG,
@@ -4854,11 +4854,17 @@ describe('backstage setup', () => {
                 ? 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.'
                 : null,
             }
-            : {
-              state: 'unavailable',
-              can_start: false,
-              detail: round.availability_headline ?? round.availability_reason ?? null,
-            },
+            : round.availability_reason_code === 'storage_checking'
+              ? {
+                state: 'temporarily_unavailable',
+                can_start: false,
+                detail: round.availability_headline ?? round.availability_reason ?? null,
+              }
+              : {
+                state: 'unavailable',
+                can_start: false,
+                detail: round.availability_headline ?? round.availability_reason ?? null,
+              },
         ])) as Partial<Record<RoundId, Partial<FightCardRoundStatus>>>
     vi.mocked(api.allBoutStatuses).mockResolvedValue(
       allReadyBoutBoard(boardUpdates ?? catalogUpdates),
@@ -5114,6 +5120,36 @@ describe('backstage setup', () => {
       expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
     },
   )
+
+  it('presents storage_checking as temporary while keeping other rounds available', async () => {
+    const storageCatalog = refusedCatalog(
+      ['put_model_score_in_app'],
+      'ROUND 4 CANNOT ARM: a shared storage check is still running.',
+      'Backstage is still checking this round\'s lakehouse storage. It opens automatically once the check answers; the other rounds are unaffected.',
+      'storage_checking',
+    )
+    const user = await fightCardFor(storageCatalog, 'put_model_score_in_app')
+
+    const roundFour = screen.getByRole('button', { name: /^Round 4 ·/i })
+    expect(roundFour).toHaveAccessibleName(/temporarily unavailable/i)
+    expect(within(roundFour).getByText('TEMPORARILY UNAVAILABLE')).toBeVisible()
+    expect(within(roundFour).queryByText(/^unavailable$/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.getByText(/Backstage is still checking this round's lakehouse storage\. It opens automatically once the check answers; the other rounds are unaffected\./i)).toBeVisible()
+    expect(document.querySelector('.game-lock-note')).toHaveTextContent(
+      /opens automatically · other rounds remain available/i,
+    )
+
+    const card = document.querySelector('.card-scene')!
+    expect(card).not.toHaveTextContent(/cannot arm tonight|not on tonight's card/i)
+    expect(screen.getByRole('button', { name: /^Round 1 ·/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /^Round 2 ·/i })).toBeEnabled()
+
+    await pickRound(user, 'wake_idle_app')
+    const unselectedRoundFour = screen.getByRole('button', { name: /^Round 4 ·/i })
+    expect(unselectedRoundFour).toHaveAccessibleName(/temporarily unavailable/i)
+    expect(within(unselectedRoundFour).getByText('TEMPORARILY UNAVAILABLE')).toBeVisible()
+  })
 
   it('keeps a live Round 5 bout distinct from backstage cleanup', async () => {
     await fightCardFor(
