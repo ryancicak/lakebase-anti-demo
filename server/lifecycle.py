@@ -7449,6 +7449,20 @@ _ROUND4_PIPELINE_POWER_TIMEOUT_SECONDS = 600.0
 #: How long a park after the baseline lets the pipeline's update settle into a continuous sync
 #: before it stops it anyway.
 _ROUND4_PARK_SETTLE_SECONDS = 300.0
+#: How long that sync must have read healthy, unbroken, before setup parks it.
+#:
+#: Two healthy reads were not enough. On 2026-10-13, a fresh install parked its new pipeline
+#: 30 s into its first update's RUNNING, after two healthy reads and with the baseline already
+#: synced. The synced table then read SYNCED_TABLE_OFFLINE_FAILED for more than 40 minutes,
+#: through setup's closing check.
+#:
+#: rc20's was parked 3 s in. Every park of a sync that had run longer, as each bout's has, left
+#: the table online.
+_ROUND4_PARK_MIN_HEALTHY_SECONDS = 90.0
+#: How long after a park setup waits for the synced table to leave SYNCED_TABLE_OFFLINE_FAILED.
+_ROUND4_POST_PARK_SETTLE_SECONDS = 120.0
+#: How many times setup starts again and re-parks a pipeline whose park left the table offline.
+_ROUND4_PARK_REPAIRS = 1
 #: The newest-update states in which the pipeline is still bringing the synced table online.
 _ROUND4_UNSETTLED_UPDATE_STATES = frozenset(
     {
@@ -7478,6 +7492,38 @@ def _round4_pipeline_signals(manifest: DemoManifest, names: dict[str, str], pipe
         synced_table_state=str(status.get("detailed_state") or ""),
         continuous_reported=bool(status.get("continuous_update_status")),
     )
+
+
+def _round4_synced_table_reads_offline_failed(
+    manifest: DemoManifest, names: dict[str, str]
+) -> bool:
+    """Whether either view of Round 4's synced table reads SYNCED_TABLE_OFFLINE_FAILED.
+
+    These are the same two reads setup's closing check judges the table by.
+    """
+
+    postgres = (_round4_get_synced_table(manifest, names) or {}).get("status") or {}
+    database = (
+        (_round4_get_database_synced_table(manifest, names) or {}).get(
+            "data_synchronization_status"
+        )
+        or {}
+    )
+    return "SYNCED_TABLE_OFFLINE_FAILED" in {
+        str(postgres.get("detailed_state") or ""),
+        str(database.get("detailed_state") or ""),
+    }
+
+
+def _round4_offline_failed_clears(manifest: DemoManifest, names: dict[str, str]) -> bool:
+    """Whether the synced table leaves SYNCED_TABLE_OFFLINE_FAILED within the post-park bound."""
+
+    deadline = time.monotonic() + _ROUND4_POST_PARK_SETTLE_SECONDS
+    while _round4_synced_table_reads_offline_failed(manifest, names):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(3)
+    return True
 
 
 def _round4_pipeline_parked(manifest: DemoManifest, pipeline_id: str) -> bool:
@@ -7546,14 +7592,24 @@ def _park_round4_pipeline(
     pipeline_id: str,
     *,
     settle_names: dict[str, str] | None = None,
+    repairs_left: int = _ROUND4_PARK_REPAIRS,
 ) -> None:
     """Stop Round 4's pipeline and wait until it is parked. A parked one costs one read.
 
     With ``settle_names``, an update still bringing the synced table online settles into a
-    continuous sync first, read healthy twice in a row as a start's is. rc20 (2026-10-05) parked
-    a new pipeline 35 s after creating it, three seconds into its first update's RUNNING, and
-    the synced table then read ``SYNCED_TABLE_OFFLINE_FAILED``, which setup's closing check
-    refuses as a broken table. Every park of a settled sync has left it online.
+    continuous sync first: read healthy twice in a row, as a start's is, and healthy
+    unbroken for `_ROUND4_PARK_MIN_HEALTHY_SECONDS`.
+
+    rc20 (2026-10-05) parked a new pipeline 35 s after creating it, three seconds into its
+    first update's RUNNING. The synced table then read ``SYNCED_TABLE_OFFLINE_FAILED``, which
+    setup's closing check refuses as a broken table. On 2026-10-13, a park 30 s into a first
+    update, after two healthy reads, did the same, and the table stayed offline for more than
+    40 minutes. Every park of a sync that ran longer has left it online.
+
+    So after a settled park, setup also waits for the table to leave that state. If it has not
+    left within `_ROUND4_POST_PARK_SETTLE_SECONDS`, setup starts the pipeline again, lets it
+    settle and parks it once more, at most `_ROUND4_PARK_REPAIRS` times. A table still offline
+    after that is left as it is, for the closing check to refuse as before.
     """
 
     from .model_score_live import pipeline_signals_are_healthy
@@ -7563,10 +7619,20 @@ def _park_round4_pipeline(
         if update.strip().upper() in _ROUND4_UNSETTLED_UPDATE_STATES:
             settle_deadline = time.monotonic() + _ROUND4_PARK_SETTLE_SECONDS
             healthy = 0
+            healthy_since: float | None = None
             while True:
                 signals = _round4_pipeline_signals(manifest, settle_names, pipeline_id)
-                healthy = healthy + 1 if pipeline_signals_are_healthy(signals) else 0
-                if healthy >= 2:
+                if pipeline_signals_are_healthy(signals):
+                    healthy += 1
+                    if healthy_since is None:
+                        healthy_since = time.monotonic()
+                else:
+                    healthy, healthy_since = 0, None
+                if (
+                    healthy >= 2
+                    and healthy_since is not None
+                    and time.monotonic() - healthy_since >= _ROUND4_PARK_MIN_HEALTHY_SECONDS
+                ):
                     break
                 if time.monotonic() >= settle_deadline:
                     print(
@@ -7585,7 +7651,7 @@ def _park_round4_pipeline(
         state = str(pipeline.get("state") or "").strip().upper()
         update = latest_pipeline_update_state(pipeline).strip().upper()
         if state == "IDLE" and update not in _ROUND4_ACTIVE_UPDATE_STATES:
-            return
+            break
         if not requested and update != "STOPPING":
             print("PARK  Round 4 Managed Sync pipeline", flush=True)
             _round4_pipeline_verb(manifest, pipeline_id, "stop")
@@ -7597,6 +7663,36 @@ def _park_round4_pipeline(
                 f"update {update or 'NONE'}); stop it with '{ROUND4_PIPELINE_STOP_COMMAND}'"
             )
         time.sleep(3)
+
+    if settle_names is None or _round4_offline_failed_clears(manifest, settle_names):
+        return
+    if repairs_left <= 0:
+        print(
+            "WAIT  Round 4's synced table still reads SYNCED_TABLE_OFFLINE_FAILED "
+            f"{_ROUND4_POST_PARK_SETTLE_SECONDS:.0f}s after its park; leaving it to the "
+            "closing check",
+            flush=True,
+        )
+        return
+    print(
+        "REPAIR Round 4's synced table read SYNCED_TABLE_OFFLINE_FAILED after its park; "
+        "starting the pipeline again, to settle and park it once more",
+        flush=True,
+    )
+    try:
+        _start_round4_pipeline(manifest, settle_names, pipeline_id)
+    except Exception as exc:
+        # A start that fails leaves the pipeline as the start left it, so park that, and let
+        # the closing check judge the table.
+        print(
+            f"WAIT  Round 4's repair start failed ({type(exc).__name__}); parking it as it is",
+            flush=True,
+        )
+        _park_round4_pipeline(manifest, pipeline_id)
+        return
+    _park_round4_pipeline(
+        manifest, pipeline_id, settle_names=settle_names, repairs_left=repairs_left - 1
+    )
 
 
 def _start_round4_pipeline(
