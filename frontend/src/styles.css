@@ -365,6 +365,19 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .fighter-glove.left { left: 1%; }
 .fighter-glove.right { right: 1%; }
 
+/* Halloween (v1.2.1): costumes on the boxers' heads only, October 1 through November 1, and
+   never with ?costumes=off (fighterCostume). Lakebase is the pumpkin; the opponent is
+   Frankenstein in every round. Bodies, gloves, labels and corner colours stay. */
+.database-fighter[data-costume] .fighter-crown i { display: none; }
+.database-fighter[data-costume="pumpkin"] .fighter-crown { top: 8%; left: 41%; width: 18%; height: 14%; background: #4caf50; }
+.database-fighter[data-costume="pumpkin"] .fighter-face { top: 21%; left: 20%; width: 60%; height: 33%; background: #ff8a1f; }
+.database-fighter[data-costume="pumpkin"] .fighter-face::after { content: ""; position: absolute; left: 22%; right: 22%; bottom: 15%; height: 15%; background: #080b1f; }
+/* Frankenstein: the flat black top, the bolts, and the share card's stitched brow and flat mouth. */
+.database-fighter[data-costume="frankenstein"] .fighter-crown { background: #0d0818; }
+.database-fighter[data-costume="frankenstein"] .fighter-face { background: #9ad46a; box-shadow: -.55em 0 0 #9aa0a6, .55em 0 0 #9aa0a6; }
+.database-fighter[data-costume="frankenstein"] .fighter-face::before { content: ""; position: absolute; top: 0; left: 56%; width: 28%; height: 13%; background: repeating-linear-gradient(90deg, #080b1f 0 26%, transparent 26% 52%); }
+.database-fighter[data-costume="frankenstein"] .fighter-face::after { content: ""; position: absolute; left: 24%; right: 24%; bottom: 16%; height: 13%; background: #080b1f; }
+
 /* Persona select. */
 .roster-scene { display: grid; grid-template-columns: 1fr 18%; grid-template-rows: auto 1fr auto; column-gap: 2.2%; row-gap: 2.2%; }
 .roster-scene .scene-heading { grid-column: 1 / -1; }
@@ -1265,6 +1278,12 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .receipt-style-option { min-height: clamp(30px, 2.6vw, 44px); padding: 0 1em; border: 3px solid #5e6c9b; color: #b6c1e6; background: #0d1432; font-family: "Press Start 2P", ui-monospace, monospace; font-size: clamp(6px, .55vw, 10px); text-transform: uppercase; cursor: pointer; }
 .receipt-style-option[data-selected="true"] { border-color: #6bf39a; color: #081a10; background: #6bf39a; box-shadow: .25em .25em #000; }
 .receipt-style-option:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
+
+/* Halloween (v1.2.1): in season, a checked box under the selector draws the same card in the
+   Halloween skin; unchecking it gives the original. */
+.receipt-theme-toggle { display: flex; align-items: center; gap: .8em; margin: 0; color: #ffb15c; font-family: "Press Start 2P", ui-monospace, monospace; font-size: clamp(6px, .55vw, 10px); text-transform: uppercase; cursor: pointer; }
+.receipt-theme-toggle input { width: 1.8em; height: 1.8em; margin: 0; accent-color: #ff8a1f; cursor: pointer; }
+.receipt-theme-toggle input:focus-visible { outline: 3px solid var(--yellow); outline-offset: 2px; }
 
 @media (max-width: 1000px) {
   .receipt-modal { display: block; }

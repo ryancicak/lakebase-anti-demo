@@ -7,6 +7,7 @@ import type {
   RoundDefinition,
   RoundId,
 } from './api/types'
+import { fighterCostume } from './halloween'
 import { NO_EQUIVALENT_NATIVE_PATH } from './recap'
 
 /**
@@ -508,6 +509,10 @@ export function FightRing(props: {
     }
   }
 
+  // Halloween (v1.2.1): the costumes the boxers wear elsewhere, on the ring's two heads.
+  const homeCostume = fighterCostume('red')
+  const awayCostume = fighterCostume('blue')
+  const frankenstein = awayCostume === 'frankenstein'
   return (
     <div className="ring">
       {/* The ticked chase rail and the red/blue corner bar that used to sit here
@@ -688,10 +693,12 @@ export function FightRing(props: {
           )}
 
           <g transform={`translate(${nearFighterX},${fighterY}) scale(${fighterScale})`}>
-            <g className="g-bob px" id="ring-home">
-              <rect x="12" y="0" width="24" height="12" fill="#e6dfc6" />
+            <g className="g-bob px" id="ring-home" data-costume={homeCostume}>
+              {homeCostume === 'pumpkin' && <rect x="22" y="-4" width="4" height="4" fill="#4caf50" />}
+              <rect x="12" y="0" width="24" height="12" fill={homeCostume === 'pumpkin' ? '#ff8a1f' : '#e6dfc6'} />
               <rect x="16" y="4" width="4" height="4" fill="#10152f" />
               <rect x="28" y="4" width="4" height="4" fill="#10152f" />
+              {homeCostume === 'pumpkin' && <rect x="18" y="9" width="12" height="2" fill="#10152f" />}
               <rect x="12" y="13" width="24" height="4" fill="#767b80" />
               <rect x="9" y="19" width="30" height="15" fill="#e6dfc6" />
               <rect x="9" y="36" width="30" height="15" fill="#cfc7ab" />
@@ -708,10 +715,20 @@ export function FightRing(props: {
 
           {lane !== 'none' && (
             <g transform={`translate(${farFighterX},${fighterY}) scale(${fighterScale})`}>
-              <g id="ring-away">
+              <g id="ring-away" data-costume={awayCostume}>
                 <g className="g-bob px">
-                  <rect x="10" y="0" width="28" height="6" fill="#74a5ff" />
-                  <rect x="12" y="6" width="24" height="11" fill="#c8d2ee" />
+                  <rect x="10" y="0" width="28" height="6" fill={frankenstein ? '#0d0818' : '#74a5ff'} />
+                  <rect x="12" y="6" width="24" height="11" fill={frankenstein ? '#9ad46a' : '#c8d2ee'} />
+                  {/* Frankenstein: bolts, a stitched brow and a flat mouth. */}
+                  {frankenstein && (
+                    <>
+                      <rect x="8" y="10" width="4" height="3" fill="#9aa0a6" />
+                      <rect x="36" y="10" width="4" height="3" fill="#9aa0a6" />
+                      <rect x="26" y="6" width="2" height="2" fill="#10152f" />
+                      <rect x="30" y="6" width="2" height="2" fill="#10152f" />
+                      <rect x="18" y="14" width="12" height="2" fill="#10152f" />
+                    </>
+                  )}
                   <rect x="16" y="9" width="4" height="4" fill="#10152f" />
                   <rect x="28" y="9" width="4" height="4" fill="#10152f" />
                   <rect x="9" y="21" width="30" height="14" fill="#c8d2ee" />

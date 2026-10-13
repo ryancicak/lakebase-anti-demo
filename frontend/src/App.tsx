@@ -58,6 +58,18 @@ import {
 } from './recap'
 import { offerNativeShare, shareDismissalPrefix } from './share'
 import {
+  BAT_SPRITE,
+  HALLOWEEN,
+  HALLOWEEN_ROUND_NAMES,
+  TOMB_SPRITE,
+  drawPixelGrid,
+  fighterCostume,
+  fighterSprite,
+  glowSprite,
+  isHalloweenSeason,
+  moonSprite,
+} from './halloween'
+import {
   buildRingsideCue,
   classifyOutcome,
   priorityKeyFor,
@@ -1395,6 +1407,13 @@ export type ReceiptCardStyle = 'health-bars' | 'knockout'
 /** The default layout for a fresh Share modal: always the health-bars card. */
 export const DEFAULT_RECEIPT_CARD_STYLE: ReceiptCardStyle = 'health-bars'
 
+/**
+ * The skin a share card is drawn in. `halloween` is offered, checked, from October 1 through
+ * November 1 (`isHalloweenSeason`), on the two layouts it re-skins. The facts are the same in
+ * both skins, and the scorecard fallback is always `classic`.
+ */
+export type ReceiptCardTheme = 'classic' | 'halloween'
+
 export interface ReceiptPresentation {
   kind: ReceiptKind
   title: string
@@ -2409,6 +2428,7 @@ async function renderReceiptCard(
   roundNumber: number,
   kind: ReceiptKind,
   style: ReceiptCardStyle = DEFAULT_RECEIPT_CARD_STYLE,
+  theme: ReceiptCardTheme = 'classic',
 ): Promise<Blob> {
   const receipt = receiptPresentation(session, kind)
   if (document.fonts) await document.fonts.ready
@@ -2418,6 +2438,20 @@ async function renderReceiptCard(
   const context = canvas.getContext('2d')
   if (!context) throw new Error('This browser cannot create the result card.')
   context.imageSmoothingEnabled = false
+
+  // The Halloween skin re-draws the two layouts it covers from the same receipt. Anything
+  // else (the scorecard fallback) is always drawn classic.
+  if (theme === 'halloween' && style === 'health-bars' && receipt.healthBars) {
+    drawHalloweenFrame(context, canvas.height)
+    drawHalloweenHealthBarReceipt(context, canvas.height, session, roundNumber, kind, receipt, receipt.healthBars)
+    return encodeReceiptCard(canvas)
+  }
+  if (theme === 'halloween' && style === 'knockout' && receipt.knockout) {
+    drawHalloweenFrame(context, canvas.height)
+    drawHalloweenKnockoutReceipt(context, canvas.height, session, roundNumber, kind, receipt, receipt.knockout)
+    return encodeReceiptCard(canvas)
+  }
+
   context.fillStyle = '#070b22'
   context.fillRect(0, 0, canvas.width, canvas.height)
   context.fillStyle = '#10183e'
@@ -2921,18 +2955,414 @@ function drawHealthBarReceipt(
   })
 }
 
+/*
+ * THE HALLOWEEN SKIN (v1.2.1). It follows Ryan's "Twelve Nights of Fright" design for the two
+ * layouts above, without its series branding (no night count, no "twelve business nights")
+ * and without its "Why pay more" line, because nothing a bout measures is a price.
+ *
+ * Every fact comes from the same receipt the classic layouts draw, under the same house rules:
+ * - the hero carries the ledger's own qualifier;
+ * - both exact clocks are printed, with the winner chipped in the scorecard's own word;
+ * - an untimed challenger prints why, never an invented figure;
+ * - "ONE LIVE RUN · NOT A BENCHMARK" and the receipt's identity keep their places.
+ *
+ * Treat and Trick follow the winner, not the brand: a round the opponent wins chips the
+ * opponent TREAT.
+ *
+ * Coordinates are the design's, inside its frame: the night panel's content box starts at
+ * (18, 18) and is 1164 px wide.
+ */
+const HALLOWEEN_X = 18
+const HALLOWEEN_Y = 18
+const HALLOWEEN_WIDTH = 1164
+
+function halloweenFont(size: number): string {
+  return `400 ${size}px "Press Start 2P", monospace`
+}
+
+/** The orange frame, the striped night panel and the logo every Halloween card shares. */
+function drawHalloweenFrame(context: CanvasRenderingContext2D, height: number) {
+  const width = 1200
+  context.fillStyle = HALLOWEEN.frame
+  context.fillRect(0, 0, width, height)
+  context.fillStyle = HALLOWEEN.border
+  context.fillRect(14, 14, width - 28, height - 28)
+  context.fillStyle = HALLOWEEN.night
+  context.fillRect(HALLOWEEN_X, HALLOWEEN_Y, HALLOWEEN_WIDTH, height - 36)
+  context.fillStyle = HALLOWEEN.stripe
+  for (let x = HALLOWEEN_X + 38; x < HALLOWEEN_X + HALLOWEEN_WIDTH; x += 76) {
+    context.fillRect(x, HALLOWEEN_Y, Math.min(38, HALLOWEEN_X + HALLOWEEN_WIDTH - x), height - 36)
+  }
+  context.textBaseline = 'top'
+  context.font = halloweenFont(38)
+  context.fillStyle = HALLOWEEN.ink
+  context.fillText('LAKEBASE', HALLOWEEN_X + 26, HALLOWEEN_Y + 20)
+  context.fillStyle = HALLOWEEN.blood
+  context.fillText('LAKEBASE', HALLOWEEN_X + 22, HALLOWEEN_Y + 16)
+  context.font = halloweenFont(14)
+  context.fillStyle = HALLOWEEN.pumpkin
+  context.fillText('THE ANTI-DEMO', HALLOWEEN_X + 22, HALLOWEEN_Y + 64)
+}
+
+/** The round's number (or IDLE) and its Halloween name, and the opponent's colours. */
+function halloweenRound(session: DemoSession, roundNumber: number, kind: ReceiptKind) {
+  const aurora = session.competitor.id === 'aurora_serverless_v2'
+  return {
+    label: kind === 'idle' ? 'IDLE' : `ROUND ${String(roundNumber).padStart(2, '0')}`,
+    name: (HALLOWEEN_ROUND_NAMES[roundNumber] ?? HALLOWEEN_ROUND_NAMES[1]).toUpperCase(),
+    opponentTag: aurora ? 'AUR' : 'RDS',
+    opponentColor: aurora ? HALLOWEEN.aurora : HALLOWEEN.rds,
+  }
+}
+
+/** The cream stub: the disclaimer box, the doorbell invitation and the receipt's identity. */
+function drawHalloweenStub(
+  context: CanvasRenderingContext2D,
+  height: number,
+  identity: { stamp: string; audit: string },
+  layout: 'knockout' | 'health-bars',
+) {
+  const top = height - HALLOWEEN_Y - 88
+  context.fillStyle = HALLOWEEN.bone
+  context.fillRect(HALLOWEEN_X, top, HALLOWEEN_WIDTH, 88)
+  context.fillStyle = HALLOWEEN.ink
+  for (let x = HALLOWEEN_X; x < HALLOWEEN_X + HALLOWEEN_WIDTH; x += 16) context.fillRect(x, top, 8, 6)
+  const left = HALLOWEEN_X + 22
+  const right = HALLOWEEN_X + HALLOWEEN_WIDTH - 22
+  if (layout === 'knockout') {
+    context.strokeStyle = HALLOWEEN.blood
+    context.lineWidth = 3
+    context.strokeRect(left + 1.5, top + 21.5, 197, 48)
+    context.textAlign = 'center'
+    context.fillStyle = HALLOWEEN.blood
+    context.font = halloweenFont(13)
+    context.fillText('ONE LIVE RUN', left + 100, top + 32)
+    context.fillStyle = HALLOWEEN.ink
+    context.font = halloweenFont(9)
+    context.fillText('NOT A BENCHMARK', left + 100, top + 52)
+    context.textAlign = 'left'
+    context.font = halloweenFont(16)
+    context.fillStyle = HALLOWEEN.ink
+    context.fillText("DON'T TRUST THIS POST.", left + 228, top + 29)
+    context.fillStyle = HALLOWEEN.blood
+    context.fillText('RING THE DOORBELL YOURSELF.', left + 228, top + 53)
+    drawFittedCanvasText(context, identity.stamp, {
+      x: right, y: top + 30, maxWidth: 330, maxLines: 1, startSize: 11, minSize: 7, color: HALLOWEEN.ink, align: 'right',
+    })
+    drawFittedCanvasText(context, identity.audit, {
+      x: right, y: top + 52, maxWidth: 330, maxLines: 1, startSize: 8, minSize: 6, color: HALLOWEEN.ink, align: 'right',
+    })
+    return
+  }
+  context.font = halloweenFont(13)
+  context.fillStyle = HALLOWEEN.blood
+  context.fillText('ONE LIVE RUN · NOT A BENCHMARK', left, top + 20)
+  context.font = halloweenFont(13)
+  context.fillStyle = HALLOWEEN.ink
+  context.fillText("DON'T TRUST THIS POST. RING THE DOORBELL YOURSELF.", left, top + 41)
+  drawFittedCanvasText(context, identity.audit, {
+    x: left, y: top + 63, maxWidth: 780, maxLines: 1, startSize: 8, minSize: 6, color: HALLOWEEN.ink,
+  })
+  context.fillStyle = HALLOWEEN.crypt
+  context.fillRect(right - 260, top + 16, 260, 60)
+  context.strokeStyle = HALLOWEEN.slime
+  context.lineWidth = 3
+  context.strokeRect(right - 258.5, top + 17.5, 257, 57)
+  const [stamp, receiptLine] = identity.stamp.split('\n')
+  drawFittedCanvasText(context, stamp, {
+    x: right - 130, y: top + 29, maxWidth: 240, maxLines: 1, startSize: 13, minSize: 8, color: HALLOWEEN.slime, align: 'center',
+  })
+  drawFittedCanvasText(context, receiptLine ?? '', {
+    x: right - 130, y: top + 52, maxWidth: 240, maxLines: 1, startSize: 9, minSize: 6, color: HALLOWEEN.bone, align: 'center',
+  })
+}
+
+/** The Halloween knockout card: the design's "Knockout" frame, from `receiptKnockout`. */
+function drawHalloweenKnockoutReceipt(
+  context: CanvasRenderingContext2D,
+  height: number,
+  session: DemoSession,
+  roundNumber: number,
+  kind: ReceiptKind,
+  receipt: ReceiptPresentation,
+  knockout: ReceiptKnockout,
+) {
+  const at = (x: number, y: number) => [HALLOWEEN_X + x, HALLOWEEN_Y + y] as const
+  const round = halloweenRound(session, roundNumber, kind)
+  const panel = height - 36
+
+  // The night: the pumpkin glow, the moon, the bats and the graveyard.
+  drawPixelGrid(context, glowSprite(), ...at(-4, 78), 10)
+  drawPixelGrid(context, moonSprite(), ...at(HALLOWEEN_WIDTH - 16 - 220, 106), 10)
+  drawPixelGrid(context, BAT_SPRITE, ...at(300, 340), 3)
+  drawPixelGrid(context, BAT_SPRITE, ...at(575, 336), 4)
+  drawPixelGrid(context, BAT_SPRITE, ...at(840, 330), 3)
+  for (const [x, cell] of [[400, 5], [445, 4], [690, 4], [728, 6]] as const) {
+    drawPixelGrid(context, TOMB_SPRITE, ...at(x, panel - 168 - 9 * cell), cell)
+  }
+
+  // Which round, and what it races.
+  const right = HALLOWEEN_X + HALLOWEEN_WIDTH - 22
+  drawFittedCanvasText(context, `${round.label} · ${round.name}`, {
+    x: right, y: HALLOWEEN_Y + 18, maxWidth: 540, maxLines: 1, startSize: 12, minSize: 8, color: HALLOWEEN.pumpkin, align: 'right',
+  })
+  drawFittedCanvasText(context, knockout.setup, {
+    x: right, y: HALLOWEEN_Y + 40, maxWidth: 540, maxLines: 1, startSize: 9, minSize: 7, color: HALLOWEEN.bone, align: 'right',
+  })
+
+  // The fighters: Lakebase is the pumpkin; the opponent is Frankenstein, in every round.
+  const fighter = (sprite: ReturnType<typeof fighterSprite>, x: number, label: string) => {
+    drawPixelGrid(context, sprite, ...at(x, 108), 10)
+    context.textAlign = 'center'
+    context.fillStyle = HALLOWEEN.bone
+    context.font = halloweenFont(15)
+    context.fillText(label, HALLOWEEN_X + x + 80, HALLOWEEN_Y + 108 + 172)
+    context.textAlign = 'left'
+  }
+  fighter(fighterSprite('pumpkin', HALLOWEEN.blood), 46, 'LB')
+  fighter(fighterSprite('frankenstein', round.opponentColor), HALLOWEEN_WIDTH - 46 - 160, round.opponentTag)
+
+  // The hero, stepped down only as far as its column needs, with the ledger's qualifier.
+  const centre = HALLOWEEN_X + HALLOWEEN_WIDTH / 2
+  let heroSize = 150
+  context.font = halloweenFont(heroSize)
+  while (heroSize > 90 && context.measureText(knockout.hero).width > 548) {
+    heroSize -= 10
+    context.font = halloweenFont(heroSize)
+  }
+  const heroY = HALLOWEEN_Y + 92 + (150 - heroSize) / 2
+  const winnerColor = knockout.winner === 'lakebase' ? HALLOWEEN.blood : round.opponentColor
+  context.textAlign = 'center'
+  context.fillStyle = HALLOWEEN.bruise
+  context.fillText(knockout.hero, centre + 12, heroY + 12)
+  context.fillStyle = winnerColor
+  context.fillText(knockout.hero, centre + 6, heroY + 6)
+  context.fillStyle = HALLOWEEN.candy
+  context.fillText(knockout.hero, centre, heroY)
+  context.textAlign = 'left'
+  const afterQualifier = drawFittedCanvasText(context, knockout.qualifier, {
+    x: centre, y: HALLOWEEN_Y + 264, maxWidth: 548, maxLines: 2, startSize: 22, minSize: 12,
+    color: HALLOWEEN.bone, align: 'center', lineHeight: 28,
+  })
+  drawFittedCanvasText(context, `LAKEBASE VS ${session.competitor.short_name.toUpperCase()}`, {
+    x: centre, y: afterQualifier + 8, maxWidth: 548, maxLines: 1, startSize: 11, minSize: 7,
+    color: HALLOWEEN.lilac, align: 'center',
+  })
+
+  // Both lanes' exact clocks; the winner's chip is TREAT and the scorecard's own word.
+  const lane = (home: boolean) => {
+    const won = knockout.winner === (home ? 'lakebase' : 'competitor')
+    const x = home ? HALLOWEEN_X + 22 : right
+    const align: CanvasTextAlign = home ? 'left' : 'right'
+    const chip = won ? `TREAT · ${knockout.chip}` : 'TRICK'
+    context.font = halloweenFont(10)
+    const chipWidth = context.measureText(chip).width + 20
+    context.fillStyle = won ? HALLOWEEN.pumpkin : HALLOWEEN.ring
+    context.fillRect(home ? x : x - chipWidth, HALLOWEEN_Y + 316, chipWidth, 20)
+    context.fillStyle = won ? HALLOWEEN.ink : HALLOWEEN.bone
+    context.textAlign = align
+    context.fillText(chip, home ? x + 10 : x - 10, HALLOWEEN_Y + 321)
+    context.textAlign = 'left'
+    const name = home ? 'LAKEBASE' : session.competitor.short_name.toUpperCase()
+    const nameColor = home ? HALLOWEEN.blood : round.opponentColor
+    if (!home && knockout.capabilityGap) {
+      // No clock to print: the lane fact, in full, where the clock would go.
+      drawFittedCanvasText(context, receipt.competitorValue.toUpperCase(), {
+        x, y: HALLOWEEN_Y + 344, maxWidth: 280, maxLines: 2, startSize: 14, minSize: 8, color: HALLOWEEN.bone, align, lineHeight: 17,
+      })
+      drawFittedCanvasText(context, receipt.competitorStatus.toUpperCase(), {
+        x, y: HALLOWEEN_Y + 380, maxWidth: 280, maxLines: 1, startSize: 7, minSize: 6, color: HALLOWEEN.lilac, align,
+      })
+    } else {
+      const value = home ? receipt.lakebaseValue : receipt.competitorValue
+      // The design's 4 px ink drop under the clock, then the clock.
+      drawFittedCanvasText(context, value, {
+        x: x + 4, y: HALLOWEEN_Y + 348, maxWidth: 280, maxLines: 1, startSize: 40, minSize: 18, color: HALLOWEEN.ink, align,
+      })
+      drawFittedCanvasText(context, value, {
+        x, y: HALLOWEEN_Y + 344, maxWidth: 280, maxLines: 1, startSize: 40, minSize: 18, color: HALLOWEEN.bone, align,
+      })
+    }
+    drawFittedCanvasText(context, name, {
+      x, y: HALLOWEEN_Y + 394, maxWidth: 280, maxLines: 1, startSize: 12, minSize: 8, color: nameColor, align,
+    })
+  }
+  lane(true)
+  lane(false)
+
+  // The verdict band: what was declared, in the scorecard's own label.
+  const bandY = HALLOWEEN_Y + 416
+  context.fillStyle = HALLOWEEN.blood
+  context.fillRect(HALLOWEEN_X, bandY, HALLOWEEN_WIDTH, 76)
+  context.fillStyle = HALLOWEEN.pumpkin
+  context.fillRect(HALLOWEEN_X + 4, bandY + 4, HALLOWEEN_WIDTH - 8, 68)
+  context.font = halloweenFont(10)
+  const verdictBox = `VERDICT · ${round.label}`
+  const boxWidth = context.measureText(verdictBox).width + 28
+  context.fillStyle = HALLOWEEN.ink
+  context.fillRect(right - boxWidth, bandY + 24, boxWidth, 30)
+  context.fillStyle = HALLOWEEN.candy
+  context.fillText(verdictBox, right - boxWidth + 14, bandY + 34)
+  drawFittedCanvasText(context, 'THE RESULTS SPEAK FOR THEMSELVES.', {
+    x: HALLOWEEN_X + 22, y: bandY + 18, maxWidth: HALLOWEEN_WIDTH - 88 - boxWidth, maxLines: 1, startSize: 20, minSize: 12, color: HALLOWEEN.ink,
+  })
+  drawFittedCanvasText(context, receipt.verdictLabel, {
+    x: HALLOWEEN_X + 22, y: bandY + 48, maxWidth: HALLOWEEN_WIDTH - 88 - boxWidth, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.ink,
+  })
+
+  const auditStart = kind === 'idle'
+    ? `RESET ${session.cooldown!.started_at}`
+    : `START GAP ${receiptStartSkewDisplay(session)}`
+  drawHalloweenStub(context, height, {
+    stamp: `${receipt.verifiedStamp} · RECEIPT ${receiptId(session)}`,
+    audit: `${auditStart} · ${receipt.measuredAt}`,
+  }, 'knockout')
+}
+
+/** The Halloween health-bar card: the design's "Health bars" frame, from `receiptHealthBars`. */
+function drawHalloweenHealthBarReceipt(
+  context: CanvasRenderingContext2D,
+  height: number,
+  session: DemoSession,
+  roundNumber: number,
+  kind: ReceiptKind,
+  receipt: ReceiptPresentation,
+  bars: ReceiptHealthBars,
+) {
+  const at = (x: number, y: number) => [HALLOWEEN_X + x, HALLOWEEN_Y + y] as const
+  const round = halloweenRound(session, roundNumber, kind)
+
+  drawPixelGrid(context, moonSprite(), ...at(770, 12), 6)
+  drawPixelGrid(context, BAT_SPRITE, ...at(560, 30), 3)
+  drawPixelGrid(context, BAT_SPRITE, ...at(690, 92), 4)
+
+  // The round's Halloween name, then its number and what the bars measure.
+  drawFittedCanvasText(context, round.name, {
+    x: HALLOWEEN_X + 22, y: HALLOWEEN_Y + 96, maxWidth: 740, maxLines: 1, startSize: 34, minSize: 18, color: HALLOWEEN.bone,
+  })
+  drawFittedCanvasText(context, `${round.label} · ${bars.title} · ${receipt.focus.toUpperCase()}`, {
+    x: HALLOWEEN_X + 22, y: HALLOWEEN_Y + 140, maxWidth: HALLOWEEN_WIDTH - 44, maxLines: 1, startSize: 12, minSize: 7, color: HALLOWEEN.pumpkin,
+  })
+
+  const trackX = HALLOWEEN_X + 132
+  const trackWidth = HALLOWEEN_WIDTH - 132 - 22
+  const fillX = trackX + 2
+  const fillWidth = trackWidth - 4
+  const lane = (laneId: LaneId, top: number) => {
+    const home = laneId === 'lakebase'
+    const color = home ? HALLOWEEN.blood : round.opponentColor
+    const value = home ? receipt.lakebaseValue : receipt.competitorValue
+    const status = (home ? receipt.lakebaseStatus : receipt.competitorStatus).toUpperCase()
+    drawPixelGrid(
+      context,
+      home ? fighterSprite('pumpkin', HALLOWEEN.blood) : fighterSprite('frankenstein', round.opponentColor),
+      HALLOWEEN_X + 34, HALLOWEEN_Y + top - 4, 5,
+    )
+    context.textAlign = 'center'
+    context.fillStyle = HALLOWEEN.bone
+    context.font = halloweenFont(8)
+    context.fillText(home ? 'LB' : round.opponentTag, HALLOWEEN_X + 74, HALLOWEEN_Y + top + 82)
+    context.textAlign = 'left'
+    drawFittedCanvasText(context, home ? 'LAKEBASE' : session.competitor.short_name.toUpperCase(), {
+      x: trackX, y: HALLOWEEN_Y + top, maxWidth: trackWidth, maxLines: 1, startSize: 14, minSize: 9, color,
+    })
+    const trackY = HALLOWEEN_Y + top + 24
+    context.fillStyle = HALLOWEEN.track
+    context.fillRect(trackX, trackY, trackWidth, 58)
+    context.strokeStyle = HALLOWEEN.trackEdge
+    context.lineWidth = 2
+    context.strokeRect(trackX + 1, trackY + 1, trackWidth - 2, 56)
+
+    const share = bars.fill[laneId]
+    if (share <= 0) {
+      // No clock: the track stays empty and carries the lane fact in full.
+      drawFittedCanvasText(context, value.toUpperCase(), {
+        x: fillX + 18, y: trackY + 10, maxWidth: fillWidth - 36, maxLines: 1, startSize: 16, minSize: 10, color: HALLOWEEN.bone,
+      })
+      drawFittedCanvasText(context, status, {
+        x: fillX + 18, y: trackY + 36, maxWidth: fillWidth - 36, maxLines: 1, startSize: 8, minSize: 6, color: HALLOWEEN.lilac,
+      })
+      return
+    }
+    // Never thinner than a visible stub, never past the track.
+    const width = Math.max(12, Math.round(fillWidth * Math.min(1, share)))
+    context.fillStyle = color
+    context.fillRect(fillX, trackY + 2, width, 54)
+    context.font = halloweenFont(34)
+    const valueWidth = context.measureText(value).width
+    if (fillX + width + 20 + valueWidth + 24 + 200 <= fillX + fillWidth) {
+      // A short bar: the clock and its status follow the fill along the track.
+      const valueX = fillX + width + 20
+      context.fillStyle = HALLOWEEN.ink
+      context.fillText(value, valueX + 3, trackY + 15)
+      context.fillStyle = HALLOWEEN.bone
+      context.fillText(value, valueX, trackY + 12)
+      drawFittedCanvasText(context, status, {
+        x: valueX + valueWidth + 24, y: trackY + 24, maxWidth: fillX + fillWidth - 18 - (valueX + valueWidth + 24),
+        maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.bone,
+      })
+    } else {
+      // A long bar: the clock sits at its end, the status inside it.
+      context.textAlign = 'right'
+      context.fillStyle = HALLOWEEN.ink
+      context.fillText(value, fillX + width - 17, trackY + 15)
+      context.fillStyle = HALLOWEEN.bone
+      context.fillText(value, fillX + width - 20, trackY + 12)
+      context.textAlign = 'left'
+      drawFittedCanvasText(context, status, {
+        x: fillX + 20, y: trackY + 24, maxWidth: width - valueWidth - 64, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.bone,
+      })
+    }
+  }
+  lane('lakebase', 170)
+  lane('competitor', 288)
+
+  // The verdict band: the precondition and the exact margin, then the verdict in human units.
+  const bandY = HALLOWEEN_Y + 386
+  context.fillStyle = HALLOWEEN.blood
+  context.fillRect(HALLOWEEN_X, bandY, HALLOWEEN_WIDTH, 102)
+  context.fillStyle = HALLOWEEN.pumpkin
+  context.fillRect(HALLOWEEN_X + 4, bandY + 4, HALLOWEEN_WIDTH - 8, 94)
+  const right = HALLOWEEN_X + HALLOWEEN_WIDTH - 22
+  let asideWidth = 0
+  if (bars.aside) {
+    drawFittedCanvasText(context, bars.aside, {
+      x: right, y: bandY + 16, maxWidth: 420, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.ink, align: 'right',
+    })
+    asideWidth = context.measureText(bars.aside).width + 24
+  }
+  drawFittedCanvasText(context, receipt.verdictLabel, {
+    x: HALLOWEEN_X + 22, y: bandY + 16, maxWidth: HALLOWEEN_WIDTH - 44 - asideWidth, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.ink,
+  })
+  drawFittedCanvasText(context, bars.verdict, {
+    x: HALLOWEEN_X + 22, y: bandY + 38, maxWidth: HALLOWEEN_WIDTH - 44, maxLines: 1, startSize: 30, minSize: 14, color: HALLOWEEN.ink,
+  })
+  drawFittedCanvasText(context, 'THE RESULTS SPEAK FOR THEMSELVES.', {
+    x: HALLOWEEN_X + 22, y: bandY + 78, maxWidth: HALLOWEEN_WIDTH - 44, maxLines: 1, startSize: 12, minSize: 8, color: HALLOWEEN.ink,
+  })
+
+  const auditStart = kind === 'idle'
+    ? `RESET ${session.cooldown!.started_at}`
+    : `START GAP ${fanInStartSkewDisplay(session)}`
+  drawHalloweenStub(context, height, {
+    stamp: `${receipt.verifiedStamp}\n${receipt.receiptLabel} ${receiptId(session)}`,
+    audit: `${auditStart} · ${receipt.measuredAt}`,
+  }, 'health-bars')
+}
+
 async function downloadReceiptCard(
   session: DemoSession,
   roundNumber: number,
   kind: ReceiptKind,
   style: ReceiptCardStyle = DEFAULT_RECEIPT_CARD_STYLE,
+  theme: ReceiptCardTheme = 'classic',
   rendered?: Blob,
 ): Promise<void> {
-  const blob = rendered ?? await renderReceiptCard(session, roundNumber, kind, style)
+  const blob = rendered ?? await renderReceiptCard(session, roundNumber, kind, style, theme)
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = receiptCardFilename(session, roundNumber, kind, style)
+  link.download = receiptCardFilename(session, roundNumber, kind, style, theme)
   link.click()
   window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
@@ -2942,11 +3372,12 @@ function receiptCardFilename(
   roundNumber: number,
   kind: ReceiptKind,
   style: ReceiptCardStyle = DEFAULT_RECEIPT_CARD_STYLE,
+  theme: ReceiptCardTheme = 'classic',
 ): string {
   const base = kind === 'idle'
     ? `lakebase-anti-demo-idle-receipt-${receiptId(session)}`
     : `lakebase-anti-demo-round-${roundNumber}-receipt-${receiptId(session)}`
-  return `${base}-${style}.png`
+  return `${base}-${style}${theme === 'halloween' ? '-halloween' : ''}.png`
 }
 
 /** A Round 6 lane's own clock, or that it has none: never an invented figure. */
@@ -5296,7 +5727,7 @@ function GameNav({ back, next, onBack, onNext }: { back?: string; next: string; 
 
 function DatabaseFighter({ label, corner }: { label: string; corner: 'red' | 'blue' }) {
   return (
-    <div className="database-fighter" data-corner={corner} aria-hidden="true">
+    <div className="database-fighter" data-corner={corner} data-costume={fighterCostume(corner)} aria-hidden="true">
       <div className="fighter-crown"><i /><i /><i /></div>
       <div className="fighter-face"><i /><i /></div>
       <div className="fighter-body"><span>{label}</span></div>
@@ -7755,7 +8186,14 @@ function ShareReceipt({
     ? preferredStyle
     : availableStyles[0] ?? DEFAULT_RECEIPT_CARD_STYLE
 
-  const cardKey = `${session.id}:${session.updated_at}:${roundNumber}:${kind}:${cardStyle}`
+  // Halloween (v1.2.1): in season, the layouts above can be drawn in the Halloween skin. It
+  // is offered checked, and unchecking it gives the original card; the facts are the same.
+  // Out of season, or for a scorecard-only receipt, the box isn't there at all.
+  const halloweenOffered = availableStyles.length > 0 && isHalloweenSeason()
+  const [halloweenChosen, setHalloweenChosen] = useState(true)
+  const cardTheme: ReceiptCardTheme = halloweenOffered && halloweenChosen ? 'halloween' : 'classic'
+
+  const cardKey = `${session.id}:${session.updated_at}:${roundNumber}:${kind}:${cardStyle}:${cardTheme}`
   const [renderedCard, setRenderedCard] = useState<{ key: string; blob: Blob } | null>(null)
   const [failedCardKey, setFailedCardKey] = useState<string | null>(null)
   const cardBlob = renderedCard?.key === cardKey ? renderedCard.blob : null
@@ -7763,11 +8201,11 @@ function ShareReceipt({
 
   useEffect(() => {
     let current = true
-    void renderReceiptCard(session, roundNumber, kind, cardStyle)
+    void renderReceiptCard(session, roundNumber, kind, cardStyle, cardTheme)
       .then((blob) => { if (current) setRenderedCard({ key: cardKey, blob }) })
       .catch(() => { if (current) setFailedCardKey(cardKey) })
     return () => { current = false }
-  }, [cardKey, cardStyle, kind, roundNumber, session])
+  }, [cardKey, cardStyle, cardTheme, kind, roundNumber, session])
 
   async function copyPost(updateStatus = true): Promise<boolean> {
     try {
@@ -7795,7 +8233,7 @@ function ShareReceipt({
   async function prepareLinkedInPost() {
     if (!cardBlob) return
     const linkedinUrl = 'https://www.linkedin.com/feed/?shareActive=true'
-    const filename = receiptCardFilename(session, roundNumber, kind, cardStyle)
+    const filename = receiptCardFilename(session, roundNumber, kind, cardStyle, cardTheme)
     const file = new File([cardBlob], filename, { type: 'image/png' })
     const shareData: ShareData = {
       files: [file],
@@ -7812,7 +8250,7 @@ function ShareReceipt({
     // wants the post, so they still get the tab, the PNG and the caption.
     const dismissed = shareDismissalPrefix(outcome)
     window.open(linkedinUrl, '_blank', 'noopener,noreferrer')
-    const download = downloadReceiptCard(session, roundNumber, kind, cardStyle, cardBlob)
+    const download = downloadReceiptCard(session, roundNumber, kind, cardStyle, cardTheme, cardBlob)
     const caption = copyPost(false)
     const [downloadResult, captionCopied] = await Promise.all([download.then(() => true).catch(() => false), caption])
     if (downloadResult && captionCopied) {
@@ -7868,6 +8306,16 @@ function ShareReceipt({
               )
             })}
           </div>
+        )}
+        {halloweenOffered && (
+          <label className="receipt-theme-toggle">
+            <input
+              type="checkbox"
+              checked={halloweenChosen}
+              onChange={(event) => { setHalloweenChosen(event.target.checked); setStatus(null) }}
+            />
+            Halloween card
+          </label>
         )}
         <p className="receipt-share-note">LinkedIn desktop needs the PNG added as media; browser image paste is not reliable.</p>
         {status && <p className="receipt-status" role="status">{status}</p>}
