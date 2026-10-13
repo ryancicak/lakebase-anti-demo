@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -315,6 +316,63 @@ def _message_is_ours_to_quote(error: BaseException) -> bool:
     return (kind.__module__ or "").split(".")[0] == "server"
 
 
+def _audience_exception_may_keep_text(error: BaseException) -> bool:
+    """Whether an exception's own text may reach a card, a receipt or a 409.
+
+    An allow-list, so a library nobody thought of falls on the safe side. Only these
+    keep their text:
+    - an exception this server defines, whose sentence we wrote;
+    - a `DatabricksError`, whose message names the permission or table an operator
+      must repair;
+    - a built-in exception that this server raised.
+
+    That last condition matters because built-ins come from both sides. This server
+    raises `TimeoutError("the coordination database did not answer within 30s")`, but
+    asyncio raises `ConnectionRefusedError("[Errno 61] Connect call failed
+    ('10.0.1.23', 5432)")`. Whether a built-in is ours is decided by where it was
+    raised, not by its type.
+
+    Everything else becomes its type and code (`audience_diagnosis`): botocore,
+    psycopg, psycopg_pool, urllib3, httpx, ssl, socket. A deny-list of those packages
+    let any other one through by default (Cursor's review of v1.2.0).
+    """
+
+    kind = type(error)
+    if issubclass(kind, DatabricksError):
+        return True
+    top_level = (kind.__module__ or "").split(".")[0]
+    if top_level == "server":
+        return True
+    return top_level == "builtins" and _raised_by_this_server(error)
+
+
+#: This checkout's root: `server/` and `app.py` live here, and so do the test doubles that
+#: stand in for server code. Installed libraries do not, even under a `.venv` inside it.
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _raised_by_this_server(error: BaseException) -> bool:
+    """Whether the frame that raised ``error`` is this checkout's own code.
+
+    Judged by the raising frame's file, not its module name: a library or the standard
+    library lives outside the checkout or under a `site-packages` directory.
+    """
+
+    traceback = error.__traceback__
+    if traceback is None:
+        # Constructed, not raised: a value this server built and is now rendering.
+        return True
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    try:
+        path = Path(traceback.tb_frame.f_code.co_filename).resolve()
+    except (OSError, ValueError):
+        return False
+    if "site-packages" in path.parts or "dist-packages" in path.parts:
+        return False
+    return path.is_relative_to(_SOURCE_ROOT)
+
+
 def _quotable_link(error: BaseException) -> str:
     rendered = _redacted_link(error)
     message = " ".join(str(error).split())
@@ -353,21 +411,21 @@ def audience_diagnosis(error: BaseException) -> str:
     return _redacted_exception_chain(error)
 
 
-#: Packages whose exception text is a provider's own words: a botocore message names the
-#: account, role or ARN it refused, and a psycopg one the host and role.
-_PROVIDER_PACKAGES = frozenset({"boto3", "botocore", "psycopg"})
-
-
 def audience_error_text(error: BaseException) -> str:
     """An exception as a card, a receipt or a 409 may quote it.
 
     This server's own sentence is kept. A provider's message becomes its type and code
     (`audience_diagnosis`); the operator log is where its words belong.
+
+    ALLOW-LIST: only our own exception types, Databricks refusals, and built-in exceptions
+    may keep their text. Everything else (boto3, botocore, psycopg_pool, urllib3, httpx,
+    socket, ssl, s3transfer, etc.) is redacted to type and code, because provider messages
+    can carry DSNs, secret ARNs, hosts and IPs.
     """
 
-    if (type(error).__module__ or "").split(".")[0] in _PROVIDER_PACKAGES:
-        return audience_diagnosis(error)
-    return str(error) or type(error).__name__
+    if _audience_exception_may_keep_text(error):
+        return str(error) or type(error).__name__
+    return audience_diagnosis(error)
 
 
 def authorization_refusal(error: BaseException) -> BaseException | None:
