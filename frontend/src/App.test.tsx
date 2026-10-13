@@ -4812,17 +4812,21 @@ describe('backstage setup', () => {
     expect(within(receipt).getByRole('button', { name: /knockout/i })).toHaveAttribute('aria-pressed', 'false')
   })
 
-  it('share modal: in season the Halloween card is offered checked, keeps the facts, and unchecks to the original', async () => {
-    // October 13: inside the Halloween season. The test setup moves the clock back afterwards.
+  /**
+   * Halloween (v1.2.1): a Round 1 bout against Aurora with both clocks verified, rung and
+   * finished on October 13, inside the season (the test setup moves the clock back after),
+   * with the Share dialog's download and clipboard plumbing stubbed.
+   */
+  async function finishABoutInSeason(lakebaseMs: number, competitorMs: number, rememberedResult: string) {
     halloweenClock.now = () => new Date(2026, 9, 13, 12, 0, 0)
     const running = session('running')
     const verified: DemoSession = {
       ...session('verified'),
       lanes: {
-        lakebase: { ...running.lanes.lakebase, state: 'verified', elapsed_ms: 842.6, attempts: 1, status: 'Transaction verified' },
-        competitor: { ...running.lanes.competitor, state: 'verified', elapsed_ms: 1288.3, attempts: 1, status: 'Transaction verified' },
+        lakebase: { ...running.lanes.lakebase, state: 'verified', elapsed_ms: lakebaseMs, attempts: 1, status: 'Transaction verified' },
+        competitor: { ...running.lanes.competitor, state: 'verified', elapsed_ms: competitorMs, attempts: 1, status: 'Transaction verified' },
       },
-      remembered_result: 'LAKEBASE WINS BY 0.45s',
+      remembered_result: rememberedResult,
     }
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
@@ -4857,7 +4861,12 @@ describe('backstage setup', () => {
       occurred_at: '2026-08-17T00:00:01Z',
       payload: { state: 'verified', session: verified },
     })
-    expect(await screen.findByText('LAKEBASE WINS BY 0.45s')).toBeInTheDocument()
+    expect(await screen.findByText(rememberedResult)).toBeInTheDocument()
+    return { user, downloadClick }
+  }
+
+  it('share modal: in season the Halloween card is offered checked, keeps the facts, and unchecks to the original', async () => {
+    const { user, downloadClick } = await finishABoutInSeason(842.6, 1288.3, 'LAKEBASE WINS BY 0.45s')
 
     const openShare = () => user.click(screen.getByRole('button', { name: /share the receipt/i }))
     await openShare()
@@ -4914,6 +4923,24 @@ describe('backstage setup', () => {
     await openShare()
     receipt = await screen.findByRole('dialog', { name: /share the proof/i })
     expect(within(receipt).getByRole('checkbox', { name: /halloween card/i })).toBeChecked()
+  })
+
+  it('share modal: a round the opponent wins gives the opponent the Halloween treat', async () => {
+    const { user } = await finishABoutInSeason(1288.3, 842.6, 'AURORA SERVERLESS V2 WINS BY 0.45s')
+    await user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    const receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    expect(within(receipt).getByRole('checkbox', { name: /halloween card/i })).toBeChecked()
+    await user.click(within(receipt).getByRole('button', { name: /knockout/i }))
+    await waitFor(() => expect(canvasTexts(getCanvasRecordings().at(-1)!)).toContain('RING THE DOORBELL YOURSELF.'))
+
+    // Treat and Trick follow the winner, not the brand: Lakebase's chip is drawn on the left
+    // (x 50) and the opponent's on the right (x 1150).
+    const chips = getCanvasRecordings().at(-1)!.operations
+      .filter((operation): operation is Extract<CanvasOperation, { kind: 'fillText' }> => operation.kind === 'fillText')
+      .filter((operation) => operation.text === 'TRICK' || operation.text.startsWith('TREAT · '))
+      .map((operation) => [operation.text === 'TRICK' ? 'TRICK' : 'TREAT', operation.x < 600 ? 'lakebase' : 'opponent'])
+    expect(chips).toEqual([['TRICK', 'lakebase'], ['TREAT', 'opponent']])
+    expect(canvasTexts(getCanvasRecordings().at(-1)!)).toEqual(expect.arrayContaining(['0.84s', '1.29s']))
   })
 
   // The deployed app's own words for Round 1, copied from
