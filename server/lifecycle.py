@@ -10856,6 +10856,14 @@ def _round5_runtime_tag_inventory(manifest: DemoManifest) -> list[str]:
             "anti-demo-bout-id": bout_id,
             "anti-demo:bout-token": token,
         }
+        # Round 5 has tagged every per-bout resource with its bout's fencing token since v1.1.0
+        # (`connection_spike_live`, `str(scope.fencing_token)`). Without it here, an uninstall
+        # that met a bout's proxy on 2026-10-13 refused with "ownership tags differ" instead of
+        # naming the bout still cleaning up. Only a plain decimal fence passes; anything else
+        # still differs.
+        fence = actual.get("anti-demo:bout-fence", "")
+        if fence.isascii() and fence.isdigit():
+            exact["anti-demo:bout-fence"] = fence
         expected_token = hashlib.sha256(bout_id.encode()).hexdigest()[:16] if bout_id else ""
         if (
             actual != exact
