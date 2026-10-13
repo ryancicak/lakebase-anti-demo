@@ -98,6 +98,17 @@ def deployed_shaped_runtime(monkeypatch) -> None:
     monkeypatch.setattr("server.receipts.state_dir_from_environ", lambda *_a, **_k: None)
 
 
+def _is_terminal_outcome(sealing_event: str) -> bool:
+    """Check if a sealing event represents a terminal outcome (not a cancellation)."""
+    return (
+        sealing_event.startswith("run_finished")
+        or sealing_event.startswith("towel_finished")
+        or sealing_event.startswith("session_failed")
+        or sealing_event.startswith("redo_finished")
+        or sealing_event.startswith("redo_failed")
+    )
+
+
 class FakeCoordinationCursor:
     """Enough of the coordination database to hold receipts, and nothing more.
 
@@ -208,7 +219,7 @@ class FakeCoordinationCursor:
                         False
                         if is_cleanup
                         else latest_event[key].startswith("session_cancelled")
-                        and str(row[2]).startswith("run_finished")
+                        and _is_terminal_outcome(str(row[2]))
                         and row[6] == latest_non_cancelled_at[key]
                     ),
                     row[6],
@@ -224,7 +235,7 @@ class FakeCoordinationCursor:
                         False
                         if is_cleanup
                         else latest_event[key].startswith("session_cancelled")
-                        and str(current[2]).startswith("run_finished")
+                        and _is_terminal_outcome(str(current[2]))
                         and current[6] == latest_non_cancelled_at[key]
                     ),
                     current[6],
@@ -749,10 +760,13 @@ async def test_a_newer_accepted_failure_replaces_an_older_stopped_run_in_both_st
     write_receipt(cancellation, cancelled, tmp_path)
     await store.append(cancellation, cancelled)
 
-    assert json.loads(target.read_text())["receipt"]["sealing_event"] == "session_cancelled"
+    # A later cancellation does not replace a terminal outcome like session_failed,
+    # even when it comes from a later attempt. The failure is evidence that an
+    # accepted bout ran and failed, which is not negated by a later cancellation.
+    assert json.loads(target.read_text())["receipt"]["sealing_event"] == "session_failed"
     found = await store.load()
-    assert [item.sealing_event for item in found] == ["session_cancelled"]
-    assert found[0].failure == cancellation.failure
+    assert [item.sealing_event for item in found] == ["session_failed"]
+    assert found[0].failure == failure.failure
 
 
 async def test_a_late_older_file_write_cannot_clobber_a_newer_attempt(
@@ -1882,6 +1896,155 @@ async def test_a_run_receipt_on_disk_outranks_a_later_durable_cancellation(
 
     assert [item.sealing_event for item in found] == ["run_finished"]
     assert found[0].failure == run.failure
+
+
+async def test_a_disk_towel_finished_receipt_outranks_a_later_durable_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A towel_finished on disk survives a later durable cancellation of the same card.
+
+    The guard that keeps run_finished from being replaced must also protect other
+    terminal outcomes. A towel that finished (reached a settled state) is just as
+    terminal as a run that started, and a later cancellation cannot undo evidence
+    that the bout ended.
+    """
+
+    snapshot = await verified_round_one_snapshot()
+    monkeypatch.setenv("ANTI_DEMO_ARTIFACT_ROOT", str(tmp_path))
+    snapshot.state = SessionState.TOWELLED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.lanes["lakebase"].state = LaneState.TOWELLED
+    snapshot.lanes["lakebase"].elapsed_ms = None
+    snapshot.lanes["competitor"].state = LaneState.TOWELLED
+    snapshot.lanes["competitor"].elapsed_ms = None
+    snapshot.towel = TowelSnapshot(
+        state=TowelState.READY,
+        requested_at=snapshot.updated_at,
+        public_result="Towel thrown",
+    )
+    towel = derive_receipt(snapshot, "towel_finished")
+    write_receipt(towel, snapshot, receipts_root())
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+    store = durable_store(FakeCoordinationCursor())
+    await store.append(cancellation, cancelled)
+    install_receipt_store(store)
+
+    found = await load_receipts_async()
+
+    assert [item.sealing_event for item in found] == ["towel_finished"]
+    assert found[0].failure == towel.failure
+
+
+async def test_a_disk_session_failed_receipt_outranks_a_later_durable_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A session_failed on disk survives a later durable cancellation of the same card.
+
+    A failed but started bout is just as terminal as a successful one, and a
+    later cancellation cannot replace evidence that the bout ran and failed.
+    """
+
+    snapshot = await verified_round_one_snapshot()
+    monkeypatch.setenv("ANTI_DEMO_ARTIFACT_ROOT", str(tmp_path))
+    snapshot.state = SessionState.FAILED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.failure = "The accepted run stopped short."
+    snapshot.lanes["competitor"].state = LaneState.FAILED
+    failed = derive_receipt(snapshot, "session_failed")
+    assert failed.outcome == "stopped_short"
+    write_receipt(failed, snapshot, receipts_root())
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+    store = durable_store(FakeCoordinationCursor())
+    await store.append(cancellation, cancelled)
+    install_receipt_store(store)
+
+    found = await load_receipts_async()
+
+    assert [item.sealing_event for item in found] == ["session_failed"]
+    assert found[0].failure == failed.failure
+
+
+async def test_a_durable_towel_finished_outranks_a_disk_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Within the durable store itself, terminal outcomes outrank cancellations.
+
+    The same precedence applies to both stores independently: a towel_finished
+    in the durable store is not replaced by a later session_cancelled.
+    """
+
+    snapshot = await verified_round_one_snapshot()
+    monkeypatch.setenv("ANTI_DEMO_ARTIFACT_ROOT", str(tmp_path))
+    snapshot.state = SessionState.TOWELLED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.lanes["lakebase"].state = LaneState.TOWELLED
+    snapshot.lanes["lakebase"].elapsed_ms = None
+    snapshot.lanes["competitor"].state = LaneState.TOWELLED
+    snapshot.lanes["competitor"].elapsed_ms = None
+    snapshot.towel = TowelSnapshot(
+        state=TowelState.READY,
+        requested_at=snapshot.updated_at,
+        public_result="Towel thrown",
+    )
+    towel = derive_receipt(snapshot, "towel_finished")
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    await store.append(towel, snapshot)
+    await store.append(cancellation, cancelled)
+
+    found = await store.load()
+    assert [item.sealing_event for item in found] == ["towel_finished"]
+    assert found[0].failure == towel.failure
+
+
+async def test_a_durable_failure_outranks_a_later_durable_cancellation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Within the durable store itself, a session_failed outranks a later cancellation."""
+
+    snapshot = await verified_round_one_snapshot()
+    monkeypatch.setenv("ANTI_DEMO_ARTIFACT_ROOT", str(tmp_path))
+    snapshot.state = SessionState.FAILED
+    snapshot.remembered_result = None
+    snapshot.comparison = None
+    snapshot.failure = "The accepted run stopped short."
+    snapshot.lanes["competitor"].state = LaneState.FAILED
+    failed = derive_receipt(snapshot, "session_failed")
+
+    cancelled = snapshot.model_copy(deep=True)
+    cancelled.run_started_at = None
+    cancelled.updated_at += timedelta(seconds=1)
+    cancelled.failure = "Fight card cancelled by its owner before the bell."
+    cancellation = derive_receipt(cancelled, "session_cancelled")
+
+    cursor = FakeCoordinationCursor()
+    store = durable_store(cursor)
+    await store.append(failed, snapshot)
+    await store.append(cancellation, cancelled)
+
+    found = await store.load()
+    assert [item.sealing_event for item in found] == ["session_failed"]
+    assert found[0].failure == failed.failure
 
 
 async def test_a_broken_durable_read_still_shows_what_is_on_disk(

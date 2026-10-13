@@ -343,3 +343,39 @@ async def test_app_role_keeps_an_accepted_run_over_a_later_no_bell_cancel(pg):
             ("run_finished", stopped.sealed_at)
         ]
         await conn.rollback()
+
+
+@pytest.mark.parametrize("terminal", ["towel_finished", "session_failed"])
+async def test_app_role_keeps_a_towel_or_a_failure_over_a_later_no_bell_cancel(pg, terminal):
+    """In PostgreSQL, a no-bell cancel hides no terminal outcome, as it hides no run (v1.2.1)."""
+
+    failed, _ = await failed_then_verified_round_one_bouts()
+    failed.receipt_bout_id = "accepted-bout"
+    failed.run_started_at = failed.updated_at - timedelta(seconds=1)
+    ended = derive_receipt(failed, terminal)
+    cancelled = failed.model_copy(
+        deep=True,
+        update={
+            "receipt_bout_id": "later-no-bell-cancel",
+            "run_started_at": None,
+            "updated_at": failed.updated_at + timedelta(minutes=1),
+            "failure": "The later attempt was cancelled before the bell.",
+        },
+    )
+    no_bell = derive_receipt(cancelled, "session_cancelled")
+    _, app = pg
+    async with await psycopg.AsyncConnection.connect(**app) as conn:
+
+        async def run(operation):
+            async with conn.cursor() as cursor:
+                return await operation(cursor)
+
+        store = DurableReceiptStore(run)
+        await store.append(ended, failed)
+        await store.append(no_bell, cancelled)
+
+        found = await store.load()
+        assert [(item.sealing_event, item.sealed_at) for item in found] == [
+            (terminal, ended.sealed_at)
+        ]
+        await conn.rollback()
