@@ -108,6 +108,12 @@ for _item in os.environ.get("CHAOS_DELAYS", "").split(","):
         DELAYS.setdefault(_scenario, {})[_round] = float(_seconds)
 #: How long `armed-wait` leaves an armed card before ringing it.
 ARMED_WAIT_SECONDS = float(os.environ.get("CHAOS_ARMED_WAIT_SECONDS", "150"))
+#: How long Round 5 may take to read READY again after an `armed-wait` bout. Its cleanup ends
+#: only once AWS has deleted the bout's RDS Proxy. On 2026-10-13 that took 30.3 and 32.4 minutes
+#: after both bouts rung 150 s into their armed window, against 5-6 minutes after a prompt bell,
+#: with `DeleteDBProxy` sent 2 s after each result. The default 20 minutes failed the wave on
+#: AWS's delete, not on the bell the wave exists to test.
+ARMED_WAIT_ROUND5_READY_SECONDS = 2400.0
 TERMINAL = {"verified", "towelled", "failed"}
 #: How long a bout may take to reach a verdict. Every racing round decides its bout by its
 #: lanes' one maximum from the bell (`server/bout_limit.BOUT_TIME_LIMIT_SECONDS`, 15
@@ -683,7 +689,14 @@ class Harness:
                     result["cooldown_post"] = status
                     if status not in (200, 409):
                         raise RuntimeError(f"cooldown returned {status}: {payload}")
-            ready = self.wait_round_ready(round_id)
+            ready = self.wait_round_ready(
+                round_id,
+                timeout=(
+                    ARMED_WAIT_ROUND5_READY_SECONDS
+                    if scenario == "armed-wait" and round_id == "survive_connection_spike"
+                    else 1200
+                ),
+            )
             linger = result.get("linger")
             result.update(
                 passed=final.get("state") in {"verified", "towelled"}

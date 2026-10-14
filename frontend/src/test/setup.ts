@@ -1,4 +1,6 @@
 import '@testing-library/jest-dom/vitest'
+import { beforeEach } from 'vitest'
+import { halloweenClock } from '../halloween'
 
 const localStorageValues = new Map<string, string>()
 
@@ -210,3 +212,10 @@ Object.defineProperty(window, 'matchMedia', {
     dispatchEvent: () => false,
   }),
 })
+
+// Halloween (v1.2.1): every test starts outside the season, so none depends on the month the
+// suite runs in. A Halloween test moves `halloweenClock` into October itself; this puts it
+// back before the next test.
+const OUTSIDE_HALLOWEEN = (): Date => new Date(2026, 5, 15, 12, 0, 0)
+halloweenClock.now = OUTSIDE_HALLOWEEN
+beforeEach(() => { halloweenClock.now = OUTSIDE_HALLOWEEN })

@@ -113,6 +113,12 @@ SEALING_EVENTS = frozenset(
 # precedence also protects receipts already racing through independent durable
 # and filesystem writers.
 RUN_RECEIPT_EVENTS = frozenset({"run_finished"})
+
+# Terminal outcomes that must never be replaced by a cancellation. Any of these
+# represents a bout that either ran to completion or reached a final settled state,
+# and such evidence cannot be retroactively erased by a later cancellation, which
+# only means the owner cancelled before the bell was accepted.
+TERMINAL_OUTCOME_EVENTS = frozenset(SEALING_EVENTS - {"session_cancelled"})
 # Deliberately excluded: "towel_started" seals the session state but the towel is
 # still settling, and "towel_finished" follows with the settled truth. The one bout
 # that still leaves nothing is one killed between those two events.
@@ -877,6 +883,14 @@ class DurableReceiptStore:
 
         async def select(cursor: Any) -> list[Any]:
             id_sep, at_sep = _BOUT_ID_KEY_SEPARATOR, _ARMED_AT_KEY_SEPARATOR
+            # Built from TERMINAL_OUTCOME_EVENTS, so this read, `_merge_receipts` and
+            # `write_receipt` cannot disagree about which outcomes a cancellation may not hide.
+            terminal_outcome = " OR ".join(
+                f"sealing_event = '{event}'"
+                f" OR sealing_event LIKE '{event}{id_sep}%'"
+                f" OR sealing_event LIKE '{event}{at_sep}%'"
+                for event in sorted(TERMINAL_OUTCOME_EVENTS)
+            )
             await cursor.execute(
                 f"""
                 WITH annotated_receipts AS (
@@ -936,11 +950,7 @@ class DurableReceiptStore:
                                          OR latest_sealing_event LIKE 'session_cancelled{id_sep}%'
                                          OR latest_sealing_event LIKE 'session_cancelled{at_sep}%'
                                      )
-                                     AND (
-                                         sealing_event = 'run_finished'
-                                         OR sealing_event LIKE 'run_finished{id_sep}%'
-                                         OR sealing_event LIKE 'run_finished{at_sep}%'
-                                     )
+                                     AND ({terminal_outcome})
                                      AND sealed_at = latest_non_cancelled_at
                                     THEN 1 ELSE 0
                                 END DESC,
@@ -1070,7 +1080,7 @@ def _merge_receipts(
         existing = merged.get(key)
         if (
             existing is not None
-            and existing.sealing_event in RUN_RECEIPT_EVENTS
+            and existing.sealing_event in TERMINAL_OUTCOME_EVENTS
             and item.sealing_event == "session_cancelled"
         ):
             continue
@@ -1108,7 +1118,8 @@ def write_receipt(
     # That is a fact about the environment, not about whether the transaction
     # verified, and letting it overwrite the file would erase a proven result. The
     # later failure still reaches the operator live and the server log. Likewise,
-    # a no-bell cancellation can never replace evidence from an accepted run.
+    # a no-bell cancellation can never replace evidence from a bout that ran or
+    # reached a terminal outcome.
     existing = _stored_receipt(target) if target.exists() else None
     keep_existing = bool(
         existing is not None
@@ -1120,7 +1131,7 @@ def write_receipt(
             )
             or (
                 receipt.sealing_event == "session_cancelled"
-                and existing.sealing_event in RUN_RECEIPT_EVENTS
+                and existing.sealing_event in TERMINAL_OUTCOME_EVENTS
             )
         )
     )

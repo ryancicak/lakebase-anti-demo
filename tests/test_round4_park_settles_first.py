@@ -17,7 +17,10 @@ import pytest
 from server import lifecycle
 
 PIPELINE = "pipe-1"
-NAMES = {"synced_table_id": "main.anti_demo_online_ad_test_001.model_scores"}
+NAMES = {
+    "synced_table_id": "main.anti_demo_online_ad_test_001.model_scores",
+    "resource_name": "test_synced",
+}
 MANIFEST = SimpleNamespace(databricks=SimpleNamespace(profile="profile"), round4=None)
 
 
@@ -32,19 +35,36 @@ def synced(state: str, *, continuous: bool) -> dict:
     return {"data_synchronization_status": status}
 
 
+def postgres_synced(state: str, *, continuous: bool) -> dict:
+    """A /postgres synced table with the given state."""
+    status = {"detailed_state": state}
+    if continuous:
+        status["continuous_update_status"] = {"last_processed_commit_version": 2}
+    return {"status": status}
+
+
 class Workspace:
     """Scripted pipeline and synced-table reads, a fake clock, and every verb recorded."""
 
-    def __init__(self, monkeypatch, pipelines: list[dict], tables: list[dict]) -> None:
+    def __init__(
+        self,
+        monkeypatch,
+        pipelines: list[dict],
+        tables: list[dict],
+        postgres_tables: list[dict] | None = None,
+    ) -> None:
         self.pipelines = list(pipelines)
         self.tables = list(tables)
+        self.postgres_tables = list(postgres_tables) if postgres_tables else []
         self.last_pipeline = self.pipelines[-1]
         self.last_table = self.tables[-1] if self.tables else {}
+        self.last_postgres = self.postgres_tables[-1] if self.postgres_tables else {}
         self.verbs: list[str] = []
         self.now = 0.0
         self.stopped_at_read: int | None = None
         self.reads = 0
         monkeypatch.setattr(lifecycle, "_round4_get_pipeline", self.get_pipeline)
+        monkeypatch.setattr(lifecycle, "_round4_get_synced_table", self.get_postgres_table)
         monkeypatch.setattr(lifecycle, "_round4_get_database_synced_table", self.get_table)
         monkeypatch.setattr(lifecycle, "_round4_pipeline_verb", self.verb)
         monkeypatch.setattr(lifecycle.time, "monotonic", lambda: self.now)
@@ -57,6 +77,12 @@ class Workspace:
             self.last_pipeline = self.pipelines.pop(0)
         return self.last_pipeline
 
+    def get_postgres_table(self, _manifest, names):
+        assert names is NAMES
+        if self.postgres_tables:
+            self.last_postgres = self.postgres_tables.pop(0)
+        return self.last_postgres
+
     def get_table(self, _manifest, names):
         assert names is NAMES
         if self.tables:
@@ -67,6 +93,7 @@ class Workspace:
         assert pipeline_id == PIPELINE
         self.verbs.append(verb)
         self.stopped_at_read = self.reads
+        self.stopped_at = self.now
         # Once stopped, the pipeline parks: idle, its update cancelled.
         self.pipelines = [pipeline("IDLE", "CANCELED")]
 
@@ -91,18 +118,28 @@ def test_rc20s_new_pipeline_is_parked_only_once_its_sync_has_settled(monkeypatch
             synced("SYNCED_TABLE_ONLINE_CONTINUOUS_UPDATE", continuous=True),
             synced("SYNCED_TABLE_ONLINE_CONTINUOUS_UPDATE", continuous=True),
         ],
+        postgres_tables=[
+            postgres_synced("SYNCED_TABLE_PROVISIONING_INITIAL_SNAPSHOT", continuous=False),
+            postgres_synced("SYNCED_TABLE_ONLINE", continuous=False),
+            postgres_synced("SYNCED_TABLE_ONLINE_CONTINUOUS_UPDATE", continuous=True),
+            postgres_synced("SYNCED_TABLE_ONLINE_CONTINUOUS_UPDATE", continuous=True),
+        ],
     )
 
     lifecycle._park_round4_pipeline(MANIFEST, PIPELINE, settle_names=NAMES)
 
     assert workspace.verbs == ["stop"]
-    # Not until the sync read healthy twice: the stop came on the read after the fifth.
-    assert workspace.stopped_at_read == 6
+    # Not at the second healthy read, as v1.2.0 parked: 2026-10-13's install parked there and
+    # its table went offline. The sync must also have read healthy, unbroken, for the minimum.
+    assert workspace.stopped_at_read > 6
+    assert workspace.stopped_at >= lifecycle._ROUND4_PARK_MIN_HEALTHY_SECONDS
 
 
 def test_a_park_without_a_settle_stops_at_once(monkeypatch) -> None:
     # The carry's failure path: a broken pipeline is not left billing for a settle.
-    workspace = Workspace(monkeypatch, pipelines=[pipeline("RUNNING", "RUNNING")], tables=[])
+    workspace = Workspace(
+        monkeypatch, pipelines=[pipeline("RUNNING", "RUNNING")], tables=[], postgres_tables=[]
+    )
 
     lifecycle._park_round4_pipeline(MANIFEST, PIPELINE)
 
@@ -115,6 +152,7 @@ def test_a_sync_that_never_settles_is_parked_after_the_bound(monkeypatch, capsys
         monkeypatch,
         pipelines=[pipeline("RUNNING", "RUNNING")],
         tables=[synced("SYNCED_TABLE_ONLINE", continuous=False)],
+        postgres_tables=[postgres_synced("SYNCED_TABLE_ONLINE", continuous=False)],
     )
 
     lifecycle._park_round4_pipeline(MANIFEST, PIPELINE, settle_names=NAMES)
@@ -126,7 +164,9 @@ def test_a_sync_that_never_settles_is_parked_after_the_bound(monkeypatch, capsys
 
 @pytest.mark.parametrize("update", ["CANCELED", "COMPLETED"])
 def test_a_parked_pipeline_is_not_waited_on(monkeypatch, update):
-    workspace = Workspace(monkeypatch, pipelines=[pipeline("IDLE", update)], tables=[])
+    workspace = Workspace(
+        monkeypatch, pipelines=[pipeline("IDLE", update)], tables=[], postgres_tables=[]
+    )
 
     lifecycle._park_round4_pipeline(MANIFEST, PIPELINE, settle_names=NAMES)
 
@@ -143,6 +183,7 @@ def test_a_stop_in_progress_is_waited_out_without_a_settle(monkeypatch):
             pipeline("IDLE", "CANCELED"),
         ],
         tables=[],
+        postgres_tables=[],
     )
 
     lifecycle._park_round4_pipeline(MANIFEST, PIPELINE, settle_names=NAMES)

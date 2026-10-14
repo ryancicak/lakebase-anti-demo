@@ -73,6 +73,15 @@ def _slot_prefix(task_arn: str) -> str:
     return task_arn.rsplit(":", 1)[-1][:16].lower()
 
 
+def _task_resource_id(task_arn: str) -> str:
+    """The task's resource ID, without the account ID its ARN carries.
+
+    A DMS task ARN is arn:aws:dms:<region>:<account-id>:task:<resource-id>.
+    """
+
+    return task_arn.rsplit(":", 1)[-1]
+
+
 _COLUMNS = "order_id, sku, store, quantity, total_cents, status, proof_nonce"
 
 
@@ -439,8 +448,9 @@ class AwsCaptureLane:
         kind, _ = dms
         if kind == "already-running":
             # Prepare parks the task, so a running one at the bell means AWS started warm.
+            task_id = _task_resource_id(self._lane.task_arn)
             LOGGER.warning(
-                "Round 6's DMS task %s was already running at the bell", self._lane.task_arn
+                "Round 6's DMS task %s was already running at the bell", task_id
             )
 
     async def failure(self) -> str | None:

@@ -383,6 +383,12 @@ class TestAwsCaptureLane:
 
         logged = [record.getMessage() for record in caplog.records]
         assert any("already running at the bell" in line for line in logged), logged
+        # The task resource ID is logged, but not the full ARN with account ID.
+        has_resource_id = any(
+            "AURORA" in line and "already running at the bell" in line for line in logged
+        )
+        assert has_resource_id, logged
+        assert not any("arn:aws" in line for line in logged), logged
 
     def test_a_stale_stopped_status_just_after_the_bell_is_not_a_failure(self):
         clock = Clock()

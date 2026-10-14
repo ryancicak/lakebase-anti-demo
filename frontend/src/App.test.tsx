@@ -8,6 +8,7 @@ import App, { BetweenRounds, Finale } from './App'
 import { ApiError, api } from './api/client'
 import { APP_VERSION_LABEL } from './version'
 import { FALLBACK_CATALOG, metricForCorners, stopCondition } from './catalog'
+import { halloweenClock } from './halloween'
 import {
   getCanvasRecordings,
   resetCanvasRecordings,
@@ -4729,6 +4730,10 @@ describe('backstage setup', () => {
     await openShare()
     let receipt = await screen.findByRole('dialog', { name: /share the proof/i })
 
+    // Outside the Halloween season (where the test setup keeps the clock) there is no
+    // Halloween box at all.
+    expect(within(receipt).queryByRole('checkbox', { name: /halloween/i })).not.toBeInTheDocument()
+
     // Default is Health Bars, with the PNG preview already rendered.
     const group = within(receipt).getByRole('group', { name: /share card style/i })
     const healthBtn = within(group).getByRole('button', { name: /health bars/i })
@@ -4807,6 +4812,137 @@ describe('backstage setup', () => {
     expect(within(receipt).getByRole('button', { name: /knockout/i })).toHaveAttribute('aria-pressed', 'false')
   })
 
+  /**
+   * Halloween (v1.2.1): a Round 1 bout against Aurora with both clocks verified, rung and
+   * finished on October 13, inside the season (the test setup moves the clock back after),
+   * with the Share dialog's download and clipboard plumbing stubbed.
+   */
+  async function finishABoutInSeason(lakebaseMs: number, competitorMs: number, rememberedResult: string) {
+    halloweenClock.now = () => new Date(2026, 9, 13, 12, 0, 0)
+    const running = session('running')
+    const verified: DemoSession = {
+      ...session('verified'),
+      lanes: {
+        lakebase: { ...running.lanes.lakebase, state: 'verified', elapsed_ms: lakebaseMs, attempts: 1, status: 'Transaction verified' },
+        competitor: { ...running.lanes.competitor, state: 'verified', elapsed_ms: competitorMs, attempts: 1, status: 'Transaction verified' },
+      },
+      remembered_result: rememberedResult,
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(running))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    let urlSeq = 0
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => `blob:card-${++urlSeq}`) })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn().mockResolvedValue(undefined) } })
+    const downloadClick = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    vi.spyOn(window, 'open').mockReturnValue(null)
+    stubReceiptCanvas()
+
+    render(<App />)
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+    const source = FakeEventSource.instances.at(-1)!
+    source.open()
+    source.emit({
+      sequence: 9,
+      event: 'run_finished',
+      occurred_at: '2026-08-17T00:00:01Z',
+      payload: { state: 'verified', session: verified },
+    })
+    expect(await screen.findByText(rememberedResult)).toBeInTheDocument()
+    return { user, downloadClick }
+  }
+
+  it('share modal: in season the Halloween card is offered checked, keeps the facts, and unchecks to the original', async () => {
+    const { user, downloadClick } = await finishABoutInSeason(842.6, 1288.3, 'LAKEBASE WINS BY 0.45s')
+
+    const openShare = () => user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    await openShare()
+    let receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    const lastCardTexts = () => canvasTexts(getCanvasRecordings().at(-1)!)
+    const preparedFilename = async () => {
+      const prepare = within(receipt).getByRole('button', { name: /prepare linkedin post/i })
+      await waitFor(() => expect(prepare).toBeEnabled())
+      await user.click(prepare)
+      return (downloadClick.mock.instances.at(-1) as unknown as HTMLAnchorElement).download
+    }
+
+    // Offered, and checked: the default Health Bars card in the Halloween skin, with the
+    // same receipt -- both exact clocks and the house rule -- under the round's Halloween name.
+    const halloween = within(receipt).getByRole('checkbox', { name: /halloween card/i })
+    expect(halloween).toBeChecked()
+    await within(receipt).findByRole('img', { name: /result card exactly as it will post/i })
+    const spooky = canvasRecordingWithText(/^DON'T TRUST THIS POST\. RING THE DOORBELL YOURSELF\.$/)
+    expect(spooky, 'Halloween health-bars canvas was not drawn').toBeDefined()
+    expect(canvasTexts(spooky!)).toEqual(expect.arrayContaining([
+      'WAKE THE DEAD',
+      '0.84s',
+      '1.29s',
+      'ONE LIVE RUN · NOT A BENCHMARK',
+      'THE RESULTS SPEAK FOR THEMSELVES.',
+    ]))
+    // The opponent is Frankenstein: its green is on the card.
+    expect(spooky!.operations.some((operation) => isFillRect(operation) && operation.fillStyle === '#9ad46a')).toBe(true)
+    expect(await preparedFilename()).toMatch(/-health-bars-halloween\.png$/)
+
+    // The text mirror's boxers wear the same costumes as the live ones.
+    const poster = within(receipt).getByLabelText(/lakebase receipt result/i).closest('.receipt-poster')!
+    expect([...poster.querySelectorAll('.database-fighter')].map((fighter) => fighter.getAttribute('data-costume')))
+      .toEqual(['pumpkin', 'frankenstein'])
+
+    // Unchecked: the original card, drawn fresh, and the plain filename.
+    await user.click(halloween)
+    expect(halloween).not.toBeChecked()
+    await waitFor(() => expect(lastCardTexts()).toContain("DON'T TRUST THIS POST. RING THE BELL YOURSELF."))
+    expect(lastCardTexts()).not.toContain("DON'T TRUST THIS POST. RING THE DOORBELL YOURSELF.")
+    expect(await preparedFilename()).toMatch(/-health-bars\.png$/)
+
+    // Checked again, Knockout is re-skinned too: a treat for the winner, a trick for the other.
+    await user.click(halloween)
+    await user.click(within(receipt).getByRole('button', { name: /knockout/i }))
+    await waitFor(() => expect(lastCardTexts()).toContain('RING THE DOORBELL YOURSELF.'))
+    expect(lastCardTexts()).toEqual(expect.arrayContaining(['ONE LIVE RUN', 'NOT A BENCHMARK', 'TRICK']))
+    expect(lastCardTexts().some((text) => text.startsWith('TREAT · '))).toBe(true)
+    expect(await preparedFilename()).toMatch(/-knockout-halloween\.png$/)
+
+    // A fresh Share modal offers it checked again.
+    await user.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: /share the proof/i })).not.toBeInTheDocument())
+    await openShare()
+    receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    expect(within(receipt).getByRole('checkbox', { name: /halloween card/i })).toBeChecked()
+  })
+
+  it('share modal: a round the opponent wins gives the opponent the Halloween treat', async () => {
+    const { user } = await finishABoutInSeason(1288.3, 842.6, 'AURORA SERVERLESS V2 WINS BY 0.45s')
+    await user.click(screen.getByRole('button', { name: /share the receipt/i }))
+    const receipt = await screen.findByRole('dialog', { name: /share the proof/i })
+    expect(within(receipt).getByRole('checkbox', { name: /halloween card/i })).toBeChecked()
+    await user.click(within(receipt).getByRole('button', { name: /knockout/i }))
+    await waitFor(() => expect(canvasTexts(getCanvasRecordings().at(-1)!)).toContain('RING THE DOORBELL YOURSELF.'))
+
+    // Treat and Trick follow the winner, not the brand: Lakebase's chip is drawn on the left
+    // (x 50) and the opponent's on the right (x 1150).
+    const chips = getCanvasRecordings().at(-1)!.operations
+      .filter((operation): operation is Extract<CanvasOperation, { kind: 'fillText' }> => operation.kind === 'fillText')
+      .filter((operation) => operation.text === 'TRICK' || operation.text.startsWith('TREAT · '))
+      .map((operation) => [operation.text === 'TRICK' ? 'TRICK' : 'TREAT', operation.x < 600 ? 'lakebase' : 'opponent'])
+    expect(chips).toEqual([['TRICK', 'lakebase'], ['TREAT', 'opponent']])
+    expect(canvasTexts(getCanvasRecordings().at(-1)!)).toEqual(expect.arrayContaining(['0.84s', '1.29s']))
+  })
+
   // The deployed app's own words for Round 1, copied from
   // `server/round_availability.py` so the test is exercising the real thing.
   // Every clause of it is true and every clause of it is written for the person
@@ -4821,7 +4957,7 @@ describe('backstage setup', () => {
     refused: string[],
     reason: string,
     headline: string | null,
-    reasonCode: 'cleanup_in_progress' | null = null,
+    reasonCode: 'cleanup_in_progress' | 'storage_checking' | null = null,
   ) {
     return {
       ...FALLBACK_CATALOG,
@@ -4854,11 +4990,17 @@ describe('backstage setup', () => {
                 ? 'Round 5 will reopen automatically when its Proxy and security group are confirmed deleted. Other rounds remain available.'
                 : null,
             }
-            : {
-              state: 'unavailable',
-              can_start: false,
-              detail: round.availability_headline ?? round.availability_reason ?? null,
-            },
+            : round.availability_reason_code === 'storage_checking'
+              ? {
+                state: 'temporarily_unavailable',
+                can_start: false,
+                detail: round.availability_headline ?? round.availability_reason ?? null,
+              }
+              : {
+                state: 'unavailable',
+                can_start: false,
+                detail: round.availability_headline ?? round.availability_reason ?? null,
+              },
         ])) as Partial<Record<RoundId, Partial<FightCardRoundStatus>>>
     vi.mocked(api.allBoutStatuses).mockResolvedValue(
       allReadyBoutBoard(boardUpdates ?? catalogUpdates),
@@ -5114,6 +5256,36 @@ describe('backstage setup', () => {
       expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
     },
   )
+
+  it('presents storage_checking as temporary while keeping other rounds available', async () => {
+    const storageCatalog = refusedCatalog(
+      ['put_model_score_in_app'],
+      'ROUND 4 CANNOT ARM: a shared storage check is still running.',
+      'Backstage is still checking this round\'s lakehouse storage. It opens automatically once the check answers; the other rounds are unaffected.',
+      'storage_checking',
+    )
+    const user = await fightCardFor(storageCatalog, 'put_model_score_in_app')
+
+    const roundFour = screen.getByRole('button', { name: /^Round 4 ·/i })
+    expect(roundFour).toHaveAccessibleName(/temporarily unavailable/i)
+    expect(within(roundFour).getByText('TEMPORARILY UNAVAILABLE')).toBeVisible()
+    expect(within(roundFour).queryByText(/^unavailable$/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeDisabled()
+    expect(screen.getByText(/Backstage is still checking this round's lakehouse storage\. It opens automatically once the check answers; the other rounds are unaffected\./i)).toBeVisible()
+    expect(document.querySelector('.game-lock-note')).toHaveTextContent(
+      /opens automatically · other rounds remain available/i,
+    )
+
+    const card = document.querySelector('.card-scene')!
+    expect(card).not.toHaveTextContent(/cannot arm tonight|not on tonight's card/i)
+    expect(screen.getByRole('button', { name: /^Round 1 ·/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /^Round 2 ·/i })).toBeEnabled()
+
+    await pickRound(user, 'wake_idle_app')
+    const unselectedRoundFour = screen.getByRole('button', { name: /^Round 4 ·/i })
+    expect(unselectedRoundFour).toHaveAccessibleName(/temporarily unavailable/i)
+    expect(within(unselectedRoundFour).getByText('TEMPORARILY UNAVAILABLE')).toBeVisible()
+  })
 
   it('keeps a live Round 5 bout distinct from backstage cleanup', async () => {
     await fightCardFor(

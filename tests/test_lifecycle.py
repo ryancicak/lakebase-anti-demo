@@ -1,6 +1,7 @@
 import ast
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import threading
@@ -1739,6 +1740,425 @@ def test_round5_inventory_distinguishes_static_terraform_role_from_bout_roles(
 
     static_tags.pop("anti-demo-round")
     with pytest.raises(RuntimeError, match="static Terraform ownership tags differ"):
+        _round5_runtime_tag_inventory(candidate)
+
+
+def test_round5_inventory_accepts_per_bout_resources_with_fence_tag(
+    monkeypatch,
+) -> None:
+    """Per-bout resources carry an immutable operation-identity fence tag.
+
+    The fence is a non-negative integer string. The inventory must accept it
+    when well-formed and include the resource in the inventory (not refuse with
+    "ownership tags differ"), allowing _require_round5_clean_baseline to report
+    the clean-baseline message.
+    """
+    manifest = make_manifest().model_copy(
+        update={"installation_id": "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"}
+    )
+    prefix = "ib3beef6697cc1d6dce31-r5-"
+    control_role_arn = f"arn:aws:iam::123456789012:role/{prefix}exec-static"
+    static_tags = _required_round_tags(manifest, "r5")
+    static_tags.pop("Owner")
+
+    bout_id = "bout-test-id-1234567890abcdef"
+    bout_token = hashlib.sha256(bout_id.encode()).hexdigest()[:16]
+    fence = "16"
+    proxy_name = f"{prefix}{bout_token}-proxy"
+    proxy_arn = f"arn:aws:rds:us-west-2:123456789012:db-proxy:{proxy_name}"
+
+    class ProxySecrets:
+        def list_secrets(self, **kwargs):
+            return {"SecretList": []}
+
+    class ProxyEc2:
+        def describe_security_groups(self, **kwargs):
+            return {"SecurityGroups": []}
+
+        def describe_security_group_rules(self, **kwargs):
+            return {"SecurityGroupRules": []}
+
+    class ProxyRds:
+        def describe_db_proxies(self, **kwargs):
+            return {
+                "DBProxies": [
+                    {
+                        "DBProxyArn": proxy_arn,
+                        "DBProxyName": proxy_name,
+                    }
+                ]
+            }
+
+        def list_tags_for_resource(self, **kwargs):
+            # Return the per-bout tags including the fence tag
+            return {
+                "TagList": [
+                    {"Key": key, "Value": value}
+                    for key, value in {
+                        **static_tags,
+                        "anti-demo-bout-id": bout_id,
+                        "anti-demo:bout-token": bout_token,
+                        "anti-demo:bout-fence": fence,
+                        "managed-by": "round5-lifecycle",
+                    }.items()
+                ]
+            }
+
+    class ProxyIam:
+        def list_roles(self, **kwargs):
+            return {"Roles": [], "IsTruncated": False}
+
+        def list_role_policies(self, **kwargs):
+            return {"PolicyNames": []}
+
+    clients = {
+        "secretsmanager": ProxySecrets(),
+        "ec2": ProxyEc2(),
+        "rds": ProxyRds(),
+        "iam": ProxyIam(),
+    }
+    session = SimpleNamespace(client=lambda name: clients[name])
+    ownership = SimpleNamespace(
+        as_aws_tags=lambda: {**static_tags, "managed-by": "round5-lifecycle"}
+    )
+    sealed = SimpleNamespace(
+        ownership_tags=ownership,
+        bout_name_prefix=prefix,
+        secret_name_prefix=None,
+        vpc_id="vpc-0123456789abcdef0",
+        runner_security_group_id="sg-0123456789abcdef0",
+        control_role_arn=control_role_arn,
+        runner_role_arn="arn:aws:iam::123456789012:role/static-runner",
+        proxy_service_role_arn="arn:aws:iam::123456789012:role/static-proxy",
+    )
+    candidate = SimpleNamespace(
+        round5_ready=True,
+        require_round5_resources=lambda: sealed,
+        run_id=manifest.run_id,
+        owner=manifest.owner,
+        expires_at=manifest.expires_at,
+        installation_id=manifest.installation_id,
+        aws=SimpleNamespace(
+            resources=SimpleNamespace(rds_security_group_id="sg-1123456789abcdef0")
+        ),
+    )
+    monkeypatch.setattr("server.lifecycle._aws_session", lambda _: session)
+
+    # The proxy with a well-formed fence tag should be inventoried, not refused
+    inventory = _round5_runtime_tag_inventory(candidate)
+    assert proxy_arn in inventory, f"Expected proxy {proxy_arn} in inventory {inventory}"
+
+
+def test_round5_inventory_refuses_malformed_fence_tag(
+    monkeypatch,
+) -> None:
+    """A per-bout resource with a malformed fence tag should be refused.
+
+    The fence must be a non-negative integer string. Non-numeric or negative
+    values should cause refusal with "ownership tags differ".
+    """
+    manifest = make_manifest().model_copy(
+        update={"installation_id": "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"}
+    )
+    prefix = "ib3beef6697cc1d6dce31-r5-"
+    control_role_arn = f"arn:aws:iam::123456789012:role/{prefix}exec-static"
+    static_tags = _required_round_tags(manifest, "r5")
+    static_tags.pop("Owner")
+
+    bout_id = "bout-test-id-malformed-fence"
+    bout_token = hashlib.sha256(bout_id.encode()).hexdigest()[:16]
+    # Malformed fence: not a number
+    fence = "abc"
+    proxy_name = f"{prefix}{bout_token}-proxy"
+    proxy_arn = f"arn:aws:rds:us-west-2:123456789012:db-proxy:{proxy_name}"
+
+    class BadFenceRds:
+        def describe_db_proxies(self, **kwargs):
+            return {
+                "DBProxies": [
+                    {
+                        "DBProxyArn": proxy_arn,
+                        "DBProxyName": proxy_name,
+                    }
+                ]
+            }
+
+        def list_tags_for_resource(self, **kwargs):
+            return {
+                "TagList": [
+                    {"Key": key, "Value": value}
+                    for key, value in {
+                        **static_tags,
+                        "anti-demo-bout-id": bout_id,
+                        "anti-demo:bout-token": bout_token,
+                        "anti-demo:bout-fence": fence,
+                        "managed-by": "round5-lifecycle",
+                    }.items()
+                ]
+            }
+
+    class EmptySecrets:
+        def list_secrets(self, **kwargs):
+            return {"SecretList": []}
+
+    class EmptyEc2:
+        def describe_security_groups(self, **kwargs):
+            return {"SecurityGroups": []}
+
+        def describe_security_group_rules(self, **kwargs):
+            return {"SecurityGroupRules": []}
+
+    class EmptyIam:
+        def list_roles(self, **kwargs):
+            return {"Roles": [], "IsTruncated": False}
+
+        def list_role_policies(self, **kwargs):
+            return {"PolicyNames": []}
+
+    clients = {
+        "secretsmanager": EmptySecrets(),
+        "ec2": EmptyEc2(),
+        "rds": BadFenceRds(),
+        "iam": EmptyIam(),
+    }
+    session = SimpleNamespace(client=lambda name: clients[name])
+    ownership = SimpleNamespace(
+        as_aws_tags=lambda: {**static_tags, "managed-by": "round5-lifecycle"}
+    )
+    sealed = SimpleNamespace(
+        ownership_tags=ownership,
+        bout_name_prefix=prefix,
+        secret_name_prefix=None,
+        vpc_id="vpc-0123456789abcdef0",
+        runner_security_group_id="sg-0123456789abcdef0",
+        control_role_arn=control_role_arn,
+        runner_role_arn="arn:aws:iam::123456789012:role/static-runner",
+        proxy_service_role_arn="arn:aws:iam::123456789012:role/static-proxy",
+    )
+    candidate = SimpleNamespace(
+        round5_ready=True,
+        require_round5_resources=lambda: sealed,
+        run_id=manifest.run_id,
+        owner=manifest.owner,
+        expires_at=manifest.expires_at,
+        installation_id=manifest.installation_id,
+        aws=SimpleNamespace(
+            resources=SimpleNamespace(rds_security_group_id="sg-1123456789abcdef0")
+        ),
+    )
+    monkeypatch.setattr("server.lifecycle._aws_session", lambda _: session)
+
+    # Malformed fence should cause refusal
+    with pytest.raises(RuntimeError, match="ownership tags differ"):
+        _round5_runtime_tag_inventory(candidate)
+
+
+def test_round5_inventory_refuses_unexpected_extra_tags(
+    monkeypatch,
+) -> None:
+    """A per-bout resource with unexpected extra tags should be refused.
+
+    Only recognized per-bout tags like fence, bout-id, and bout-token should
+    be accepted. Any other extra tag should cause refusal.
+    """
+    manifest = make_manifest().model_copy(
+        update={"installation_id": "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"}
+    )
+    prefix = "ib3beef6697cc1d6dce31-r5-"
+    control_role_arn = f"arn:aws:iam::123456789012:role/{prefix}exec-static"
+    static_tags = _required_round_tags(manifest, "r5")
+    static_tags.pop("Owner")
+
+    bout_id = "bout-test-id-extra-tag"
+    bout_token = hashlib.sha256(bout_id.encode()).hexdigest()[:16]
+    fence = "16"
+    proxy_name = f"{prefix}{bout_token}-proxy"
+    proxy_arn = f"arn:aws:rds:us-west-2:123456789012:db-proxy:{proxy_name}"
+
+    class ExtraTagRds:
+        def describe_db_proxies(self, **kwargs):
+            return {
+                "DBProxies": [
+                    {
+                        "DBProxyArn": proxy_arn,
+                        "DBProxyName": proxy_name,
+                    }
+                ]
+            }
+
+        def list_tags_for_resource(self, **kwargs):
+            # Add an unexpected extra tag
+            return {
+                "TagList": [
+                    {"Key": key, "Value": value}
+                    for key, value in {
+                        **static_tags,
+                        "anti-demo-bout-id": bout_id,
+                        "anti-demo:bout-token": bout_token,
+                        "anti-demo:bout-fence": fence,
+                        "unexpected-extra-tag": "should-cause-refusal",
+                        "managed-by": "round5-lifecycle",
+                    }.items()
+                ]
+            }
+
+    class EmptySecrets:
+        def list_secrets(self, **kwargs):
+            return {"SecretList": []}
+
+    class EmptyEc2:
+        def describe_security_groups(self, **kwargs):
+            return {"SecurityGroups": []}
+
+        def describe_security_group_rules(self, **kwargs):
+            return {"SecurityGroupRules": []}
+
+    class EmptyIam:
+        def list_roles(self, **kwargs):
+            return {"Roles": [], "IsTruncated": False}
+
+        def list_role_policies(self, **kwargs):
+            return {"PolicyNames": []}
+
+    clients = {
+        "secretsmanager": EmptySecrets(),
+        "ec2": EmptyEc2(),
+        "rds": ExtraTagRds(),
+        "iam": EmptyIam(),
+    }
+    session = SimpleNamespace(client=lambda name: clients[name])
+    ownership = SimpleNamespace(
+        as_aws_tags=lambda: {**static_tags, "managed-by": "round5-lifecycle"}
+    )
+    sealed = SimpleNamespace(
+        ownership_tags=ownership,
+        bout_name_prefix=prefix,
+        secret_name_prefix=None,
+        vpc_id="vpc-0123456789abcdef0",
+        runner_security_group_id="sg-0123456789abcdef0",
+        control_role_arn=control_role_arn,
+        runner_role_arn="arn:aws:iam::123456789012:role/static-runner",
+        proxy_service_role_arn="arn:aws:iam::123456789012:role/static-proxy",
+    )
+    candidate = SimpleNamespace(
+        round5_ready=True,
+        require_round5_resources=lambda: sealed,
+        run_id=manifest.run_id,
+        owner=manifest.owner,
+        expires_at=manifest.expires_at,
+        installation_id=manifest.installation_id,
+        aws=SimpleNamespace(
+            resources=SimpleNamespace(rds_security_group_id="sg-1123456789abcdef0")
+        ),
+    )
+    monkeypatch.setattr("server.lifecycle._aws_session", lambda _: session)
+
+    # Extra unexpected tag should cause refusal
+    with pytest.raises(RuntimeError, match="ownership tags differ"):
+        _round5_runtime_tag_inventory(candidate)
+
+
+def test_round5_inventory_refuses_wrong_run_id_on_per_bout_resource(
+    monkeypatch,
+) -> None:
+    """A per-bout resource with wrong run ID should be refused.
+
+    Even with a valid fence tag, a mismatched run ID should still cause refusal.
+    """
+    manifest = make_manifest().model_copy(
+        update={"installation_id": "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"}
+    )
+    prefix = "ib3beef6697cc1d6dce31-r5-"
+    control_role_arn = f"arn:aws:iam::123456789012:role/{prefix}exec-static"
+    static_tags = _required_round_tags(manifest, "r5")
+    static_tags.pop("Owner")
+
+    bout_id = "bout-test-id-wrong-run"
+    bout_token = hashlib.sha256(bout_id.encode()).hexdigest()[:16]
+    fence = "16"
+    proxy_name = f"{prefix}{bout_token}-proxy"
+    proxy_arn = f"arn:aws:rds:us-west-2:123456789012:db-proxy:{proxy_name}"
+
+    class WrongRunIdRds:
+        def describe_db_proxies(self, **kwargs):
+            return {
+                "DBProxies": [
+                    {
+                        "DBProxyArn": proxy_arn,
+                        "DBProxyName": proxy_name,
+                    }
+                ]
+            }
+
+        def list_tags_for_resource(self, **kwargs):
+            # Use a different run ID
+            return {
+                "TagList": [
+                    {"Key": key, "Value": value}
+                    for key, value in {
+                        **static_tags,
+                        "anti-demo-run-id": "wrong-run-id-12345",
+                        "anti-demo-bout-id": bout_id,
+                        "anti-demo:bout-token": bout_token,
+                        "anti-demo:bout-fence": fence,
+                        "managed-by": "round5-lifecycle",
+                    }.items()
+                ]
+            }
+
+    class EmptySecrets:
+        def list_secrets(self, **kwargs):
+            return {"SecretList": []}
+
+    class EmptyEc2:
+        def describe_security_groups(self, **kwargs):
+            return {"SecurityGroups": []}
+
+        def describe_security_group_rules(self, **kwargs):
+            return {"SecurityGroupRules": []}
+
+    class EmptyIam:
+        def list_roles(self, **kwargs):
+            return {"Roles": [], "IsTruncated": False}
+
+        def list_role_policies(self, **kwargs):
+            return {"PolicyNames": []}
+
+    clients = {
+        "secretsmanager": EmptySecrets(),
+        "ec2": EmptyEc2(),
+        "rds": WrongRunIdRds(),
+        "iam": EmptyIam(),
+    }
+    session = SimpleNamespace(client=lambda name: clients[name])
+    ownership = SimpleNamespace(
+        as_aws_tags=lambda: {**static_tags, "managed-by": "round5-lifecycle"}
+    )
+    sealed = SimpleNamespace(
+        ownership_tags=ownership,
+        bout_name_prefix=prefix,
+        secret_name_prefix=None,
+        vpc_id="vpc-0123456789abcdef0",
+        runner_security_group_id="sg-0123456789abcdef0",
+        control_role_arn=control_role_arn,
+        runner_role_arn="arn:aws:iam::123456789012:role/static-runner",
+        proxy_service_role_arn="arn:aws:iam::123456789012:role/static-proxy",
+    )
+    candidate = SimpleNamespace(
+        round5_ready=True,
+        require_round5_resources=lambda: sealed,
+        run_id=manifest.run_id,
+        owner=manifest.owner,
+        expires_at=manifest.expires_at,
+        installation_id=manifest.installation_id,
+        aws=SimpleNamespace(
+            resources=SimpleNamespace(rds_security_group_id="sg-1123456789abcdef0")
+        ),
+    )
+    monkeypatch.setattr("server.lifecycle._aws_session", lambda _: session)
+
+    # Wrong run ID should cause refusal
+    with pytest.raises(RuntimeError, match="ownership tags differ"):
         _round5_runtime_tag_inventory(candidate)
 
 
