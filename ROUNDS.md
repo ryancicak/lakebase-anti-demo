@@ -48,20 +48,20 @@ Round 4 is **Move lakehouse data into live applications**:
 - After the result the row is restored while both lanes still run, and both are parked. Round 4 has no re-do: after a bout both integrations are running, so a re-do could not start cold. Racing again is a new bout.
 - An installation without the AWS lane races Lakebase alone. The competitor lane says the lane is not installed and why, and no margin is claimed.
 
-Round 5 is **Ready a pooled application path**. It scores pooled-path setup and then
-runs a bounded connection check as a pass/fail guard:
+Round 5 is **Ready a pooled application path**. Each lane readies a pooled path and proves it
+by holding exactly 10,000 client connections:
 
-- This is a two-phase proof. Phase 1 is the primary score: both setup workflows share one monotonic T0, launch within 10 ms, and run under one 30-minute deadline. Each lane stops only at its exact public setup gate. The UI never adds setup elapsed time to burst p99.
-- Lakebase uses its returned `read_write_pooled_host`: 0 separately provisioned per-bout pooling components and 0 per-bout pooling infrastructure mutations. Its baseline still discloses native-login, ordinary-role, and runner-credential preparation.
-- The selected Aurora/RDS lane performs 9 timed, journaled competitor mutations: 1 per-bout Proxy security group, 1 default-egress change, 4 exact security-group rules, 1 RDS Proxy, 1 target-group configuration, and 1 target registration. Its setup clock stops at the exact application transaction. The Proxy is configured for 90% maximum connections and a 120-second connection-borrow timeout.
-- IAM service role, runner permission, and dedicated proxy credential secret(s) are sealed install-time prerequisites outside the setup clock. They are required configuration, not timed mutations. The AWS design still adds RDS Proxy, Secrets Manager, IAM, and network configuration; RDS Proxy and Secrets Manager are incremental billable services.
-- Phase 2 is a warm burst that validates the setup result. One neutral, SSM-managed `m6i.large` runner uses Python 3.12, psycopg 3.3.4, prepared statements disabled, and TLS `verify-full` with the same explicit `sslrootcert` in both lanes. Each lane gets four warmups and 128 attempts, maximum 64 concurrent and no more than 10 ms burst-launch skew.
-- Every fresh burst connection uses a parameterized `SELECT` for one run-unique probe UUID/value, returns the exact response plus `pg_backend_pid()`, and commits. Successful raw latencies produce nearest-rank p99. Those counts and p99 values are secondary evidence, never the primary score and never part of the setup margin.
-- The downstream witness holds 64 clients per lane and uses a direct `pg_stat_activity` observer. All clients must verify; both unique returned backend PIDs and peak observed sessions must remain below 64. The direct RDS path is limited to observation and run-owned cleanup; all tested application connections use the new per-bout Proxy.
-- A winner and setup margin appear only when both primary setup lanes and every burst, witness, fairness, exact-transaction, and cleanup gate validate. Setup failure or a setup towel displays no winner and no margin.
-- Cleanup closes clients, deletes only run-owned probes and the 9 journaled competitor mutations, verifies a clean baseline, and releases the runner flock. **Ring Again** creates a new bout after that clean baseline and never reuses the Proxy.
-- If Round 5 cleanup fails, the failed bout remains fenced with no winner or margin. The UI exposes only idempotent **Retry Cleanup**—never Ring Again or continuation—until the retry verifies the clean baseline and releases the bout.
-- RDS Proxy is the managed AWS pooling option selected for this reference path, not a universal Aurora or RDS requirement. Direct connections, an existing Proxy, PgBouncer, and application pooling are not compared.
+- One bell starts both lanes in the same server event-loop turn. Each clock runs from that bell to the server's observation of exactly 10,000 authenticated client connections held at once on that lane. Each lane has its own clock and its own sealed runner, and neither waits for the other: a finished lane's clock stops while the other keeps running from the same bell.
+- Lakebase's first post-bell operation is the dispatch to its runner. Its client 1 connects through the included pooled endpoint, authenticates, runs the readiness transaction, and stays in the 10,000-client set; clients 2–10,000 follow immediately. There are 0 separately provisioned per-bout pooling components and 0 per-bout pooling infrastructure mutations.
+- The selected Aurora/RDS lane's first timed AWS mutation is `CreateDBProxy`, issued after the bell. The lane then configures the Proxy's target group with the sealed pool settings, 90% maximum connections and a 120-second connection-borrow timeout, and registers the selected database. Its runner is dispatched only after the Proxy, its target, and the static network fixtures sealed at install all verify exactly. Its client 1 runs the real transaction through the new Proxy and stays in the 10,000-client set. The setup asymmetry is shown, never hidden: the AWS clock includes building the Proxy.
+- IAM service role, runner permission, dedicated proxy credential secret(s), and the Proxy's static network fixtures are sealed install-time prerequisites outside the clock. They are required configuration, not timed mutations. The AWS design still adds RDS Proxy, Secrets Manager, IAM, and network configuration; RDS Proxy and Secrets Manager are incremental billable services.
+- Both runners are `c7i.2xlarge` instances running the same Python 3.12 client with TLS `verify-full` and the same explicit `sslrootcert`. A lane may retry at most 100 connects, at most three per client, and only for a login the pooler or the regional front door refused or dropped before it completed. Every retry is inside the clock and reported on the lane. Credentials, SCRAM, TLS identity, protocol shape, and login timeouts are terminal on the first failure.
+- A lane verifies only when exactly 10,000 clients are initiated, authenticated, distinct, and held at once with zero terminal failures or hold disconnects; all of them then hold for at least 30 seconds; 64 of 64 sampled queries succeed; and a direct `pg_stat_activity` observer, on its own role and connection, sees fewer PostgreSQL backends than clients. Identity, fairness, telemetry, hard-safety, and cleanup gates must also pass. 9,999 fails.
+- Launch timing is recorded, not scored: the two lanes' workflow starts after the bell (target ≤ 10 ms apart), `CreateDBProxy` within 100 ms of the bell, and each lane's first-launch spread across its four worker shards (target ≤ 10 ms). A miss is a scheduling advisory and never voids an exact result, because the delay is already charged to that lane's own clock.
+- A winner and margin appear only when both lanes verify. A one-sided exact result may remain visible but never declares a winner, and a lane failure or a towel declares no winner and no margin.
+- Cleanup closes clients, deregisters the target, deletes the per-bout Proxy and every journaled per-bout resource in reverse dependency order, and proves exact absence. Only that proof re-warms Round 5, automatically, for the next bout, which creates a new Proxy; a Proxy is never reused.
+- Until cleanup proves absence, Round 5 stays closed and retries on its own; a terminal cleanup block needs an operator. The bout's posted result and receipt do not change while cleanup runs.
+- RDS Proxy is the managed AWS pooling option selected for this reference path, not a universal Aurora or RDS requirement. Direct connections, an existing Proxy, PgBouncer, application pooling, and transaction throughput are not compared.
 
 Round 6 is **Move live application data into the lakehouse**:
 
@@ -108,7 +108,7 @@ The retro title, matchup, ringside personas, and bell are a short setup ritual. 
 - one task name;
 - two equally weighted product lanes, with a timer only for each eligible participant;
 - one final fairness line and one remembered result;
-- in Round 5 only, a clearly separated primary setup panel, secondary burst validation panel, and compact required component disclosure.
+- in Round 5 only, a clearly separated scored 10,000-client panel, a supporting pooled-path readiness panel, and compact required component disclosure.
 
 No chat, charts, unrelated infrastructure inventory, health bars, cumulative score, fake progress, or scrolling UI appears in the measured proof.
 
@@ -132,7 +132,7 @@ Pair and triple selections use a complete integrative question, not a concatenat
 
 Every track is dual-use: a presenter can read it verbatim without sounding like backstage instruction, and an attendee can read it silently and understand what happened and why it may matter. Visible copy never exposes template machinery or labels people as a persona, consumer, or beneficiary. Relevance is framed for the selected role and tested through the room question rather than asserted as fact. Lower bounds and material caveats are explained in plain language inside **WHAT WE PROVED**.
 
-The dialog renders no priority cards, accordions, nested details, success measure, universal disclosure stack, or supporting priority list. Material caveats live directly in **WHAT WE PROVED**. **Instant Replay** is a persona-neutral presenter story with exactly three beats — **SETUP**, **SAME TEST**, and **TAKEAWAY** — followed by one collapsed **VIEW FULL EVIDENCE** boundary. That boundary contains configured capacity, exact calls, timestamps, lane facts, and Round 5's full setup/burst proof without nested accordions. Descent, bout, standing, and pricing-receipt evidence remains in **What It Cost**, and the portable exact result remains in **Share Receipt**.
+The dialog renders no priority cards, accordions, nested details, success measure, universal disclosure stack, or supporting priority list. Material caveats live directly in **WHAT WE PROVED**. **Instant Replay** is a persona-neutral presenter story with exactly three beats — **SETUP**, **SAME TEST**, and **TAKEAWAY** — followed by one collapsed **VIEW FULL EVIDENCE** boundary. That boundary contains configured capacity, exact calls, timestamps, lane facts, and Round 5's full bell-to-10,000-client proof without nested accordions. Descent, bout, standing, and pricing-receipt evidence remains in **What It Cost**, and the portable exact result remains in **Share Receipt**.
 
 Cost language distinguishes measured rates, standing or per-event spend, and measured wait. Operator toil remains unmeasured unless executed steps are counted; cost of delay remains a discovery question. Performance names the exact executed stop boundary. Simplicity names concrete tools, tickets, runbooks, approvals, steps, handoffs, and owners without treating demo automation as proof of customer simplicity. A new acceptance condition requires a new round and explicit re-arm.
 
@@ -239,7 +239,7 @@ Production code has no simulation mode. Deterministic fakes exist only inside au
 - No secrets in UI, logs, committed files, or test snapshots.
 - Audience view works at 1920x1080 without scrolling.
 - Cleanup confirms no demo-owned AWS or Databricks resources remain.
-- Round 5 declares a setup winner and margin only when both setup lanes, both bounded result sets (128 attempts, maximum 64 concurrent), both launch-skew gates, both 64-client witnesses, exact transactions, and run-owned cleanup evidence verify under the frozen contract.
+- Round 5 declares a winner and margin only when both lanes reach and hold exactly 10,000 authenticated client connections, every hold, sample, multiplexing, identity, fairness, telemetry, and cleanup gate verifies, and the AWS lane's Proxy was first created after the bell, under the frozen contract.
 
 ## Explicitly out of scope for V1
 

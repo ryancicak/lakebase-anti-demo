@@ -172,20 +172,25 @@ For setup options and troubleshooting, see
 | 2 | Change a schema safely | Lakebase branches, Aurora clones, and RDS restores to a point in time. |
 | 3 | Recover a deleted order | Each lane restores and reads the same row. |
 | 4 | Move lakehouse data into an app | One Delta change moves into Lakebase through its synced table, and into Aurora or RDS through an AWS Glue job. Both integrations cold start at the bell. |
-| 5 | Ready a pooled application path | Lakebase verifies its included pool. The selected AWS reference path provisions RDS Proxy. Both run 128 attempts, maximum 64 concurrent, plus a separate witness. |
+| 5 | Ready a pooled application path | One bell starts both lanes. Lakebase connects through its included pooler, and the selected AWS reference path first creates a new RDS Proxy. Each clock stops at exactly 10,000 client connections authenticated and held at once. |
 | 6 | Move app data into the lakehouse | One checkout moves into Delta through Lakebase's built-in change feed, and from Aurora or RDS through AWS DMS and a Glue job. AWS cold starts at the bell; Lakebase's feed is always on. |
 
 Every round compares 2 lanes. Rounds 4 and 6 race AWS wherever the installation
 has built their AWS lanes, which setup does. Without its lane, either round races
 Lakebase alone, says so, and makes no AWS performance claim.
 
-Round 5 scores pooled-path setup from a database-only declared start. Its recurring
-validation runs 128 attempts, maximum 64 concurrent, plus separate multiplexing
-proof. Lakebase separately documents a built-in PgBouncer `max_client_conn` product
-limit of [up to 10,000 client connections](https://docs.databricks.com/aws/en/oltp/projects/connection-pooling).
+Round 5 times each lane from one bell to exactly 10,000 authenticated client
+connections held at once. Each lane has its own identical runner and the same
+client, and neither waits for the other. Lakebase's lane connects through its
+included pooler. The selected AWS reference path creates a new RDS Proxy at the
+bell, so its clock includes that build. A lane verifies only after all 10,000
+clients hold for 30 seconds, 64 sampled queries succeed, and a direct observer
+confirms they share fewer PostgreSQL backends than there are clients. Lakebase
+documents a built-in PgBouncer `max_client_conn` product limit of
+[up to 10,000 client connections](https://docs.databricks.com/aws/en/oltp/projects/connection-pooling).
 Client connections are not PostgreSQL backend sessions or simultaneous transactions.
-Direct AWS connections, an existing Proxy, and sustained load remain outside the
-selected-path comparison.
+Direct AWS connections, an existing Proxy, and transaction throughput are not
+compared.
 
 [ROUNDS.md](ROUNDS.md) defines the timing and fairness rules for every round.
 
@@ -207,7 +212,7 @@ column before the number. These rates are for `us-west-2`:
 | AWS databases, runners, storage, addresses, secrets, and Round 6's DMS instance | From `--apply` until `cleanup`, whether or not anyone runs a round | **~$29.50/day** |
 | Databricks App compute | Only if you deployed the App, and then until you stop it — a running App bills for its provisioned capacity even with nobody on it | **~$10.93/day** |
 | The Lakebase coordination database | While the app is running: it and Round 5's warm runners write to it every few seconds, so it does not scale to zero | **~$1.06/day** at the posted `$0.26` per DBU, measured on the test installation |
-| The SQL warehouse Rounds 4 and 6 read through | Only while it runs: while a person is using the app or a bout reads through it, and then until its own auto-stop. The installer uses one your workspace already has | **~$8.40/hour** while it runs, for a Small serverless warehouse (12 DBU an hour at `$0.70`) |
+| The SQL warehouse Rounds 4 and 6 read through | Only while it runs: while a person is using the app or a bout reads through it, and then until its own auto-stop. The installer uses one your workspace already has | **~$8.40/hour** while it runs, for a Small serverless warehouse (12 DBU an hour at `$0.70` per DBU) |
 | Round 4's two integrations | Only during a bout. Both are parked at rest. The bell starts Lakebase's synced-table pipeline and the AWS Glue job, and both are parked again once the bout settles, 3–5 minutes later on the test installation | pipeline **~$0.61/hour** while up; Glue **$0.44 per DPU-hour** at 2 DPU for the seconds a run consumes, **~$0.02–$0.04** a bout |
 | Round 6's AWS lane | Only during a bout. Its DMS task and Glue job are parked at rest and started at the bell; the task adds nothing beyond the DMS instance above | Glue **$0.44 per DPU-hour** at 2 DPU for the seconds a run consumes |
 
@@ -315,7 +320,7 @@ step. Verified from outside the installer: `/readyz` answered 200 with
 That is one run on one machine against one pair of accounts, which is the claim: it
 works, not that it always will.
 
-The author's live runs as of 2026-08-25:
+The author's live runs, as of 2026-08-25 unless a row gives its own date:
 
 | Area | Evidence |
 | --- | --- |
@@ -323,7 +328,7 @@ The author's live runs as of 2026-08-25:
 | Round 2 | 10 verified schema-change bouts — 7 against Aurora, 3 against RDS |
 | Round 3 | 8 verified recovery bouts — 3 against Aurora, 5 against RDS |
 | Round 4 | Re-measured for v1.1 on 2026-09-29, on a test installation: 20 two-lane bouts, 10 against Aurora and 10 against RDS, both integrations parked at every bell. Lakebase won all 20, bell to exact app read p50 31–33 s against AWS Glue's 80–89 s |
-| Round 5 | 6 verified setup and bounded-check bouts across Aurora and RDS. The exact 10,000-client fan-in protocol is implemented and sealed but has never completed a scored run, so no 10,000-connection timing is claimed anywhere |
+| Round 5 | Measured on the deployed app on 2026-10-13 and 2026-10-14: 4 receipt-backed bouts against Aurora Serverless v2 + RDS Proxy, each lane held to exactly 10,000 client connections. Lakebase won all 4, bell to 10,000 held clients in 13.52–15.48 s against the AWS path's 661.70–717.64 s, a clock that includes building its new RDS Proxy |
 | Round 6 | 7 receipt-backed bouts and 1 earlier log-derived bout; no AWS lane was timed |
 | Deployed app | All 6 rounds have run. The 2026-09-14 install above exposed all six from a single command, with no separate Round 5 IAM step |
 
