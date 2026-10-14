@@ -2949,7 +2949,7 @@ def test_execution_probes_capture_callback_cpu_and_fifo_age() -> None:
 
 
 def test_callback_profiling_cpu_overhead_is_bounded() -> None:
-    def measure(*, probed: bool, callbacks: int = 10_000) -> float:
+    def measure(*, probed: bool, callbacks: int = 10_000) -> tuple[float, int, int]:
         loop = asyncio.new_event_loop()
         diagnostics = runner.RuntimeDiagnostics()
         diagnostics.install_ready_batch_limit(loop)
@@ -2968,12 +2968,16 @@ def test_callback_profiling_cpu_overhead_is_bounded() -> None:
                 loop.call_soon(callback)
             started_ns = time.thread_time_ns()
             loop.run_until_complete(completed)
-            return (time.thread_time_ns() - started_ns) / 1_000_000
+            elapsed_ms = (time.thread_time_ns() - started_ns) / 1_000_000
         finally:
             if probed:
                 diagnostics.restore_execution_probes()
             diagnostics.restore_ready_batch_limit()
             loop.close()
+        classified = sum(
+            int(profile["calls"]) for profile in diagnostics.callback_profiles.values()
+        )
+        return elapsed_ms, diagnostics.interval_callback_calls, classified
 
     callbacks = 10_000
     # Interleaved and best of seven. The two figures are subtracted, so they must
@@ -2984,8 +2988,18 @@ def test_callback_profiling_cpu_overhead_is_bounded() -> None:
     baseline_runs: list[float] = []
     profiled_runs: list[float] = []
     for _ in range(7):
-        baseline_runs.append(measure(probed=False, callbacks=callbacks))
-        profiled_runs.append(measure(probed=True, callbacks=callbacks))
+        baseline_runs.append(measure(probed=False, callbacks=callbacks)[0])
+        profiled, handled, classified = measure(probed=True, callbacks=callbacks)
+        profiled_runs.append(profiled)
+        # What keeps the probe cheap is that it classifies one callback in 16, plus any
+        # that really spent 50us of CPU, and that is checked by count, because timing
+        # cannot see it. With every callback classified the probe measured 0.83us per
+        # callback against 0.33us as shipped on Apple silicon: 3.0x a bare callback,
+        # under both time bounds below. The 1% is slack for the slow callbacks.
+        assert handled >= callbacks
+        assert classified <= handled // 16 + handled // 100, (
+            f"the probe classified {classified} of {handled} callbacks; it samples 1 in 16"
+        )
     baseline_ms = min(baseline_runs)
     profiled_ms = min(profiled_runs)
 
@@ -3002,9 +3016,22 @@ def test_callback_profiling_cpu_overhead_is_bounded() -> None:
     # milliseconds against a ramp measured in seconds, which is inside the noise of
     # a single connect. Two microseconds is the ceiling; past that the
     # instrumentation is shaping the measurement rather than observing it.
+    #
+    # That ceiling assumes a machine of ordinary speed, and a shared CI runner is not
+    # always one. On 2026-10-14 two runs read 2.85us and 3.18us on runners where a
+    # bare callback alone took 1.75us and 2.10us, while the same commit's other runs
+    # passed. The probe was 1.6x and 1.5x a bare callback there, inside the 1.2x to
+    # 2.4x it measures on ordinary machines, so the probe had not grown: the runner
+    # was slow, and both figures scale with it. The ceiling therefore also admits up
+    # to four bare callbacks of overhead on the machine measuring it.
     overhead_us_per_callback = (profiled_ms - baseline_ms) * 1_000 / callbacks
-    assert overhead_us_per_callback < 2.0, (
-        f"callback profiling costs {overhead_us_per_callback:.2f}us per callback "
+    baseline_us_per_callback = baseline_ms * 1_000 / callbacks
+    assert (
+        overhead_us_per_callback < 2.0
+        or overhead_us_per_callback <= 4 * baseline_us_per_callback
+    ), (
+        f"callback profiling costs {overhead_us_per_callback:.2f}us per callback, "
+        f"{overhead_us_per_callback / baseline_us_per_callback:.1f}x a bare callback "
         f"(baseline {baseline_ms:.2f}ms, profiled {profiled_ms:.2f}ms)"
     )
 
