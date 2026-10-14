@@ -328,7 +328,7 @@ The author's live runs, as of 2026-08-25 unless a row gives its own date:
 | Round 2 | 10 verified schema-change bouts — 7 against Aurora, 3 against RDS |
 | Round 3 | 8 verified recovery bouts — 3 against Aurora, 5 against RDS |
 | Round 4 | Re-measured for v1.1 on 2026-09-29, on a test installation: 20 two-lane bouts, 10 against Aurora and 10 against RDS, both integrations parked at every bell. Lakebase won all 20, bell to exact app read p50 31–33 s against AWS Glue's 80–89 s |
-| Round 5 | Measured on the deployed app on 2026-10-13 and 2026-10-14: 3 receipt-backed bouts against Aurora Serverless v2 + RDS Proxy, each lane held to exactly 10,000 client connections. Lakebase won all 3, bell to 10,000 held clients in 13.52–15.48 s against the AWS path's 661.70–717.64 s, a clock that includes building its new RDS Proxy |
+| Round 5 | Measured on the deployed app on 2026-10-13 and 2026-10-14: 4 receipt-backed bouts against Aurora Serverless v2 + RDS Proxy, each lane held to exactly 10,000 client connections. Lakebase won all 4, bell to 10,000 held clients in 13.52–15.48 s against the AWS path's 661.70–717.64 s, a clock that includes building its new RDS Proxy |
 | Round 6 | 7 receipt-backed bouts and 1 earlier log-derived bout; no AWS lane was timed |
 | Deployed app | All 6 rounds have run. The 2026-09-14 install above exposed all six from a single command, with no separate Round 5 IAM step |
 
