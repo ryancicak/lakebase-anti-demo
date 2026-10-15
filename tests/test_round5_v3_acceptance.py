@@ -1260,6 +1260,154 @@ async def test_run_returns_one_bell_and_two_advancing_clocks_without_provider_pr
     await manager.close()
 
 
+@pytest.mark.parametrize(
+    ("raised", "told"),
+    [
+        (
+            "runner",
+            "Round 5's Lakebase lane did not verify its 10,000-client proof; "
+            "no comparison was declared.",
+        ),
+        ("runner_wrapped", "Round 5's Lakebase lane did not verify its 10,000-client proof; "
+            "no comparison was declared."),
+        ("runner_unknown_lane", "A Round 5 lane did not verify its 10,000-client proof; "
+            "no comparison was declared."),
+        ("setup", "The Round 5 setup phase failed; no comparison was declared."),
+    ],
+)
+async def test_a_lane_pipeline_failure_tells_the_room_whose_proof_failed(
+    raised: str,
+    told: str,
+) -> None:
+    """The v1.2.2 release bar, 2026-10-15: Lakebase verified its setup, held 10,000
+    clients, then one worker kept 2,499 of its 2,500 through the 30-second hold. Its
+    resident runner reported `fanin_worker_partial_result`, and because V4 runs each
+    lane's whole pipeline in the setup task, the room was told "The Round 5 setup
+    phase failed". A runner's failure is its lane's 10,000-client proof; only a
+    failure from anywhere else is still the setup phase's."""
+
+    from server.round5_control import Round5ResidentRunnerError
+
+    def error() -> BaseException:
+        if raised == "runner":
+            return Round5ResidentRunnerError("fanin_worker_partial_result", lane_id="lakebase")
+        if raised == "runner_unknown_lane":
+            return Round5ResidentRunnerError("fanin_worker_partial_result")
+        if raised == "runner_wrapped":
+            # As the release bar logged it: the sibling lane's cancellation chained on.
+            try:
+                try:
+                    raise Round5ResidentRunnerError(
+                        "fanin_worker_partial_result", lane_id="lakebase"
+                    )
+                except Round5ResidentRunnerError as runner_error:
+                    raise RuntimeError("lane pipeline stopped") from runner_error
+            except RuntimeError as wrapped:
+                return wrapped
+        return RuntimeError("CreateDBProxy was refused")
+
+    class Engine:
+        has_timed_setup = True
+        _armed = object()
+
+        def bind_claim(self, claim) -> None:
+            del claim
+
+        async def prepare(self, bout_id, fencing_token) -> None:
+            del bout_id, fencing_token
+
+        async def precommit_launch_intent(self, bout_id, fencing_token) -> None:
+            del bout_id, fencing_token
+
+        async def setup(
+            self,
+            bout_id,
+            fencing_token,
+            on_setup_progress,
+            on_lane_progress,
+            on_lane_result,
+        ):
+            del bout_id, fencing_token, on_setup_progress, on_lane_progress, on_lane_result
+            await asyncio.sleep(0)
+            raise error()
+
+        async def cancel_setup_and_settle(self, bout_id) -> None:
+            del bout_id
+
+    engine = Engine()
+    claim = SimpleNamespace(
+        claim_id="claim-one",
+        lakebase_job_id="a" * 64,
+        competitor_job_id="b" * 64,
+    )
+    capsule = SimpleNamespace(
+        variant_contexts={Round5Variant.AURORA: engine, Round5Variant.RDS: engine}
+    )
+
+    class Warm:
+        ring_ready = True
+        store = SimpleNamespace()
+
+        async def claim(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(claim=claim), capsule
+
+        def release_claim_active(self, claim_id):
+            del claim_id
+
+        def require_dispatchable(self, claim):
+            del claim
+
+        async def accept_bell(self, claim_id):
+            return BellContext(
+                bell_id="bell-one",
+                claim_id=claim_id,
+                warm_generation=4,
+                bout_id="bout-one",
+                bout_fence=1,
+                bell_at_utc=datetime(2026, 10, 15, tzinfo=UTC),
+                t0_monotonic_ns=1_000_000_000,
+            )
+
+    manager = RunManager(
+        connection_spike_factory=lambda competitor: engine,
+        round5_warm_coordinator=Warm(),
+        clock_ns=lambda: 1_050_000_000,
+    )
+
+    async def no_cost_bout(*_args, **_kwargs):
+        return None
+
+    manager._open_cost_bout = no_cost_bout
+    operator = BoutOperator(display_name="Owner", subject="owner")
+    created = await manager.create(
+        SessionCreate(
+            competitor=CompetitorId.AURORA_SERVERLESS_V2,
+            primary_persona="sre",
+            corners=[Corner.PERFORMANCE],
+            round_id=RoundId.SURVIVE_CONNECTION_SPIKE,
+        )
+    )
+    await manager.start_arm(created.id, operator)
+    for _ in range(100):
+        armed = await manager.get(created.id)
+        if armed.state == SessionState.ARMED:
+            break
+        await asyncio.sleep(0)
+    assert armed.state == SessionState.ARMED
+
+    await asyncio.wait_for(manager.start_run(created.id, operator), timeout=1)
+    for _ in range(400):
+        finished = await manager.get(created.id)
+        if finished.state == SessionState.FAILED:
+            break
+        await asyncio.sleep(0.005)
+
+    assert finished.state == SessionState.FAILED
+    assert finished.failure == told
+    await manager.close()
+
+
 async def test_a_towel_freezes_both_clocks_at_the_towel_not_at_their_last_milestone() -> None:
     """Ryan's towel 3.09 s after the bell: both clocks had run 3.09 s, as the room watched.
 
