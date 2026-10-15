@@ -295,11 +295,13 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
         else ""
     )
     warm_detail = None
+    round5_start_stage: str | None = None
     if coordinator_present and not warm_ring_ready:
         start_stage = str(
             warm_status.get("round5_start_stage")
             or ("cleaning" if warm_state == "cleaning" else "rewarming")
         ).upper()
+        round5_start_stage = start_stage.lower()
         generation = warm_status.get("round5_warm_generation")
         stage_instruction = (
             "pre-bell resident cleanup; auto-converge scheduled; "
@@ -383,6 +385,9 @@ def _availability_signals(request: Request) -> round_availability.AvailabilitySi
             else bool(getattr(round5_status, "ring_ready", False))
         ),
         round5_reason_code=round5_reason_code,
+        round5_start_stage=round5_start_stage,
+        round5_bout_live=bool(getattr(run_manager, "round5_bout_live", False)),
+        round5_blocked_terminal=blocked_terminal,
         round5_detail=(
             None
             if coordinator_present and warm_ring_ready

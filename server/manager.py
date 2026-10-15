@@ -1711,6 +1711,24 @@ class RunManager:
         return self._round5_protocol
 
     @property
+    def round5_bout_live(self) -> bool:
+        """Whether a Round 5 bout in this process holds an unexpired lease short of cleanup.
+
+        One of the reasons `round5_ring_ready` is False, and the one the catalog says as
+        "in use" rather than as Round 5 preparing backstage. A cleanup lease is not a bout:
+        cleanup is reported as cleanup.
+        """
+
+        now = datetime.now(UTC)
+        return any(
+            record.round5_lease is not None
+            and record.round5_lease.expires_at > now
+            and record.round5_lease.phase != "round5_cleanup"
+            for record in self._records.values()
+            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+        )
+
+    @property
     def round5_ring_ready(self) -> bool:
         # A local artifact lease is a third, synchronous gate. It closes the
         # health/catalog race where the warm cache still said READY for one beat

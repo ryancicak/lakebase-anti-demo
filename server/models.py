@@ -307,7 +307,9 @@ class RoundDefinition(BaseModel):
     #: clients and diagnostics; new clients branch on this field, never on the
     #: prose. Absent for every durable configuration, credential, permission,
     #: and health failure.
-    availability_reason_code: Literal["cleanup_in_progress", "storage_checking"] | None = Field(
+    availability_reason_code: Literal[
+        "cleanup_in_progress", "storage_checking", "round5_warming", "bout_in_progress"
+    ] | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
     )

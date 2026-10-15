@@ -213,6 +213,36 @@ _ROUND5_CLEANUP_HEADLINE = (
     "other rounds are unaffected."
 )
 
+#: Not `NOT_ON_THE_CARD`: a stage the coordinator names as clearing by itself is a
+#: round on tonight's card, a moment away -- the same register as storage checking.
+#: `_ROUND5_WARMING_HEADLINE` stays for a closed Round 5 with no stage to go on.
+_ROUND5_PREPARING_HEADLINE = (
+    "Round 5 is preparing backstage and opens automatically; the other rounds are "
+    "unaffected."
+)
+
+#: Not `NOT_ON_THE_CARD`: the round is on tonight's card and somebody is in it.
+_ROUND5_BOUT_HEADLINE = (
+    "Round 5 is in use: a bout is running in its ring. It opens again once that bout "
+    "has finished and cleaned up; the other rounds are unaffected."
+)
+
+#: The one closed Round 5 that does not reopen by itself, so it must not say it will.
+_ROUND5_BLOCKED_HEADLINE = (
+    f"{NOT_ON_THE_CARD} Round 5 needs operator attention backstage and will not "
+    "unlock on its own. The other rounds are unaffected."
+)
+
+#: Reason codes the fight card reads before its first board poll answers: Round 5
+#: preparing backstage (it reopens by itself), and Round 5 in use by a live bout.
+#: Neither is set for a stage that needs an operator.
+ROUND5_WARMING_REASON_CODE = "round5_warming"
+BOUT_IN_PROGRESS_REASON_CODE = "bout_in_progress"
+
+#: The coordinator stages that clear without anyone acting (`server.round5_warm`). A
+#: running bout reads as `rewarming` there, since its slot is in no other named state.
+_ROUND5_SELF_CLEARING_STAGES = frozenset({"rewarming", "claim-drain", "identity-refresh"})
+
 
 _ABSENT_OPPONENT_HEADLINE = (
     f"{NOT_ON_THE_CARD} The opponent it races is not set up in the account "
@@ -344,6 +374,16 @@ class AvailabilitySignals:
     round5_ring_ready: bool = True
     round5_reason_code: str | None = None
     round5_detail: str | None = None
+    #: The warm coordinator's own stage when Round 5 is closed (`server.round5_warm`'s
+    #: `round5_start_stage`, lowercased), or None when no coordinator reported one. Which
+    #: closed Round 5 is the catalog describing: one that reopens by itself, or one that
+    #: needs an operator?
+    round5_start_stage: str | None = None
+    #: Whether a Round 5 bout holds an unexpired lease in this process: closed because it
+    #: is in use, which reopens when the bout ends.
+    round5_bout_live: bool = False
+    #: Whether the coordinator has given up on its own and needs an operator.
+    round5_blocked_terminal: bool = False
     #: A `server.aws_credential_probe.CredentialVerdict`, or None when this
     #: process runs no probe. Typed loosely to keep this module importable
     #: without pulling botocore in behind it.
@@ -549,19 +589,27 @@ def refusal(round_id: RoundId, signals: AvailabilitySignals) -> RoundRefusal | N
                 _credential_detail(signals) or ROUND5_DEPLOYED_REFUSAL,
             )
         if not signals.round5_ring_ready:
-            return RoundRefusal(
-                (
-                    _ROUND5_CLEANUP_HEADLINE
-                    if signals.round5_reason_code == "cleanup_in_progress"
-                    else _ROUND5_WARMING_HEADLINE
-                ),
-                signals.round5_detail or _ROUND5_UNSETTLED_REFUSAL,
-                (
-                    "cleanup_in_progress"
-                    if signals.round5_reason_code == "cleanup_in_progress"
-                    else None
-                ),
+            detail = signals.round5_detail or _ROUND5_UNSETTLED_REFUSAL
+            if signals.round5_reason_code == "cleanup_in_progress":
+                return RoundRefusal(_ROUND5_CLEANUP_HEADLINE, detail, "cleanup_in_progress")
+            # Named in that order because each is the more specific fact. A fight card
+            # restored before its first board poll answers reads this code alone, and
+            # without one it drew a running or warming Round 5 as a red "unavailable
+            # tonight" for that poll.
+            terminal = signals.round5_blocked_terminal or (
+                signals.round5_start_stage == "terminal-blocked"
             )
+            if signals.round5_bout_live and not terminal:
+                return RoundRefusal(_ROUND5_BOUT_HEADLINE, detail, BOUT_IN_PROGRESS_REASON_CODE)
+            if terminal:
+                return RoundRefusal(_ROUND5_BLOCKED_HEADLINE, detail)
+            if signals.round5_start_stage in _ROUND5_SELF_CLEARING_STAGES:
+                return RoundRefusal(
+                    _ROUND5_PREPARING_HEADLINE, detail, ROUND5_WARMING_REASON_CODE
+                )
+            # No coordinator stage to go on: today's words, and no code that would
+            # promise the room an automatic reopening nobody has confirmed.
+            return RoundRefusal(_ROUND5_WARMING_HEADLINE, detail)
 
     presence = signals.presence
     if (
