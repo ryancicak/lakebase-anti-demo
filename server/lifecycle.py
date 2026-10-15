@@ -8245,8 +8245,9 @@ def _grant_posted_usage_read(profile: str, warehouse_id: str, app_client_id: str
     """Grant the app its billing read, or tell the operator exactly what an admin must run.
 
     The one grant in setup that may be refused without failing it. `system` is
-    Databricks' own catalog: only a metastore admin, or whoever an admin has made
-    able to grant there, can share it, and an installer that is neither still
+    Databricks' own catalog, and Databricks takes a grant on `system.billing` only
+    from an account admin (the v1.2.2 release install was refused all three with
+    "User is not an account admin for Account"); an installer that is not one still
     stands a working install with one degraded panel. So a refusal is printed with
     the statements to run, and setup goes on. Returns the statements that did not
     apply.

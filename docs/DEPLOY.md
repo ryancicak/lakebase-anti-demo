@@ -286,7 +286,7 @@ What It Cost reads the Databricks lanes' cost, Lakebase's included, from
 `system.billing`. From v1.2.2 setup grants the app that read, but
 `--deploy-only` never does, so an upgraded installation needs the four
 statements in [The billing read](#the-billing-read--what-what-it-cost-reads) run
-once, as a metastore admin. Without them the upgrade still works, and What It
+once, as an account admin. Without them the upgrade still works, and What It
 Cost says why those lanes are unpriced.
 
 An installation on v1.2.0 takes the same steps. One still on v1.1.1 follows
@@ -893,11 +893,12 @@ included, read as unpriced.
 
 `antidemo setup` grants it, from `_posted_usage_unity_catalog_grants()` in
 `server/lifecycle.py`, and it is the one grant setup may be refused without failing.
-`system` is Databricks' own catalog: only a metastore admin, or a principal an admin
-has allowed to grant there, can share it. When setup is refused it prints these
-statements and carries on. `./bootstrap.sh --deploy-only` never issues them, so an
-installation provisioned before this grant existed needs them run once by hand, as a
-metastore admin, on any SQL warehouse:
+`system` is Databricks' own catalog, and Databricks takes a grant on `system.billing`
+only from an account admin; anyone else is refused with "User is not an account admin
+for Account". When setup is refused it prints the statements that did not apply and
+carries on. `./bootstrap.sh --deploy-only` never issues them, so an installation
+whose setup was refused, or provisioned before this grant existed, needs them run
+once by hand, as an account admin, on any SQL warehouse:
 
 ```sql
 GRANT USE CATALOG ON CATALOG `system` TO `<app-client-id>`;
