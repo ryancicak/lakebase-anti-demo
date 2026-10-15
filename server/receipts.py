@@ -360,7 +360,13 @@ def derive_receipt(
     # receipts retain their setup metric only when no V4 runtime exists.
     setup = snapshot.round5_setup
     runtime = snapshot.round5_runtime
+    start_skew_ms = snapshot.fairness.launch_skew_ms
     if runtime is not None and runtime.protocol == "round5-bell-to-10k-v4":
+        # The start gap is how far apart the two lanes started. A V4 bout's
+        # fairness skew is not that: each lane runs on its own runner, and the
+        # skew is the wider of the two lanes' own four-shard launch spreads. The
+        # gap between the lanes is the setup workflows' launch skew after the bell.
+        start_skew_ms = setup.workflow_launch_skew_ms if setup is not None else None
         metric = "bell_to_10000_observed_ms"
         lb_runtime = runtime.lanes.get("lakebase")
         competitor_runtime = runtime.lanes.get("competitor")
@@ -464,7 +470,7 @@ def derive_receipt(
         lakebase=lakebase,
         opponent_lane=opponent,
         margin_ms=margin_ms,
-        start_skew_ms=snapshot.fairness.launch_skew_ms,
+        start_skew_ms=start_skew_ms,
         sealed_at=snapshot.updated_at,
         remembered_result=snapshot.remembered_result,
         failure=snapshot.failure,

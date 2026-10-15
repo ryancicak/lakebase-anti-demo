@@ -588,6 +588,78 @@ async def test_stopped_short_bout_with_both_lanes_verified_records_no_margin() -
     assert receipt.margin_ms is None
 
 
+async def test_a_v4_bell_receipt_keeps_the_gap_between_the_lanes_as_its_start_gap() -> None:
+    """Receipt 69D4C724 (2026-10-14): the lanes started 0.015 ms apart after the
+    bell, and the ledger stored 8.758 ms, the Aurora runner's own four-shard
+    launch spread. Each lane runs on its own runner, so that spread is never a
+    gap between the lanes, and a V4 receipt must carry the setup skew instead."""
+    from server.models import (
+        RoundFiveRuntimeLaneSnapshot,
+        RoundFiveRuntimeSnapshot,
+        RoundFiveSetupLaneSnapshot,
+        RoundFiveSetupSnapshot,
+    )
+
+    snapshot = await verified_round_one_snapshot()
+    snapshot.round = snapshot.round.model_copy(
+        update={
+            "id": RoundId.SURVIVE_CONNECTION_SPIKE,
+            "title": "Ready a pooled application path",
+        }
+    )
+    snapshot.fairness.launch_skew_ms = 8.757639
+    snapshot.round5_runtime = RoundFiveRuntimeSnapshot(
+        protocol="round5-bell-to-10k-v4",
+        warm_generation=1,
+        bell_id="bell-69d4c724",
+        revision=40,
+        state="verified",
+        bell_at_utc=snapshot.updated_at,
+        lanes={
+            lane_id: RoundFiveRuntimeLaneSnapshot(
+                id=lane_id,
+                phase="verified",
+                elapsed_at_snapshot_ms=elapsed,
+                bell_to_10000_observed_ms=elapsed,
+                clients_initiated=10_000,
+                clients_authenticated=10_000,
+                held_clients=10_000,
+                peak_clients_authenticated=10_000,
+                peak_held_clients=10_000,
+                sampled_queries_succeeded=64,
+                status="Exact 10,000-client retained gate verified",
+            )
+            for lane_id, elapsed in (("lakebase", 15_479.115026), ("competitor", 717_638.607605))
+        },
+    )
+    snapshot.round5_setup = RoundFiveSetupSnapshot(
+        lanes={
+            lane_id: RoundFiveSetupLaneSnapshot(
+                id=lane_id, name=name, workflow_launch_delay_ms=delay
+            )
+            for lane_id, name, delay in (
+                ("lakebase", "Lakebase", 5.021),
+                ("competitor", "Aurora Serverless v2 + RDS Proxy", 5.036),
+            )
+        },
+        workflow_launch_skew_ms=0.015251,
+    )
+
+    receipt = derive_receipt(snapshot, "run_finished")
+
+    assert receipt.start_skew_ms == pytest.approx(0.015251)
+
+    # Without the setup evidence there is no gap between the lanes to report:
+    # the ledger says so rather than falling back to one lane's shard spread.
+    snapshot.round5_setup = None
+    assert derive_receipt(snapshot, "run_finished").start_skew_ms is None
+
+    # Rounds 1-3 keep the verifier's own inter-lane launch skew.
+    round_one = await verified_round_one_snapshot()
+    round_one_receipt = derive_receipt(round_one, "run_finished")
+    assert round_one_receipt.start_skew_ms == round_one.fairness.launch_skew_ms
+
+
 async def test_a_verified_lane_is_never_flagged_as_a_lower_bound() -> None:
     snapshot = await verified_round_one_snapshot()
 
