@@ -14,6 +14,8 @@ import threading
 
 import pytest
 
+from server.round4_glue import GlueLaneError
+from server.round6_dms import DmsLaneError
 from server.round6_race import COMPETITOR_LANE, LAKEBASE_LANE, Verdict, new_bout_orders
 from tests.test_round6_race import BASELINE, FakeLane, engine, quiet
 from tests.test_round6_race_live import FakeJob, FakeTask, aws_lane
@@ -36,9 +38,11 @@ class BlockingDmsStart(FakeTask):
 
 
 class RefusingGlueStart(FakeJob):
+    # The lane's own error type, as `round4_glue` raises it: the operator log quotes this
+    # server's messages and only a type for anybody else's.
     def start(self, arguments):
         self.calls.append("start")
-        raise RuntimeError("ConcurrentRunsExceededException")
+        raise GlueLaneError("ConcurrentRunsExceededException")
 
 
 class BlockingGlueStart(FakeJob):
@@ -57,7 +61,7 @@ class BlockingGlueStart(FakeJob):
 class RefusingDmsStart(FakeTask):
     def start(self):
         self.calls.append("start")
-        raise RuntimeError("InvalidResourceStateFault")
+        raise DmsLaneError("InvalidResourceStateFault")
 
 
 def racing_aws_lane(task: FakeTask, job: FakeJob) -> FakeLane:
@@ -129,7 +133,9 @@ async def test_when_both_starts_are_refused_the_refusal_not_raised_is_logged(cap
         str(raised.value)
     }
     logged = [record.getMessage() for record in caplog.records]
-    assert any(f"RuntimeError: {dropped}" in line for line in logged), logged
+    assert any(
+        "also refused to start" in line and f"Error: {dropped}" in line for line in logged
+    ), logged
 
 
 async def test_both_starts_accepted_is_unchanged() -> None:
@@ -154,7 +160,7 @@ async def test_a_glue_refusal_is_no_result_though_dms_s_start_outlasts_the_bound
     aws = result.outcomes[COMPETITOR_LANE]
     assert not aws.timed_out and aws.bound_ms is None
     # The card names the refusal's type, never a provider's message, which can carry an ARN.
-    assert aws.failure == "AWS could not be started: RuntimeError"
+    assert aws.failure == "AWS could not be started: GlueLaneError"
     assert result.outcomes[LAKEBASE_LANE].verified
     assert result.resolution.verdict is Verdict.NO_RESULT
     assert result.resolution.winner is None

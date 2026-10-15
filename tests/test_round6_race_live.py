@@ -8,15 +8,18 @@ adapter, and AWS's DMS task, Glue job, source database and history table.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 
 from server.live_orders import LiveOrder, LiveOrderHistory, LiveOrdersLiveAdapter
+from server.manager import operator_diagnosis
 from server.models import CompetitorId
 from server.round4_glue import GlueRun
-from server.round6_dms import DmsTaskState
+from server.round6_dms import DmsCaptureTask, DmsLaneError, DmsTaskState
 from server.round6_race import (
     BOUT_NONCE_PREFIX,
     COMPETITOR_LANE,
@@ -389,6 +392,56 @@ class TestAwsCaptureLane:
         )
         assert has_resource_id, logged
         assert not any("arn:aws" in line for line in logged), logged
+
+    @staticmethod
+    def _refusing_dms_task(delay: float = 0.0) -> DmsCaptureTask:
+        """The real task, over a DMS that refuses the start with an ARN in its own words."""
+
+        arn = manifest().round6_aws.lane(None).task_arn
+
+        class Dms:
+            def describe_replication_tasks(self, **kwargs):
+                return {"ReplicationTasks": [{"ReplicationTaskArn": arn, "Status": "stopped"}]}
+
+            def start_replication_task(self, **kwargs):
+                time.sleep(delay)
+                raise ClientError(
+                    {
+                        "Error": {
+                            "Code": "AccessDeniedFault",
+                            "Message": f"arn:aws:iam::000000000000:user/x may not start {arn}",
+                        }
+                    },
+                    "StartReplicationTask",
+                )
+
+        return DmsCaptureTask(SimpleNamespace(client=lambda name, config=None: Dms()), arn)
+
+    def test_a_dms_refusal_after_glues_never_puts_the_task_arn_in_the_log(self, caplog):
+        # Both refuse, Glue first, so the DMS refusal is the one this lane logs itself.
+        class RefusingJob(FakeJob):
+            def start(self, arguments):
+                raise RuntimeError("Glue refused the start")
+
+        lane = aws_lane(self._refusing_dms_task(delay=0.05), RefusingJob())
+        with caplog.at_level("WARNING", logger="server.round6_race_live"):
+            with pytest.raises(RuntimeError, match="Glue refused the start"):
+                asyncio.run(lane.start())
+
+        logged = [record.getMessage() for record in caplog.records]
+        assert any("DMS task AURORA also refused to start" in line for line in logged), logged
+        assert any("AccessDeniedFault" in line for line in logged), logged
+        assert not any("arn:aws" in line for line in logged), logged
+
+    def test_a_first_dms_refusal_names_the_task_by_resource_id(self):
+        # This one is raised, and `round6_race` logs it through `operator_diagnosis`.
+        lane = aws_lane(self._refusing_dms_task(), FakeJob())
+        with pytest.raises(DmsLaneError) as refused:
+            asyncio.run(lane.start())
+
+        assert "AURORA" in str(refused.value)
+        assert "arn:aws" not in str(refused.value)
+        assert "arn:aws" not in operator_diagnosis(refused.value)
 
     def test_a_stale_stopped_status_just_after_the_bell_is_not_a_failure(self):
         clock = Clock()

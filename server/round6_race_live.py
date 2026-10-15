@@ -39,7 +39,7 @@ from .manifest import DemoManifest
 from .model_score_live import SqlParameter, WorkspaceStatementRunner
 from .models import CompetitorId
 from .round4_glue import TERMINAL_STATES, GlueWriterJob
-from .round6_dms import TRANSITIONAL, DmsCaptureTask, DmsTaskState
+from .round6_dms import TRANSITIONAL, DmsCaptureTask, DmsTaskState, task_resource_id
 from .round6_race import (
     BOUT_NONCE_PREFIX,
     COMPETITOR_LANE,
@@ -71,15 +71,6 @@ def _slot_prefix(task_arn: str) -> str:
     then a suffix of its own (read off the v1.1 test installation, 2026-09-29)."""
 
     return task_arn.rsplit(":", 1)[-1][:16].lower()
-
-
-def _task_resource_id(task_arn: str) -> str:
-    """The task's resource ID, without the account ID its ARN carries.
-
-    A DMS task ARN is arn:aws:dms:<region>:<account-id>:task:<resource-id>.
-    """
-
-    return task_arn.rsplit(":", 1)[-1]
 
 
 _COLUMNS = "order_id, sku, store, quantity, total_cents, status, proof_nonce"
@@ -427,7 +418,11 @@ class AwsCaptureLane:
 
         dms_start = asyncio.ensure_future(asyncio.to_thread(task.start))
         glue_start = asyncio.ensure_future(asyncio.to_thread(lambda: job.start({})))
-        dms_start.add_done_callback(partial(answered, f"DMS task {self._lane.task_arn}"))
+        # Named by resource ID: these names reach the operator log, and an ARN carries the
+        # AWS account ID.
+        dms_start.add_done_callback(
+            partial(answered, f"DMS task {task_resource_id(self._lane.task_arn)}")
+        )
         glue_start.add_done_callback(partial(answered, f"Glue job {self._lane.job_name}"))
         # Settling waits on this start alone before it parks, so it answers only once both
         # starts have: answering at the first refusal would let the other be accepted after
@@ -437,20 +432,25 @@ class AwsCaptureLane:
             self._run_id = glue[0]
         if refusals:
             (_, first), *others = refusals
-            for pipeline, other in others:
-                LOGGER.warning(
-                    "Round 6's %s also refused to start: %s: %s",
-                    pipeline,
-                    type(other).__name__,
-                    other,
-                )
+            if others:
+                # The first refusal is logged where the bout fails (`round6_race`), through
+                # the same rule: this server's own words, and only a type and code for a
+                # provider's, whose message can quote the account, role or task ARN.
+                from .manager import operator_diagnosis
+
+                for pipeline, other in others:
+                    LOGGER.warning(
+                        "Round 6's %s also refused to start: %s",
+                        pipeline,
+                        operator_diagnosis(other),
+                    )
             raise first
         kind, _ = dms
         if kind == "already-running":
             # Prepare parks the task, so a running one at the bell means AWS started warm.
-            task_id = _task_resource_id(self._lane.task_arn)
             LOGGER.warning(
-                "Round 6's DMS task %s was already running at the bell", task_id
+                "Round 6's DMS task %s was already running at the bell",
+                task_resource_id(self._lane.task_arn),
             )
 
     async def failure(self) -> str | None:
