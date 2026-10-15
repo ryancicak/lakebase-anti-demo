@@ -60,6 +60,7 @@ import { offerNativeShare, shareDismissalPrefix } from './share'
 import {
   BAT_SPRITE,
   HALLOWEEN,
+  HALLOWEEN_IDLE_NAME,
   HALLOWEEN_ROUND_NAMES,
   TOMB_SPRITE,
   drawPixelGrid,
@@ -200,7 +201,13 @@ function roundCardState(
 ): RoundCardState {
   if (status) return status.state === 'ready' ? 'available' : status.state
   if (round.availability_reason_code === 'cleanup_in_progress') return 'cleanup_in_progress'
-  if (round.availability_reason_code === 'storage_checking') return 'temporarily_unavailable'
+  // A restored fight card reads the catalog alone until its first board poll answers,
+  // and without these Round 5 running or warming read as a red "unavailable tonight".
+  if (round.availability_reason_code === 'bout_in_progress') return 'bout_in_progress'
+  if (
+    round.availability_reason_code === 'storage_checking'
+    || round.availability_reason_code === 'round5_warming'
+  ) return 'temporarily_unavailable'
   return round.availability === 'ready' ? 'available' : 'unavailable'
 }
 
@@ -1493,29 +1500,29 @@ function roundFiveCensoredLowerBoundMilliseconds(session: DemoSession, laneId: L
     : null
 }
 
-function receiptStartSkewDisplay(session: DemoSession): string {
+/**
+ * The start gap every receipt surface prints: how far apart the two lanes
+ * started, so lower is fairer.
+ *
+ * Round 5 reads it from the setup workflows' launch skew after the one bell.
+ * Its `fairness.launch_skew_ms` is a different number and is never a start gap:
+ * each lane runs on its own runner, and that figure is the wider of the two
+ * lanes' own four-shard launch spreads (receipt 69D4C724: lanes 0.015 ms apart,
+ * Aurora's shards 8.758 ms apart). Every other round's fairness skew is the
+ * verifier's own gap between the lanes.
+ */
+function receiptStartSkewMilliseconds(session: DemoSession): number | null {
   const skew = isRoundFive(session)
     ? isRoundFiveSetupEvidence(session.round5_setup)
       ? session.round5_setup?.workflow_launch_skew_ms
       : null
     : session.fairness.launch_skew_ms
-  return typeof skew === 'number' && Number.isFinite(skew) && skew >= 0
-    ? `${skew.toFixed(3)}ms`
-    : 'N/A'
+  return typeof skew === 'number' && Number.isFinite(skew) && skew >= 0 ? skew : null
 }
 
-/**
- * The launch skew that belongs beside the health-bars clocks. Those bars are
- * the fan-in race (bell to 10,000 held clients), whose fairness is the shared
- * post-readiness T0 -- `session.fairness.launch_skew_ms`. The Round 5 *setup*
- * workflow skew (`round5_setup.workflow_launch_skew_ms`) measures a different
- * thing and must not be relabelled as the race's start gap.
- */
-function fanInStartSkewDisplay(session: DemoSession): string {
-  const skew = session.fairness.launch_skew_ms
-  return typeof skew === 'number' && Number.isFinite(skew) && skew >= 0
-    ? `${skew.toFixed(3)}ms`
-    : 'N/A'
+function receiptStartSkewDisplay(session: DemoSession): string {
+  const skew = receiptStartSkewMilliseconds(session)
+  return skew === null ? 'N/A' : `${skew.toFixed(3)}ms`
 }
 
 /**
@@ -1553,14 +1560,33 @@ function roundFiveVerifiedVerdict(session: DemoSession): string {
   return `${winner} reached exactly 10,000 held clients · ${marginLabel} sooner`
 }
 
+/**
+ * Round 5's fair-start line, as ROUNDS.md states the V4 contract: one bell, the
+ * two lanes' start gap, each lane on its own clock to exactly 10,000 held
+ * clients, and each lane's own shard-launch spread (recorded, not scored).
+ * "Shared post-readiness T0" belonged to V3's shared barrier, where both lanes
+ * waited to be ready; a V4 clock includes the AWS lane building its Proxy, so
+ * that phrase would contradict the very clocks beside it.
+ */
 function roundFiveFairness(session: DemoSession): string {
-  const skew = session.fairness.launch_skew_ms
-  const skewLabel = typeof skew === 'number' && Number.isFinite(skew) && skew >= 0
-    ? `${skew.toFixed(3)} ms`
+  if (!roundFiveUsesFanIn(session)) {
+    return 'Legacy Round 5 scorecard decoded · current 10,000-client fan-in contract not recorded'
+  }
+  const shardSpread = session.fairness.launch_skew_ms
+  const shardSpreadLabel = typeof shardSpread === 'number' && Number.isFinite(shardSpread) && shardSpread >= 0
+    ? `${shardSpread.toFixed(3)} ms`
     : 'N/A'
-  return roundFiveUsesFanIn(session)
-    ? `Shared post-readiness monotonic T0 · Fan-in launch skew ${skewLabel} · Each clock stopped at exactly 10,000 authenticated held clients`
-    : 'Legacy Round 5 scorecard decoded · current 10,000-client fan-in contract not recorded'
+  if (!roundFiveBellRuntime(session)) {
+    return `Shared post-readiness monotonic T0 · Fan-in launch skew ${shardSpreadLabel} · Each clock stopped at exactly 10,000 authenticated held clients`
+  }
+  const startGap = receiptStartSkewMilliseconds(session)
+  const parts = [
+    'One server bell',
+    startGap === null ? 'Lane start gap not recorded' : `Lanes started ${startGap.toFixed(3)} ms apart`,
+    'Each clock runs to exactly 10,000 authenticated held clients',
+  ]
+  if (shardSpreadLabel !== 'N/A') parts.push(`Each lane's shards launched within ${shardSpreadLabel}`)
+  return parts.join(' · ')
 }
 
 function roundFiveIntegrityDetail(session: DemoSession): string {
@@ -2244,6 +2270,7 @@ function receiptPresentationBase(
       title: session.round.title,
       focus: priorityLabel(session.corners),
       winner: classified.formalWinner,
+      ...stackLaneLabels(session),
       lakebaseValue: towelLaneValue(session, 'lakebase'),
       competitorValue: towelLaneValue(session, 'competitor'),
       lakebaseStatus: towelVerifiedMs(session, 'lakebase') !== null ? 'EXACT VERIFIED' : towelLowerBoundMs(session, 'lakebase') !== null ? 'UNFINISHED · LOWER BOUND' : 'NO EXACT RESULT',
@@ -2318,10 +2345,7 @@ function receiptPresentationBase(
     const evidence = modelScoreEvidence(session.lanes.lakebase)
     return {
       ...receipt,
-      lakebaseLabel: roundFourLaneLabel(session, 'lakebase'),
-      competitorLabel: session.lanes.competitor.state === 'not_supported'
-        ? session.competitor.short_name
-        : roundFourLaneLabel(session, 'competitor'),
+      ...stackLaneLabels(session),
       integrityDetail: `INTEGRITY · CUSTOMER ${evidence.primaryKey} · RISK ${scoreText(evidence.score)} · MODEL ${evidence.modelVersion} · DELTA ${evidence.deltaVersion} · NONCE ${evidence.proofNonce}`,
     }
   }
@@ -2332,14 +2356,28 @@ function receiptPresentationBase(
     const evidence = liveOrderEvidence(session.lanes.lakebase)
     return {
       ...receipt,
-      lakebaseLabel: roundSixLaneLabel(session, 'lakebase'),
-      competitorLabel: session.lanes.competitor.state === 'not_supported'
-        ? session.competitor.short_name
-        : roundSixLaneLabel(session, 'competitor'),
+      ...stackLaneLabels(session),
       integrityDetail: `INTEGRITY · ORDER ${evidence.orderId} · ${evidence.totalDisplay} · NONCE ${evidence.proofNonce} · SEPARATE CHECKOUT ${evidence.guardrailOrderId} COMMITTED`,
     }
   }
   return receipt
+}
+
+/**
+ * The stack each lane raced with, for the receipts of Rounds 4 and 6, towelled or not:
+ * what the two lanes do differently is the integration, so a lane's brand alone would
+ * misname it ("Aurora Serverless v2" for a Glue job writing into it). An installation
+ * without the AWS lane names only its brand there, because no stack ran.
+ */
+function stackLaneLabels(session: DemoSession): Pick<ReceiptPresentation, 'lakebaseLabel' | 'competitorLabel'> {
+  const label = isRoundFour(session) ? roundFourLaneLabel : isRoundSix(session) ? roundSixLaneLabel : null
+  if (!label) return {}
+  return {
+    lakebaseLabel: label(session, 'lakebase'),
+    competitorLabel: session.lanes.competitor.state === 'not_supported'
+      ? session.competitor.short_name
+      : label(session, 'competitor'),
+  }
 }
 
 function canvasLines(
@@ -2363,6 +2401,52 @@ function canvasLines(
   return lines
 }
 
+function cardFont(size: number): string {
+  return `400 ${size}px "Press Start 2P", monospace`
+}
+
+interface CanvasTextFit {
+  size: number
+  lines: string[]
+  /** False when even `minSize` needed more lines, or more width, than the box allows. */
+  fits: boolean
+}
+
+/**
+ * The largest size, from `startSize` down to `minSize`, at which `text` wraps into at
+ * most `maxLines` lines that are each no wider than `maxWidth`. Leaves `context.font`
+ * at the size it returns.
+ *
+ * Width is checked as well as the line count. A single word is always one line, so a
+ * clock like "1000.00s" used to "fit" a 280 px slot at its 40 px start size and run
+ * 40 px past it. When nothing fits at `minSize`, every word is kept, in at most
+ * `maxLines` lines, and `fits` is false: the caller can move the text somewhere with
+ * room, and `drawFittedCanvasText` condenses what is still too wide into its box.
+ */
+function fitCanvasText(
+  context: CanvasRenderingContext2D,
+  text: string,
+  options: { maxWidth: number; maxLines: number; startSize: number; minSize: number },
+): CanvasTextFit {
+  for (let size = options.startSize; size >= options.minSize; size -= 1) {
+    context.font = cardFont(size)
+    const lines = canvasLines(context, text, options.maxWidth)
+    if (
+      lines.length <= options.maxLines
+      && lines.every((line) => context.measureText(line).width <= options.maxWidth)
+    ) return { size, lines, fits: true }
+  }
+  context.font = cardFont(options.minSize)
+  const lines = canvasLines(context, text, options.maxWidth)
+  return {
+    size: options.minSize,
+    lines: lines.length <= options.maxLines
+      ? lines
+      : [...lines.slice(0, options.maxLines - 1), lines.slice(options.maxLines - 1).join(' ')],
+    fits: false,
+  }
+}
+
 function drawFittedCanvasText(
   context: CanvasRenderingContext2D,
   text: string,
@@ -2378,20 +2462,47 @@ function drawFittedCanvasText(
     lineHeight?: number
   },
 ): number {
-  let size = options.startSize
-  let lines: string[] = []
-  while (size >= options.minSize) {
-    context.font = `400 ${size}px "Press Start 2P", monospace`
-    lines = canvasLines(context, text, options.maxWidth)
-    if (lines.length <= options.maxLines) break
-    size -= 1
-  }
-  const lineHeight = options.lineHeight ?? size * 1.28
+  const fit = fitCanvasText(context, text, options)
+  const lineHeight = options.lineHeight ?? fit.size * 1.28
   context.fillStyle = options.color
   context.textAlign = options.align ?? 'left'
-  lines.forEach((line, index) => context.fillText(line, options.x, options.y + index * lineHeight))
+  // `maxWidth` is the backstop: a line that still does not fit is condensed into its
+  // box instead of drawn over its neighbor. It changes nothing for a line that fits.
+  fit.lines.forEach((line, index) => context.fillText(line, options.x, options.y + index * lineHeight, options.maxWidth))
   context.textAlign = 'left'
-  return options.y + lines.length * lineHeight
+  return options.y + fit.lines.length * lineHeight
+}
+
+/**
+ * A lane's name as the PNG cards print it: the stack it raced with, in the poster's own
+ * words (Rounds 4, 5 and 6), or the plain brand. A card read without its caption still
+ * says that the AWS clock includes building an RDS Proxy, or starting Glue cold.
+ * Press Start 2P has no "→" glyph, and a canvas draws a missing glyph in another font
+ * mid-word, so the card spells the arrow out.
+ */
+function receiptCardLaneName(session: DemoSession, receipt: ReceiptPresentation, laneId: LaneId): string {
+  const label = laneId === 'lakebase'
+    ? receipt.lakebaseLabel ?? 'Lakebase'
+    : receipt.competitorLabel ?? session.competitor.short_name
+  return label.replace(/\s*→\s*/g, ' to ').toUpperCase()
+}
+
+/**
+ * What a receipt's audit line says about the start, before its timestamp: in capitals
+ * on the PNG cards, in sentence case on the text poster that mirrors them.
+ *
+ * Rounds 4 and 6 have no gap between the lanes' starts to report: one bell starts both
+ * integrations and both clocks are read from it on the controller's clock
+ * (`server/round4_race.py`, `server/round6_race.py`), so "START GAP N/A" was true and
+ * read like a missing fairness check. The figure keeps its lower-case unit either way.
+ */
+function receiptAuditStart(session: DemoSession, kind: ReceiptKind, form: 'card' | 'poster' = 'card'): string {
+  const card = form === 'card'
+  if (kind === 'idle') return `${card ? 'RESET' : 'Reset'} ${session.cooldown!.started_at}`
+  if ((isRoundFour(session) || isRoundSix(session)) && session.lanes.competitor.state !== 'not_supported') {
+    return card ? 'BOTH CLOCKS FROM ONE BELL' : 'Both clocks from one bell'
+  }
+  return `${card ? 'START GAP' : 'Start gap'} ${receiptStartSkewDisplay(session)}`
 }
 
 function drawPixelFighter(
@@ -2423,7 +2534,9 @@ function drawPixelFighter(
   context.textAlign = 'left'
 }
 
-async function renderReceiptCard(
+// Exported for the card layout test; it remains a pure renderer.
+// eslint-disable-next-line react-refresh/only-export-components
+export async function renderReceiptCard(
   session: DemoSession,
   roundNumber: number,
   kind: ReceiptKind,
@@ -2506,14 +2619,17 @@ async function renderReceiptCard(
   context.fillStyle = '#fff4c2'
   context.font = '400 13px "Press Start 2P", monospace'
   context.fillText(`ROUND ${String(roundNumber).padStart(2, '0')}`, 53, 140)
-  drawFittedCanvasText(context, receipt.title.toUpperCase(), {
-    x: 205, y: 137, maxWidth: 620, maxLines: 1, startSize: 21, minSize: 13, color: '#fff4c2',
+  // The focus line takes the width it needs from the right of the row, and the title
+  // has what is left. Round 5's focus ("EXACT 10,000-CLIENT FAN-IN · 30S HOLD") is
+  // 460px, and its 620px title used to run 145px into it.
+  const focusLine = `FOCUS · ${receipt.focus}`
+  drawFittedCanvasText(context, focusLine, {
+    x: 1140, y: 142, maxWidth: 520, maxLines: 1, startSize: 10, minSize: 7, color: '#f8d83b', align: 'right',
   })
-  context.fillStyle = '#f8d83b'
-  context.font = '400 10px "Press Start 2P", monospace'
-  context.textAlign = 'right'
-  context.fillText(`FOCUS · ${receipt.focus}`, 1140, 142)
-  context.textAlign = 'left'
+  const focusWidth = Math.min(520, context.measureText(focusLine).width)
+  drawFittedCanvasText(context, receipt.title.toUpperCase(), {
+    x: 205, y: 137, maxWidth: Math.min(620, 1140 - focusWidth - 24 - 205), maxLines: 1, startSize: 21, minSize: 13, color: '#fff4c2',
+  })
 
   const winner = receipt.winner
   const laneY = 177
@@ -2542,8 +2658,11 @@ async function renderReceiptCard(
     context.fillRect(x, laneY + 121, laneWidth, 5)
     context.globalAlpha = 1
     drawPixelFighter(context, x + 25, laneY + 47, color, fighter)
+    // A winner's chip sits at the right of the label's row (x + 422 on), so a winner's
+    // label stops 10px short of it rather than running under it: the chip used to hide
+    // the end of "AURORA SERVERLESS V2", and a lane's stack name is longer still.
     drawFittedCanvasText(context, label.toUpperCase(), {
-      x: x + 125, y: laneY + 28, maxWidth: 380, maxLines: 2, startSize: 17, minSize: 11, color,
+      x: x + 125, y: laneY + 28, maxWidth: isWinner ? laneWidth - 126 - 125 - 10 : 380, maxLines: 2, startSize: 17, minSize: 11, color,
     })
     drawFittedCanvasText(context, value, {
       x: x + 125,
@@ -2563,8 +2682,10 @@ async function renderReceiptCard(
       context.fillStyle = '#070b22'
       context.font = '400 9px "Press Start 2P", monospace'
       context.textAlign = 'center'
+      // A tie chips both lanes, so the chip must not say WINNER on both: every round
+      // says TIED, as Round 5 always did.
       context.fillText(
-        isRoundFive(session) ? winner === 'tie' ? 'TIED' : 'EARLIER' : 'WINNER',
+        winner === 'tie' ? 'TIED' : isRoundFive(session) ? 'EARLIER' : 'WINNER',
         x + laneWidth - 75,
         laneY + 25,
       )
@@ -2572,11 +2693,11 @@ async function renderReceiptCard(
     }
   }
   drawLane(
-    38, '#e8482e', 'Lakebase', receipt.lakebaseValue,
+    38, '#e8482e', receiptCardLaneName(session, receipt, 'lakebase'), receipt.lakebaseValue,
     receipt.lakebaseStatus, 'LB', winner === 'lakebase' || winner === 'tie',
   )
   drawLane(
-    614, '#4a83e8', session.competitor.short_name, receipt.competitorValue,
+    614, '#4a83e8', receiptCardLaneName(session, receipt, 'competitor'), receipt.competitorValue,
     receipt.competitorStatus,
     session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS',
     winner === 'competitor' || winner === 'tie',
@@ -2625,12 +2746,8 @@ async function renderReceiptCard(
   drawFittedCanvasText(context, receipt.fairness.toUpperCase(), {
     x: 58, y: 528, maxWidth: 735, maxLines: 2, startSize: 10, minSize: 8, color: '#070b22',
   })
-  const skew = receiptStartSkewDisplay(session)
-  const auditStart = kind === 'idle'
-    ? `RESET ${session.cooldown!.started_at}`
-    : `START GAP ${skew}`
   context.font = '400 7px "Press Start 2P", monospace'
-  context.fillText(`${auditStart} · ${receipt.measuredAt} · RECEIPT ${receiptId(session)}`, 58, 574)
+  context.fillText(`${receiptAuditStart(session, kind)} · ${receipt.measuredAt} · RECEIPT ${receiptId(session)}`, 58, 574)
 
   context.strokeStyle = '#e8482e'
   context.lineWidth = 5
@@ -2705,6 +2822,8 @@ function drawKnockoutReceipt(
   // The hero: 180px for a short ratio, stepped down for a longer label, never
   // under 100px -- smaller than that it is no longer the one thing a
   // phone-sized feed can read, which is this card's whole reason to exist.
+  // At the floor, a hero of eight or more characters (a margin of 1000s or more)
+  // is condensed into the 700px column rather than drawn over the fighters.
   let heroSize = 180
   context.font = font(heroSize)
   while (heroSize > 100 && context.measureText(knockout.hero).width > 700) {
@@ -2715,9 +2834,9 @@ function drawKnockoutReceipt(
   const drop = Math.round(heroSize / 24)
   context.textAlign = 'center'
   context.fillStyle = knockout.winnerColor
-  context.fillText(knockout.hero, 600 + drop, heroY + drop)
+  context.fillText(knockout.hero, 600 + drop, heroY + drop, 700)
   context.fillStyle = '#f8d83b'
-  context.fillText(knockout.hero, 600, heroY)
+  context.fillText(knockout.hero, 600, heroY, 700)
   context.textAlign = 'left'
 
   // The condition on the figure, in the ledger's own words.
@@ -2735,14 +2854,17 @@ function drawKnockoutReceipt(
   context.textAlign = 'center'
   context.fillText(knockout.chip, chipX + 51, 434)
   context.textAlign = 'left'
-  drawFittedCanvasText(context, 'LAKEBASE', {
-    x: 70, y: 452, maxWidth: 420, maxLines: 1, startSize: 13, minSize: 9, color: '#e8482e',
+  // Each lane is named by its stack. The name row is free between the two clocks'
+  // columns, so each name may run 520px toward the middle: "AWS DMS + GLUE FROM AURORA
+  // SERVERLESS V2 (COLD START)" fits at 10px, with 20px left between the two names.
+  drawFittedCanvasText(context, receiptCardLaneName(session, receipt, 'lakebase'), {
+    x: 70, y: 452, maxWidth: 520, maxLines: 1, startSize: 13, minSize: 9, color: '#e8482e',
   })
   drawFittedCanvasText(context, receipt.lakebaseValue, {
     x: 70, y: 470, maxWidth: 420, maxLines: 1, startSize: 40, minSize: 20, color: '#fff4c2',
   })
-  drawFittedCanvasText(context, session.competitor.short_name.toUpperCase(), {
-    x: 1130, y: 452, maxWidth: 420, maxLines: 1, startSize: 13, minSize: 9, color: '#4a83e8', align: 'right',
+  drawFittedCanvasText(context, receiptCardLaneName(session, receipt, 'competitor'), {
+    x: 1130, y: 452, maxWidth: 520, maxLines: 1, startSize: 13, minSize: 9, color: '#4a83e8', align: 'right',
   })
   if (knockout.capabilityGap) {
     // No clock to print: the lane fact, in full, where the clock would go.
@@ -2784,15 +2906,12 @@ function drawKnockoutReceipt(
   context.fillText("DON'T TRUST THIS POST.", 352, 545)
   context.fillStyle = '#e8482e'
   context.fillText('RING THE BELL YOURSELF.', 352, 569)
-  const auditStart = kind === 'idle'
-    ? `RESET ${session.cooldown!.started_at}`
-    : `START GAP ${receiptStartSkewDisplay(session)}`
   context.textAlign = 'right'
   context.fillStyle = '#070b22'
   context.font = font(9)
   context.fillText(`${receipt.verifiedStamp} · RECEIPT ${receiptId(session)}`, 1133, 543)
   context.font = font(7)
-  context.fillText(`${auditStart} · ${receipt.measuredAt}`, 1133, 561)
+  context.fillText(`${receiptAuditStart(session, kind)} · ${receipt.measuredAt}`, 1133, 561)
   context.textAlign = 'left'
 }
 
@@ -2857,7 +2976,7 @@ function drawHealthBarReceipt(
       context, 58, trackY - 20, color,
       home ? 'LB' : session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS',
     )
-    drawFittedCanvasText(context, home ? 'LAKEBASE' : session.competitor.short_name.toUpperCase(), {
+    drawFittedCanvasText(context, receiptCardLaneName(session, receipt, lane), {
       x: trackX, y: trackY - 20, maxWidth: trackWidth, maxLines: 1, startSize: 13, minSize: 9, color,
     })
     context.fillStyle = '#111e48'
@@ -2865,6 +2984,22 @@ function drawHealthBarReceipt(
     context.strokeStyle = '#46527c'
     context.lineWidth = 3
     context.strokeRect(trackX + 1.5, trackY + 1.5, trackWidth - 3, 57)
+
+    // The status rides beside its clock, or inside its bar, only while it fits there
+    // on one line. A bar of middling length leaves neither place room (a 65-character
+    // Round 6 status needs 455px even at 7px), and the status used to wrap into two or
+    // three rows of 7px type over the bar. Under the track a whole row is free.
+    const drawStatus = (x: number, maxWidth: number, statusColor: string) => {
+      if (maxWidth > 0 && fitCanvasText(context, status, { maxWidth, maxLines: 1, startSize: 9, minSize: 7 }).fits) {
+        drawFittedCanvasText(context, status, {
+          x, y: trackY + 26, maxWidth, maxLines: 1, startSize: 9, minSize: 7, color: statusColor,
+        })
+        return
+      }
+      drawFittedCanvasText(context, status, {
+        x: trackX, y: trackY + 65, maxWidth: trackWidth, maxLines: 1, startSize: 9, minSize: 7, color: '#aeb9df',
+      })
+    }
 
     const share = bars.fill[lane]
     if (share <= 0) {
@@ -2888,18 +3023,13 @@ function drawHealthBarReceipt(
       // A short bar: the clock and its status follow the fill along the track.
       const valueX = fillX + width + 18
       context.fillText(value, valueX, trackY + 12)
-      drawFittedCanvasText(context, status, {
-        x: valueX + valueWidth + 24, y: trackY + 26, maxWidth: fillX + fillWidth - 18 - (valueX + valueWidth + 24),
-        maxLines: 1, startSize: 9, minSize: 7, color: '#aeb9df',
-      })
+      drawStatus(valueX + valueWidth + 24, fillX + fillWidth - 18 - (valueX + valueWidth + 24), '#aeb9df')
     } else {
       // A long bar: the clock sits at its end, the status inside it.
       context.textAlign = 'right'
       context.fillText(value, fillX + width - 18, trackY + 12)
       context.textAlign = 'left'
-      drawFittedCanvasText(context, status, {
-        x: fillX + 18, y: trackY + 26, maxWidth: width - valueWidth - 60, maxLines: 1, startSize: 9, minSize: 7, color: '#070b22',
-      })
+      drawStatus(fillX + 18, width - valueWidth - 60, '#070b22')
     }
   }
   drawLane('lakebase', 216)
@@ -2936,10 +3066,7 @@ function drawHealthBarReceipt(
   context.font = font(11)
   context.fillStyle = '#070b22'
   context.fillText("DON'T TRUST THIS POST. RING THE BELL YOURSELF.", 58, 558)
-  const auditStart = kind === 'idle'
-    ? `RESET ${session.cooldown!.started_at}`
-    : `START GAP ${fanInStartSkewDisplay(session)}`
-  drawFittedCanvasText(context, `${auditStart} · ${receipt.measuredAt}`, {
+  drawFittedCanvasText(context, `${receiptAuditStart(session, kind)} · ${receipt.measuredAt}`, {
     x: 58, y: 580, maxWidth: 790, maxLines: 1, startSize: 7, minSize: 6, color: '#070b22',
   })
   context.fillStyle = '#0a2c22'
@@ -3009,7 +3136,9 @@ function halloweenRound(session: DemoSession, roundNumber: number, kind: Receipt
   const aurora = session.competitor.id === 'aurora_serverless_v2'
   return {
     label: kind === 'idle' ? 'IDLE' : `ROUND ${String(roundNumber).padStart(2, '0')}`,
-    name: (HALLOWEEN_ROUND_NAMES[roundNumber] ?? HALLOWEEN_ROUND_NAMES[1]).toUpperCase(),
+    name: (kind === 'idle'
+      ? HALLOWEEN_IDLE_NAME
+      : HALLOWEEN_ROUND_NAMES[roundNumber] ?? HALLOWEEN_ROUND_NAMES[1]).toUpperCase(),
     opponentTag: aurora ? 'AUR' : 'RDS',
     opponentColor: aurora ? HALLOWEEN.aurora : HALLOWEEN.rds,
   }
@@ -3049,8 +3178,11 @@ function drawHalloweenStub(
     drawFittedCanvasText(context, identity.stamp, {
       x: right, y: top + 30, maxWidth: 330, maxLines: 1, startSize: 11, minSize: 7, color: HALLOWEEN.ink, align: 'right',
     })
+    // 420px, not the stamp's 330: an idle card's line carries two full timestamps
+    // (60 characters, 360px even at 6px) and used to wrap. The invitation to its left
+    // ends at x 700, so the line still keeps 40px clear of it.
     drawFittedCanvasText(context, identity.audit, {
-      x: right, y: top + 52, maxWidth: 330, maxLines: 1, startSize: 8, minSize: 6, color: HALLOWEEN.ink, align: 'right',
+      x: right, y: top + 52, maxWidth: 420, maxLines: 1, startSize: 8, minSize: 6, color: HALLOWEEN.ink, align: 'right',
     })
     return
   }
@@ -3123,22 +3255,25 @@ function drawHalloweenKnockoutReceipt(
   fighter(fighterSprite('frankenstein', round.opponentColor), HALLOWEEN_WIDTH - 46 - 160, round.opponentTag)
 
   // The hero, stepped down only as far as its column needs, with the ledger's qualifier.
+  // Steps of 10 to 90px keep every hero's earlier size; below that, steps of 2 to a
+  // 70px floor fit a seven-character margin ("100.30s", a race under 2×) at 78px, where
+  // 90px ran 82px out of the 548px column toward the moon. Anything longer is condensed.
   const centre = HALLOWEEN_X + HALLOWEEN_WIDTH / 2
   let heroSize = 150
   context.font = halloweenFont(heroSize)
-  while (heroSize > 90 && context.measureText(knockout.hero).width > 548) {
-    heroSize -= 10
+  while (heroSize > 70 && context.measureText(knockout.hero).width > 548) {
+    heroSize -= heroSize > 90 ? 10 : 2
     context.font = halloweenFont(heroSize)
   }
   const heroY = HALLOWEEN_Y + 92 + (150 - heroSize) / 2
   const winnerColor = knockout.winner === 'lakebase' ? HALLOWEEN.blood : round.opponentColor
   context.textAlign = 'center'
   context.fillStyle = HALLOWEEN.bruise
-  context.fillText(knockout.hero, centre + 12, heroY + 12)
+  context.fillText(knockout.hero, centre + 12, heroY + 12, 548)
   context.fillStyle = winnerColor
-  context.fillText(knockout.hero, centre + 6, heroY + 6)
+  context.fillText(knockout.hero, centre + 6, heroY + 6, 548)
   context.fillStyle = HALLOWEEN.candy
-  context.fillText(knockout.hero, centre, heroY)
+  context.fillText(knockout.hero, centre, heroY, 548)
   context.textAlign = 'left'
   const afterQualifier = drawFittedCanvasText(context, knockout.qualifier, {
     x: centre, y: HALLOWEEN_Y + 264, maxWidth: 548, maxLines: 2, startSize: 22, minSize: 12,
@@ -3163,7 +3298,7 @@ function drawHalloweenKnockoutReceipt(
     context.textAlign = align
     context.fillText(chip, home ? x + 10 : x - 10, HALLOWEEN_Y + 321)
     context.textAlign = 'left'
-    const name = home ? 'LAKEBASE' : session.competitor.short_name.toUpperCase()
+    const name = receiptCardLaneName(session, receipt, home ? 'lakebase' : 'competitor')
     const nameColor = home ? HALLOWEEN.blood : round.opponentColor
     if (!home && knockout.capabilityGap) {
       // No clock to print: the lane fact, in full, where the clock would go.
@@ -3183,9 +3318,15 @@ function drawHalloweenKnockoutReceipt(
         x, y: HALLOWEEN_Y + 344, maxWidth: 280, maxLines: 1, startSize: 40, minSize: 18, color: HALLOWEEN.bone, align,
       })
     }
-    drawFittedCanvasText(context, name, {
-      x, y: HALLOWEEN_Y + 394, maxWidth: 280, maxLines: 1, startSize: 12, minSize: 8, color: nameColor, align,
-    })
+    // The lane's stack, under its clock, in a 280px slot. A name that won't sit on one
+    // line at 8px or more ("AWS GLUE TO AURORA SERVERLESS V2 (COLD START)") takes two
+    // lines of 9px or less, 10px apart, which still end 3px above the band.
+    const nameSlot = { x, y: HALLOWEEN_Y + 394, maxWidth: 280, color: nameColor, align }
+    if (fitCanvasText(context, name, { maxWidth: 280, maxLines: 1, startSize: 12, minSize: 8 }).fits) {
+      drawFittedCanvasText(context, name, { ...nameSlot, maxLines: 1, startSize: 12, minSize: 8 })
+    } else {
+      drawFittedCanvasText(context, name, { ...nameSlot, maxLines: 2, startSize: 9, minSize: 7, lineHeight: 10 })
+    }
   }
   lane(true)
   lane(false)
@@ -3210,12 +3351,9 @@ function drawHalloweenKnockoutReceipt(
     x: HALLOWEEN_X + 22, y: bandY + 48, maxWidth: HALLOWEEN_WIDTH - 88 - boxWidth, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.ink,
   })
 
-  const auditStart = kind === 'idle'
-    ? `RESET ${session.cooldown!.started_at}`
-    : `START GAP ${receiptStartSkewDisplay(session)}`
   drawHalloweenStub(context, height, {
     stamp: `${receipt.verifiedStamp} · RECEIPT ${receiptId(session)}`,
-    audit: `${auditStart} · ${receipt.measuredAt}`,
+    audit: `${receiptAuditStart(session, kind)} · ${receipt.measuredAt}`,
   }, 'knockout')
 }
 
@@ -3263,7 +3401,7 @@ function drawHalloweenHealthBarReceipt(
     context.font = halloweenFont(8)
     context.fillText(home ? 'LB' : round.opponentTag, HALLOWEEN_X + 74, HALLOWEEN_Y + top + 82)
     context.textAlign = 'left'
-    drawFittedCanvasText(context, home ? 'LAKEBASE' : session.competitor.short_name.toUpperCase(), {
+    drawFittedCanvasText(context, receiptCardLaneName(session, receipt, laneId), {
       x: trackX, y: HALLOWEEN_Y + top, maxWidth: trackWidth, maxLines: 1, startSize: 14, minSize: 9, color,
     })
     const trackY = HALLOWEEN_Y + top + 24
@@ -3272,6 +3410,22 @@ function drawHalloweenHealthBarReceipt(
     context.strokeStyle = HALLOWEEN.trackEdge
     context.lineWidth = 2
     context.strokeRect(trackX + 1, trackY + 1, trackWidth - 2, 56)
+
+    // The status rides beside its clock, or inside its bar, only while it fits there on
+    // one line; a bar of middling length leaves neither place room, and the status used
+    // to wrap into two or three rows of 7px type over the bar. Under the track a whole
+    // row is free, and at 8px it ends 4px above the verdict band.
+    const drawStatus = (x: number, maxWidth: number) => {
+      if (maxWidth > 0 && fitCanvasText(context, status, { maxWidth, maxLines: 1, startSize: 10, minSize: 7 }).fits) {
+        drawFittedCanvasText(context, status, {
+          x, y: trackY + 24, maxWidth, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.bone,
+        })
+        return
+      }
+      drawFittedCanvasText(context, status, {
+        x: trackX, y: trackY + 62, maxWidth: trackWidth, maxLines: 1, startSize: 8, minSize: 7, color: HALLOWEEN.bone,
+      })
+    }
 
     const share = bars.fill[laneId]
     if (share <= 0) {
@@ -3297,10 +3451,7 @@ function drawHalloweenHealthBarReceipt(
       context.fillText(value, valueX + 3, trackY + 15)
       context.fillStyle = HALLOWEEN.bone
       context.fillText(value, valueX, trackY + 12)
-      drawFittedCanvasText(context, status, {
-        x: valueX + valueWidth + 24, y: trackY + 24, maxWidth: fillX + fillWidth - 18 - (valueX + valueWidth + 24),
-        maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.bone,
-      })
+      drawStatus(valueX + valueWidth + 24, fillX + fillWidth - 18 - (valueX + valueWidth + 24))
     } else {
       // A long bar: the clock sits at its end, the status inside it.
       context.textAlign = 'right'
@@ -3309,9 +3460,7 @@ function drawHalloweenHealthBarReceipt(
       context.fillStyle = HALLOWEEN.bone
       context.fillText(value, fillX + width - 20, trackY + 12)
       context.textAlign = 'left'
-      drawFittedCanvasText(context, status, {
-        x: fillX + 20, y: trackY + 24, maxWidth: width - valueWidth - 64, maxLines: 1, startSize: 10, minSize: 7, color: HALLOWEEN.bone,
-      })
+      drawStatus(fillX + 20, width - valueWidth - 64)
     }
   }
   lane('lakebase', 170)
@@ -3341,12 +3490,9 @@ function drawHalloweenHealthBarReceipt(
     x: HALLOWEEN_X + 22, y: bandY + 78, maxWidth: HALLOWEEN_WIDTH - 44, maxLines: 1, startSize: 12, minSize: 8, color: HALLOWEEN.ink,
   })
 
-  const auditStart = kind === 'idle'
-    ? `RESET ${session.cooldown!.started_at}`
-    : `START GAP ${fanInStartSkewDisplay(session)}`
   drawHalloweenStub(context, height, {
     stamp: `${receipt.verifiedStamp}\n${receipt.receiptLabel} ${receiptId(session)}`,
-    audit: `${auditStart} · ${receipt.measuredAt}`,
+    audit: `${receiptAuditStart(session, kind)} · ${receipt.measuredAt}`,
   }, 'health-bars')
 }
 
@@ -3841,6 +3987,12 @@ function App() {
   const [primary, setPrimary] = useState<PersonaId>(initialProgress.primary)
   const [secondary, setSecondary] = useState<PersonaId[]>(initialProgress.secondary)
   const [roundOverride, setRoundOverride] = useState<RoundId | null>(initialProgress.roundOverride)
+  // Whether the pin above came from rolling the opponent on the fight card (◀/▶) rather
+  // than from a tile the presenter picked. Rolling the opponent must not swap the round
+  // under the presenter, so it pins the round on screen; but nobody chose that round, so
+  // a new lead voice or priority lets go of it and the card recommends again. A picked
+  // tile stays picked. Not saved: after a reload every pin reads as picked, as before.
+  const [roundPinImplicit, setRoundPinImplicit] = useState(false)
   const [session, setSession] = useState<DemoSession | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [liveEvidenceConnected, setLiveEvidenceConnected] = useState(true)
@@ -4125,6 +4277,7 @@ function App() {
           setPrimary(incoming.primary_persona.id)
           setSecondary(incoming.secondary_personas.map((persona) => persona.id))
           setRoundOverride(incoming.round.id)
+          setRoundPinImplicit(false)
           setCommentaryOpen(true)
           setSession(incoming)
           setSessionRestoreError(null)
@@ -4509,6 +4662,7 @@ function App() {
 
   function changePrimary(id: PersonaId) {
     if (sound) playCursor()
+    if (id !== primary) releaseImplicitRoundPin(recommend(catalog, competitor, corners, id).round_id)
     setPrimary(id)
     setSecondary((current) => current.filter((candidate) => candidate !== id))
   }
@@ -4525,6 +4679,10 @@ function App() {
 
   function toggleCorner(corner: CustomerCorner) {
     if (sound) playCursor()
+    // The last priority cannot be switched off, so only a real change lets go of the pin.
+    if (!corners.includes(corner) || corners.length > 1) {
+      releaseImplicitRoundPin(recommendation.round_id)
+    }
     setCorners((current) => {
       if (!current.includes(corner)) {
         return catalog.corners.filter((candidate) => current.includes(candidate) || candidate === corner)
@@ -4763,15 +4921,23 @@ function App() {
     return prepareFight({ competitor, corners, primary, secondary, roundOverride })
   }
 
-  function changeRoundOverride(id: RoundId | null) {
-    const nextRoundId = id ?? recommendation.round_id
+  function changeRoundOverride(id: RoundId | null, recommended: RoundId = recommendation.round_id) {
+    const nextRoundId = id ?? recommended
     if (nextRoundId !== selectedRoundId) {
       roundChangesRef.current += 1
       // The last press's reason is about the round it was pressed for. Kept, it sits
       // in the pinned bar over the new round's PREPARE and reads as being about it.
       setError(null)
     }
+    setRoundPinImplicit(false)
     setRoundOverride(id)
+  }
+
+  // The lead voice or the priorities changed: a pin that rolling the opponent made
+  // (`roundPinImplicit`) lets go, and the card follows what the new choice recommends.
+  // `recommended` is that new recommendation, since this runs before the state update.
+  function releaseImplicitRoundPin(recommended: RoundId) {
+    if (roundPinImplicit) changeRoundOverride(null, recommended)
   }
 
   function ringAgain() {
@@ -4788,6 +4954,7 @@ function App() {
     setPrimary(exactSelection.primary)
     setSecondary(exactSelection.secondary)
     setRoundOverride(exactSelection.roundOverride)
+    setRoundPinImplicit(false)
     return prepareFight(exactSelection)
   }
 
@@ -4989,6 +5156,7 @@ function App() {
     setPrimary(completed.primary_persona.id)
     setSecondary(completed.secondary_personas.map((persona) => persona.id))
     setRoundOverride(nextRound?.id ?? completed.round.id)
+    setRoundPinImplicit(false)
     navigate('setup', 'card')
   }
 
@@ -5003,6 +5171,7 @@ function App() {
       setPrimary(completed.primary_persona.id)
       setSecondary(completed.secondary_personas.map((persona) => persona.id))
       setRoundOverride(completed.round.id)
+      setRoundPinImplicit(false)
     }
     navigate('setup', 'card')
   }
@@ -5297,8 +5466,15 @@ function App() {
       onScene={changeSetupScene}
       onCompetitor={(id) => {
         if (sound) playCursor()
+        // The last refusal was about the old matchup; kept, it sits over the new
+        // opponent's PREPARE and reads as being about it (as in `changeRoundOverride`).
+        if (id !== competitor) setError(null)
         setCompetitor(id)
-        setRoundOverride(setupScene === 'card' ? selectedRoundId : null)
+        // On the card the round on screen stays put (see `roundPinImplicit`); a pin the
+        // presenter picked stays a picked one.
+        const pinned = setupScene === 'card' ? selectedRoundId : null
+        setRoundPinImplicit(pinned !== null && (roundOverride === null || roundPinImplicit))
+        setRoundOverride(pinned)
       }}
       onCorner={toggleCorner}
       onPrimary={changePrimary}
@@ -8086,7 +8262,6 @@ function ReceiptPoster({
 }) {
   const receipt = receiptPresentation(session, kind)
   const resultWidth = receipt.verdict.length > 52 ? 'long' : receipt.verdict.length > 36 ? 'medium' : 'short'
-  const skew = receiptStartSkewDisplay(session)
   const competitorFighter = session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS'
   return (
     <article className={fallbackOnly ? 'receipt-poster receipt-poster--mirror' : 'receipt-poster'} aria-label={kind === 'idle' ? 'Verified back to idle poster preview' : session.towel ? 'Bout result poster preview' : 'Verified result poster preview'}>
@@ -8123,7 +8298,7 @@ function ReceiptPoster({
         <div>
           <strong>Fair-start contract</strong>
           <p>{receipt.fairness}</p>
-          <small>{kind === 'idle' ? `Reset ${session.cooldown!.started_at}` : `Start gap ${skew}`} · {receipt.measuredAt} · Receipt {receiptId(session)}</small>
+          <small>{receiptAuditStart(session, kind, 'poster')} · {receipt.measuredAt} · Receipt {receiptId(session)}</small>
         </div>
         <b>One live run<span>Not a benchmark</span></b>
       </footer>
@@ -8157,7 +8332,8 @@ function ReceiptCardPreview({ blob, kind }: { blob: Blob; kind: ReceiptKind }) {
   )
 }
 
-function ShareReceipt({
+// Exported for the share dialog's redraw test.
+export function ShareReceipt({
   session,
   roundNumber,
   kind,
@@ -8199,13 +8375,22 @@ function ShareReceipt({
   const cardBlob = renderedCard?.key === cardKey ? renderedCard.blob : null
   const cardRenderFailed = failedCardKey === cardKey
 
+  // The card is drawn from what the receipt says, not from the object that carried it.
+  // A reconcile hands this dialog a new session object even when the server's snapshot
+  // has not changed, and each one used to redraw and re-encode the PNG and swap its
+  // object URL: five canvases in three seconds while the event stream was down.
+  // `updated_at` cannot key the drawing either: a cooldown event changes what the idle
+  // card draws and keeps `updated_at` (round4.ts, `applyRunEventSnapshot`).
+  const sessionSignature = JSON.stringify(session)
+  const cardSession = useMemo(() => JSON.parse(sessionSignature) as DemoSession, [sessionSignature])
+
   useEffect(() => {
     let current = true
-    void renderReceiptCard(session, roundNumber, kind, cardStyle, cardTheme)
+    void renderReceiptCard(cardSession, roundNumber, kind, cardStyle, cardTheme)
       .then((blob) => { if (current) setRenderedCard({ key: cardKey, blob }) })
       .catch(() => { if (current) setFailedCardKey(cardKey) })
     return () => { current = false }
-  }, [cardKey, cardStyle, cardTheme, kind, roundNumber, session])
+  }, [cardKey, cardStyle, cardTheme, kind, roundNumber, cardSession])
 
   async function copyPost(updateStatus = true): Promise<boolean> {
     try {

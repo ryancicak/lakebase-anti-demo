@@ -217,7 +217,7 @@ export interface RoundDefinition {
    * configuration and health failures; presentation must never infer it from
    * `availability_reason` or `availability_headline`.
    */
-  availability_reason_code?: 'cleanup_in_progress' | 'storage_checking' | null
+  availability_reason_code?: 'cleanup_in_progress' | 'storage_checking' | 'round5_warming' | 'bout_in_progress' | null
   // The operator's full account of the refusal: the port, the security group,
   // the exact permission Databricks named. Never the thing a fight card leads
   // with -- see `availability_headline`, which is what the room reads.

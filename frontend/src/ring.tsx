@@ -513,6 +513,8 @@ export function FightRing(props: {
   const homeCostume = fighterCostume('red')
   const awayCostume = fighterCostume('blue')
   const frankenstein = awayCostume === 'frankenstein'
+  const pumpkinHome = homeCostume === 'pumpkin'
+  const homeHeadTop = pumpkinHome ? 4 : 0
   return (
     <div className="ring">
       {/* The ticked chase rail and the red/blue corner bar that used to sit here
@@ -694,12 +696,16 @@ export function FightRing(props: {
 
           <g transform={`translate(${nearFighterX},${fighterY}) scale(${fighterScale})`}>
             <g className="g-bob px" id="ring-home" data-costume={homeCostume}>
-              {homeCostume === 'pumpkin' && <rect x="22" y="-4" width="4" height="4" fill="#4caf50" />}
-              <rect x="12" y="0" width="24" height="12" fill={homeCostume === 'pumpkin' ? '#ff8a1f' : '#e6dfc6'} />
-              <rect x="16" y="4" width="4" height="4" fill="#10152f" />
-              <rect x="28" y="4" width="4" height="4" fill="#10152f" />
-              {homeCostume === 'pumpkin' && <rect x="18" y="9" width="12" height="2" fill="#10152f" />}
-              <rect x="12" y="13" width="24" height="4" fill="#767b80" />
+              {/* The pumpkin's stem sits inside the sprite's 0-88 box, its head four units
+                  lower where the boxer's grey jaw was. Drawn above y=0, at the 2.3 scale of
+                  Rounds 2, 3 and 5 the stem crossed the top rope that the scale is the
+                  ceiling for (see ACT_FIGHTER_SCALE). */}
+              {pumpkinHome && <rect x="22" y="0" width="4" height="4" fill="#4caf50" />}
+              <rect x="12" y={homeHeadTop} width="24" height="12" fill={pumpkinHome ? '#ff8a1f' : '#e6dfc6'} />
+              <rect x="16" y={homeHeadTop + 4} width="4" height="4" fill="#10152f" />
+              <rect x="28" y={homeHeadTop + 4} width="4" height="4" fill="#10152f" />
+              {pumpkinHome && <rect x="18" y={homeHeadTop + 9} width="12" height="2" fill="#10152f" />}
+              {!pumpkinHome && <rect x="12" y="13" width="24" height="4" fill="#767b80" />}
               <rect x="9" y="19" width="30" height="15" fill="#e6dfc6" />
               <rect x="9" y="36" width="30" height="15" fill="#cfc7ab" />
               <rect x="12" y="53" width="24" height="13" fill="#ee452d" />
@@ -1130,12 +1136,17 @@ export function FightRing(props: {
              unchanged when it comes back, and not what anybody is reading the
              strip for while a bout is live. */
           const live = props.roundStatuses?.[item.id] ?? null
+          // Before the board answers, the catalog's reason code is all there is: a Round 5
+          // bout in progress or warming backstage must not read as a red UNAVAILABLE.
           const state = live?.state
             ?? (item.availability_reason_code === 'cleanup_in_progress'
               ? 'cleanup_in_progress'
-              : item.availability_reason_code === 'storage_checking'
-                ? 'temporarily_unavailable'
-                : item.availability === 'ready' ? 'ready' : 'unavailable')
+              : item.availability_reason_code === 'bout_in_progress'
+                ? 'bout_in_progress'
+                : item.availability_reason_code === 'storage_checking'
+                  || item.availability_reason_code === 'round5_warming'
+                  ? 'temporarily_unavailable'
+                  : item.availability === 'ready' ? 'ready' : 'unavailable')
           const busy = state === 'bout_in_progress'
           const resetting = state === 'temporarily_unavailable' && roundFiveResetting(live)
           const cleaning = state === 'cleanup_in_progress' || resetting
