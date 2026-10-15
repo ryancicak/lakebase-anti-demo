@@ -446,9 +446,23 @@ def _run_streamed(
         timer.start()
         try:
             assert process.stdout is not None
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                kept.append(line)
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    kept.append(line)
+            except KeyboardInterrupt:
+                # Ctrl-C reaches the whole foreground process group, so the command has
+                # the interrupt too, and Terraform answers one by finishing the calls in
+                # flight and recording what they made. Leaving now closes its pipe under
+                # it, and it dies at its next line of output before it writes that state:
+                # 2026-10-15's interrupted install left eight databases its state never
+                # listed, which cleanup cannot destroy. So read on until it exits, then
+                # let the interrupt stop the caller. A second Ctrl-C still leaves at once.
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    kept.append(line)
+                process.wait()
+                raise
             returncode = process.wait()
         finally:
             timer.cancel()

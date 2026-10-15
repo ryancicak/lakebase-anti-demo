@@ -200,6 +200,42 @@ def test_a_watched_command_past_its_timeout_is_killed() -> None:
     assert time.monotonic() - started < 30
 
 
+def test_an_interrupted_watch_lets_the_command_finish_shutting_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Ctrl-C reaches Terraform too, and Terraform records what it made before it exits.
+
+    2026-10-15: an interrupted install closed Terraform's pipe and returned within a
+    quarter second. Terraform died at its next line of output, before it recorded the
+    databases it was creating, and cleanup could not destroy what its state never listed.
+    """
+    recorded = tmp_path / "state"
+    script = (
+        "import pathlib, sys, time\n"
+        "print('Still creating...', flush=True)\n"
+        "time.sleep(1)\n"
+        "print('Stopping operation...', flush=True)\n"
+        f"pathlib.Path({str(recorded)!r}).write_text('recorded')\n"
+        "sys.exit(1)\n"
+    )
+    real_print = print
+    interrupted: list[bool] = []
+
+    def ctrl_c_on_the_first_line(*args, **kwargs) -> None:
+        if not interrupted:
+            interrupted.append(True)
+            raise KeyboardInterrupt
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "print", ctrl_c_on_the_first_line, raising=False)
+
+    with pytest.raises(KeyboardInterrupt):
+        lifecycle._run_streamed(_python(script), timeout=60, env=_UTF8)
+
+    assert recorded.read_text() == "recorded"
+    assert "Stopping operation..." in capsys.readouterr().out
+
+
 MANIFEST = SimpleNamespace(run_id="ad-test-001")
 LOST = lifecycle.NetworkFailure(
     "Error: reading IAM Role (dms-vpc-role): dial tcp: lookup iam.amazonaws.com: no such host"
