@@ -76,7 +76,7 @@ describe('deterministic fight-card recommendation', () => {
     // describe the only Round 5 protocol the server can run (server/catalog.py).
     const round = FALLBACK_CATALOG.rounds.find((item) => item.id === 'survive_connection_spike')!
     expect(round.round5_protocol).toBe(ROUND_FIVE_BELL_PROTOCOL)
-    expect(round.metric_specs.find((spec) => spec.role === 'primary')?.id).toBe('bell_to_10000_observed_ms')
+    expect(round.metric_specs?.find((spec) => spec.role === 'primary')?.id).toBe('bell_to_10000_observed_ms')
     expect(round.scorecard_by_corner.simplicity).toContain(
       'Included Lakebase pooled endpoint versus 3 timed Proxy mutations on the selected AWS managed pooling path',
     )
