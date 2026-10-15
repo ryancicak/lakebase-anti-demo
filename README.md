@@ -113,13 +113,13 @@ read [Cost and safety](#cost-and-safety) for what bills until then.
 
 ## Which version is running
 
-The app shows its release — `v1.2.1` — in the bottom-right corner of the title
+The app shows its release — `v1.2.2` — in the bottom-right corner of the title
 screen, on the staff roll's title card and on the card it holds at the end.
 `GET /api/version` says the same, plus the exact commit when `bootstrap.sh`
 deployed it:
 
 ```json
-{"version": "1.2.1", "commit": "0123456789ab", "dirty": false}
+{"version": "1.2.2", "commit": "0123456789ab", "dirty": false}
 ```
 
 `dirty` is `true` when the deployed tree had uncommitted changes. Every release
@@ -130,8 +130,9 @@ test holds them equal — and is tagged `v<version>` once it has passed
 ## Upgrading an existing installation
 
 Pull the new release into the checkout the installation was made from. Coming
-from v1.2.0, the usual `./bootstrap.sh --deploy-only` is the whole upgrade:
-[Upgrading from v1.2.0](docs/DEPLOY.md#upgrading-from-v120). Coming from v1.1.1,
+from v1.2.1 or v1.2.0, the usual `./bootstrap.sh --deploy-only` is the whole
+upgrade: [Upgrading from v1.2.1](docs/DEPLOY.md#upgrading-from-v121), which also
+names the one-time billing grant What It Cost needs. Coming from v1.1.1,
 follow [Upgrading from v1.1.1](docs/DEPLOY.md#upgrading-from-v111). That is one
 extra command, `./antidemo coordination-upgrade` with `ANTI_DEMO_MANIFEST`
 exported as that section shows, which creates and grants the coordination table
