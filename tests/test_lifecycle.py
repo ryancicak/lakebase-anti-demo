@@ -4444,6 +4444,11 @@ def test_round4_pipeline_requires_exactly_one_exact_sink(monkeypatch) -> None:
         "GRANT SELECT, MODIFY ON TABLE "
         f"`{names['source_table'].replace('.', '`.`')}` TO `{principal}`",
         f"GRANT SELECT ON TABLE `{names['synced_table_id'].replace('.', '`.`')}` TO `{principal}`",
+        # What It Cost's posted read, on the same warehouse it runs on.
+        f"GRANT USE CATALOG ON CATALOG `system` TO `{principal}`",
+        f"GRANT USE SCHEMA ON SCHEMA `system`.`billing` TO `{principal}`",
+        f"GRANT SELECT ON TABLE `system`.`billing`.`usage` TO `{principal}`",
+        f"GRANT SELECT ON TABLE `system`.`billing`.`list_prices` TO `{principal}`",
     ]
 
     role_reads: dict[str, int] = {}

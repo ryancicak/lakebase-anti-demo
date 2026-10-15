@@ -270,6 +270,28 @@ table is missing or ungranted, startup refuses rather than installing no power
 store and serving anyway. `antidemo renew` is not the upgrade either: its
 Round 5 re-seal can create this table, but it never grants it to the app.
 
+### Upgrading from v1.2.1
+
+v1.2.2 changes neither the coordination schema nor the Round 5 runner, so the
+usual redeploy is the whole upgrade. From the checkout the installation was made
+from, while nobody is presenting:
+
+```bash
+git pull                     # or check out the release tag
+uv sync --locked             # a no-op unless uv.lock changed
+./bootstrap.sh --deploy-only
+```
+
+What It Cost reads the Databricks lanes' cost, Lakebase's included, from
+`system.billing`. From v1.2.2 setup grants the app that read, but
+`--deploy-only` never does, so an upgraded installation needs the four
+statements in [The billing read](#the-billing-read--what-what-it-cost-reads) run
+once, as a metastore admin. Without them the upgrade still works, and What It
+Cost says why those lanes are unpriced.
+
+An installation on v1.2.0 takes the same steps. One still on v1.1.1 follows
+[the v1.1.1 steps](#upgrading-from-v111) first.
+
 ### Upgrading from v1.2.0
 
 v1.2.1 changes neither the coordination schema nor the Round 5 runner, so the
@@ -789,10 +811,11 @@ The deploy writes secrets, binds resources and pushes source; it cannot grant
 privileges to its own service principal. `antidemo setup` does that instead, one
 provision before the app's first read — the Databricks-side half is `CAN_USE` on
 the warehouse, `USE CATALOG` / `USE SCHEMA` / `SELECT` / `MODIFY` on the Round 4
-source table, and read on the Round 4 target Postgres. The two sections below are
-that whole set written out: the Unity Catalog and Lakebase grants first, then the
-Postgres coordination grants in full. Both blocks are for running by hand only
-against an installation provisioned before the fix that added them.
+source table, read on the Round 4 target Postgres, and read on `system.billing`
+for What It Cost. The sections below are that whole set written out: the Unity
+Catalog and Lakebase grants first, then the billing read, then the Postgres
+coordination grants in full. Each block is for running by hand only against an
+installation provisioned before the fix that added it.
 
 ### Unity Catalog and Lakebase grants — what the deployed app reads
 
@@ -858,6 +881,36 @@ the Round 6 branch endpoint as the schema owner:
 GRANT SELECT, INSERT, DELETE ON TABLE
   "<round 6 source schema>"."live_orders" TO "<app-client-id>";
 ```
+
+### The billing read — what What It Cost reads
+
+What It Cost compares what the installation was projected to cost with what
+Databricks actually posted, and the posted half is one `SELECT` over
+`system.billing.usage` and `system.billing.list_prices` (`server/posted_usage.py`).
+Without read access there, the app's read is refused, What It Cost says the app is
+not yet granted read access to `system.billing`, and both Databricks lanes, Lakebase
+included, read as unpriced.
+
+`antidemo setup` grants it, from `_posted_usage_unity_catalog_grants()` in
+`server/lifecycle.py`, and it is the one grant setup may be refused without failing.
+`system` is Databricks' own catalog: only a metastore admin, or a principal an admin
+has allowed to grant there, can share it. When setup is refused it prints these
+statements and carries on. `./bootstrap.sh --deploy-only` never issues them, so an
+installation provisioned before this grant existed needs them run once by hand, as a
+metastore admin, on any SQL warehouse:
+
+```sql
+GRANT USE CATALOG ON CATALOG `system` TO `<app-client-id>`;
+GRANT USE SCHEMA ON SCHEMA `system`.`billing` TO `<app-client-id>`;
+GRANT SELECT ON TABLE `system`.`billing`.`usage` TO `<app-client-id>`;
+GRANT SELECT ON TABLE `system`.`billing`.`list_prices` TO `<app-client-id>`;
+```
+
+`system.billing.usage` holds the whole account's usage, not only this
+installation's. The app's one query reads only the rows for the endpoints, app and
+pipeline its manifest seals, but the grant itself is account-wide. An admin who
+would rather not share that can leave it ungranted: What It Cost then says why the
+Databricks lanes are unpriced and prices the AWS half as before.
 
 ### Coordination-database grants — the complete runtime set
 

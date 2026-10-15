@@ -30,6 +30,9 @@ import pytest
 from server.cost_model import InstallationShape, RateCard
 from server.models import StandingCostLaneId
 from server.posted_usage import (
+    POSTED_READ_FAILED,
+    POSTED_READ_NOT_GRANTED,
+    POSTED_READ_UNPARSED,
     PostedUsageCache,
     PostedUsageScope,
     PostedUsageScopeError,
@@ -497,7 +500,7 @@ class TestLosingBillingCostsTheVarianceAndNothingElse:
             raise TimeoutError("statement execution timed out")
 
         posted = read_posted_databricks_usage(FakeManifest(), execute=explode)
-        assert "TimeoutError" in posted.unavailable
+        assert posted.unavailable == POSTED_READ_FAILED
         assert posted.posted_usd is None
 
     def test_the_degraded_disclosure_still_prices_the_aws_half_and_claims_no_zero(self):
@@ -507,7 +510,10 @@ class TestLosingBillingCostsTheVarianceAndNothingElse:
         built = disclosure(read_posted_databricks_usage(FakeManifest(), execute=explode))
         assert built.seal_state == "sealed"
         assert built.posted.state == "unavailable"
-        assert "PERMISSION_DENIED" in built.posted.unavailable_reason
+        # The refusal is named in fixed words that say what to do about it; the
+        # provider's own sentence stays in the operator log.
+        assert built.posted.unavailable_reason == POSTED_READ_NOT_GRANTED
+        assert "PERMISSION_DENIED" not in built.posted.display
         # The projection is untouched: losing the ability to read billing does
         # not make the account stop spending.
         aws = lane(built, StandingCostLaneId.RDS).figure
@@ -533,6 +539,94 @@ class TestLosingBillingCostsTheVarianceAndNothingElse:
         posted = read_posted_databricks_usage(FakeManifest(), execute=lambda _: [])
         assert "no usage rows" in posted.unavailable
         assert posted.posted_usd is None
+
+
+#: The failure the deployed v1.2.1 app printed in What It Cost on 2026-10-14, in
+#: `_sql_statement`'s own format, with placeholder IDs.
+LIVE_REFUSAL = (
+    "Databricks SQL statement failed with state FAILED [BAD_REQUEST] "
+    "(warehouse=0123456789abcdef, statement=01f1-test-statement, attempt 1/4): "
+    "[INSUFFICIENT_PERMISSIONS] Insufficient privileges: User does not have USE SCHEMA "
+    "on Schema 'system.billing'. SQLSTATE: 42501"
+)
+
+
+class TestTheRoomNeverReadsTheProvidersOwnWords:
+    """What It Cost is an audience surface, and a failed read used to print the
+    statement API's whole sentence there, warehouse and statement IDs included."""
+
+    def test_the_live_refusal_reaches_the_room_as_fixed_words(self, caplog):
+        def refuse(_: str):
+            raise RuntimeError(LIVE_REFUSAL)
+
+        with caplog.at_level("WARNING", logger="server.posted_usage"):
+            built = disclosure(read_posted_databricks_usage(FakeManifest(), execute=refuse))
+
+        assert built.posted.unavailable_reason == POSTED_READ_NOT_GRANTED
+        assert built.posted.display == f"Posted actuals unavailable · {POSTED_READ_NOT_GRANTED}"
+        # Nothing the disclosure serves carries the provider's text, in any field:
+        # the posted line, the platform lane's detail, or anywhere else.
+        served = built.model_dump_json()
+        for fragment in (
+            "warehouse=",
+            "statement=",
+            "0123456789abcdef",
+            "01f1-test-statement",
+            "SQLSTATE",
+        ):
+            assert fragment not in served
+        # The operator log keeps the whole of it, which is where it is useful.
+        assert LIVE_REFUSAL in caplog.text
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            LIVE_REFUSAL,
+            "PERMISSION_DENIED: User does not have SELECT on Table 'system.billing.usage'",
+            "PermissionDenied: the request was refused",
+            "[INSUFFICIENT_PERMISSIONS] User does not have USE CATALOG on Catalog 'system'",
+        ],
+    )
+    def test_every_spelling_of_a_refused_grant_says_to_grant_it(self, message):
+        def refuse(_: str):
+            raise RuntimeError(message)
+
+        posted = read_posted_databricks_usage(FakeManifest(), execute=refuse)
+        assert posted.unavailable == POSTED_READ_NOT_GRANTED
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TimeoutError("statement execution timed out"),
+            RuntimeError(
+                "Databricks SQL statement failed with state CANCELED (warehouse=w, statement=s)"
+            ),
+            ConnectionResetError(54, "Connection reset by peer"),
+        ],
+    )
+    def test_anything_else_says_the_read_did_not_complete(self, error):
+        def explode(_: str):
+            raise error
+
+        posted = read_posted_databricks_usage(FakeManifest(), execute=explode)
+        assert posted.unavailable == POSTED_READ_FAILED
+        assert "warehouse=" not in posted.unavailable
+
+    def test_an_unparseable_answer_does_not_quote_the_rows_it_choked_on(self, caplog):
+        class Unreadable(dict):
+            """A row whose every field raises, quoting it, as a parsing error does."""
+
+            def get(self, key, default=None):
+                raise ValueError(f"cannot read {key} from billing row 4711")
+
+        def answer(_: str):
+            return [Unreadable(window_row())]
+
+        with caplog.at_level("WARNING", logger="server.posted_usage"):
+            posted = read_posted_databricks_usage(FakeManifest(), execute=answer)
+        assert posted.unavailable == POSTED_READ_UNPARSED
+        assert "4711" not in posted.unavailable
+        assert "billing row 4711" in caplog.text
 
     def test_no_manifest_is_a_stated_absence(self):
         posted = read_posted_databricks_usage(None, execute=lambda _: [])
@@ -674,7 +768,7 @@ class TestTheCacheKeepsTheWarehouseOffTheRequestPath:
 
         cache = PostedUsageCache(FakeManifest(), execute=explode)
         value = cache.refresh()
-        assert "TimeoutError" in value.unavailable
+        assert value.unavailable == POSTED_READ_FAILED
         # And the panel that reads it still has an AWS half and two totals.
         built = disclosure(value)
         assert built.posted.state == "unavailable"
