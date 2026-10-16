@@ -131,6 +131,7 @@ from .round5_cleanup_owed import (
     clear_round5_cleanup_owed,
     record_round5_cleanup_owed,
 )
+from .round5_control import Round5ResidentRunnerError
 from .round5_warm import (
     BellContext,
     Round5LaunchCapsule,
@@ -399,6 +400,31 @@ def operator_diagnosis(error: BaseException) -> str:
     if len(diagnosis) <= _DIAGNOSIS_LIMIT:
         return diagnosis
     return diagnosis[: _DIAGNOSIS_LIMIT - 1].rstrip() + "…"
+
+
+def _resident_runner_error(error: BaseException) -> Round5ResidentRunnerError | None:
+    """The Round 5 resident runner's own failure, wherever it sits in ``error``.
+
+    Searched through causes, contexts and exception groups, because a lane's
+    failure can reach the setup task's handler wrapped, or with its sibling lane's
+    cancellation chained to it.
+    """
+
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending and len(seen) < 32:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, Round5ResidentRunnerError):
+            return current
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return None
 
 
 def audience_diagnosis(error: BaseException) -> str:
@@ -1709,6 +1735,24 @@ class RunManager:
     @property
     def round5_protocol(self) -> str:
         return self._round5_protocol
+
+    @property
+    def round5_bout_live(self) -> bool:
+        """Whether a Round 5 bout in this process holds an unexpired lease short of cleanup.
+
+        One of the reasons `round5_ring_ready` is False, and the one the catalog says as
+        "in use" rather than as Round 5 preparing backstage. A cleanup lease is not a bout:
+        cleanup is reported as cleanup.
+        """
+
+        now = datetime.now(UTC)
+        return any(
+            record.round5_lease is not None
+            and record.round5_lease.expires_at > now
+            and record.round5_lease.phase != "round5_cleanup"
+            for record in self._records.values()
+            if record.snapshot.round.id == RoundId.SURVIVE_CONNECTION_SPIKE
+        )
 
     @property
     def round5_ring_ready(self) -> bool:
@@ -10150,10 +10194,9 @@ class RunManager:
                 # runner had returned it explicitly. Third-party messages still
                 # remain redacted by ``operator_diagnosis``.
                 self._log_bout_refusal(record, exc, round_number=5)
-                message = "The Round 5 setup phase failed; no comparison was declared."
                 await self._finish_connection_spike_failure(
                     record,
-                    message,
+                    self._round_five_pipeline_failure_message(record, exc),
                 )
                 return
         else:
@@ -11520,6 +11563,32 @@ class RunManager:
             receipt_bout_id=snapshot.receipt_bout_id,
         )
         return True
+
+    @staticmethod
+    def _round_five_pipeline_failure_message(record: SessionRecord, error: BaseException) -> str:
+        """What the room is told when Round 5's lane pipelines raise.
+
+        In V4 each lane's whole pipeline, setup through the 30-second hold, runs in
+        the one setup task, so "the setup phase failed" was said of every failure,
+        including a lane that had verified its setup and then lost a held client
+        (the v1.2.2 release bar: Lakebase, 2,499 of 2,500 held on one worker). A
+        failure a lane's resident runner reported is that lane's 10,000-client
+        proof, so it is named as such; anything else is still the setup phase.
+        """
+
+        runner_error = _resident_runner_error(error)
+        if runner_error is None:
+            return "The Round 5 setup phase failed; no comparison was declared."
+        lane = record.snapshot.lanes.get(runner_error.lane_id or "")
+        if lane is None:
+            return (
+                "A Round 5 lane did not verify its 10,000-client proof; "
+                "no comparison was declared."
+            )
+        return (
+            f"Round 5's {lane.name} lane did not verify its 10,000-client proof; "
+            "no comparison was declared."
+        )
 
     async def _finish_connection_spike_failure(
         self,

@@ -88,17 +88,25 @@ async def test_an_expired_local_lease_cannot_hold_the_fight_card_closed() -> Non
             record = manager._records[created.json()["id"]]
             now = datetime.now(UTC)
 
-            # A lease that is still live keeps closing the local gate, as designed.
+            # A lease that is still live keeps closing the local gate, as designed, and
+            # the catalog says why: the round is in use.
+            assert manager.round5_bout_live is False
             live = _lease(record.snapshot.id, expires_at=now + timedelta(seconds=60))
             record.round5_lease = live
             assert coordinator.ring_ready is True
             assert manager.round5_ring_ready is False
+            assert manager.round5_bout_live is True
             board = (await client.get("/api/bout/all")).json()
             assert _round_five_card(board)["can_start"] is False
+            # A cleanup lease closes the gate too, but it is cleanup, not a bout.
+            record.round5_lease = replace(live, phase="round5_cleanup")
+            assert manager.round5_bout_live is False
+            record.round5_lease = live
 
             # The same lease past its expiry is no authority anywhere; the card reopens.
             record.round5_lease = replace(live, expires_at=now - timedelta(seconds=1))
             assert manager.round5_ring_ready is True
+            assert manager.round5_bout_live is False
             card = _round_five_card((await client.get("/api/bout/all")).json())
             assert card["state"] == FightCardState.READY.value
             assert card["can_start"] is True

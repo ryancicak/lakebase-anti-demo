@@ -142,6 +142,30 @@ describe('the fight card ring in costume', () => {
     expect(awayBoxers).toBeGreaterThan(6)
   })
 
+  it("keeps the pumpkin's stem inside the sprite, so its head stays under the top rope at the 2.3 ceiling", () => {
+    // An independent review (2026-10-14): the stem was drawn at y=-4, above the 0-88 box the
+    // 2.3 scale of Rounds 2, 3 and 5 is the ceiling for, so it crossed the rope at y=168.
+    const rects = (container: HTMLElement) => [...container.querySelectorAll('#ring-home rect')]
+    const ys = (container: HTMLElement) => rects(container).map((rect) => Number(rect.getAttribute('y')))
+    const jaw = (container: HTMLElement) => rects(container).filter((rect) => rect.getAttribute('fill') === '#767b80')
+
+    halloweenClock.now = () => IN_SEASON
+    for (const round of FALLBACK_CATALOG.rounds) {
+      const { container, unmount } = renderRing(round.id, 'aurora_serverless_v2')
+      expect(Math.min(...ys(container)), round.id).toBeGreaterThanOrEqual(0)
+      // The grey jaw belongs to the man; under a pumpkin it read as stubble.
+      expect(jaw(container), round.id).toHaveLength(0)
+      expect(rects(container).some((rect) => rect.getAttribute('fill') === '#4caf50'), round.id).toBe(true)
+      unmount()
+    }
+
+    // The classic boxer is unchanged: head at the top of the box, jaw beneath it.
+    halloweenClock.now = () => new Date(2026, 5, 15, 12, 0, 0)
+    const { container } = renderRing('survive_connection_spike', 'aurora_serverless_v2')
+    expect(Math.min(...ys(container))).toBe(0)
+    expect(jaw(container)).toHaveLength(1)
+  })
+
   it('draws the classic boxers outside the season, and with ?costumes=off', () => {
     const classic = () => {
       const { container, unmount } = renderRing('make_schema_change_safely', 'aurora_serverless_v2')

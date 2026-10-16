@@ -1925,6 +1925,8 @@ async def test_a_runner_reported_failure_reaches_the_operator_log_as_a_bounded_c
     assert str(raised.value) == quoted
     assert quoted in operator_diagnosis(raised.value)
     assert "host-a" not in operator_diagnosis(raised.value)
+    # Which lane's runner said it, so the room is told whose proof failed.
+    assert raised.value.lane_id == event_binding.lane_id
 
 
 async def test_restart_reconciliation_uses_resident_registry_not_ssm() -> None:

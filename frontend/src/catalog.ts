@@ -8,7 +8,7 @@ import type {
   RoundId,
 } from './api/types'
 import { personaPortraits } from './assets'
-import { ROUND_FIVE_DISPLAY_TITLE, ROUND_FIVE_MAX_RETRIES } from './round5'
+import { ROUND_FIVE_BELL_PROTOCOL, ROUND_FIVE_DISPLAY_TITLE, ROUND_FIVE_MAX_RETRIES } from './round5'
 
 export interface LocalRecommendation {
   round_id: RoundId
@@ -132,25 +132,27 @@ const connectionSpikeRound: RoundDefinition = {
   capability: 'Included pooling compared with a selected AWS managed pooling path',
   scorecard_by_corner: {
     cost: 'Published rates include the new RDS Proxy selected for the AWS reference path',
-    simplicity: 'Included Lakebase pooled endpoint vs the newly provisioned selected AWS managed pooling path',
-    performance: 'Pooled-path setup time is primary; 128 attempts, maximum 64 concurrent, plus a separate witness are pass/fail validation',
+    simplicity: 'Included Lakebase pooled endpoint versus 3 timed Proxy mutations on the selected AWS managed pooling path',
+    performance: 'One server bell to observed exact 10,000 held client connections per lane; runner-local ramp time and peak backend sessions are supporting evidence',
   },
   competitors: ['aurora_serverless_v2', 'rds_postgres'],
   availability: 'ready',
+  round5_protocol: ROUND_FIVE_BELL_PROTOCOL,
   metric_specs: [
-    { id: 'setup_elapsed_ms', label: 'Pooled-path setup time', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
-    { id: 'successful_clients', label: 'Successful clients', role: 'secondary', unit: 'count', direction: 'higher_is_better' },
-    { id: 'application_p99_ms', label: 'Bounded-check application p99', role: 'secondary', unit: 'milliseconds', direction: 'lower_is_better' },
-    { id: 'error_clients', label: 'Client errors', role: 'guardrail', unit: 'count', direction: 'lower_is_better' },
+    { id: 'bell_to_10000_observed_ms', label: 'Bell to 10,000 held clients', role: 'primary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'setup_elapsed_ms', label: 'Pooled-path setup time', role: 'secondary', unit: 'milliseconds', direction: 'lower_is_better' },
+    { id: 'peak_backend_sessions', label: 'Peak backend sessions', role: 'secondary', unit: 'count', direction: 'lower_is_better' },
+    { id: 'held_clients_at_gate', label: 'Clients held at the gate', role: 'guardrail', unit: 'count', direction: 'exact' },
+    { id: 'terminal_failures', label: 'Client failures', role: 'guardrail', unit: 'count', direction: 'lower_is_better' },
   ],
   comparison_kind: 'measured',
   non_claims: [
-    'From a database-only declared start, Lakebase verifies its included pooled endpoint without new pooling infrastructure; the selected AWS reference path provisions RDS Proxy and dependencies.',
-    'Both paths then run 128 attempts, maximum 64 concurrent, followed by a separate 64-client witness. The sequential phases are never summed.',
-    'RDS Proxy is the AWS managed pooling option selected for this reference path, not a universal requirement. Direct connections, an existing Proxy, PgBouncer, and application pooling were not compared.',
-    'Built-in Lakebase PgBouncer product limit: up to 10,000 pooled client connections. The recurring bout measures 128 attempts at maximum 64 concurrent, followed by separate multiplexing proof. Direct AWS connections, an existing Proxy, sustained throughput, and storm resilience remain outside this comparison.',
-    'Application p99 is secondary validation and is never combined with primary pooled-path setup time.',
-    'Setup failure or a setup towel produces no winner and no margin.',
+    'Lakebase dispatches its first retained pooled client immediately at the bell. Native login, ordinary roles, capacity, credentials, and endpoint bindings are prepared automatically backstage.',
+    'The selected AWS path performs 3 journaled timed mutations: CreateDBProxy first, exact target-group configuration, and exact target registration. Least-privilege Proxy network fixtures stand warm but the Proxy does not.',
+    'The IAM service role, runner permission, and dedicated proxy credential secret or secrets are sealed install-time prerequisites outside the setup clock. RDS Proxy is the AWS managed pooling option selected for this reference path, not a universal Aurora or RDS requirement. Direct connections, an existing RDS Proxy, PgBouncer, and application pooling were not compared.',
+    `Each independent lane opens exactly 10,000 authenticated retained clients, holds them for 30 seconds, and may spend up to ${ROUND_FIVE_MAX_RETRIES} retried logins during establishment. All 64 sampled queries must succeed with no sample retries. 9,999 fails. Each lane owns a distinct physical c7i.2xlarge runner.`,
+    'Multiplexing is read during the hold by a second database role on its own direct connection, never inferred from the client count. Connect latency p50, p95 and p99 are nearest-rank over raw, unrounded per-client measurements. Runner-local ramp time is supporting evidence; the large comparison clock is always server-observed bell to exact 10,000 held.',
+    'Lakebase’s built-in PgBouncer product limit is up to 10,000 client connections, not PostgreSQL backend sessions or simultaneous transactions. The bout holds exactly that many per lane and proves multiplexing while they are held. Direct AWS connections, an existing Proxy, sustained throughput, and storm resilience remain outside this comparison.',
     'This is one live proof session, not a benchmark.',
   ],
 }

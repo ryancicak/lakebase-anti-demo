@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .connection_fanin import TARGET_CLIENTS_PER_LANE
 from .models import (
     CapacityDisclosure,
     CapacityLaneDisclosure,
@@ -547,7 +548,8 @@ def build_capacity_disclosure(
                 f"PostgreSQL slots and approximately {pooled_backends} active backend "
                 "connections per user/database pool. Built-in pooled endpoint product "
                 f"limit: up to {LAKEBASE_POOL_MAX_CLIENT_CONN:,} client connections per "
-                "pooled compute endpoint; not exercised by this 64-concurrent bout."
+                f"pooled compute endpoint; this bout holds exactly "
+                f"{TARGET_CLIENTS_PER_LANE:,} on each lane."
             )
     return CapacityDisclosure(
         lanes=[lakebase, competitor],

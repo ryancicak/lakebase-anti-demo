@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { FALLBACK_CATALOG, recommend, stopCondition } from './catalog'
-import { ROUND_FIVE_MAX_RETRIES } from './round5'
+import { ROUND_FIVE_BELL_PROTOCOL, ROUND_FIVE_MAX_RETRIES } from './round5'
 
 describe('deterministic fight-card recommendation', () => {
   it('selects cold wake for Aurora without changing evidence by persona', () => {
@@ -71,19 +71,22 @@ describe('deterministic fight-card recommendation', () => {
     expect(claims).not.toMatch(/warm|not built|remains unpriced/i)
   })
 
-  it('keeps the bundled Round 5 catalog aligned to the static-IAM clock boundary', () => {
+  it('keeps the bundled Round 5 catalog on the 10,000-client bell protocol the server runs', () => {
+    // The bundle paints this catalog before /api/catalog answers, so it must
+    // describe the only Round 5 protocol the server can run (server/catalog.py).
     const round = FALLBACK_CATALOG.rounds.find((item) => item.id === 'survive_connection_spike')!
+    expect(round.round5_protocol).toBe(ROUND_FIVE_BELL_PROTOCOL)
+    expect(round.metric_specs?.find((spec) => spec.role === 'primary')?.id).toBe('bell_to_10000_observed_ms')
     expect(round.scorecard_by_corner.simplicity).toContain(
-      'Included Lakebase pooled endpoint vs the newly provisioned selected AWS managed pooling path',
+      'Included Lakebase pooled endpoint versus 3 timed Proxy mutations on the selected AWS managed pooling path',
     )
     expect(round.non_claims).toEqual(expect.arrayContaining([
-      expect.stringMatching(/database-only declared start.*included pooled endpoint.*selected AWS reference path provisions RDS Proxy and dependencies/i),
-      expect.stringMatching(/RDS Proxy is the AWS managed pooling option selected.*not a universal requirement.*direct connections.*PgBouncer.*application pooling were not compared/i),
-      expect.stringMatching(/128 attempts, maximum 64 concurrent.*separate 64-client witness.*never summed/i),
-      expect.stringMatching(/PgBouncer product limit.*10,000 pooled client connections.*recurring bout measures 128 attempts at maximum 64 concurrent.*separate multiplexing proof/i),
+      expect.stringMatching(/RDS Proxy is the AWS managed pooling option selected.*not a universal Aurora or RDS requirement.*direct connections.*PgBouncer.*application pooling were not compared/i),
+      expect.stringMatching(/each independent lane opens exactly 10,000 authenticated retained clients.*holds them for 30 seconds.*9,999 fails/i),
+      expect.stringMatching(/PgBouncer product limit is up to 10,000 client connections.*holds exactly that many per lane/i),
     ]))
     expect(round.non_claims?.join(' ')).not.toMatch(
-      /(?:AWS|Aurora|RDS) (?:requires|required).*RDS Proxy|10,000 (?:backend|simultaneous transaction)|did not (?:load-)?test 10,000|did not exercise that limit/i,
+      /128 attempts|maximum 64 concurrent|64-client witness|(?:AWS|Aurora|RDS) (?:requires|required).*RDS Proxy|10,000 (?:backend|simultaneous transaction)|did not (?:load-)?test 10,000|did not exercise that limit/i,
     )
   })
 })

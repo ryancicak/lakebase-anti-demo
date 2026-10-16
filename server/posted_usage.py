@@ -48,6 +48,7 @@ not run.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -62,10 +63,49 @@ from .standing_cost import (
     observed_platform_components,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 SECONDS_PER_HOUR = Decimal(3600)
 
 USAGE_TABLE = "system.billing.usage"
 PRICE_TABLE = "system.billing.list_prices"
+
+# What the room reads when the posted read fails, in fixed words. The provider's own
+# text never reaches What It Cost: `_sql_statement` puts the warehouse and statement
+# IDs in every failure it raises, and the audience-facing cost messages use fixed
+# wording while the detail goes to the operator log (`server.manager`). Kept apart by
+# the one question the operator has to act on: is this a grant, or anything else?
+POSTED_READ_NOT_GRANTED = (
+    "the app is not yet granted read access to system.billing; an admin grants it once "
+    '(docs/DEPLOY.md, "Grants the deploy cannot issue itself")'
+)
+POSTED_READ_FAILED = "the posted read did not complete; the operator log has the detail"
+POSTED_READ_UNPARSED = "the posted read's answer could not be read; the operator log has the detail"
+
+# How a refusal to read `system.billing` reads, whichever layer reported it: the SQL
+# state and error class the statement API returns, or the SDK's error code. Matched
+# case-insensitively, because the casing differs between the two.
+_PERMISSION_REFUSAL = re.compile(
+    r"INSUFFICIENT_PERMISSIONS|PERMISSION_DENIED|PermissionDenied|SQLSTATE: 42501"
+    r"|does not have (?:USE (?:CATALOG|SCHEMA)|SELECT)",
+    re.IGNORECASE,
+)
+
+
+def posted_read_failure(error: BaseException) -> str:
+    """The fixed words for a posted read that raised, after logging what it raised.
+
+    The full text is for the operator, and only the operator log gets it.
+    """
+
+    detail = f"{type(error).__name__}: {error}"
+    refused = _PERMISSION_REFUSAL.search(detail) is not None
+    LOGGER.warning(
+        "posted Databricks usage read %s: %s",
+        "was refused" if refused else "failed",
+        detail,
+    )
+    return POSTED_READ_NOT_GRANTED if refused else POSTED_READ_FAILED
 
 # Every identifier below is read from the manifest and interpolated into SQL. The
 # pattern is narrower than any of them needs to be, and a value that does not
@@ -494,15 +534,17 @@ def read_posted_databricks_usage(
     try:
         rows = execute(posted_usage_query(scope))
     except Exception as error:  # noqa: BLE001 - a billing read may never take the app down
-        return PostedDatabricksUsage(
-            unavailable=f"the posted read could not run: {type(error).__name__}: {error}"
-        )
+        return PostedDatabricksUsage(unavailable=posted_read_failure(error))
     try:
         return posted_usage_from_rows(rows, scope)
     except Exception as error:  # noqa: BLE001 - nor may parsing its answer
-        return PostedDatabricksUsage(
-            unavailable=f"the posted read could not be parsed: {type(error).__name__}: {error}"
+        # Parsing errors quote the values they choked on, and those are billing rows.
+        LOGGER.warning(
+            "posted Databricks usage answer could not be parsed: %s: %s",
+            type(error).__name__,
+            error,
         )
+        return PostedDatabricksUsage(unavailable=POSTED_READ_UNPARSED)
 
 
 def warehouse_query_executor(manifest: object) -> QueryExecutor | None:

@@ -798,7 +798,11 @@ class TestTheNoteMayNotOutClaimTheVerdict:
         assert "443 direct PostgreSQL slots" in disclosure.note
         assert "approximately 399 active backend connections" in disclosure.note
         assert "up to 10,000 client connections per pooled compute endpoint" in disclosure.note
-        assert "not exercised by this 64-concurrent bout" in disclosure.note
+        # Every Round 5 bout holds exactly 10,000 clients per lane, so the
+        # note must not say the limit goes unexercised.
+        assert "this bout holds exactly 10,000 on each lane" in disclosure.note
+        assert "64-concurrent" not in disclosure.note
+        assert "not exercised" not in disclosure.note
         assert "10,000 backend" not in disclosure.note
 
     def test_the_failures_travel_on_the_result_rather_than_being_reparsed(

@@ -29,6 +29,12 @@ export const HALLOWEEN_ROUND_NAMES: Readonly<Record<number, string>> = {
 }
 
 /**
+ * The back-to-idle card's Halloween name. It proves the opposite of Round 1, both databases
+ * scaling back to zero after the bout, so it cannot borrow Round 1's "Wake the dead".
+ */
+export const HALLOWEEN_IDLE_NAME = 'Back to the grave'
+
+/**
  * The clock the season is read from. The test setup pins it outside the season, so no test
  * depends on the month it runs in; a Halloween test sets it, and restores it.
  */

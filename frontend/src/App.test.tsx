@@ -3685,6 +3685,73 @@ describe('backstage setup', () => {
     expect(screen.getByRole('button', { name: /prepare fight card/i })).toBeEnabled()
   })
 
+  it('drops a refused Prepare’s reason once the opponent is rolled, and keeps the round', async () => {
+    // The reason was about the old matchup. Left in the pinned bar it sits over the
+    // new opponent's PREPARE as if it were about that one.
+    const held = "THIS ROUND IS NOT ON TONIGHT'S CARD. Backstage is still checking this round's lakehouse storage, and it opens automatically once the check answers. The other rounds are unaffected."
+    vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      throw new Error(`Unexpected request: ${input}`)
+    }))
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await pickRound(user, 'make_schema_change_safely')
+    vi.mocked(api.allBoutStatuses).mockResolvedValue(allReadyBoutBoard({
+      make_schema_change_safely: { state: 'temporarily_unavailable', can_start: false, detail: held },
+    }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(held)
+
+    await user.click(screen.getByRole('button', { name: /next opponent/i }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Round 2 ·/i })).toHaveAttribute('aria-current', 'true')
+  })
+
+  it('lets go of the round the opponent arrows held once the lead voice changes, but keeps a picked tile', async () => {
+    window.history.replaceState({}, '', '/?review=1')
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')))
+    const user = userEvent.setup()
+    render(<App />)
+    const currentRound = () => document.querySelector('.ring-key[aria-current="true"]')?.getAttribute('aria-label') ?? ''
+    const backToLead = async () => {
+      await user.click(screen.getByRole('button', { name: /^b · back$/i }))
+      await user.click(screen.getByRole('button', { name: /change lead/i }))
+    }
+    const toCard = async () => {
+      await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+      await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    }
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await toCard()
+    // 3 A.M. Sam's card recommends Round 1.
+    expect(currentRound()).toMatch(/^Round 1 · /)
+    // Rolling the opponent keeps the round under the presenter...
+    await user.click(screen.getByRole('button', { name: /next opponent/i }))
+    expect(currentRound()).toMatch(/^Round 1 · /)
+    // ...but nobody chose it, so a new lead voice is recommended again: Lockjaw Lucy's Round 3.
+    await backToLead()
+    await user.click(screen.getByRole('radio', { name: /lockjaw lucy/i }))
+    await toCard()
+    expect(currentRound()).toMatch(/^Round 3 · /)
+
+    // A tile the presenter picks stays picked through the arrows and a new lead voice.
+    await pickRound(user, 'make_schema_change_safely')
+    expect(currentRound()).toMatch(/^Round 2 · /)
+    await user.click(screen.getByRole('button', { name: /next opponent/i }))
+    await backToLead()
+    await user.click(screen.getByRole('radio', { name: /lockjaw lucy/i }))
+    await toCard()
+    expect(currentRound()).toMatch(/^Round 2 · /)
+  })
+
   it('refreshes a transient Round 5 identity refusal back to backstage preparation', async () => {
     const warming = allReadyBoutBoard({
       survive_connection_spike: {
@@ -4957,7 +5024,7 @@ describe('backstage setup', () => {
     refused: string[],
     reason: string,
     headline: string | null,
-    reasonCode: 'cleanup_in_progress' | 'storage_checking' | null = null,
+    reasonCode: 'cleanup_in_progress' | 'storage_checking' | 'round5_warming' | 'bout_in_progress' | null = null,
   ) {
     return {
       ...FALLBACK_CATALOG,
@@ -4977,6 +5044,7 @@ describe('backstage setup', () => {
     catalog: ReturnType<typeof refusedCatalog>,
     roundId: RoundId,
     boardUpdates?: Partial<Record<RoundId, Partial<FightCardRoundStatus>>>,
+    boardAnswers = true,
   ) {
     const catalogUpdates = Object.fromEntries(catalog.rounds
         .filter((round) => round.availability !== 'ready')
@@ -5002,9 +5070,14 @@ describe('backstage setup', () => {
                 detail: round.availability_headline ?? round.availability_reason ?? null,
               },
         ])) as Partial<Record<RoundId, Partial<FightCardRoundStatus>>>
-    vi.mocked(api.allBoutStatuses).mockResolvedValue(
-      allReadyBoutBoard(boardUpdates ?? catalogUpdates),
-    )
+    if (boardAnswers) {
+      vi.mocked(api.allBoutStatuses).mockResolvedValue(
+        allReadyBoutBoard(boardUpdates ?? catalogUpdates),
+      )
+    } else {
+      // The first board poll is still out: the card has only the catalog to go on.
+      vi.mocked(api.allBoutStatuses).mockReturnValue(new Promise(() => undefined))
+    }
     vi.stubGlobal('fetch', vi.fn().mockImplementation((input: string) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
       throw new Error(`Unexpected request: ${input}`)
@@ -5286,6 +5359,28 @@ describe('backstage setup', () => {
     expect(unselectedRoundFour).toHaveAccessibleName(/temporarily unavailable/i)
     expect(within(unselectedRoundFour).getByText('TEMPORARILY UNAVAILABLE')).toBeVisible()
   })
+
+  it.each([
+    ['round5_warming', 'temporarily unavailable', 'TEMPORARILY UNAVAILABLE'],
+    ['bout_in_progress', 'bout in progress', 'BOUT IN PROGRESS'],
+  ] as const)(
+    'before the first board poll answers, a %s Round 5 never reads as a red unavailable',
+    async (code, accessibleState, badgeOrLine) => {
+      // An independent review (2026-10-14): a fight card restored during a Round 5 bout, or while
+      // it re-warmed, drew tile 5 UNAVAILABLE and "cannot arm tonight" until the board
+      // answered, because the catalog carried no reason code for either.
+      await fightCardFor(
+        refusedCatalog(['survive_connection_spike'], 'ROUND 5 NOT STARTABLE · STAGE REWARMING', null, code),
+        'wake_idle_app',
+        undefined,
+        false,
+      )
+      const tile = screen.getByRole('button', { name: /^Round 5 ·/i })
+      expect(tile).toHaveAccessibleName(new RegExp(accessibleState, 'i'))
+      expect(within(tile).getByText(badgeOrLine)).toBeVisible()
+      expect(within(tile).queryByText(/^unavailable$/i)).not.toBeInTheDocument()
+    },
+  )
 
   it('keeps a live Round 5 bout distinct from backstage cleanup', async () => {
     await fightCardFor(

@@ -67,7 +67,17 @@ class Round5ResidentRunnerError(RuntimeError):
     failed at 8,000 held clients logged nothing but "RuntimeError <-
     CancelledError". Runner-supplied codes pass through :func:`_runner_code`
     first, so only bounded tokens ever reach a log.
+
+    ``lane_id`` is the lane whose runner reported it, from the wait's binding.
+    In V4 a lane's whole pipeline, setup through the 30-second hold, runs inside
+    one setup task, so without it every runner failure read to the room as "The
+    Round 5 setup phase failed": the v1.2.2 release bar's Lakebase lane lost one
+    held client of 10,000 during its hold, after setup had verified.
     """
+
+    def __init__(self, message: str, *, lane_id: str | None = None) -> None:
+        super().__init__(message)
+        self.lane_id = lane_id
 
 
 def _runner_code(payload: Mapping[str, object], default: str) -> str:
@@ -1503,7 +1513,9 @@ class Round5ResidentTransport:
                 )
                 for event in events:
                     if event.binding != binding:
-                        raise Round5ResidentRunnerError("resident runner event binding changed")
+                        raise Round5ResidentRunnerError(
+                            "resident runner event binding changed", lane_id=binding.lane_id
+                        )
                     sequence = event.sequence
                     if event.kind == Round5RunnerEventKind.PROGRESS:
                         if on_progress is not None:
@@ -1514,14 +1526,16 @@ class Round5ResidentTransport:
                         failure = _runner_code(event.payload, "resident_runner_failed")
                     elif event.kind == Round5RunnerEventKind.QUARANTINED:
                         raise Round5ResidentRunnerError(
-                            _runner_code(event.payload, "resident_control_quarantined")
+                            _runner_code(event.payload, "resident_control_quarantined"),
+                            lane_id=binding.lane_id,
                         )
                     elif event.kind == Round5RunnerEventKind.SETTLED:
                         if failure is not None:
-                            raise Round5ResidentRunnerError(failure)
+                            raise Round5ResidentRunnerError(failure, lane_id=binding.lane_id)
                         if result is None:
                             raise Round5ResidentRunnerError(
-                                "resident settled without publishing a result"
+                                "resident settled without publishing a result",
+                                lane_id=binding.lane_id,
                             )
                         return result
                 await self._sleep(0.05)
@@ -1599,7 +1613,8 @@ class Round5ResidentTransport:
                         Round5RunnerEventKind.QUARANTINED,
                     }:
                         raise Round5ResidentRunnerError(
-                            _runner_code(event.payload, "resident_preparation_failed")
+                            _runner_code(event.payload, "resident_preparation_failed"),
+                            lane_id=binding.lane_id,
                         )
                 await self._sleep(0.05)
 
@@ -1618,7 +1633,8 @@ class Round5ResidentTransport:
                         return
                     if event.kind == Round5RunnerEventKind.QUARANTINED:
                         raise Round5ResidentRunnerError(
-                            _runner_code(event.payload, "resident_control_quarantined")
+                            _runner_code(event.payload, "resident_control_quarantined"),
+                            lane_id=binding.lane_id,
                         )
                 await self._sleep(0.05)
 

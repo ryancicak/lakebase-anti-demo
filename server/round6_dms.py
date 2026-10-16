@@ -56,7 +56,21 @@ _CLIENT_CONFIG = Config(retries={"mode": "standard", "max_attempts": 5})
 
 
 class DmsLaneError(RuntimeError):
-    """A DMS task could not be started, stopped, or read the way Round 6 needs."""
+    """A DMS task could not be started, stopped, or read the way Round 6 needs.
+
+    Its message names the task by resource ID, never by ARN: the operator log quotes this
+    server's own messages (`server.manager.operator_diagnosis`), and the ARN carries the
+    AWS account ID.
+    """
+
+
+def task_resource_id(task_arn: str) -> str:
+    """The task's resource ID, without the account ID its ARN carries.
+
+    A DMS task ARN is arn:aws:dms:<region>:<account-id>:task:<resource-id>.
+    """
+
+    return task_arn.rsplit(":", 1)[-1]
 
 
 @dataclass(frozen=True)
@@ -144,6 +158,8 @@ class DmsCaptureTask:
         if not task_arn:
             raise DmsLaneError("A Round 6 capture task needs its sealed ARN")
         self.task_arn = task_arn
+        #: How every message names the task. The ARN is for DMS alone.
+        self.task_id = task_resource_id(task_arn)
         self._dms = session.client("dms", config=_CLIENT_CONFIG)
         self._clock = clock
         self._sleep = sleep
@@ -157,11 +173,11 @@ class DmsCaptureTask:
         except ClientError as error:
             # DMS answers a filter that matches nothing with a fault, not an empty list.
             if _error_code(error) == "ResourceNotFoundFault":
-                raise DmsLaneError(f"The DMS task {self.task_arn} does not exist") from error
+                raise DmsLaneError(f"The DMS task {self.task_id} does not exist") from error
             raise
         tasks = response.get("ReplicationTasks") or []
         if len(tasks) != 1 or tasks[0].get("ReplicationTaskArn") != self.task_arn:
-            raise DmsLaneError(f"DMS did not return exactly the task {self.task_arn}")
+            raise DmsLaneError(f"DMS did not return exactly the task {self.task_id}")
         return DmsTaskState.from_api(tasks[0])
 
     def start(self) -> tuple[str, float]:
@@ -196,8 +212,11 @@ class DmsCaptureTask:
                 )
                 return kind, self._clock() - began
             except ClientError as error:
+                # The code alone: botocore's own sentence quotes the caller and the resource
+                # ARNs, and this message is quoted into the operator log.
                 refused = DmsLaneError(
-                    f"DMS refused to start {self.task_arn} ({kind}): {_error_code(error) or error}"
+                    f"DMS refused to start {self.task_id} ({kind}): "
+                    f"{_error_code(error) or type(error).__name__}"
                 )
                 if _error_code(error) != "InvalidResourceStateFault":
                     raise refused from error
@@ -225,12 +244,12 @@ class DmsCaptureTask:
             moved = moved or state.status in TRANSITIONAL
             if state.parked and (moved or self._clock() - began >= START_GRACE_SECONDS):
                 raise DmsLaneError(
-                    f"The DMS task {self.task_arn} stopped instead of running: "
+                    f"The DMS task {self.task_id} stopped instead of running: "
                     f"{state.failure or state.stop_reason or state.status}"
                 )
             if self._clock() >= deadline:
                 raise DmsLaneError(
-                    f"The DMS task {self.task_arn} did not run within "
+                    f"The DMS task {self.task_id} did not run within "
                     f"{TRANSITION_BOUND_SECONDS:.0f}s; it is {state.status}"
                 )
             self._sleep(TRANSITION_POLL_SECONDS)
@@ -272,7 +291,7 @@ class DmsCaptureTask:
                 say("Stopping the DMS task")
             if self._clock() >= deadline:
                 raise DmsLaneError(
-                    f"The DMS task {self.task_arn} did not stop within "
+                    f"The DMS task {self.task_id} did not stop within "
                     f"{TRANSITION_BOUND_SECONDS:.0f}s; it is {state.status}"
                 )
             self._sleep(TRANSITION_POLL_SECONDS)
@@ -287,7 +306,7 @@ class DmsCaptureTask:
                 return state
             if self._clock() >= deadline:
                 raise DmsLaneError(
-                    f"The DMS task {self.task_arn} stayed {state.status} for "
+                    f"The DMS task {self.task_id} stayed {state.status} for "
                     f"{TRANSITION_BOUND_SECONDS:.0f}s"
                 )
             self._sleep(TRANSITION_POLL_SECONDS)

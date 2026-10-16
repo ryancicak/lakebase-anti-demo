@@ -2045,6 +2045,108 @@ def test_round_five_cleanup_is_machine_readable_without_reclassifying_failures()
     assert "availability_reason_code" not in reopened
 
 
+@pytest.mark.parametrize(
+    ("signals", "reason_code", "reopens_by_itself"),
+    [
+        ({"round5_start_stage": "rewarming"}, "round5_warming", True),
+        ({"round5_start_stage": "claim-drain"}, "round5_warming", True),
+        ({"round5_start_stage": "identity-refresh"}, "round5_warming", True),
+        # A running bout's slot reads as rewarming; the lease is what says it is in use.
+        ({"round5_start_stage": "rewarming", "round5_bout_live": True}, "bout_in_progress", True),
+        ({"round5_start_stage": "terminal-blocked"}, None, False),
+        ({"round5_start_stage": "rewarming", "round5_blocked_terminal": True}, None, False),
+        # An operator's block outranks the bout that happens to hold the ring.
+        ({"round5_start_stage": "terminal-blocked", "round5_bout_live": True}, None, False),
+        # No coordinator stage to go on: today's words, and no code.
+        ({}, None, True),
+    ],
+)
+def test_a_closed_round_five_tells_the_card_which_kind_of_closed_it_is(
+    signals: dict[str, object],
+    reason_code: str | None,
+    reopens_by_itself: bool,
+) -> None:
+    """The catalog is what a fight card restored before its first board poll reads.
+    With no code, it drew a running or warming Round 5 as red UNAVAILABLE "tonight"
+    for that poll, and its terminal-blocked headline promised an automatic unlock."""
+
+    round_five = next(
+        item
+        for item in sealed_catalog(connection_spike_available=True).rounds
+        if item.id == RoundId.SURVIVE_CONNECTION_SPIKE
+    )
+    served = round_availability.apply(
+        [round_five],
+        round_availability.AvailabilitySignals(
+            round5_ring_ready=False,
+            round5_detail="ROUND 5 NOT STARTABLE · STAGE REWARMING · CAN_START FALSE",
+            **signals,  # type: ignore[arg-type]
+        ),
+    )[0].model_dump(mode="json")
+
+    assert served["availability"] == "unavailable"
+    assert served.get("availability_reason_code") == reason_code
+    # The operator's detail travels unchanged whatever the headline says.
+    assert served["availability_reason"] == (
+        "ROUND 5 NOT STARTABLE · STAGE REWARMING · CAN_START FALSE"
+    )
+    headline = served["availability_headline"]
+    assert ("will not unlock on its own" in headline) is not reopens_by_itself
+    if not reopens_by_itself:
+        assert "automatically" not in headline
+    # A round that reopens by itself, by its stage or because a bout holds it, is on
+    # tonight's card; only a stage that needs an operator, or no stage at all, is not.
+    on_tonights_card = reason_code in {"round5_warming", "bout_in_progress"}
+    assert headline.startswith(round_availability.NOT_ON_THE_CARD) is not on_tonights_card
+
+
+def test_the_api_passes_round_fives_stage_and_live_bout_to_the_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api_app = FastAPI()
+    api_app.state.run_manager = SimpleNamespace(
+        grant_refusals={},
+        storage_refusals={},
+        round5_ring_ready=False,
+        round5_bout_live=True,
+        round5_warm_status={
+            "round5_warm_state": "warm",
+            "round5_start_stage": "rewarming",
+            "round5_warm_generation": 9,
+        },
+    )
+    api_app.state.readiness_gate = SimpleNamespace(
+        status=SimpleNamespace(ring_ready=True, maintenance_detail=None),
+        round5_status=SimpleNamespace(
+            ring_ready=False,
+            reason_code=None,
+            maintenance_state="ready",
+            maintenance_detail=None,
+        ),
+    )
+    monkeypatch.setattr(api_module, "effective_credential_verdict", lambda _state: None)
+    monkeypatch.setattr(api_module, "cached_installation_report", lambda: None)
+    monkeypatch.setattr(
+        api_module,
+        "deployed_aws_posture",
+        lambda: SimpleNamespace(
+            egress_sealed=True,
+            runtime_role_sealed=True,
+            round4_aws_sealed=False,
+            round6_aws_sealed=False,
+        ),
+    )
+    monkeypatch.setattr(api_module.selfheal, "deployed", lambda: False)
+    request = Request({"type": "http", "app": api_app})
+
+    signals = api_module._availability_signals(request)
+
+    assert signals.round5_start_stage == "rewarming"
+    assert signals.round5_bout_live is True
+    assert signals.round5_blocked_terminal is False
+    assert signals.round5_reason_code is None
+
+
 def test_round_five_warm_cleaning_is_cleanup_in_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -79,6 +79,7 @@ from .model_score_live import (
     synced_table_failure_is_a_stopped_pipeline,
 )
 from .models import RoundId
+from .posted_usage import PRICE_TABLE, USAGE_TABLE
 from .reconcile import (
     ORPHAN_EPHEMERAL,
     PRESENCE_MISSING,
@@ -445,9 +446,23 @@ def _run_streamed(
         timer.start()
         try:
             assert process.stdout is not None
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                kept.append(line)
+            try:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    kept.append(line)
+            except KeyboardInterrupt:
+                # Ctrl-C reaches the whole foreground process group, so the command has
+                # the interrupt too, and Terraform answers one by finishing the calls in
+                # flight and recording what they made. Leaving now closes its pipe under
+                # it, and it dies at its next line of output before it writes that state:
+                # 2026-10-15's interrupted install left eight databases its state never
+                # listed, which cleanup cannot destroy. So read on until it exits, then
+                # let the interrupt stop the caller. A second Ctrl-C still leaves at once.
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    kept.append(line)
+                process.wait()
+                raise
             returncode = process.wait()
         finally:
             timer.cancel()
@@ -8219,6 +8234,66 @@ def _round6_unity_catalog_grants(
     )
 
 
+def _posted_usage_unity_catalog_grants() -> tuple[UnityCatalogAppGrant, ...]:
+    """Every Unity Catalog securable What It Cost's posted read touches, and the least it needs.
+
+    `server.posted_usage` sends one `SELECT` that joins these two tables and reads
+    nothing else, so the names come from that module rather than from fresh literals.
+    No setup ever issued them, and the deployed app's read was refused on every
+    installation: What It Cost showed Lakebase as unpriced, the one contrast the
+    panel exists to draw.
+    """
+
+    schema = USAGE_TABLE.rsplit(".", 1)[0]
+    if PRICE_TABLE.rsplit(".", 1)[0] != schema:
+        raise RuntimeError("the posted read's two tables are expected in one schema")
+    return (
+        UnityCatalogAppGrant("CATALOG", schema.split(".", 1)[0], ("USE CATALOG",)),
+        UnityCatalogAppGrant("SCHEMA", schema, ("USE SCHEMA",)),
+        UnityCatalogAppGrant("TABLE", USAGE_TABLE, ("SELECT",)),
+        UnityCatalogAppGrant("TABLE", PRICE_TABLE, ("SELECT",)),
+    )
+
+
+def _grant_posted_usage_read(profile: str, warehouse_id: str, app_client_id: str) -> list[str]:
+    """Grant the app its billing read, or tell the operator exactly what an admin must run.
+
+    The one grant in setup that may be refused without failing it. `system` is
+    Databricks' own catalog, and Databricks takes a grant on `system.billing` only
+    from an account admin (the v1.2.2 release install was refused all three with
+    "User is not an account admin for Account"); an installer that is not one still
+    stands a working install with one degraded panel. So a refusal is printed with
+    the statements to run, and setup goes on. Returns the statements that did not
+    apply.
+
+    A network failure is still raised: it is not a refusal, and the setup steps
+    after this one would fail on it anyway.
+    """
+
+    unapplied: list[str] = []
+    reason = ""
+    for grant in _posted_usage_unity_catalog_grants():
+        statement = grant.statement(app_client_id)
+        try:
+            _sql_statement(profile, warehouse_id, statement)
+        except NetworkFailure:
+            raise
+        except RuntimeError as error:
+            unapplied.append(statement)
+            reason = reason or str(error)
+    if unapplied:
+        print(
+            "WARN  What It Cost: the app could not be granted its read of system.billing, "
+            "so the room will see Lakebase as unpriced until an admin runs these on any "
+            f"warehouse (docs/DEPLOY.md, \"Grants the deploy cannot issue itself\"). "
+            f"The first refusal: {reason}",
+            flush=True,
+        )
+        for statement in unapplied:
+            print(f"        {statement};", flush=True)
+    return unapplied
+
+
 def _grant_round6_unity_catalog(
     manifest: DemoManifest,
     destination_table_full_name: str,
@@ -8304,6 +8379,10 @@ def _grant_round4_uc_and_warehouse(
     )
     for grant in _round4_unity_catalog_grants(names):
         _sql_statement(profile, warehouse_id, grant.statement(app_client_id))
+    # Here, beside the other Unity Catalog grants, because this is the warehouse the
+    # posted read itself runs on (`warehouse_query_executor` picks Round 4's) and
+    # `_ensure_round4` is reached on every provision and every resume.
+    _grant_posted_usage_read(profile, warehouse_id, app_client_id)
 
 
 def _lakebase_app_role_id(app_client_id: str) -> str:

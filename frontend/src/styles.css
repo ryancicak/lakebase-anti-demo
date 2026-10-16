@@ -1327,6 +1327,8 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cooldown-lane[data-state="confirmed_zero"] { border-color: #6bf39a; }
 .cooldown-name { display: flex; align-items: center; justify-content: center; gap: 1.5vw; text-transform: uppercase; }
 .cooldown-name .database-fighter { width: clamp(55px, 4.6vw, 90px); height: clamp(48px, min(5.5vw, 9vh), 108px); }
+/* At this size the pumpkin's stem is ~12px across, and the crown's full 5-9px border on each side left no green at all: a black square. The proof fighter's thinner border, at about the same size, keeps the stem green. */
+.cooldown-name .database-fighter[data-costume="pumpkin"] .fighter-crown { border-width: clamp(3px, .27vw, 5px); }
 .cooldown-name strong { max-width: 28vw; font-size: clamp(11px, 1.25vw, 24px); line-height: 1.35; overflow-wrap: anywhere; }
 /* The clock stays the hero and keeps its width-driven scale; min() only adds a
    height ceiling so a short viewport cannot be handed a clock taller than the
