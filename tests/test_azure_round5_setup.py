@@ -211,9 +211,15 @@ async def test_a_slow_staging_never_holds_the_competitors_setup_clock() -> None:
     gate_seen: list[bool] = []
 
     async def slow_stage(stop: Any) -> None:
-        for _ in range(50):  # longer than the fake's gate takes to open
-            await asyncio.sleep(0)
-        gate_seen.append(azure.enabled and azure.probes_since_switch > 2)
+        # Staging that outlasts the gate: it finishes only once the gate has opened, however fast
+        # the machine (counting loop turns raced the gate's threads on a slow CI runner). Had the
+        # staging held the gate up, the gate could never open here, and this times out.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10.0
+        while not (azure.enabled and azure.probes_since_switch > 2):
+            assert loop.time() < deadline, "the gate never opened beside the staging"
+            await asyncio.sleep(0.01)
+        gate_seen.append(True)
         staged.set()
 
     ready: list[str] = []

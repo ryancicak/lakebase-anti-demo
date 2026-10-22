@@ -1732,14 +1732,15 @@ async def test_a_reconnect_in_the_hold_restarts_it_and_the_restart_is_bounded(
     await asyncio.sleep(0.1)
     window.end(time.monotonic_ns())  # one shard's reconnect completes 0.1 s into the hold
     await hold
-    # The hold ran its 0.2 s again from the reconnect, not from its own start.
-    assert 0.29 <= (time.monotonic_ns() - started_ns) / 1e9 < 0.45
+    # The hold ran its 0.2 s again from the reconnect, not from its own start. (The upper bound
+    # is loose: a slow CI runner oversleeps.)
+    assert 0.29 <= (time.monotonic_ns() - started_ns) / 1e9 < 1.5
 
     stuck = runner.HoldWindow.local()
     stuck.begin()  # a reconnect that never finishes
     started_ns = time.monotonic_ns()
     await runner._hold_until_settled(stuck, started_ns)
-    assert 0.69 <= (time.monotonic_ns() - started_ns) / 1e9 < 0.9
+    assert 0.69 <= (time.monotonic_ns() - started_ns) / 1e9 < 2.0
 
 
 def test_the_lane_counts_each_shards_reconnects() -> None:

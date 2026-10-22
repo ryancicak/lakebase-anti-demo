@@ -400,12 +400,14 @@ def test_the_agents_receive_never_waits_on_a_slow_service_bus() -> None:
     # Round 5 for a runner it took for lost. The pump does the waiting now.
     import time
 
-    slow = SlowQueue(["stage", "release"], receive_seconds=0.3)
-    pumped = azure_io.PumpedControlQueue(slow, wait_seconds=0.3)
+    # Service Bus takes 1 s per receive here, so an agent poll that waited on it couldn't return
+    # under 0.9 s however fast the machine, and one that doesn't returns well inside it.
+    slow = SlowQueue(["stage", "release"], receive_seconds=1.0)
+    pumped = azure_io.PumpedControlQueue(slow, wait_seconds=1.0)
     try:
         started = time.monotonic()
         assert pumped.receive(0.05) == []  # the agent's long poll ends on time; it heartbeats
-        assert time.monotonic() - started < 0.25
+        assert time.monotonic() - started < 0.9
         (stage,) = _received(pumped)
         assert stage.body == "stage"
         # One event at a time: the next isn't received until the agent decides on this one.
