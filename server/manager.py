@@ -1124,6 +1124,20 @@ def _pooled_path(competitor_id: CompetitorId) -> str:
     return "RDS Proxy"
 
 
+def _lane_arm_waiting(progress: SafeChangeProgress | RecoveryProgress) -> dict[str, object]:
+    """One lane's arming line. `status` is both lanes' old single line. The lane's own fields
+    let the arming screen give each lane its own line and timer, so a lane that is ready no
+    longer looks stuck behind the one still waiting (an Aurora writer resuming: 73.7 s once)."""
+
+    return {
+        "state": SessionState.CHECKING,
+        "status": f"{progress.lane_name} · {progress.status}",
+        "lane_id": progress.lane_id,
+        "lane_name": progress.lane_name,
+        "lane_status": progress.status,
+    }
+
+
 def reset_mode_for_round(round_id: RoundId) -> ResetMode:
     """Return the explicit, round-specific contract for a re-do."""
     if round_id == RoundId.WAKE_IDLE_APP:
@@ -9061,13 +9075,7 @@ class RunManager:
                     lane = record.snapshot.lanes[progress.lane_id]
                     lane.status = progress.status
                     record.snapshot.updated_at = datetime.now(UTC)
-                await record.event_log.publish(
-                    "arm_waiting",
-                    {
-                        "state": SessionState.CHECKING,
-                        "status": f"{progress.lane_name} · {progress.status}",
-                    },
-                )
+                await record.event_log.publish("arm_waiting", _lane_arm_waiting(progress))
 
             arm = await engine.arm(record.snapshot.competitor.id, on_progress)
             loop = asyncio.get_running_loop()
@@ -9134,13 +9142,7 @@ class RunManager:
                         recovery_at=progress.recovery_at,
                     )
                     record.snapshot.updated_at = datetime.now(UTC)
-                await record.event_log.publish(
-                    "arm_waiting",
-                    {
-                        "state": SessionState.CHECKING,
-                        "status": f"{progress.lane_name} · {progress.status}",
-                    },
-                )
+                await record.event_log.publish("arm_waiting", _lane_arm_waiting(progress))
 
             arm = await engine.arm(record.snapshot.competitor.id, on_progress)
             loop = asyncio.get_running_loop()
@@ -9431,6 +9433,18 @@ class RunManager:
                 engine = factory(record.snapshot.competitor.id)
             record.connection_spike_engine = engine
             has_timed_setup = self._round_five_has_timed_setup(engine)
+            # The only line Round 5's arm gives, so the arming screen names what it is waiting on.
+            await record.event_log.publish(
+                "arm_waiting",
+                {
+                    "state": SessionState.CHECKING,
+                    "status": (
+                        "Sealing this bout on both warm runners · Timed setup starts at the bell"
+                        if has_timed_setup
+                        else "Checking both pooled paths before the bell"
+                    ),
+                },
+            )
             arm = None
             if not has_timed_setup:
                 check = engine.check  # type: ignore[attr-defined]

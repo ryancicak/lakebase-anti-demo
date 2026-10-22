@@ -1082,7 +1082,15 @@ export type EventName =
 type EventPayloads = {
   session_created: { session: DemoSession }
   arm_started: { state: 'checking' }
-  arm_waiting: { state: 'checking'; status: string }
+  /** `status` is one line for the whole arm. Rounds 2 and 3 also name the lane it is about
+   *  (`lane_status` is that lane's own words), so each lane gets its own line and timer. */
+  arm_waiting: {
+    state: 'checking'
+    status: string
+    lane_id?: LaneId
+    lane_name?: string
+    lane_status?: string
+  }
   armed: { state: 'armed'; evidence: Record<string, unknown>; session: DemoSession }
   session_cancelled: { state: 'failed'; message: string; session: DemoSession }
   run_preparing: { state: 'armed' }

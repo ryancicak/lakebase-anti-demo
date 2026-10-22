@@ -4057,7 +4057,20 @@ function App() {
   // on the first event of a resume it had to serve past its retention floor, and
   // the play-by-play would otherwise render the hole with no sign of it.
   const [missedCalls, setMissedCalls] = useState(0)
-  const [armStatus, setArmStatus] = useState('Verifying the sealed start state…')
+  const [armStatus, setArmStatusLine] = useState('Verifying the sealed start state…')
+  // When the arming line last changed, for its timer: an arm can wait over a minute (an Aurora
+  // writer resuming, a cold Round 4 Prepare), and a line that never moves reads as a hang. Set
+  // where the line is, never in render; a repeated line keeps its timer.
+  const [armStatusSince, setArmStatusSince] = useState(() => Date.now())
+  const armStatusRef = useRef(armStatus)
+  const setArmStatus = useCallback((line: string) => {
+    if (armStatusRef.current !== line) {
+      armStatusRef.current = line
+      setArmStatusSince(Date.now())
+    }
+    setArmStatusLine(line)
+  }, [])
+  const [armLanes, setArmLanes] = useState<ArmLaneLine[]>([])
   const [activeBout, setActiveBout] = useState<BoutStatus | null>(null)
   const [boutBoard, setBoutBoard] = useState<AllBoutStatus | null>(null)
   const [boutBoardFresh, setBoutBoardFresh] = useState(false)
@@ -4641,9 +4654,16 @@ function App() {
         setError((current) => isStreamError(current) ? null : current)
         if (event.event === 'arm_started') {
           setArmStatus('Verifying the sealed start state…')
+          setArmLanes([])
         }
         if (event.event === 'arm_waiting') {
-          setArmStatus(armWaitingCopy(event.payload.status))
+          const { lane_id: laneId, lane_name: laneName, lane_status: laneStatus } = event.payload
+          if (laneId && laneName && laneStatus) {
+            const since = Date.now()
+            setArmLanes((current) => withArmLane(current, { id: laneId, name: laneName, status: laneStatus, since }))
+          } else {
+            setArmStatus(armWaitingCopy(event.payload.status))
+          }
         }
         if (event.event === 'session_failed') {
           setError(event.payload.message)
@@ -4722,7 +4742,7 @@ function App() {
       if (reconciliationTimer !== undefined) window.clearTimeout(reconciliationTimer)
       unsubscribe()
     }
-  }, [sessionId, uiReview, navigate])
+  }, [sessionId, uiReview, navigate, setArmStatus])
 
   function changePrimary(id: PersonaId) {
     if (sound) playCursor()
@@ -4853,6 +4873,7 @@ function App() {
     setActiveBout(null)
     setArmCancelPending(false)
     setArmStatus('Verifying the sealed start state…')
+    setArmLanes([])
     if (uiReview) {
       setCommentaryOpen(true)
       setSession(buildReviewSession(
@@ -5406,6 +5427,8 @@ function App() {
         reducedMotion={reducedMotion}
         uiReview={uiReview}
         status={armStatus}
+        statusSince={armStatusSince}
+        lanes={armLanes}
         activeBout={activeBout}
         onInspectBout={inspectActiveBout}
         onLeave={leaveBlockedMatchup}
@@ -6058,6 +6081,8 @@ function Matchup({
   reducedMotion,
   uiReview,
   status,
+  statusSince,
+  lanes,
   activeBout,
   onInspectBout,
   onLeave,
@@ -6070,6 +6095,10 @@ function Matchup({
   reducedMotion: boolean
   uiReview: boolean
   status: string
+  /** When `status` last changed (`Date.now()`), for its timer. */
+  statusSince: number
+  /** Each lane's own arming line, once the server names lanes (Rounds 2 and 3). */
+  lanes: ArmLaneLine[]
   activeBout: BoutStatus | null
   onInspectBout: () => Promise<BoutStatus | null>
   onLeave: () => void
@@ -6082,6 +6111,14 @@ function Matchup({
   // name, so "Who's in the ring?" could only answer "The ring just cleared". It is
   // the hold the fight card shows as temporarily unavailable, and says so.
   const ringHeld = boutInProgress && status.includes('RING LEASE LOST')
+  // The arming timers' clock. Nothing before the bell is timed, and the screen says so.
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (boutInProgress) return
+    const ticker = window.setInterval(() => setNow(Date.now()), 500)
+    return () => window.clearInterval(ticker)
+  }, [boutInProgress])
+  const auroraWaking = lanes.some((lane) => lane.status === AURORA_WAKING_STATUS)
   const [showOwner, setShowOwner] = useState(false)
   const [inspectedBout, setInspectedBout] = useState<BoutStatus | null>(null)
   const displayedBout = inspectedBout ?? activeBout
@@ -6108,7 +6145,18 @@ function Matchup({
       </div>
       <div className="matchup-wait" role="status">
         <strong className={reducedMotion || boutInProgress ? '' : 'blink'}>{ringHeld ? 'Temporarily unavailable' : boutInProgress ? 'Bout in progress' : 'Checking both corners…'}</strong>
-        <span>{status}</span>
+        {boutInProgress
+          ? <span>{status}</span>
+          : lanes.length > 0
+            ? lanes.map((lane) => (
+              <span key={lane.id}>
+                {lane.name} · {lane.status}
+                {!lane.status.startsWith(LANE_READY_PREFIX) && <span className="matchup-timer" aria-hidden="true"> · {elapsedClock(lane.since, now)}</span>}
+              </span>
+            ))
+            : <span>{status}<span className="matchup-timer" aria-hidden="true"> · {elapsedClock(statusSince, now)}</span></span>}
+        {!boutInProgress && auroraWaking && <small className="matchup-note">{AURORA_RESUME_NOTE}</small>}
+        {!boutInProgress && <small className="matchup-note">Before the bell · Not timed</small>}
         {boutInProgress && (
           <div className="bout-wait-actions">
             <button onClick={onLeave}>B · Fight card</button>
@@ -10354,6 +10402,32 @@ function fairnessCopy(roundId: RoundId, fanInRoundFive = false, competitorId?: C
  * silently stopped recognising the Aurora lane and printed raw server text.
  * Both replacement phrases are matched here, and pinned by App.test.tsx.
  */
+/** One lane's own line on the arming screen, and when it last changed (`Date.now()`). */
+type ArmLaneLine = { id: LaneId; name: string; status: string; since: number }
+
+/** The server's words for an Aurora lane whose writer is resuming (server/safe_change.py). */
+const AURORA_WAKING_STATUS = 'Aurora is waking from its automatic pause'
+/** How a lane's last arming line starts once its own start state holds (server/safe_change.py).
+ *  That lane's timer stops there. */
+const LANE_READY_PREFIX = 'Ready for the bell'
+/** AWS's own figures (Aurora User Guide, "Scaling to zero ACUs with automatic pause and
+ *  resume"). A Round 3 arm waited 73.7 s on one live, with nothing on the screen saying why. */
+const AURORA_RESUME_NOTE = 'AWS: an Aurora Serverless v2 writer resumes in about 15 s, or 30 s or longer after more than a day paused'
+
+/** A lane's newest line into the lanes, in corner order. A line that hasn't changed keeps its
+ *  timer. */
+function withArmLane(lanes: ArmLaneLine[], line: ArmLaneLine): ArmLaneLine[] {
+  if (lanes.some((lane) => lane.id === line.id && lane.status === line.status)) return lanes
+  return [...lanes.filter((lane) => lane.id !== line.id), line]
+    .sort((a, b) => Number(a.id !== 'lakebase') - Number(b.id !== 'lakebase'))
+}
+
+/** `m:ss` from `since` to `now`, for an arming line's timer. */
+function elapsedClock(since: number, now: number): string {
+  const seconds = Math.max(0, Math.floor((now - since) / 1000))
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+}
+
 function armWaitingCopy(status: string): string {
   const waitingForLakebase = status.includes('not IDLE')
   const waitingForAurora = status.includes('zero-capacity')

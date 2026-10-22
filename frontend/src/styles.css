@@ -489,6 +489,9 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .matchup-wait { position: relative; display: grid; gap: 1.1em; max-width: min(1000px, 82vw); font-size: clamp(7px, .62vw, 12px); line-height: 1.55; text-transform: uppercase; }
 .matchup-wait strong { color: var(--cream); }
 .matchup-wait span { color: var(--yellow); font-family: ui-monospace, monospace; font-weight: 900; }
+/* The arming timers: the step's own time, never a race clock (the note under them says so). */
+.matchup-wait .matchup-timer { color: var(--cream); font-variant-numeric: tabular-nums; }
+.matchup-wait .matchup-note { color: #b7c2e7; font-family: ui-monospace, monospace; font-size: .9em; }
 .bout-wait-actions { display: flex; justify-content: center; gap: 1.2em; }
 .bout-wait-actions button { padding: 1em 1.25em; border: 3px solid var(--cream); color: var(--cream); background: #10183e; box-shadow: .35em .35em #000; font-size: clamp(6px, .5vw, 10px); line-height: 1.2; text-transform: uppercase; }
 .bout-wait-actions button:last-child { color: var(--yellow); border-color: var(--yellow); }

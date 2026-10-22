@@ -3469,6 +3469,83 @@ describe('backstage setup', () => {
     expect(screen.getByText(/aurora auto-pauses after 5 idle minutes.*aws confirmation may add ~1–2 minutes.*bell not started/i)).toBeInTheDocument()
   })
 
+  async function armingScreen() {
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(session('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(session('checking')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    expect(await screen.findByText(/checking both corners/i)).toBeInTheDocument()
+    return FakeEventSource.instances.at(-1)!
+  }
+
+  it('names what each lane waits on while arming, with timers that are not the race clock', async () => {
+    // A Round 3 arm sat 76 s on "Committing and aging the exact incident row" on the live app
+    // (2026-10-16) while Aurora's writer resumed, and it read as a hang.
+    const stream = await armingScreen()
+    expect(screen.getByText(/before the bell · not timed/i)).toBeInTheDocument()
+    const realNow = Date.now.bind(Date)
+    let offset = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offset)
+    const line = (sequence: number, laneId: 'lakebase' | 'competitor', name: string, status: string) => {
+      stream.emit({
+        sequence,
+        event: 'arm_waiting',
+        occurred_at: '2026-08-17T00:00:00Z',
+        payload: { state: 'checking', status: `${name} · ${status}`, lane_id: laneId, lane_name: name, lane_status: status },
+      })
+    }
+    try {
+      act(() => {
+        line(3, 'competitor', 'Aurora Serverless v2', 'Aurora is waking from its automatic pause')
+        line(4, 'lakebase', 'Lakebase', 'Ready for the bell · Exact incident row committed and aged')
+      })
+      const waking = await screen.findByText(/aurora serverless v2 · aurora is waking from its automatic pause/i)
+      const ready = screen.getByText(/lakebase · ready for the bell · exact incident row committed and aged/i)
+      // Lakebase's corner first, and its timer stopped once it was ready.
+      expect(ready.compareDocumentPosition(waking) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(ready).not.toHaveTextContent(/· \d+:\d\d/)
+      expect(screen.getByText(
+        /aws: an aurora serverless v2 writer resumes in about 15 s, or 30 s or longer after more than a day paused/i,
+      )).toBeInTheDocument()
+      offset = 75_000
+      await waitFor(() => expect(waking).toHaveTextContent(/· 1:1[56]$/))
+      // The same line again keeps its timer; a new one starts its own.
+      act(() => line(5, 'competitor', 'Aurora Serverless v2', 'Aurora is waking from its automatic pause'))
+      expect(waking).toHaveTextContent(/· 1:1[56]$/)
+      act(() => line(6, 'competitor', 'Aurora Serverless v2', 'Aurora awake after 75.2 s'))
+      expect(await screen.findByText(/aurora serverless v2 · aurora awake after 75\.2 s/i)).toHaveTextContent(/· 0:0\d$/)
+      expect(screen.queryByText(/aws: an aurora serverless v2 writer resumes/i)).not.toBeInTheDocument()
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('times a whole-round arming line too, such as Round 4 putting the last row back', async () => {
+    const stream = await armingScreen()
+    act(() => {
+      stream.emit({
+        sequence: 3,
+        event: 'arm_waiting',
+        occurred_at: '2026-08-17T00:00:00Z',
+        payload: { state: 'checking', status: "Putting the previous bout's row back and parking both lanes first" },
+      })
+    })
+    expect(await screen.findByText(/putting the previous bout's row back and parking both lanes first/i))
+      .toHaveTextContent(/· 0:0\d$/)
+    expect(screen.getByText(/before the bell · not timed/i)).toBeInTheDocument()
+  })
+
   it('returns a failed preflight to the fight card with audience-safe wording', async () => {
     const safeFailure = (
       'The native CDF start state could not be verified. '

@@ -93,6 +93,59 @@ class SafeChangePhase(StrEnum):
     RESET = "reset"
 
 
+#: How long a lane's source connect may take before arming says what the lane is waiting for. An
+#: awake database answers in well under a second. An Aurora Serverless v2 writer resuming from its
+#: automatic pause takes about 15 s, and 30 s or longer after more than a day paused (AWS, "Scaling
+#: to zero ACUs with automatic pause and resume"). One took 73.7 s on the live app (2026-10-16),
+#: while the arming screen said only "Committing and aging the exact incident row".
+SLOW_CONNECT_NOTICE_SECONDS = 2.0
+#: What an Aurora lane says while its writer resumes. The browser keys AWS's resume times off it.
+AURORA_WAKING_STATUS = "Aurora is waking from its automatic pause"
+#: How a lane's last arming line starts, once its own start state holds. The browser stops that
+#: lane's timer on it.
+LANE_READY_PREFIX = "Ready for the bell"
+
+
+async def connect_saying_waits[T](
+    connect: Awaitable[T],
+    say: Callable[[str], Awaitable[None]],
+    provider: SafeChangeProvider,
+    clock_ns: Callable[[], int],
+) -> T:
+    """Await `connect`, and say why once it has taken `SLOW_CONNECT_NOTICE_SECONDS`.
+
+    Then, once it answers, say how long it took. Arming is never timed (each lane's clock starts
+    at the bell), so this only tells the room why it is waiting. `say` must not raise: the
+    engines' `_emit` swallows every failure, because progress is observational.
+    """
+
+    started_ns = clock_ns()
+    said: list[bool] = []
+
+    async def say_when_slow() -> None:
+        await asyncio.sleep(SLOW_CONNECT_NOTICE_SECONDS)
+        said.append(True)
+        await say(
+            AURORA_WAKING_STATUS
+            if provider == SafeChangeProvider.AURORA
+            else "Waiting for the database to accept the connection"
+        )
+
+    notice = asyncio.create_task(say_when_slow())
+    try:
+        result = await connect
+    finally:
+        notice.cancel()
+    if said:
+        waited = (clock_ns() - started_ns) / 1_000_000_000
+        await say(
+            f"Aurora awake after {waited:.1f} s"
+            if provider == SafeChangeProvider.AURORA
+            else f"Connected after {waited:.1f} s"
+        )
+    return result
+
+
 class SafeChangeLaneState(StrEnum):
     VERIFIED = "verified"
     FAILED = "failed"
@@ -690,7 +743,7 @@ class SafeChangeEngine:
                 on_progress,
                 plan,
                 SafeChangePhase.ARMED,
-                "Source and isolated-change start state verified",
+                f"{LANE_READY_PREFIX} · Source and isolated-change start state verified",
             )
         return SafeChangeArm(
             competitor=competitor,
@@ -862,14 +915,21 @@ class SafeChangeEngine:
                 "Previous owned environment cleared · verifying clean source",
             )
 
+        async def say(status: str) -> None:
+            await self._emit(on_progress, plan, SafeChangePhase.PREFLIGHT, status)
+
         try:
             async with asyncio.timeout(self.preflight_timeout_seconds):
                 evidence = dict(await adapter.preflight(plan))
-                source = await adapter.connect_source(plan)
+                source = await connect_saying_waits(
+                    adapter.connect_source(plan), say, plan.provider, self._clock_ns)
                 try:
                     await self._assert_source_clean(source)
                 finally:
                     await self._close(source)
+                # This lane's own line ends here, while the other may still be waiting. Still
+                # PREFLIGHT: `arm` says ARMED once for each lane, after both.
+                await say(f"{LANE_READY_PREFIX} · Source verified clean")
                 return evidence
         except TimeoutError as exc:
             raise SafeChangeNotArmedError(

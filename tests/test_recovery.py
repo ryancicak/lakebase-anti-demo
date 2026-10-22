@@ -210,6 +210,39 @@ def build_engine(*, cancel_teardown_timeout_seconds: float = 5.0):
     return engine, lakebase, aurora, rds, timeline
 
 
+async def test_an_arm_says_aurora_is_waking_and_each_lane_says_when_it_is_ready(
+    monkeypatch,
+) -> None:
+    # The live app's Round 3 arm waited 73.7 s on a resuming Aurora writer (2026-10-16), while
+    # the arming screen said only "Committing and aging the exact incident row".
+    from server.safe_change import AURORA_WAKING_STATUS, LANE_READY_PREFIX
+
+    monkeypatch.setattr("server.safe_change.SLOW_CONNECT_NOTICE_SECONDS", 0.01)
+    engine, _lakebase, aurora, _, _ = build_engine()
+    awake = aurora.connect_source
+
+    async def resuming(plan):
+        await asyncio.sleep(0.05)
+        return await awake(plan)
+
+    aurora.connect_source = resuming
+    progress: list[tuple[str, str]] = []
+
+    async def capture(event) -> None:
+        progress.append((event.lane_id, event.status))
+
+    await engine.arm(CompetitorId.AURORA_SERVERLESS_V2, capture)
+    aurora_lines = [status for lane, status in progress if lane == "competitor"]
+    lakebase_lines = [status for lane, status in progress if lane == "lakebase"]
+    waking = aurora_lines.index(AURORA_WAKING_STATUS)
+    assert aurora_lines[waking + 1].startswith("Aurora awake after ")
+    # A lane that answers at once says nothing about waiting, and says when it is ready, as the
+    # waiting one does once it is.
+    assert not any("waking" in status or "Waiting" in status for status in lakebase_lines)
+    assert lakebase_lines[-1].startswith(LANE_READY_PREFIX)
+    assert aurora_lines[-1].startswith(LANE_READY_PREFIX)
+
+
 async def test_arm_commits_and_ages_only_selected_exact_rows_without_prewait() -> None:
     engine, lakebase, aurora, rds, _ = build_engine()
 
