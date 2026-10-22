@@ -1,4 +1,5 @@
-import type { DemoSession, LaneId, LaneSnapshot, MetricValue } from './api/types'
+import type { CompetitorId, DemoSession, LaneId, LaneSnapshot, MetricValue } from './api/types'
+import { byCompetitor } from './competitor-kind'
 export { roundFourUnsupportedReason as roundSixUnsupportedReason } from './round4'
 
 export const ROUND_SIX_ID = 'analyze_live_orders_without_slowing_checkout' as const
@@ -16,22 +17,36 @@ export function isRoundSix(session: { round: { id: string } } | null | undefined
  */
 export const ROUND_SIX_CONDITION = 'Lakebase: built-in change feed · AWS: DMS + Glue (cold start)'
 
+/** The condition in the matchup's words: Azure's lane is one Data Factory data flow. */
+export function roundSixCondition(competitorId: CompetitorId): string {
+  return byCompetitor(competitorId, {
+    aurora: ROUND_SIX_CONDITION,
+    rds: ROUND_SIX_CONDITION,
+    azure: 'Lakebase: built-in change feed · Azure: Data Factory (cold start)',
+  })
+}
+
 /**
  * What carries each Round 6 lane's checkout into the lakehouse, printed under that
  * lane's database.
  *
  * The lane's own name stays the database the checkout commits to (Lakebase, or the
- * matchup's Aurora or RDS). What moves the order into Delta is the stack, and it is
- * the only thing the two lanes do differently. The AWS wording is the server's own
- * lane label, so the ring and the engine's progress lines name it the same way.
+ * matchup's Aurora, RDS or Azure PostgreSQL). What moves the order into Delta is the
+ * stack, and it is the only thing the two lanes do differently. The AWS wording is
+ * the server's own lane label, so the ring and the engine's progress lines name it
+ * the same way.
  */
 export function roundSixStackLabel(
   session: Pick<DemoSession, 'competitor'>,
   laneId: LaneId,
 ): string {
-  return laneId === 'lakebase'
-    ? 'Lakebase built-in change feed'
-    : `AWS DMS + Glue from ${session.competitor.short_name}`
+  if (laneId === 'lakebase') return 'Lakebase built-in change feed'
+  const name = session.competitor.short_name
+  return byCompetitor(session.competitor.id, {
+    aurora: `AWS DMS + Glue from ${name}`,
+    rds: `AWS DMS + Glue from ${name}`,
+    azure: `Azure Data Factory from ${name}`,
+  })
 }
 
 /**

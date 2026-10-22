@@ -16,6 +16,7 @@ from server.capacity import (
     RDS_CLASS_MEMORY_GIB,
     RDS_INSTANCE_CLASS,
 )
+from server.catalog import COMPETITORS
 from server.cost_model import (
     ACU_DESCENT_FLOOR_SECONDS,
     ACU_SAMPLE_LEAD_SECONDS,
@@ -936,7 +937,8 @@ class TestEveryProvisionedLaneProducesALine:
         assert not provisioned & cost_model_module._ROUNDS_WITHOUT_AWS
 
     @pytest.mark.parametrize("round_id", sorted(cost_model_module._AWS_ROUND_KEYS, key=str))
-    @pytest.mark.parametrize("competitor", sorted(CompetitorId, key=str))
+    # The AWS edition's competitors: the ones its rounds accept, each priced on AWS.
+    @pytest.mark.parametrize("competitor", sorted((item.id for item in COMPETITORS), key=str))
     def test_a_provisioned_round_prices_its_database_on_either_lane(
         self,
         round_id: RoundId,

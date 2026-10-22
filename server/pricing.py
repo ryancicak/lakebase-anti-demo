@@ -6,8 +6,8 @@ from decimal import Decimal
 from math import isfinite
 from typing import Literal
 
-from .capacity import RDS_INSTANCE_CLASS
-from .models import CompetitorId, CostLineItem, CostReceiptSnapshot, RoundId
+from .capacity import AZURE_ROUND5_RUNNER_SIZE, RDS_INSTANCE_CLASS
+from .models import CompetitorId, CostLineItem, CostReceiptSnapshot, RoundId, aws_lane
 
 REGION = "us-west-2"
 DBRICKS_AS_OF = datetime(2026, 8, 20, 3, 45, 20, tzinfo=UTC)
@@ -171,7 +171,7 @@ def calculate_rds_proxy_cost(
     """Return the capacity-hour quantity and cost for an RDS Proxy lifetime."""
     if not isfinite(billable_seconds) or billable_seconds < 0:
         raise ValueError("RDS Proxy billable seconds must be a finite non-negative value")
-    capacity = 8.0 if competitor_id == CompetitorId.AURORA_SERVERLESS_V2 else 2.0
+    capacity = 8.0 if aws_lane(competitor_id) == "aurora" else 2.0
     priced_seconds = max(RDS_PROXY_MINIMUM_SECONDS, billable_seconds)
     quantity = capacity * priced_seconds / 3600.0
     # Preserve the provider formula's operation order so exact floor examples
@@ -249,7 +249,7 @@ def _lakebase_database_lines() -> list[CostLineItem]:
 
 
 def _aws_database_lines(competitor_id: CompetitorId) -> list[CostLineItem]:
-    if competitor_id == CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(competitor_id) == "aurora":
         lines = [
             _line(
                 "competitor",
@@ -387,7 +387,7 @@ def _ephemeral_artifact_lines(
     aws_purpose = (
         "isolated clone" if round_id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY else "PITR restore"
     )
-    if competitor_id == CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(competitor_id) == "aurora":
         lines.extend(
             [
                 _line(
@@ -584,12 +584,9 @@ def _external_stack_lines(round_id: RoundId) -> list[CostLineItem]:
 
 
 def _round_five_lines(competitor_id: CompetitorId) -> list[CostLineItem]:
-    proxy_target = (
-        "Aurora Serverless v2 · 8 ACU"
-        if competitor_id == CompetitorId.AURORA_SERVERLESS_V2
-        else "provisioned RDS · 2 vCPU"
-    )
-    proxy_unit = "ACU-hour" if competitor_id == CompetitorId.AURORA_SERVERLESS_V2 else "vCPU-hour"
+    aurora = aws_lane(competitor_id) == "aurora"
+    proxy_target = "Aurora Serverless v2 · 8 ACU" if aurora else "provisioned RDS · 2 vCPU"
+    proxy_unit = "ACU-hour" if aurora else "vCPU-hour"
     proxy_component = (
         f"RDS Proxy · {proxy_target} · published 10-minute minimum applies; "
         "provider lifetime pending"
@@ -702,6 +699,105 @@ def _receipt(lines: list[CostLineItem]) -> CostReceiptSnapshot:
     )
 
 
+#: The Azure edition's list rates, the same in westus2 and eastus2 (Azure Retail Prices API, read
+#: for the design on 2026-10-19). Lakebase's own rate on Azure Databricks is the workspace's
+#: `system.billing.list_prices`, which this receipt hasn't read, so its Lakebase lines say so
+#: rather than borrow the AWS rate.
+AZURE_PRICES_AS_OF = datetime(2026, 10, 19, tzinfo=UTC)
+AZURE_PRICES = "Azure Retail Prices API · westus2 · pay as you go"
+AZURE_LAKEBASE_PRICES = "system.billing.list_prices on this Azure Databricks workspace (not read)"
+AZURE_B2S_HOUR_USD = 0.068
+AZURE_D2DS_V5_HOUR_USD = 0.178
+AZURE_STORAGE_GB_MONTH_USD = 0.115
+AZURE_SERVER_STORAGE_GB = 32.0
+AZURE_DATA_FLOW_VCORE_HOUR_USD = 0.2572
+#: Round 5's runner overhead on Azure (Retail Prices API, read 2026-10-20): two D8ls v7 (Linux),
+#: their Standard HDD S4 OS disks, the NAT gateway they leave by and its public address, and the
+#: Service Bus Standard namespace their control queues are in.
+AZURE_ROUND5_RUNNER_HOUR_USD = 0.469
+AZURE_S4_DISK_MONTH_USD = 1.536
+AZURE_NAT_GATEWAY_HOUR_USD = 0.045
+AZURE_PUBLIC_IP_HOUR_USD = 0.005
+AZURE_SERVICE_BUS_STANDARD_MONTH_USD = 10.0
+AZURE_ROUND5_RUNNERS = 2
+
+
+def _azure_cost_receipt(round_id: RoundId) -> CostReceiptSnapshot:
+    """The Azure edition's receipt: its own server, copies and data flows at Azure's list rates."""
+
+    lines = [
+        _line("lakebase", "Lakebase compute", "DBU", None, AZURE_LAKEBASE_PRICES,
+              AZURE_PRICES_AS_OF),
+        _line("lakebase", "Lakebase database, PITR, and snapshot storage", "DSU", None,
+              AZURE_LAKEBASE_PRICES, AZURE_PRICES_AS_OF, scope="required_monthly_carrying_cost"),
+    ]
+    if round_id != RoundId.WAKE_IDLE_APP:  # Round 1 stands no Azure server up (design 6.1)
+        size, rate = (
+            ("D2ds_v5", AZURE_D2DS_V5_HOUR_USD)
+            if round_id == RoundId.SURVIVE_CONNECTION_SPIKE
+            else ("B2s", AZURE_B2S_HOUR_USD)
+        )
+        lines.append(_line(
+            "competitor", f"Azure Database for PostgreSQL Flexible Server {size} compute",
+            "server-hour", rate, AZURE_PRICES, AZURE_PRICES_AS_OF, cadence="hour",
+            status="estimate", scope="required_monthly_carrying_cost", confidence="high",
+            quantity_method="selected_configuration"))
+        storage = AZURE_SERVER_STORAGE_GB * AZURE_STORAGE_GB_MONTH_USD
+        lines.append(_line(
+            "competitor", "Azure Database for PostgreSQL storage", "GB-month",
+            AZURE_STORAGE_GB_MONTH_USD, AZURE_PRICES, AZURE_PRICES_AS_OF,
+            quantity=AZURE_SERVER_STORAGE_GB, subtotal=round(storage, 6), cadence="month",
+            status="estimate", scope="required_monthly_carrying_cost", confidence="high",
+            quantity_method="selected_configuration"))
+    if round_id in {RoundId.MAKE_SCHEMA_CHANGE_SAFELY, RoundId.RECOVER_DELETED_ORDER}:
+        purpose = ("isolated copy" if round_id == RoundId.MAKE_SCHEMA_CHANGE_SAFELY
+                   else "point-in-time restore")
+        lines.append(_line(
+            "competitor", f"Azure PostgreSQL temporary {purpose} (B2s)", "server-hour",
+            AZURE_B2S_HOUR_USD, AZURE_PRICES, AZURE_PRICES_AS_OF, cadence="hour"))
+    if round_id in {RoundId.PUT_MODEL_SCORE_IN_APP, RoundId.ANALYZE_LIVE_ORDERS}:
+        lines.append(_line(
+            "competitor", "Azure Data Factory data flow (General Purpose, 8 vCores)",
+            "vCore-hour", AZURE_DATA_FLOW_VCORE_HOUR_USD, AZURE_PRICES, AZURE_PRICES_AS_OF))
+    if round_id == RoundId.SURVIVE_CONNECTION_SPIKE:
+        # The two resident runners, one per lane, and what they stand on, as AWS's receipt
+        # lists its own: installation overhead, never part of a bout's estimate.
+        lines.extend([
+            _line("shared", f"Two isolated {AZURE_ROUND5_RUNNER_SIZE} runners", "instance-hour",
+                  AZURE_ROUND5_RUNNER_HOUR_USD, AZURE_PRICES, AZURE_PRICES_AS_OF, cadence="month",
+                  scope="installation_overhead"),
+            _line("shared", "Two isolated runner Standard HDD S4 OS disks", "disk-month",
+                  AZURE_S4_DISK_MONTH_USD, AZURE_PRICES, AZURE_PRICES_AS_OF,
+                  quantity=float(AZURE_ROUND5_RUNNERS),
+                  subtotal=round(AZURE_S4_DISK_MONTH_USD * AZURE_ROUND5_RUNNERS, 12),
+                  cadence="month", status="estimate", scope="installation_overhead",
+                  confidence="high", quantity_method="selected_configuration"),
+            _line("shared", "Runner NAT gateway", "gateway-hour", AZURE_NAT_GATEWAY_HOUR_USD,
+                  AZURE_PRICES, AZURE_PRICES_AS_OF, cadence="month",
+                  scope="installation_overhead"),
+            _line("shared", "Runner NAT public IPv4 address", "address-hour",
+                  AZURE_PUBLIC_IP_HOUR_USD, AZURE_PRICES, AZURE_PRICES_AS_OF, cadence="month",
+                  scope="installation_overhead"),
+            _line("shared", "Service Bus Standard namespace (the runners' control queues)",
+                  "namespace-month", AZURE_SERVICE_BUS_STANDARD_MONTH_USD, AZURE_PRICES,
+                  AZURE_PRICES_AS_OF, quantity=1.0,
+                  subtotal=AZURE_SERVICE_BUS_STANDARD_MONTH_USD, cadence="month",
+                  status="estimate", scope="installation_overhead", confidence="high",
+                  quantity_method="selected_configuration"),
+        ])
+    receipt = _receipt(lines)
+    return receipt.model_copy(update={
+        "region": "westus2",
+        "note": (
+            "Immediate estimate, not an invoice. Azure's rates are its published list prices; "
+            "Lakebase's Azure rate is this workspace's own list price, not read here, so its "
+            "lines are pending rather than priced at another cloud's rate. Null quantity means "
+            "pending evidence, not zero cost. Required monthly carrying cost is shown separately "
+            "and never added to the bout estimate."
+        ),
+    })
+
+
 def build_cost_receipt(
     round_id: RoundId,
     competitor_id: CompetitorId,
@@ -720,6 +816,8 @@ def build_cost_receipt(
     CDC-to-Delta stack a customer would still have to select.
     """
 
+    if competitor_id == CompetitorId.AZURE_POSTGRES:
+        return _azure_cost_receipt(round_id)
     lines = _lakebase_database_lines()
     round_four_races_aws = round_id == RoundId.PUT_MODEL_SCORE_IN_APP and round4_aws_lane
     round_six_races_aws = round_id == RoundId.ANALYZE_LIVE_ORDERS and round6_aws_lane

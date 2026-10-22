@@ -949,7 +949,7 @@ class RecoveryEngine:
 
         plans = [self._plan("lakebase", self.lakebase)]
         plans.extend(
-            self._plan(f"competitor-{competitor.value}", adapter)
+            self._plan(f"competitor-{competitor!s}", adapter)
             for competitor, adapter in self.competitors.items()
         )
         return await self._reset_plans(

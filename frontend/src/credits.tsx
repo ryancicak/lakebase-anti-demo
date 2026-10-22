@@ -27,6 +27,7 @@ import {
   type ReactNode,
 } from 'react'
 import { brandAssets } from './assets'
+import { competitorKind } from './competitor-kind'
 import contributorsData from './credits-contributors.json'
 import {
   playConfirm,
@@ -316,6 +317,8 @@ export function Credits({
     () => competitors.filter((competitor) => tally.competitors.includes(competitor.short_name)),
     [competitors, tally.competitors],
   )
+  // The Azure edition's installation: its own cloud's names in the credits that name one.
+  const azure = competitors.some((competitor) => competitorKind(competitor.id) === 'azure')
 
   return (
     <main
@@ -434,13 +437,13 @@ export function Credits({
 
           <Block kicker="No stunt doubles">
             <Name role="Application and verifier" name="FastAPI · React · psycopg 3" />
-            <Name role="Owned environment" name="Terraform · AWS SDK · Databricks SDK" />
-            <Name role="Neutral burst runners" name="SSM-managed c7i.2xlarge, one per lane" />
+            <Name role="Owned environment" name={azure ? 'Terraform · Azure Resource Manager · Databricks SDK' : 'Terraform · AWS SDK · Databricks SDK'} />
+            <Name role="Neutral burst runners" name={azure ? 'Run Command-managed Standard_D8ls_v7, one per lane' : 'SSM-managed c7i.2xlarge, one per lane'} />
             <Name role="Ring lease" name="Fenced Lakebase coordination branch" />
           </Block>
 
           <Block kicker="Filmed on location">
-            <Name role="Live infrastructure, one owned run" name="us-west-2" />
+            <Name role="Live infrastructure, one owned run" name={azure ? 'westus2' : 'us-west-2'} />
             <Name role="Every database in this picture" name="PostgreSQL 17" />
             <Name role="Every clock in this picture" name="Measured, never simulated" />
           </Block>

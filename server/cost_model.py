@@ -33,7 +33,7 @@ from enum import StrEnum
 
 from .capacity import AURORA_AUTO_PAUSE_SECONDS, LAKEBASE_SUSPEND_SECONDS
 from .capacity import AURORA_MAX_ACU as _AURORA_MAX_ACU
-from .models import CompetitorId, LaneState, RoundId, SessionSnapshot
+from .models import CompetitorId, LaneState, RoundId, SessionSnapshot, aws_lane
 from .pricing import (
     CONFIGURED_RDS_INSTANCE_CLASS,
     rds_instance_compute_source,
@@ -1399,7 +1399,7 @@ def _restore_lines(
     )
     lines: list[CostLine] = []
 
-    if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(telemetry.competitor_id) == "aurora":
         lines.append(
             _line(
                 "Aurora temporary PITR restore compute",
@@ -1481,7 +1481,7 @@ def _proxy_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[CostLine]:
     """
 
     capacity = (
-        Decimal(8) if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2 else Decimal(2)
+        Decimal(8) if aws_lane(telemetry.competitor_id) == "aurora" else Decimal(2)
     )
     lifetime = _lifetime(telemetry, telemetry.observed_proxy_lifetime_seconds, what="RDS Proxy")
     billed = _billed_seconds(lifetime, RDS_MINIMUM_BILLED_SECONDS)
@@ -1529,7 +1529,7 @@ def _connection_spike_database_lines(
       chargeable through the auto-pause descent after the check has finished.
     """
 
-    if telemetry.competitor_id is not CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(telemetry.competitor_id) == "rds":
         return [
             _line(
                 f"{rates.rds_compute_label} bounded connection check · already-running instance",
@@ -1576,7 +1576,7 @@ def _baseline_wake_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[Cost
     before the capacity it woke stops billing.
     """
 
-    if telemetry.competitor_id is not CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(telemetry.competitor_id) == "rds":
         return [
             _line(
                 "RDS PostgreSQL wake · already-running instance",
@@ -1686,7 +1686,7 @@ def _model_score_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[CostLi
     stopped once the bout has settled.
     """
 
-    if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(telemetry.competitor_id) == "aurora":
         database = _line(
             "Aurora Serverless v2 Glue writes and app reads",
             cloud=Cloud.AWS,
@@ -1741,7 +1741,7 @@ def _live_orders_lines(telemetry: BoutTelemetry, rates: RateCard) -> list[CostLi
     started at the bell and stopped once the bout has settled.
     """
 
-    if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(telemetry.competitor_id) == "aurora":
         database = _line(
             "Aurora Serverless v2 checkout and DMS capture above the replication floor",
             cloud=Cloud.AWS,
@@ -1868,7 +1868,7 @@ def _competitor_lane_raced(telemetry: BoutTelemetry) -> bool:
 
 
 def _competitor_database_rate(telemetry: BoutTelemetry, rates: RateCard) -> Rate:
-    if telemetry.competitor_id is CompetitorId.AURORA_SERVERLESS_V2:
+    if aws_lane(telemetry.competitor_id) == "aurora":
         return rates.aurora_acu_hour
     return rates.rds_instance_hour
 

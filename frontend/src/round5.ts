@@ -1,15 +1,20 @@
 import type {
+  CompetitorId,
   DemoSession,
   LaneId,
+  PersonaId,
   LaneSnapshot,
   RoundFiveRuntimeLane,
   RoundFiveRuntimePhase,
   RoundFiveRuntimeSnapshot,
   RoundFiveSetupState,
 } from './api/types'
-import { ROUND_FIVE_PERSONA_MEANING } from './ringside-cues/corpus'
+import { competitorKind } from './competitor-kind'
+import { roundFivePersonaMeaning } from './ringside-cues/corpus'
 
 export const ROUND_FIVE_ID = 'survive_connection_spike' as const
+/** The Azure edition's Round 5 builds nothing per bout: its cleanup switches PgBouncer back off. */
+export const ROUND_FIVE_AZURE_CLEANUP_COPY = 'Round 5 is switching the last bout\'s PgBouncer back off and will reopen automatically once Azure confirms it. Other rounds remain available.'
 export const ROUND_FIVE_DISPLAY_TITLE = 'Ready a pooled application path'
 export const ROUND_FIVE_DISPLAY_TITLE_UPPER = 'READY A POOLED APPLICATION PATH'
 export const ROUND_FIVE_TARGET_CLIENTS = 128
@@ -55,8 +60,8 @@ export const ROUND_FIVE_MAX_RETRIES = 100
 const ROUND_FIVE_FANIN_RUNNER = 'Python 3.12 event-driven TLS/native-password'
 const ROUND_FIVE_AUTH_METHODS = new Set(['tls-cleartext-password', 'scram-sha-256'])
 
-export function roundFiveFightCardOpening(personaId: string): string {
-  const focus = ROUND_FIVE_PERSONA_MEANING[personaId as keyof typeof ROUND_FIVE_PERSONA_MEANING]
+export function roundFiveFightCardOpening(personaId: string, competitorId?: CompetitorId): string {
+  const focus = roundFivePersonaMeaning(personaId as PersonaId, competitorId)
     ?? 'Lakebase includes a built-in pool for up to 10,000 client connections. Teams still decide who owns the application path around it.'
   return focus
 }
@@ -70,6 +75,8 @@ export interface RoundFiveLaneResult {
   terminalFailures: number | null
   retries: number | null
   disconnectedDuringHold: number | null
+  /** Held clients the server reset that the runner reconnected (v1.3.0). */
+  reconnectedAfterReset: number | null
   timeToTargetMs: number | null
   holdElapsedMs: number | null
   sampledQueriesAttempted: number | null
@@ -171,6 +178,10 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
   const terminalFailures = count(fanIn ? evidence.terminal_failures : evidence.error_clients)
   const retries = fanIn ? count(evidence.retries) : 0
   const disconnectedDuringHold = fanIn ? count(evidence.disconnected_during_hold) : 0
+  // A result from before v1.3.0 carries no reconnects, and needed no disconnect.
+  const reconnectedAfterReset = fanIn
+    ? (evidence.reconnected_after_reset === undefined ? 0 : count(evidence.reconnected_after_reset))
+    : 0
   const timeToTargetMs = nonNegativeNumber(evidence.time_to_target_ms)
   const holdElapsedMs = nonNegativeNumber(evidence.hold_elapsed_ms)
   const witnessVerifiedClients = count(evidence.witness_verified_clients)
@@ -243,7 +254,8 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     && (!fanInCurrent || portAccountingVerified)
     && (!fanIn || terminalFailures === 0)
     && (!fanIn || (retries !== null && retries <= ROUND_FIVE_MAX_RETRIES))
-    && (!fanIn || disconnectedDuringHold === 0)
+    // Every held client the server reset was reconnected, and the hold started again (v1.3.0).
+    && (!fanIn || (disconnectedDuringHold !== null && disconnectedDuringHold === reconnectedAfterReset))
     && (!fanIn || (
       preexistingClientRoleSessions !== null
       && preexistingClientRoleSessions <= ROUND_FIVE_MAX_PREEXISTING_CLIENT_SESSIONS
@@ -265,6 +277,7 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     terminalFailures,
     retries,
     disconnectedDuringHold,
+    reconnectedAfterReset,
     timeToTargetMs,
     holdElapsedMs,
     sampledQueriesAttempted,
@@ -303,6 +316,21 @@ export function roundFiveLaneResult(lane: LaneSnapshot): RoundFiveLaneResult {
     telemetryVerified,
     contractVerified,
   }
+}
+
+/**
+ * "1 held connection reset by the server, reconnected", or '' if none was (v1.3.0). The runner
+ * logs a held client the server resets back in, in its slot and on its lane's clock, and a
+ * reconnect once the hold began starts the 30-second hold again, so a verified lane still held
+ * all 10,000 clients for 30 seconds at once. The room is told it happened.
+ */
+export function roundFiveServerResetNote(lane: LaneSnapshot): string {
+  const reconnected = roundFiveLaneResult(lane).reconnectedAfterReset ?? 0
+  if (reconnected <= 0) return ''
+  const connections = reconnected === 1
+    ? '1 held connection'
+    : `${reconnected.toLocaleString('en-US')} held connections`
+  return `${connections} reset by the server, reconnected`
 }
 
 export function roundFiveSetupLaneResult(
@@ -397,6 +425,23 @@ const ROUND_FIVE_SETUP_ADVISORY_TEXT: Record<string, string> = {
 }
 
 /**
+ * The Azure edition's words for the codes that name CreateDBProxy. The server checks Azure's
+ * timed mutation, PgBouncer's switch, under the same codes (`create_db_proxy_request_delta_ms`).
+ */
+const ROUND_FIVE_AZURE_SETUP_TEXT: Record<string, string> = {
+  create_db_proxy_pre_bell: 'PgBouncer\u2019s switch was requested before the bell (pre-bell or wrong clock domain)',
+  create_db_proxy_missing: 'PgBouncer\u2019s switch request boundary was never observed (no timed Azure mutation)',
+  create_db_proxy_window: 'PgBouncer\u2019s switch was requested more than 100 ms after the bell (slow, already charged to this lane\u2019s clock)',
+}
+
+function setupCodeText(session: DemoSession, code: string, texts: Record<string, string>): string {
+  const azure = session.competitor?.id === 'azure_postgres'
+    ? ROUND_FIVE_AZURE_SETUP_TEXT[code]
+    : undefined
+  return azure ?? texts[code] ?? code
+}
+
+/**
  * Reduce every lane's non-fatal scheduling advisories to a readable, advisory-only
  * summary for the detailed play-by-play. Returns null when no lane carries one.
  * A verified lane can still carry an advisory, so this does NOT skip verified lanes.
@@ -412,7 +457,7 @@ export function roundFiveSchedulingAdvisorySummary(session: DemoSession): string
     const name = lane.name || session.lanes[laneId]?.name || laneId
     const readable = advisory
       .split(';')
-      .map((code) => ROUND_FIVE_SETUP_ADVISORY_TEXT[code] ?? code)
+      .map((code) => setupCodeText(session, code, ROUND_FIVE_SETUP_ADVISORY_TEXT))
       .join(' · ')
     parts.push(`${name}: ${readable}`)
   }
@@ -452,7 +497,7 @@ export function roundFiveSetupDiagnosticSummary(session: DemoSession): string | 
     const name = lane.name || session.lanes[laneId]?.name || laneId
     const readable = diagnostic
       .split(';')
-      .map((code) => ROUND_FIVE_SETUP_DIAGNOSTIC_TEXT[code] ?? code)
+      .map((code) => setupCodeText(session, code, ROUND_FIVE_SETUP_DIAGNOSTIC_TEXT))
       .join(' · ')
     parts.push(`${name}: ${readable}`)
   }
@@ -814,9 +859,17 @@ const ROUND_FIVE_PHASE_LABELS: Record<RoundFiveRuntimePhase, string> = {
   cancelled: 'CANCELLED',
 }
 
+/** The Azure edition's pooling phases: its built-in PgBouncer, switched on at the bell. */
+const AZURE_ROUND_FIVE_PHASE_LABELS: Partial<Record<RoundFiveRuntimePhase, string>> = {
+  provisioning_proxy: 'SWITCHING ON PGBOUNCER',
+  verifying_proxy: 'CHECKING PGBOUNCER',
+}
+
 /** An unknown phase from a newer server still reads as words: `some_phase` is "Some Phase". */
-export function roundFivePhaseLabel(phase: string): string {
-  const known = (ROUND_FIVE_PHASE_LABELS as Record<string, string>)[phase]
+export function roundFivePhaseLabel(phase: string, competitor?: CompetitorId): string {
+  const azure = competitor !== undefined && competitorKind(competitor) === 'azure'
+  const known = (azure ? (AZURE_ROUND_FIVE_PHASE_LABELS as Record<string, string>)[phase] : undefined)
+    ?? (ROUND_FIVE_PHASE_LABELS as Record<string, string>)[phase]
   if (known) return known
   const words = phase.replace(/_+/g, ' ').trim().toLowerCase()
   return words ? words.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Unknown'

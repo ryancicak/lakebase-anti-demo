@@ -1,4 +1,5 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
+import { scalesToZero } from '../competitor-kind'
 import { modelScoreEvidence, roundFourStackLabel } from '../round4'
 import { roundSixStackLabel } from '../round6'
 import {
@@ -186,7 +187,7 @@ function sessionContractVerified(session: DemoSession): boolean {
   switch (session.round.id) {
     case 'wake_idle_app':
       return session.lanes.competitor.state === 'not_supported'
-        ? session.competitor.id === 'rds_postgres'
+        ? !scalesToZero(session.competitor.id)
         : comparisonFor(session) !== null
     case 'make_schema_change_safely':
     case 'recover_deleted_order':
@@ -408,7 +409,11 @@ export function classifyOutcome(session: DemoSession): ClassifiedSessionOutcome 
       || session.state === 'towelled',
     recordNoEvidence: Boolean(session.towel),
   })
-  const outcome = getOutcomeRecord(session.round.id, outcomeIdFor(session, decision))
+  const outcome = getOutcomeRecord(
+    session.round.id,
+    outcomeIdFor(session, decision),
+    session.competitor.id,
+  )
   return {
     ...decision,
     outcome,
@@ -609,7 +614,12 @@ export function buildRingsideCue(
   const classified = classifyOutcome(session)
   const { outcome } = classified
   const values = proofValues(session, classified)
-  const personaVerified = getVerifiedRecord(session.round.id, personaId, priorityKey)
+  const personaVerified = getVerifiedRecord(
+    session.round.id,
+    personaId,
+    priorityKey,
+    session.competitor.id,
+  )
   const verified = outcome.copy_mode === 'INHERIT_VERIFIED_CORPUS'
     ? personaVerified
     : null
@@ -617,7 +627,7 @@ export function buildRingsideCue(
     session.round.id === 'survive_connection_spike'
     && outcome.copy_mode === 'OUTCOME_OVERRIDE'
   )
-    ? getRoundFivePersonaOutcomeRecord(outcome.outcome_id, personaId)
+    ? getRoundFivePersonaOutcomeRecord(outcome.outcome_id, personaId, session.competitor.id)
     : null
   const sayRecord = verified
     ? authoredText(verified.meaning_record_id, verified.meaning, verified.meaning_decision)

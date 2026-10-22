@@ -78,6 +78,7 @@ import {
   type FormalWinner,
 } from './ringside-cues'
 import { compactDuration, preciseDuration } from './time'
+import { byCompetitor, competitorKind, fighterLabel, fighterLabelForName, scalesToZero } from './competitor-kind'
 import { replayStory } from './instant-replay'
 import { loadScorecard, saveScorecard, type ScorecardEntry } from './scorecard-storage'
 export type { ScorecardEntry } from './scorecard-storage'
@@ -92,6 +93,7 @@ import {
   selectRound4Session,
 } from './round4'
 import {
+  ROUND_FIVE_AZURE_CLEANUP_COPY,
   ROUND_FIVE_BELL_PROTOCOL,
   ROUND_FIVE_DISPLAY_TITLE,
   ROUND_FIVE_FANIN_PROTOCOL,
@@ -110,6 +112,7 @@ import {
   roundFiveLanePresentation,
   roundFiveLaneResult,
   roundFiveLaneVerification,
+  roundFiveServerResetNote,
   roundFiveSetupElapsedDisplay,
   roundFiveSetupLaneResult,
   roundFiveStoppedVerdict,
@@ -122,6 +125,7 @@ import {
   ROUND_SIX_CONDITION,
   isRoundSix,
   liveOrderEvidence,
+  roundSixCondition,
   roundSixLaneLabel,
   roundSixStackLabel,
   roundSixUnsupportedReason,
@@ -180,6 +184,11 @@ const ROUND_CLEANUP_COPY: Record<RoundId, string> = {
   survive_connection_spike: 'Round 5 is removing the last bout\'s RDS Proxy and will reopen automatically once AWS confirms it is deleted. Other rounds remain available.',
   analyze_live_orders_without_slowing_checkout: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
 }
+function roundCleanupCopy(roundId: RoundId, competitor?: CompetitorId): string {
+  return roundId === 'survive_connection_spike' && competitor === 'azure_postgres'
+    ? ROUND_FIVE_AZURE_CLEANUP_COPY
+    : ROUND_CLEANUP_COPY[roundId]
+}
 
 type RoundCardState =
   | 'available'
@@ -220,7 +229,7 @@ function roundCardState(
  * projector. The exact stage, generation and error code stay machine-readable in
  * `round5_start` and `/readyz` for operators and soak monitors.
  */
-function roundFiveStartMessage(status: FightCardRoundStatus): string {
+function roundFiveStartMessage(status: FightCardRoundStatus, competitor?: CompetitorId): string {
   if (status.state === 'bout_in_progress') return BOUT_IN_PROGRESS
   const start = status.round5_start!
   switch (start.stage) {
@@ -229,7 +238,7 @@ function roundFiveStartMessage(status: FightCardRoundStatus): string {
         return 'Round 5 is finishing cleanup backstage. Other rounds remain available.'
       }
       return start.cleanup_scope === 'postbell_resources'
-        ? ROUND_CLEANUP_COPY.survive_connection_spike
+        ? roundCleanupCopy('survive_connection_spike', competitor)
         : 'Round 5 is resetting after the last fight card and will reopen automatically in under a minute. Other rounds remain available.'
     case 'claim-drain':
       return 'Another Round 5 fight card was just prepared. Round 5 reopens automatically if it is not used. Other rounds remain available.'
@@ -246,6 +255,7 @@ function roundFiveStartMessage(status: FightCardRoundStatus): string {
 function roundBoardMessage(
   roundId: RoundId,
   status: FightCardRoundStatus | null,
+  competitor?: CompetitorId,
 ): string {
   if (
     roundId === 'survive_connection_spike'
@@ -253,11 +263,11 @@ function roundBoardMessage(
     && !status.can_start
     && status.round5_start
   ) {
-    return roundFiveStartMessage(status)
+    return roundFiveStartMessage(status, competitor)
   }
   if (status?.detail) return status.detail
   if (status?.state === 'bout_in_progress') return BOUT_IN_PROGRESS
-  if (status?.state === 'cleanup_in_progress') return ROUND_CLEANUP_COPY[roundId]
+  if (status?.state === 'cleanup_in_progress') return roundCleanupCopy(roundId, competitor)
   if (status?.state === 'temporarily_unavailable') {
     return 'Round 5 is resetting and will reopen automatically. Other rounds remain available.'
   }
@@ -277,6 +287,8 @@ interface FinaleBeat {
   title: string
   flow: string
   proof: string
+  /** The proof line where the opponent is Azure's, when it differs from AWS's. */
+  azureProof?: string
   accent: 'red' | 'blue' | 'yellow'
 }
 
@@ -286,7 +298,7 @@ const FINALE_BEATS: FinaleBeat[] = [
   { number: '03', roundId: 'recover_deleted_order', title: 'Recover exactly', flow: 'Delete → exact row restored', proof: 'Recovered row verified · deletion preserved', accent: 'yellow' },
   { number: '04', roundId: 'put_model_score_in_app', title: 'Delta → live app', flow: 'Analytics → operational data', proof: 'Both cold start · exact app read stops each clock', accent: 'red' },
   { number: '05', roundId: 'survive_connection_spike', title: 'Ready a pooled path', flow: 'Pool setup → dual 10K fan-in', proof: '10,000 clients held / lane · 30s hold · multiplexing proved', accent: 'blue' },
-  { number: '06', roundId: 'analyze_live_orders_without_slowing_checkout', title: 'Live app → Delta', flow: 'Checkout → exact Delta read', proof: 'AWS cold starts · exact Delta read stops each clock', accent: 'yellow' },
+  { number: '06', roundId: 'analyze_live_orders_without_slowing_checkout', title: 'Live app → Delta', flow: 'Checkout → exact Delta read', proof: 'AWS cold starts · exact Delta read stops each clock', azureProof: 'Data Factory cold starts · exact Delta read stops each clock', accent: 'yellow' },
 ]
 
 /**
@@ -367,15 +379,33 @@ function sessionStage(session: DemoSession, preferred: Stage = 'proof'): Stage {
   return 'proof'
 }
 
-function opponentLabel(roundId: RoundId, shortName: string): string {
-  return roundId === 'survive_connection_spike' ? `${shortName} + RDS Proxy` : shortName
+function opponentLabel(roundId: RoundId, competitorId: CompetitorId, shortName: string): string {
+  if (roundId !== 'survive_connection_spike') return shortName
+  return `${shortName} + ${byCompetitor(competitorId, { aurora: 'RDS Proxy', rds: 'RDS Proxy', azure: 'PgBouncer' })}`
+}
+
+/** The competitor's cloud, as share cards and receipts name it: AWS, or Azure. */
+function cloudOf(session: DemoSession): string {
+  return byCompetitor(session.competitor.id, { aurora: 'AWS', rds: 'AWS', azure: 'Azure' })
+}
+
+/** What Round 5 did not test, as its receipt and share text say it, in the edition's words. */
+function roundFiveNotTested(session: DemoSession): string {
+  return byCompetitor(session.competitor.id, {
+    aurora: 'Direct AWS connections, an existing Proxy, and transaction throughput were not tested',
+    rds: 'Direct AWS connections, an existing Proxy, and transaction throughput were not tested',
+    // The catalog's own disclosure for Azure's lane (server/catalog.py).
+    azure: 'Direct connections, a self-managed PgBouncer, and transaction throughput were not tested',
+  })
 }
 
 function fightCardOpponentLabel(roundId: RoundId, competitorId: CompetitorId, shortName: string): string {
   if (roundId !== 'survive_connection_spike') return shortName
-  return competitorId === 'aurora_serverless_v2'
-    ? 'Aurora + RDS Proxy reference path'
-    : 'RDS PostgreSQL + RDS Proxy reference path'
+  return byCompetitor(competitorId, {
+    aurora: 'Aurora + RDS Proxy reference path',
+    rds: 'RDS PostgreSQL + RDS Proxy reference path',
+    azure: 'Azure PostgreSQL + built-in PgBouncer',
+  })
 }
 const STREAM_INTERRUPTION_ERROR = 'Live evidence stream interrupted. Display timers are frozen at disconnect while the app reconnects; no result has been inferred.'
 const STREAM_FAILURE_ERROR = 'Live evidence stream remains unavailable after repeated reconnects. Last-known proof is retained; check the server before continuing.'
@@ -452,6 +482,7 @@ const cornerCopy: Record<CustomerCorner, string> = {
 const competitorEpithet: Record<CompetitorId, { epithet: string; tagline?: string }> = {
   aurora_serverless_v2: { epithet: 'NOT DEAD YET', tagline: 'Like the guy on Monty Python’s plague cart, it keeps yelling “I’m not dead yet.”' },
   rds_postgres: { epithet: 'NEVER SLEEPS', tagline: 'Like Samara from the Ring, it never sleeps.' },
+  azure_postgres: { epithet: 'ALWAYS COMES BACK', tagline: 'Like Michael Myers, it comes back on its own: seven days after you stop it.' },
 }
 
 interface FightSelection {
@@ -1074,8 +1105,9 @@ export function CostReceiptDisclosure({ session }: { session: DemoSession }) {
             {lines.map((line) => {
               const isDatabricksSource = line.source.startsWith('system.billing')
               const isAwsSource = line.source.startsWith('AWS') || line.source.startsWith('Amazon')
-              const sourceLabel = isDatabricksSource ? 'Databricks list prices' : isAwsSource ? 'AWS published pricing' : line.status === 'selection_required' ? 'Product selection required' : 'Published pricing'
-              const timestampLabel = isAwsSource ? 'provider published' : 'checked'
+              const isAzureSource = line.source.startsWith('Azure')
+              const sourceLabel = isDatabricksSource ? 'Databricks list prices' : isAwsSource ? 'AWS published pricing' : isAzureSource ? 'Azure published pricing' : line.status === 'selection_required' ? 'Product selection required' : 'Published pricing'
+              const timestampLabel = isAwsSource || isAzureSource ? 'provider published' : 'checked'
               const timestamp = formatCostTimestamp(line.source_as_of)
               const rate = line.unit_rate_usd
               const rateDisplay = rate == null
@@ -1217,6 +1249,7 @@ function prepareRefusal(params: {
   round: CatalogResponse['rounds'][number]
   rounds: CatalogResponse['rounds']
   roundState: RoundCardState
+  competitor?: CompetitorId
 }): string | null {
   if (params.restoringSession) return 'RESTORING LIVE BOUT…'
   if (params.uiReview) return null
@@ -1242,7 +1275,7 @@ function prepareRefusal(params: {
       : RING_STATUS_UNREAD
   }
   if (!roundCanStart(params.ringStatus)) {
-    return roundBoardMessage(params.round.id, params.ringStatus)
+    return roundBoardMessage(params.round.id, params.ringStatus, params.competitor)
   }
   return null
 }
@@ -1591,7 +1624,11 @@ function roundFiveFairness(session: DemoSession): string {
 
 function roundFiveIntegrityDetail(session: DemoSession): string {
   return roundFiveUsesFanIn(session)
-    ? `INTEGRITY · EXACT 10,000-CLIENT MARGIN ${roundFiveFanInMarginDisplay(session)} · 10,000 AUTHENTICATED + HELD / LANE ✓ · 30S COMMON HOLD ✓ · 64 SPARSE SAMPLES / LANE ✓ · DIRECT-OBSERVER MULTIPLEXING ✓ · CLEANUP VERIFIED ✓ · LAKEBASE INCLUDED POOL / 0 PER-BOUT POOLING CHANGES · SELECTED AWS PATH / 9 JOURNALED RESOURCES + TARGET DRAIN/REBIND`
+    ? `INTEGRITY · EXACT 10,000-CLIENT MARGIN ${roundFiveFanInMarginDisplay(session)} · 10,000 AUTHENTICATED + HELD / LANE ✓ · 30S COMMON HOLD ✓ · 64 SPARSE SAMPLES / LANE ✓ · DIRECT-OBSERVER MULTIPLEXING ✓ · CLEANUP VERIFIED ✓ · LAKEBASE INCLUDED POOL / 0 PER-BOUT POOLING CHANGES · ${byCompetitor(session.competitor.id, {
+      aurora: 'SELECTED AWS PATH / 9 JOURNALED RESOURCES + TARGET DRAIN/REBIND',
+      rds: 'SELECTED AWS PATH / 9 JOURNALED RESOURCES + TARGET DRAIN/REBIND',
+      azure: 'SELECTED AZURE PATH / PGBOUNCER SWITCHED ON + CLIENT LIMIT RAISED',
+    })}`
     : 'INTEGRITY · LEGACY SCORECARD DECODED · CURRENT 10,000-CLIENT FAN-IN EVIDENCE NOT RECORDED'
 }
 
@@ -1620,10 +1657,10 @@ function linkedInHook(session: DemoSession): string {
       ? session.round5_runtime
       : null
     if (runtime) {
-      return `One accepted bell: Lakebase ${laneReceiptTime(runtime.lanes.lakebase.bell_to_10000_observed_ms)}; selected AWS path ${laneReceiptTime(runtime.lanes.competitor.bell_to_10000_observed_ms)} to the observed exact 10,000-client held gate. ${roundFiveVerifiedVerdict(session)}. Both held for 30 seconds, passed 64 held-connection checks, and proved backend multiplexing. Direct AWS connections, an existing Proxy, and transaction throughput were not tested. 🥊`
+      return `One accepted bell: Lakebase ${laneReceiptTime(runtime.lanes.lakebase.bell_to_10000_observed_ms)}; selected ${cloudOf(session)} path ${laneReceiptTime(runtime.lanes.competitor.bell_to_10000_observed_ms)} to the observed exact 10,000-client held gate. ${roundFiveVerifiedVerdict(session)}. Both held for 30 seconds, passed 64 held-connection checks, and proved backend multiplexing. ${roundFiveNotTested(session)}. 🥊`
     }
     if (roundFiveUsesFanIn(session)) {
-      return `One accepted bell: Lakebase ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}; selected AWS path ${laneReceiptTime(session.lanes.competitor.elapsed_ms)} to the observed exact 10,000-client held gate. ${roundFiveVerifiedVerdict(session)}. Both held for 30 seconds, passed 64 held-connection checks, and proved backend multiplexing. Direct AWS connections, an existing Proxy, and transaction throughput were not tested. 🥊`
+      return `One accepted bell: Lakebase ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}; selected ${cloudOf(session)} path ${laneReceiptTime(session.lanes.competitor.elapsed_ms)} to the observed exact 10,000-client held gate. ${roundFiveVerifiedVerdict(session)}. Both held for 30 seconds, passed 64 held-connection checks, and proved backend multiplexing. ${roundFiveNotTested(session)}. 🥊`
     }
     return 'Legacy Round 5 scorecard decoded. The current 10,000-client fan-in result was not recorded, so no fan-in claim is shown. 🥊'
   }
@@ -1650,7 +1687,7 @@ function linkedInHook(session: DemoSession): string {
   }
   if (isRoundFour(session)) {
     if (session.lanes.competitor.state === 'not_supported') {
-      return `Lakebase put one Delta change into the live app in ${laneReceiptTime(lakebaseMs)} through its synced table. This installation has no AWS lane, so nothing was compared. 🥊`
+      return `Lakebase put one Delta change into the live app in ${laneReceiptTime(lakebaseMs)} through its synced table. This installation has no ${cloudOf(session)} lane, so nothing was compared. 🥊`
     }
     if (winner === 'lakebase' && difference) {
       return `Lakebase put one Delta change into the live app ${difference} before ${roundFourStackLabel(session, 'competitor')}, with both integrations starting cold at the bell. 🥊`
@@ -1658,7 +1695,7 @@ function linkedInHook(session: DemoSession): string {
   }
   if (isRoundSix(session)) {
     if (session.lanes.competitor.state === 'not_supported') {
-      return `Lakebase's built-in change feed put one live checkout into Delta in ${laneReceiptTime(lakebaseMs)}. This installation has no AWS lane, so nothing was compared. 🥊`
+      return `Lakebase's built-in change feed put one live checkout into Delta in ${laneReceiptTime(lakebaseMs)}. This installation has no ${cloudOf(session)} lane, so nothing was compared. 🥊`
     }
     if (winner === 'lakebase' && difference) {
       return `Lakebase's built-in change feed put one live checkout into Delta ${difference} before ${roundSixStackLabel(session, 'competitor')}, which cold started at the bell. 🥊`
@@ -1705,7 +1742,7 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       `Receipt ${receiptId(session)} · ${receiptBoundary} · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
-    lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+    lines.push('', `#Lakebase #PostgreSQL #${cloudOf(session)} #Databricks`)
     return lines.join('\n')
   }
   // A V4 bell towel is shared from the same enabled Share control the arena
@@ -1729,7 +1766,7 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       `Receipt ${receiptId(session)} · Towel thrown mid-bout · The 30-second hold and 64 held-connection checks did not complete · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
-    lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+    lines.push('', `#Lakebase #PostgreSQL #${cloudOf(session)} #Databricks`)
     return lines.join('\n')
   }
   if (!classified.shareable) {
@@ -1746,20 +1783,30 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
     const lines = [
       linkedInHook(session),
       '',
-      `🔴 Lakebase · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'}`,
-      `🔵 ${session.competitor.short_name} + RDS Proxy · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'}`,
+      [
+        `🔴 Lakebase · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'}`,
+        fanIn ? roundFiveServerResetNote(session.lanes.lakebase) : '',
+      ].filter(Boolean).join(' · '),
+      [
+        `🔵 ${opponentLabel('survive_connection_spike', session.competitor.id, session.competitor.short_name)} · ${fanIn ? '10,000 authenticated held clients' : 'legacy scorecard · 10,000-client fan-in not recorded'}`,
+        fanIn ? roundFiveServerResetNote(session.lanes.competitor) : '',
+      ].filter(Boolean).join(' · '),
       '',
       `ROUND ${roundNumber} · ${ROUND_FIVE_DISPLAY_TITLE}`,
       roundFiveVerifiedVerdict(session),
       roundFiveFairness(session),
       roundFiveIntegrityDetail(session),
-      'Database-only declared start · Lakebase included pooling · selected AWS reference path provisioned a new RDS Proxy and dependencies.',
+      byCompetitor(session.competitor.id, {
+        aurora: 'Database-only declared start · Lakebase included pooling · selected AWS reference path provisioned a new RDS Proxy and dependencies.',
+        rds: 'Database-only declared start · Lakebase included pooling · selected AWS reference path provisioned a new RDS Proxy and dependencies.',
+        azure: 'Database-only declared start · Lakebase included pooling · Azure turned on its built-in PgBouncer.',
+      }),
       fanIn
-    ? `Receipt ${receiptId(session)} · exact 10,000 authenticated held clients per lane; 30-second hold, 64 held-connection checks, direct-observer multiplexing, fairness, contracts, and cleanup are exact gates · Direct AWS connections, an existing Proxy, and transaction throughput were not tested · One live run, not a benchmark.`
+    ? `Receipt ${receiptId(session)} · exact 10,000 authenticated held clients per lane; 30-second hold, 64 held-connection checks, direct-observer multiplexing, fairness, contracts, and cleanup are exact gates · ${roundFiveNotTested(session)} · One live run, not a benchmark.`
         : `Receipt ${receiptId(session)} · legacy scorecard decoded; current 10,000-client fan-in evidence was not recorded · One live run, not a benchmark.`,
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
-    lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+    lines.push('', `#Lakebase #PostgreSQL #${cloudOf(session)} #Databricks`)
     return lines.join('\n')
   }
   if (isRoundFour(session)) {
@@ -1771,17 +1818,17 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       `🔴 ${roundFourLaneLabel(session, 'lakebase')} · ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}`,
       awsLane
         ? `🔵 ${roundFourLaneLabel(session, 'competitor')} · ${competitorReceiptValue(session)}`
-        : `🔵 ${session.competitor.short_name} · AWS lane not installed · not timed`,
+        : `🔵 ${session.competitor.short_name} · ${cloudOf(session)} lane not installed · not timed`,
       '',
       `ROUND ${roundNumber} · ${session.round.title}`,
-      fairnessCopy(session.round.id),
+      fairnessCopy(session.round.id, false, session.competitor.id),
       `Integrity · ${evidence.primaryKey} · risk score ${scoreText(evidence.score)} · model ${evidence.modelVersion} · Delta ${evidence.deltaVersion} · nonce ${evidence.proofNonce}`,
       `Receipt ${receiptId(session)} · One live run, not a benchmark.`,
       '',
       "Don't trust this post. Ring the bell yourself.",
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
-    lines.push('', '#Lakebase #ReverseETL #PostgreSQL #AWS #Databricks')
+    lines.push('', `#Lakebase #ReverseETL #PostgreSQL #${cloudOf(session)} #Databricks`)
     return lines.join('\n')
   }
   if (isRoundSix(session)) {
@@ -1793,17 +1840,17 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
       `🔴 ${roundSixLaneLabel(session, 'lakebase')} · ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}`,
       awsLane
         ? `🔵 ${roundSixLaneLabel(session, 'competitor')} · ${competitorReceiptValue(session)}`
-        : `🔵 ${session.competitor.short_name} · AWS lane not installed · not timed`,
+        : `🔵 ${session.competitor.short_name} · ${cloudOf(session)} lane not installed · not timed`,
       '',
       `ROUND ${roundNumber} · ${session.round.title}`,
-      fairnessCopy(session.round.id),
+      fairnessCopy(session.round.id, false, session.competitor.id),
       `Integrity · order ${evidence.orderId} · ${evidence.totalDisplay} · nonce ${evidence.proofNonce} · separate checkout ${evidence.guardrailOrderId} committed`,
       `Receipt ${receiptId(session)} · No throughput or p99 claim · One live run, not a benchmark.`,
       '',
       "Don't trust this post. Ring the bell yourself.",
     ]
     if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
-    lines.push('', '#Lakebase #PostgreSQL #DeltaLake #AWS #Databricks')
+    lines.push('', `#Lakebase #PostgreSQL #DeltaLake #${cloudOf(session)} #Databricks`)
     return lines.join('\n')
   }
   const lines = [
@@ -1815,13 +1862,13 @@ export function linkedInReceipt(session: DemoSession, roundNumber: number): stri
     `🔴 Lakebase · ${laneReceiptTime(session.lanes.lakebase.elapsed_ms)}`,
     `🔵 ${session.competitor.short_name} · ${competitorReceiptValue(session)}`,
     '',
-    fairnessCopy(session.round.id, roundFiveUsesFanIn(session)),
+    fairnessCopy(session.round.id, roundFiveUsesFanIn(session), session.competitor.id),
     `Receipt ${receiptId(session)} · One live run, not a benchmark.`,
     '',
     "Don't trust this post. Ring the bell yourself.",
   ]
   if (demoUrl) lines.push(`Try the same round → ${demoUrl}`)
-  lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+  lines.push('', `#Lakebase #PostgreSQL #${cloudOf(session)} #Databricks`)
   return lines.join('\n')
 }
 
@@ -1853,7 +1900,7 @@ function idleReceiptVerdict(session: DemoSession): string {
   const lakebase = cooldown.lanes.lakebase.elapsed_ms
   const competitor = cooldown.lanes.competitor.elapsed_ms
   if (cooldown.lanes.competitor.state === 'not_supported') {
-    return 'LAKEBASE REACHED ZERO · RDS CANNOT'
+    return `LAKEBASE REACHED ZERO · ${byCompetitor(session.competitor.id, { aurora: 'RDS', rds: 'RDS', azure: 'AZURE POSTGRESQL' })} CANNOT`
   }
   if (lakebase === null || competitor === null) return 'NO IDLE RESULT DECLARED'
   const difference = compactDuration(Math.abs(lakebase - competitor))
@@ -1878,7 +1925,7 @@ function idleMeasuredAt(session: DemoSession): string {
 
 function idleFairnessCopy(session: DemoSession): string {
   return session.cooldown?.lanes.competitor.state === 'not_supported'
-    ? 'Same reset bell · Lakebase clock stopped only at confirmed zero · RDS capability verified'
+    ? `Same reset bell · Lakebase clock stopped only at confirmed zero · ${byCompetitor(session.competitor.id, { aurora: 'RDS', rds: 'RDS', azure: 'Azure PostgreSQL' })} capability verified`
     : 'Same reset bell · Independent control planes · Each clock stopped only at confirmed zero'
 }
 
@@ -1910,7 +1957,7 @@ function linkedInIdleReceipt(session: DemoSession): string {
   ]
   const demoUrl = publicDemoUrl()
   if (demoUrl) lines.push(`Try it → ${demoUrl}`)
-  lines.push('', '#Lakebase #PostgreSQL #AWS #Databricks')
+  lines.push('', `#Lakebase #PostgreSQL #${cloudOf(session)} #Databricks`)
   return lines.join('\n')
 }
 
@@ -2278,7 +2325,7 @@ function receiptPresentationBase(
       competitorCapabilityGap: classified.evidence.shape === 'capability_gap',
       verdictLabel: 'TOWEL RESULT · THIS ROUND',
       verdict: classified.headline,
-      fairness: fairnessCopy(session.round.id, roundFiveUsesFanIn(session)),
+      fairness: fairnessCopy(session.round.id, roundFiveUsesFanIn(session), session.competitor.id),
       measuredAt: session.towel.requested_at,
       verifiedStamp: 'TOWELED LIVE',
       receiptLabel: 'BOUT RECEIPT',
@@ -2333,7 +2380,7 @@ function receiptPresentationBase(
       ? 'RESULT DECLARED · THIS ROUND'
       : 'NO RESULT DECLARED · THIS ROUND',
     verdict: classified.headline,
-    fairness: fairnessCopy(session.round.id, roundFiveUsesFanIn(session)),
+    fairness: fairnessCopy(session.round.id, roundFiveUsesFanIn(session), session.competitor.id),
     measuredAt: measuredAt(session),
     verifiedStamp: classified.contractComplete ? 'VERIFIED LIVE' : 'NOT DECLARED',
     receiptLabel: 'BOUT RECEIPT',
@@ -2699,7 +2746,7 @@ export async function renderReceiptCard(
   drawLane(
     614, '#4a83e8', receiptCardLaneName(session, receipt, 'competitor'), receipt.competitorValue,
     receipt.competitorStatus,
-    session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS',
+    fighterLabel(session.competitor.id),
     winner === 'competitor' || winner === 'tie',
     receipt.competitorCapabilityGap,
   )
@@ -2816,7 +2863,7 @@ function drawKnockoutReceipt(
   drawPixelFighter(context, 70, 150, '#e8482e', 'LB', 2)
   drawPixelFighter(
     context, 970, 150, '#4a83e8',
-    session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS', 2,
+    fighterLabel(session.competitor.id), 2,
   )
 
   // The hero: 180px for a short ratio, stepped down for a longer label, never
@@ -2974,7 +3021,7 @@ function drawHealthBarReceipt(
     const status = (home ? receipt.lakebaseStatus : receipt.competitorStatus).toUpperCase()
     drawPixelFighter(
       context, 58, trackY - 20, color,
-      home ? 'LB' : session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS',
+      home ? 'LB' : fighterLabel(session.competitor.id),
     )
     drawFittedCanvasText(context, receiptCardLaneName(session, receipt, lane), {
       x: trackX, y: trackY - 20, maxWidth: trackWidth, maxLines: 1, startSize: 13, minSize: 9, color,
@@ -3133,14 +3180,13 @@ function drawHalloweenFrame(context: CanvasRenderingContext2D, height: number) {
 
 /** The round's number (or IDLE) and its Halloween name, and the opponent's colours. */
 function halloweenRound(session: DemoSession, roundNumber: number, kind: ReceiptKind) {
-  const aurora = session.competitor.id === 'aurora_serverless_v2'
   return {
     label: kind === 'idle' ? 'IDLE' : `ROUND ${String(roundNumber).padStart(2, '0')}`,
     name: (kind === 'idle'
       ? HALLOWEEN_IDLE_NAME
       : HALLOWEEN_ROUND_NAMES[roundNumber] ?? HALLOWEEN_ROUND_NAMES[1]).toUpperCase(),
-    opponentTag: aurora ? 'AUR' : 'RDS',
-    opponentColor: aurora ? HALLOWEEN.aurora : HALLOWEEN.rds,
+    opponentTag: fighterLabel(session.competitor.id),
+    opponentColor: HALLOWEEN[competitorKind(session.competitor.id)],
   }
 }
 
@@ -3547,7 +3593,8 @@ function finaleLatestProof(session: DemoSession): string {
   return verdict ? `${clocks.join(' · ')} · ${verdict}` : clocks.join(' · ')
 }
 
-function finaleCaption(session: DemoSession): string {
+// eslint-disable-next-line react-refresh/only-export-components
+export function finaleCaption(session: DemoSession): string {
   return [
     'Six proof contracts. One full data loop.',
     '',
@@ -3556,9 +3603,17 @@ function finaleCaption(session: DemoSession): string {
     '03 · Recover exactly → deleted row restored, source deletion preserved',
     '04 · Analytics Delta → verified live application row',
     '05 · Both pooled paths → exactly 10,000 held clients per lane, 30s hold, held-connection checks, multiplexing',
-    '06 · Live checkout → exact Delta read, Lakebase’s built-in change feed against AWS DMS + Glue',
+    byCompetitor(session.competitor.id, {
+      aurora: '06 · Live checkout → exact Delta read, Lakebase’s built-in change feed against AWS DMS + Glue',
+      rds: '06 · Live checkout → exact Delta read, Lakebase’s built-in change feed against AWS DMS + Glue',
+      azure: '06 · Live checkout → exact Delta read, Lakebase’s built-in change feed against an Azure Data Factory data flow',
+    }),
     '',
-    'Round 4 races an AWS Glue job, with both integrations cold at the bell. Round 6 races AWS DMS and Glue, cold at the bell, against Lakebase’s built-in change feed, which is always on. Round 5 scores one server bell to exactly 10,000 held clients per lane. Direct AWS connections, existing pools, transaction throughput, and storm resilience were not tested.',
+    byCompetitor(session.competitor.id, {
+      aurora: 'Round 4 races an AWS Glue job, with both integrations cold at the bell. Round 6 races AWS DMS and Glue, cold at the bell, against Lakebase’s built-in change feed, which is always on. Round 5 scores one server bell to exactly 10,000 held clients per lane. Direct AWS connections, existing pools, transaction throughput, and storm resilience were not tested.',
+      rds: 'Round 4 races an AWS Glue job, with both integrations cold at the bell. Round 6 races AWS DMS and Glue, cold at the bell, against Lakebase’s built-in change feed, which is always on. Round 5 scores one server bell to exactly 10,000 held clients per lane. Direct AWS connections, existing pools, transaction throughput, and storm resilience were not tested.',
+      azure: 'Round 4 races an Azure Data Factory data flow, with both integrations cold at the bell. Round 6 races a Data Factory data flow, cold at the bell, against Lakebase’s built-in change feed, which is always on. Round 5 scores one server bell to exactly 10,000 held clients per lane. Direct Azure connections, existing pools, transaction throughput, and storm resilience were not tested.',
+    }),
     '',
     `Latest live proof, Round 6: ${finaleLatestProof(session)}.`,
     'Each result is one observed run, not a benchmark. Ring the bell yourself. 🥊',
@@ -3607,7 +3662,9 @@ export function finaleLaneBars(result: RoundResult | null): FinaleLaneBars {
     case 'uncontested':
       return {
         lakebase: lb === null ? empty('UNCONTESTED') : { share: 1, label: summaryDuration(lb) },
-        opponent: empty(racesAwsLane(result.roundId) ? 'AWS LANE NOT INSTALLED' : 'NO NATIVE PATH'),
+        opponent: empty(racesAwsLane(result.roundId)
+          ? `${result.opponentId === 'azure_postgres' ? 'AZURE' : 'AWS'} LANE NOT INSTALLED`
+          : 'NO NATIVE PATH'),
       }
     case 'no_result':
       // Toweled with neither lane declared. Each clock that ran shows where it
@@ -4379,6 +4436,13 @@ function App() {
         .then((response) => {
           if (!active) return
           setCatalog(withBundledPortraits(response))
+          // An installation offers its own cloud's competitors only. A remembered choice it
+          // doesn't offer (an Aurora pick, on an Azure installation) becomes the first it does.
+          setCompetitor((current) => (
+            response.competitors.some((item) => item.id === current)
+              ? current
+              : response.competitors[0]?.id ?? current
+          ))
           setApiStatus('online')
           schedule(30000)
         })
@@ -4772,7 +4836,7 @@ function App() {
       }
       if (transition !== transitionRef.current) return
       if (!roundCanStart(selectionRingStatus)) {
-        setError(roundBoardMessage(selectionRoundId, selectionRingStatus))
+        setError(roundBoardMessage(selectionRoundId, selectionRingStatus, selection.competitor))
         return
       }
     }
@@ -4864,7 +4928,11 @@ function App() {
         try {
           const result = await refreshBoutBoard()
           if (!stillCurrent()) return
-          setError(roundBoardMessage(selectionRoundId, result.board.rounds[selectionRoundId]))
+          setError(roundBoardMessage(
+            selectionRoundId,
+            result.board.rounds[selectionRoundId],
+            selection.competitor,
+          ))
         } catch {
           if (!stillCurrent()) return
           setError(
@@ -5331,6 +5399,7 @@ function App() {
       <Matchup
         competitor={opponentLabel(
           session?.round.id ?? selectedRoundId,
+          session?.competitor.id ?? selectedCompetitor.id,
           session?.competitor.short_name ?? selectedCompetitor.short_name,
         )}
         personas={activePersonas}
@@ -5349,7 +5418,7 @@ function App() {
   if (stage === 'ready' && session) {
     return (
       <Ready
-        competitor={opponentLabel(session.round.id, session.competitor.short_name)}
+        competitor={opponentLabel(session.round.id, session.competitor.id, session.competitor.short_name)}
         roundTitle={isRoundFive(session) ? ROUND_FIVE_DISPLAY_TITLE : session.round.title}
         competitorLaneState={session.lanes.competitor.state}
         sessionState={session.state}
@@ -5629,21 +5698,25 @@ function Setup(props: {
     || selectedRoundState === 'unavailable'
   const selectedWhy = selectedRoundState === 'cleanup_in_progress'
     ? {
-        headline: roundBoardMessage(selectedRound.id, props.ringStatus),
+        headline: roundBoardMessage(selectedRound.id, props.ringStatus, props.competitor),
         detail: null,
       }
     : (selectedRoundState === 'temporarily_unavailable'
       || selectedRoundState === 'unavailable') && props.ringStatus?.detail
-      ? { headline: roundBoardMessage(selectedRound.id, props.ringStatus), detail: null }
+      ? {
+          headline: roundBoardMessage(selectedRound.id, props.ringStatus, props.competitor),
+          detail: null,
+        }
     : selectedRoundWhy(selectedRound, props.recommendation)
-  const selectedCompetitor = props.catalog.competitors.find((item) => item.id === props.competitor)!
+  const selectedCompetitor = props.catalog.competitors.find((item) => item.id === props.competitor)
+    ?? props.catalog.competitors[0]
   const selectedOpponent = fightCardOpponentLabel(selectedRound.id, props.competitor, selectedCompetitor.short_name)
   const primaryPersona = props.catalog.personas.find((persona) => persona.id === props.primary)!
   const secondaryPersonas = props.secondary.map((id) => props.catalog.personas.find((persona) => persona.id === id)!).filter(Boolean)
   const selectedOpening = selectedRound.id === recommendedRound.id
     ? props.recommendation.presenter_opening
     : selectedRound.id === ROUND_FIVE_ID
-      ? roundFiveFightCardOpening(primaryPersona.id)
+      ? roundFiveFightCardOpening(primaryPersona.id, props.competitor)
       : `This round: ${selectedRound.title}. Read it through the ${primaryPersona.role} lens; stop only when the application verifies the outcome.`
   const sceneNumber = { opponent: 1, lead: 2, lenses: 3, card: 4 }[props.scene]
   const sceneLabel = { opponent: 'Choose opponent', lead: 'Lead voice', lenses: 'Supporting lenses', card: 'Fight card' }[props.scene]
@@ -5657,6 +5730,7 @@ function Setup(props: {
     round: selectedRound,
     rounds: props.catalog.rounds,
     roundState: selectedRoundState,
+    competitor: props.competitor,
   })
   const canPrepare = refusal === null
 
@@ -5695,7 +5769,7 @@ function Setup(props: {
                   )}
                 >
                   <span className="select-cursor" aria-hidden="true">▶</span>
-                  <DatabaseFighter label={item.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS'} corner="blue" />
+                  <DatabaseFighter label={fighterLabel(item.id)} corner="blue" />
                   <strong>{item.short_name}</strong>
                   <small>{competitorEpithet[item.id].epithet}</small>
                   {competitorEpithet[item.id].tagline && <em>{competitorEpithet[item.id].tagline}</em>}
@@ -6026,7 +6100,7 @@ function Matchup({
       <div className="matchup-lockup">
         <div className="matchup-corner"><DatabaseFighter label="LB" corner="red" /><strong>LAKEBASE</strong><span>Red corner</span></div>
         <b>VS</b>
-        <div className="matchup-corner"><DatabaseFighter label={competitor.toLowerCase().includes('aurora') ? 'AUR' : 'RDS'} corner="blue" /><strong>{competitor.toUpperCase()}</strong><span>Blue corner</span></div>
+        <div className="matchup-corner"><DatabaseFighter label={fighterLabelForName(competitor)} corner="blue" /><strong>{competitor.toUpperCase()}</strong><span>Blue corner</span></div>
       </div>
       <div className="ringside-strip">
         <p>At ringside</p>
@@ -6289,7 +6363,7 @@ function RoundFiveRuntimeBurstCard({
     ?? session.lanes[laneId].name
   return (
     <section className="round5-lane" data-corner={corner} aria-label={`${name} live fan-in evidence`}>
-      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : roundFivePhaseLabel(lane.phase)}</span></header>
+      <header><strong>{name}</strong><span>{lane.phase === 'verified' ? '10K GATE + HOLD ✓' : roundFivePhaseLabel(lane.phase, session.competitor.id)}</span></header>
       <dl>
         <div><dt>Initiated</dt><dd>{lane.clients_initiated.toLocaleString('en-US')} / 10,000 clients</dd></div>
         <div><dt>Authenticated</dt><dd>{lane.clients_authenticated.toLocaleString('en-US')} / 10,000 clients</dd></div>
@@ -6382,8 +6456,13 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
       <div className="round5-explain-components" aria-label="Managed component disclosure">
         <strong>COMPONENT DISCLOSURE</strong>
         <p>Lakebase · included pooled endpoint · 0 extra per-bout pooling components · 0 per-bout pooling infrastructure changes.</p>
-        <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
-        <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+        {competitorKind(session.competitor.id) === 'azure' ? <>
+          <p>{awsEngineName} · selected Azure pooling path · this bout switched on the server’s built-in PgBouncer and raised its client limit to 10,100.</p>
+          <p>Direct connections, a self-managed PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+        </> : <>
+          <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
+          <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+        </>}
       </div>
     </section>
   )
@@ -6546,9 +6625,12 @@ function roundFiveTimerCaption(verification: RoundFiveLaneVerification): string 
 function RoundFiveHoldChecks({
   verification,
   awaitingOtherLane,
+  serverResetNote = '',
 }: {
   verification: RoundFiveLaneVerification
   awaitingOtherLane: boolean
+  /** `roundFiveServerResetNote`: said under a verified lane whose server reset a held client. */
+  serverResetNote?: string
 }) {
   const { phase, reachedTenK, heldConnectionChecksDone: done, heldConnectionChecksTotal: total } = verification
   const waiting = phase === 'ramping' || ((phase === 'failed' || phase === 'towelled') && !reachedTenK)
@@ -6566,6 +6648,9 @@ function RoundFiveHoldChecks({
         awaitingOtherLane
           ? <p className="lane-hold-checks-line">This lane verified · waiting for the other</p>
           : <p className="lane-hold-checks-line">This lane verified</p>
+      )}
+      {phase === 'verified' && serverResetNote && (
+        <p className="lane-hold-checks-line" data-server-reset="true">{serverResetNote}</p>
       )}
       {phase === 'failed' && (
         reachedTenK
@@ -6770,7 +6855,13 @@ export function RoundFiveProof({
               timerCaption={lakebaseVerification ? roundFiveTimerCaption(lakebaseVerification) : undefined}
               preserveTimerOnFailure={lakebaseVerification?.reachedTenK ?? false}
               holdChecks={lakebaseVerification
-                ? <RoundFiveHoldChecks verification={lakebaseVerification} awaitingOtherLane={lakebaseAwaitingOther} />
+                ? (
+                    <RoundFiveHoldChecks
+                      verification={lakebaseVerification}
+                      awaitingOtherLane={lakebaseAwaitingOther}
+                      serverResetNote={roundFiveServerResetNote(session.lanes.lakebase)}
+                    />
+                  )
                 : undefined}
               censoredMs={towelled ? roundFiveCensoredLowerBoundMilliseconds(session, 'lakebase') ?? undefined : undefined}
               notTimed={towelled
@@ -6786,7 +6877,7 @@ export function RoundFiveProof({
             <Lane
               lane={competitorSetupLane}
               fallbackLabel={session.competitor.short_name}
-              fighterLabel={session.competitor.short_name.toLowerCase().includes('aurora') ? 'AUR' : 'RDS'}
+              fighterLabel={fighterLabel(session.competitor.id)}
               corner="blue"
               sessionState={session.state}
               liveEvidenceConnected={liveEvidenceConnected}
@@ -6797,7 +6888,13 @@ export function RoundFiveProof({
               timerCaption={competitorVerification ? roundFiveTimerCaption(competitorVerification) : undefined}
               preserveTimerOnFailure={competitorVerification?.reachedTenK ?? false}
               holdChecks={competitorVerification
-                ? <RoundFiveHoldChecks verification={competitorVerification} awaitingOtherLane={competitorAwaitingOther} />
+                ? (
+                    <RoundFiveHoldChecks
+                      verification={competitorVerification}
+                      awaitingOtherLane={competitorAwaitingOther}
+                      serverResetNote={roundFiveServerResetNote(session.lanes.competitor)}
+                    />
+                  )
                 : undefined}
               censoredMs={towelled ? roundFiveCensoredLowerBoundMilliseconds(session, 'competitor') ?? undefined : undefined}
               notTimed={towelled
@@ -7022,7 +7119,7 @@ export function RoundFiveProof({
         <header className="round5-header">
           <HomeLogo className="home-logo-compact" onHome={onHome} />
           <div>
-            <p>Round {roundNumber} · Built-in pool · Added RDS Proxy</p>
+            <p>Round {roundNumber} · Built-in pool · {competitorKind(session.competitor.id) === 'azure' ? 'Switched-on PgBouncer' : 'Added RDS Proxy'}</p>
             <h1>{ROUND_FIVE_DISPLAY_TITLE}</h1>
             <p className="round5-matchup"><strong>Lakebase</strong><span>vs</span><strong>{session.lanes.competitor.name}</strong></p>
           </div>
@@ -7043,7 +7140,9 @@ export function RoundFiveProof({
                   <div><dt>{awsEngineName} setup</dt><dd>{setupStateLabel(setupResults.competitor)} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
                   <div><dt>Workflow launch skew</dt><dd>{setupSkew}</dd></div>
                 </dl>
-                <p>Lakebase uses its included pooled endpoint. The selected AWS managed pooling path adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are sealed before the clock.</p>
+                <p>{competitorKind(session.competitor.id) === 'azure'
+                  ? 'Lakebase uses its included pooled endpoint. The selected Azure path switches on the server’s built-in PgBouncer and raises its client limit; the client credential is sealed before the clock.'
+                  : 'Lakebase uses its included pooled endpoint. The selected AWS managed pooling path adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are sealed before the clock.'}</p>
               </details>
               <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
               {!uiReview && (terminal || showCleanupFallback) && (
@@ -7149,12 +7248,20 @@ function Proof({
   const roundFour = isRoundFour(session)
   const roundSix = isRoundSix(session)
   const racesAwsLane = roundFour || roundSix
-  const capabilityCopy = racesAwsLane
+  const capabilityCopy: { title: string, detail: string } | undefined = racesAwsLane
     ? {
-        title: `Lakebase measured live · Round ${roundFour ? '4' : '6'}’s AWS lane is not installed here`,
-        detail: 'Only Lakebase ran, so there is no AWS clock and no margin',
+        title: `Lakebase measured live · Round ${roundFour ? '4' : '6'}’s ${cloudOf(session)} lane is not installed here`,
+        detail: `Only Lakebase ran, so there is no ${cloudOf(session)} clock and no margin`,
       }
-    : undefined
+    // Round 1's note: RDS's words are the note's own defaults.
+    : byCompetitor<{ title: string, detail: string } | undefined>(session.competitor.id, {
+        aurora: undefined,
+        rds: undefined,
+        azure: {
+          title: 'Lakebase measured live · Azure PostgreSQL capability checked before the bell',
+          detail: 'Azure PostgreSQL has no automatic scale-to-zero wake, so there is no Azure PostgreSQL timer',
+        },
+      })
   const stack = (laneId: LaneId) => roundFour
     ? roundFourLaneLabel(session, laneId)
     : roundSix
@@ -7193,7 +7300,7 @@ function Proof({
         <Lane
           lane={session.lanes.competitor}
           fallbackLabel={competitor}
-          fighterLabel={competitor.toLowerCase().includes('aurora') ? 'AUR' : 'RDS'}
+          fighterLabel={fighterLabelForName(competitor)}
           corner="blue"
           sessionState={session.state}
           liveEvidenceConnected={liveEvidenceConnected}
@@ -7216,7 +7323,7 @@ function Proof({
         ) : capabilityGap ? (
           <CapabilityNote {...capabilityCopy} />
         ) : (
-          <div className="fairness"><span aria-hidden="true">◆</span>{fairnessCopy(session.round.id, roundFiveUsesFanIn(session))}<span aria-hidden="true">◆</span></div>
+          <div className="fairness"><span aria-hidden="true">◆</span>{fairnessCopy(session.round.id, roundFiveUsesFanIn(session), session.competitor.id)}<span aria-hidden="true">◆</span></div>
         )}
         {!uiReview && complete && capabilityGap && <CapabilityNote compact {...capabilityCopy} />}
         {/* A towel posts the terminal result immediately while auxiliary
@@ -7229,7 +7336,7 @@ function Proof({
             onExplain={cleanupAllowsActions ? undefined : () => setShowRingsideTake(true)}
           />
         )}
-        {!uiReview && complete && session.remembered_result && !capabilityGap && <p className="final-fairness">{fairnessCopy(session.round.id, roundFiveUsesFanIn(session))}</p>}
+        {!uiReview && complete && session.remembered_result && !capabilityGap && <p className="final-fairness">{fairnessCopy(session.round.id, roundFiveUsesFanIn(session), session.competitor.id)}</p>}
         <TowelControl
           session={session}
           uiReview={uiReview}
@@ -7405,33 +7512,41 @@ interface ReplayStep {
 function replaySteps(session: DemoSession): ReplayStep[] {
   if (session.round.id === 'wake_idle_app') {
     const competitorStart = session.lanes.competitor.state === 'not_supported'
-      ? 'RDS capability checked: no automatic scale-to-zero or connection-triggered wake; no timer invented.'
+      ? `${byCompetitor(session.competitor.id, { aurora: 'RDS', rds: 'RDS', azure: 'Azure PostgreSQL' })} capability checked: no automatic scale-to-zero or connection-triggered wake; no timer invented.`
       : 'Both control planes proved genuine scale zero before the bell.'
-    const competitorStartCalls: ReplayCall[] = session.competitor.id === 'aurora_serverless_v2'
-      ? [
-          { label: 'AWS topology', code: 'RDS.DescribeDBClusters(DBClusterIdentifier=<cluster>)' },
-          { label: 'Writer check', code: 'RDS.DescribeDBInstances(DBInstanceIdentifier=<writer>)' },
-          { label: 'Primary pause proof', code: 'RDS.DescribeEvents(SourceIdentifier=<cluster>, EventCategories=["serverless"])', note: 'Requires the exact “Successfully paused” writer event.' },
-          { label: 'Fallback only', code: 'CloudWatch.GetMetricStatistics(MetricName="ServerlessDatabaseCapacity")', note: 'Used only when no qualifying pause event is available.' },
-        ]
-      : [
-          { label: 'AWS capability check', code: 'RDS.DescribeDBInstances(DBInstanceIdentifier=<instance>)' },
-          { label: 'No call by design', code: 'No PostgreSQL connection; no RDS timer started.', note: 'RDS PostgreSQL has no automatic scale-to-zero plus connection-triggered wake path.' },
-        ]
-    const competitorConnectCalls: ReplayCall[] = session.competitor.id === 'aurora_serverless_v2'
-      ? [
-          { label: 'Credential lookup', code: 'SecretsManager.GetSecretValue(SecretId=<aurora-secret>)' },
-          { label: 'PostgreSQL wire—not a cloud API', code: 'TLS connect → <aurora-writer>:5432' },
-        ]
-      : [{ label: 'No call by design', code: 'RDS lane is not eligible, so no connection or clock is started.' }]
+    const competitorStartCalls: ReplayCall[] = byCompetitor(session.competitor.id, {
+      aurora: [
+        { label: 'AWS topology', code: 'RDS.DescribeDBClusters(DBClusterIdentifier=<cluster>)' },
+        { label: 'Writer check', code: 'RDS.DescribeDBInstances(DBInstanceIdentifier=<writer>)' },
+        { label: 'Primary pause proof', code: 'RDS.DescribeEvents(SourceIdentifier=<cluster>, EventCategories=["serverless"])', note: 'Requires the exact “Successfully paused” writer event.' },
+        { label: 'Fallback only', code: 'CloudWatch.GetMetricStatistics(MetricName="ServerlessDatabaseCapacity")', note: 'Used only when no qualifying pause event is available.' },
+      ],
+      rds: [
+        { label: 'AWS capability check', code: 'RDS.DescribeDBInstances(DBInstanceIdentifier=<instance>)' },
+        { label: 'No call by design', code: 'No PostgreSQL connection; no RDS timer started.', note: 'RDS PostgreSQL has no automatic scale-to-zero plus connection-triggered wake path.' },
+      ],
+      azure: [
+        { label: 'No call by design', code: 'No PostgreSQL connection; no Azure PostgreSQL timer started.', note: 'Azure Database for PostgreSQL has no automatic scale-to-zero plus connection-triggered wake path.' },
+      ],
+    })
+    const competitorConnectCalls: ReplayCall[] = byCompetitor(session.competitor.id, {
+      aurora: [
+        { label: 'Credential lookup', code: 'SecretsManager.GetSecretValue(SecretId=<aurora-secret>)' },
+        { label: 'PostgreSQL wire—not a cloud API', code: 'TLS connect → <aurora-writer>:5432' },
+      ],
+      rds: [{ label: 'No call by design', code: 'RDS lane is not eligible, so no connection or clock is started.' }],
+      azure: [{ label: 'No call by design', code: 'Azure PostgreSQL lane is not eligible, so no connection or clock is started.' }],
+    })
     const probeTransaction: ReplayCall[] = [
       { label: 'PostgreSQL wire—not a cloud API', code: 'INSERT INTO public.anti_demo_probe (probe_id, expected_value, created_at) VALUES (<nonce>, <value>, clock_timestamp())' },
       { label: 'PostgreSQL wire—not a cloud API', code: 'COMMIT' },
       { label: 'PostgreSQL wire—not a cloud API', code: 'SELECT expected_value FROM public.anti_demo_probe WHERE probe_id = <nonce>', note: 'The returned value must match the unique value generated for this run.' },
     ]
-    const competitorProbe = session.competitor.id === 'aurora_serverless_v2'
-      ? probeTransaction
-      : [{ label: 'No call by design', code: 'RDS lane remains NOT TIMED.' }]
+    const competitorProbe = byCompetitor(session.competitor.id, {
+      aurora: probeTransaction,
+      rds: [{ label: 'No call by design', code: 'RDS lane remains NOT TIMED.' }],
+      azure: [{ label: 'No call by design', code: 'Azure PostgreSQL lane remains NOT TIMED.' }],
+    })
     return [
       {
         summary: competitorStart,
@@ -7466,30 +7581,40 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Final receipt event', code: 'event: run_finished · state=verified' },
         ],
         lakebase: [{ label: 'Stop rule', code: 'Freeze Lakebase clock only after matching SELECT read-back.' }],
-        competitor: session.competitor.id === 'aurora_serverless_v2'
-          ? [{ label: 'Stop rule', code: 'Freeze Aurora clock only after matching SELECT read-back.' }]
-          : [{ label: 'Stop rule', code: 'No RDS clock exists for this capability gap.' }],
+        competitor: byCompetitor(session.competitor.id, {
+          aurora: [{ label: 'Stop rule', code: 'Freeze Aurora clock only after matching SELECT read-back.' }],
+          rds: [{ label: 'Stop rule', code: 'No RDS clock exists for this capability gap.' }],
+          azure: [{ label: 'Stop rule', code: 'No Azure PostgreSQL clock exists for this capability gap.' }],
+        }),
       },
     ]
   }
   if (session.round.id === 'make_schema_change_safely') {
-    const competitorCopy = session.competitor.id === 'aurora_serverless_v2'
-      ? 'Aurora used a point-in-time copy-on-write clone and a new writer.'
-      : 'RDS used a point-in-time restored instance.'
+    const competitorCopy = byCompetitor(session.competitor.id, {
+      aurora: 'Aurora used a point-in-time copy-on-write clone and a new writer.',
+      rds: 'RDS used a point-in-time restored instance.',
+      azure: 'Azure PostgreSQL used a point-in-time restored server.',
+    })
     const sourceChecks: ReplayCall[] = [
       { label: 'PostgreSQL wire—not a cloud API', code: 'SELECT customer_email, total_cents, status FROM public.orders WHERE order_id = <baseline-order>' },
       { label: 'PostgreSQL wire—not a cloud API', code: 'SELECT data_type, is_nullable FROM information_schema.columns WHERE table_name = \'orders\' AND column_name = \'delivery_instructions\'' },
     ]
-    const competitorCreate: ReplayCall[] = session.competitor.id === 'aurora_serverless_v2'
-      ? [
-          { label: 'AWS control plane', code: 'RDS.RestoreDBClusterToPointInTime(RestoreType="copy-on-write", UseLatestRestorableTime=true)' },
-          { label: 'AWS control plane', code: 'RDS.CreateDBInstance(DBInstanceClass="db.serverless", Engine="aurora-postgresql")' },
-          { label: 'Readiness polling', code: 'RDS.DescribeDBClusters(<clone>) + RDS.DescribeDBInstances(<writer>)' },
-        ]
-      : [
-          { label: 'AWS control plane', code: 'RDS.RestoreDBInstanceToPointInTime(UseLatestRestorableTime=true)' },
-          { label: 'Readiness polling', code: 'RDS.DescribeDBInstances(DBInstanceIdentifier=<restored-instance>)' },
-        ]
+    const competitorCreate: ReplayCall[] = byCompetitor(session.competitor.id, {
+      aurora: [
+        { label: 'AWS control plane', code: 'RDS.RestoreDBClusterToPointInTime(RestoreType="copy-on-write", UseLatestRestorableTime=true)' },
+        { label: 'AWS control plane', code: 'RDS.CreateDBInstance(DBInstanceClass="db.serverless", Engine="aurora-postgresql")' },
+        { label: 'Readiness polling', code: 'RDS.DescribeDBClusters(<clone>) + RDS.DescribeDBInstances(<writer>)' },
+      ],
+      rds: [
+        { label: 'AWS control plane', code: 'RDS.RestoreDBInstanceToPointInTime(UseLatestRestorableTime=true)' },
+        { label: 'Readiness polling', code: 'RDS.DescribeDBInstances(DBInstanceIdentifier=<restored-instance>)' },
+      ],
+      azure: [
+        { label: 'Azure control plane', code: 'PUT flexibleServers/<copy> {createMode: "PointInTimeRestore", sourceServerResourceId: <source>, pointInTimeUTC: <now>}' },
+        { label: 'Readiness polling', code: 'GET <Azure-AsyncOperation> until Succeeded' },
+        { label: 'Azure control plane', code: 'PUT flexibleServers/<copy>/firewallRules/<rule>, one rule at a time', note: 'A restored server keeps none of its source’s firewall rules.' },
+      ],
+    })
     const migration: ReplayCall[] = [
       { label: 'PostgreSQL wire—not a cloud API', code: 'ALTER TABLE public.orders ADD COLUMN delivery_instructions TEXT' },
       { label: 'PostgreSQL wire—not a cloud API', code: 'COMMIT' },
@@ -7540,16 +7665,27 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     ]
   }
   if (session.round.id === 'recover_deleted_order') {
-    const competitorRestore: ReplayCall[] = session.competitor.id === 'aurora_serverless_v2'
-      ? [
-          { label: 'Recovery request', code: 'RDS.RestoreDBClusterToPointInTime(RestoreToTime=<recovery_at>)  // full-copy default' },
-          { label: 'Writer request', code: 'RDS.CreateDBInstance(DBClusterIdentifier=<recovery-cluster>, DBInstanceClass="db.serverless")' },
-          { label: 'Recovery readiness', code: 'RDS.DescribeDBClusters + RDS.DescribeDBInstances' },
-        ]
-      : [
-          { label: 'Recovery request', code: 'RDS.RestoreDBInstanceToPointInTime(RestoreToTime=<recovery_at>)' },
-          { label: 'Recovery readiness', code: 'RDS.DescribeDBInstances' },
-        ]
+    const competitorRestore: ReplayCall[] = byCompetitor(session.competitor.id, {
+      aurora: [
+        { label: 'Recovery request', code: 'RDS.RestoreDBClusterToPointInTime(RestoreToTime=<recovery_at>)  // full-copy default' },
+        { label: 'Writer request', code: 'RDS.CreateDBInstance(DBClusterIdentifier=<recovery-cluster>, DBInstanceClass="db.serverless")' },
+        { label: 'Recovery readiness', code: 'RDS.DescribeDBClusters + RDS.DescribeDBInstances' },
+      ],
+      rds: [
+        { label: 'Recovery request', code: 'RDS.RestoreDBInstanceToPointInTime(RestoreToTime=<recovery_at>)' },
+        { label: 'Recovery readiness', code: 'RDS.DescribeDBInstances' },
+      ],
+      azure: [
+        { label: 'Recovery request', code: 'PUT flexibleServers/<recovery> {createMode: "PointInTimeRestore", pointInTimeUTC: <recovery_at>}' },
+        { label: 'Recovery readiness', code: 'GET <Azure-AsyncOperation> until Succeeded' },
+        { label: 'Recovery firewall', code: 'PUT flexibleServers/<recovery>/firewallRules/<rule>, one rule at a time' },
+      ],
+    })
+    const competitorEligibility: ReplayCall = byCompetitor(session.competitor.id, {
+      aurora: { label: 'Recovery eligibility', code: 'RDS.DescribeDBClusters / RDS.DescribeDBInstances until recovery_at is restorable' },
+      rds: { label: 'Recovery eligibility', code: 'RDS.DescribeDBClusters / RDS.DescribeDBInstances until recovery_at is restorable' },
+      azure: { label: 'Recovery eligibility', code: 'No call: Azure waits for its own log inside the restore', note: 'Azure exposes no latest restorable time to wait on first.' },
+    })
     const exactRead: ReplayCall[] = [
       { label: 'Recovered TLS session', code: 'PostgreSQL TLS connect → <recovery-endpoint>:5432' },
       { label: 'Recovered order', code: 'SELECT customer_email, total_cents, status, created_at FROM public.orders WHERE order_id=<owned-order>' },
@@ -7577,10 +7713,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Recovery branch', code: 'databricks postgres create-branch <project> <recovery-branch> --json {spec.source_branch_time:<recovery_at>}' },
           { label: 'Recovery endpoint', code: 'databricks postgres create-endpoint <recovery-branch> <endpoint>' },
         ],
-        competitor: [
-          { label: 'Recovery eligibility', code: 'RDS.DescribeDBClusters / RDS.DescribeDBInstances until recovery_at is restorable' },
-          ...competitorRestore,
-        ],
+        competitor: [competitorEligibility, ...competitorRestore],
       },
       {
         summary: 'Each clock stopped only after the recovered exact row matched and a fresh source session still proved it absent.',
@@ -7627,6 +7760,10 @@ function replaySteps(session: DemoSession): ReplayStep[] {
       [result.connectP50Ms, result.connectP95Ms, result.connectP99Ms]
         .map((value) => value === null ? 'N/A' : `${value.toFixed(2)} ms`)
         .join(' / ')
+    // The Azure edition's lane: its built-in PgBouncer, switched on at the bell, on the
+    // server's own host (6432), from two Standard_D8ls_v7 runners.
+    const azureFive = competitorKind(session.competitor.id) === 'azure'
+    const runnerShape = azureFive ? 'Standard_D8ls_v7' : 'c7i.2xlarge'
     const burstContract: ReplayCall[] = legacy
       ? [
           { label: 'Legacy scorecard', code: 'Decoded successfully · current 10,000-client fan-in evidence not recorded', note: 'No current fan-in result is inferred from legacy fields.' },
@@ -7641,25 +7778,36 @@ function replaySteps(session: DemoSession): ReplayStep[] {
       {
         summary: legacy
           ? 'This stored scorecard predates the current 10,000-client fan-in contract. Its compatible fields decoded without being presented as current fan-in evidence.'
-          : 'Automatic warming measured one sealed c7i.2xlarge per physical 10,000-client lane before the bell.',
+          : `Automatic warming measured one sealed ${runnerShape} per physical 10,000-client lane before the bell.`,
         shared: [
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
-          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: `Evidence validity (Proxy absent before the bell, CreateDBProxy the first timed post-bell AWS mutation, shared T0, exact 10,000 client connections) is what verifies a bout. Scheduling quality — launches within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other, CreateDBProxy within 100 ms of the bell — is advisory only; a miss is charged to that lane's own clock and never voids an exact result.` },
+          { label: v4 ? 'Bell gate' : 'Setup start barrier', code: v4 ? 'durable bell transaction → one server T0 → release both lane tasks' : 'time.monotonic_ns() → release both setup workflows', note: azureFive
+            ? `Evidence validity (PgBouncer off before the bell, its switch the first timed post-bell Azure mutation, shared T0, exact 10,000 client connections) is what verifies a bout. Scheduling quality — launches within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other, the switch within 100 ms of the bell — is advisory only; a miss is charged to that lane's own clock and never voids an exact result.`
+            : `Evidence validity (Proxy absent before the bell, CreateDBProxy the first timed post-bell AWS mutation, shared T0, exact 10,000 client connections) is what verifies a bout. Scheduling quality — launches within ${ROUND_FIVE_SETUP_MAX_LAUNCH_SKEW_MS} ms of each other, CreateDBProxy within 100 ms of the bell — is advisory only; a miss is charged to that lane's own clock and never voids an exact result.` },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
-          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? 'One sealed c7i.2xlarge per lane, which alone tracks, holds and can cancel that lane’s clients.' : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
+          { label: v4 ? 'Physical runners' : 'Neutral runner', code: legacy ? 'Legacy runner metadata decoded' : 'Python 3.12 event-driven TLS/native-password generator', note: legacy ? 'Current 10,000-client fan-in evidence was not recorded.' : v4 ? `One sealed ${runnerShape} per lane, which alone tracks, holds and can cancel that lane’s clients.` : 'One process, one mirrored micro-batch scheduler, and equal wave policy drive both lanes; each provider selects its supported password exchange.' },
         ],
         lakebase: [{ label: 'No new pool to provision', code: 'Connection pooling is built into the Lakebase endpoint.', note: 'No per-bout pooling resource is created, so no creation is journaled.' }],
-        competitor: [{ label: 'Journaled per-bout build', code: 'Every RDS Proxy resource is written to the creation journal before AWS is called.', note: 'The journal is what lets an interrupted bout be cleaned up instead of leaking.' }],
+        competitor: [azureFive
+          ? { label: 'Journaled per-bout switch', code: 'PgBouncer’s switch is written to the creation journal before Azure is called.', note: 'The journal is what lets an interrupted bout be reset instead of leaving PgBouncer on.' }
+          : { label: 'Journaled per-bout build', code: 'Every RDS Proxy resource is written to the creation journal before AWS is called.', note: 'The journal is what lets an interrupted bout be cleaned up instead of leaking.' }],
       },
       {
-        summary: v4 ? 'Lakebase scheduled its retained first client at the bell. AWS called CreateDBProxy first and dispatched only after its exact control-plane gate.' : 'Lakebase validated its included pool. The selected AWS reference path needed nine journaled resource mutations, then drained and rebound its setup target before fan-in.',
+        summary: azureFive
+          ? 'Lakebase scheduled its retained first client at the bell. Azure switched on its built-in PgBouncer first and dispatched only once port 6432 committed a transaction.'
+          : v4 ? 'Lakebase scheduled its retained first client at the bell. AWS called CreateDBProxy first and dispatched only after its exact control-plane gate.' : 'Lakebase validated its included pool. The selected AWS reference path needed nine journaled resource mutations, then drained and rebound its setup target before fan-in.',
         lakebase: v4 ? [
           { label: 'run_lane_v3', code: 'Client 1 → pooled transaction → retain → fan in clients 2–10,000' },
         ] : [
           { label: 'validating_host', code: 'Check the built-in Lakebase pooled endpoint' },
           { label: 'verifying_transaction', code: 'Fresh pooled connection → full application transaction' },
         ],
-        competitor: v4 ? [
+        competitor: azureFive ? [
+          { label: 'switching_on_pgbouncer', code: 'journal intent → ARM: pgbouncer.enabled = true', note: 'First timed Azure mutation.' },
+          { label: 'waiting_for_pooled_port', code: 'Client 1 on 6432: TLS verify-full + login + committed transaction' },
+          { label: 'raising_client_limit', code: 'ARM: pgbouncer.max_client_conn = 10,100', note: 'Azure accepts it only once PgBouncer is on.' },
+          { label: 'run_lane_v3', code: 'Client 1 → PgBouncer transaction → retain → fan in clients 2–10,000' },
+        ] : v4 ? [
           { label: 'creating_proxy', code: 'journal intent → RDS.CreateDBProxy', note: 'First timed AWS mutation.' },
           { label: 'freezing_proxy_settings', code: 'journal: proxy_target_group' },
           { label: 'registering_proxy_target', code: 'journal: proxy_target' },
@@ -7682,13 +7830,18 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         ],
       },
       {
-        summary: v4 ? 'Both clocks started at the bell. Lakebase never waited for Proxy readiness; the AWS lane dispatched at its own exact gate.' : 'Each supporting setup clock stopped at its own exact pooled-path gate. Only after both were ready could the primary shared fan-in clock start.',
+        summary: azureFive
+          ? 'Both clocks started at the bell. Lakebase never waited for PgBouncer; the Azure lane dispatched at its own exact gate.'
+          : v4 ? 'Both clocks started at the bell. Lakebase never waited for Proxy readiness; the AWS lane dispatched at its own exact gate.' : 'Each supporting setup clock stopped at its own exact pooled-path gate. Only after both were ready could the primary shared fan-in clock start.',
         shared: [{ label: 'Stop rule', code: 'event: lane_update · activity.phase=setup_stop · setup_elapsed_ms=<exact scored elapsed>' }],
         lakebase: [
           { label: v4 ? 'Gate lakebase_dispatch_eligibility' : 'Gate lakebase_fresh_pooled_transaction', code: v4 ? 'warm_launch_capsule_current=true · pooled_endpoint_binding_exact=true' : 'fresh_pooled_path_verified=true · runner_verify_full_transaction=true' },
           { label: 'Supporting clock boundary', code: 'Setup T0 → exact Lakebase setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'lakebase') },
         ],
-        competitor: [
+        competitor: azureFive ? [
+          { label: 'Gate azure_pgbouncer_exact_data_plane', code: 'pgbouncer_enabled=true · max_client_conn=10100 · pooled_port=6432 · pooled_transaction_committed=true' },
+          { label: 'Supporting clock boundary', code: 'Setup T0 → exact PgBouncer setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'competitor') },
+        ] : [
           { label: v4 ? 'Gate rds_proxy_exact_control_plane' : 'Gate rds_proxy_topology_transaction', code: v4 ? 'identity + target + role + auth + TLS + VPC + subnet + network fixture exact' : 'sealed_proxy_auth_verified=true · proxy_target_state=AVAILABLE · max_connections_percent=90 · max_idle_connections_percent=0 · setup_backend_target_rebound=true · connection_borrow_timeout_seconds=120 · runner_verify_full_transaction=true' },
           { label: 'Supporting clock boundary', code: 'Setup T0 → exact RDS Proxy setup stop gate', note: roundFiveSetupStopEvidenceNote(session, 'competitor') },
         ],
@@ -7702,7 +7855,9 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         shared: [
           ...burstContract,
           { label: 'PID witness', code: legacy ? 'Legacy multiplexing metadata decoded' : 'Direct observers → current/peak dedicated-role backend PIDs', note: legacy ? 'Not presented as current fan-in evidence.' : 'Backend sessions must be at least one and strictly fewer than 10,000 held clients.' },
-          { label: 'Cleanup gate', code: 'Delete every journaled per-bout resource, then confirm the journal has no unresolved entry' },
+          { label: 'Cleanup gate', code: azureFive
+            ? 'Reset PgBouncer (its limit back to 5,000, then off), then confirm the journal has no unresolved entry'
+            : 'Delete every journaled per-bout resource, then confirm the journal has no unresolved entry' },
         ],
         lakebase: legacy
           ? [
@@ -7739,11 +7894,13 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     const untimedOpponent: ReplayCall[] = [
       {
         label: 'No call by design',
-        code: 'This installation has no AWS lane, so nothing was started or timed.',
+        code: `This installation has no ${cloudOf(session)} lane, so nothing was started or timed.`,
         note: roundFourUnsupportedReason(competitor),
       },
     ]
     const awsLane = competitor.state !== 'not_supported'
+    // The Azure edition's lane: one Data Factory data flow, reading one Delta version from ADLS.
+    const azure = competitorKind(session.competitor.id) === 'azure'
     return [
       {
         summary: 'Before the bell both integrations were confirmed parked and both applications read the baseline row, so each clock could only measure this bout’s change.',
@@ -7755,7 +7912,12 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'confirm_parked', code: 'Synced-table pipeline IDLE with no active update', note: 'A park still in progress is waited out here; nothing is started.' },
           { label: 'baseline', code: 'Lakebase application read returns the baseline row' },
         ],
-        competitor: awsLane
+        competitor: awsLane && azure
+          ? [
+              { label: 'confirm_parked', code: 'DataFactory.queryPipelineRuns(<Round 4 pipeline>) → no run in progress', note: 'A run still in flight is cancelled and seen to end here; nothing is started.' },
+              { label: 'baseline', code: `${session.competitor.short_name} application read returns the baseline row` },
+            ]
+          : awsLane
           ? [
               { label: 'confirm_parked', code: 'Glue.GetJobRuns(JobName=<writer job>) → no active run, run slot released', note: 'Glue refuses a new run for seconds after a stop, so Prepare waits 30 s after one; that wait is never on a clock.' },
               { label: 'baseline', code: `${session.competitor.short_name} application read returns the baseline row` },
@@ -7771,7 +7933,11 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         lakebase: [
           { label: 'starting', code: 'Cold start the synced-table pipeline', note: `Pipeline update ${laneEvidenceText(lakebase, 'pipeline_update')}` },
         ],
-        competitor: awsLane
+        competitor: awsLane && azure
+          ? [
+              { label: 'starting', code: 'DataFactory.createRun(<Round 4 pipeline>, version=<version after Prepare>, table_id=<Delta table>)', note: `Run ${laneEvidenceText(competitor, 'adf_run')} reads Delta version ${laneEvidenceText(competitor, 'adf_version')} from the installation’s ADLS account, on a data flow cluster it starts cold.` },
+            ]
+          : awsLane
           ? [
               { label: 'starting', code: 'Glue.StartJobRun(JobName=<writer job>, --starting_version=<version after Prepare>)', note: `Run ${laneEvidenceText(competitor, 'glue_run')} reads the change feed from version ${laneEvidenceText(competitor, 'glue_starting_version')} on a fresh checkpoint.` },
             ]
@@ -7791,9 +7957,13 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Verdict rule', code: 'winner first exact read ≤ loser last miss started', note: 'A lane still running 900 s after the bell leaves a lower bound, never a margin. A lane that errors measures nothing.' },
         ],
         lakebase: [
-          { label: 'Reverse ETL sync (Lakebase’s own timestamps)', code: metricDisplay(session, 'managed_availability_ms'), note: 'Sync end time minus the Delta commit time. Shown, never compared: the AWS lane has no service timestamp like it.' },
+          { label: 'Reverse ETL sync (Lakebase’s own timestamps)', code: metricDisplay(session, 'managed_availability_ms'), note: `Sync end time minus the Delta commit time. Shown, never compared: the ${cloudOf(session)} lane has no service timestamp like it.` },
         ],
-        competitor: awsLane
+        competitor: awsLane && azure
+          ? [
+              { label: 'Ledger applied', code: laneEvidenceText(competitor, 'ledger_applied_at'), note: `Delta version ${laneEvidenceText(competitor, 'ledger_delta_commit_version')} · Data Factory run started ${laneEvidenceText(competitor, 'adf_run_started_on')}` },
+            ]
+          : awsLane
           ? [
               { label: 'First batch applied', code: laneEvidenceText(competitor, 'glue_first_batch_applied_at'), note: `Glue stream started ${laneEvidenceText(competitor, 'glue_stream_started_at')}` },
             ]
@@ -7818,14 +7988,16 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     const untimedOpponent: ReplayCall[] = [
       {
         label: 'No call by design',
-        code: 'This installation has no AWS lane, so nothing was started or timed.',
+        code: `This installation has no ${cloudOf(session)} lane, so nothing was started or timed.`,
         note: roundSixUnsupportedReason(competitor),
       },
     ]
     const awsLane = competitor.state !== 'not_supported'
+    // The Azure edition's lane: one Data Factory data flow, extracting by a watermark into Delta.
+    const azure = competitorKind(session.competitor.id) === 'azure'
     return [
       {
-        summary: 'Before the bell AWS’s pipeline was confirmed parked, Lakebase’s change feed was confirmed streaming, and both sources read the baseline order, so each clock could only measure this bout’s checkout.',
+        summary: `Before the bell ${azure ? 'Azure’s data flow' : 'AWS’s pipeline'} was confirmed parked, Lakebase’s change feed was confirmed streaming, and both sources read the baseline order, so each clock could only measure this bout’s checkout.`,
         shared: [
           { label: 'Application API', code: 'POST /api/sessions/<session>/run' },
           { label: 'Live result stream', code: 'GET /api/sessions/<session>/events?after=<sequence>  (SSE)' },
@@ -7834,7 +8006,12 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'confirm_parked', code: 'Change feed state == CDF_STATE_STREAMING, with the baseline order in its Delta history', note: 'Built into the database and always on, so Lakebase’s side has nothing to start or park.' },
           { label: 'baseline', code: 'Lakebase source reads the baseline order' },
         ],
-        competitor: awsLane
+        competitor: awsLane && azure
+          ? [
+              { label: 'confirm_parked', code: 'DataFactory.queryPipelineRuns(<Round 6 pipeline>) → no run in progress', note: 'A run still in flight is cancelled and seen to end here; nothing is started.' },
+              { label: 'baseline', code: `${session.competitor.short_name} source reads the baseline order` },
+            ]
+          : awsLane
           ? [
               { label: 'confirm_parked', code: 'DMS.DescribeReplicationTasks → stopped · Glue.GetJobRuns → no active run', note: 'A park still in progress is waited out here; nothing is started.' },
               { label: 'baseline', code: `${session.competitor.short_name} source reads the baseline order` },
@@ -7842,15 +8019,22 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           : untimedOpponent,
       },
       {
-        summary: 'One bell committed the same checkout on both sources and cold started AWS’s DMS task and Glue job. Both clocks start here.',
+        summary: azure
+          ? 'One bell committed the same checkout on both sources and cold started Azure’s Data Factory data flow. Both clocks start here.'
+          : 'One bell committed the same checkout on both sources and cold started AWS’s DMS task and Glue job. Both clocks start here.',
         shared: [
-          { label: 'Bell', code: 'INSERT the checkout on every source + start AWS DMS and Glue' },
+          { label: 'Bell', code: azure ? 'INSERT the checkout on every source + start the Data Factory data flow' : 'INSERT the checkout on every source + start AWS DMS and Glue' },
           { label: 'Commit skew', code: metricDisplay(session, 'commit_skew_ms'), note: 'How far apart the sources acknowledged the checkout. Recorded, never scored: each clock contains its own commit.' },
         ],
         lakebase: [
           { label: 'commit', code: `Commit order ${order.orderId} (${order.totalDisplay})`, note: `Acknowledged at ${replayMsText(lakebase, 'commit_ack_ms')}` },
         ],
-        competitor: awsLane
+        competitor: awsLane && azure
+          ? [
+              { label: 'commit', code: `Commit order ${order.orderId} (${order.totalDisplay})`, note: `Acknowledged at ${replayMsText(competitor, 'commit_ack_ms')}` },
+              { label: 'starting', code: 'DataFactory.createRun(<Round 6 pipeline>)', note: `Run ${laneEvidenceText(competitor, 'adf_run')} extracts every order committed after ${laneEvidenceText(competitor, 'watermark')} and appends it to the lane’s Delta table.` },
+            ]
+          : awsLane
           ? [
               { label: 'commit', code: `Commit order ${order.orderId} (${order.totalDisplay})`, note: `Acknowledged at ${replayMsText(competitor, 'commit_ack_ms')}` },
               { label: 'starting', code: 'DMS.StartReplicationTask(StartReplicationTaskType=resume-processing) + Glue.StartJobRun(JobName=<writer job>)', note: `Run ${laneEvidenceText(competitor, 'glue_run')} appends DMS’s change files to the lane’s Delta table.` },
@@ -7863,7 +8047,9 @@ function replaySteps(session: DemoSession): ReplayStep[] {
           { label: 'Stop rule', code: 'First read that returns the exact order id and proof nonce as exactly one insert' },
         ],
         lakebase: [exactRead(lakebase, 'its change-feed history'), guardrail(lakebase)],
-        competitor: awsLane ? [exactRead(competitor, 'its DMS history'), guardrail(competitor)] : untimedOpponent,
+        competitor: awsLane
+          ? [exactRead(competitor, azure ? 'its Data Factory history' : 'its DMS history'), guardrail(competitor)]
+          : untimedOpponent,
       },
       {
         summary: 'A lane wins only if its first exact read completed before the other lane’s last miss began. Anything closer is within the verifiers’ resolution.',
@@ -7873,7 +8059,11 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         lakebase: [
           { label: 'Change feed LSN', code: laneEvidenceText(lakebase, 'history_lsn'), note: 'Lakebase’s feed records a change type and LSN for each change.' },
         ],
-        competitor: awsLane
+        competitor: awsLane && azure
+          ? [
+              { label: 'Source commit time', code: laneEvidenceText(competitor, 'committed_at'), note: `Data Factory run started ${laneEvidenceText(competitor, 'adf_run_started_on')} · copies of the order in its history: ${laneEvidenceText(competitor, 'history_copies')}` },
+            ]
+          : awsLane
           ? [
               { label: 'DMS commit time', code: laneEvidenceText(competitor, 'dms_commit_ts'), note: `Glue applied it at ${laneEvidenceText(competitor, 'glue_applied_at')} · its run started ${laneEvidenceText(competitor, 'glue_run_started_on')}` },
             ]
@@ -8016,7 +8206,7 @@ export function InstantReplay({ session, roundNumber, onClose }: { session: Demo
             )}
             <CapacityDisclosure session={session} embedded />
             <dl className="replay-facts">
-              <div><dt>Fair start</dt><dd>{fairnessCopy(session.round.id, roundFiveUsesFanIn(session))}</dd></div>
+              <div><dt>Fair start</dt><dd>{fairnessCopy(session.round.id, roundFiveUsesFanIn(session), session.competitor.id)}</dd></div>
               {untimedOpponent
                 ? (
                   <div><dt>Opponent lane</dt><dd>Not timed<small>{roundFourUnsupportedReason(session.lanes.competitor)}</small></dd></div>
@@ -8262,7 +8452,7 @@ function ReceiptPoster({
 }) {
   const receipt = receiptPresentation(session, kind)
   const resultWidth = receipt.verdict.length > 52 ? 'long' : receipt.verdict.length > 36 ? 'medium' : 'short'
-  const competitorFighter = session.competitor.id === 'aurora_serverless_v2' ? 'AUR' : 'RDS'
+  const competitorFighter = fighterLabel(session.competitor.id)
   return (
     <article className={fallbackOnly ? 'receipt-poster receipt-poster--mirror' : 'receipt-poster'} aria-label={kind === 'idle' ? 'Verified back to idle poster preview' : session.towel ? 'Bout result poster preview' : 'Verified result poster preview'}>
       <header className="receipt-ticket-top">
@@ -8589,7 +8779,6 @@ function CooldownDetails({
   if (!cooldown) return null
   const lakebase = cooldown.lanes.lakebase
   const competitor = cooldown.lanes.competitor
-  const aurora = session.competitor.id === 'aurora_serverless_v2'
   const deleting = cooldown.mode !== 'return_to_idle'
   const recovery = cooldown.mode === 'delete_recovery_environment'
   const originOffset = cooldownOriginOffsetCopy(cooldown, session.competitor.short_name)
@@ -8615,23 +8804,32 @@ function CooldownDetails({
             <b>{deleting ? competitor.state === 'confirmed_deleted' ? 'DELETED confirmed' : 'Deleting' : competitor.state === 'confirmed_zero' ? 'PAUSED confirmed' : competitor.state === 'not_supported' ? 'Not supported' : 'Watching'}</b>
             {deleting ? (
               <>
-                <span>Calls · <code>RDS DescribeDBInstances{aurora ? ' + DescribeDBClusters' : ''}</code></span>
+                <span>Calls · <code>{byCompetitor(session.competitor.id, { aurora: 'RDS DescribeDBInstances + DescribeDBClusters', rds: 'RDS DescribeDBInstances', azure: 'Azure Resource Manager GET flexibleServers' })}</code></span>
                 <span>Read · owned {recovery ? 'recovery' : 'isolated'} resources absent</span>
                 <span>Stop · deletion confirmed</span>
               </>
-            ) : aurora ? (
-              <>
-                <span>Calls · <code>RDS DescribeDBClusters + DescribeEvents</code></span>
-                <span>Fallback · <code>CloudWatch GetMetricStatistics</code></span>
-                <span>Stop · <code>Successfully paused</code> event; fallback: two fresh 0 ACU samples</span>
-              </>
-            ) : (
-              <>
-                <span>Call · <code>RDS DescribeDBInstances</code></span>
-                <span>Read · engine, version, class, status</span>
-                <span>Stop · not timed; no automatic scale-to-zero</span>
-              </>
-            )}
+            ) : byCompetitor(session.competitor.id, {
+              aurora: (
+                <>
+                  <span>Calls · <code>RDS DescribeDBClusters + DescribeEvents</code></span>
+                  <span>Fallback · <code>CloudWatch GetMetricStatistics</code></span>
+                  <span>Stop · <code>Successfully paused</code> event; fallback: two fresh 0 ACU samples</span>
+                </>
+              ),
+              rds: (
+                <>
+                  <span>Call · <code>RDS DescribeDBInstances</code></span>
+                  <span>Read · engine, version, class, status</span>
+                  <span>Stop · not timed; no automatic scale-to-zero</span>
+                </>
+              ),
+              azure: (
+                <>
+                  <span>Call · none: Round 1 stands no Azure PostgreSQL server up</span>
+                  <span>Stop · not timed; no automatic scale-to-zero</span>
+                </>
+              ),
+            })}
             <p>Now · {competitor.status}</p>
           </article>
         </div>
@@ -8786,7 +8984,7 @@ export function BetweenRounds({
  * complaint that produced this screen was a scorecard you could read top to
  * bottom without ever learning who won.
  */
-function FinaleRow({ beat, result, record, latest, opponent }: {
+function FinaleRow({ beat, result, record, latest, opponent, opponentId }: {
   beat: FinaleBeat
   /** Null when the record has been read and holds nothing for this round. */
   result: RoundResult | null
@@ -8803,6 +9001,8 @@ function FinaleRow({ beat, result, record, latest, opponent }: {
   latest: boolean
   /** The blue corner's chip, the fight card's own, for the lane badge. */
   opponent: { badge: string; name: string }
+  /** The fight card's own competitor, for a row whose record names none. */
+  opponentId?: CompetitorId
 }) {
   const verdict: LedgerVerdict = verdictFor(result, record)
   // A result from an earlier day says so, or the ledger reads as one sitting.
@@ -8815,9 +9015,10 @@ function FinaleRow({ beat, result, record, latest, opponent }: {
     ? { badge: opponentBadge(result.opponentId), name: result.opponent }
     : opponent
   // Keep the finale scorecard concise; hold/check details remain on the Round 5 receipt.
+  const proofOpponent = result?.opponentId ?? opponentId
   const proof = beat.roundId === 'survive_connection_spike'
     ? '10,000 clients held / lane · multiplexing proved'
-    : beat.proof
+    : beat.azureProof && proofOpponent === 'azure_postgres' ? beat.azureProof : beat.proof
   const lane = (side: FinaleLane, corner: 'red' | 'blue', badge: string) => (
     <div className="finale-lane" data-corner={corner} aria-hidden="true">
       <b>{badge}</b>
@@ -9034,6 +9235,7 @@ export function Finale({ session, onBack, onSummary }: {
               badge: opponentBadge(session.competitor.id),
               name: session.competitor.short_name,
             }}
+            opponentId={session.competitor.id}
           />
         ))}
       </section>
@@ -9104,8 +9306,8 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
             </dl>
             {entry.competitor_capability_gap && (
               <p className="scorecard-gap">
-                Capability gap, not a race · no AWS lane was built, so nothing was
-                timed against it and there is no margin to report.
+                Capability gap, not a race · no {fighterLabelForName(entry.competitor) === 'AZR' ? 'Azure' : 'AWS'} lane
+                was built, so nothing was timed against it and there is no margin to report.
               </p>
             )}
             {(entry.contract_status === 'comparison_incomplete'
@@ -9491,7 +9693,7 @@ function proofCommentary(
       const lane = session.lanes[laneId]
       const name = roundFourStackLabel(session, laneId)
       if (lane.state === 'not_supported') {
-        return `${session.competitor.short_name} · The AWS lane is not installed here, so there is no timer`
+        return `${session.competitor.short_name} · The ${cloudOf(session)} lane is not installed here, so there is no timer`
       }
       if (lane.state === 'verified') return `${name} · Exact row read in the app${frozenLaneTime(lane.elapsed_ms)}`
       if (lane.state === 'failed') return `${name} · ${lane.status}`
@@ -9519,7 +9721,10 @@ function proofCommentary(
         const lane = runtime.lanes[laneId]
         const name = session.round5_setup?.lanes?.[laneId]?.name
           ?? session.lanes[laneId].name
-        return `${name} · ${lane.held_clients.toLocaleString('en-US')} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`
+        return [
+          `${name} · ${lane.held_clients.toLocaleString('en-US')} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`,
+          roundFiveServerResetNote(session.lanes[laneId]),
+        ].filter(Boolean).join(' · ')
       })
       return {
         lanes: lines,
@@ -9609,7 +9814,9 @@ function proofCommentary(
             : active.length > 0
               ? 'Supporting pooled-path setup in progress · Primary fan-in has not started'
               : 'Untimed preparation in progress · Both setup clocks start at the bell'
-    const verdict = `${setupUpdate} · RDS Proxy is the AWS managed pooling option selected for this reference path; direct and existing-pool designs were not tested`
+    const verdict = competitorKind(session.competitor.id) === 'azure'
+      ? `${setupUpdate} · Azure’s built-in PgBouncer is the pooling option selected for this reference path; direct connections and a self-managed PgBouncer were not tested`
+      : `${setupUpdate} · RDS Proxy is the AWS managed pooling option selected for this reference path; direct and existing-pool designs were not tested`
     return {
       lanes: setupLanes.map((lane) => lane.line),
       verdict,
@@ -9623,7 +9830,7 @@ function proofCommentary(
       const lane = session.lanes[laneId]
       const name = roundSixStackLabel(session, laneId)
       if (lane.state === 'not_supported') {
-        return `${session.competitor.short_name} · The AWS lane is not installed here, so there is no timer`
+        return `${session.competitor.short_name} · The ${cloudOf(session)} lane is not installed here, so there is no timer`
       }
       if (lane.state === 'verified') return `${name} · Exact order read in Delta${frozenLaneTime(lane.elapsed_ms)}`
       if (lane.state === 'failed') return `${name} · ${lane.status}`
@@ -9632,7 +9839,11 @@ function proofCommentary(
       if (phase === 'starting') {
         return laneId === 'lakebase'
           ? `${name} · Committing the checkout · The feed is already streaming`
-          : `${name} · Committing the checkout · DMS and Glue cold start at the bell`
+          : `${name} · Committing the checkout · ${byCompetitor(session.competitor.id, {
+            aurora: 'DMS and Glue cold start',
+            rds: 'DMS and Glue cold start',
+            azure: 'Data Factory cold starts',
+          })} at the bell`
       }
       if (phase === 'waiting') return `${name} · Carrying the order · The verifier reads its Delta history every second`
       return `${name} · ${lane.status}`
@@ -10089,9 +10300,9 @@ function buildReviewSession(
     },
     lanes: {
       lakebase: { id: 'lakebase', name: 'Lakebase', state: 'sealed', elapsed_ms: null, attempts: 0, status: 'No live transaction', error: null },
-      competitor: competitorId === 'rds_postgres' && round.id === 'wake_idle_app'
+      competitor: !scalesToZero(competitorId) && round.id === 'wake_idle_app'
         ? { id: 'competitor', name: competitor.short_name, state: 'not_supported', elapsed_ms: null, attempts: 0, status: 'No automatic scale-to-zero or connection-triggered wake', error: null }
-        : { id: 'competitor', name: opponentLabel(round.id, competitor.short_name), state: 'sealed', elapsed_ms: null, attempts: 0, status: 'No live transaction', error: null },
+        : { id: 'competitor', name: opponentLabel(round.id, competitor.id, competitor.short_name), state: 'sealed', elapsed_ms: null, attempts: 0, status: 'No live transaction', error: null },
     },
     fairness: { same_client: true, same_transaction: true, same_nonce: true, launch_skew_ms: null },
     remembered_result: null,
@@ -10107,12 +10318,13 @@ function stateLabel(state: DemoSession['state']): string {
   return state
 }
 
-function fairnessCopy(roundId: RoundId, fanInRoundFive = false): string {
+function fairnessCopy(roundId: RoundId, fanInRoundFive = false, competitorId?: CompetitorId): string {
   if (roundId === 'put_model_score_in_app') {
     return 'Both integrations cold start at the bell · One Delta change · Each clock stops at its own first exact app read'
   }
   if (roundId === 'analyze_live_orders_without_slowing_checkout') {
-    return `${ROUND_SIX_CONDITION} · One checkout on both sources · Each clock stops at its own first exact Delta read`
+    const condition = competitorId ? roundSixCondition(competitorId) : ROUND_SIX_CONDITION
+    return `${condition} · One checkout on both sources · Each clock stops at its own first exact Delta read`
   }
   if (roundId === 'wake_idle_app') {
     return 'Same DB region · Same data · Same client · Same transaction · Same verification'

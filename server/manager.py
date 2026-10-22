@@ -77,6 +77,7 @@ from .models import (
     CooldownSnapshot,
     CooldownState,
     FairnessSnapshot,
+    InstallationCloud,
     LaneActivity,
     LaneSnapshot,
     LaneState,
@@ -99,6 +100,8 @@ from .models import (
     StandingCostDisclosure,
     TowelSnapshot,
     TowelState,
+    aws_lane,
+    competitor_cloud,
 )
 from .posted_usage import PostedDatabricksUsage
 from .pricing import build_cost_receipt, update_terminal_cost_receipt
@@ -135,13 +138,13 @@ from .round5_control import Round5ResidentRunnerError
 from .round5_warm import (
     BellContext,
     Round5LaunchCapsule,
-    Round5Variant,
     Round5WarmCoordinator,
     Round5WarmSlot,
     Round5WarmState,
     WarmBellMarginError,
     WarmClaimUnavailableError,
     WarmStoreConflictError,
+    round5_variant,
 )
 from .round6_race import LANE_TIMEOUT_SECONDS as ROUND6_LANE_TIMEOUT_SECONDS
 from .round6_race import (
@@ -643,11 +646,13 @@ def _round_four_comparison(
     competitor_name: str,
     *,
     has_competitor: bool,
+    competitor: CompetitorId | None = None,
 ) -> tuple[ComparisonSnapshot, bool]:
     """The card's verdict, taken from the engine's resolution and never recomputed.
 
     Returns the comparison and whether the bout measured anything. A lane that
-    errored measures nothing, so its bout is not a result.
+    errored measures nothing, so its bout is not a result. `competitor` picks the
+    edition's words; without it they are the AWS edition's.
     """
 
     resolution = result.resolution
@@ -666,7 +671,11 @@ def _round_four_comparison(
             ComparisonSnapshot(
                 kind=ComparisonKind.CAPABILITY_GAP,
                 winner_lane_id=LAKEBASE_LANE,
-                detail=_ROUND_FOUR_UNSUPPORTED_REASON,
+                detail=(
+                    _lane_not_installed(4, competitor)[1]
+                    if competitor is not None
+                    else _ROUND_FOUR_UNSUPPORTED_REASON
+                ),
             ),
             True,
         )
@@ -764,6 +773,33 @@ _ROUND_SIX_UNSUPPORTED_REASON = (
 _ROUND_SIX_CONDITION = (
     "AWS DMS and Glue start cold at the bell; Lakebase's change feed is built in and always on"
 )
+#: The Azure edition's words for Rounds 4 and 6, where the AWS edition's name AWS's products.
+_AZURE_ROUND_SIX_CONDITION = (
+    "Azure Data Factory starts cold at the bell; Lakebase's change feed is built in and always on"
+)
+
+
+def _round_six_condition(competitor: CompetitorId) -> str:
+    return (
+        _AZURE_ROUND_SIX_CONDITION
+        if competitor_cloud(competitor) == "azure"
+        else _ROUND_SIX_CONDITION
+    )
+
+
+def _lane_not_installed(round_number: int, competitor: CompetitorId) -> tuple[str, str]:
+    """A Round 4 or 6 lane this installation lacks: the lane's status, and the reason."""
+
+    if competitor_cloud(competitor) == "azure":
+        return (
+            "Azure lane not installed on this installation",
+            f"Round {round_number}'s Azure lane is not installed on this installation, so only "
+            "Lakebase ran.",
+        )
+    return (
+        "AWS lane not installed on this installation",
+        _ROUND_FOUR_UNSUPPORTED_REASON if round_number == 4 else _ROUND_SIX_UNSUPPORTED_REASON,
+    )
 
 #: How long the next Round 6 Prepare waits for the previous bout to finish settling (remove its
 #: orders, park DMS and Glue, and wait out Glue's slot release) before refusing.
@@ -775,16 +811,21 @@ def _round_six_comparison(
     competitor_name: str,
     *,
     has_competitor: bool,
+    competitor: CompetitorId | None = None,
 ) -> tuple[ComparisonSnapshot, bool]:
     """The card's verdict, taken from the engine's resolution and never recomputed.
 
     Returns the comparison and whether the bout measured anything. A lane that errored measures
-    nothing, so its bout is not a result.
+    nothing, so its bout is not a result. `competitor` picks the edition's words; without it
+    they are the AWS edition's.
     """
 
     resolution = result.resolution
     names = {LAKEBASE_LANE: "Lakebase", COMPETITOR_LANE: competitor_name}
     lakebase = result.outcomes[LAKEBASE_LANE]
+    condition = (
+        _round_six_condition(competitor) if competitor is not None else _ROUND_SIX_CONDITION
+    )
     if not has_competitor:
         if not lakebase.verified:
             return (
@@ -798,7 +839,11 @@ def _round_six_comparison(
             ComparisonSnapshot(
                 kind=ComparisonKind.CAPABILITY_GAP,
                 winner_lane_id=LAKEBASE_LANE,
-                detail=_ROUND_SIX_UNSUPPORTED_REASON,
+                detail=(
+                    _lane_not_installed(6, competitor)[1]
+                    if competitor is not None
+                    else _ROUND_SIX_UNSUPPORTED_REASON
+                ),
             ),
             True,
         )
@@ -816,7 +861,7 @@ def _round_six_comparison(
                 ),
                 detail=(
                     f"{names[winner]} put the exact order in the lakehouse "
-                    f"{resolution.margin_ms / 1000:.2f} s sooner; {_ROUND_SIX_CONDITION}."
+                    f"{resolution.margin_ms / 1000:.2f} s sooner; {condition}."
                 ),
             ),
             True,
@@ -827,7 +872,7 @@ def _round_six_comparison(
                 kind=ComparisonKind.TIE,
                 detail=(
                     "Both orders arrived within the verifiers' measurement resolution; "
-                    f"{_ROUND_SIX_CONDITION}."
+                    f"{condition}."
                 ),
             ),
             True,
@@ -846,7 +891,7 @@ def _round_six_comparison(
                 detail=(
                     f"{names[winner]} put the exact order in the lakehouse; {names[loser]} did "
                     f"not within {ROUND6_LANE_TIMEOUT_SECONDS:.0f} s of the bell, {floor}; "
-                    f"{_ROUND_SIX_CONDITION}."
+                    f"{condition}."
                 ),
             ),
             True,
@@ -1060,12 +1105,23 @@ def _round_one_cooldown_wire_call(
 ) -> str:
     if lane_id == "lakebase":
         return "databricks postgres get-endpoint"
-    if competitor_id == CompetitorId.AURORA_SERVERLESS_V2:
+    if competitor_id == CompetitorId.AZURE_POSTGRES:
+        # Like RDS, Azure has no scale-to-zero, and Round 1 stands no Azure server up to ask.
+        return "none: Round 1 stands no Azure PostgreSQL server up"
+    if aws_lane(competitor_id) == "aurora":
         return (
             "RDS DescribeDBClusters + DescribeDBInstances + DescribeEvents → "
             "CloudWatch GetMetricStatistics fallback"
         )
     return "RDS DescribeDBInstances"
+
+
+def _pooled_path(competitor_id: CompetitorId) -> str:
+    """What Round 5's competitor lane turns on to pool: a new RDS Proxy, or Azure's PgBouncer."""
+
+    if competitor_id == CompetitorId.AZURE_POSTGRES:
+        return "PgBouncer"
+    return "RDS Proxy"
 
 
 def reset_mode_for_round(round_id: RoundId) -> ResetMode:
@@ -1420,7 +1476,10 @@ class RunManager:
         delta_storage_probe_watched: Callable[[], bool] | None = None,
         round5_protocol: str = ROUND5_BELL_PROTOCOL,
         round5_warm_coordinator: Round5WarmCoordinator | None = None,
+        cloud: InstallationCloud = "aws",
     ) -> None:
+        #: The installation's cloud, which decides the competitors and rounds it offers.
+        self.cloud: InstallationCloud = cloud
         self._records: dict[str, SessionRecord] = {}
         self._records_lock = asyncio.Lock()
         self._lease_store = lease_store or InMemoryBoutLeaseStore()
@@ -2184,7 +2243,7 @@ class RunManager:
     def _standing_cost_disclosure(
         self,
         capacity: CapacityDisclosure | None = None,
-    ) -> StandingCostDisclosure:
+    ) -> StandingCostDisclosure | None:
         """What the installation is billed for right now, rebuilt on every read.
 
         WHY PER READ AND NOT ONCE AT CREATION. ``as_of`` and the accrued figure
@@ -2214,6 +2273,10 @@ class RunManager:
         rather than assuming the two agree.
         """
 
+        if self.cloud == "azure":
+            # Its arithmetic is the AWS installation's shape and rate card; the Azure edition has
+            # none of its own yet, and an empty AWS panel would only explain AWS's billing.
+            return None
         return build_standing_cost_disclosure(
             self._cost_manifest,
             now=datetime.now(UTC),
@@ -2249,7 +2312,7 @@ class RunManager:
         elif component == "Database public IPv4":
             wanted = (
                 "aurora_cluster"
-                if competitor_id == CompetitorId.AURORA_SERVERLESS_V2
+                if aws_lane(competitor_id) == "aurora"
                 else "rds_postgres_instance"
             )
         if wanted is None:
@@ -2998,8 +3061,13 @@ class RunManager:
     async def create(self, request: SessionCreate) -> SessionSnapshot:
         self._require_open()
         self._readiness_check()
-        primary = persona_by_id(request.primary_persona)
-        secondary = [persona_by_id(persona_id) for persona_id in request.secondary_personas]
+        if competitor_cloud(request.competitor) != self.cloud:
+            # An installation lives in one cloud, and offers that cloud's competitors only.
+            raise ValueError("This installation does not offer this competitor")
+        primary = persona_by_id(request.primary_persona, self.cloud)
+        secondary = [
+            persona_by_id(persona_id, self.cloud) for persona_id in request.secondary_personas
+        ]
         if request.round_id is None:
             selected_round, reason = recommend_round(
                 request.competitor,
@@ -3016,6 +3084,7 @@ class RunManager:
                 connection_spike_available=self.connection_spike_available,
                 live_orders_available=self.live_orders_available,
                 round5_protocol=self.round5_protocol,
+                cloud=self.cloud,
             )
             if request.competitor not in selected_round.competitors:
                 raise ValueError("The selected round does not support this competitor")
@@ -3029,7 +3098,7 @@ class RunManager:
             "competitor": LaneSnapshot(
                 id="competitor",
                 name=(
-                    f"{competitor.short_name} + RDS Proxy"
+                    f"{competitor.short_name} + {_pooled_path(competitor.id)}"
                     if selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE
                     else competitor.short_name
                 ),
@@ -3076,7 +3145,9 @@ class RunManager:
             standing_cost=self._standing_cost_disclosure(capacity),
             # Round-agnostic on purpose: the claim it carries is a comparison
             # between rounds, so every round shows the whole measured table.
-            bout_cost=build_bout_cost_disclosure(),
+            # Aurora's measured table, so the AWS edition's alone: the Azure edition has no
+            # measured bouts to tabulate yet.
+            bout_cost=build_bout_cost_disclosure() if self.cloud == "aws" else None,
             cost_receipt=build_cost_receipt(selected_round.id, request.competitor),
             round5_setup=round5_setup,
             metric_specs=[item.model_copy(deep=True) for item in selected_round.metric_specs],
@@ -3260,7 +3331,14 @@ class RunManager:
         return runtime.revision
 
     @staticmethod
-    def _new_round_five_runtime(context: BellContext) -> RoundFiveRuntimeSnapshot:
+    def _new_round_five_runtime(
+        context: BellContext, competitor_id: object = CompetitorId.RDS_POSTGRES
+    ) -> RoundFiveRuntimeSnapshot:
+        building = (
+            "Azure is switching on its built-in PgBouncer"
+            if competitor_id == CompetitorId.AZURE_POSTGRES
+            else "AWS is creating the per-bout RDS Proxy"
+        )
         return RoundFiveRuntimeSnapshot(
             warm_generation=context.warm_generation,
             bell_id=context.bell_id,
@@ -3278,7 +3356,7 @@ class RunManager:
                     id="competitor",
                     phase="provisioning_proxy",
                     elapsed_at_snapshot_ms=0.0,
-                    status="AWS is creating the per-bout RDS Proxy",
+                    status=building,
                 ),
             },
         )
@@ -3818,12 +3896,7 @@ class RunManager:
                     warm_slot, capsule = await self._round5_warm_coordinator.claim(
                         session_id=record.snapshot.id,
                         bout_id=record.snapshot.id,
-                        selected_variant=(
-                            Round5Variant.AURORA
-                            if record.snapshot.competitor.id
-                            == CompetitorId.AURORA_SERVERLESS_V2
-                            else Round5Variant.RDS
-                        ),
+                        selected_variant=round5_variant(record.snapshot.competitor.id),
                         bout_fence=authority.fencing_token,
                     )
                 except (WarmClaimUnavailableError, WarmStoreConflictError) as exc:
@@ -4627,7 +4700,7 @@ class RunManager:
                 )
                 record.snapshot.round5_setup.state = RoundFiveSetupState.RUNNING
                 record.snapshot.round5_runtime = self._new_round_five_runtime(
-                    context
+                    context, record.snapshot.competitor.id
                 )
                 record.round5_projection_revision = 1
                 record.round5_clock_projection_revision = 0
@@ -5700,12 +5773,7 @@ class RunManager:
                 ) = await self._round5_warm_coordinator.claim_with_leases(
                     session_id=record.snapshot.id,
                     bout_id=record.snapshot.id,
-                    selected_variant=(
-                        Round5Variant.AURORA
-                        if record.snapshot.competitor.id
-                        == CompetitorId.AURORA_SERVERLESS_V2
-                        else Round5Variant.RDS
-                    ),
+                    selected_variant=round5_variant(record.snapshot.competitor.id),
                     main_store=self._lease_store_for_record(record),
                     cleanup_store=self._round5_cleanup_store(),
                     operator=operator,
@@ -9190,11 +9258,12 @@ class RunManager:
                         lane.activity = LaneActivity(phase=Round4Phase.ARMED)
                         lane.evidence = dict(baseline_evidence)
                     else:
+                        status, reason = _lane_not_installed(4, record.snapshot.competitor.id)
                         lane.state = LaneState.NOT_SUPPORTED
-                        lane.status = "AWS lane not installed on this installation"
+                        lane.status = status
                         lane.error = None
                         lane.activity = LaneActivity(phase="not_supported")
-                        lane.evidence = {"unsupported_reason": _ROUND_FOUR_UNSUPPORTED_REASON}
+                        lane.evidence = {"unsupported_reason": reason}
                 # The receipt built at create could not know whether this installation
                 # races Round 4's AWS lane; the engine just said.
                 record.snapshot.cost_receipt = build_cost_receipt(
@@ -9277,11 +9346,7 @@ class RunManager:
         if factory is None and capsule is None:
             raise InvalidStateError("Round 5 live adapter is not configured.")
         if capsule is not None and warm_slot is not None:
-            variant = (
-                Round5Variant.AURORA
-                if record.snapshot.competitor.id == CompetitorId.AURORA_SERVERLESS_V2
-                else Round5Variant.RDS
-            )
+            variant = round5_variant(record.snapshot.competitor.id)
             engine = capsule.variant_contexts[variant]
         else:
             assert factory is not None
@@ -9359,12 +9424,7 @@ class RunManager:
             if record.connection_spike_engine is not None:
                 engine = record.connection_spike_engine
             elif capsule is not None and warm_slot is not None:
-                variant = (
-                    Round5Variant.AURORA
-                    if record.snapshot.competitor.id
-                    == CompetitorId.AURORA_SERVERLESS_V2
-                    else Round5Variant.RDS
-                )
+                variant = round5_variant(record.snapshot.competitor.id)
                 engine = capsule.variant_contexts[variant]
             else:
                 assert factory is not None
@@ -9563,11 +9623,12 @@ class RunManager:
                         lane.activity = LaneActivity(phase=Round6Phase.ARMED)
                         lane.evidence = dict(baseline)
                     else:
+                        status, reason = _lane_not_installed(6, record.snapshot.competitor.id)
                         lane.state = LaneState.NOT_SUPPORTED
-                        lane.status = "AWS lane not installed on this installation"
+                        lane.status = status
                         lane.error = None
                         lane.activity = LaneActivity(phase="not_supported")
-                        lane.evidence = {"unsupported_reason": _ROUND_SIX_UNSUPPORTED_REASON}
+                        lane.evidence = {"unsupported_reason": reason}
                 # As in Round 4: the receipt built at create could not know whether this
                 # installation races Round 6's AWS lane; the engine just said.
                 record.snapshot.cost_receipt = build_cost_receipt(
@@ -9735,7 +9796,9 @@ class RunManager:
                 and progress_status == "verified"
                 and progress_elapsed_ms is not None
             )
-            status = self._round_five_setup_status(lane_id, phase)
+            status = self._round_five_setup_status(
+                lane_id, phase, record.snapshot.competitor.id
+            )
             async with record.lock:
                 if not ingestion_is_open():
                     return
@@ -9798,6 +9861,9 @@ class RunManager:
                                 "registering_proxy_target",
                                 "waiting_for_proxy_target",
                                 "resuming_database",
+                                # The Azure edition's: its PgBouncer coming up.
+                                "switching_on_pgbouncer",
+                                "waiting_for_pooled_port",
                             }
                             else "verifying_proxy"
                             if affected_lane_id == "competitor"
@@ -10512,6 +10578,7 @@ class RunManager:
             result,
             snapshot.lanes[COMPETITOR_LANE].name,
             has_competitor=COMPETITOR_LANE in result.outcomes,
+            competitor=snapshot.competitor.id,
         )
         return measured
 
@@ -11946,6 +12013,7 @@ class RunManager:
                 "connection_diagnostics",
                 "retries",
                 "disconnected_during_hold",
+                "reconnected_after_reset",
                 "time_to_target_ns",
                 "time_to_target_ms",
                 "hold_elapsed_ms",
@@ -12132,8 +12200,12 @@ class RunManager:
                 and isinstance(failure_codes, Mapping)
                 and not any(failure_codes.values())
                 and 0 <= cls._round_five_count(evidence.get("retries")) <= ROUND5_MAX_RETRIES
+                # Every held client the server reset was reconnected (v1.3.0); a result from
+                # before then carries no reconnects and needed no disconnect. A count that isn't
+                # one (-1) never matches: the first must be a real count.
+                and cls._round_five_count(evidence.get("disconnected_during_hold")) >= 0
                 and cls._round_five_count(evidence.get("disconnected_during_hold"))
-                == 0
+                == cls._round_five_count(evidence.get("reconnected_after_reset", 0))
                 and cls._round_five_number(evidence.get("time_to_target_ms"))
                 is not None
                 and cls._round_five_number(evidence.get("hold_elapsed_ms")) is not None
@@ -12233,8 +12305,17 @@ class RunManager:
         return "setup"
 
     @staticmethod
-    def _round_five_setup_status(lane_id: object, phase: str) -> str:
+    def _round_five_setup_status(
+        lane_id: object, phase: str, competitor_id: object = CompetitorId.RDS_POSTGRES
+    ) -> str:
         generic = "Preparing and verifying the per-bout pooling path"
+        if lane_id == "competitor" and competitor_id == CompetitorId.AZURE_POSTGRES:
+            # The Azure edition's timed setup: its built-in PgBouncer, on the server's own host.
+            return {
+                "switching_on_pgbouncer": "Azure is switching on its built-in PgBouncer",
+                "waiting_for_pooled_port": "Waiting for PgBouncer to commit on port 6432",
+                "setup_stop": "Built-in PgBouncer path verified",
+            }.get(phase, generic)
         if lane_id == "lakebase":
             return {
                 "validating_host": "Checking the built-in Lakebase pool",
@@ -13043,6 +13124,7 @@ class RunManager:
             result,
             snapshot.lanes[COMPETITOR_LANE].name,
             has_competitor=COMPETITOR_LANE in result.outcomes,
+            competitor=snapshot.competitor.id,
         )
         return measured
 
@@ -14915,7 +14997,14 @@ class RunManager:
             return _round_four_remembered_result(snapshot)
         if snapshot.lanes["competitor"].state == LaneState.NOT_SUPPORTED:
             assert snapshot.lanes["lakebase"].state == LaneState.VERIFIED
-            return "LAKEBASE WINS — RDS CANNOT ENTER THE ROUND"
+            # The AWS edition's words are RDS's, whichever AWS competitor stands; the Azure
+            # edition's challenger is named as its card names it.
+            challenger = (
+                snapshot.competitor.short_name.upper()
+                if competitor_cloud(snapshot.competitor.id) == "azure"
+                else "RDS"
+            )
+            return f"LAKEBASE WINS — {challenger} CANNOT ENTER THE ROUND"
         stoppage = snapshot.comparison
         if (
             stoppage is not None

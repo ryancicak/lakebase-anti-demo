@@ -34,6 +34,7 @@ from .aws_auth import (
     validate_runtime_auth,
 )
 from .bout_limit import BOUT_TIME_LIMIT_SECONDS
+from .home_cloud import LAKEBASE_HOST_PATTERN
 from .manifest import DemoManifest, load_manifest
 from .models import CompetitorId
 from .safe_change import (
@@ -524,10 +525,7 @@ _LAKEBASE_ENDPOINT = re.compile(
     r"(?P<branch>[a-z][a-z0-9-]{0,62})/endpoints/"
     r"(?P<endpoint>[a-z][a-z0-9-]{0,62})$"
 )
-_LAKEBASE_HOST = re.compile(
-    r"^[^.]+\.database\.(?P<region>[a-z0-9-]+)\.cloud\.databricks\.com$",
-    re.IGNORECASE,
-)
+_LAKEBASE_HOST = re.compile(LAKEBASE_HOST_PATTERN, re.IGNORECASE)
 
 
 def _lakebase_endpoint_parts(endpoint: str) -> tuple[str, str, str]:
@@ -2820,6 +2818,20 @@ def build_safe_change_engine(
     """
 
     owned = manifest or load_manifest()
+    if getattr(owned, "azure", None) is not None:
+        # The Azure edition's lanes, on ARM: nothing below is reached, and no boto3 client made.
+        from .azure_runtime import build_azure_safe_change_engine
+
+        return build_azure_safe_change_engine(
+            owned,
+            cleanup_only=cleanup_only,
+            round_number=round_number,
+            environment=environment,
+            databricks_runner=databricks_runner,
+            connector=connector,
+            sleep=sleep,
+            clock=clock,
+        )
     if round_number not in (2, 3):
         raise SafeChangeLiveConfigurationError("Safe-change source round must be 2 or 3")
     if not cleanup_only:

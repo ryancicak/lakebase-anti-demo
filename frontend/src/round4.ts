@@ -7,6 +7,7 @@ import type {
   RedoSnapshot,
   RunEvent,
 } from './api/types'
+import { byCompetitor } from './competitor-kind'
 
 export const ROUND_FOUR_ID = 'put_model_score_in_app' as const
 
@@ -20,16 +21,21 @@ export function isRoundFour(
  * The integration each Round 4 lane races, printed under that lane's database.
  *
  * The lane's own name stays the database the application reads (Lakebase, or the
- * matchup's Aurora or RDS), because that is where the clock stops. What moved the
- * row there is the stack, and it is the only thing the two lanes do differently.
+ * matchup's Aurora, RDS or Azure PostgreSQL), because that is where the clock stops.
+ * What moved the row there is the stack, and it is the only thing the two lanes do
+ * differently: AWS's Glue job, or Azure's Data Factory data flow.
  */
 export function roundFourStackLabel(
   session: Pick<DemoSession, 'competitor'>,
   laneId: 'lakebase' | 'competitor',
 ): string {
-  return laneId === 'lakebase'
-    ? 'Lakebase synced table'
-    : `AWS Glue → ${session.competitor.short_name}`
+  if (laneId === 'lakebase') return 'Lakebase synced table'
+  const name = session.competitor.short_name
+  return byCompetitor(session.competitor.id, {
+    aurora: `AWS Glue → ${name}`,
+    rds: `AWS Glue → ${name}`,
+    azure: `Azure Data Factory → ${name}`,
+  })
 }
 
 /**

@@ -1,4 +1,4 @@
-export type CompetitorId = 'aurora_serverless_v2' | 'rds_postgres'
+export type CompetitorId = 'aurora_serverless_v2' | 'rds_postgres' | 'azure_postgres'
 export type PersonaId =
   | 'data_engineer'
   | 'software_engineer'

@@ -4,6 +4,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+from .capacity import AZURE_ROUND5_RUNNER_SIZE
 from .connection_fanin import MAX_RETRIES
 from .models import (
     Availability,
@@ -12,6 +13,7 @@ from .models import (
     Competitor,
     CompetitorId,
     Corner,
+    InstallationCloud,
     MetricDirection,
     MetricRole,
     MetricSpec,
@@ -22,6 +24,7 @@ from .models import (
     RedoPresentation,
     RoundDefinition,
     RoundId,
+    competitor_cloud,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +53,17 @@ COMPETITORS = [
         name="Amazon RDS for PostgreSQL",
         short_name="RDS PostgreSQL",
         edition="RDS FOR POSTGRESQL EDITION",
+    ),
+]
+
+#: The Azure edition's competitors (design section 12). An installation offers its own cloud's
+#: list only: there is no bout across clouds.
+AZURE_COMPETITORS = [
+    Competitor(
+        id=CompetitorId.AZURE_POSTGRES,
+        name="Azure Database for PostgreSQL",
+        short_name="Azure PostgreSQL",
+        edition="AZURE DATABASE FOR POSTGRESQL EDITION",
     ),
 ]
 
@@ -399,6 +413,195 @@ ROUNDS = [
 ]
 
 
+def _azure_round(round_id: RoundId, **update: object) -> RoundDefinition:
+    """An AWS round's definition with Azure's competitor, and Azure's words where they differ."""
+
+    item = next(item for item in ROUNDS if item.id == round_id)
+    return item.model_copy(
+        update={"competitors": [CompetitorId.AZURE_POSTGRES], **update}, deep=True
+    )
+
+
+#: The Azure edition's rounds: the same rounds, clocks and verifiers, raced against Azure Database
+#: for PostgreSQL with Azure's own integrations (design section 6). Rounds 1-3 say nothing about
+#: AWS, so only their competitor changes.
+AZURE_ROUNDS = [
+    _azure_round(RoundId.WAKE_IDLE_APP),
+    _azure_round(RoundId.MAKE_SCHEMA_CHANGE_SAFELY),
+    _azure_round(RoundId.RECOVER_DELETED_ORDER),
+    _azure_round(
+        RoundId.PUT_MODEL_SCORE_IN_APP,
+        capability=(
+            "Managed reverse ETL from Unity Catalog Delta to operational Lakebase Postgres, "
+            "raced against an Azure Data Factory data flow writing the same change into Azure "
+            "Database for PostgreSQL"
+        ),
+        scorecard_by_corner={
+            Corner.COST: (
+                "Published rates: the synced-table pipeline and the Data Factory data flow each "
+                "bill only while a bout runs"
+            ),
+            Corner.SIMPLICITY: (
+                "One synced table against a Data Factory pipeline and data flow, its managed "
+                "network, private endpoints, staging table and ledger"
+            ),
+            Corner.PERFORMANCE: (
+                "Bell to the exact row in the app, with both integrations cold starting at "
+                "the bell"
+            ),
+        },
+        non_claims=[
+            (
+                "Both integrations cold start at the bell, and each lane's clock "
+                "contains its own start. Neither is warmed for the audience."
+            ),
+            (
+                "Azure moves the Azure lane's data: an Azure Data Factory mapping data flow reads "
+                "the Delta table's files straight from the installation's ADLS account, around "
+                "Unity Catalog's permissions, lineage and audit, and writes them into Azure "
+                "Database for PostgreSQL. The supported routes for an outside engine (credential "
+                "vending, Iceberg REST, Delta Sharing) would each put Databricks back in the lane."
+            ),
+            (
+                "One change, one verifier: one Delta commit feeds both lanes, and each lane is "
+                "read by the same query on the same client every 250 ms."
+            ),
+            (
+                "The Data Factory pipeline, its data flow, managed network and private endpoints "
+                "are installed once and standing."
+            ),
+            "This is one live proof session, not a benchmark.",
+            "No dollar savings are claimed.",
+            "No full model-serving capability is claimed.",
+        ],
+    ),
+    _azure_round(
+        RoundId.SURVIVE_CONNECTION_SPIKE,
+        # What the card says while the round is planned here, in place of "This round is
+        # unavailable right now", which reads as an outage.
+        availability_headline="Not raced on the Azure edition yet",
+        capability=(
+            "Included pooling compared with Azure Database for PostgreSQL's built-in PgBouncer"
+        ),
+        scorecard_by_corner={
+            Corner.COST: (
+                "Published rates include the General Purpose server Azure's built-in PgBouncer "
+                "needs"
+            ),
+            Corner.SIMPLICITY: (
+                "Included Lakebase pooled endpoint versus 2 timed server-parameter changes that "
+                "turn on Azure's built-in PgBouncer"
+            ),
+            Corner.PERFORMANCE: (
+                "One server bell to observed exact 10,000 held client connections per lane; "
+                "runner-local ramp time and peak backend sessions are supporting evidence"
+            ),
+        },
+        non_claims=[
+            (
+                "Lakebase dispatches its first retained pooled client immediately at the "
+                "bell. Native login, ordinary roles, capacity, credentials, and endpoint "
+                "bindings are prepared automatically backstage."
+            ),
+            (
+                "The Azure path performs 2 timed server-parameter changes: PgBouncer on, then "
+                "its client limit raised to 10,100, which Azure accepts only once PgBouncer is "
+                "on. The server stands warm, and its PgBouncer is proved off before the bell."
+            ),
+            (
+                "Azure's built-in PgBouncer runs only on General Purpose and Memory Optimized "
+                "servers, so Azure's lane runs on a D2ds_v5 with twice Lakebase's memory. Direct "
+                "connections, a self-managed PgBouncer, and application pooling were not "
+                "compared."
+            ),
+            (
+                "Each independent lane opens exactly 10,000 authenticated retained clients, "
+                "holds them for 30 seconds, and may spend up to "
+                f"{MAX_RETRIES} retried logins during establishment. "
+                "All 64 sampled queries must succeed with no sample retries. "
+                "9,999 fails. Each lane owns a distinct physical "
+                f"{AZURE_ROUND5_RUNNER_SIZE} runner."
+            ),
+            (
+                "Multiplexing is read during the hold by a second database role on its own "
+                "direct connection, never inferred from the client count. Connect latency "
+                "p50, p95 and p99 are nearest-rank over raw, unrounded per-client "
+                "measurements. Runner-local ramp time is supporting evidence; the large "
+                "comparison clock is always server-observed bell to exact 10,000 held."
+            ),
+            (
+                "Lakebase's built-in PgBouncer product limit is up to 10,000 client "
+                "connections, not PostgreSQL backend sessions or simultaneous transactions. "
+                "The bout holds exactly that many per lane and proves multiplexing while "
+                "they are held. Direct Azure connections, sustained throughput, and storm "
+                "resilience remain outside this comparison."
+            ),
+            "This is one live proof session, not a benchmark.",
+        ],
+    ),
+    _azure_round(
+        RoundId.ANALYZE_LIVE_ORDERS,
+        capability=(
+            "Lakebase's built-in change feed into Delta, raced against an Azure Data Factory data "
+            "flow reading the same checkout from Azure Database for PostgreSQL and appending it "
+            "to Delta"
+        ),
+        scorecard_by_corner={
+            Corner.COST: "Published rates: the Data Factory data flow bills only while a bout runs",
+            Corner.SIMPLICITY: (
+                "One built-in change feed against a Data Factory pipeline and data flow, its "
+                "managed network, private endpoints, watermark column and storage account"
+            ),
+            Corner.PERFORMANCE: (
+                "Bell to the exact order in the lakehouse, with the Data Factory data flow cold "
+                "starting at the bell"
+            ),
+        },
+        non_claims=[
+            (
+                "The Data Factory data flow cold starts at the bell, and the Azure lane's clock "
+                "contains its start. Lakebase's change feed is built into the database and "
+                "always on, so its side has nothing to start."
+            ),
+            (
+                "Azure Data Factory has no log-based change capture for PostgreSQL: its data "
+                "flow reads the rows committed after a watermark column and appends them to a "
+                "Delta table in the installation's ADLS account, which Unity Catalog reads as an "
+                "external table."
+            ),
+            (
+                "One checkout, one verifier: the bell commits the same order on both sources, "
+                "and each lane's Delta history is read by the same query on the same SQL "
+                "warehouse every second."
+            ),
+            (
+                "Each history keeps its own shape: Lakebase's feed writes a change type and "
+                "LSN, and Azure's lane writes the order as its source holds it, with the "
+                "watermark column. The claim is the order's delivery, not identical tables."
+            ),
+            (
+                "The Data Factory pipeline, its data flow, managed network, private endpoints "
+                "and storage account are installed once and standing."
+            ),
+            "This is one live proof session, not a benchmark.",
+            "No dollar savings are claimed.",
+        ],
+    ),
+]
+
+
+def competitors_for(cloud: InstallationCloud) -> list[Competitor]:
+    """The competitors an installation in `cloud` offers."""
+
+    return AZURE_COMPETITORS if cloud == "azure" else COMPETITORS
+
+
+def rounds_for(cloud: InstallationCloud) -> list[RoundDefinition]:
+    """The round definitions an installation in `cloud` offers."""
+
+    return AZURE_ROUNDS if cloud == "azure" else ROUNDS
+
+
 @lru_cache(maxsize=1)
 def load_personas() -> tuple[Persona, ...]:
     path = ROOT / "config" / "personas.json"
@@ -406,16 +609,47 @@ def load_personas() -> tuple[Persona, ...]:
     return tuple(Persona.model_validate(item) for item in raw["personas"])
 
 
+#: The persona lines that name AWS's products, in Azure's words, by persona and presenter field.
+_AZURE_PERSONA_PRESENTER = {
+    ("software_engineer", "objection"): (
+        "Azure Database for PostgreSQL also restores any point in time to a new server."
+    ),
+}
+
+
+def personas_for(cloud: InstallationCloud) -> tuple[Persona, ...]:
+    """The personas an installation in `cloud` presents, each naming that cloud's products."""
+
+    personas = load_personas()
+    if cloud != "azure":
+        return personas
+    return tuple(
+        persona.model_copy(
+            update={
+                "presenter": persona.presenter.model_copy(
+                    update={
+                        field: text
+                        for (persona_id, field), text in _AZURE_PERSONA_PRESENTER.items()
+                        if persona_id == persona.id
+                    }
+                )
+            }
+        )
+        for persona in personas
+    )
+
+
 def catalog(
     model_score_available: bool = False,
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
     round5_protocol: str = ROUND5_BELL_PROTOCOL,
+    cloud: InstallationCloud = "aws",
 ) -> CatalogResponse:
     return CatalogResponse(
-        competitors=COMPETITORS,
+        competitors=competitors_for(cloud),
         corners=list(Corner),
-        personas=list(load_personas()),
+        personas=list(personas_for(cloud)),
         rounds=[
             round_by_id(
                 item.id,
@@ -423,21 +657,22 @@ def catalog(
                 connection_spike_available=connection_spike_available,
                 live_orders_available=live_orders_available,
                 round5_protocol=round5_protocol,
+                cloud=cloud,
             )
-            for item in ROUNDS
+            for item in rounds_for(cloud)
         ],
     )
 
 
-def persona_by_id(persona_id: str) -> Persona:
+def persona_by_id(persona_id: str, cloud: InstallationCloud = "aws") -> Persona:
     try:
-        return next(persona for persona in load_personas() if persona.id == persona_id)
+        return next(persona for persona in personas_for(cloud) if persona.id == persona_id)
     except StopIteration as exc:
         raise ValueError(f"Unknown persona: {persona_id}") from exc
 
 
 def competitor_by_id(competitor_id: CompetitorId) -> Competitor:
-    return next(item for item in COMPETITORS if item.id == competitor_id)
+    return next(item for item in (*COMPETITORS, *AZURE_COMPETITORS) if item.id == competitor_id)
 
 
 def round_by_id(
@@ -446,10 +681,11 @@ def round_by_id(
     connection_spike_available: bool = False,
     live_orders_available: bool = False,
     round5_protocol: str = ROUND5_BELL_PROTOCOL,
+    cloud: InstallationCloud = "aws",
 ) -> RoundDefinition:
     if round5_protocol not in ROUND5_PROTOCOLS:
         raise ValueError(f"Unknown Round 5 protocol: {round5_protocol}")
-    item = next(item for item in ROUNDS if item.id == round_id)
+    item = next(item for item in rounds_for(cloud) if item.id == round_id)
     if item.id == RoundId.PUT_MODEL_SCORE_IN_APP:
         return item.model_copy(
             update={
@@ -468,6 +704,10 @@ def round_by_id(
                     else Availability.PLANNED
                 ),
                 "round5_protocol": ROUND5_BELL_PROTOCOL,
+                # A planned round's own headline (the Azure edition's) goes once it races.
+                "availability_headline": (
+                    None if connection_spike_available else item.availability_headline
+                ),
             },
             deep=True,
         )
@@ -483,6 +723,21 @@ def round_by_id(
     return item
 
 
+#: The competitors with no automatic scale-to-zero wake path, by the name Round 1's reason gives
+#: them. Round 1 checks their capability before the bell and times Lakebase alone.
+_NO_SCALE_TO_ZERO = {
+    CompetitorId.RDS_POSTGRES: "RDS PostgreSQL",
+    CompetitorId.AZURE_POSTGRES: "Azure Database for PostgreSQL",
+}
+
+
+def _untimed_wake_reason(competitor: CompetitorId) -> str:
+    return (
+        f"{_NO_SCALE_TO_ZERO[competitor]} has no automatic scale-to-zero wake path; its "
+        "capability is checked before the bell and only Lakebase is timed."
+    )
+
+
 def recommend_round(
     competitor: CompetitorId,
     primary: Persona,
@@ -491,6 +746,8 @@ def recommend_round(
     live_orders_available: bool = False,
     round5_protocol: str = ROUND5_BELL_PROTOCOL,
 ) -> tuple[RoundDefinition, str]:
+    # A competitor is one cloud's, so its rounds are that cloud's.
+    cloud = competitor_cloud(competitor)
     for preferred in primary.recommended_rounds:
         if preferred == "inherit_primary_round":
             continue
@@ -501,18 +758,13 @@ def recommend_round(
                 connection_spike_available=connection_spike_available,
                 live_orders_available=live_orders_available,
                 round5_protocol=round5_protocol,
+                cloud=cloud,
             )
         except ValueError:
             continue
         if competitor in candidate.competitors and candidate.availability == Availability.READY:
-            if (
-                competitor == CompetitorId.RDS_POSTGRES
-                and candidate.id == RoundId.WAKE_IDLE_APP
-            ):
-                return candidate, (
-                    "RDS PostgreSQL has no automatic scale-to-zero wake path; its capability "
-                    "is checked before the bell and only Lakebase is timed."
-                )
+            if competitor in _NO_SCALE_TO_ZERO and candidate.id == RoundId.WAKE_IDLE_APP:
+                return candidate, _untimed_wake_reason(competitor)
             return candidate, f"Recommended for {primary.role} and executable for this matchup."
 
     candidate = round_by_id(
@@ -520,12 +772,10 @@ def recommend_round(
         model_score_available=model_score_available,
         connection_spike_available=connection_spike_available,
         live_orders_available=live_orders_available,
+        cloud=cloud,
     )
-    if competitor == CompetitorId.RDS_POSTGRES:
-        return candidate, (
-            "RDS PostgreSQL has no automatic scale-to-zero wake path; its capability is "
-            "checked before the bell and only Lakebase is timed."
-        )
+    if competitor in _NO_SCALE_TO_ZERO:
+        return candidate, _untimed_wake_reason(competitor)
     return candidate, (
         f"Selected as the strongest honest {competitor_by_id(competitor).short_name} "
         f"round; the {primary.role} lens changes the explanation, not the evidence."
@@ -550,6 +800,7 @@ def build_presenter_pack(
         )
 
     discovery_question = primary.questions.get("why") or next(iter(primary.questions.values()))
+    azure = competitor == CompetitorId.AZURE_POSTGRES
     if len(corners) == 1:
         remembered_metric = selected_round.scorecard_by_corner[corners[0]]
     else:
@@ -576,6 +827,11 @@ def build_presenter_pack(
             "start; secondary pooled-path setup time, peak backend sessions, and "
             "nearest-rank connect p99"
         )
+    elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS and azure:
+        remembered_metric = (
+            "Bell to the exact order in the lakehouse on each lane, the Azure Data Factory "
+            "data flow cold starting at the bell"
+        )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
         remembered_metric = (
             "Bell to the exact order in the lakehouse on each lane, AWS DMS and Glue cold "
@@ -588,6 +844,11 @@ def build_presenter_pack(
         stop_condition = (
             "Lakebase stops after commit + read-back; RDS eligibility is checked before "
             "the bell and not timed."
+        )
+    elif selected_round.id == RoundId.WAKE_IDLE_APP and azure:
+        stop_condition = (
+            "Lakebase stops after commit + read-back; Azure PostgreSQL eligibility is checked "
+            "before the bell and not timed."
         )
     elif selected_round.id == RoundId.WAKE_IDLE_APP:
         stop_condition = (
@@ -610,10 +871,16 @@ def build_presenter_pack(
             "250 ms on both lanes."
         )
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
+        pooled_path = (
+            "Azure's path stops only after its built-in PgBouncer is on and an exact "
+            "transaction verifies through it."
+            if azure
+            else "The selected AWS managed pooling path stops only after its new RDS Proxy and "
+            "exact transaction verify."
+        )
         stop_condition = (
             "Lakebase stops after its included pooled endpoint verifies an exact transaction. "
-            "The selected AWS managed pooling path stops only after its new RDS Proxy and "
-            "exact transaction verify. Each lane then holds exactly 10,000 authenticated "
+            f"{pooled_path} Each lane then holds exactly 10,000 authenticated "
             "clients for a 30-second hold and may spend up to "
             f"{MAX_RETRIES} retried logins during establishment. "
             "All 64 sampled queries must succeed with no sample retries; "
@@ -621,10 +888,12 @@ def build_presenter_pack(
             "winner or margin is declared."
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
+        integration = "the Azure Data Factory data flow" if azure else "AWS DMS and Glue"
         stop_condition = (
-            "The bell commits the same checkout on both sources and cold starts AWS DMS and "
-            "Glue. Each lane's clock stops at its first read of the exact order, once, in its "
-            "own Delta history, polled every second on both lanes. A separate checkout must "
+            "The bell commits the same checkout on both sources and cold starts "
+            f"{integration}. Each lane's clock stops at its first read of the exact order, "
+            "once, in its own Delta history, polled every second on both lanes. A separate "
+            "checkout must "
             "commit on each source."
         )
     elif selected_round.availability == Availability.PREVIEW:

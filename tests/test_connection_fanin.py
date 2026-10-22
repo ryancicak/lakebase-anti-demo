@@ -95,6 +95,7 @@ def raw_lane(
         "failure_codes": {},
         "retries": 0,
         "disconnected_during_hold": 0,
+        "reconnected_after_reset": 0,
         "time_to_target_ns": (
             int(time_to_target_ms * 1_000_000)
             if time_to_target_ms is not None
@@ -1429,6 +1430,12 @@ def _retry_runtime(**overrides: object) -> SimpleNamespace:
         failure_codes={},
         diagnostics=diagnostics,
         record_connection_diagnostic=lambda **item: diagnostics.append(item),
+        held_now=0,
+        gate_frozen=False,
+        t0_ns=0,
+        reconnected_after_reset=0,
+        reconnects={},
+        hold_window=None,
     )
     for name, value in overrides.items():
         setattr(runtime, name, value)
@@ -1562,6 +1569,211 @@ async def test_a_towel_during_the_retry_pause_is_counted_as_cancelled(
     accounted = runtime.authenticated + runtime.terminal_failures + runtime.cancelled
     assert runtime.initiated == accounted
     assert runtime.cancelled == 1
+
+
+def _reset_runtime(**changes: object) -> runner.LaneRuntime:
+    """One shard of one lane, from the bell, as `execute_fanin` sets it up."""
+
+    runtime = runner.LaneRuntime(
+        lane_id="lakebase",
+        database={"host": "example.test", "port": 5432},
+        observer_database={},
+        application_name="test",
+        ssl_context=object(),  # type: ignore[arg-type]
+        target_clients=1,
+        hold_window=runner.HoldWindow.local(),
+        reconnect_enabled=True,
+        t0_ns=time.monotonic_ns(),
+    )
+    for name, value in changes.items():
+        setattr(runtime, name, value)
+    return runtime
+
+
+async def test_a_held_client_the_server_resets_is_reconnected_in_its_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lakebase's pooled endpoint reset one of 10,000 held connections (`Connection reset by
+    peer`: v1.2.2's AWS run 1, and three Azure ramps by 2026-10-21), and the exact gate failed
+    the bout for it. The slot is logged back in instead, as a retry, on the lane's own clock."""
+
+    made = _scripted_connects(monkeypatch, [None, None])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    first_gate = runtime.target_elapsed_ns
+    assert (runtime.held_now, first_gate is not None) == (1, True)
+
+    made[0].closed.set_result(None)
+    runtime.unexpected_disconnect("lakebase", 0)  # as the client's connection_lost calls it
+    assert (runtime.held_now, runtime.disconnected_during_hold) == (0, 1)
+    await runner._settle_reconnects([runtime])
+
+    assert runtime.clients == [made[1]] and runtime.reconnects == {}
+    assert (runtime.held_now, runtime.reconnected_after_reset, runtime.retries) == (1, 1, 1)
+    assert (runtime.initiated, runtime.authenticated, runtime.terminal_failures) == (1, 1, 0)
+    # The gate is every client held at once, so it moved to the reconnect: the lane's time
+    # includes what the reset cost it.
+    assert runtime.target_elapsed_ns is not None and runtime.target_elapsed_ns >= first_gate
+    latest, in_flight = runtime.hold_window.read()
+    assert latest > 0 and in_flight == 0
+    assert {"ordinal": 0, "stage": "reconnect", "code": "server_reset_reconnected"} in (
+        runtime.connection_diagnostics
+    )
+
+
+async def test_a_reconnect_after_the_gate_froze_restarts_the_hold_not_the_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made = _scripted_connects(monkeypatch, [None, None])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    gate = runtime.target_elapsed_ns
+    runtime.gate_frozen = True  # the shard has entered the hold's barrier
+
+    made[0].closed.set_result(None)
+    runtime.unexpected_disconnect("lakebase", 0)
+    await runner._settle_reconnects([runtime])
+
+    assert runtime.target_elapsed_ns == gate and runtime.reconnected_after_reset == 1
+    assert runtime.hold_window.read()[0] > runtime.t0_ns + gate  # the hold restarts from it
+
+
+async def test_a_reset_after_the_hold_ended_is_not_reconnected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scripted_connects(monkeypatch, [None])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    runtime.reconnect_enabled = False
+
+    runtime.unexpected_disconnect("lakebase", 0)
+
+    assert runtime.reconnects == {} and runtime.reconnected_after_reset == 0
+    assert (runtime.disconnected_during_hold, runtime.held_now) == (1, 0)
+
+
+async def test_a_refusal_in_passing_is_tried_again_and_a_timeout_fails_the_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made = _scripted_connects(
+        monkeypatch, [None, runner.FanInProtocolError("postgres_error_08p01"), None])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    runtime.unexpected_disconnect("lakebase", 0)
+    await runner._settle_reconnects([runtime])
+    assert (runtime.reconnected_after_reset, runtime.retries) == (1, 2)
+    assert runtime.clients == [made[2]]
+
+    # A login timeout is congestion a retry would only lengthen: terminal, as for a first login.
+    made = _scripted_connects(monkeypatch, [None, TimeoutError()])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    runtime.unexpected_disconnect("lakebase", 0)
+    await runner._settle_reconnects([runtime])
+    assert (runtime.reconnected_after_reset, runtime.terminal_failures) == (0, 1)
+    assert sum(runtime.failure_codes.values()) == 1 and runtime.held_now == 0
+    assert runtime.hold_window.read() == (0, 0)  # finished, and nothing reconnected
+
+
+async def test_a_reset_past_the_retry_budget_fails_the_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _scripted_connects(monkeypatch, [None, None])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    runtime.retries = runner.PARTITION_RETRY_BUDGET
+
+    runtime.unexpected_disconnect("lakebase", 0)
+    await runner._settle_reconnects([runtime])
+
+    assert runtime.failure_codes == {"server_reset_unrecovered": 1}
+    assert (runtime.terminal_failures, runtime.reconnected_after_reset) == (1, 0)
+
+
+async def test_a_check_on_a_reset_client_is_asked_of_its_reconnected_slot() -> None:
+    class Client:
+        def __init__(self, ordinal: int, *, fails: bool = False) -> None:
+            self.ordinal, self.fails, self.ready = ordinal, fails, True
+            self.closed = asyncio.get_running_loop().create_future()
+
+        async def sample_select_one(self) -> None:
+            await asyncio.sleep(0)
+            if self.fails:
+                raise runner.FanInProtocolError("connection_lost_during_query")
+
+    target = runner.PARTITION_CLIENTS_PER_LANE
+    runtime = _reset_runtime(target_clients=target, clients=[Client(i) for i in range(target)])
+    reset, broken = runner._sample_group_indices(runtime, 2)[:2]
+    runtime.clients[reset].fails = True
+    runtime.clients[broken].fails = True
+
+    async def reconnect() -> None:  # the slot's reconnect, finishing with a fresh client
+        await asyncio.sleep(0.01)
+        runtime.clients[reset] = Client(reset)
+
+    runtime.reconnects[reset] = asyncio.create_task(reconnect())
+    await runner._sample_group(runtime, 2)
+
+    # The reset slot's check passed on its new client; a failure with no reset stays failed.
+    assert runtime.sample_attempted == runner.CLIENTS_PER_SAMPLE_GROUP
+    assert (runtime.sample_succeeded, runtime.sample_failed) == (
+        runner.CLIENTS_PER_SAMPLE_GROUP - 1, 1)
+
+
+async def test_a_reconnect_in_the_hold_restarts_it_and_the_restart_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner, "HOLD_SECONDS", 0.2)
+    monkeypatch.setattr(runner, "HOLD_RESTART_LIMIT_SECONDS", 0.5)
+    window = runner.HoldWindow.local()
+    started_ns = time.monotonic_ns()
+    hold = asyncio.create_task(runner._hold_until_settled(window, started_ns))
+    window.begin()
+    await asyncio.sleep(0.1)
+    window.end(time.monotonic_ns())  # one shard's reconnect completes 0.1 s into the hold
+    await hold
+    # The hold ran its 0.2 s again from the reconnect, not from its own start.
+    assert 0.29 <= (time.monotonic_ns() - started_ns) / 1e9 < 0.45
+
+    stuck = runner.HoldWindow.local()
+    stuck.begin()  # a reconnect that never finishes
+    started_ns = time.monotonic_ns()
+    await runner._hold_until_settled(stuck, started_ns)
+    assert 0.69 <= (time.monotonic_ns() - started_ns) / 1e9 < 0.9
+
+
+def test_the_lane_counts_each_shards_reconnects() -> None:
+    workers = [worker_result(index) for index in range(runner.WORKER_COUNT)]
+    lane = next(item for item in workers[1]["lanes"] if item["lane_id"] == "lakebase")
+    lane.update({"disconnected_during_hold": 1, "reconnected_after_reset": 1, "retries": 1})
+
+    aggregated = runner.aggregate_worker_results(workers)
+
+    lakebase = next(item for item in aggregated["lanes"] if item["lane_id"] == "lakebase")
+    assert (lakebase["disconnected_during_hold"], lakebase["reconnected_after_reset"]) == (1, 1)
+
+
+@pytest.mark.parametrize(
+    ("disconnected", "reconnected", "retries", "verified"),
+    [
+        (0, 0, 0, True),
+        (1, 1, 1, True),  # reset and reconnected: the lane still held its exact count
+        (1, 0, 0, False),  # reset and not reconnected
+        (2, 1, 3, False),
+        (1, 1, 0, False),  # a reconnect is a retry, so one with none is not a real count
+    ],
+)
+def test_the_server_verifies_a_lane_only_if_every_reset_was_reconnected(
+    disconnected: int, reconnected: int, retries: int, verified: bool,
+) -> None:
+    raw = raw_lane("lakebase")
+    raw.update({"disconnected_during_hold": disconnected,
+                "reconnected_after_reset": reconnected, "retries": retries})
+
+    result = finalize(raw)
+
+    assert result.verified is verified
+    assert result.reconnected_after_reset == reconnected
 
 
 async def test_equal_wave_scheduler_bounds_each_mirrored_microbatch(
@@ -1720,6 +1932,7 @@ async def test_disconnect_during_sampling_cannot_invalidate_selected_indices() -
         sample_succeeded=0,
         sample_failed=0,
         record_connection_diagnostic=lambda **_kwargs: None,
+        reconnects={},
     )
     indices = runner._sample_group_indices(runtime, 2)
     sample = asyncio.create_task(runner._sample_group(runtime, 2))

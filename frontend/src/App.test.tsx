@@ -7402,6 +7402,47 @@ describe('backstage setup', () => {
     expect(screen.getByText(/no measurement recorded/i)).toBeInTheDocument()
   })
 
+  it('names Azure PostgreSQL, never RDS, when it cannot enter Round 1', async () => {
+    // The Azure edition's first browser bout read "RDS CANNOT ENTER THE ROUND" and "no RDS
+    // timer" under Azure's own lane (2026-10-19).
+    const rds = FALLBACK_CATALOG.competitors.find((item) => item.id === 'rds_postgres')!
+    const azure = { ...rds, id: 'azure_postgres' as const, name: 'Azure Database for PostgreSQL', short_name: 'Azure PostgreSQL' }
+    const catalog = { ...FALLBACK_CATALOG, competitors: [azure] }
+    const azureSession = (state: 'draft' | 'armed' | 'verified'): DemoSession => {
+      const base = rdsSession(state)
+      return {
+        ...base,
+        competitor: azure,
+        lanes: { ...base.lanes, competitor: { ...base.lanes.competitor, name: azure.short_name } },
+        remembered_result: state === 'verified' ? 'LAKEBASE WINS — AZURE POSTGRESQL CANNOT ENTER THE ROUND' : null,
+      }
+    }
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      if (input === '/api/catalog') return Promise.resolve(jsonResponse(catalog))
+      if (input === '/api/sessions' && init?.method === 'POST') return Promise.resolve(jsonResponse(azureSession('draft')))
+      if (input.endsWith('/arm')) return Promise.resolve(jsonResponse(azureSession('armed')))
+      if (input.endsWith('/run')) return Promise.resolve(jsonResponse(azureSession('verified')))
+      throw new Error(`Unexpected request: ${input}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    vi.stubGlobal('EventSource', FakeEventSource)
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(screen.getByRole('button', { name: /press start/i }))
+    await user.click(await screen.findByRole('radio', { name: /azure/i }))
+    await user.click(screen.getByRole('button', { name: /choose the lead voice/i }))
+    await user.click(screen.getByRole('button', { name: /add supporting lenses/i }))
+    await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
+    await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
+
+    expect(await screen.findByText('LAKEBASE WINS — AZURE POSTGRESQL CANNOT ENTER THE ROUND')).toBeInTheDocument()
+    expect(screen.getByText(/Azure PostgreSQL capability checked before the bell/i)).toBeInTheDocument()
+    expect(screen.getByText(/so there is no Azure PostgreSQL timer/i)).toBeInTheDocument()
+    expect(screen.queryByText(/RDS capability checked|no RDS timer/i)).not.toBeInTheDocument()
+  })
+
   it('shows the verified RDS capability win without a fake RDS time', async () => {
     const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
       if (input === '/api/catalog') return Promise.resolve(jsonResponse(FALLBACK_CATALOG))

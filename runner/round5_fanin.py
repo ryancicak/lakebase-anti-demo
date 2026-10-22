@@ -150,6 +150,24 @@ LAUNCH_SKEW_SEMANTICS = "advisory_scheduling_not_fatal"
 # Compatibility alias of ADVISORY_LAUNCH_SKEW_MS. Not a validity gate.
 MAX_LAUNCH_SKEW_MS = ADVISORY_LAUNCH_SKEW_MS
 CONNECT_TIMEOUT_SECONDS = 20.0
+#: A held client the server resets is reconnected in its own slot (v1.3.0), as a refused connect
+#: is retried in it. Lakebase's pooled endpoint reset one of a lane's 10,000 held connections now
+#: and then (`Connection reset by peer`: once in v1.2.2's AWS release runs, three times in about
+#: 30 Azure ramps by 2026-10-21), and the exact gate failed the whole bout for it.
+#:
+#: Every reconnect is a retry: it spends the slot's and the shard's budgets, and its time is its
+#: lane's. The lane still reaches its gate only with every client held at once, and a reconnect
+#: that completes once the hold has begun starts the 30 s hold again for every shard of the lane,
+#: so the lane holds all 10,000 for 30 s at once whatever the server did. Each one is evidence
+#: (`reconnected_after_reset`), and a reset that can't be reconnected fails the lane as before.
+SERVER_RESET_RULE = "reconnect-in-slot-within-retry-budget-hold-restarts"
+#: How long a gate proof or a hold's end waits for one reconnect in flight: a slot's tries.
+RECONNECT_SETTLE_SECONDS = MAX_RETRIES_PER_CLIENT * (
+    CONNECT_TIMEOUT_SECONDS + max(CONNECT_RETRY_BACKOFF_SECONDS)
+)
+#: The most reconnects may draw a hold out past its own HOLD_SECONDS. Past it the hold ends
+#: wherever it stands, and a client still being reconnected fails the lane's exact gate.
+HOLD_RESTART_LIMIT_SECONDS = 120.0
 OBSERVER_READY_TIMEOUT_SECONDS = 120.0
 OBSERVER_RETRY_SECONDS = 0.5
 OBSERVER_QUIESCE_TIMEOUT_SECONDS = 120.0
@@ -1341,6 +1359,8 @@ def config_sha256() -> str:
             "bounded-in-flight-unbounded-drain"
         ),
         "sample_schedule": "eight-groups-offset-250ms",
+        "server_reset_rule": SERVER_RESET_RULE,
+        "hold_restart_limit_seconds": HOLD_RESTART_LIMIT_SECONDS,
         "tls_mode": TLS_MODE,
         "client_role": CLIENT_ROLE,
         "observer_role": OBSERVER_ROLE,
@@ -2475,6 +2495,38 @@ class DirectObserver:
 
 
 @dataclass(slots=True)
+class HoldWindow:
+    """When a lane's hold may end, given the reconnects in all of its shards (`SERVER_RESET_RULE`).
+
+    A lane's shards are separate processes, so the window is shared through these three calls:
+    the parent's counters in a pooled run, `local()` in one process. A hold ends HOLD_SECONDS
+    after its epoch, or after the latest reconnect if that completed later, and never while a
+    reconnect is in flight in any shard.
+    """
+
+    #: A reconnect started.
+    begin: Callable[[], None]
+    #: A reconnect finished: the monotonic ns it completed at, or None if it didn't reconnect.
+    end: Callable[[int | None], None]
+    #: The latest completion (0 for none) and how many are in flight.
+    read: Callable[[], tuple[int, int]]
+
+    @classmethod
+    def local(cls) -> HoldWindow:
+        state = {"latest": 0, "in_flight": 0}
+
+        def begin() -> None:
+            state["in_flight"] += 1
+
+        def end(completed_ns: int | None) -> None:
+            state["in_flight"] -= 1
+            if completed_ns is not None:
+                state["latest"] = max(state["latest"], completed_ns)
+
+        return cls(begin=begin, end=end, read=lambda: (state["latest"], state["in_flight"]))
+
+
+@dataclass(slots=True)
 class LaneRuntime:
     lane_id: str
     database: dict[str, object]
@@ -2501,6 +2553,21 @@ class LaneRuntime:
     failure_codes: dict[str, int] = field(default_factory=dict)
     connection_diagnostics: list[dict[str, object]] = field(default_factory=list)
     first_launch_ns: int | None = None
+    #: Clients held right now: logged in, and not lost since. Kept as a count, so finding the
+    #: moment the shard holds all of its clients again costs nothing per login.
+    held_now: int = 0
+    #: Held clients the server reset that were reconnected in their slots (`SERVER_RESET_RULE`).
+    reconnected_after_reset: int = 0
+    #: Each slot's reconnect in flight, by ordinal.
+    reconnects: dict[int, asyncio.Task[None]] = field(default_factory=dict)
+    #: A reset is reconnected only from the bell until the hold ends.
+    reconnect_enabled: bool = False
+    #: The bell (release) every time is measured from.
+    t0_ns: int = 0
+    #: The gate's time is the last return to holding every client before the hold's barrier,
+    #: and stops moving there; a reconnect after it restarts the hold instead.
+    gate_frozen: bool = False
+    hold_window: HoldWindow | None = None
 
     def record_connection_diagnostic(self, *, ordinal: int, stage: str, code: str) -> None:
         if len(self.connection_diagnostics) >= CONNECTION_DIAGNOSTIC_LIMIT:
@@ -2516,11 +2583,16 @@ class LaneRuntime:
     def unexpected_disconnect(self, lane_id: str, ordinal: int) -> None:
         if lane_id == self.lane_id:
             self.disconnected_during_hold += 1
+            self.held_now -= 1
             self.record_connection_diagnostic(
                 ordinal=ordinal,
                 stage="hold",
                 code="unexpected_disconnect",
             )
+            if self.reconnect_enabled and ordinal not in self.reconnects:
+                self.reconnects[ordinal] = asyncio.get_running_loop().create_task(
+                    _reconnect_client(self, ordinal)
+                )
 
 
 @dataclass(slots=True)
@@ -2944,7 +3016,10 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
                 )
             runtime.auth_methods.add(client.auth_method)
             runtime.connect_latencies_ms.append((completed_ns - started_ns) / 1_000_000)
-            if runtime.authenticated == runtime.target_clients:
+            # The gate is every client held at once, not every slot logged in once: a held client
+            # the server reset before this login holds the gate until it is reconnected.
+            runtime.held_now += 1
+            if not runtime.gate_frozen and runtime.held_now == runtime.target_clients:
                 runtime.target_elapsed_ns = completed_ns - t0_ns
             return
         except asyncio.CancelledError:
@@ -2985,6 +3060,95 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
                 code=code,
             )
             return
+
+
+async def _reconnect_client(runtime: LaneRuntime, ordinal: int) -> None:
+    """Log a held client the server reset back in, in its own slot (`SERVER_RESET_RULE`).
+
+    A retry like a refused connect's: each try spends the slot's and the shard's budgets, a
+    refusal in passing is tried again after the same pauses, and anything else (credentials,
+    TLS, a login timeout) is terminal, as it is for a first login. Its time is the lane's.
+    """
+
+    window = runtime.hold_window
+    if window is not None:
+        window.begin()
+    completed_ns: int | None = None
+    loop = asyncio.get_running_loop()
+    tries = 0
+    try:
+        while True:
+            if tries >= MAX_RETRIES_PER_CLIENT or runtime.retries >= PARTITION_RETRY_BUDGET:
+                runtime.terminal_failures += 1
+                runtime.failure_codes["server_reset_unrecovered"] = (
+                    runtime.failure_codes.get("server_reset_unrecovered", 0) + 1
+                )
+                runtime.record_connection_diagnostic(
+                    ordinal=ordinal, stage="reconnect", code="server_reset_unrecovered"
+                )
+                return
+            if tries:
+                await asyncio.sleep(CONNECT_RETRY_BACKOFF_SECONDS[tries - 1])
+            tries += 1
+            runtime.retries += 1
+            client = PostgresClient(
+                lane_id=runtime.lane_id,
+                ordinal=ordinal,
+                database=runtime.database,
+                application_name=runtime.application_name,
+                ssl_context=runtime.ssl_context,
+                on_unexpected_disconnect=lambda lane_id: runtime.unexpected_disconnect(
+                    lane_id,
+                    ordinal,
+                ),
+                key_cache=runtime.key_cache,
+            )
+            runtime.clients[ordinal] = client
+            try:
+                await loop.create_connection(
+                    lambda attempt=client: attempt,
+                    host=runtime.connect_host or str(runtime.database["host"]),
+                    port=int(runtime.database["port"]),
+                )
+                async with asyncio.timeout(CONNECT_TIMEOUT_SECONDS):
+                    await client.authenticated
+            except asyncio.CancelledError:
+                client.close()
+                raise
+            except Exception as exc:
+                code = _connect_failure_code(exc)
+                client.close()
+                if code in RETRYABLE_CONNECT_CODES:
+                    runtime.record_connection_diagnostic(
+                        ordinal=ordinal, stage="reconnect_retry", code=code
+                    )
+                    continue
+                runtime.terminal_failures += 1
+                runtime.failure_codes[code] = runtime.failure_codes.get(code, 0) + 1
+                runtime.record_connection_diagnostic(ordinal=ordinal, stage="reconnect", code=code)
+                return
+            completed_ns = time.monotonic_ns()
+            runtime.auth_methods.add(client.auth_method)
+            runtime.reconnected_after_reset += 1
+            runtime.held_now += 1
+            if not runtime.gate_frozen and runtime.held_now == runtime.target_clients:
+                runtime.target_elapsed_ns = completed_ns - runtime.t0_ns
+            runtime.record_connection_diagnostic(
+                ordinal=ordinal, stage="reconnect", code="server_reset_reconnected"
+            )
+            return
+    finally:
+        runtime.reconnects.pop(ordinal, None)
+        if window is not None:
+            window.end(completed_ns)
+
+
+async def _settle_reconnects(lanes: Sequence[LaneRuntime]) -> None:
+    """Wait, within `RECONNECT_SETTLE_SECONDS`, for every reconnect in flight to finish."""
+
+    pending = [task for lane in lanes for task in lane.reconnects.values()]
+    if pending:
+        await asyncio.wait(pending, timeout=RECONNECT_SETTLE_SECONDS)
 
 
 def _connect_failure_code(exc: Exception) -> str:
@@ -3208,12 +3372,35 @@ async def _sample_group(runtime: LaneRuntime, group_index: int) -> None:
         f"sample_group_{group_index}",
         phase="hold_sample",
     )
-    clients = [runtime.clients[index] for index in _sample_group_indices(runtime, group_index)]
+    indices = _sample_group_indices(runtime, group_index)
+    clients = [runtime.clients[index] for index in indices]
     runtime.sample_attempted += len(clients)
-    results = await asyncio.gather(
-        *(client.sample_select_one() for client in clients),
-        return_exceptions=True,
+    results: list[object] = list(
+        await asyncio.gather(
+            *(client.sample_select_one() for client in clients),
+            return_exceptions=True,
+        )
     )
+    # A check that met a client the server reset is asked once more, of the slot's reconnected
+    # client (`SERVER_RESET_RULE`): the slot's held connection is that one now. Any other failed
+    # check stays failed.
+    for position, (index, client) in enumerate(zip(indices, clients, strict=True)):
+        if not isinstance(results[position], BaseException):
+            continue
+        if index not in runtime.reconnects and runtime.clients[index] is client:
+            continue
+        pending = runtime.reconnects.get(index)
+        if pending is not None:
+            await asyncio.wait({pending}, timeout=RECONNECT_SETTLE_SECONDS)
+        replacement = runtime.clients[index]
+        if replacement is client or not replacement.ready or replacement.closed.done():
+            continue
+        try:
+            await replacement.sample_select_one()
+        except Exception as exc:
+            results[position] = exc
+        else:
+            results[position] = None
     successes = sum(not isinstance(result, BaseException) for result in results)
     runtime.sample_succeeded += successes
     runtime.sample_failed += len(results) - successes
@@ -3226,6 +3413,23 @@ async def _sample_group(runtime: LaneRuntime, group_index: int) -> None:
             )
 
 
+async def _hold_until_settled(window: HoldWindow, hold_started_ns: int) -> None:
+    """Hold on until HOLD_SECONDS after the lane's latest reconnect, with none in flight.
+
+    A reconnect that completed after the hold began means the lane held every client at once
+    only from then, so the hold starts again there, for every shard (`SERVER_RESET_RULE`).
+    """
+
+    limit_ns = hold_started_ns + int((HOLD_SECONDS + HOLD_RESTART_LIMIT_SECONDS) * 1e9)
+    while True:
+        latest_ns, in_flight = window.read()
+        end_ns = max(hold_started_ns, latest_ns) + HOLD_SECONDS * 1_000_000_000
+        now_ns = time.monotonic_ns()
+        if (in_flight == 0 and now_ns >= end_ns) or now_ns >= limit_ns:
+            return
+        await asyncio.sleep(0.1 if in_flight else min(0.1, (end_ns - now_ns) / 1e9))
+
+
 async def _hold_and_sample(
     lanes: Sequence[LaneRuntime],
     observers: Sequence[DirectObserver],
@@ -3236,6 +3440,7 @@ async def _hold_and_sample(
     telemetry_summary: TelemetrySummary,
     hold_started_ns: int | None = None,
     sample_groups: Sequence[int] = tuple(range(SAMPLE_GROUPS)),
+    hold_window: HoldWindow | None = None,
 ) -> tuple[float, bool]:
     hold_started_ns = hold_started_ns or time.monotonic_ns()
     observer_stop = asyncio.Event()
@@ -3303,6 +3508,9 @@ async def _hold_and_sample(
         remaining = HOLD_SECONDS - (time.monotonic_ns() - hold_started_ns) / 1_000_000_000
         if remaining > 0 and not telemetry_summary.hard_failures:
             await asyncio.sleep(remaining)
+        if hold_window is not None and not telemetry_summary.hard_failures:
+            _set_worker_operation("hold_restart_wait", phase="hold")
+            await _hold_until_settled(hold_window, hold_started_ns)
         if not telemetry_summary.hard_failures:
             observer_stop.set()
             observer_results = await asyncio.gather(
@@ -3389,6 +3597,7 @@ def _lane_result(
         "connection_diagnostics": list(runtime.connection_diagnostics),
         "retries": runtime.retries,
         "disconnected_during_hold": runtime.disconnected_during_hold,
+        "reconnected_after_reset": runtime.reconnected_after_reset,
         "time_to_target_ns": runtime.target_elapsed_ns,
         "time_to_target_ms": (
             runtime.target_elapsed_ns / 1_000_000 if runtime.target_elapsed_ns is not None else None
@@ -3837,6 +4046,9 @@ def aggregate_worker_results(
                 "disconnected_during_hold": sum(
                     int(value["disconnected_during_hold"]) for value in values
                 ),
+                "reconnected_after_reset": sum(
+                    int(value["reconnected_after_reset"]) for value in values
+                ),
                 # The 10K clock stops only when the parent has validated all
                 # four exact-held proofs. Individual authentication timestamps
                 # can precede that synchronized gate and are diagnostic only.
@@ -3982,13 +4194,20 @@ async def execute_fanin(
     partition_target_clients: int = TARGET_CLIENTS_PER_LANE,
     await_release: Callable[[], Awaitable[int]] | None = None,
     await_hold: Callable[
-        [Callable[[], Mapping[str, Mapping[str, object]]]],
+        [
+            Callable[
+                [],
+                Mapping[str, Mapping[str, object]]
+                | Awaitable[Mapping[str, Mapping[str, object]]],
+            ]
+        ],
         Awaitable[int],
     ]
     | None = None,
     before_teardown: Callable[[], Awaitable[None]] | None = None,
     worker_cpu: int | None = None,
     capacity_preflight_verified: bool = False,
+    hold_window: HoldWindow | None = None,
 ) -> dict[str, object]:
     global _runtime_diagnostics, _socket_states_cache_ns
     global _worker_execution_context
@@ -4044,6 +4263,7 @@ async def execute_fanin(
     lanes: list[LaneRuntime] = []
     observers: list[DirectObserver] = []
     key_cache = ScramKeyCache()
+    window = hold_window if hold_window is not None else HoldWindow.local()
     for lane_id in lane_order:
         target = targets[lane_id]
         database = dict(target.get("database") or {})
@@ -4064,6 +4284,9 @@ async def execute_fanin(
             ssl_context=ssl_context,
             key_cache=key_cache,
             target_clients=partition_target_clients,
+            # One window for the shard's lanes (a runner runs one): the parent shares it across
+            # the lane's shards in a pooled run (SERVER_RESET_RULE).
+            hold_window=window,
         )
         lanes.append(runtime)
         observers.append(DirectObserver(lane_id, observer_database, application_name))
@@ -4133,6 +4356,9 @@ async def execute_fanin(
     for lane in lanes:
         ready_ns[lane.lane_id] = time.monotonic_ns()
     release_ns = await await_release() if await_release is not None else time.monotonic_ns()
+    for lane in lanes:
+        lane.t0_ns = release_ns
+        lane.reconnect_enabled = True
     start_cpu = time.process_time()
     telemetry_summary = TelemetrySummary()
     diagnostic_evidence: dict[str, object] = {}
@@ -4230,7 +4456,13 @@ async def execute_fanin(
                 for lane in lanes
             }
 
-        ramp_proof = current_ramp_proof()
+        async def settled_ramp_proof() -> dict[str, dict[str, object]]:
+            # A client the server reset just before a proof is still being reconnected: the
+            # proof counts the shard once that has finished, either way (SERVER_RESET_RULE).
+            await _settle_reconnects(lanes)
+            return current_ramp_proof()
+
+        ramp_proof = await settled_ramp_proof()
         if (
             telemetry_summary.verified
             and all(
@@ -4244,8 +4476,11 @@ async def execute_fanin(
             )
         ):
             _set_worker_operation("await_shared_hold", phase="hold_barrier")
+            # The gate's time stops here; a reconnect from now on restarts the hold instead.
+            for lane in lanes:
+                lane.gate_frozen = True
             shared_hold_started_ns = (
-                await await_hold(current_ramp_proof)
+                await await_hold(settled_ramp_proof)
                 if await_hold is not None
                 else time.monotonic_ns()
             )
@@ -4261,7 +4496,10 @@ async def execute_fanin(
                     telemetry_summary=telemetry_summary,
                     hold_started_ns=shared_hold_started_ns,
                     sample_groups=tuple(range(worker_index, SAMPLE_GROUPS, worker_count)),
+                    hold_window=window,
                 )
+        for lane in lanes:
+            lane.reconnect_enabled = False
         launches = [lane.first_launch_ns for lane in lanes if lane.first_launch_ns is not None]
         launch_skew_ms = (
             (max(launches) - min(launches)) / 1_000_000 if len(launches) == 2 else math.inf
@@ -4297,7 +4535,8 @@ async def execute_fanin(
                 and int(lane["cancelled_clients"]) == 0
                 and int(lane["held_clients_at_gate"]) == partition_target_clients
                 and int(lane["terminal_failures"]) == 0
-                and int(lane["disconnected_during_hold"]) == 0
+                # Every held client the server reset was reconnected (SERVER_RESET_RULE).
+                and int(lane["disconnected_during_hold"]) == int(lane["reconnected_after_reset"])
                 and int(lane["sampled_queries_attempted"]) == expected_worker_samples
                 and int(lane["sampled_queries_succeeded"]) == expected_worker_samples
                 and int(lane["sampled_queries_failed"]) == 0
@@ -4354,6 +4593,15 @@ async def execute_fanin(
         raise
     finally:
         try:
+            # A reconnect still in flight (a towel, or a hold that ended at its limit) is stopped
+            # before the sockets are torn down, so none is opened behind the cleanup.
+            for lane in lanes:
+                lane.reconnect_enabled = False
+            stray = [task for lane in lanes for task in lane.reconnects.values()]
+            for task in stray:
+                task.cancel()
+            if stray:
+                await asyncio.shield(asyncio.gather(*stray, return_exceptions=True))
             if before_teardown is not None and lanes:
                 await asyncio.shield(before_teardown())
             cleanup_verified = await asyncio.shield(_close_everything(lanes, observers))

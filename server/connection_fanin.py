@@ -515,6 +515,9 @@ def fanin_config_sha256() -> str:
             "bounded-in-flight-unbounded-drain"
         ),
         "sample_schedule": "eight-groups-offset-250ms",
+        # runner/round5_fanin.py's SERVER_RESET_RULE and HOLD_RESTART_LIMIT_SECONDS (v1.3.0).
+        "server_reset_rule": "reconnect-in-slot-within-retry-budget-hold-restarts",
+        "hold_restart_limit_seconds": 120.0,
         "tls_mode": "verify-full",
         "client_role": "anti_demo_burst",
         "observer_role": "anti_demo_observer",
@@ -793,6 +796,9 @@ class ConnectionSpikeLaneResult:
     observer_connection_states: tuple[str, ...] = ()
     cancelled_clients: int = 0
     connection_diagnostics: tuple[Mapping[str, object], ...] = ()
+    #: Held clients the server reset that the runner reconnected (v1.3.0, the runner's
+    #: SERVER_RESET_RULE). The lane verifies only if it reconnected every one it lost.
+    reconnected_after_reset: int = 0
 
     @property
     def verified(self) -> bool:
@@ -977,6 +983,7 @@ def finalize_lane(
     connection_diagnostics = tuple(dict(item) for item in raw_connection_diagnostics)
     retries = _count(raw, "retries")
     disconnected = _count(raw, "disconnected_during_hold")
+    reconnected = _count(raw, "reconnected_after_reset")
     attempted = _count(raw, "sampled_queries_attempted")
     succeeded = _count(raw, "sampled_queries_succeeded")
     failed = _count(raw, "sampled_queries_failed")
@@ -1139,7 +1146,10 @@ def finalize_lane(
         and initiated == authenticated + terminal_failures + cancelled
         and sum(failure_codes.values()) == terminal_failures
         and 0 <= retries <= MAX_RETRIES
-        and disconnected == 0
+        # A held client the server reset is reconnected in its slot, as a retry; the lane holds
+        # its exact count only if every one was (the runner's SERVER_RESET_RULE).
+        and disconnected == reconnected
+        and reconnected <= retries
     )
     hold = hold_ms >= HOLD_SECONDS * 1_000
     samples = (
@@ -1239,6 +1249,7 @@ def finalize_lane(
         failure_codes=failure_codes,
         retries=retries,
         disconnected_during_hold=disconnected,
+        reconnected_after_reset=reconnected,
         time_to_target_ns=target_ns,
         time_to_target_ms=target_ms,
         hold_elapsed_ms=hold_ms,
