@@ -408,6 +408,8 @@ async def test_run_uses_one_barrier_and_the_identical_full_sql_proof() -> None:
 
     result = await engine.run(arm, capture)
 
+    # The run checks each source again after the bell, and says nothing about being ready for it.
+    assert not any(event.status.startswith(LANE_READY_PREFIX) for event in progress)
     assert result.all_verified is True
     assert result.lanes["lakebase"].state == SafeChangeLaneState.VERIFIED
     assert result.lanes["competitor"].state == SafeChangeLaneState.VERIFIED

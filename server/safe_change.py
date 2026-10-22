@@ -717,11 +717,22 @@ class SafeChangeEngine:
         on_progress: ProgressCallback | None = None,
     ) -> SafeChangeArm:
         plans = self.plans_for(competitor)
+
+        async def preflight_and_say(plan: SafeChangePlan) -> Mapping[str, object]:
+            evidence = await self._preflight_lane(plan, on_progress, cleanup_existing=True)
+            # This lane's own line ends here, while the other may still be waiting. Said here,
+            # not in `_preflight_lane`, which `run` repeats after the bell. Still PREFLIGHT: ARMED
+            # comes once for each lane, after both.
+            await self._emit(
+                on_progress,
+                plan,
+                SafeChangePhase.PREFLIGHT,
+                f"{LANE_READY_PREFIX} · Source verified clean",
+            )
+            return evidence
+
         checks = await asyncio.gather(
-            *(
-                self._preflight_lane(plan, on_progress, cleanup_existing=True)
-                for plan in plans
-            ),
+            *(preflight_and_say(plan) for plan in plans),
             return_exceptions=True,
         )
         errors = [
@@ -927,9 +938,6 @@ class SafeChangeEngine:
                     await self._assert_source_clean(source)
                 finally:
                     await self._close(source)
-                # This lane's own line ends here, while the other may still be waiting. Still
-                # PREFLIGHT: `arm` says ARMED once for each lane, after both.
-                await say(f"{LANE_READY_PREFIX} · Source verified clean")
                 return evidence
         except TimeoutError as exc:
             raise SafeChangeNotArmedError(
