@@ -1731,7 +1731,7 @@ async def test_a_reconnect_in_the_hold_restarts_it_and_the_restart_is_bounded(
     window.begin()
     await asyncio.sleep(0.1)
     window.end(time.monotonic_ns())  # one shard's reconnect completes 0.1 s into the hold
-    await hold
+    assert await hold is True
     # The hold ran its 0.2 s again from the reconnect, not from its own start. (The upper bound
     # is loose: a slow CI runner oversleeps.)
     assert 0.29 <= (time.monotonic_ns() - started_ns) / 1e9 < 1.5
@@ -1739,8 +1739,80 @@ async def test_a_reconnect_in_the_hold_restarts_it_and_the_restart_is_bounded(
     stuck = runner.HoldWindow.local()
     stuck.begin()  # a reconnect that never finishes
     started_ns = time.monotonic_ns()
-    await runner._hold_until_settled(stuck, started_ns)
+    assert await runner._hold_until_settled(stuck, started_ns) is False
     assert 0.69 <= (time.monotonic_ns() - started_ns) / 1e9 < 2.0
+
+    # A reconnect that finished too late to hold its 0.2 s again before the limit, with none
+    # left in flight: every reset was reconnected, but no 0.2 s ever held every client at once.
+    late = runner.HoldWindow.local()
+    started_ns = time.monotonic_ns()
+    late.begin()
+    late.end(started_ns + int(0.6e9))
+    assert await runner._hold_until_settled(late, started_ns) is False
+    assert 0.69 <= (time.monotonic_ns() - started_ns) / 1e9 < 2.0
+
+
+async def test_a_hold_the_restart_limit_ends_unsettled_fails_its_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without this, a lane whose resets were all reconnected, the last one under 30 s before
+    the limit ended the hold, verified with no 30 s that held all 10,000 at once."""
+
+    monkeypatch.setattr(runner, "HOLD_RESTART_LIMIT_SECONDS", 0.2)
+
+    async def sample_group(runtime, unused_group):
+        runtime.sample_attempted += runner.CLIENTS_PER_SAMPLE_GROUP
+        runtime.sample_succeeded += runner.CLIENTS_PER_SAMPLE_GROUP
+
+    async def telemetry(*unused_args, **unused_kwargs):
+        return {
+            "physical_memory_bytes": 15 * 1024**3,
+            "available_memory_bytes": 7 * 1024**3,
+            "rss_bytes": 100 * 1024**2,
+            "fd_soft_limit": 65_535,
+            "open_fds": 7,
+            "ephemeral_port_count": 28_232,
+            "ephemeral_ports_in_use": 10_000,
+            "ephemeral_ports_remaining": 18_232,
+            "event_loop_p99_ms": 5.0,
+            "cpu_capacity_fraction": 0.5,
+        }
+
+    class Observer:
+        async def sample(self):
+            return True
+
+    monkeypatch.setattr(runner, "_sample_group", sample_group)
+    monkeypatch.setattr(runner, "_telemetry_off_loop", telemetry)
+    monkeypatch.setattr(runner, "_progress", lambda unused: None)
+
+    async def hold(window: runner.HoldWindow, hold_started_ns: int) -> runner.LaneRuntime:
+        lane = _reset_runtime()
+        await runner._hold_and_sample(
+            [lane],
+            [Observer()],
+            t0_ns=hold_started_ns,
+            start_cpu=0.0,
+            network_start=(0, 0),
+            telemetry_summary=runner.TelemetrySummary(),
+            hold_started_ns=hold_started_ns,
+            hold_window=window,
+        )
+        return lane
+
+    # The hold's own 30 s are over, with no reconnect: it settles, and the lane is untouched.
+    settled = await hold(
+        runner.HoldWindow.local(), time.monotonic_ns() - runner.HOLD_SECONDS * 1_000_000_000)
+    assert (settled.terminal_failures, settled.failure_codes) == (0, {})
+
+    # A reconnect has just finished, with only 0.2 s of limit left to hold 30 s again in.
+    hold_started_ns = time.monotonic_ns() - runner.HOLD_SECONDS * 1_000_000_000
+    window = runner.HoldWindow.local()
+    window.begin()
+    window.end(time.monotonic_ns())
+    unsettled = await hold(window, hold_started_ns)
+    assert unsettled.failure_codes == {"hold_restart_unsettled": 1}
+    assert unsettled.terminal_failures == 1
 
 
 def test_the_lane_counts_each_shards_reconnects() -> None:

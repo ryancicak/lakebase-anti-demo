@@ -165,8 +165,9 @@ SERVER_RESET_RULE = "reconnect-in-slot-within-retry-budget-hold-restarts"
 RECONNECT_SETTLE_SECONDS = MAX_RETRIES_PER_CLIENT * (
     CONNECT_TIMEOUT_SECONDS + max(CONNECT_RETRY_BACKOFF_SECONDS)
 )
-#: The most reconnects may draw a hold out past its own HOLD_SECONDS. Past it the hold ends
-#: wherever it stands, and a client still being reconnected fails the lane's exact gate.
+#: The most reconnects may draw a hold out past its own HOLD_SECONDS. A hold still unsettled
+#: there ends, and fails its lane (`hold_restart_unsettled`): the lane never held all its
+#: clients for HOLD_SECONDS at once.
 HOLD_RESTART_LIMIT_SECONDS = 120.0
 OBSERVER_READY_TIMEOUT_SECONDS = 120.0
 OBSERVER_RETRY_SECONDS = 0.5
@@ -3413,11 +3414,13 @@ async def _sample_group(runtime: LaneRuntime, group_index: int) -> None:
             )
 
 
-async def _hold_until_settled(window: HoldWindow, hold_started_ns: int) -> None:
+async def _hold_until_settled(window: HoldWindow, hold_started_ns: int) -> bool:
     """Hold on until HOLD_SECONDS after the lane's latest reconnect, with none in flight.
 
     A reconnect that completed after the hold began means the lane held every client at once
     only from then, so the hold starts again there, for every shard (`SERVER_RESET_RULE`).
+    False if `HOLD_RESTART_LIMIT_SECONDS` ran out first, with a reconnect in flight or one too
+    recent: no HOLD_SECONDS ever held every client at once.
     """
 
     limit_ns = hold_started_ns + int((HOLD_SECONDS + HOLD_RESTART_LIMIT_SECONDS) * 1e9)
@@ -3425,8 +3428,10 @@ async def _hold_until_settled(window: HoldWindow, hold_started_ns: int) -> None:
         latest_ns, in_flight = window.read()
         end_ns = max(hold_started_ns, latest_ns) + HOLD_SECONDS * 1_000_000_000
         now_ns = time.monotonic_ns()
-        if (in_flight == 0 and now_ns >= end_ns) or now_ns >= limit_ns:
-            return
+        if in_flight == 0 and now_ns >= end_ns:
+            return True
+        if now_ns >= limit_ns:
+            return False
         await asyncio.sleep(0.1 if in_flight else min(0.1, (end_ns - now_ns) / 1e9))
 
 
@@ -3510,7 +3515,12 @@ async def _hold_and_sample(
             await asyncio.sleep(remaining)
         if hold_window is not None and not telemetry_summary.hard_failures:
             _set_worker_operation("hold_restart_wait", phase="hold")
-            await _hold_until_settled(hold_window, hold_started_ns)
+            if not await _hold_until_settled(hold_window, hold_started_ns):
+                for lane in lanes:
+                    lane.terminal_failures += 1
+                    lane.failure_codes["hold_restart_unsettled"] = (
+                        lane.failure_codes.get("hold_restart_unsettled", 0) + 1
+                    )
         if not telemetry_summary.hard_failures:
             observer_stop.set()
             observer_results = await asyncio.gather(
