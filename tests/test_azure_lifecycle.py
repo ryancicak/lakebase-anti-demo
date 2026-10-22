@@ -348,6 +348,70 @@ def test_an_ambient_aws_setting_is_not_an_input(monkeypatch) -> None:
     assert not [name for name in vars(read) if "aws" in name.lower()]
 
 
+class FakeApps:
+    """`databricks apps get` and `create` as `subprocess.run` answers. A create makes the App, then
+    exits non-zero if `create_fails`, as it did on 2026-10-22."""
+
+    def __init__(self, *, create_fails: bool, made_by: str = "operator@example.com",
+                 made_at: str = "2026-10-19T21:30:00Z") -> None:
+        self.app: dict[str, Any] | None = None
+        self.create_fails, self.made_by, self.made_at = create_fails, made_by, made_at
+        self.calls: list[str] = []
+
+    def __call__(self, arguments: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        verb = arguments[2]
+        self.calls.append(verb)
+        if verb == "get":
+            if self.app is None:
+                return subprocess.CompletedProcess(arguments, 1, "", "Error: does not exist")
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(self.app), "")
+        assert verb == "create"
+        self.app = {"name": arguments[3], "creator": self.made_by, "create_time": self.made_at,
+                    "description": arguments[5], "service_principal_client_id": "app-client-1"}
+        if self.create_fails:
+            return subprocess.CompletedProcess(
+                arguments, 1, "", "Error: the App's compute is starting\nTo view app logs, run:\n"
+                "  databricks apps logs anti-demo-test")
+        return subprocess.CompletedProcess(arguments, 0, json.dumps(self.app), "")
+
+
+def test_an_app_whose_create_failed_after_making_it_is_adopted(tmp_path, monkeypatch) -> None:
+    # 2026-10-22: `apps create` exited non-zero about 25 s in, while the App's compute was still
+    # starting, and the compute came up by itself. The install's rerun then refused the App as a
+    # stranger's, and an uninstall would have left it running.
+    from server.azure_lifecycle import ensure_app
+
+    generation = Generation(tmp_path / ".anti-demo-azure")
+    generation.ensure()
+    apps = FakeApps(create_fails=True)
+    monkeypatch.setattr("server.azure_lifecycle.subprocess.run", apps)
+    assert ensure_app(generation, "p", "anti-demo-test", manifest()) == "app-client-1"
+    assert json.loads((generation.root / "app.json").read_text()) == {
+        "name": "anti-demo-test", "created": True, "client_id": "app-client-1"}
+    # Run again, it is this installation's by its record, and nothing else is made.
+    assert ensure_app(generation, "p", "anti-demo-test", manifest()) == "app-client-1"
+    assert apps.calls.count("create") == 1
+
+
+@pytest.mark.parametrize(("made_by", "made_at"), [
+    ("someone@example.com", "2026-10-19T21:30:00Z"),  # another user's
+    ("operator@example.com", "2026-10-18T09:00:00Z"),  # from before this installation was sealed
+])
+def test_an_app_this_installation_cannot_prove_it_made_is_never_adopted(
+    tmp_path, monkeypatch, made_by: str, made_at: str,
+) -> None:
+    from server.azure_lifecycle import ensure_app
+
+    generation = Generation(tmp_path / ".anti-demo-azure")
+    generation.ensure()
+    monkeypatch.setattr("server.azure_lifecycle.subprocess.run",
+                        FakeApps(create_fails=True, made_by=made_by, made_at=made_at))
+    with pytest.raises(AzureSetupError, match="could not create the Databricks App anti-demo-test"):
+        ensure_app(generation, "p", "anti-demo-test", manifest())
+    with pytest.raises(AzureSetupError, match="this installation didn't make it"):
+        ensure_app(generation, "p", "anti-demo-test", manifest())
+
+
 def test_a_manifest_and_its_variables_round_trip_through_the_generation(tmp_path) -> None:
     from server.manifest import load_manifest, save_manifest
 

@@ -699,38 +699,89 @@ def ensure_unity_catalog(
         catalog=names["catalog"], app_service_credential=credential)})
 
 
-def ensure_app(generation: Generation, profile: str, app_name: str) -> str:
+#: What every App this installer makes says about itself (`databricks apps create --description`).
+APP_DESCRIPTION = "Lakebase: The Anti-Demo (Azure edition)"
+
+
+def app_made_by_installation(live: Mapping[str, Any], manifest: DemoManifest) -> bool:
+    """Whether a live App is the one this installation asked for, though its create never said so.
+
+    `databricks apps create` waits for the App's compute, and it can exit non-zero after the App
+    exists. On 2026-10-22 it failed about 25 s in, while the compute was still starting, and the
+    compute came up by itself. The install's record then said only that a create was pending: a
+    rerun refused the App as a stranger's, and an uninstall would have left it running.
+
+    Such an App is this installation's when three things hold. This installation's Databricks user
+    created it, with the installer's own description, and after the installation was sealed. An
+    App of the same name from an earlier installation was created before that.
+    """
+
+    try:
+        created = datetime.fromisoformat(str(live.get("create_time") or ""))
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    user = manifest.databricks.user.strip().casefold()
+    return (
+        bool(user)
+        and str(live.get("creator") or "").strip().casefold() == user
+        and live.get("description") == APP_DESCRIPTION
+        and created >= manifest.created_at - timedelta(minutes=1)
+    )
+
+
+def ensure_app(generation: Generation, profile: str, app_name: str, manifest: DemoManifest) -> str:
     """The Databricks App, made by this installation, and its service principal's client ID.
 
     An App of that name that this installation didn't make is refused, never adopted: its
-    principal would be handed every grant below.
+    principal would be handed every grant below. One whose create didn't confirm is adopted only
+    if `app_made_by_installation` proves it this installation's.
     """
 
     record_path = generation.root / "app.json"
     record = json.loads(record_path.read_text(encoding="utf-8")) if record_path.exists() else {}
-    existing = subprocess.run(["databricks", "apps", "get", app_name, "-p", profile, "-o", "json"],
-                              capture_output=True, text=True, timeout=120, check=False)
-    if existing.returncode == 0:
-        client_id = str(json.loads(existing.stdout).get("service_principal_client_id") or "")
-        if record.get("name") != app_name or record.get("client_id") != client_id:
-            raise AzureSetupError(f"a Databricks App named {app_name} already exists and this "
-                                  "installation didn't make it: set DATABRICKS_APP_NAME to another")
+
+    def live_app() -> dict[str, Any] | None:
+        found = subprocess.run(["databricks", "apps", "get", app_name, "-p", profile, "-o", "json"],
+                               capture_output=True, text=True, timeout=120, check=False)
+        return json.loads(found.stdout) if found.returncode == 0 else None
+
+    def adopt(app: Mapping[str, Any]) -> str:
+        client_id = str(app.get("service_principal_client_id") or "")
+        if not client_id:
+            raise AzureSetupError("the new Databricks App returned no service principal")
+        _private(record_path, json.dumps({"name": app_name, "created": True,
+                                          "client_id": client_id}) + "\n")
         return client_id
+
+    existing = live_app()
+    if existing is not None:
+        client_id = str(existing.get("service_principal_client_id") or "")
+        if record.get("name") == app_name and record.get("client_id") == client_id:
+            return client_id
+        if (record.get("name") == app_name and record.get("creation_pending")
+                and app_made_by_installation(existing, manifest)):
+            print(f"ADOPT Databricks App {app_name}: this installation made it, though its "
+                  "create didn't confirm", flush=True)
+            return adopt(existing)
+        raise AzureSetupError(f"a Databricks App named {app_name} already exists and this "
+                              "installation didn't make it: set DATABRICKS_APP_NAME to another")
     _private(record_path, json.dumps({"name": app_name, "creation_pending": True}) + "\n")
     print(f"CREATE Databricks App {app_name} (its compute starts now)", flush=True)
     created = subprocess.run(
-        ["databricks", "apps", "create", app_name, "--description",
-         "Lakebase: The Anti-Demo (Azure edition)", "-p", profile, "-o", "json"],
+        ["databricks", "apps", "create", app_name, "--description", APP_DESCRIPTION,
+         "-p", profile, "-o", "json"],
         capture_output=True, text=True, timeout=1800, check=False)
     if created.returncode != 0:
+        made = live_app()
+        if made is not None and app_made_by_installation(made, manifest):
+            print(f"ADOPT Databricks App {app_name}: `apps create` failed after making it "
+                  f"({_tail(created, 8).replace(chr(10), ' | ')})", flush=True)
+            return adopt(made)
         raise AzureSetupError(
-            f"could not create the Databricks App {app_name}: {_tail(created, 3)}")
-    client_id = str(json.loads(created.stdout).get("service_principal_client_id") or "")
-    if not client_id:
-        raise AzureSetupError("the new Databricks App returned no service principal")
-    _private(record_path, json.dumps({"name": app_name, "created": True,
-                                      "client_id": client_id}) + "\n")
-    return client_id
+            f"could not create the Databricks App {app_name}: {_tail(created, 8)}")
+    return adopt(json.loads(created.stdout))
 
 
 def prepare_round4_source(manifest: DemoManifest, warehouse_id: str) -> None:
@@ -948,7 +999,7 @@ class AzureSetup:
             save_manifest(manifest, self.generation.manifest)
         sealed_uc = _azure(manifest).unity_catalog
         assert sealed_uc is not None
-        app_client_id = ensure_app(self.generation, profile, self.inputs.app_name)
+        app_client_id = ensure_app(self.generation, profile, self.inputs.app_name, manifest)
         os.environ.update({"DATABRICKS_WAREHOUSE_ID": self.inputs.warehouse_id,
                            "DATABRICKS_APP_CLIENT_ID": app_client_id,
                            lifecycle.ROUND4_CATALOG_ENV: sealed_uc.catalog,

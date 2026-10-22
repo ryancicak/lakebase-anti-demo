@@ -46,6 +46,7 @@ from .azure_lifecycle import (
     Terraform,
     _get_or_none,
     _tail,
+    app_made_by_installation,
     arm_client,
     only_retryable,
     uc_names,
@@ -131,14 +132,28 @@ class AzureUninstall:
         self.inputs = inputs
         self.generation = generation or Generation()
 
-    def _app(self) -> tuple[str, str] | None:
-        """The App this installation made, by its record, or None."""
+    def _app(self, manifest: DemoManifest) -> tuple[str, str] | None:
+        """The App this installation made, by its record, or None.
+
+        A record that says only that a create was pending names an App that may stand anyway:
+        its create can fail after making it (`app_made_by_installation`). Such an App is removed
+        only on the same proof that adopts it.
+        """
 
         path = self.generation.root / "app.json"
         record = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        if not record.get("created") or not record.get("client_id"):
+        if record.get("created") and record.get("client_id"):
+            return str(record["name"]), str(record["client_id"])
+        if not record.get("creation_pending") or not record.get("name"):
             return None
-        return str(record["name"]), str(record["client_id"])
+        live = _databricks(self.inputs.databricks_profile, "apps", "get", str(record["name"]))
+        if live.returncode != 0:
+            return None
+        app = json.loads(live.stdout)
+        client_id = str(app.get("service_principal_client_id") or "")
+        if not client_id or not app_made_by_installation(app, manifest):
+            return None
+        return str(record["name"]), client_id
 
     def run(self, *, yes: bool) -> Removal:
         from databricks.sdk import WorkspaceClient
@@ -151,7 +166,7 @@ class AzureUninstall:
         workspace = WorkspaceClient(profile=profile)
         arm = arm_client(self.inputs)
         names = uc_names(manifest)
-        app = self._app()
+        app = self._app(manifest)
         report = Removal()
         scope = secret_scope_name(self.inputs.app_name, manifest.run_id)
         # Only what is there: each one asked for by its own name.

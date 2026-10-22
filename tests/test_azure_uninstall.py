@@ -167,6 +167,36 @@ def test_an_uninstall_run_again_skips_what_an_earlier_run_removed(tmp_path, monk
     assert list(tmp_path.glob(".anti-demo-azure.removed-*"))
 
 
+def test_an_app_whose_create_never_confirmed_is_removed_only_if_provably_this_installations(
+    tmp_path, monkeypatch,
+) -> None:
+    # Its create can fail after making it (2026-10-22), and the record then says only "pending".
+    import subprocess
+    from datetime import timedelta
+
+    from server.azure_lifecycle import APP_DESCRIPTION
+
+    base = azure_manifest()
+    manifest = azure_manifest(
+        databricks=base.databricks.model_copy(update={"user": "operator@example.com"}))
+    generation = Generation(tmp_path / ".anti-demo-azure")
+    generation.ensure()
+    (generation.root / "app.json").write_text(
+        json.dumps({"name": "lakebase-anti-demo", "creation_pending": True}))
+    live = {"name": "lakebase-anti-demo", "creator": "operator@example.com",
+            "create_time": (manifest.created_at + timedelta(minutes=20)).isoformat(),
+            "description": APP_DESCRIPTION, "service_principal_client_id": "app-client"}
+    monkeypatch.setattr(azure_uninstall, "_databricks", lambda _profile, *args, **_k: (
+        subprocess.CompletedProcess(args, 0, json.dumps(live), "")))
+    inputs = AzureInputs(databricks_profile="p", tenant_id="t", subscription_id="s",
+                         resource_group="rg-test", region="westus2", owner="o",
+                         operator_cidr="192.0.2.10/32")
+    uninstall = AzureUninstall(inputs, generation)
+    assert uninstall._app(manifest) == ("lakebase-anti-demo", "app-client")
+    live["creator"] = "someone@example.com"  # not this installation's to remove
+    assert uninstall._app(manifest) is None
+
+
 def test_the_factory_is_found_in_terraforms_state_when_no_lane_sealed(tmp_path) -> None:
     generation = Generation(tmp_path / ".anti-demo-azure")
     generation.ensure()
