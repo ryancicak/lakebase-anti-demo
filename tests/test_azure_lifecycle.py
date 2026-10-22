@@ -412,6 +412,29 @@ def test_an_app_this_installation_cannot_prove_it_made_is_never_adopted(
         ensure_app(generation, "p", "anti-demo-test", manifest())
 
 
+def test_a_workspace_path_that_never_existed_reads_absent_and_a_refusal_does_not() -> None:
+    # 2026-10-22: an install that had made its App, but not yet synced the App's source, stopped
+    # its uninstall at "Path (...) doesn't exist.", the SDK's ResourceDoesNotExist.
+    from databricks.sdk.errors import PermissionDenied, ResourceDoesNotExist
+
+    from server.azure_lifecycle import _get_or_none
+
+    def missing() -> Any:
+        raise ResourceDoesNotExist(
+            "Path (/Workspace/Users/operator@example.com/anti-demo-test) doesn't exist.")
+
+    def missing_in_words() -> Any:  # the same answer, as plain text
+        raise RuntimeError("Path (/Workspace/Users/operator@example.com/x) doesn't exist.")
+
+    def refused() -> Any:
+        raise PermissionDenied("User does not have READ permission on the path")
+
+    assert _get_or_none(missing) is None
+    assert _get_or_none(missing_in_words) is None
+    with pytest.raises(PermissionDenied):
+        _get_or_none(refused)
+
+
 def test_a_manifest_and_its_variables_round_trip_through_the_generation(tmp_path) -> None:
     from server.manifest import load_manifest, save_manifest
 

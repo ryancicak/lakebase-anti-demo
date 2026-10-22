@@ -617,8 +617,17 @@ def _output(outputs: Mapping[str, Any], name: str) -> dict[str, Any]:
 
 
 def _absent(error: BaseException) -> bool:
+    # Any of the SDK's NotFound family is absent, whatever it says. Its `ResourceDoesNotExist`
+    # for a workspace path says "Path (...) doesn't exist.", which the words below missed: it
+    # stopped an uninstall of an install that had made its App but not yet synced the App's
+    # source (2026-10-22). The words still serve errors that reach here as text (a gateway's 404).
+    from databricks.sdk.errors import NotFound
+
+    if isinstance(error, NotFound):
+        return True
     text = f"{type(error).__name__} {error}".lower()
     return any(marker in text for marker in ("notfound", "not found", "does not exist",
+                                              "doesn't exist", "resourcedoesnotexist",
                                               "resource_does_not_exist"))
 
 
