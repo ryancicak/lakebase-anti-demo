@@ -3281,9 +3281,11 @@ def test_callback_profiling_cpu_overhead_is_bounded() -> None:
         # that really spent 50us of CPU, and that is checked by count, because timing
         # cannot see it. With every callback classified the probe measured 0.83us per
         # callback against 0.33us as shipped on Apple silicon: 3.0x a bare callback,
-        # under both time bounds below. The 1% is slack for the slow callbacks.
+        # under both time bounds below. The slack is for the slow callbacks: a shared CI
+        # runner counted 1.24% of these no-op callbacks at 50us of CPU (2026-10-22, when 1%
+        # was allowed). 5% leaves room for that and still fails a probe that samples 1 in 8.
         assert handled >= callbacks
-        assert classified <= handled // 16 + handled // 100, (
+        assert classified <= handled // 16 + handled // 20, (
             f"the probe classified {classified} of {handled} callbacks; it samples 1 in 16"
         )
     baseline_ms = min(baseline_runs)
