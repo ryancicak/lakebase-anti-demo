@@ -174,3 +174,68 @@ def test_the_factory_is_found_in_terraforms_state_when_no_lane_sealed(tmp_path) 
     generation.state.write_text(json.dumps(
         {"outputs": {"data_factory": {"value": {"name": "adf-test"}}}}), encoding="utf-8")
     assert azure_uninstall._factory_of(generation) == "adf-test"
+
+
+def _unsealed_uninstall(
+    tmp_path, monkeypatch, *, deletes: bool
+) -> tuple[Any, list[str], list[str]]:
+    """An uninstall of an install that stopped before it sealed its Lakebase projects, all seven of
+    which Lakebase made. `deletes` is whether a delete takes a project away."""
+
+    manifest = azure_manifest(status="provisioning", round_environments=None,
+                              coordination_environment=None)
+    generation = Generation(tmp_path / ".anti-demo-azure")
+    generation.ensure()
+    save_manifest(manifest, generation.manifest)
+    compact = str(manifest.installation_id).replace("-", "")
+    made = [*(f"anti-demo-{compact}-r{number}" for number in range(1, 7)),
+            f"anti-demo-{compact}-coord"]
+    standing, deleted = set(made), []
+
+    def delete(_manifest: Any, _profile: str, project_id: str) -> None:
+        deleted.append(project_id)
+        if deletes:
+            standing.discard(project_id)
+
+    async def settled(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr("databricks.sdk.WorkspaceClient", lambda **_k: Workspace())
+    monkeypatch.setattr(azure_uninstall, "arm_client", lambda _inputs: object())
+    monkeypatch.setattr(azure_uninstall, "inventory", lambda _arm, _run: [])
+    monkeypatch.setattr(azure_uninstall, "settle", settled)
+    monkeypatch.setattr(AzureUninstall, "_destroy", lambda self: None)
+    monkeypatch.setattr(
+        "server.lifecycle._get_lakebase_project_or_none",
+        lambda _manifest, project_id: {"name": project_id} if project_id in standing else None)
+    monkeypatch.setattr("server.lifecycle._delete_lakebase_project", delete)
+    inputs = AzureInputs(databricks_profile="p", tenant_id="t", subscription_id="s",
+                         resource_group="rg-test", region="westus2", owner="o",
+                         operator_cidr="192.0.2.10/32")
+    return (lambda: AzureUninstall(inputs, generation).run(yes=True)), made, deleted
+
+
+def test_an_install_that_stopped_before_its_seals_has_its_lakebase_projects_removed(
+    tmp_path, monkeypatch
+) -> None:
+    # 2026-10-22: an install stopped on a transient error as it made the coordination project,
+    # before it sealed any. Reading the seals alone, the uninstall would have left all seven
+    # standing and said ALL GONE.
+    run, made, deleted = _unsealed_uninstall(tmp_path, monkeypatch, deletes=True)
+    report = run()
+    assert deleted == made
+    assert report.survivors == []
+    assert list(tmp_path.glob(".anti-demo-azure.removed-*"))
+
+
+def test_all_gone_needs_the_databricks_side_gone_too(tmp_path, monkeypatch) -> None:
+    import pytest
+
+    from server.azure_lifecycle import AzureSetupError
+
+    run, made, _ = _unsealed_uninstall(tmp_path, monkeypatch, deletes=False)
+    with pytest.raises(AzureSetupError, match="7 resources of run .* survive: not ALL GONE"):
+        run()
+    # Not archived: the next run finds the installation and asks again.
+    assert (tmp_path / ".anti-demo-azure" / "manifest.json").exists()
+    assert not list(tmp_path.glob(".anti-demo-azure.removed-*"))

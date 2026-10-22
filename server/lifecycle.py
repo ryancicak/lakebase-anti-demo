@@ -4495,6 +4495,49 @@ def _seal_lakebase_environment(
     return sealed
 
 
+#: How many times an install asks Lakebase to make, configure and seal one project, riding out a
+#: transient control-plane error as an uninstall's delete does (`LAKEBASE_DELETE_ATTEMPTS`). On
+#: 2026-10-22 "INTERNAL_ERROR: Unhandled error in API call" stopped an install as it made the
+#: coordination project, which Lakebase had made. Asking again is safe: a project that exists is
+#: checked rather than made again, its endpoint's limits are set rather than added to, and the
+#: seal only reads.
+LAKEBASE_ENSURE_ATTEMPTS = 4
+
+
+def _ensure_and_seal_lakebase(
+    manifest: DemoManifest,
+    binding: _LakebaseBinding,
+    *,
+    display_label: str,
+    max_cu: float = 2,
+) -> LakebaseEnvironmentSeal:
+    def attempt() -> LakebaseEnvironmentSeal:
+        _ensure_lakebase(
+            manifest,
+            project_id=binding.project_id,
+            endpoint_name=binding.endpoint_name,
+            display_label=display_label,
+            max_cu=max_cu,
+        )
+        return _seal_lakebase_environment(manifest, binding)
+
+    for number in range(1, LAKEBASE_ENSURE_ATTEMPTS):
+        try:
+            return attempt()
+        except RuntimeError as exc:
+            if not _sql_statement_error_is_transient(str(exc)):
+                raise
+            backoff = min(60.0, 5.0 * 2 ** (number - 1))
+            print(
+                f"RETRY Lakebase project {binding.project_id} hit a transient control-plane "
+                f"error (attempt {number}/{LAKEBASE_ENSURE_ATTEMPTS}); retrying in "
+                f"{backoff:.0f}s",
+                flush=True,
+            )
+            time.sleep(backoff)
+    return attempt()
+
+
 def _ensure_v7_lakebase_projects(
     manifest: DemoManifest,
 ) -> tuple[dict[RoundId, LakebaseEnvironmentSeal], LakebaseEnvironmentSeal]:
@@ -4505,27 +4548,23 @@ def _ensure_v7_lakebase_projects(
             f"CREATE/VERIFY Round {number} Lakebase project {binding.project_id}",
             flush=True,
         )
-        _ensure_lakebase(
+        rounds[round_id] = _ensure_and_seal_lakebase(
             manifest,
-            project_id=binding.project_id,
-            endpoint_name=binding.endpoint_name,
+            binding,
             display_label=f"Lakebase Anti-Demo {manifest.run_id} Round {number}",
         )
-        rounds[round_id] = _seal_lakebase_environment(manifest, binding)
 
     coordination = _coordination_lakebase_binding(manifest)
     print(
         f"CREATE/VERIFY installation coordination Lakebase project {coordination.project_id}",
         flush=True,
     )
-    _ensure_lakebase(
+    return rounds, _ensure_and_seal_lakebase(
         manifest,
-        project_id=coordination.project_id,
-        endpoint_name=coordination.endpoint_name,
+        coordination,
         display_label=f"Lakebase Anti-Demo {manifest.run_id} Coordination",
         max_cu=1,
     )
-    return rounds, _seal_lakebase_environment(manifest, coordination)
 
 
 def _prepare_v7_round_environments(manifest: DemoManifest, outputs: dict[str, Any]) -> None:

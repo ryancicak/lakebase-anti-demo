@@ -111,10 +111,19 @@ def _project_standing(manifest: DemoManifest, round_number: int) -> bool:
 
 
 def _project_ids(manifest: DemoManifest) -> list[str]:
-    ids = [seal.lakebase.project_id for seal in (manifest.round_environments or {}).values()]
-    if manifest.coordination_environment is not None:
-        ids.append(manifest.coordination_environment.project_id)
-    return ids
+    """The installation's seven Lakebase projects, whether or not it got as far as sealing them.
+
+    An install that stopped before its seals has still made some, under IDs derived from its
+    installation ID, as AWS's cleanup derives them. Reading the seals alone would have left all
+    seven standing and still said ALL GONE (2026-10-22: an install stopped on a transient error
+    while it created the coordination project).
+    """
+
+    if manifest.round_environments is None and manifest.installation_id is None:
+        return []
+    return [*(lifecycle._round_lakebase_binding(manifest, number).project_id
+              for number in range(1, 7)),
+            lifecycle._coordination_lakebase_binding(manifest).project_id]
 
 
 class AzureUninstall:
@@ -224,12 +233,17 @@ class AzureUninstall:
                  if key in manifest.azure.servers])
         self._destroy()
         report.removed.append("infra/azure")
-        report.survivors = [f"Azure {item.type} {item.name}"
-                            for item in inventory(arm, manifest.run_id)]
-        if report.survivors or not all_gone(inventory(arm, manifest.run_id)):
+        # ALL GONE asks again, by name, for everything it removed, not only for what Azure tags:
+        # a Lakebase project left standing still bills.
+        standing = inventory(arm, manifest.run_id)
+        report.survivors = [
+            *(f"Azure {item.type} {item.name}" for item in standing),
+            *(label for label, read in present if _get_or_none(read) is not None),
+        ]
+        if report.survivors or not all_gone(standing):
             for line in report.survivors:
                 print(f"SURVIVES {line}", flush=True)
-            raise AzureSetupError(f"{len(report.survivors)} Azure resources of run "
+            raise AzureSetupError(f"{len(report.survivors)} resources of run "
                                   f"{manifest.run_id} survive: not ALL GONE")
         archive = self.generation.root.with_name(
             f"{self.generation.root.name}.removed-{datetime.now(UTC):%Y%m%d-%H%M%S}")
