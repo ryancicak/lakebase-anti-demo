@@ -64,6 +64,30 @@ class Removal:
     survivors: list[str] = field(default_factory=list)
 
 
+#: How long ALL GONE gives Azure's resource lists to catch up with deletes that have finished.
+#: Right after `terraform destroy`, the group's list still showed a Round 2 server Terraform had
+#: just destroyed, and the server read ResourceNotFound moments later (2026-10-22).
+ALL_GONE_SETTLE_SECONDS = 300.0
+ALL_GONE_POLL_SECONDS = 15.0
+
+
+def standing_after_destroy(
+    arm: Any,
+    run_id: str,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[Any]:
+    """What still stands of the run, read again until nothing does or the settle bound passes."""
+
+    deadline = clock() + ALL_GONE_SETTLE_SECONDS
+    while True:
+        standing = inventory(arm, run_id)
+        if not standing or clock() >= deadline:
+            return standing
+        sleep(ALL_GONE_POLL_SECONDS)
+
+
 def _databricks(profile: str, *args: str, timeout: float = 900) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["databricks", *args, "-p", profile, "-o", "json"],
                           capture_output=True, text=True, timeout=timeout, check=False)
@@ -250,7 +274,7 @@ class AzureUninstall:
         report.removed.append("infra/azure")
         # ALL GONE asks again, by name, for everything it removed, not only for what Azure tags:
         # a Lakebase project left standing still bills.
-        standing = inventory(arm, manifest.run_id)
+        standing = standing_after_destroy(arm, manifest.run_id)
         report.survivors = [
             *(f"Azure {item.type} {item.name}" for item in standing),
             *(label for label, read in present if _get_or_none(read) is not None),

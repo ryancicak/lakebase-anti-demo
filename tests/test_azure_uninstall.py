@@ -197,6 +197,33 @@ def test_an_app_whose_create_never_confirmed_is_removed_only_if_provably_this_in
     assert uninstall._app(manifest) is None
 
 
+def test_all_gone_lets_azures_lists_catch_up_with_a_finished_delete(monkeypatch) -> None:
+    # 2026-10-22: right after `terraform destroy`, the group's list still showed a Round 2 server
+    # Terraform had just destroyed, which read ResourceNotFound moments later.
+    from server.azure_inventory import Standing
+
+    server = Standing("server-r2", "Microsoft.DBforPostgreSQL/flexibleServers", "run tag")
+    answers = [[server], [server], []]
+    monkeypatch.setattr(azure_uninstall, "inventory", lambda _arm, _run: answers.pop(0))
+    now = [0.0]
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        now[0] += seconds
+
+    assert azure_uninstall.standing_after_destroy(object(), "run", sleep=sleep,
+                                                  clock=lambda: now[0]) == []
+    assert slept == [azure_uninstall.ALL_GONE_POLL_SECONDS] * 2
+
+    # One that really stands is reported once the bound has passed.
+    monkeypatch.setattr(azure_uninstall, "inventory", lambda _arm, _run: [server])
+    now[0] = 0.0
+    assert azure_uninstall.standing_after_destroy(object(), "run", sleep=sleep,
+                                                  clock=lambda: now[0]) == [server]
+    assert now[0] >= azure_uninstall.ALL_GONE_SETTLE_SECONDS
+
+
 def test_the_factory_is_found_in_terraforms_state_when_no_lane_sealed(tmp_path) -> None:
     generation = Generation(tmp_path / ".anti-demo-azure")
     generation.ensure()
