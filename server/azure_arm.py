@@ -29,6 +29,7 @@ Synchronous, like boto3. The app calls it through ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import ipaddress
 import json
@@ -48,8 +49,12 @@ POSTGRES_API = "2025-08-01"
 DATA_FACTORY_API = "2018-06-01"
 COMPUTE_API = "2024-07-01"
 
-#: How long a token is reused. Entra ID issues them for about an hour.
+#: How long a token is reused at most. Entra ID issues them for about an hour.
 TOKEN_REUSE_SECONDS = 1800.0
+#: How long before its own expiry a token is minted again, so ARM still accepts a call sent with it.
+#: Shorter than the life `az` leaves on a token it hands back (it refreshes one with five minutes
+#: or less left), so a token is reused for minutes, not minted again for every call.
+TOKEN_EXPIRY_MARGIN_SECONDS = 120.0
 #: Bounded retries for throttling and transient front-door failures (429, 5xx before a body).
 REQUEST_ATTEMPTS = 5
 #: ARM's own gateway saying the service behind it didn't answer in time.
@@ -227,6 +232,26 @@ def _error_of(body: Any) -> tuple[str | None, str]:
     return code, _SUBSCRIPTION.sub(r"\1<subscription>", message)[:500]
 
 
+def token_reuse_seconds(token: str, *, ceiling: float = TOKEN_REUSE_SECONDS,
+                        now: Callable[[], float] = time.time) -> float:
+    """How long `token` may be reused: `ceiling`, or until `TOKEN_EXPIRY_MARGIN_SECONDS` before
+    the token's own expiry, if that comes first.
+
+    The expiry is the token's JWT `exp` claim, read without checking anything else, because it
+    can only shorten the reuse. `az account get-access-token` hands back the token it has cached,
+    which may expire in minutes: an uninstall reused one for 29 minutes, past its expiry, and ARM
+    answered 401 (2026-10-22). A token with no readable `exp` keeps the ceiling.
+    """
+
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        expires_at = float(claims["exp"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return ceiling
+    return max(0.0, min(ceiling, expires_at - now() - TOKEN_EXPIRY_MARGIN_SECONDS))
+
+
 class ArmClient:
     """One subscription, one resource group, one service principal."""
 
@@ -251,7 +276,8 @@ class ArmClient:
         self._sleep = sleep
         self._clock = clock
         self._token_source = token_source
-        self._token: tuple[str, float] | None = None
+        #: The token in use: the token, when it was minted, and how long it may be reused.
+        self._token: tuple[str, float, float] | None = None
 
     @property
     def resource_group_path(self) -> str:
@@ -259,11 +285,12 @@ class ArmClient:
                 f"/resourceGroups/{self._resource_group}")
 
     def _bearer(self) -> str:
-        if self._token and self._clock() - self._token[1] < TOKEN_REUSE_SECONDS:
+        if self._token and self._clock() - self._token[1] < self._token[2]:
             return self._token[0]
         if self._token_source is not None:
-            self._token = (self._token_source(), self._clock())
-            return self._token[0]
+            token = self._token_source()
+            self._token = (token, self._clock(), token_reuse_seconds(token))
+            return token
         if not self._credentials.client_id:
             raise ArmError("no Azure token source: give a token_source or a service principal")
         form = urllib.parse.urlencode({
@@ -281,7 +308,7 @@ class ArmClient:
             raise ArmError(f"Entra ID refused the service principal's token request: "
                            f"{code or response.status}: {message}", status=response.status,
                            code=code)
-        self._token = (str(token), self._clock())
+        self._token = (str(token), self._clock(), token_reuse_seconds(str(token)))
         return self._token[0]
 
     def request(
@@ -301,6 +328,10 @@ class ArmClient:
         read waits `READ_TIMEOUT_SECONDS` for one (`timeout` overrides). Its last failure, or the
         first of a call that isn't idempotent, is an `ArmError` naming the method alone: the URL
         carries the subscription.
+
+        A 401 drops the token, and the call is sent once more with a new one: a token can run out
+        between its own reuse check and ARM's (`token_reuse_seconds`). ARM refuses a 401 before
+        it acts on anything, so this is safe for a call that isn't idempotent too.
         """
 
         url = url_or_path if url_or_path.startswith("https://") else ARM + url_or_path
@@ -308,6 +339,7 @@ class ArmClient:
         if timeout is None:
             timeout = READ_TIMEOUT_SECONDS if method == "GET" else WRITE_TIMEOUT_SECONDS
         last: Response | None = None
+        reminted = False
         for attempt in range(REQUEST_ATTEMPTS):
             headers = {"Authorization": f"Bearer {self._bearer()}",
                        "Content-Type": "application/json"}
@@ -318,6 +350,9 @@ class ArmClient:
                     raise ArmError(f"ARM gave no answer to a {method} "
                                    f"({type(error).__name__})") from error
                 self._sleep(min(2.0 ** attempt, 30.0))
+                continue
+            if last.status == 401 and not reminted and attempt < REQUEST_ATTEMPTS - 1:
+                self._token, reminted = None, True
                 continue
             retryable = last.status == 429 or (
                 idempotent and last.status >= 500

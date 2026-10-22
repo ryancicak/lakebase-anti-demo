@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from .azure_arm import ArmClient
+from .azure_arm import ArmClient, ArmError
 from .azure_inventory import Standing, copy_names, inventory
 
 SERVER_TYPE = "microsoft.dbforpostgresql/flexibleservers"
@@ -42,10 +42,22 @@ def _window() -> tuple[str, str]:
 
 
 def park_pipelines(arm: ArmClient, factory: str, pipelines: Iterable[str]) -> list[str]:
+    """Cancel each pipeline's runs still in flight. A factory that's gone has none.
+
+    An uninstall run again after its `terraform destroy` finds no factory at all, and stopped on
+    ARM's 404 for it (2026-10-22), though nothing of the factory was left to park.
+    """
+
     since, until = _window()
     cancelled = []
     for pipeline in pipelines:
-        for run in arm.pipeline_runs(factory, pipeline, since_utc=since, until_utc=until):
+        try:
+            runs = arm.pipeline_runs(factory, pipeline, since_utc=since, until_utc=until)
+        except ArmError as error:
+            if error.status == 404:
+                return cancelled
+            raise
+        for run in runs:
             arm.cancel_pipeline_run(factory, str(run["runId"]))
             cancelled.append(str(run["runId"]))
     return cancelled

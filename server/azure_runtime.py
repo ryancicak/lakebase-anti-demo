@@ -31,7 +31,7 @@ from typing import Any
 
 import psycopg
 
-from .azure_arm import ArmClient, AzureCredentials
+from .azure_arm import ArmClient, AzureCredentials, token_reuse_seconds
 from .azure_identity import az_cli_token_source, service_credential_token_source
 from .azure_manifest import AzureManifest
 from .azure_recovery import AzurePostgresRecoveryAdapter
@@ -414,11 +414,15 @@ SERVICE_BUS_TOKEN_REUSE_SECONDS = 1800.0
 
 def reused_token(source: Callable[[], str], *, seconds: float = SERVICE_BUS_TOKEN_REUSE_SECONDS,
                  clock: Callable[[], float] = time.monotonic) -> Callable[[], str]:
-    held: list[tuple[str, float]] = []
+    """`source`'s token, reused for `seconds`, or until shortly before it expires if that is
+    sooner (`token_reuse_seconds`): `az` may hand back one that expires in minutes."""
+
+    held: list[tuple[str, float, float]] = []
 
     def token() -> str:
-        if not held or clock() - held[0][1] >= seconds:
-            held[:] = [(source(), clock())]
+        if not held or clock() - held[0][1] >= held[0][2]:
+            minted = source()
+            held[:] = [(minted, clock(), token_reuse_seconds(minted, ceiling=seconds))]
         return held[0][0]
 
     return token

@@ -7,8 +7,10 @@ parameters that do not exist while it is off, and throttling.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
+import time
 import urllib.error
 from collections.abc import Mapping
 from typing import Any
@@ -16,11 +18,14 @@ from typing import Any
 import pytest
 
 from server.azure_arm import (
+    TOKEN_EXPIRY_MARGIN_SECONDS,
+    TOKEN_REUSE_SECONDS,
     ArmClient,
     ArmError,
     AzureCredentials,
     Response,
     RestoreNotReady,
+    token_reuse_seconds,
 )
 
 SUB = "00000000-1111-2222-3333-444444444444"
@@ -76,6 +81,86 @@ def test_the_token_is_fetched_once_and_reused() -> None:
     assert arm.get_server("a") is None
     assert arm.get_server("b") is None
     assert sum(1 for method, url, _ in transport.calls if "oauth2" in url) == 1
+
+
+def jwt(expires_at: float) -> str:
+    """A token shaped like Entra ID's: a JWT whose payload carries `exp`. Nothing here checks a
+    signature, so it has none."""
+
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": expires_at}).encode()).decode()
+    return f"header.{payload.rstrip('=')}.signature"
+
+
+def test_a_token_is_reused_only_until_shortly_before_its_own_expiry() -> None:
+    # `az account get-access-token` hands back its cached token, which may expire in minutes: an
+    # uninstall reused one for 29 minutes, past its expiry, and ARM answered 401 (2026-10-22).
+    now = 1_800_000_000.0
+    assert token_reuse_seconds(jwt(now + 3600), now=lambda: now) == TOKEN_REUSE_SECONDS
+    assert token_reuse_seconds(jwt(now + 600), now=lambda: now) == (
+        600 - TOKEN_EXPIRY_MARGIN_SECONDS)
+    assert token_reuse_seconds(jwt(now + 60), now=lambda: now) == 0.0
+    # A token whose expiry can't be read keeps the ceiling, as every token did before.
+    for opaque in ("tok", "a.!!!.c", f"a.{base64.urlsafe_b64encode(b'[1]').decode()}.c"):
+        assert token_reuse_seconds(opaque, now=lambda: now) == TOKEN_REUSE_SECONDS
+
+
+class RecordingTransport:
+    """Each call's bearer token, answered from a script in order."""
+
+    def __init__(self, answers: list[Response]) -> None:
+        self.answers = list(answers)
+        self.bearers: list[str] = []
+
+    def __call__(self, method: str, url: str, headers: Mapping[str, str], data: bytes | None,
+                 timeout: float) -> Response:
+        self.bearers.append(headers["Authorization"].removeprefix("Bearer "))
+        return self.answers.pop(0)
+
+
+def test_a_token_that_expires_soon_is_minted_again_before_it_does() -> None:
+    clock = [0.0]
+    minted: list[str] = []
+
+    def source() -> str:  # each with ten minutes left, as `az` may hand one back
+        minted.append(jwt(time.time() + 600))
+        return minted[-1]
+
+    transport = RecordingTransport([Response(404, None, {})] * 3)
+    arm = ArmClient(CREDENTIALS, "rg-test", transport=transport, sleep=lambda _: None,
+                    clock=lambda: clock[0], token_source=source)
+    arm.get_server("a")
+    clock[0] = 400.0  # inside the token's 480 s of reuse
+    arm.get_server("a")
+    assert len(minted) == 1
+    clock[0] = 500.0  # past it, though well inside the 30-minute ceiling
+    arm.get_server("a")
+    assert len(minted) == 2 and transport.bearers == [minted[0], minted[0], minted[1]]
+
+
+def test_a_401_mints_a_new_token_and_sends_the_call_once_more() -> None:
+    expired = Response(401, {"error": {"code": "ExpiredAuthenticationToken",
+                                       "message": "The access token expiry has passed."}}, {})
+    minted: list[str] = []
+
+    def source() -> str:
+        minted.append(f"token-{len(minted)}")
+        return minted[-1]
+
+    transport = RecordingTransport([expired, Response(404, None, {})])
+    arm = ArmClient(CREDENTIALS, "rg-test", transport=transport, sleep=lambda _: None,
+                    token_source=source)
+    assert arm.get_server("a") is None
+    assert transport.bearers == ["token-0", "token-1"]
+
+    # A call that isn't idempotent is sent again too: ARM refuses a 401 before it acts on it.
+    transport.answers = [expired, Response(200, {"runId": "run-1"}, {})]
+    assert arm.request("POST", "/createRun", {}, idempotent=False).status == 200
+    assert transport.bearers[2:] == ["token-1", "token-2"]
+
+    # A second 401 in a row is ARM's answer, not a stale token's: it comes back as it was.
+    transport.answers = [expired, expired]
+    assert arm.request("GET", "/flexibleServers/b").status == 401
+    assert transport.bearers[4:] == ["token-2", "token-3"]
 
 
 def test_a_name_still_held_by_a_server_being_deleted_reads_unavailable() -> None:

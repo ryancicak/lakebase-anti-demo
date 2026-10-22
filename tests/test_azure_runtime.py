@@ -267,6 +267,32 @@ def test_the_deployed_app_takes_its_token_from_its_service_credential() -> None:
                        workspace=workspace)
 
 
+def test_the_service_bus_token_is_reused_only_until_shortly_before_its_own_expiry() -> None:
+    # As the ARM client's: `az` may hand back a token that expires in minutes (2026-10-22).
+    import time
+
+    from test_azure_arm import jwt
+
+    from server.azure_runtime import reused_token
+
+    clock = [0.0]
+    minted: list[str] = []
+
+    def source() -> str:
+        minted.append(jwt(time.time() + 600))
+        return minted[-1]
+
+    token = reused_token(source, clock=lambda: clock[0])
+    assert token() == minted[0]
+    clock[0] = 400.0  # inside its 480 s of reuse
+    assert token() == minted[0]
+    clock[0] = 500.0  # past it, inside the 30-minute ceiling
+    assert token() == minted[1]
+    # A token whose expiry can't be read keeps the ceiling.
+    opaque = reused_token(lambda: "t0ken", clock=lambda: clock[0])
+    assert opaque() == "t0ken"
+
+
 def test_the_admin_password_is_the_apps_binding_and_never_a_default() -> None:
     assert admin_password({ADMIN_PASSWORD_ENV: "bound"})() == "bound"
     with pytest.raises(AzureRuntimeError, match="not bound"):

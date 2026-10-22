@@ -60,6 +60,27 @@ def test_in_flight_runs_are_cancelled_per_pipeline() -> None:
     assert park_pipelines(arm, "adf", ["r4_pipeline", "r6_pipeline"]) == ["r4_pipeline-run"]  # type: ignore[arg-type]
 
 
+def test_a_factory_already_destroyed_has_nothing_to_park() -> None:
+    # An uninstall run again after its `terraform destroy` found no factory, and stopped on ARM's
+    # 404 for it (2026-10-22). Any other refusal still stops it.
+    import pytest
+
+    from server.azure_arm import ArmError, Response
+    from tests.test_azure_arm import TOKEN, client
+
+    gone = Response(404, {"error": {"code": "ResourceNotFound", "message": "not found"}}, {})
+    arm, transport = client([("POST", "/oauth2/v2.0/token", TOKEN),
+                             ("POST", "/queryPipelineRuns?", gone)])
+    assert park_pipelines(arm, "adf", ["r4_pipeline", "r6_pipeline"]) == []
+    assert sum("/queryPipelineRuns?" in url for _, url, _ in transport.calls) == 1
+
+    refused = Response(403, {"error": {"code": "AuthorizationFailed", "message": "no"}}, {})
+    arm, _ = client([("POST", "/oauth2/v2.0/token", TOKEN),
+                     ("POST", "/queryPipelineRuns?", refused)])
+    with pytest.raises(ArmError, match="AuthorizationFailed"):
+        park_pipelines(arm, "adf", ["r4_pipeline"])
+
+
 async def test_settle_parks_deletes_and_resets(monkeypatch) -> None:
     arm = FakeArm()
     monkeypatch.setattr("server.azure_cleanup.inventory", lambda _arm, _run: [
