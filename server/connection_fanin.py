@@ -515,9 +515,12 @@ def fanin_config_sha256() -> str:
             "bounded-in-flight-unbounded-drain"
         ),
         "sample_schedule": "eight-groups-offset-250ms",
-        # runner/round5_fanin.py's SERVER_RESET_RULE and HOLD_RESTART_LIMIT_SECONDS (v1.3.0).
-        "server_reset_rule": "reconnect-in-slot-within-retry-budget-hold-restarts",
+        # runner/round5_fanin.py's SERVER_RESET_RULE, HOLD_RESTART_LIMIT_SECONDS and the
+        # reconnect's patience (v1.3.0).
+        "server_reset_rule": "reconnect-in-slot-patiently-within-retry-budget-hold-restarts",
         "hold_restart_limit_seconds": 120.0,
+        "reconnect_max_tries": 7,
+        "reconnect_backoff_seconds": [0.5, 1.0, 2.0, 4.0, 8.0, 16.0],
         "tls_mode": "verify-full",
         "client_role": "anti_demo_burst",
         "observer_role": "anti_demo_observer",

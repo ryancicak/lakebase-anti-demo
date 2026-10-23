@@ -155,15 +155,22 @@ CONNECT_TIMEOUT_SECONDS = 20.0
 #: and then (`Connection reset by peer`: once in v1.2.2's AWS release runs, three times in about
 #: 30 Azure ramps by 2026-10-21), and the exact gate failed the whole bout for it.
 #:
-#: Every reconnect is a retry: it spends the slot's and the shard's budgets, and its time is its
-#: lane's. The lane still reaches its gate only with every client held at once, and a reconnect
-#: that completes once the hold has begun starts the 30 s hold again for every shard of the lane,
-#: so the lane holds all 10,000 for 30 s at once whatever the server did. Each one is evidence
+#: Every try of a reconnect is a retry: it spends the shard's budget, and its time is its lane's.
+#: The lane still reaches its gate only with every client held at once, and a reconnect that
+#: completes once the hold has begun starts the 30 s hold again for every shard of the lane, so
+#: the lane holds all 10,000 for 30 s at once whatever the server did. Each one is evidence
 #: (`reconnected_after_reset`), and a reset that can't be reconnected fails the lane as before.
-SERVER_RESET_RULE = "reconnect-in-slot-within-retry-budget-hold-restarts"
-#: How long a gate proof or a hold's end waits for one reconnect in flight: a slot's tries.
-RECONNECT_SETTLE_SECONDS = MAX_RETRIES_PER_CLIENT * (
-    CONNECT_TIMEOUT_SECONDS + max(CONNECT_RETRY_BACKOFF_SECONDS)
+SERVER_RESET_RULE = "reconnect-in-slot-patiently-within-retry-budget-hold-restarts"
+#: A reconnect's own patience: up to RECONNECT_MAX_TRIES tries over about 30 s, where a first
+#: login gets three, 0.25 s apart. A pooler at exactly its client cap (Lakebase's is 10,000) can
+#: go on counting a connection it has reset, and refuse a new login until it notices. A reconnect
+#: on the first login's three tries gave up within a second of its reset (2026-10-22, the Azure
+#: release bar's Round 5 late towel: `server_reset_unrecovered`).
+RECONNECT_MAX_TRIES = 7
+RECONNECT_BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
+#: How long a gate proof or a hold's end waits for one reconnect in flight: all of its tries.
+RECONNECT_SETTLE_SECONDS = RECONNECT_MAX_TRIES * CONNECT_TIMEOUT_SECONDS + sum(
+    RECONNECT_BACKOFF_SECONDS
 )
 #: The most reconnects may draw a hold out past its own HOLD_SECONDS. A hold still unsettled
 #: there ends, and fails its lane (`hold_restart_unsettled`): the lane never held all its
@@ -1362,6 +1369,8 @@ def config_sha256() -> str:
         "sample_schedule": "eight-groups-offset-250ms",
         "server_reset_rule": SERVER_RESET_RULE,
         "hold_restart_limit_seconds": HOLD_RESTART_LIMIT_SECONDS,
+        "reconnect_max_tries": RECONNECT_MAX_TRIES,
+        "reconnect_backoff_seconds": list(RECONNECT_BACKOFF_SECONDS),
         "tls_mode": TLS_MODE,
         "client_role": CLIENT_ROLE,
         "observer_role": OBSERVER_ROLE,
@@ -3063,23 +3072,32 @@ async def _open_client(runtime: LaneRuntime, t0_ns: int) -> None:
             return
 
 
+def _journal_reconnect(runtime: LaneRuntime, ordinal: int, outcome: str, detail: str) -> None:
+    """One line of a reconnect's story for the runner's journal, one a try at most. Its stdout
+    carries more than progress lines, and their readers skip any other line."""
+
+    print(f"FANIN_RECONNECT:{runtime.lane_id}:{ordinal}:{outcome}:{detail}", flush=True)
+
+
 async def _reconnect_client(runtime: LaneRuntime, ordinal: int) -> None:
     """Log a held client the server reset back in, in its own slot (`SERVER_RESET_RULE`).
 
-    A retry like a refused connect's: each try spends the slot's and the shard's budgets, a
-    refusal in passing is tried again after the same pauses, and anything else (credentials,
-    TLS, a login timeout) is terminal, as it is for a first login. Its time is the lane's.
+    A retry like a refused connect's: each try spends the shard's budget, and anything other than
+    a refusal in passing (credentials, TLS, a login timeout) is terminal, as it is for a first
+    login. A refusal is tried again with the reconnect's own patience (RECONNECT_MAX_TRIES over
+    RECONNECT_BACKOFF_SECONDS). Its time is the lane's.
     """
 
     window = runtime.hold_window
     if window is not None:
         window.begin()
     completed_ns: int | None = None
+    started_ns = time.monotonic_ns()
     loop = asyncio.get_running_loop()
     tries = 0
     try:
         while True:
-            if tries >= MAX_RETRIES_PER_CLIENT or runtime.retries >= PARTITION_RETRY_BUDGET:
+            if tries >= RECONNECT_MAX_TRIES or runtime.retries >= PARTITION_RETRY_BUDGET:
                 runtime.terminal_failures += 1
                 runtime.failure_codes["server_reset_unrecovered"] = (
                     runtime.failure_codes.get("server_reset_unrecovered", 0) + 1
@@ -3087,9 +3105,11 @@ async def _reconnect_client(runtime: LaneRuntime, ordinal: int) -> None:
                 runtime.record_connection_diagnostic(
                     ordinal=ordinal, stage="reconnect", code="server_reset_unrecovered"
                 )
+                _journal_reconnect(runtime, ordinal, "unrecovered",
+                                   f"tries={tries}:shard_retries={runtime.retries}")
                 return
             if tries:
-                await asyncio.sleep(CONNECT_RETRY_BACKOFF_SECONDS[tries - 1])
+                await asyncio.sleep(RECONNECT_BACKOFF_SECONDS[tries - 1])
             tries += 1
             runtime.retries += 1
             client = PostgresClient(
@@ -3123,10 +3143,12 @@ async def _reconnect_client(runtime: LaneRuntime, ordinal: int) -> None:
                     runtime.record_connection_diagnostic(
                         ordinal=ordinal, stage="reconnect_retry", code=code
                     )
+                    _journal_reconnect(runtime, ordinal, "refused", f"try={tries}:{code}")
                     continue
                 runtime.terminal_failures += 1
                 runtime.failure_codes[code] = runtime.failure_codes.get(code, 0) + 1
                 runtime.record_connection_diagnostic(ordinal=ordinal, stage="reconnect", code=code)
+                _journal_reconnect(runtime, ordinal, "failed", f"try={tries}:{code}")
                 return
             completed_ns = time.monotonic_ns()
             runtime.auth_methods.add(client.auth_method)
@@ -3137,6 +3159,8 @@ async def _reconnect_client(runtime: LaneRuntime, ordinal: int) -> None:
             runtime.record_connection_diagnostic(
                 ordinal=ordinal, stage="reconnect", code="server_reset_reconnected"
             )
+            _journal_reconnect(runtime, ordinal, "reconnected",
+                               f"tries={tries}:ms={(completed_ns - started_ns) / 1e6:.0f}")
             return
     finally:
         runtime.reconnects.pop(ordinal, None)

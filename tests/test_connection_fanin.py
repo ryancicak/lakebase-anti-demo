@@ -1675,6 +1675,48 @@ async def test_a_refusal_in_passing_is_tried_again_and_a_timeout_fails_the_lane(
     assert runtime.hold_window.read() == (0, 0)  # finished, and nothing reconnected
 
 
+async def test_a_reconnect_outlasts_a_pooler_still_counting_the_connection_it_reset(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """2026-10-22, the Azure release bar's Round 5 late towel: Lakebase's pooled endpoint reset a
+    held client at the end of the hold, and the reconnect, on a first login's three tries 0.25 s
+    apart, gave up within a second (`server_reset_unrecovered`). A pooler at exactly its client
+    cap can refuse a new login until it notices the connection it reset."""
+
+    monkeypatch.setattr(runner, "RECONNECT_BACKOFF_SECONDS", (0.0,) * 6)
+    refused = runner.FanInProtocolError("postgres_error_53300")
+    made = _scripted_connects(monkeypatch, [None, *([refused] * 6), None])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    runtime.unexpected_disconnect("lakebase", 0)
+    await runner._settle_reconnects([runtime])
+
+    assert (runtime.reconnected_after_reset, runtime.terminal_failures) == (1, 0)
+    assert runtime.retries == runner.RECONNECT_MAX_TRIES  # every try is a retry
+    assert runtime.clients == [made[-1]]
+    journal = capsys.readouterr().out
+    assert journal.count("FANIN_RECONNECT:lakebase:0:refused:") == 6
+    assert "FANIN_RECONNECT:lakebase:0:reconnected:tries=7:" in journal
+
+    # One refusal past its patience fails the lane, and the journal says how far it got.
+    _scripted_connects(monkeypatch, [None, *([refused] * runner.RECONNECT_MAX_TRIES)])
+    runtime = _reset_runtime()
+    await runner._open_client(runtime, runtime.t0_ns)
+    runtime.unexpected_disconnect("lakebase", 0)
+    await runner._settle_reconnects([runtime])
+    assert runtime.failure_codes == {"server_reset_unrecovered": 1}
+    assert "FANIN_RECONNECT:lakebase:0:unrecovered:tries=7:shard_retries=7" in (
+        capsys.readouterr().out)
+
+
+def test_a_reconnects_patience_is_about_thirty_seconds_and_fits_the_hold_limit() -> None:
+    # Long enough for a pooler to notice a connection it reset, inside the hold's restart limit.
+    waits = sum(runner.RECONNECT_BACKOFF_SECONDS)
+    assert len(runner.RECONNECT_BACKOFF_SECONDS) == runner.RECONNECT_MAX_TRIES - 1
+    assert 25 <= waits <= 35 < runner.HOLD_RESTART_LIMIT_SECONDS
+    assert runner.RECONNECT_SETTLE_SECONDS >= waits
+
+
 async def test_a_reset_past_the_retry_budget_fails_the_lane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
