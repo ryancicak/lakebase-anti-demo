@@ -86,6 +86,10 @@ TERRAFORM_RETRYABLE = re.compile(
 )
 TERRAFORM_ATTEMPTS = 3
 TERRAFORM_RETRY_SECONDS = 60.0
+#: How many times one install resumes itself after a transient error (`AzureSetup.run`), and how
+#: long it waits first.
+SETUP_ATTEMPTS = 3
+SETUP_RESUME_SECONDS = 30.0
 #: Azure refusing a VM's create for want of room in its zone at that moment: Round 5's runners
 #: (D8ls_v6, westus2 zone 1) twice on 2026-10-20. The refused VM is left Failed, with its OS disk,
 #: outside Terraform's state, and the next apply stops on "already exists" for it. Every apply
@@ -888,6 +892,29 @@ class AzureSetup:
                             principal_object_id=operator_object_id(), egress=egress, **kept)
 
     def run(self) -> DemoManifest:
+        """The install, resumed by itself after a transient error, as running it again would be.
+
+        Every stage picks up where the last run stopped (the manifest's `status`, then each seal),
+        so an attempt after a transient control-plane or network error repeats nothing that had
+        finished. Three different ones stopped one night's installs at three different steps
+        (2026-10-22: a Lakebase INTERNAL_ERROR, a CLI call's EOF, an `az` token). Anything else
+        stops the install at once, as before.
+        """
+
+        for attempt in range(1, SETUP_ATTEMPTS):
+            try:
+                return self._run_once()
+            except Exception as exc:
+                text = f"{type(exc).__name__} {exc}"
+                if not lifecycle._sql_statement_error_is_transient(text):
+                    raise
+                print(f"RESUME the run stopped on a transient error ({text.splitlines()[0][:200]});"
+                      f" resuming in {SETUP_RESUME_SECONDS:.0f}s (attempt {attempt + 1} of "
+                      f"{SETUP_ATTEMPTS})", flush=True)
+                time.sleep(SETUP_RESUME_SECONDS)
+        return self._run_once()
+
+    def _run_once(self) -> DemoManifest:
         # Nothing to do with AWS by construction: no AWS setting reaches anything this runs.
         for name in [name for name in os.environ if name.startswith("AWS_")]:
             del os.environ[name]

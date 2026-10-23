@@ -6368,6 +6368,17 @@ def test_a_lakebase_delete_refused_for_good_is_raised_at_once(monkeypatch) -> No
     assert calls == ["delete-project"]
 
 
+def test_a_connection_closed_without_an_answer_is_transient() -> None:
+    # 2026-10-22: an install stopped on the Databricks CLI's (Go's) bare EOF.
+    assert lifecycle._sql_statement_error_is_transient(
+        'Error: Patch "https://example.test/api/2.0/postgres/projects/p/branches/production/'
+        'endpoints/primary?update_mask=spec.suspension": EOF')
+    assert lifecycle._sql_statement_error_is_transient("read tcp 10.0.0.1:5432: unexpected EOF")
+    assert lifecycle._sql_statement_error_is_transient("write: broken pipe")
+    assert not lifecycle._sql_statement_error_is_transient(
+        "the schema and the tables thereof are missing")
+
+
 _COORDINATION_BINDING = lifecycle._LakebaseBinding(
     "anti-demo-x-coord", "projects/anti-demo-x-coord/branches/production/endpoints/primary")
 

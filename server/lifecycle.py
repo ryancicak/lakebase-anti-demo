@@ -3036,6 +3036,12 @@ _SQL_TRANSIENT_ERROR_SUBSTRINGS: tuple[str, ...] = (
     "internal_error",
     "unavailable",
     "maintenance",
+    # A connection that closed without an answer, in the Databricks CLI's (Go's) words: an
+    # install stopped on `Patch ".../endpoints/primary?update_mask=spec.suspension": EOF`
+    # (2026-10-22). Spelled with its colon so "thereof" and the like don't match.
+    ": eof",
+    "unexpected eof",
+    "broken pipe",
 )
 
 

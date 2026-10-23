@@ -412,6 +412,51 @@ def test_an_app_this_installation_cannot_prove_it_made_is_never_adopted(
         ensure_app(generation, "p", "anti-demo-test", manifest())
 
 
+def test_an_install_resumes_itself_after_a_transient_error_and_stops_on_any_other(
+    monkeypatch, capsys,
+) -> None:
+    # 2026-10-22: a Lakebase INTERNAL_ERROR, a CLI call's EOF and an expired token stopped one
+    # night's installs at three different steps. Each stage resumes where a run stopped, so the
+    # install resumes itself, as running it again would.
+    from server.azure_lifecycle import SETUP_ATTEMPTS, AzureSetup
+
+    outcomes: list[Any] = []
+    calls: list[int] = []
+
+    def run_once(self: Any) -> Any:
+        calls.append(1)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(AzureSetup, "_run_once", run_once)
+    monkeypatch.setattr("server.azure_lifecycle.time.sleep", lambda seconds: None)
+    setup = AzureSetup(inputs=inputs())
+
+    outcomes[:] = [RuntimeError(
+        'Error: Patch "https://example.test/api/2.0/postgres/projects/p/branches/production/'
+        'endpoints/primary?update_mask=spec.suspension": EOF'), "installed"]
+    assert setup.run() == "installed" and len(calls) == 2
+    assert "RESUME the run stopped on a transient error" in capsys.readouterr().out
+
+    # A refusal that isn't transient stops it at once.
+    calls.clear()
+    outcomes[:] = [AzureSetupError("a Databricks App named x already exists and this "
+                                   "installation didn't make it"), "installed"]
+    with pytest.raises(AzureSetupError, match="didn't make it"):
+        setup.run()
+    assert len(calls) == 1
+
+    # And a transient one that never clears stops it after its attempts.
+    calls.clear()
+    outcomes[:] = [RuntimeError("Error: INTERNAL_ERROR: Unhandled error in API call")] * (
+        SETUP_ATTEMPTS)
+    with pytest.raises(RuntimeError, match="INTERNAL_ERROR"):
+        setup.run()
+    assert len(calls) == SETUP_ATTEMPTS
+
+
 def test_a_workspace_path_that_never_existed_reads_absent_and_a_refusal_does_not() -> None:
     # 2026-10-22: an install that had made its App, but not yet synced the App's source, stopped
     # its uninstall at "Path (...) doesn't exist.", the SDK's ResourceDoesNotExist.
