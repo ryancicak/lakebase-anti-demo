@@ -199,6 +199,8 @@ CLEANUP_FINALIZE_CONFLICT_ATTEMPTS = 40
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _RUNNER_ID = re.compile(r"^i-[0-9a-f]{8,17}$")
+#: An Azure edition runner, by its VM name (infra/azure/round5_runners.tf).
+_AZURE_RUNNER_ID = re.compile(r"^vm-[a-z0-9-]{1,48}-r5-runner-[0-9]$")
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
@@ -323,6 +325,25 @@ class Round5WarmState(StrEnum):
 class Round5Variant(StrEnum):
     AURORA = "aurora"
     RDS = "rds"
+    AZURE = "azure"
+
+
+#: The competitor variants one installation warms: AWS's two (Aurora and RDS, on the same physical
+#: runners), or the Azure edition's one (Flexible Server's built-in PgBouncer). Exactly one of
+#: these sets, never a mix.
+AWS_ROUND5_VARIANTS = frozenset({Round5Variant.AURORA, Round5Variant.RDS})
+AZURE_ROUND5_VARIANTS = frozenset({Round5Variant.AZURE})
+ROUND5_VARIANT_SETS = (AWS_ROUND5_VARIANTS, AZURE_ROUND5_VARIANTS)
+
+
+def round5_variant(competitor: str) -> Round5Variant:
+    """The warm variant a competitor's bout claims: AWS's lane key, or Azure's one variant."""
+
+    from .models import CompetitorId, aws_lane
+
+    if competitor == CompetitorId.AZURE_POSTGRES:
+        return Round5Variant.AZURE
+    return Round5Variant(aws_lane(competitor))
 
 
 class WarmStoreConflictError(RuntimeError):
@@ -390,7 +411,8 @@ class Round5RunnerReceipt:
     def __post_init__(self) -> None:
         if self.lane_id not in {"lakebase", "competitor"}:
             raise ValueError("runner lane_id must be lakebase or competitor")
-        if _RUNNER_ID.fullmatch(self.instance_id) is None:
+        if (_RUNNER_ID.fullmatch(self.instance_id) is None
+                and _AZURE_RUNNER_ID.fullmatch(self.instance_id) is None):
             raise ValueError("runner instance_id is invalid")
         _safe_identifier(self.boot_id, "boot_id")
         _safe_identifier(self.process_boot_id, "process_boot_id")
@@ -574,7 +596,7 @@ class Round5WarmSlot:
         if self.state == Round5WarmState.READY:
             if (
                 self.shared_receipt is None
-                or set(self.variants) != {Round5Variant.AURORA, Round5Variant.RDS}
+                or frozenset(self.variants) not in ROUND5_VARIANT_SETS
                 or self.ready_at is None
                 or self.ready_expires_at is None
                 or self.renew_by is None
@@ -664,9 +686,12 @@ class Round5LaunchCapsule:
         _safe_identifier(self.warm_attempt_token, "warm_attempt_token")
         if set(self.runner_contexts) != {"lakebase", "competitor"}:
             raise ValueError("capsule requires independent runner contexts")
-        if set(self.aws_control_contexts) != {Round5Variant.AURORA, Round5Variant.RDS}:
+        if frozenset(self.aws_control_contexts) not in ROUND5_VARIANT_SETS:
             raise ValueError("capsule requires both AWS variant contexts")
-        if set(self.variant_contexts) != {Round5Variant.AURORA, Round5Variant.RDS}:
+        if (
+            frozenset(self.variant_contexts) not in ROUND5_VARIANT_SETS
+            or set(self.variant_contexts) != set(self.aws_control_contexts)
+        ):
             raise ValueError("capsule requires both variant launch contexts")
         if set(self.dispatch_expires_at) != {"lakebase", "competitor"}:
             raise ValueError("capsule requires separate dispatch credential expirations")
@@ -726,7 +751,7 @@ class Round5WarmPreparation:
     capsule: Round5LaunchCapsule
 
     def __post_init__(self) -> None:
-        if set(self.variants) != {Round5Variant.AURORA, Round5Variant.RDS}:
+        if frozenset(self.variants) not in ROUND5_VARIANT_SETS:
             raise ValueError("warming must prepare both competitor variants")
         if not all(receipt.proxy_absent for receipt in self.variants.values()):
             raise ValueError("warming may not pre-create an RDS Proxy")

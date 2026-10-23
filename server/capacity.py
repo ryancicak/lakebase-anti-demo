@@ -29,6 +29,7 @@ from .models import (
     CapacityLaneDisclosure,
     CompetitorId,
     RoundId,
+    aws_lane,
 )
 
 # Lakebase autoscaling range applied by server/lifecycle.py:_configure_lakebase.
@@ -55,6 +56,16 @@ RDS_INSTANCE_CLASS = "db.t4g.medium"
 # discriminator `observed_rds_instance_class` uses to tell an RDS competitor
 # lane from an Aurora one, and two copies of it could drift apart.
 RDS_PRODUCT_LABEL = "RDS PostgreSQL"
+AZURE_PRODUCT_LABEL = "Azure PostgreSQL"
+#: The Azure edition's server for each round (infra/azure): Burstable B2s, except Round 5's, whose
+#: built-in PgBouncer needs General Purpose (design 6.5). Memory and `max_connections` are
+#: Azure's published figures for each size (`concepts-limits`, read 2026-10-16).
+AZURE_SERVER_B2S = ("Flexible Server B2s", 4.0, 429)
+AZURE_SERVER_D2DS_V5 = ("Flexible Server D2ds_v5", 8.0, 859)
+#: Round 5's runner VM, one per lane (infra/azure's `runner_vm_sku` default): 8 vCPU and 16 GiB,
+#: the shape the harness's model sizes as c7i.2xlarge. westus2 zone 1 refused D8ls_v6 with
+#: ZonalAllocationFailed twice on 2026-10-20, and created this v7 at once.
+AZURE_ROUND5_RUNNER_SIZE = "Standard_D8ls_v7"
 
 # Engine versions applied by infra/aws/aurora.tf and infra/aws/rds.tf. Lakebase
 # reports a major version only, so the two sides can be proved equal on the
@@ -356,7 +367,8 @@ def configured_rds_instance_class(round_id: RoundId) -> str | None:
 
 
 def competitor_is_aurora(competitor_id: CompetitorId) -> bool:
-    return competitor_id == CompetitorId.AURORA_SERVERLESS_V2
+    """Aurora's lane, not RDS's. Refuses a competitor with no AWS lane, which has neither."""
+    return aws_lane(competitor_id) == "aurora"
 
 
 @dataclass(frozen=True)
@@ -486,6 +498,79 @@ def observed_rds_instance_class(disclosure: CapacityDisclosure | None) -> str | 
     return None
 
 
+def _azure_lane(round_id: RoundId) -> tuple[CapacityLaneDisclosure, float]:
+    """The round's Azure server, as Terraform sized it. Round 1 stands none up (design 6.1)."""
+
+    size, memory, max_connections = (
+        AZURE_SERVER_D2DS_V5 if round_id is RoundId.SURVIVE_CONNECTION_SPIKE else AZURE_SERVER_B2S
+    )
+    lane = CapacityLaneDisclosure(
+        lane_id="competitor",
+        product=AZURE_PRODUCT_LABEL,
+        configured=size,
+        memory=f"{_number(memory)} GiB",
+        engine_version="PostgreSQL 17 (major only)",
+        idle_policy="No automatic idle pause exists for Flexible Server",
+        basis="configured",
+        max_connections=max_connections,
+    )
+    return lane, memory
+
+
+def _azure_capacity_disclosure(
+    round_id: RoundId, observed: ObservedCapacity | None
+) -> CapacityDisclosure:
+    """The Azure edition's disclosure: the round's server against Lakebase's ceiling."""
+
+    lakebase, _min_cu, max_cu = _lakebase_lane(round_id, observed)
+    if not round_has_aws_lane(round_id):
+        verb = "writes into" if round_id is RoundId.PUT_MODEL_SCORE_IN_APP else "reads from"
+        return CapacityDisclosure(
+            lanes=[lakebase],
+            matched=True,
+            summary=f"{lakebase.product} {lakebase.configured} ({lakebase.memory})",
+            note=(
+                f"Round {4 if round_id is RoundId.PUT_MODEL_SCORE_IN_APP else 6} times data "
+                f"movement, not database capacity: an Azure Data Factory data flow {verb} this "
+                "round's own Azure Database for PostgreSQL server. No compute comparison is "
+                "made here and no capacity margin is claimed."
+            ),
+        )
+    if round_id is RoundId.WAKE_IDLE_APP:
+        return CapacityDisclosure(
+            lanes=[lakebase],
+            matched=True,
+            summary=f"{lakebase.product} {lakebase.configured} ({lakebase.memory})",
+            note=(
+                "Round 1 times Lakebase alone: Azure Database for PostgreSQL has no automatic "
+                "scale-to-zero, so its lane is checked before the bell and no server stands for "
+                "it. No compute comparison is made and no capacity margin is claimed."
+            ),
+        )
+    competitor, memory = _azure_lane(round_id)
+    matched = memory == lakebase_memory_gb(max_cu)
+    note = (
+        f"Both ceilings are hand-set to the same memory: Lakebase {_number(max_cu)} CU against "
+        f"Azure's {competitor.configured}, {competitor.memory} each."
+        if matched
+        else (
+            f"Azure's lane has {_number(memory / lakebase_memory_gb(max_cu))}x Lakebase's "
+            f"memory: its built-in PgBouncer runs only on General Purpose servers, and the "
+            f"smallest, {competitor.configured}, has {competitor.memory}. The difference "
+            "favors Azure."
+        )
+    )
+    return CapacityDisclosure(
+        lanes=[lakebase, competitor],
+        matched=matched,
+        summary=(
+            f"{lakebase.product} {lakebase.configured} ({lakebase.memory}) · "
+            f"{competitor.product} {competitor.configured} ({competitor.memory})"
+        ),
+        note=note,
+    )
+
+
 def build_capacity_disclosure(
     round_id: RoundId,
     competitor_id: CompetitorId,
@@ -501,6 +586,8 @@ def build_capacity_disclosure(
     told, and Round 6's AWS lane does not race yet.
     """
 
+    if competitor_id == CompetitorId.AZURE_POSTGRES:
+        return _azure_capacity_disclosure(round_id, observed)
     lakebase, lakebase_min_cu, lakebase_max_cu = _lakebase_lane(round_id, observed)
     if not round_has_aws_lane(round_id):
         note = (

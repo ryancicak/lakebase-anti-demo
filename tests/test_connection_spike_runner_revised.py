@@ -1251,6 +1251,8 @@ async def test_four_fresh_hold_prepares_commit_one_shared_epoch(
                     sample_release_event,
                     teardown_event,
                     cancel_event,
+                    reconnect_latest_ns,
+                    reconnects_in_flight,
                 ) = self.args
                 try:
                     control_queue.put(("ready", index))
@@ -1882,6 +1884,39 @@ async def test_7134_partial_topology_never_commits_hold_or_publishes_samples(
     assert context.values[1].value == 0
 
 
+def test_a_lanes_shards_share_one_hold_window() -> None:
+    """A held client the server resets is reconnected in its shard, and the hold then runs 30 s
+    from the lane's latest reconnect in every shard (round5_fanin.SERVER_RESET_RULE)."""
+
+    latest, in_flight = _FakeValue(0), _FakeValue(0)
+    shard_a = runner._shared_hold_window(latest, in_flight)
+    shard_b = runner._shared_hold_window(latest, in_flight)
+
+    shard_a.begin()
+    assert shard_b.read() == (0, 1)  # one in flight anywhere holds every shard's hold open
+    shard_a.end(5_000)
+    shard_b.begin()
+    shard_b.end(None)  # a reconnect that failed moves nothing
+    assert shard_b.read() == (5_000, 0)
+    shard_b.begin()
+    shard_b.end(4_000)  # an earlier completion never pulls the latest back
+    assert shard_a.read() == (5_000, 0)
+
+
+def test_each_job_starts_with_an_empty_hold_window() -> None:
+    request_queue: queue.Queue = queue.Queue()
+    pool = SimpleNamespace(
+        reconnect_latest_ns=_FakeValue(9_000),
+        reconnects_in_flight=_FakeValue(1),
+        request_queues=[request_queue],
+    )
+
+    runner.ResidentShardPool.submit(pool, {"run_id": "run"})  # type: ignore[arg-type]
+
+    assert (pool.reconnect_latest_ns.value, pool.reconnects_in_flight.value) == (0, 0)
+    assert request_queue.get_nowait() == {"run_id": "run"}
+
+
 def test_worker_normal_completion_does_not_wait_for_unset_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1943,6 +1978,8 @@ def test_worker_normal_completion_does_not_wait_for_unset_cancellation(
         sample_release_event,
         teardown_event,
         cancel_event,
+        _FakeValue(0),
+        _FakeValue(0),
     )
 
     assert time.monotonic() - started < 1.0
@@ -2026,6 +2063,8 @@ def test_disconnect_between_ramp_ready_and_hold_prepare_prevents_completion(
         sample_release_event,
         threading.Event(),
         threading.Event(),
+        _FakeValue(0),
+        _FakeValue(0),
     )
 
     controls = []
@@ -2109,6 +2148,8 @@ def test_socket_loss_after_hold_prepared_prevents_commit_and_sampling(
         sample_release_event,
         threading.Event(),
         threading.Event(),
+        _FakeValue(0),
+        _FakeValue(0),
     )
 
     controls = []
@@ -2179,6 +2220,8 @@ def test_retired_telemetry_outcome_is_partial_and_never_announces_ramp_ready(
         _FakeValue(0),
         threading.Event(),
         threading.Event(),
+        _FakeValue(0),
+        _FakeValue(0),
     )
 
     controls = []
@@ -2244,6 +2287,8 @@ def test_worker_cancellation_is_bounded_and_publishes_one_result(
         threading.Event(),
         threading.Event(),
         cancel_event,
+        _FakeValue(0),
+        _FakeValue(0),
     )
     trigger.join()
 
@@ -2298,6 +2343,8 @@ def test_worker_crash_envelope_retains_sanitized_context(
         _FakeValue(1),
         threading.Event(),
         threading.Event(),
+        _FakeValue(0),
+        _FakeValue(0),
     )
 
     result = result_queue.get_nowait()

@@ -1791,6 +1791,34 @@ def test_manager_gate_rejects_missing_retries_key() -> None:
     assert RunManager._round_five_lane_valid(result, evidence) is False
 
 
+def test_manager_gate_accepts_a_lane_that_reconnected_every_reset_and_no_other() -> None:
+    """v1.3.0: a held client the server resets is reconnected, as a retry, and the hold starts
+    again. The room's gate agrees with the finalizer and the runner on what that proves."""
+
+    result = finalize_fanin_lane({
+        **raw_fanin_lane("lakebase"),
+        "disconnected_during_hold": 1,
+        "reconnected_after_reset": 1,
+        "retries": 1,
+    })
+    assert result.verified
+    evidence = RunManager._round_five_evidence(result)
+    assert (evidence["disconnected_during_hold"], evidence["reconnected_after_reset"]) == (1, 1)
+    assert RunManager._round_five_lane_valid(result, evidence) is True
+    # One it did not reconnect still fails the exact gate.
+    assert RunManager._round_five_lane_valid(
+        result, {**evidence, "reconnected_after_reset": 0}) is False
+    # Two counts that are not counts never match each other.
+    assert RunManager._round_five_lane_valid(
+        result, {**evidence, "disconnected_during_hold": None, "reconnected_after_reset": "x"},
+    ) is False
+    # A result from before v1.3.0 carries no reconnects, and needed no disconnect.
+    exact = finalize_fanin_lane(raw_fanin_lane("lakebase"))
+    old = dict(RunManager._round_five_evidence(exact))
+    del old["reconnected_after_reset"]
+    assert RunManager._round_five_lane_valid(exact, old) is True
+
+
 async def test_on_lane_result_accepts_a_retried_exact_lane_and_publishes_comparison() -> None:
     clock = Clock()
     provider = _EngineProvider(clock, _RetriedExactPlan)

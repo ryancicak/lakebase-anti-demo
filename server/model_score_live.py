@@ -742,7 +742,8 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
             or _enum_value(table.get("data_source_format")) != "DELTA"
             or actual_columns != expected_columns
             or not str(table.get("table_id") or "")
-            or not str(table.get("storage_location") or "").startswith("s3://")
+            # In the installation's own cloud storage: S3 on AWS, ADLS (abfss) on Azure.
+            or not str(table.get("storage_location") or "").startswith(("s3://", "abfss://"))
         ):
             raise ModelScoreLiveConfigurationError(
                 "Round 4 source table identity, ownership, schema, or Delta format changed"
@@ -811,11 +812,16 @@ class LiveModelScoreAdapter(ModelScoreAdapter):
             else {}
         )
         notebook = _mapping(task.get("notebook_task"))
+        # As the job was made: a service principal's application ID, or a user's email where the
+        # operator installed as themselves.
+        run_as_key = (
+            "user_name" if "@" in self.config.setup_principal else "service_principal_name"
+        )
         if (
             str(job.get("job_id") or "") != self.config.source_repair_job_id
             or str(job.get("creator_user_name") or "") != self.config.setup_principal
             or settings.get("name") != self.config.source_repair_job_name
-            or run_as.get("service_principal_name") != self.config.setup_principal
+            or run_as.get(run_as_key) != self.config.setup_principal
             or settings.get("max_concurrent_runs") != 1
             or task.get("task_key") != "repair_exact_round4_source"
             or notebook.get("notebook_path") != self.config.source_repair_notebook_path
@@ -2417,9 +2423,10 @@ def build_model_score_engine(manifest: DemoManifest) -> ModelScoreEngine:
     """Build the sealed live engine without performing any network operation."""
 
     resources = manifest.round4
-    if manifest.manifest_version not in (2, 3, 4, 5, 6, 7) or resources is None:
+    # v8 is the Azure edition's, whose Round 4 Lakebase seal is the AWS edition's own.
+    if manifest.manifest_version not in (2, 3, 4, 5, 6, 7, 8) or resources is None:
         raise ModelScoreLiveConfigurationError(
-            "A sealed manifest v2-v7 Round 4 contract is required"
+            "A sealed manifest v2-v8 Round 4 contract is required"
         )
     contract = ModelScoreContract(
         pipeline_id=resources.pipeline_id,

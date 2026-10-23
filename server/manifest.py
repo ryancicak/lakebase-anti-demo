@@ -12,8 +12,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .aws_auth import AwsAuthMode
+from .azure_manifest import AzureManifest
 from .capacity import rds_lane_is_scored
-from .models import RoundId
+from .models import InstallationCloud, RoundId
 from .round6_contract import round6_contract_sha256
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -684,6 +685,79 @@ class Round5FrozenConstants(BaseModel):
     rds_proxy_borrow_timeout_seconds: Literal[120] = 120
 
 
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
+#: A Key Vault secret, in the ARN shape AWS's runner harness checks (server/azure_round5_runner.py).
+_KEY_VAULT_SECRET_PATTERN = (
+    r"^arn:aws:secretsmanager:[a-z0-9-]+:000000000000:secret:[A-Za-z0-9-]{1,127}$")
+_SERVICE_BUS_QUEUE_PATTERN = (
+    r"^sb://[A-Za-z0-9-]{6,50}\.servicebus\.windows\.net/[A-Za-z0-9._-]{1,260}$")
+
+
+class Round5AzureResources(BaseModel):
+    """Secret-free Round 5 seal for the Azure edition (ROUND5-AZURE-SERVER-DESIGN.md, D).
+
+    The counterpart of `Round5Resources`, with none of its AWS fields: two runner VMs and their
+    identities, the Service Bus queues and Key Vault they read, the r5 Flexible Server whose
+    PgBouncer is the competitor's timed setup, and the digests the runners attested. Written by the
+    Azure installer's Round 5 step once both runners are installed, set up and proven.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    lakebase_direct_host: str = Field(min_length=1, max_length=253)
+    lakebase_pooled_host: str = Field(min_length=1, max_length=253)
+    #: The r5 Flexible Server: name, ARM id, FQDN. PgBouncer is the same host on 6432.
+    server_name: str = Field(min_length=3, max_length=63)
+    server_resource_id: str = Field(pattern=r"(?i)^/subscriptions/[0-9a-f-]{36}/resourceGroups/.+")
+    server_host: str = Field(pattern=r"^[a-z0-9-]{3,63}\.postgres\.database\.azure\.com$")
+    lakebase_runner_vm: str = Field(pattern=r"^vm-[a-z0-9-]{1,48}-r5-runner-[0-9]$")
+    competitor_runner_vm: str = Field(pattern=r"^vm-[a-z0-9-]{1,48}-r5-runner-[0-9]$")
+    runner_vm_size: str = Field(pattern=r"^Standard_D[0-9]+ls_v[67]$")
+    lakebase_runner_principal_id: str = Field(pattern=r"^[0-9a-f-]{36}$")
+    competitor_runner_principal_id: str = Field(pattern=r"^[0-9a-f-]{36}$")
+    #: The runners' one outbound address (their NAT gateway's), which the r5 server admits.
+    runner_egress_ip: str = Field(min_length=7, max_length=45)
+    service_bus_namespace: str = Field(pattern=r"^[A-Za-z0-9-]{6,50}$")
+    lakebase_control_queue: str = Field(pattern=_SERVICE_BUS_QUEUE_PATTERN)
+    competitor_control_queue: str = Field(pattern=_SERVICE_BUS_QUEUE_PATTERN)
+    key_vault_uri: str = Field(pattern=r"^https://[A-Za-z0-9-]{3,24}\.vault\.azure\.net/?$")
+    lakebase_control_secret: str = Field(pattern=_KEY_VAULT_SECRET_PATTERN)
+    competitor_control_secret: str = Field(pattern=_KEY_VAULT_SECRET_PATTERN)
+    #: The server's admin credential, as JSON in Key Vault, for the competitor's baseline setup.
+    competitor_master_secret: str = Field(pattern=_KEY_VAULT_SECRET_PATTERN)
+    #: A digest of the runners' network: their subnet, NSG and NAT address.
+    network_sha256: str = Field(pattern=_SHA256_PATTERN)
+    runner_harness_sha256: str = Field(pattern=_SHA256_PATTERN)
+    azure_runner_sha256: str = Field(pattern=_SHA256_PATTERN)
+    trust_bundle_sha256: str = Field(pattern=_SHA256_PATTERN)
+    runner_public_key_sha256: str = Field(pattern=_SHA256_PATTERN)
+    competitor_runner_public_key_sha256: str = Field(pattern=_SHA256_PATTERN)
+    lakebase_credential_sha256: str = Field(pattern=_SHA256_PATTERN)
+    lakebase_observer_credential_sha256: str = Field(pattern=_SHA256_PATTERN)
+    competitor_credential_sha256: str = Field(pattern=_SHA256_PATTERN)
+    competitor_observer_credential_sha256: str = Field(pattern=_SHA256_PATTERN)
+    baseline_sha256: str = Field(pattern=_SHA256_PATTERN)
+    #: The core Round 5 contract the runners were sealed under, and the digest of the two together,
+    #: as AWS's seal records them.
+    contract_sha256: str = Field(pattern=_SHA256_PATTERN)
+    config_sha256: str = Field(pattern=_SHA256_PATTERN)
+    sealed_at: datetime
+
+    @model_validator(mode="after")
+    def _two_distinct_runners(self) -> Round5AzureResources:
+        if (self.lakebase_runner_vm == self.competitor_runner_vm
+                or self.lakebase_control_queue == self.competitor_control_queue
+                or self.lakebase_control_secret == self.competitor_control_secret):
+            raise ValueError("Round 5 on Azure needs two distinct runners, queues and secrets")
+        return self
+
+    @property
+    def factory_ready(self) -> bool:
+        """Every field is required, so a loaded seal is complete."""
+
+        return True
+
+
 class LegacyRound5Resources(BaseModel):
     """The retired v3 pre-provisioned topology, retained only for safe loading."""
 
@@ -1176,19 +1250,43 @@ class Round5Resources(BaseModel):
         return self
 
 
+#: The fields only an AWS installation can carry. An Azure manifest with any of them is refused.
+AWS_ONLY_FIELDS = (
+    "aws",
+    "round3_anchor",
+    "round4_aws_source_location",
+    "round4_aws",
+    "round4_glue_subnet_cidr",
+    "round6_dms_subnet_cidr",
+    "round5",
+    "round6_aws_uc_external_id",
+    "round6_aws",
+    "round6_aws_unsupported",
+)
+
+
 class DemoManifest(BaseModel):
-    manifest_version: Literal[1, 2, 3, 4, 5, 6, 7] = 1
+    #: 1-7 are the AWS edition's, and 8 the Azure edition's (design section 9).
+    manifest_version: Literal[1, 2, 3, 4, 5, 6, 7, 8] = 1
     installation_id: str | None = Field(
         default=None,
         frozen=True,
         pattern=_INSTALLATION_ID_PATTERN,
+    )
+    #: The installation's cloud, sealed at its first provision. Every manifest before the Azure
+    #: edition is AWS's, so a missing value is ``aws``, and an AWS manifest is written without it:
+    #: its file is byte-identical to the one an earlier release wrote.
+    cloud: InstallationCloud = Field(
+        default="aws", frozen=True, exclude_if=lambda value: value == "aws"
     )
     run_id: str
     owner: str
     created_at: datetime
     expires_at: datetime
     status: Literal["provisioning", "seeding", "waiting_for_zero", "ready", "cleanup_failed"]
-    aws: AwsManifest
+    #: Required on AWS and absent on Azure (`azure` is the reverse).
+    aws: AwsManifest | None = Field(default=None, exclude_if=lambda value: value is None)
+    azure: AzureManifest | None = Field(default=None, exclude_if=lambda value: value is None)
     databricks: DatabricksManifest
     prior_databricks: list[DatabricksManifest] = Field(default_factory=list)
     schema_sha256: str = ""
@@ -1210,6 +1308,9 @@ class DemoManifest(BaseModel):
     round4_glue_subnet_cidr: str | None = Field(default=None, pattern=LANE_CIDR_PATTERN)
     round6_dms_subnet_cidr: str | None = Field(default=None, pattern=LANE_CIDR_PATTERN)
     round5: Round5Resources | LegacyRound5Resources | None = None
+    #: The Azure edition's Round 5 seal (`round5` is AWS's). Absent from an AWS manifest's file.
+    round5_azure: Round5AzureResources | None = Field(
+        default=None, exclude_if=lambda value: value is None)
     round6: Round6Resources | None = None
     #: The external ID of Round 6's Unity Catalog storage credential, recorded once the
     #: installer has created the credential and before the lane's own Terraform apply, and kept
@@ -1230,6 +1331,16 @@ class DemoManifest(BaseModel):
 
     @model_validator(mode="after")
     def require_versioned_resources(self) -> DemoManifest:
+        if self.cloud == "azure":
+            self._validate_azure_installation()
+            self._validate_environment_seals()
+            return self
+        if self.aws is None:
+            raise ValueError("an AWS installation requires its aws section")
+        if self.azure is not None:
+            raise ValueError("an AWS installation carries no azure section")
+        if self.manifest_version == 8:
+            raise ValueError("manifest_version 8 is the Azure edition's")
         if self.manifest_version in (2, 3, 4, 5, 6, 7) and self.round4 is None:
             raise ValueError(
                 f"manifest_version {self.manifest_version} requires sealed Round 4 resources"
@@ -1263,6 +1374,28 @@ class DemoManifest(BaseModel):
         self._validate_round6_aws()
         self._validate_environment_seals()
         return self
+
+    def _validate_azure_installation(self) -> None:
+        """An Azure installation's own rules (design section 9): its section, and nothing AWS's.
+
+        Setup seals the rounds one at a time after the installation says ``ready``, as on AWS, so
+        nothing here asks for a round's seal. A round without one isn't offered.
+        """
+
+        if self.manifest_version != 8:
+            raise ValueError("an Azure installation requires manifest_version 8")
+        if self.azure is None:
+            raise ValueError("an Azure installation requires its azure section")
+        carried = [name for name in AWS_ONLY_FIELDS if getattr(self, name) is not None]
+        if carried:
+            raise ValueError(
+                f"an Azure installation carries no AWS field; got {', '.join(carried)}"
+            )
+        if self.installation_id is None:
+            raise ValueError("an Azure installation requires a full installation_id")
+        for round_id, sealed in (self.round_environments or {}).items():
+            if sealed.aurora is not None or sealed.rds is not None:
+                raise ValueError(f"{round_id.value} seals an AWS database on an Azure installation")
 
     def _validate_round6_aws(self) -> None:
         if self.round6_aws_uc_external_id is not None and self.installation_id is None:
@@ -1376,7 +1509,7 @@ class DemoManifest(BaseModel):
 
         expected = set(_ROUND_IDS)
         actual = set(environments)
-        if self.manifest_version == 7 and actual != expected:
+        if self.manifest_version in (7, 8) and actual != expected:
             missing = sorted(round_id.value for round_id in expected - actual)
             extra = sorted(str(round_id) for round_id in actual - expected)
             raise ValueError(
@@ -1389,6 +1522,8 @@ class DemoManifest(BaseModel):
                 raise ValueError("manifest_version 7 requires a full installation_id")
             if self.coordination_environment is None:
                 raise ValueError("manifest_version 7 requires a coordination environment")
+        if self.manifest_version == 8 and self.coordination_environment is None:
+            raise ValueError("manifest_version 8 requires a coordination environment")
 
         if self.manifest_version == 7:
             aws_rounds = {
@@ -1473,6 +1608,13 @@ class DemoManifest(BaseModel):
         if self.manifest_version == 7:
             self._require_round1_legacy_mirror(environments[RoundId.WAKE_IDLE_APP])
             self._require_adapter_seal_matches(environments)
+        if self.manifest_version == 8:
+            # Lakebase's half of each round seal, which is the AWS edition's. Each is checked once
+            # setup has sealed it.
+            if self.round4 is not None:
+                self._require_round4_adapter_seal_matches(environments)
+            if self.round6 is not None:
+                self._require_round6_adapter_seal_matches(environments)
 
     @staticmethod
     def _require_unique_round_identity(label: str, values: list[str]) -> None:
@@ -1522,14 +1664,7 @@ class DemoManifest(BaseModel):
     ) -> None:
         assert self.round4 is not None and isinstance(self.round5, Round5Resources)
         assert self.round6 is not None
-        round4 = environments[RoundId.PUT_MODEL_SCORE_IN_APP].lakebase
-        if (
-            self.round4.project_uid != round4.project_uid
-            or self.round4.branch_uid != round4.branch_uid
-            or self.round4.branch != round4.branch_name
-            or self.round4.endpoint_name != round4.endpoint_name
-        ):
-            raise ValueError("Round 4 adapter identities do not match its environment seal")
+        self._require_round4_adapter_seal_matches(environments)
 
         round5 = environments[RoundId.SURVIVE_CONNECTION_SPIKE]
         assert round5.aurora is not None and round5.rds is not None
@@ -1547,6 +1682,25 @@ class DemoManifest(BaseModel):
         ):
             raise ValueError("Round 5 adapter identities do not match its environment seal")
 
+        self._require_round6_adapter_seal_matches(environments)
+
+    def _require_round4_adapter_seal_matches(
+        self, environments: dict[RoundId, RoundEnvironmentSeal]
+    ) -> None:
+        assert self.round4 is not None
+        round4 = environments[RoundId.PUT_MODEL_SCORE_IN_APP].lakebase
+        if (
+            self.round4.project_uid != round4.project_uid
+            or self.round4.branch_uid != round4.branch_uid
+            or self.round4.branch != round4.branch_name
+            or self.round4.endpoint_name != round4.endpoint_name
+        ):
+            raise ValueError("Round 4 adapter identities do not match its environment seal")
+
+    def _require_round6_adapter_seal_matches(
+        self, environments: dict[RoundId, RoundEnvironmentSeal]
+    ) -> None:
+        assert self.round6 is not None
         round6 = environments[RoundId.ANALYZE_LIVE_ORDERS].lakebase
         if (
             self.round6.branch_name != round6.branch_name
@@ -1592,7 +1746,29 @@ class DemoManifest(BaseModel):
         return self.round5
 
     @property
+    def round5_available(self) -> bool:
+        """Whether the App races Round 5: AWS's seal (`round5_ready`), or the Azure edition's.
+
+        `round5_ready` stays AWS's alone, because the AWS installer, reset and doctor branch on it
+        throughout; the App's own Round 5 wiring and readiness gate ask this.
+        """
+
+        if self.cloud == "azure":
+            return self.round5_azure is not None
+        return self.round5_ready
+
+    def require_azure_round5_resources(self) -> Round5AzureResources:
+        """The Azure edition's Round 5 seal (`round5_ready` does not answer for it yet)."""
+
+        if self.cloud != "azure" or self.round5_azure is None:
+            raise RuntimeError("Round 5 on Azure requires its sealed runners and server")
+        return self.round5_azure
+
+    @property
     def round6_ready(self) -> bool:
+        if self.cloud == "azure":
+            # Azure's Round 6 needs no Round 5 seal: its lane is its own server and data flow.
+            return self.round6 is not None
         return self.manifest_version in (6, 7) and self.round5_ready and self.round6 is not None
 
     # There is deliberately no `assert_not_expired` here, and re-adding one would
@@ -1683,10 +1859,32 @@ def save_manifest(manifest: DemoManifest, path: Path | None = None) -> Path:
     return target
 
 
+#: What an AWS manifest exports that an Azure one must not inherit from the shell that ran it.
+_AWS_ENVIRONMENT = (
+    "AWS_AUTH_MODE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_EXPECTED_ACCOUNT_ID",
+    "AWS_PROFILE",
+    "AWS_DEFAULT_PROFILE",
+    "ANTI_DEMO_RUNTIME_ROLE_ARN",
+    "AURORA_CLUSTER_ID",
+    "AURORA_SECRET_ARN",
+    "AURORA_DATABASE",
+    "RDS_INSTANCE_ID",
+    "RDS_SECRET_ARN",
+    "RDS_DATABASE",
+)
+
+
 def apply_manifest_environment(manifest: DemoManifest) -> None:
     coordination_endpoint = manifest.databricks.coordination_endpoint_name or (
         f"projects/{manifest.databricks.project_id}/branches/coordination/endpoints/primary"
     )
+    if getattr(manifest, "azure", None) is not None:
+        _apply_azure_manifest_environment(manifest, coordination_endpoint)
+        return
+    assert manifest.aws is not None
     values = {
         "AWS_AUTH_MODE": manifest.aws.auth_mode,
         "AWS_REGION": manifest.aws.region,
@@ -1715,6 +1913,33 @@ def apply_manifest_environment(manifest: DemoManifest) -> None:
         os.environ.pop("AWS_DEFAULT_PROFILE", None)
     if manifest.aws.runtime_role_arn is None:
         os.environ.pop("ANTI_DEMO_RUNTIME_ROLE_ARN", None)
+    _export(manifest, values)
+
+
+def _apply_azure_manifest_environment(manifest: DemoManifest, coordination_endpoint: str) -> None:
+    """The Azure edition's half: Lakebase's bindings as on AWS, and nothing AWS's at all."""
+
+    assert getattr(manifest, "azure", None) is not None
+    for name in _AWS_ENVIRONMENT:
+        os.environ.pop(name, None)
+    values = {
+        "DATABRICKS_PROFILE": manifest.databricks.profile,
+        "LAKEBASE_ENDPOINT_NAME": manifest.databricks.endpoint_name,
+        "LAKEBASE_DATABASE": manifest.databricks.database,
+        "LAKEBASE_USER": manifest.databricks.user,
+        # Lakebase runs in the installation's own region, named as Azure names it.
+        "LAKEBASE_EXPECTED_REGION": manifest.azure.region,
+        "ANTI_DEMO_COORDINATION_ENDPOINT_NAME": coordination_endpoint,
+        "ANTI_DEMO_COORDINATION_DATABASE": manifest.databricks.database,
+        "ANTI_DEMO_COORDINATION_USER": manifest.databricks.user,
+        "AZURE_TENANT_ID": manifest.azure.tenant_id,
+        "AZURE_SUBSCRIPTION_ID": manifest.azure.subscription_id,
+        "EXPECTED_POSTGRES_MAJOR": "17",
+    }
+    _export(manifest, values)
+
+
+def _export(manifest: DemoManifest, values: dict[str, str]) -> None:
     if "@" in manifest.owner:
         values.update(
             {

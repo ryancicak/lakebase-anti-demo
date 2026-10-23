@@ -7,10 +7,41 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+#: The cloud an installation lives in, for life (Azure design, section 1). Sealed in the manifest.
+InstallationCloud = Literal["aws", "azure"]
+
 
 class CompetitorId(StrEnum):
     AURORA_SERVERLESS_V2 = "aurora_serverless_v2"
     RDS_POSTGRES = "rds_postgres"
+    #: The Azure edition's one competitor (design section 12), offered only on an Azure
+    #: installation, as Aurora and RDS are only on an AWS one.
+    AZURE_POSTGRES = "azure_postgres"
+
+
+def competitor_cloud(competitor: str) -> InstallationCloud:
+    """The cloud whose installations offer a competitor."""
+
+    if competitor == CompetitorId.AZURE_POSTGRES:
+        return "azure"
+    if competitor in (CompetitorId.AURORA_SERVERLESS_V2, CompetitorId.RDS_POSTGRES):
+        return "aws"
+    raise ValueError(f"unknown competitor {competitor!r}")
+
+
+def aws_lane(competitor: str) -> Literal["aurora", "rds"]:
+    """The AWS edition's lane key for a competitor, refusing any competitor that isn't AWS's.
+
+    Several lanes used to read "aurora if Aurora, else rds", which sends any third competitor down
+    RDS's path in silence. The Azure edition adds one (design section 11, "capabilities, not
+    identities"), so the mapping is explicit and an unknown competitor is a named refusal.
+    """
+
+    if competitor == CompetitorId.AURORA_SERVERLESS_V2:
+        return "aurora"
+    if competitor == CompetitorId.RDS_POSTGRES:
+        return "rds"
+    raise ValueError(f"competitor {competitor!r} has no AWS lane")
 
 
 class Corner(StrEnum):

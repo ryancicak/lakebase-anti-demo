@@ -41,6 +41,12 @@ def _load(name: str):
 
 def test_every_step_has_a_script():
     assert {path.name for path in SCRIPTS} == {
+        # The Azure edition's `backup` step: a bout inside an on-demand backup of its source.
+        "azure_backup.py",
+        # The Azure edition's `lease` step: the app keeps its resources' lease alive.
+        "azure_lease_check.py",
+        # The Azure edition's `leaks` step: its per-bout copies and data flow runs.
+        "azure_leftovers.py",
         "backup.py",
         "chaos.py",
         "gone.py",

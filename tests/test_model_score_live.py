@@ -84,7 +84,18 @@ async def test_statement_runner_preserves_provider_failure_category(
     assert "FAILED" not in str(caught.value)
 
 
-async def test_source_repair_can_only_run_the_sealed_job_without_parameters() -> None:
+@pytest.mark.parametrize(
+    ("principal", "run_as"),
+    [
+        # An M2M install's service principal, by application ID (AWS's installs).
+        ("11111111-2222-3333-4444-555555555555", "service_principal_name"),
+        # An operator who installed as themselves: Databricks runs the job as that user.
+        ("operator@databricks.com", "user_name"),
+    ],
+)
+async def test_source_repair_can_only_run_the_sealed_job_without_parameters(
+    principal: str, run_as: str
+) -> None:
     calls: list[tuple[str, str, object]] = []
 
     class ApiClient:
@@ -93,12 +104,10 @@ async def test_source_repair_can_only_run_the_sealed_job_without_parameters() ->
             if path == "/api/2.1/jobs/get?job_id=123":
                 return {
                     "job_id": 123,
-                    "creator_user_name": "operator@databricks.com",
+                    "creator_user_name": principal,
                     "settings": {
                         "name": "lakebase-anti-demo-owner-round4-source-repair",
-                        "run_as": {
-                            "service_principal_name": "operator@databricks.com",
-                        },
+                        "run_as": {run_as: principal},
                         "max_concurrent_runs": 1,
                         "tasks": [
                             {
@@ -126,6 +135,7 @@ async def test_source_repair_can_only_run_the_sealed_job_without_parameters() ->
     adapter = LiveModelScoreAdapter(
         replace(
             live_config(),
+            setup_principal=principal,
             source_repair_job_id="123",
             source_repair_job_name="lakebase-anti-demo-owner-round4-source-repair",
             source_repair_notebook_path=(
@@ -498,6 +508,10 @@ async def test_inspect_sync_uses_sealed_spec_cdf_source_head_and_fail_closed_sta
     manifest.manifest_version = 6
     assert model_score_live.build_model_score_engine(manifest).contract == engine.contract
     manifest.manifest_version = 7
+    assert model_score_live.build_model_score_engine(manifest).contract == engine.contract
+    # The Azure edition's v8 seals Round 4's Lakebase lane exactly as v7 does. Its first bout
+    # was refused here as "a sealed manifest v2-v7 Round 4 contract is required" (2026-10-19).
+    manifest.manifest_version = 8
     assert model_score_live.build_model_score_engine(manifest).contract == engine.contract
 
 

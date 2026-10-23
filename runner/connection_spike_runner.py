@@ -1063,6 +1063,31 @@ def _worker_stop_envelope(
     }
 
 
+def _shared_hold_window(reconnect_latest_ns: Any, reconnects_in_flight: Any) -> fanin.HoldWindow:
+    """The lane's hold window across its four shards, in the parent's shared counters.
+
+    A held client the server resets is reconnected in its shard, and the hold then runs
+    HOLD_SECONDS from the lane's latest reconnect, in every shard (round5_fanin.SERVER_RESET_RULE).
+    CLOCK_MONOTONIC is the host's, so the shards' times compare, as `hold_ns` does.
+    """
+
+    def begin() -> None:
+        with reconnects_in_flight.get_lock():
+            reconnects_in_flight.value += 1
+
+    def end(completed_ns: int | None) -> None:
+        if completed_ns is not None:
+            with reconnect_latest_ns.get_lock():
+                reconnect_latest_ns.value = max(int(reconnect_latest_ns.value), completed_ns)
+        with reconnects_in_flight.get_lock():
+            reconnects_in_flight.value -= 1
+
+    def read() -> tuple[int, int]:
+        return int(reconnect_latest_ns.value), int(reconnects_in_flight.value)
+
+    return fanin.HoldWindow(begin=begin, end=end, read=read)
+
+
 def _fanin_worker_process(
     request: Mapping[str, object],
     worker_index: int,
@@ -1076,6 +1101,8 @@ def _fanin_worker_process(
     sample_release_event: Any,
     teardown_event: Any,
     cancel_event: Any,
+    reconnect_latest_ns: Any,
+    reconnects_in_flight: Any,
 ) -> None:
     worker_cpu = _pin_fanin_worker(worker_index)
 
@@ -1154,15 +1181,25 @@ def _fanin_worker_process(
             return int(release_ns.value)
 
         async def await_hold(
-            proof_reader: Callable[[], Mapping[str, Mapping[str, object]]],
+            proof_reader: Callable[
+                [],
+                Mapping[str, Mapping[str, object]]
+                | Awaitable[Mapping[str, Mapping[str, object]]],
+            ],
         ) -> int:
+            async def read_proof() -> object:
+                # The shard's reader first lets a reconnect in flight finish
+                # (round5_fanin.SERVER_RESET_RULE), so it may need awaiting.
+                proof = proof_reader()
+                return await proof if isinstance(proof, Awaitable) else proof
+
             proof_identity = {
                 "expected_run_id": str(request.get("run_id") or ""),
                 "expected_worker_index": worker_index,
                 "expected_release_ns": int(release_ns.value),
             }
             initial_proof = _validated_ramp_proof(
-                proof_reader(),
+                await read_proof(),
                 **proof_identity,
             )
             control_queue.put(("ramp_ready", worker_index, initial_proof))
@@ -1175,7 +1212,7 @@ def _fanin_worker_process(
             # prevents the hold epoch instead of being hidden by the earlier
             # count.
             prepared_proof = _validated_ramp_proof(
-                proof_reader(),
+                await read_proof(),
                 **proof_identity,
             )
             control_queue.put(("hold_prepared", worker_index, prepared_proof))
@@ -1184,7 +1221,7 @@ def _fanin_worker_process(
             if shared_hold_ns <= int(release_ns.value):
                 raise RunnerContractError("fanin_worker_hold_epoch_invalid")
             committed_proof = _validated_ramp_proof(
-                proof_reader(),
+                await read_proof(),
                 **proof_identity,
             )
             control_queue.put(
@@ -1222,6 +1259,7 @@ def _fanin_worker_process(
                 before_teardown=before_teardown,
                 worker_cpu=worker_cpu,
                 capacity_preflight_verified=True,
+                hold_window=_shared_hold_window(reconnect_latest_ns, reconnects_in_flight),
             )
             return result
         finally:
@@ -1313,6 +1351,8 @@ def _resident_worker_entry(
     sample_release_event: Any,
     teardown_event: Any,
     cancel_event: Any,
+    reconnect_latest_ns: Any,
+    reconnects_in_flight: Any,
 ) -> None:
     preload_ready_queue.put(
         (
@@ -1338,6 +1378,8 @@ def _resident_worker_entry(
         sample_release_event,
         teardown_event,
         cancel_event,
+        reconnect_latest_ns,
+        reconnects_in_flight,
     )
 
 
@@ -1359,6 +1401,8 @@ class ResidentShardPool:
     request_queues: list[Any]
     processes: list[Any]
     worker_ready_indexes: tuple[int, ...]
+    reconnect_latest_ns: Any = None
+    reconnects_in_flight: Any = None
 
     @classmethod
     def start(cls) -> ResidentShardPool:
@@ -1373,6 +1417,8 @@ class ResidentShardPool:
         cancel_event = context.Event()
         release_ns = context.Value("q", 0)
         hold_ns = context.Value("q", 0)
+        reconnect_latest_ns = context.Value("q", 0)
+        reconnects_in_flight = context.Value("q", 0)
         request_queues = [context.Queue(maxsize=1) for _ in range(fanin.WORKER_COUNT)]
         preload_ready_queue = context.Queue()
         processes = [
@@ -1392,6 +1438,8 @@ class ResidentShardPool:
                     sample_release_event,
                     teardown_event,
                     cancel_event,
+                    reconnect_latest_ns,
+                    reconnects_in_flight,
                 ),
                 name=f"round5-resident-fanin-{index}",
             )
@@ -1439,9 +1487,16 @@ class ResidentShardPool:
             request_queues=request_queues,
             processes=processes,
             worker_ready_indexes=tuple(sorted(ready)),
+            reconnect_latest_ns=reconnect_latest_ns,
+            reconnects_in_flight=reconnects_in_flight,
         )
 
     def submit(self, request: Mapping[str, object]) -> None:
+        # Each job's hold window starts empty (round5_fanin.SERVER_RESET_RULE).
+        for counter in (self.reconnect_latest_ns, self.reconnects_in_flight):
+            if counter is not None:
+                with counter.get_lock():
+                    counter.value = 0
         for request_queue in self.request_queues:
             request_queue.put(dict(request))
 
@@ -1471,6 +1526,9 @@ async def _execute_sharded_fanin(
     cancel_event = resident_pool.cancel_event if resident_pool is not None else context.Event()
     release_ns = resident_pool.release_ns if resident_pool is not None else context.Value("q", 0)
     hold_ns = resident_pool.hold_ns if resident_pool is not None else context.Value("q", 0)
+    # A pool's workers already hold its own pair (ResidentShardPool.start); fresh workers get one.
+    reconnect_latest_ns = None if resident_pool is not None else context.Value("q", 0)
+    reconnects_in_flight = None if resident_pool is not None else context.Value("q", 0)
     processes = (
         resident_pool.processes
         if resident_pool is not None
@@ -1490,6 +1548,8 @@ async def _execute_sharded_fanin(
                     sample_release_event,
                     teardown_event,
                     cancel_event,
+                    reconnect_latest_ns,
+                    reconnects_in_flight,
                 ),
                 name=f"round5-fanin-{index}",
             )

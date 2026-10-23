@@ -340,16 +340,33 @@ def _validate_database(workspace: Any, names: Mapping[str, str]) -> Mapping[str,
     return database
 
 
-def _validate_catalog(workspace: Any, catalog_name: str) -> Mapping[str, Any]:
+def _validate_catalog(
+    workspace: Any, catalog_name: str, *, owned_storage: bool = False
+) -> Mapping[str, Any]:
+    """The destination catalog, as Round 6 needs it.
+
+    `owned_storage` is the Azure edition's catalog, the installation's own: its metastore has no
+    root, so every catalog there carries managed storage, and this one's is the installation's
+    ADLS account. Elsewhere the catalog must use the metastore's storage, as `main` does on AWS.
+    """
+
     catalog = _mapping(workspace.catalogs.get(catalog_name))
     if catalog.get("name") != catalog_name or catalog.get("full_name") not in {
         None,
         catalog_name,
     }:
         raise RuntimeError("Round 6 destination catalog identity changed")
-    if catalog.get("storage_root") or catalog.get("storage_location"):
+    if not owned_storage and (catalog.get("storage_root") or catalog.get("storage_location")):
         raise RuntimeError("Round 6 CDF catalog must not have catalog-level managed storage")
     return catalog
+
+
+def _installation_catalog(manifest: DemoManifest, catalog: str) -> bool:
+    """Whether `catalog` is the Azure installation's own, sealed in its Unity Catalog seal."""
+
+    azure = getattr(manifest, "azure", None)
+    sealed = getattr(azure, "unity_catalog", None)
+    return sealed is not None and sealed.catalog == catalog
 
 
 def _ensure_round6_app_role(
@@ -725,7 +742,10 @@ def prepare_round6(
 ) -> Round6Resources:
     """Provision and validate Round 6, but leave manifest persistence to lifecycle."""
 
-    if not manifest.round5_ready or manifest.round4 is None:
+    # On AWS, Round 6 is sealed after Round 5's baseline. The Azure edition's Round 6 is its own
+    # server and data flow, so it needs Round 4's identities (the setup and App principals) alone.
+    azure = getattr(manifest, "cloud", "aws") == "azure"
+    if manifest.round4 is None or not (manifest.round5_ready or azure):
         raise RuntimeError("Round 6 requires the complete manifest v5 baseline")
     names = round6_names(manifest)
     catalog = os.environ.get("DATABRICKS_CDF_CATALOG", "main").strip()
@@ -740,7 +760,7 @@ def prepare_round6(
         workspace, names
     )
     _validate_database(workspace, names)
-    _validate_catalog(workspace, catalog)
+    _validate_catalog(workspace, catalog, owned_storage=_installation_catalog(manifest, catalog))
     app_client_id = manifest.round4.app_service_principal_client_id
     _ensure_round6_app_role(
         manifest,
@@ -919,7 +939,11 @@ def _check_round6(
         ):
             raise RuntimeError("Round 6 branch or endpoint seal changed")
         _validate_database(workspace, names)
-        _validate_catalog(workspace, sealed.destination_catalog)
+        _validate_catalog(
+            workspace,
+            sealed.destination_catalog,
+            owned_storage=_installation_catalog(manifest, sealed.destination_catalog),
+        )
         schema = _validate_schema(
             workspace.schemas.get(f"{sealed.destination_catalog}.{sealed.destination_schema}"),
             catalog=sealed.destination_catalog,
@@ -1523,6 +1547,12 @@ def cleanup_round6(
         history_table_full_name(sealed.destination_catalog, sealed.destination_schema, competitor)
         for competitor in ("aurora", "rds")
     }
+    # The Azure edition's lane keeps its one history beside Lakebase's the same way.
+    from .azure_runtime import ROUND6_HISTORY_TABLE
+
+    aws_history.add(
+        f"{sealed.destination_catalog}.{sealed.destination_schema}.{ROUND6_HISTORY_TABLE}"
+    )
     destination = (sealed.destination_table_full_name, sealed.destination_table_id)
     if any(
         (item.get("full_name"), item.get("table_id")) != destination

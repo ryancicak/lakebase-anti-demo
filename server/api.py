@@ -424,6 +424,7 @@ async def get_catalog(request: Request) -> CatalogResponse:
         model_score_available=run_manager.model_score_available,
         connection_spike_available=run_manager.connection_spike_available,
         live_orders_available=run_manager.live_orders_available,
+        cloud=getattr(run_manager, "cloud", "aws"),
     )
     # The seal says what was built; this says what can arm. Offering the first as
     # though it were the second is what put six green rounds on the round-select

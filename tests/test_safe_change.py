@@ -6,8 +6,11 @@ from pathlib import Path
 
 import pytest
 
+from server import safe_change
 from server.models import CompetitorId
 from server.safe_change import (
+    AURORA_WAKING_STATUS,
+    LANE_READY_PREFIX,
     SAFE_CHANGE_MIGRATION_PATH,
     ArtifactInspection,
     SafeChangeAdapter,
@@ -21,6 +24,7 @@ from server.safe_change import (
     SafeChangeProvider,
     SafeChangeResetError,
     abandon_on_cancel,
+    connect_saying_waits,
 )
 
 
@@ -300,6 +304,61 @@ async def test_arm_preflights_both_sources_and_builds_deterministic_plans() -> N
     assert lakebase.source_connections[-1].closed is True
     assert aurora.source_connections[-1].closed is True
     assert [event.phase for event in progress].count(SafeChangePhase.ARMED) == 2
+    # Each lane says it is ready when its own preflight holds, not only once both have.
+    for lane_id in ("lakebase", "competitor"):
+        lines = [event for event in progress if event.lane_id == lane_id]
+        assert any(event.phase == SafeChangePhase.PREFLIGHT
+                   and event.status.startswith(LANE_READY_PREFIX) for event in lines)
+        assert lines[-1].phase == SafeChangePhase.ARMED
+        assert lines[-1].status.startswith(LANE_READY_PREFIX)
+
+
+async def test_a_slow_connect_says_why_then_how_long_and_a_quick_one_says_nothing(
+    monkeypatch,
+) -> None:
+    # An Aurora writer resuming from its automatic pause held a Round 3 arm 73.7 s on the live
+    # app (2026-10-16), with nothing on the screen saying so.
+    monkeypatch.setattr(safe_change, "SLOW_CONNECT_NOTICE_SECONDS", 0.01)
+    said: list[str] = []
+
+    async def say(status: str) -> None:
+        said.append(status)
+
+    async def connect(delay: float) -> str:
+        await asyncio.sleep(delay)
+        return "connection"
+
+    assert await connect_saying_waits(
+        connect(0), say, SafeChangeProvider.AURORA, lambda: 0) == "connection"
+    assert said == []
+
+    ticks = iter([0, 42_300_000_000])
+    assert await connect_saying_waits(
+        connect(0.05), say, SafeChangeProvider.AURORA, lambda: next(ticks)) == "connection"
+    assert said == [AURORA_WAKING_STATUS, "Aurora awake after 42.3 s"]
+
+    said.clear()
+    ticks = iter([0, 4_200_000_000])
+    await connect_saying_waits(connect(0.05), say, SafeChangeProvider.RDS, lambda: next(ticks))
+    assert said == ["Waiting for the database to accept the connection", "Connected after 4.2 s"]
+
+
+async def test_a_slow_connect_cancelled_says_nothing_more(monkeypatch) -> None:
+    monkeypatch.setattr(safe_change, "SLOW_CONNECT_NOTICE_SECONDS", 0.01)
+    said: list[str] = []
+    noticed = asyncio.Event()
+
+    async def say(status: str) -> None:
+        said.append(status)
+        noticed.set()
+
+    waiting = asyncio.create_task(connect_saying_waits(
+        asyncio.Event().wait(), say, SafeChangeProvider.AURORA, lambda: 0))
+    await asyncio.wait_for(noticed.wait(), timeout=5)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert said == [AURORA_WAKING_STATUS]
 
 
 async def test_reset_settles_both_lanes_before_cleanup_inspection() -> None:
@@ -349,6 +408,8 @@ async def test_run_uses_one_barrier_and_the_identical_full_sql_proof() -> None:
 
     result = await engine.run(arm, capture)
 
+    # The run checks each source again after the bell, and says nothing about being ready for it.
+    assert not any(event.status.startswith(LANE_READY_PREFIX) for event in progress)
     assert result.all_verified is True
     assert result.lanes["lakebase"].state == SafeChangeLaneState.VERIFIED
     assert result.lanes["competitor"].state == SafeChangeLaneState.VERIFIED

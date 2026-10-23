@@ -1146,6 +1146,10 @@ def build_recovery_engine(
     cleanup_only: bool = False,
 ) -> RecoveryEngine:
     owned = manifest or load_manifest()
+    if getattr(owned, "azure", None) is not None:
+        from .azure_runtime import build_azure_recovery_engine
+
+        return build_azure_recovery_engine(owned, cleanup_only=cleanup_only)
     safe_change = build_safe_change_engine(
         owned, cleanup_only=cleanup_only, round_number=3
     )

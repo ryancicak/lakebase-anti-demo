@@ -6368,6 +6368,69 @@ def test_a_lakebase_delete_refused_for_good_is_raised_at_once(monkeypatch) -> No
     assert calls == ["delete-project"]
 
 
+def test_a_connection_closed_without_an_answer_is_transient() -> None:
+    # 2026-10-22: an install stopped on the Databricks CLI's (Go's) bare EOF.
+    assert lifecycle._sql_statement_error_is_transient(
+        'Error: Patch "https://example.test/api/2.0/postgres/projects/p/branches/production/'
+        'endpoints/primary?update_mask=spec.suspension": EOF')
+    assert lifecycle._sql_statement_error_is_transient("read tcp 10.0.0.1:5432: unexpected EOF")
+    assert lifecycle._sql_statement_error_is_transient("write: broken pipe")
+    assert not lifecycle._sql_statement_error_is_transient(
+        "the schema and the tables thereof are missing")
+
+
+_COORDINATION_BINDING = lifecycle._LakebaseBinding(
+    "anti-demo-x-coord", "projects/anti-demo-x-coord/branches/production/endpoints/primary")
+
+
+def test_an_install_rides_out_a_transient_error_making_a_lakebase_project(monkeypatch) -> None:
+    # 2026-10-22: "INTERNAL_ERROR: Unhandled error in API call" stopped an install as it made the
+    # coordination project, which Lakebase had made by then. The next ask checks it, configures
+    # it and seals it.
+    asked: list[float] = []
+    seal = object()
+
+    def flaky(manifest, *, project_id, endpoint_name, display_label, max_cu):
+        asked.append(max_cu)
+        if len(asked) == 1:
+            raise RuntimeError("Error: INTERNAL_ERROR: Unhandled error in API call [TraceId: 0]")
+
+    monkeypatch.setattr("server.lifecycle._ensure_lakebase", flaky)
+    monkeypatch.setattr("server.lifecycle._seal_lakebase_environment", lambda *_args: seal)
+    monkeypatch.setattr("server.lifecycle.time.sleep", lambda seconds: None)
+
+    sealed = lifecycle._ensure_and_seal_lakebase(
+        object(), _COORDINATION_BINDING, display_label="x", max_cu=1)
+    assert sealed is seal and asked == [1, 1]
+
+
+def test_an_install_raises_a_lakebase_refusal_at_once_and_a_transient_one_in_the_end(
+    monkeypatch,
+) -> None:
+    asked: list[str] = []
+
+    def refusing(text: str):
+        def ensure(manifest, **kwargs):
+            asked.append(text)
+            raise RuntimeError(text)
+
+        return ensure
+
+    monkeypatch.setattr("server.lifecycle.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "server.lifecycle._ensure_lakebase", refusing("Error: PERMISSION_DENIED: no grant"))
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        lifecycle._ensure_and_seal_lakebase(object(), _COORDINATION_BINDING, display_label="x")
+    assert len(asked) == 1
+
+    asked.clear()
+    monkeypatch.setattr(
+        "server.lifecycle._ensure_lakebase", refusing("Error: INTERNAL_ERROR: Unhandled error"))
+    with pytest.raises(RuntimeError, match="INTERNAL_ERROR"):
+        lifecycle._ensure_and_seal_lakebase(object(), _COORDINATION_BINDING, display_label="x")
+    assert len(asked) == lifecycle.LAKEBASE_ENSURE_ATTEMPTS
+
+
 def test_a_pipeline_that_outlived_its_synced_table_is_deleted_not_assumed_gone(
     monkeypatch,
 ) -> None:

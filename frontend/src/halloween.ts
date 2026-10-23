@@ -79,6 +79,7 @@ export const HALLOWEEN = {
   crypt: '#0f2d1f',
   aurora: '#3b7bea',
   rds: '#2aa3b8',
+  azure: '#0078d4',
 } as const
 
 const SPRITE_PALETTE: Readonly<Record<string, string>> = {

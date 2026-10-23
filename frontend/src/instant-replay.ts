@@ -1,4 +1,5 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
+import { byCompetitor } from './competitor-kind'
 import { classifyOutcome } from './ringside-cues'
 import { modelScoreEvidence, roundFourLaneLabel } from './round4'
 import { liveOrderEvidence, roundSixLaneLabel } from './round6'
@@ -9,8 +10,14 @@ import {
   roundFiveBellRuntime,
   roundFiveLanePresentation,
   roundFiveLaneResult,
+  roundFiveServerResetNote,
 } from './round5'
 import { preciseDuration } from './time'
+
+/** Azure's words where the AWS edition's name AWS's products; the AWS edition's are unchanged. */
+function azureOr(session: DemoSession, azure: string, aws: string): string {
+  return byCompetitor(session.competitor.id, { aurora: aws, rds: aws, azure })
+}
 
 export type ReplayBeatId = 'setup' | 'same-test' | 'takeaway'
 export type ReplayStoryState = 'verified' | 'partial' | 'no-result'
@@ -201,7 +208,11 @@ function roundOneStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
   const unsupported = session.lanes.competitor.state === 'not_supported'
   const setup = unsupported
-    ? 'Lakebase began at scale zero. Provisioned RDS cannot automatically scale to zero, so no RDS clock was started.'
+    ? azureOr(
+      session,
+      'Lakebase began at scale zero. Azure Database for PostgreSQL cannot automatically scale to zero, so no Azure PostgreSQL clock was started.',
+      'Lakebase began at scale zero. Provisioned RDS cannot automatically scale to zero, so no RDS clock was started.',
+    )
     : 'Both databases were confirmed at genuine scale zero before the bell.'
   const metrics = observedMetrics(
     session,
@@ -227,7 +238,11 @@ function roundOneStory(session: DemoSession): ReplayStory {
         title: 'Takeaway',
         body: incompleteTakeaway(session)
           ?? (unsupported
-            ? 'Lakebase woke and completed the transaction. This proves the automatic wake path; RDS did not enter the race.'
+            ? azureOr(
+              session,
+              'Lakebase woke and completed the transaction. This proves the automatic wake path; Azure PostgreSQL did not enter the race.',
+              'Lakebase woke and completed the transaction. This proves the automatic wake path; RDS did not enter the race.',
+            )
             : 'The clock covers wake through the exact transaction. It does not measure the rest of the application.'),
       },
     ],
@@ -236,9 +251,12 @@ function roundOneStory(session: DemoSession): ReplayStory {
 
 function roundTwoStory(session: DemoSession): ReplayStory {
   const state = storyState(session)
-  const copyKind = session.competitor.id === 'aurora_serverless_v2'
-    ? 'point-in-time clone'
-    : 'point-in-time restore'
+  const copyKind = byCompetitor(session.competitor.id, {
+    aurora: 'point-in-time clone',
+    rds: 'point-in-time restore',
+    azure: 'point-in-time restore',
+  })
+  const cloud = azureOr(session, 'Azure', 'AWS')
   return {
     ...state,
     metricBeat: 'takeaway',
@@ -254,7 +272,7 @@ function roundTwoStory(session: DemoSession): ReplayStory {
       {
         id: 'setup',
         title: 'Setup',
-        body: `Each side created an isolated environment from the same clean source: a Lakebase branch and an AWS ${copyKind}.`,
+        body: `Each side created an isolated environment from the same clean source: a Lakebase branch and an ${cloud} ${copyKind}.`,
       },
       {
         id: 'same-test',
@@ -311,6 +329,7 @@ function roundFourStory(session: DemoSession): ReplayStory {
   const score = evidence.score === '—' ? 'one model score' : `score ${evidence.score}`
   const delta = evidence.deltaVersion === '—' ? '' : ` at Delta version ${evidence.deltaVersion}`
   const awsLane = session.lanes.competitor.state !== 'not_supported'
+  const cloud = azureOr(session, 'Azure', 'AWS')
   return {
     ...state,
     metricBeat: 'takeaway',
@@ -328,7 +347,7 @@ function roundFourStory(session: DemoSession): ReplayStory {
         title: 'Setup',
         body: awsLane
           ? 'Both integrations were parked before the bell, and both applications read the baseline row.'
-          : 'Lakebase’s synced table was parked and its application read the baseline row. This installation has no AWS lane, so no AWS clock started.',
+          : `Lakebase’s synced table was parked and its application read the baseline row. This installation has no ${cloud} lane, so no ${cloud} clock started.`,
       },
       {
         id: 'same-test',
@@ -341,7 +360,7 @@ function roundFourStory(session: DemoSession): ReplayStory {
         body: incompleteTakeaway(session)
           ?? (awsLane
             ? 'Each clock contains its own cold start. Lakebase’s sync figure comes from its own timestamps and is never compared. Model serving was not tested.'
-            : 'This proves the Lakebase path. Without the AWS lane there is no race or margin.'),
+            : `This proves the Lakebase path. Without the ${cloud} lane there is no race or margin.`),
       },
     ],
   }
@@ -395,6 +414,9 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       ? null
       : { laneId, label, value: preciseDuration(milliseconds), note }
   }
+  // The competitor's pooled path: AWS's new RDS Proxy, or Azure's built-in PgBouncer turned on.
+  const pool = azureOr(session, 'Azure built-in PgBouncer', 'Selected AWS managed pool')
+  const provisioned = azureOr(session, 'PgBouncer turned on', 'New RDS Proxy provisioned')
   const setup = [
     exactFanInMetric(
       'lakebase',
@@ -408,25 +430,37 @@ function roundFiveStory(session: DemoSession): ReplayStory {
     ) ?? lowerBoundMetric(session, 'lakebase', 'Lakebase built-in pool'),
     exactFanInMetric(
       'competitor',
-      recurringFanIn ? 'Selected AWS path time to 10,000' : 'Selected AWS managed pool',
-      recurringFanIn ? 'Exact authenticated held-client gate' : 'New RDS Proxy provisioned',
+      recurringFanIn ? azureOr(session, 'Azure PgBouncer time to 10,000', 'Selected AWS path time to 10,000') : pool,
+      recurringFanIn ? 'Exact authenticated held-client gate' : provisioned,
     ) ?? exactMetric(
       session,
       'competitor',
-      recurringFanIn ? 'Selected AWS path time to 10,000' : 'Selected AWS managed pool',
-      recurringFanIn ? 'Exact authenticated held-client gate' : 'New RDS Proxy provisioned',
-    ) ?? lowerBoundMetric(session, 'competitor', 'Selected AWS managed pool'),
+      recurringFanIn ? azureOr(session, 'Azure PgBouncer time to 10,000', 'Selected AWS path time to 10,000') : pool,
+      recurringFanIn ? 'Exact authenticated held-client gate' : provisioned,
+    ) ?? lowerBoundMetric(session, 'competitor', pool),
   ].filter((metric): metric is ReplayMetric => metric !== null)
   // On the V4 bell runtime a lane can genuinely reach 10,000 clients, so asserting "all
   // 20,000 held 30s" on a towel/failure is a false completed-hold claim. Only
   // rewrite that beat for an incomplete bell bout; legacy fan-in keeps its
   // methodology description (which already appends an "did not complete" suffix).
   const bellIncomplete = bellRuntime !== null && bellRuntime.state !== 'verified'
+  // A held client the server reset was logged back in (v1.3.0), before the hold or with the
+  // hold started again, so the 30 seconds counted ran with every client held: the replay says
+  // which lane, and how many.
+  const serverResets = (['lakebase', 'competitor'] as const)
+    .map((laneId) => {
+      const note = roundFiveServerResetNote(session.lanes[laneId])
+      return note ? `${laneName(session, laneId)}: ${note}` : ''
+    })
+    .filter(Boolean)
+  const serverResetSentence = serverResets.length
+    ? ` ${serverResets.join('; ')}, and the 30s counted ran with every client held.`
+    : ''
   const sameTestBody = !recurringFanIn
     ? `Legacy Round 5 scorecard decoded. The current exact 10,000-client fan-in contract was not recorded, so the replay does not infer fan-in evidence.${incompleteTestSuffix(session)}`
     : bellIncomplete
       ? `Phase 2 raced each lane on its own clock to exactly 10,000 authenticated held clients under one verify-full TLS client. The 30-second hold and ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks per lane did not complete before the bout stopped, so no lane is verified.${incompleteTestSuffix(session)}`
-      : `Phase 2 held exactly 10,000 authenticated held clients per lane, each lane on its own clock, under one verify-full TLS client. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks passed per lane; observers proved multiplexing.${incompleteTestSuffix(session)}`
+      : `Phase 2 held exactly 10,000 authenticated held clients per lane, each lane on its own clock, under one verify-full TLS client. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks passed per lane; observers proved multiplexing.${serverResetSentence}${incompleteTestSuffix(session)}`
   return {
     ...state,
     metricBeat: 'setup',
@@ -435,7 +469,11 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       {
         id: 'setup',
         title: 'Setup',
-        body: "Phase 1 timed Lakebase's included pool and new selected RDS Proxy separately.",
+        body: azureOr(
+          session,
+          "Phase 1 timed Lakebase's included pool and Azure's PgBouncer turning on separately.",
+          "Phase 1 timed Lakebase's included pool and new selected RDS Proxy separately.",
+        ),
       },
       {
         id: 'same-test',
@@ -447,7 +485,7 @@ function roundFiveStory(session: DemoSession): ReplayStory {
         title: 'Takeaway',
         body: incompleteTakeaway(session)
           ?? (recurringFanIn
-            ? 'Fan-in time is primary; setup supports it. Authentication is recorded, not excluded. Client count is not backend count or transaction throughput. Direct AWS connections and other pools were not tested.'
+            ? `Fan-in time is primary; setup supports it. Authentication is recorded, not excluded. Client count is not backend count or transaction throughput. Direct ${azureOr(session, 'Azure', 'AWS')} connections and other pools were not tested.`
             : 'Legacy scorecard fields remain readable, but only the current 10,000-client fan-in contract is presented. No fan-in claim is inferred.'),
       },
     ],
@@ -459,6 +497,7 @@ function roundSixStory(session: DemoSession): ReplayStory {
   const total = liveOrderEvidence(session.lanes.lakebase).totalDisplay
   const checkout = total === '—' ? 'one checkout' : `one ${total} checkout`
   const awsLane = session.lanes.competitor.state !== 'not_supported'
+  const cloud = azureOr(session, 'Azure', 'AWS')
   return {
     ...state,
     metricBeat: 'takeaway',
@@ -475,14 +514,18 @@ function roundSixStory(session: DemoSession): ReplayStory {
         id: 'setup',
         title: 'Setup',
         body: awsLane
-          ? 'AWS DMS and Glue were parked before the bell, Lakebase’s change feed was streaming, and both sources read the baseline order.'
-          : 'Lakebase’s change feed was streaming and its source read the baseline order. This installation has no AWS lane, so no AWS clock started.',
+          ? azureOr(
+            session,
+            'The Azure Data Factory data flow was parked before the bell, Lakebase’s change feed was streaming, and both sources read the baseline order.',
+            'AWS DMS and Glue were parked before the bell, Lakebase’s change feed was streaming, and both sources read the baseline order.',
+          )
+          : `Lakebase’s change feed was streaming and its source read the baseline order. This installation has no ${cloud} lane, so no ${cloud} clock started.`,
       },
       {
         id: 'same-test',
         title: 'Same test',
         body: awsLane
-          ? `The bell committed ${checkout} on both sources and started AWS DMS and Glue cold. Each clock stopped at its own first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`
+          ? `The bell committed ${checkout} on both sources and started ${azureOr(session, 'the Azure Data Factory data flow', 'AWS DMS and Glue')} cold. Each clock stopped at its own first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`
           : `The bell committed ${checkout} on Lakebase. Its clock stopped at its first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`,
       },
       {
@@ -490,8 +533,8 @@ function roundSixStory(session: DemoSession): ReplayStory {
         title: 'Takeaway',
         body: incompleteTakeaway(session)
           ?? (awsLane
-            ? 'AWS’s clock contains its cold start; Lakebase’s feed is built in and always on. A separate checkout committed on each source.'
-            : 'This proves the Lakebase path. Without the AWS lane there is no race or margin.'),
+            ? `${cloud}’s clock contains its cold start; Lakebase’s feed is built in and always on. A separate checkout committed on each source.`
+            : `This proves the Lakebase path. Without the ${cloud} lane there is no race or margin.`),
       },
     ],
   }

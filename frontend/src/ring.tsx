@@ -7,6 +7,7 @@ import type {
   RoundDefinition,
   RoundId,
 } from './api/types'
+import { scalesToZero } from './competitor-kind'
 import { fighterCostume } from './halloween'
 import { NO_EQUIVALENT_NATIVE_PATH } from './recap'
 
@@ -62,7 +63,7 @@ export function blueCornerLane(round: RoundDefinition, competitorId: CompetitorI
   // RDS cannot pause, so it is described through the control plane before the
   // bell and then left alone. It is present and it carries no clock; this is
   // the same fact `stopCondition()` states in prose for the same pairing.
-  if (round.id === 'wake_idle_app' && competitorId === 'rds_postgres') return 'untimed'
+  if (round.id === 'wake_idle_app' && !scalesToZero(competitorId)) return 'untimed'
   return 'race'
 }
 
@@ -78,7 +79,7 @@ export function blueCornerLane(round: RoundDefinition, competitorId: CompetitorI
  * words rather than a paraphrase of them.
  */
 export function laneWording(round: RoundDefinition, competitorId: CompetitorId): string {
-  if (round.id === 'wake_idle_app' && competitorId === 'rds_postgres') return 'NO SCALE-TO-ZERO'
+  if (round.id === 'wake_idle_app' && !scalesToZero(competitorId)) return 'NO SCALE-TO-ZERO'
   return NO_EQUIVALENT_NATIVE_PATH
 }
 
@@ -176,13 +177,17 @@ export function roundBell(roundId: RoundId): string {
  * real bouts are recorded now. `App.test.tsx` pins both absences.
  */
 
-const OPPONENT_BADGES: Record<string, string> = {
+// Keyed by every competitor, so a new one fails the type check here instead of wearing `???`
+// (the Azure edition's first deploy did). `???` stays for an ID the server names before this
+// build knows it.
+const OPPONENT_BADGES: Record<CompetitorId, string> = {
   aurora_serverless_v2: 'AUR',
   rds_postgres: 'RDS',
+  azure_postgres: 'AZR',
 }
 
 export function opponentBadge(competitorId: CompetitorId): string {
-  return OPPONENT_BADGES[competitorId] ?? '???'
+  return (OPPONENT_BADGES as Record<string, string | undefined>)[competitorId] ?? '???'
 }
 
 /**
