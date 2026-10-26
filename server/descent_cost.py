@@ -317,6 +317,10 @@ def build_descent_cost_disclosure(
 
     if round_id is not DESCENT_ROUND:
         return None
+    if competitor_id == CompetitorId.AZURE_POSTGRES:
+        # The comparison is priced from AWS's rate card, and the Azure edition has no card of
+        # its own for it yet: no panel, rather than another cloud's figures.
+        return None
 
     card = rates or RateCard()
     lakebase = _lakebase_lane(card)

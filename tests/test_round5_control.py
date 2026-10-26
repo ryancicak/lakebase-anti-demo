@@ -2309,6 +2309,8 @@ def test_preloaded_worker_does_nothing_before_authenticated_request() -> None:
             object(),
             object(),
             object(),
+            object(),  # the lane's hold window: its latest reconnect
+            object(),  # and how many are in flight
         ),
     )
     try:

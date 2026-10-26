@@ -13,6 +13,7 @@ from typing import Protocol
 from .models import CompetitorId
 from .safe_change import (
     DEFAULT_CANCEL_TEARDOWN_SECONDS,
+    LANE_READY_PREFIX,
     ArtifactInspection,
     SafeChangeOwnershipScope,
     SafeChangeProvider,
@@ -20,6 +21,7 @@ from .safe_change import (
     SafeChangeResetResult,
     SafeChangeSqlConnection,
     abandon_on_cancel,
+    connect_saying_waits,
     reset_lane_causes,
 )
 
@@ -448,7 +450,12 @@ class RecoveryEngine:
                 "Previous owned environment cleared · committing the exact incident row",
                 wire_call="PostgreSQL SELECT → INSERT → COMMIT → clock_timestamp()",
             )
-        source = await adapter.connect_source(plan)
+
+        async def say(status: str) -> None:
+            await self._emit(on_progress, plan, RecoveryPhase.PREPARING_INCIDENT, status)
+
+        source = await connect_saying_waits(
+            adapter.connect_source(plan), say, plan.provider, self._clock_ns)
         try:
             row = await source.fetch_one(
                 self.contract.select_sql,
@@ -478,6 +485,13 @@ class RecoveryEngine:
                 raise RecoveryNotArmedError(
                     "The exact incident row changed while the recovery boundary aged"
                 )
+            # This lane's own line ends here, while the other may still be waiting.
+            await self._emit(
+                on_progress,
+                plan,
+                RecoveryPhase.PREPARING_INCIDENT,
+                f"{LANE_READY_PREFIX} · Exact incident row committed and aged",
+            )
             return {
                 "artifact_absent": True,
                 "exact_incident_committed": True,
@@ -949,7 +963,7 @@ class RecoveryEngine:
 
         plans = [self._plan("lakebase", self.lakebase)]
         plans.extend(
-            self._plan(f"competitor-{competitor.value}", adapter)
+            self._plan(f"competitor-{competitor!s}", adapter)
             for competitor, adapter in self.competitors.items()
         )
         return await self._reset_plans(

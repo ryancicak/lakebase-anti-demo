@@ -29,6 +29,12 @@ ALL_ROUNDS = (
     "survive_connection_spike",
     "analyze_live_orders_without_slowing_checkout",
 )
+#: Rounds the installation under test doesn't offer (an Azure installation built with
+#: `round5_runners = false` has no Round 5), as CHAOS_ABSENT_ROUNDS names them: never in play, and
+#: never held to READY by any step.
+ABSENT_ROUNDS = frozenset(
+    item for item in os.environ.get("CHAOS_ABSENT_ROUNDS", "").split(",") if item
+)
 
 #: A Databricks OAuth token lives for about an hour. Re-minting well inside that
 #: is what kept a five-hour campaign from dying on 401s halfway through.
@@ -277,11 +283,12 @@ def _parsed(raw: bytes) -> Any:
 
 
 def all_ready(rounds: dict[str, dict[str, Any]]) -> bool:
-    """Every one of the six rounds is READY and can start. A missing round is not."""
+    """Every round the installation offers is READY and can start. A missing round is not."""
     return all(
         (rounds.get(round_id) or {}).get("state") == "ready"
         and (rounds.get(round_id) or {}).get("can_start") is True
         for round_id in ALL_ROUNDS
+        if round_id not in ABSENT_ROUNDS
     )
 
 

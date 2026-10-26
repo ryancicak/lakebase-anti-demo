@@ -37,7 +37,7 @@ from .live_orders import (
 )
 from .manifest import DemoManifest
 from .model_score_live import SqlParameter, WorkspaceStatementRunner
-from .models import CompetitorId
+from .models import CompetitorId, aws_lane
 from .round4_glue import TERMINAL_STATES, GlueWriterJob
 from .round6_dms import TRANSITIONAL, DmsCaptureTask, DmsTaskState, task_resource_id
 from .round6_race import (
@@ -187,7 +187,7 @@ class AwsCaptureLane:
         sealed = manifest.round6_aws
         if sealed is None:
             raise Round6NotArmedError("Round 6's AWS lane is not sealed")
-        self._competitor = "aurora" if competitor == CompetitorId.AURORA_SERVERLESS_V2 else "rds"
+        self._competitor = aws_lane(competitor)
         self.label = (
             "AWS DMS + Glue from Aurora Serverless v2"
             if self._competitor == "aurora"
@@ -570,6 +570,10 @@ def build_round6_race_engine(manifest: DemoManifest, competitor: CompetitorId) -
     whose AWS lane is not sealed.
     """
 
+    if getattr(manifest, "azure", None) is not None:
+        from .azure_runtime import build_azure_round6_race_engine
+
+        return build_azure_round6_race_engine(manifest, competitor)
     v1 = build_live_orders_engine(manifest)
     adapter = v1.adapter
     assert isinstance(adapter, LiveOrdersLiveAdapter)

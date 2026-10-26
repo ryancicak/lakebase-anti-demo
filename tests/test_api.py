@@ -503,6 +503,91 @@ async def test_a_startup_failure_after_the_readiness_gate_leaves_nothing_behind(
     assert sorted(closed) == sorted(["cost-ledger", "main", round5_key])
 
 
+@pytest.mark.parametrize("cloud", ["azure", "aws"])
+async def test_only_the_azure_editions_deployed_start_goes_on_without_a_ready_round_5(
+    monkeypatch,
+    cloud: str,
+) -> None:
+    """The Azure edition's App starts without a ready Round 5; AWS's refuses, as it always has.
+
+    The deployed start read AWS's Round 5 resources whatever the seal said, and that reader
+    refuses an unready Round 5. So the Azure App's first start failed with "Round 5 requires a
+    complete factory-ready manifest v5" (2026-10-19). Reaching the readiness gate, which is built
+    just after that read, is the proof; the gate is given no Round 5 work. The Azure edition's
+    seal is its own, and AWS's reader is never asked about it.
+    """
+
+    manifest = deployed_manifest()
+    manifest.manifest_version = 7
+    manifest.installation_id = "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"
+    if cloud == "azure":
+        manifest.cloud, manifest.round5_available = "azure", False
+
+    def refuse() -> None:
+        raise RuntimeError("Round 5 requires a complete factory-ready manifest v5")
+
+    manifest.require_round5_resources = refuse
+    monkeypatch.setenv("ANTI_DEMO_ENV", "databricks-app")
+    monkeypatch.setenv("DATABRICKS_CLIENT_ID", APP_CLIENT_ID)
+    monkeypatch.setattr(app_module, "load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        app_module,
+        "WorkspaceClient",
+        lambda: SimpleNamespace(
+            current_user=SimpleNamespace(me=lambda: SimpleNamespace(user_name=APP_CLIENT_ID))
+        ),
+    )
+    monkeypatch.setattr(app_module, "validate_app_aws_environment", lambda _env: None)
+
+    class FakeStore:
+        mode = "lakebase"
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        async def initialize(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(app_module, "build_lease_store", lambda *, ring_key="main": FakeStore())
+    monkeypatch.setattr(app_module, "build_cost_ledger_store", FakeStore)
+
+    class QuietSentry:
+        def __init__(self, *_args, **_kwargs) -> None:
+            return None
+
+        def verdict(self):
+            return None
+
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(app_module, "CredentialSentry", QuietSentry)
+
+    class ReachedTheGate(Exception):
+        pass
+
+    given: dict[str, object] = {}
+
+    def gate(*_args, **kwargs):
+        given.update(kwargs)
+        raise ReachedTheGate
+
+    monkeypatch.setattr(app_module, "ShowtimeReadinessGate", gate)
+
+    if cloud == "aws":
+        with pytest.raises(RuntimeError, match="factory-ready manifest v5"):
+            await app_module._open_runtime(app, deployed=True)
+        assert given == {}
+        return
+    with pytest.raises(ReachedTheGate):
+        await app_module._open_runtime(app, deployed=True)
+    assert given["round5_factory"] is None
+    assert given["round5_cleanup_delegated"] is False
+
+
 async def test_catalog_and_session_creation_do_not_touch_databases(monkeypatch) -> None:
     monkeypatch.delenv("DATABRICKS_APP_NAME", raising=False)
     monkeypatch.delenv("ANTI_DEMO_ENV", raising=False)
@@ -1949,6 +2034,47 @@ async def test_catalog_storage_probe_reads_both_sealed_delta_paths(monkeypatch) 
     await probe()
 
     assert calls == ["round4", "round6"]
+
+
+@pytest.mark.parametrize(
+    ("manifest", "competitor"),
+    [
+        (SimpleNamespace(), CompetitorId.RDS_POSTGRES),
+        (SimpleNamespace(cloud="azure"), CompetitorId.AZURE_POSTGRES),
+    ],
+    ids=["aws", "azure"],
+)
+async def test_catalog_storage_probe_builds_the_installations_own_matchup(
+    monkeypatch, manifest, competitor
+) -> None:
+    # On the Azure edition the probe asked for RDS's engines, which Azure's builders refuse, so
+    # its storage check never ran ("the Azure edition races Azure PostgreSQL, not rds_postgres",
+    # 2026-10-19).
+    asked: list[CompetitorId] = []
+
+    class Probe:
+        async def probe_storage(self) -> None:
+            return None
+
+    def factory(engine: SimpleNamespace):
+        def build(requested: CompetitorId) -> SimpleNamespace:
+            asked.append(requested)
+            return engine
+
+        return lambda manifest=None: build
+
+    monkeypatch.setattr(
+        app_module, "model_score_factory_from_manifest", factory(SimpleNamespace(source=Probe()))
+    )
+    monkeypatch.setattr(
+        app_module, "live_orders_factory_from_manifest", factory(SimpleNamespace(lanes=(Probe(),)))
+    )
+
+    probe = app_module.delta_storage_probe_from_manifest(manifest)
+    assert probe is not None
+    await probe()
+
+    assert asked == [competitor, competitor]
 
 
 async def test_storage_probe_attributes_unrepairable_round6_delta_absence(

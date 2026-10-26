@@ -26,7 +26,9 @@ Configuration is environment variables, as `run.sh` sets them:
     EVIDENCE_DIR          where to write (default: release-bar-evidence/chaos-<UTC>)
     CHAOS_ROUNDS          comma-separated round ids (default: all six)
     CHAOS_SCENARIOS       comma-separated waves (default: the release bar's six)
-    CHAOS_COMPETITOR      aurora_serverless_v2 (default) or rds_postgres
+    CHAOS_COMPETITOR      aurora_serverless_v2 (default), rds_postgres, or azure_postgres
+    CHAOS_ABSENT_ROUNDS   rounds this installation doesn't offer (Round 5 on an Azure one built
+                          with round5_runners = false): never in play, and never held to READY
     CHAOS_LINGER_SECONDS  how long `finish-linger` watches a result (default 300)
     CHAOS_ARMED_WAIT_SECONDS  how long `armed-wait` holds the armed card (default 150,
                           inside the 180 s armed window)
@@ -54,6 +56,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import (  # noqa: E402
+    ABSENT_ROUNDS,
     ALL_ROUNDS,
     PLATFORM_RETRY_SECONDS,
     AppClient,
@@ -241,6 +244,8 @@ class Harness:
             owned = set(self.owned_active)
             released = dict(self.released_at)
         for round_id in ALL_ROUNDS:
+            if round_id in ABSENT_ROUNDS:
+                continue
             # A poll sent before this round was released can land after it, and
             # still carries the cleanup state that preceded READY. That is request
             # reordering, not a flicker (05:02:25 Round 4, pass 3).

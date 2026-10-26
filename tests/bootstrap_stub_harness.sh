@@ -166,7 +166,7 @@ case "$args" in
         printf '%s' '{"issuer":"stub","token_endpoint":"https://stub/oidc/v1/token"}' >"${body_file:-/dev/null}"
         printf '200' ;;
     esac ;;
-  *"accounts.cloud.databricks.com"*)
+  *"accounts.cloud.databricks.com"* | *"accounts.azuredatabricks.net"*)
     [[ "${STUB_WORKSPACE_PROBE:-live}" == "offline" ]] && exit 6
     exit 0 ;;
   *"/api/health"*)

@@ -270,6 +270,27 @@ table is missing or ungranted, startup refuses rather than installing no power
 store and serving anyway. `antidemo renew` is not the upgrade either: its
 Round 5 re-seal can create this table, but it never grants it to the app.
 
+### Upgrading from v1.2.2
+
+v1.3.0 changes the Round 5 runner: a held client the server resets is now
+reconnected, and the hold starts again, where it used to fail the bout
+([ROUNDS.md](../ROUNDS.md)). So the sealed runner is refreshed before the usual
+redeploy; the coordination schema is unchanged. From the checkout the
+installation was made from, while nobody is presenting:
+
+```bash
+git pull                     # or check out the release tag
+uv sync --locked             # a no-op unless uv.lock changed
+export ANTI_DEMO_MANIFEST="$PWD/$(ls -d .anti-demo-v*/ | sort -V | tail -1)manifest.json"
+./antidemo runner refresh
+env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE ./bootstrap.sh --deploy-only --yes
+```
+
+`--deploy-only` refuses until the runner is refreshed, and says so. An
+installation on v1.2.1 or v1.2.0 takes the same steps. The Azure edition
+([AZURE.md](AZURE.md)) is new in v1.3.0; its `./bootstrap.sh --apply
+--deploy-app --yes` reinstalls its runners itself when their files change.
+
 ### Upgrading from v1.2.1
 
 v1.2.2 changes neither the coordination schema nor the Round 5 runner, so the

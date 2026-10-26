@@ -3596,6 +3596,12 @@ async def test_round_five_setup_launch_jitter_still_verifies() -> None:
     )
     await manager.start_arm(created.id, operator)
     await wait_for_state(manager, created.id, SessionState.ARMED)
+    # Round 5's arm used to give no line at all, so its arming screen could only say "Verifying
+    # the sealed start state…" however long the arm took.
+    waiting = [event.payload["status"] for event in manager._records[created.id].event_log.events
+               if event.event == "arm_waiting"]
+    assert waiting == [
+        "Sealing this bout on both warm runners · Timed setup starts at the bell"]
     await manager.start_run(created.id, operator)
     terminal = await wait_for_state(manager, created.id, SessionState.VERIFIED)
 
@@ -7376,6 +7382,14 @@ async def test_round_three_executes_and_resets_owned_recovery_environments() -> 
     with pytest.raises(InvalidStateError, match="must be running"):
         await manager.start_towel(created.id)
     events = manager._records[created.id].event_log.events
+    # Each arming line names its lane, so the arming screen gives each lane its own line and
+    # timer; `status` is the single line browsers before v1.3.0 show.
+    waiting = [event.payload for event in events if event.event == "arm_waiting"]
+    assert [(line["lane_id"], line["lane_name"], line["lane_status"]) for line in waiting] == [
+        ("lakebase", "Lakebase", "Committing and aging the exact incident row"),
+        ("competitor", "RDS PostgreSQL", "Committing and aging the exact incident row"),
+    ]
+    assert waiting[1]["status"] == "RDS PostgreSQL · Committing and aging the exact incident row"
     run_started = next(index for index, event in enumerate(events) if event.event == "run_started")
     started_session = events[run_started].payload["session"]
     assert all(

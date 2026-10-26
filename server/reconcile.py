@@ -435,6 +435,16 @@ class InstallationPresence:
     absent: int = 0
     #: Why the account could not be read. Empty unless `state` is `unverified`.
     reason: str = ""
+    #: The installation's cloud, which names what was swept: AWS's account, or Azure's group.
+    cloud: str = "aws"
+
+    def _words(self) -> tuple[str, str, str, str]:
+        """(cloud, its databases, where they live, the repair command), in the cloud's names."""
+
+        if self.cloud == "azure":
+            return ("Azure", "Azure Database for PostgreSQL", "resource group",
+                    "./antidemo azure-setup")
+        return ("AWS", "Aurora or RDS", "account", INSTALLATION_REPAIR_COMMAND)
 
     @property
     def verified_missing(self) -> bool:
@@ -448,31 +458,32 @@ class InstallationPresence:
     def detail(self) -> str:
         """One sentence, in the vocabulary /readyz and the CLI already use."""
 
+        cloud, databases, where, repair = self._words()
         if self.state == PRESENCE_MISSING:
             return (
-                f"THE SEALED AWS INFRASTRUCTURE IS GONE: the account was read and "
+                f"THE SEALED {cloud.upper()} INFRASTRUCTURE IS GONE: the {where} was read and "
                 f"{self.absent} of {self.sealed} sealed resources are absent from it. "
-                f"Every round that connects to Aurora or RDS will fail until they "
-                f"are re-created. Run '{INSTALLATION_REPAIR_COMMAND}', which "
+                f"Every round that connects to {databases} will fail until they "
+                f"are re-created. Run '{repair}', which "
                 f"re-applies Terraform and reseeds. Nothing re-creates them from "
                 f"inside the server, by design."
             )
         if self.state == PRESENCE_UNVERIFIED:
             return (
-                f"THE SEALED AWS INFRASTRUCTURE COULD NOT BE CHECKED: "
+                f"THE SEALED {cloud.upper()} INFRASTRUCTURE COULD NOT BE CHECKED: "
                 f"{self.reason}. This is not a report that anything is missing -- "
-                f"the account was never read, so the {self.sealed} sealed resources "
+                f"the {where} was never read, so the {self.sealed} sealed resources "
                 f"are neither confirmed present nor confirmed gone. Whatever stopped "
                 f"the read is the thing to fix; this answers itself once it clears, "
                 f"with no restart."
             )
         if self.state == PRESENCE_NEVER_CHECKED:
             return (
-                f"THE SEALED AWS INFRASTRUCTURE HAS NOT BEEN CHECKED yet in this "
+                f"THE SEALED {cloud.upper()} INFRASTRUCTURE HAS NOT BEEN CHECKED yet in this "
                 f"process, so its {self.sealed} sealed resources are neither "
                 f"confirmed present nor confirmed gone."
             )
-        return f"all {self.sealed} sealed AWS resources are present in the account"
+        return f"all {self.sealed} sealed {cloud} resources are present in the {where}"
 
     @property
     def capabilities(self) -> tuple[str, ...]:
@@ -480,9 +491,10 @@ class InstallationPresence:
 
         if self.state != PRESENCE_MISSING:
             return ()
+        cloud, databases, where, _repair = self._words()
         return (
-            f"every round backed by Aurora or RDS -- {self.absent} of {self.sealed} "
-            f"sealed AWS resources are absent from the account, so there is nothing "
+            f"every round backed by {databases} -- {self.absent} of {self.sealed} "
+            f"sealed {cloud} resources are absent from the {where}, so there is nothing "
             f"for those rounds to connect to",
         )
 

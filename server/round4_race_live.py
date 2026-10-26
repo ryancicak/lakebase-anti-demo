@@ -49,7 +49,7 @@ from .model_score_live import (
     pipeline_signals_are_healthy,
     read_pipeline_signals,
 )
-from .models import CompetitorId
+from .models import CompetitorId, aws_lane
 from .round4_glue import TERMINAL_STATES, GlueWriterJob, starting_version
 from .round4_race import (
     COMPETITOR_LANE,
@@ -586,7 +586,7 @@ class GlueWriterLane:
         sealed = manifest.round4_aws
         if sealed is None:
             raise ModelScoreLiveConfigurationError("Round 4's AWS lane is not sealed")
-        self._competitor = "aurora" if competitor == CompetitorId.AURORA_SERVERLESS_V2 else "rds"
+        self._competitor = aws_lane(competitor)
         self.label = (
             "AWS Glue → Aurora Serverless v2"
             if self._competitor == "aurora"
@@ -799,6 +799,10 @@ def build_round4_race_engine(
     whose AWS lane is not sealed.
     """
 
+    if getattr(manifest, "azure", None) is not None:
+        from .azure_runtime import build_azure_round4_race_engine
+
+        return build_azure_round4_race_engine(manifest, competitor)
     v1 = build_model_score_engine(manifest)
     adapter = v1.adapter
     assert isinstance(adapter, LiveModelScoreAdapter)

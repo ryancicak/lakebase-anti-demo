@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from server.round5_warm import (
+    AWS_ROUND5_VARIANTS,
     MAX_PROVENANCE_PROBE_FAILURES,
     SELF_VERIFIABLE_BLOCK_RETRY_SECONDS,
     WARM_ATTEMPT_TOKEN_REUSE_SECONDS,
@@ -149,7 +150,7 @@ def preparation(
             request_template_sha256=DIGEST,
             expires_at=expires_at,
         )
-        for variant in Round5Variant
+        for variant in sorted(AWS_ROUND5_VARIANTS)
     }
     return Round5WarmPreparation(
         shared_receipt=shared,

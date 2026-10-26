@@ -249,6 +249,11 @@ _SECRET_ARN = re.compile(
 )
 _TERMINAL = {"Success", "Cancelled", "Failed", "TimedOut"}
 _COMPETITOR_IDS = {"rds_postgres", "aurora_serverless_v2"}
+#: A lane target is the one Round 5 type both editions build. The Azure edition's competitor rides
+#: AWS's resident engine with its own setup and adapter (server/azure_round5_setup.py,
+#: azure_round5_adapter.py), and the runner holds its credential as "rds" (`_fanin_request`'s
+#: else). AWS's setup config and manifest builders keep AWS's two.
+_TARGET_COMPETITOR_IDS = _COMPETITOR_IDS | {"azure_postgres"}
 
 
 def _proxy_target_set_matches(
@@ -593,7 +598,7 @@ class ConnectionSpikeTarget:
             bool(self.competitor_resource_id),
         )
         if len(set(source_bindings)) != 1 or (
-            self.competitor_id and self.competitor_id not in _COMPETITOR_IDS
+            self.competitor_id and self.competitor_id not in _TARGET_COMPETITOR_IDS
         ):
             raise ConnectionSpikeLiveConfigurationError(
                 f"Round 5 {self.lane_id} competitor source bindings must be sealed together"

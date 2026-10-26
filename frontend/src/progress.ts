@@ -33,7 +33,7 @@ export interface SetupProgress {
 const STORAGE_KEY = 'lakebase-anti-demo:setup:v1'
 const HISTORY_KEY = 'lakebaseAntiDemoView'
 
-const competitors = new Set<CompetitorId>(['aurora_serverless_v2', 'rds_postgres'])
+const competitors = new Set<CompetitorId>(['aurora_serverless_v2', 'rds_postgres', 'azure_postgres'])
 const corners = new Set<CustomerCorner>(['cost', 'simplicity', 'performance'])
 const personas = new Set<PersonaId>([
   'data_engineer',

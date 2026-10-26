@@ -238,6 +238,10 @@ AMBIENT_NAME_PREFIXES = (
     "RDS_",
     "AURORA_",
     "TF_VAR_",
+    # The Azure edition's: `apply_manifest_environment` exports `AZURE_*` for an Azure
+    # manifest, and azurerm reads `ARM_*` from whatever shell runs Terraform.
+    "AZURE_",
+    "ARM_",
 )
 
 # The four the convention misses, because they predate it. `ROUND4_CATALOG` and

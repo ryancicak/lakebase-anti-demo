@@ -74,6 +74,10 @@ class SafeChangeProvider(StrEnum):
     LAKEBASE = "lakebase"
     AURORA = "aurora"
     RDS = "rds"
+    # A short product name like the others, because the value ends every copy's name
+    # (`adsc-<run>-<provider>`, `adrc-<run>-<provider>`) and Azure server names allow lowercase
+    # letters, digits and hyphens only: "azure_postgres" would be refused at the restore.
+    AZURE_POSTGRES = "azure"
 
 
 class SafeChangePhase(StrEnum):
@@ -89,6 +93,59 @@ class SafeChangePhase(StrEnum):
     RESET = "reset"
 
 
+#: How long a lane's source connect may take before arming says what the lane is waiting for. An
+#: awake database answers in well under a second. An Aurora Serverless v2 writer resuming from its
+#: automatic pause takes about 15 s, and 30 s or longer after more than a day paused (AWS, "Scaling
+#: to zero ACUs with automatic pause and resume"). One took 73.7 s on the live app (2026-10-16),
+#: while the arming screen said only "Committing and aging the exact incident row".
+SLOW_CONNECT_NOTICE_SECONDS = 2.0
+#: What an Aurora lane says while its writer resumes. The browser keys AWS's resume times off it.
+AURORA_WAKING_STATUS = "Aurora is waking from its automatic pause"
+#: How a lane's last arming line starts, once its own start state holds. The browser stops that
+#: lane's timer on it.
+LANE_READY_PREFIX = "Ready for the bell"
+
+
+async def connect_saying_waits[T](
+    connect: Awaitable[T],
+    say: Callable[[str], Awaitable[None]],
+    provider: SafeChangeProvider,
+    clock_ns: Callable[[], int],
+) -> T:
+    """Await `connect`, and say why once it has taken `SLOW_CONNECT_NOTICE_SECONDS`.
+
+    Then, once it answers, say how long it took. Arming is never timed (each lane's clock starts
+    at the bell), so this only tells the room why it is waiting. `say` must not raise: the
+    engines' `_emit` swallows every failure, because progress is observational.
+    """
+
+    started_ns = clock_ns()
+    said: list[bool] = []
+
+    async def say_when_slow() -> None:
+        await asyncio.sleep(SLOW_CONNECT_NOTICE_SECONDS)
+        said.append(True)
+        await say(
+            AURORA_WAKING_STATUS
+            if provider == SafeChangeProvider.AURORA
+            else "Waiting for the database to accept the connection"
+        )
+
+    notice = asyncio.create_task(say_when_slow())
+    try:
+        result = await connect
+    finally:
+        notice.cancel()
+    if said:
+        waited = (clock_ns() - started_ns) / 1_000_000_000
+        await say(
+            f"Aurora awake after {waited:.1f} s"
+            if provider == SafeChangeProvider.AURORA
+            else f"Connected after {waited:.1f} s"
+        )
+    return result
+
+
 class SafeChangeLaneState(StrEnum):
     VERIFIED = "verified"
     FAILED = "failed"
@@ -97,6 +154,11 @@ class SafeChangeLaneState(StrEnum):
 _RUN_ID = re.compile(r"^[a-z](?:[a-z0-9-]{1,46}[a-z0-9])$")
 _AWS_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 _AWS_REGION = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-[0-9]+$")
+_AZURE_SUBSCRIPTION_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+#: Azure's programmatic region names: lowercase letters and digits, e.g. westus2.
+_AZURE_REGION = re.compile(r"^[a-z]+[0-9]?$")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SAFE_CHANGE_MIGRATION_PATH = PROJECT_ROOT / "sql" / "003_add_delivery_instructions.sql"
 
@@ -119,13 +181,21 @@ CANONICAL_SAFE_CHANGE_MIGRATION = SAFE_CHANGE_MIGRATION_PATH.read_text(encoding=
 
 @dataclass(frozen=True)
 class SafeChangeOwnershipScope:
-    """Exact ownership boundary inherited from the secret-free run manifest."""
+    """Exact ownership boundary inherited from the secret-free run manifest.
+
+    An installation lives in one cloud for life (Azure design, section 1). On ``aws`` the
+    account and region are AWS's and the Azure fields stay empty; on ``azure`` it is the reverse,
+    so an artifact can never be proved owned by the wrong cloud's identity.
+    """
 
     run_id: str
     owner: str
     expires_at: str
-    aws_account_id: str
-    aws_region: str
+    aws_account_id: str = ""
+    aws_region: str = ""
+    cloud: str = "aws"
+    azure_subscription_id: str = ""
+    azure_region: str = ""
 
     def __post_init__(self) -> None:
         if _RUN_ID.fullmatch(self.run_id) is None or "--" in self.run_id:
@@ -142,6 +212,18 @@ class SafeChangeOwnershipScope:
             or expiry.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") != self.expires_at
         ):
             raise ValueError("expires_at must use canonical RFC 3339 UTC form")
+        if self.cloud == "azure":
+            if self.aws_account_id or self.aws_region:
+                raise ValueError("an Azure ownership scope carries no AWS account or region")
+            if _AZURE_SUBSCRIPTION_ID.fullmatch(self.azure_subscription_id) is None:
+                raise ValueError("azure_subscription_id must be a lowercase GUID")
+            if _AZURE_REGION.fullmatch(self.azure_region) is None:
+                raise ValueError("azure_region is invalid")
+            return
+        if self.cloud != "aws":
+            raise ValueError("cloud must be aws or azure")
+        if self.azure_subscription_id or self.azure_region:
+            raise ValueError("an AWS ownership scope carries no Azure subscription or region")
         if _AWS_ACCOUNT_ID.fullmatch(self.aws_account_id) is None:
             raise ValueError("aws_account_id must be exactly 12 digits")
         if _AWS_REGION.fullmatch(self.aws_region) is None:
@@ -175,6 +257,8 @@ class ArtifactInspection:
     aws_account_id: str | None = None
     aws_region: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    azure_subscription_id: str | None = None
+    azure_region: str | None = None
 
 
 @dataclass(frozen=True)
@@ -592,14 +676,19 @@ class SafeChangeEngine:
             cancel_teardown_timeout_seconds,
         ) <= 0:
             raise ValueError("safe-change timeouts must be positive")
-        expected = {
+        expected: dict[str, SafeChangeProvider] = {
             CompetitorId.AURORA_SERVERLESS_V2: SafeChangeProvider.AURORA,
             CompetitorId.RDS_POSTGRES: SafeChangeProvider.RDS,
+            # The Azure edition's competitor (design section 12). A string key, because
+            # CompetitorId gains the member in Phase 2, and a StrEnum member finds its string.
+            "azure_postgres": SafeChangeProvider.AZURE_POSTGRES,
         }
         for competitor, adapter in competitors.items():
+            if competitor not in expected:
+                raise ValueError(f"no safe-change provider is known for {competitor!s}")
             if adapter.provider != expected[competitor]:
                 raise ValueError(
-                    f"{competitor.value} adapter must identify as provider "
+                    f"{competitor!s} adapter must identify as provider "
                     f"{expected[competitor].value}"
                 )
         self.scope = scope
@@ -628,11 +717,22 @@ class SafeChangeEngine:
         on_progress: ProgressCallback | None = None,
     ) -> SafeChangeArm:
         plans = self.plans_for(competitor)
+
+        async def preflight_and_say(plan: SafeChangePlan) -> Mapping[str, object]:
+            evidence = await self._preflight_lane(plan, on_progress, cleanup_existing=True)
+            # This lane's own line ends here, while the other may still be waiting. Said here,
+            # not in `_preflight_lane`, which `run` repeats after the bell. Still PREFLIGHT: ARMED
+            # comes once for each lane, after both.
+            await self._emit(
+                on_progress,
+                plan,
+                SafeChangePhase.PREFLIGHT,
+                f"{LANE_READY_PREFIX} · Source verified clean",
+            )
+            return evidence
+
         checks = await asyncio.gather(
-            *(
-                self._preflight_lane(plan, on_progress, cleanup_existing=True)
-                for plan in plans
-            ),
+            *(preflight_and_say(plan) for plan in plans),
             return_exceptions=True,
         )
         errors = [
@@ -654,7 +754,7 @@ class SafeChangeEngine:
                 on_progress,
                 plan,
                 SafeChangePhase.ARMED,
-                "Source and isolated-change start state verified",
+                f"{LANE_READY_PREFIX} · Source and isolated-change start state verified",
             )
         return SafeChangeArm(
             competitor=competitor,
@@ -745,7 +845,7 @@ class SafeChangeEngine:
     ) -> SafeChangeResetResult:
         plans = [self._plan("lakebase", self.lakebase)]
         plans.extend(
-            self._plan(f"competitor-{competitor.value}", adapter)
+            self._plan(f"competitor-{competitor!s}", adapter)
             for competitor, adapter in self.competitors.items()
         )
         await asyncio.gather(
@@ -769,7 +869,7 @@ class SafeChangeEngine:
         try:
             return self.competitors[competitor]
         except KeyError as exc:
-            raise ValueError(f"No safe-change adapter exists for {competitor.value}") from exc
+            raise ValueError(f"No safe-change adapter exists for {competitor!s}") from exc
 
     def _adapter_for(self, plan: SafeChangePlan) -> SafeChangeAdapter:
         if plan.provider == SafeChangeProvider.LAKEBASE:
@@ -826,10 +926,14 @@ class SafeChangeEngine:
                 "Previous owned environment cleared · verifying clean source",
             )
 
+        async def say(status: str) -> None:
+            await self._emit(on_progress, plan, SafeChangePhase.PREFLIGHT, status)
+
         try:
             async with asyncio.timeout(self.preflight_timeout_seconds):
                 evidence = dict(await adapter.preflight(plan))
-                source = await adapter.connect_source(plan)
+                source = await connect_saying_waits(
+                    adapter.connect_source(plan), say, plan.provider, self._clock_ns)
                 try:
                     await self._assert_source_clean(source)
                 finally:
@@ -1225,7 +1329,12 @@ class SafeChangeEngine:
             failures.append("run ID")
         if artifact.owner != plan.scope.owner:
             failures.append("owner")
-        if plan.provider != SafeChangeProvider.LAKEBASE:
+        if plan.provider != SafeChangeProvider.LAKEBASE and plan.scope.cloud == "azure":
+            if artifact.azure_subscription_id != plan.scope.azure_subscription_id:
+                failures.append("Azure subscription")
+            if artifact.azure_region != plan.scope.azure_region:
+                failures.append("Azure region")
+        elif plan.provider != SafeChangeProvider.LAKEBASE:
             if artifact.aws_account_id != plan.scope.aws_account_id:
                 failures.append("AWS account")
             if artifact.aws_region != plan.scope.aws_region:

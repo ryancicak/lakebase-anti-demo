@@ -532,7 +532,9 @@ class ShowtimeReadinessGate:
 
     @staticmethod
     def _manifest_has_round5(manifest: DemoManifest) -> bool:
-        return bool(getattr(manifest, "round5_ready", False))
+        # AWS's seal or the Azure edition's (`DemoManifest.round5_available`).
+        return bool(getattr(manifest, "round5_available",
+                            getattr(manifest, "round5_ready", False)))
 
     @property
     def status(self) -> ReadinessStatus:
@@ -1161,7 +1163,7 @@ class ShowtimeReadinessGate:
         error so the round is surrendered (blocked), not retried forever.
         """
 
-        if not self._manifest.round5_ready:
+        if not self._manifest_has_round5(self._manifest):
             return
         from .connection_spike_journal import LifecycleState
 
@@ -1180,7 +1182,7 @@ class ShowtimeReadinessGate:
     async def _unresolved_round5_bouts(
         self, journal: LakebaseCreationJournalStore
     ) -> tuple[str, ...]:
-        if not self._manifest.round5_ready:
+        if not self._manifest_has_round5(self._manifest):
             return ()
         return tuple(await journal.unresolved_bout_ids())
 

@@ -629,6 +629,22 @@ def _parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--port", default=8000, type=int)
     setup_parser.add_argument("--no-serve", action="store_true")
 
+    azure_setup_parser = subparsers.add_parser(
+        "azure-setup",
+        help=(
+            "Install the Azure edition: infra/azure, Lakebase and the seeds, from AZURE_* and "
+            "DATABRICKS_PROFILE (az login in the installation's tenant, no AWS setting)"
+        ),
+    )
+    azure_setup_parser.add_argument("--zero-timeout", type=float, default=900)
+    azure_cleanup_parser = subparsers.add_parser(
+        "azure-cleanup",
+        help=(
+            "Remove the Azure installation and prove ALL GONE: a dry run listing it unless --yes"
+        ),
+    )
+    azure_cleanup_parser.add_argument("--yes", action="store_true")
+
     provision_parser = subparsers.add_parser(
         "provision",
         help="Create one owned Lakebase + AWS Round 1 environment",
@@ -1148,6 +1164,28 @@ def main() -> int:
             if args.no_serve or already_serving:
                 return 0
             return _serve(args.host, args.port)
+        if args.command == "azure-cleanup":
+            from .azure_lifecycle import GENERATION, Generation, inputs_from_manifest
+            from .azure_uninstall import AzureUninstall
+
+            # The installation it removes is the one sealed in the generation, settings included.
+            sealed = load_manifest(GENERATION / "manifest.json")
+            uninstall = AzureUninstall(inputs_from_manifest(sealed, Generation()))
+            with hold_generation(GENERATION / "manifest.json", "antidemo azure-cleanup"):
+                uninstall.run(yes=args.yes)
+            return 0
+        if args.command == "azure-setup":
+            from .azure_lifecycle import GENERATION, AzureSetup, inputs_from_environment
+
+            installer = AzureSetup(
+                inputs_from_environment(), zero_timeout_seconds=args.zero_timeout
+            )
+            # The Azure edition's generation is its own directory, and its lock is that
+            # manifest's, as every AWS generation's is its own.
+            with hold_generation(GENERATION / "manifest.json", "antidemo azure-setup"):
+                manifest = installer.run()
+            print(f"Azure installation {manifest.run_id} is {manifest.status}.", flush=True)
+            return 0
         if args.command == "provision":
             with _mutating("antidemo provision"):
                 manifest = provision(

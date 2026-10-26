@@ -16,6 +16,7 @@ import {
   roundFiveLaneResult,
   roundFivePhaseLabel,
   roundFiveSchedulingAdvisorySummary,
+  roundFiveServerResetNote,
   roundFiveSetupDiagnosticSummary,
   roundFiveStoppedVerdict,
 } from './round5'
@@ -55,7 +56,7 @@ it('consumes only exact backend V2/V3/V4 protocol-schema serialization pairs', (
 
 it('gives every Round 5 lead voice a distinct human implication without proof mechanics', () => {
   const personaIds = FALLBACK_CATALOG.personas.map((persona) => persona.id)
-  const openings = personaIds.map(roundFiveFightCardOpening)
+  const openings = personaIds.map((personaId) => roundFiveFightCardOpening(personaId))
 
   expect(personaIds).toHaveLength(10)
   expect(new Set(openings).size).toBe(personaIds.length)
@@ -523,6 +524,52 @@ it('accepts exactly the server retry budget and nothing above it', () => {
   expect(lane(ROUND_FIVE_MAX_RETRIES).contractVerified).toBe(true)
   expect(lane(ROUND_FIVE_MAX_RETRIES + 1).contractVerified).toBe(false)
   expect(lane(undefined).contractVerified).toBe(false)
+})
+
+it('declares the win when the server reset a held client and the runner reconnected it', () => {
+  // v1.3.0: Lakebase's pooled endpoint reset 1 of 10,000 held connections (v1.2.2's AWS run 1,
+  // three Azure ramps by 2026-10-21) and the exact gate failed each bout. The runner now logs it
+  // back in, as a retry, and starts the hold again; the server verifies that, so the browser
+  // must not overrule it, and it says what happened.
+  const session = verifiedV4RoundFiveSession(0)
+  const lane = (disconnected: unknown, reconnected: unknown) => {
+    session.lanes.lakebase.evidence = {
+      ...session.lanes.lakebase.evidence,
+      retries: 1,
+      disconnected_during_hold: disconnected,
+      reconnected_after_reset: reconnected,
+    }
+    return roundFiveLaneResult(session.lanes.lakebase)
+  }
+
+  expect(lane(1, 1).contractVerified).toBe(true)
+  expect(roundFiveServerResetNote(session.lanes.lakebase)).toBe(
+    '1 held connection reset by the server, reconnected')
+  const outcome = classifyOutcome(session)
+  expect(outcome.status).toBe('declared_comparison')
+  expect(linkedInReceipt(session, 5)).toContain(
+    '🔴 Lakebase · 10,000 authenticated held clients · 1 held connection reset by the server, reconnected')
+  expect(replayStory(session).beats.map((beat) => beat.body).join(' ')).toContain(
+    'Lakebase: 1 held connection reset by the server, reconnected, and the 30s counted ran with every client held.')
+
+  // One it did not reconnect fails; so do counts that are not counts.
+  expect(lane(1, 0).contractVerified).toBe(false)
+  expect(lane(undefined, undefined).contractVerified).toBe(false)
+  expect(lane(2, 2).contractVerified).toBe(true)
+  expect(roundFiveServerResetNote(session.lanes.lakebase)).toBe(
+    '2 held connections reset by the server, reconnected')
+})
+
+it('reads a result from before v1.3.0, which has no reconnect count, as none', () => {
+  const session = verifiedV4RoundFiveSession(0)
+  const evidence = { ...session.lanes.lakebase.evidence } as Record<string, unknown>
+  delete evidence.reconnected_after_reset
+  session.lanes.lakebase.evidence = evidence
+
+  expect(roundFiveLaneResult(session.lanes.lakebase).reconnectedAfterReset).toBe(0)
+  expect(roundFiveLaneResult(session.lanes.lakebase).contractVerified).toBe(true)
+  expect(roundFiveServerResetNote(session.lanes.lakebase)).toBe('')
+  expect(linkedInReceipt(session, 5)).not.toContain('reset by the server')
 })
 
 it('keeps a warm-baseline win shareable while the per-bout Proxy is still being deleted', () => {

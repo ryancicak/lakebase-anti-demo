@@ -27,6 +27,7 @@ from .cost_model import (
     acu_sampling_window,
     integrate_acu_seconds,
 )
+from .home_cloud import LAKEBASE_HOST_PATTERN
 from .models import CompetitorId, RoundId
 from .verifier import FatalProbeError, PreparedTarget
 
@@ -39,10 +40,7 @@ class TargetNotArmedError(RuntimeError):
     pass
 
 
-_LAKEBASE_HOST = re.compile(
-    r"^[^.]+\.database\.([a-z0-9-]+)\.cloud\.databricks\.com$",
-    re.IGNORECASE,
-)
+_LAKEBASE_HOST = re.compile(LAKEBASE_HOST_PATTERN, re.IGNORECASE)
 
 #: The one relation every measured lane writes, schema-qualified, exported so the
 #: privilege the deployed app is granted is derived from the same expression that
@@ -1084,6 +1082,44 @@ class PsycopgPreparedTarget(PreparedTarget):
         return datetime.now(UTC)
 
 
+_AZURE_NO_SCALE_TO_ZERO_REASON = (
+    "Azure Database for PostgreSQL has no automatic connection-triggered scale-to-zero and "
+    "wake state; manual stop/start is a different operator action."
+)
+
+
+class AzurePostgresCredentialProvider:
+    """Round 1's Azure lane: refused on the engine's capability, with no server and no call.
+
+    RDS's rule exactly (design 6.1): Flexible Server can't scale to zero and wake on a connection,
+    so Round 1 times Lakebase alone, and the Azure edition stands no Round 1 server up. The refusal
+    is a property of the engine, returned before anything is asked of Azure, so it can't depend on
+    a server that does not exist.
+    """
+
+    round_id = RoundId.WAKE_IDLE_APP
+
+    async def assert_armed(
+        self,
+        *,
+        not_before: datetime | None = None,
+    ) -> dict[str, object]:
+        del not_before
+        return {
+            "eligible": False,
+            "state": "NO_SCALE_TO_ZERO",
+            "reason": _AZURE_NO_SCALE_TO_ZERO_REASON,
+            "engine": "postgres",
+            "basis": "engine_capability",
+            "round_id": str(self.round_id),
+            "azure_calls": 0,
+        }
+
+    async def connection_material(self) -> ConnectionMaterial:
+        # Only an eligible lane is prepared, so this is never reached by a bout.
+        raise TargetNotArmedError(_AZURE_NO_SCALE_TO_ZERO_REASON)
+
+
 @dataclass(frozen=True)
 class LiveTarget:
     id: str
@@ -1115,10 +1151,19 @@ class TargetResolver:
                 name="Aurora Serverless v2",
                 provider=AuroraCredentialProvider(),
             )
-        else:
+        elif competitor == CompetitorId.RDS_POSTGRES:
             challenger = LiveTarget(
                 id="competitor",
                 name="RDS PostgreSQL",
                 provider=RdsCredentialProvider(),
             )
+        elif competitor == CompetitorId.AZURE_POSTGRES:
+            challenger = LiveTarget(
+                id="competitor",
+                name="Azure PostgreSQL",
+                provider=AzurePostgresCredentialProvider(),
+            )
+        else:
+            # Never "anything else is RDS": a third competitor gets its own provider.
+            raise ValueError(f"competitor {competitor!r} has no Round 1 target")
         return lakebase, challenger

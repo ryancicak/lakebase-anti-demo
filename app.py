@@ -265,8 +265,8 @@ def _coordination_lakebase_endpoint(manifest: DemoManifest) -> str:
 
 
 def _round_isolation_config(manifest: DemoManifest | None) -> tuple[bool, str]:
-    """Enable independent ring fences only for a fully identified v7 install."""
-    if manifest is None or manifest.manifest_version != 7:
+    """Enable independent ring fences only for a fully identified per-round install (v7, v8)."""
+    if manifest is None or manifest.manifest_version not in (7, 8):
         return False, ""
     if manifest.installation_id is None:
         raise InvalidStateError("Manifest v7 is missing its installation identity")
@@ -318,6 +318,9 @@ def _bind_deployed_runtime(manifest: DemoManifest) -> None:
     ):
         raise InvalidStateError("Sealed Databricks runtime targets are not exact")
 
+    if getattr(manifest, "azure", None) is not None:
+        _bind_azure_runtime(manifest, sealed_client_id, expected_production, expected_coordination)
+        return
     resources = manifest.aws.resources
     bindings = {
         "AWS_AUTH_MODE": "environment",
@@ -369,6 +372,54 @@ def _bind_deployed_runtime(manifest: DemoManifest) -> None:
     ):
         if value:
             bindings[name] = value
+    os.environ.update(bindings)
+
+
+#: What a deployed Azure App must not inherit, whatever the container was started with.
+_AWS_RUNTIME_NAMES = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_AUTH_MODE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_EXPECTED_ACCOUNT_ID",
+    "ANTI_DEMO_RUNTIME_ROLE_ARN",
+)
+
+
+def _bind_azure_runtime(
+    manifest: DemoManifest,
+    sealed_client_id: str,
+    expected_production: str,
+    expected_coordination: str,
+) -> None:
+    """The Azure edition's runtime bindings: Lakebase's, as on AWS, and nothing of AWS's.
+
+    The App reaches ARM through its own Unity Catalog service credential, named in
+    the manifest, so nothing Azure's is bound here: there is no Azure secret to bind.
+    """
+
+    assert getattr(manifest, "azure", None) is not None
+    for name in _AWS_RUNTIME_NAMES:
+        os.environ.pop(name, None)
+    bindings = {
+        "LAKEBASE_ENDPOINT_NAME": expected_production,
+        "ANTI_DEMO_ROUND2_LAKEBASE_ENDPOINT_NAME": _round_lakebase_endpoint(manifest, 2),
+        "ANTI_DEMO_ROUND3_LAKEBASE_ENDPOINT_NAME": _round_lakebase_endpoint(manifest, 3),
+        "LAKEBASE_DATABASE": manifest.databricks.database,
+        "LAKEBASE_EXPECTED_REGION": manifest.azure.region,
+        "LAKEBASE_USER": sealed_client_id,
+        "ANTI_DEMO_COORDINATION_ENDPOINT_NAME": expected_coordination,
+        "ANTI_DEMO_COORDINATION_DATABASE": manifest.databricks.database,
+        "ANTI_DEMO_COORDINATION_USER": sealed_client_id,
+        "EXPECTED_POSTGRES_MAJOR": "17",
+    }
+    missing = [name for name, value in bindings.items() if not value]
+    if missing:
+        raise InvalidStateError(
+            "Sealed runtime manifest is missing bindings: " + ", ".join(missing)
+        )
     os.environ.update(bindings)
 
 
@@ -474,13 +525,19 @@ def delta_storage_probe_from_manifest(
     live_orders_factory = live_orders_factory_from_manifest(manifest)
     if model_score_factory is None:
         return None
+    # The Azure edition has one matchup, and its builders refuse AWS's competitors.
+    competitor = (
+        CompetitorId.AZURE_POSTGRES
+        if getattr(manifest, "cloud", "aws") == "azure"
+        else CompetitorId.RDS_POSTGRES
+    )
 
     async def probe() -> None:
         from server.model_score_live import DeltaPathDoesNotExistError
 
         # Either matchup's engine shares the one Delta source, and building an engine makes
         # no network call; the probe reads Delta history through the source and nothing else.
-        model_score = await asyncio.to_thread(model_score_factory, CompetitorId.RDS_POSTGRES)
+        model_score = await asyncio.to_thread(model_score_factory, competitor)
         source = getattr(model_score, "source", None)
         source_probe = getattr(source, "probe_storage", None)
         if not callable(source_probe):
@@ -500,7 +557,7 @@ def delta_storage_probe_from_manifest(
             return
         # Lakebase's lane is always the first, and its history is the one Delta path Round 6
         # seals; the AWS lane's external table is Prepare's to check, never catalog readiness's.
-        live_orders = await asyncio.to_thread(live_orders_factory, CompetitorId.RDS_POSTGRES)
+        live_orders = await asyncio.to_thread(live_orders_factory, competitor)
         history_probe = getattr(live_orders.lanes[0], "probe_storage", None)
         if not callable(history_probe):
             raise InvalidStateError("Round 6's Lakebase lane has no read-only Delta history probe")
@@ -652,7 +709,71 @@ def connection_spike_factory_from_manifest(
     resident_transport: object | None = None
     resident_delivery_failure_handler: Callable[[str], Awaitable[None]] | None = None
 
+    def azure_build() -> Callable[[CompetitorId], object] | None:
+        # The Azure edition: AWS's engine and warm machinery with Azure's setup, adapters and
+        # transport (server/azure_round5_engine.py), from its own seal.
+        if not manifest.round5_available:
+            return None
+        refusal = _round5_coordination_refusal(manifest, lease_store)
+        if refusal is not None:
+            round_unavailable(5, RoundId.SURVIVE_CONNECTION_SPIKE, refusal)
+            return None
+        from server.azure_round5_engine import azure_lane_config, azure_setup_config
+
+        for lane in ("lakebase", "competitor"):
+            azure_lane_config(manifest, lane)
+        azure_setup_config(manifest)
+        return azure_factory
+
+    def azure_factory(competitor: CompetitorId) -> object:
+        nonlocal resident_transport
+        from server.azure_runtime import azure_round5_publisher, build_azure_round5_engine
+        from server.connection_spike_live import LakebaseCreationJournalStore
+        from server.round5_control import (
+            LakebaseRound5ControlStore,
+            Round5ControlDispatcher,
+            Round5ResidentTransport,
+        )
+
+        del competitor  # one competitor on Azure: whatever a reconcile asks for, it's this one
+        if resident_transport is None:
+            control_store = LakebaseRound5ControlStore(lease_store._run)
+            dispatcher = Round5ControlDispatcher(
+                control_store,
+                azure_round5_publisher(manifest),
+                on_persistent_failure=resident_delivery_failure_handler,
+            )
+            resident_transport = Round5ResidentTransport(control_store, dispatcher)
+        workspace = (
+            WorkspaceClient()
+            if os.environ.get("ANTI_DEMO_ENV") == "databricks-app"
+            or os.environ.get("DATABRICKS_APP_NAME")
+            else WorkspaceClient(profile=manifest.databricks.profile)
+        )
+
+        async def fresh_lakebase_host() -> str:
+            endpoint = await asyncio.to_thread(
+                workspace.postgres.get_endpoint, _round_lakebase_endpoint(manifest, 5)
+            )
+            hosts = getattr(getattr(endpoint, "status", None), "hosts", None)
+            host = str(getattr(hosts, "read_write_pooled_host", None) or "")
+            if not host:
+                raise InvalidStateError("Fresh Lakebase pooled host is unavailable")
+            return host
+
+        return build_azure_round5_engine(
+            manifest,
+            journal=LakebaseCreationJournalStore(
+                lease_store._run, authority_ring_key=lease_store.ring_key
+            ),
+            fence=_Round5ArtifactCleanupFence(lease_store),
+            fresh_lakebase_host=fresh_lakebase_host,
+            resident_transport=resident_transport,
+        )
+
     def build() -> Callable[[CompetitorId], object] | None:
+        if getattr(manifest, "cloud", "aws") == "azure":
+            return azure_build()
         if not manifest.round5_ready:
             return None
         refusal = _round5_coordination_refusal(manifest, lease_store)
@@ -1234,7 +1355,9 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
                 # Ask about the app's service credentials and exact account before
                 # the lease store or RunManager can accept an end-user request.
                 # Reported rather than raised: see `_deployed_credential_preflight`.
-                startup_credential_verdict = _deployed_credential_preflight()
+                # The Azure edition holds no AWS credential to ask about.
+                if getattr(manifest, "azure", None) is None:
+                    startup_credential_verdict = _deployed_credential_preflight()
             candidate_store = build_lease_store()
             # A profile-bound localhost process can use the same durable Lakebase
             # fence as the deployed app. It must also reconcile crash residue before
@@ -1373,15 +1496,24 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round5_resource_reader = getattr(
                 manifest, "require_round5_resources", None
             )
+            # AWS's reader refuses the Azure edition, whose Round 5 seal is its own
+            # (`require_azure_round5_resources`, read by the warm coordinator below).
             round5_resources = (
                 round5_resource_reader()
                 if callable(round5_resource_reader)
+                and getattr(manifest, "cloud", "aws") != "azure"
                 else None
             )
             round5_cleanup_delegated = bool(
                 manifest.round5_ready
                 and getattr(round5_lease_store, "mode", None) == "lakebase"
                 and getattr(round5_resources, "v3_factory_ready", False)
+            ) or bool(
+                # The Azure edition's Round 5 is warm-coordinator owned from the start, as
+                # AWS's v3 is: its cleanup is the coordinator's, never this gate's.
+                getattr(manifest, "cloud", "aws") == "azure"
+                and getattr(manifest, "round5_available", False)
+                and getattr(round5_lease_store, "mode", None) == "lakebase"
             )
             readiness_gate = ShowtimeReadinessGate(
                 manifest,
@@ -1510,6 +1642,55 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             )
             if callable(set_delivery_failure_handler):
                 set_delivery_failure_handler(round5_warm_coordinator.invalidate_readiness)
+        elif (
+            manifest is not None
+            and getattr(manifest, "cloud", "aws") == "azure"
+            and manifest.round5_available
+            and getattr(round5_lease_store, "mode", None) == "lakebase"
+            and connection_spike_factory is not None
+        ):
+            # The Azure edition's warm coordinator: AWS's, over Azure's one competitor variant.
+            from server.azure_round5_engine import AzureRound5WarmProvider
+            from server.connection_fanin import (
+                capacity_model_sha256,
+                fanin_config_sha256,
+                fanin_generator_sha256,
+            )
+            from server.round5_control import ROUND5_CONTROL_PROTOCOL
+            from server.round5_warm import (
+                ROUND5_WARM_PROTOCOL,
+                LakebaseRound5WarmStore,
+                Round5WarmCoordinator,
+                stable_round5_id,
+            )
+
+            azure_resources = manifest.require_azure_round5_resources()
+            round5_warm_coordinator = Round5WarmCoordinator(
+                installation_id=manifest.installation_id or manifest.run_id,
+                warm_contract_sha256=stable_round5_id(
+                    ROUND5_WARM_PROTOCOL,
+                    azure_resources.baseline_sha256,
+                    azure_resources.config_sha256,
+                    fanin_config_sha256(),
+                    fanin_generator_sha256(),
+                    capacity_model_sha256(),
+                    ROUND5_CONTROL_PROTOCOL,
+                    azure_resources.lakebase_control_queue,
+                    azure_resources.competitor_control_queue,
+                    azure_resources.lakebase_control_secret,
+                    azure_resources.competitor_control_secret,
+                ),
+                store=LakebaseRound5WarmStore(
+                    round5_lease_store._run,
+                    database=manifest.databricks.database,
+                ),
+                provider=AzureRound5WarmProvider(manifest, connection_spike_factory),
+            )
+            set_delivery_failure_handler = getattr(
+                connection_spike_factory, "set_resident_delivery_failure_handler", None
+            )
+            if callable(set_delivery_failure_handler):
+                set_delivery_failure_handler(round5_warm_coordinator.invalidate_readiness)
         app.state.round5_warm_coordinator = round5_warm_coordinator
         app.state.run_manager = RunManager(
             lease_store=lease_store,
@@ -1536,6 +1717,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             # reads whatever the last `/readyz` sweep left behind, and None until
             # there has been one -- which the disclosure renders as not-read.
             drift_report=cached_installation_report,
+            cloud=getattr(manifest, "cloud", "aws") if manifest is not None else "aws",
         )
         app.state.round4_stop_recovery = None
         if inherited_round4_stop is not None:
@@ -1587,7 +1769,20 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         # `exited` record and its leaked per-bout clones; a live one leaves a `live`
         # record and the sweep declines. Deliberately not a shutdown hook: the
         # dying process is the worst place to run destructive AWS calls.
-        app.state.startup_reap = await _reap_startup_orphans(manifest, lease_store)
+        # The reaper sweeps AWS's per-bout clones. The Azure edition's copies are settled by
+        # each round's own reset, as its readiness gate does at startup.
+        if manifest is not None and getattr(manifest, "azure", None) is not None:
+            from server.reap import MODE_REPORT, ReapReport
+
+            app.state.startup_reap = ReapReport(
+                mode=MODE_REPORT,
+                run_id=manifest.run_id,
+                unavailable=(
+                    "the Azure edition settles its copies through each round's own reset"
+                ),
+            )
+        else:
+            app.state.startup_reap = await _reap_startup_orphans(manifest, lease_store)
         if round5_warm_coordinator is not None:
             await round5_warm_coordinator.start()
         posted_usage_task = asyncio.create_task(
@@ -1702,7 +1897,8 @@ def _start_credential_sentry(
     """
 
     app.state.credential_sentry = None
-    if manifest is None:
+    if manifest is None or getattr(manifest, "azure", None) is not None:
+        # Nothing to probe: a local start has no manifest, and the Azure edition no AWS credential.
         return None
     gate = getattr(app.state, "readiness_gate", None)
     notify = getattr(gate, "notify_credentials_recovered", None)
@@ -1739,7 +1935,17 @@ def _start_lease_keeper(
     if manifest is None:
         return None
     try:
-        keeper = LeaseKeeper(manifest, _lease_session)
+        if getattr(manifest, "azure", None) is not None:
+            from server.azure_lease import AzureLeaseScope, azure_lease_keeper
+            from server.azure_runtime import app_arm_client
+
+            keeper = azure_lease_keeper(
+                manifest,
+                AzureLeaseScope(manifest.run_id, manifest.azure.lease_date_tag),
+                lambda: app_arm_client(manifest),
+            )
+        else:
+            keeper = LeaseKeeper(manifest, _lease_session)
     except Exception:  # noqa: BLE001 - an observer may never break startup
         LOGGER.warning("Could not start the installation lease keeper", exc_info=True)
         return None

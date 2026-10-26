@@ -14,6 +14,11 @@ With `--stop-start` it stops and starts the app itself instead, deploying
 nothing, which takes seconds where a redeploy takes minutes: soon enough to land
 inside a Round 4 bout, which is over in about three, or a Round 6 bout.
 
+Each round is armed, and waited on until it is, before the next is: an armed card
+nobody rings expires after 180 s. The Azure edition's Round 4 can take three or four
+minutes to arm (its Prepare waits out a cold Data Factory run), and on 2026-10-20
+the cards armed before it expired while it did. Name a slow-arming round first.
+
 The restart has happened once the old sessions are gone (they live in the old
 process). From then on the board is polled until all six rounds are READY again,
 for up to 45 minutes. Round 5 is the slow one: it inherits the old bout's claim,
@@ -121,9 +126,10 @@ def main() -> int:
         if status != 201:
             log("create_failed", round=round_id, status=status, body=created)
             return 2
-        sessions[round_id] = created["id"]
-        post(f"/api/sessions/{created['id']}/arm", settled=ARMED_OR_LATER)
-    for round_id, session_id in sessions.items():
+        session_id = sessions[round_id] = created["id"]
+        post(f"/api/sessions/{session_id}/arm", settled=ARMED_OR_LATER)
+        # Armed before the next round is, so one slow arm cannot run out the 180 s of the
+        # cards armed before it (see the docstring).
         snapshot: Any = {}
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:

@@ -50,6 +50,7 @@ from server.round5_control import (
     canonical_request_sha256,
 )
 from server.round5_warm import (
+    AWS_ROUND5_VARIANTS,
     MAX_IDENTITY_REESTABLISH_ATTEMPTS,
     InMemoryRound5WarmStore,
     Round5LaunchCapsule,
@@ -220,7 +221,7 @@ def _preparation(
             request_template_sha256=DIGEST,
             expires_at=expires_at,
         )
-        for variant in Round5Variant
+        for variant in sorted(AWS_ROUND5_VARIANTS)
     }
     return Round5WarmPreparation(
         shared_receipt=shared,

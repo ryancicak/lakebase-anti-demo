@@ -254,14 +254,16 @@ databricks_reply_excerpt() {
 HOST_VERDICT=""
 HOST_VERDICT_WHY=""
 databricks_host_verdict() { # <workspace URL>
-  local hostname="${1#*://}" body code status=0
+  local hostname="${1#*://}" body code status=0 witness=accounts.cloud.databricks.com
   hostname="${hostname%%/*}"
+  # The workspace's own cloud's DNS witness (server/home_cloud.py).
+  [[ "$hostname" == *.azuredatabricks.net ]] && witness=accounts.azuredatabricks.net
   body="$(mktemp)"
   code="$(curl -sS -m 20 -o "$body" -w '%{http_code}' \
     "https://$hostname/oidc/.well-known/oauth-authorization-server" 2>/dev/null)" || status=$?
   if ((status == 6)); then
     status=0
-    curl -sS -m 20 -o /dev/null "https://accounts.cloud.databricks.com/" 2>/dev/null || status=$?
+    curl -sS -m 20 -o /dev/null "https://$witness/" 2>/dev/null || status=$?
     if ((status == 6)); then
       HOST_VERDICT=unverified
       HOST_VERDICT_WHY="$hostname could not be looked up, nor could Databricks"
@@ -460,7 +462,19 @@ step "Prerequisite tools"
 # are really this one; what was wrong was reporting one name when nine were
 # checked.
 MISSING_TOOLS=()
-for tool in uv node npm databricks aws terraform psql python3 jq; do
+# The Azure edition needs az and not aws (Azure design, section 8.1). Its host is read here, ahead
+# of the env file's own reading below, only to choose the tools: from the shell, or the file's line.
+REQUIRED_TOOLS=(uv node npm databricks aws terraform psql python3 jq)
+AZURE_HOST_PEEK="${DATABRICKS_HOST:-}"
+if [[ -z "$AZURE_HOST_PEEK" && -f "$ENV_FILE" ]]; then
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ "$_line" =~ ^[[:space:]]*(export[[:space:]]+)?DATABRICKS_HOST=(.*)$ ]] &&
+      AZURE_HOST_PEEK="${BASH_REMATCH[2]}"
+  done <"$ENV_FILE"
+fi
+[[ "$AZURE_HOST_PEEK" == *.azuredatabricks.net* ]] &&
+  REQUIRED_TOOLS=(uv node npm databricks az terraform python3 jq)
+for tool in "${REQUIRED_TOOLS[@]}"; do
   if command -v "$tool" >/dev/null 2>&1; then
     ok "$tool"
   else
@@ -483,8 +497,16 @@ fi
 
 TF_VERSION="$(terraform version -json 2>/dev/null | jq -r '.terraform_version' 2>/dev/null || echo unknown)"
 [[ -n "$TF_VERSION" ]] || TF_VERSION=unknown
-[[ "$TF_VERSION" == unknown ]] && warn "could not read the Terraform version; infra/aws requires >= 1.9.0"
-[[ "$TF_VERSION" != unknown ]] && ok "terraform $TF_VERSION (infra/aws/versions.tf requires >= 1.9.0)"
+# The Azure edition's tree is infra/azure, which needs 1.12 (its versions.tf, and its init refuses
+# an older one); the AWS edition's needs 1.9.0, checked again below for its S3 backend.
+TF_TREE=infra/aws
+TF_MINIMUM=1.9.0
+if [[ "$AZURE_HOST_PEEK" == *.azuredatabricks.net* ]]; then
+  TF_TREE=infra/azure
+  TF_MINIMUM=1.12
+fi
+[[ "$TF_VERSION" == unknown ]] && warn "could not read the Terraform version; $TF_TREE requires >= $TF_MINIMUM"
+[[ "$TF_VERSION" != unknown ]] && ok "terraform $TF_VERSION ($TF_TREE/versions.tf requires >= $TF_MINIMUM)"
 
 # Compare dotted versions without assuming sort -V is available everywhere.
 version_at_least() {
@@ -589,13 +611,44 @@ if [[ -f "$ENV_FILE" ]]; then
   source "$ENV_FILE"
   set -u
   say "Read inputs from $ENV_FILE_ABS"
-  say "  Only five values are required: DATABRICKS_HOST, DATABRICKS_CLIENT_ID,"
-  say "  DATABRICKS_CLIENT_SECRET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Everything"
-  say "  else in the file is optional -- bootstrap derives it and asks only if it must."
+  if [[ "${DATABRICKS_HOST:-}" == *.azuredatabricks.net* ]]; then
+    say "  The Azure edition reads DATABRICKS_HOST, DATABRICKS_PROFILE, DATABRICKS_WAREHOUSE_ID"
+    say "  and the AZURE_* settings (docs/AZURE.md), and takes no AWS value."
+  else
+    say "  Only five values are required: DATABRICKS_HOST, DATABRICKS_CLIENT_ID,"
+    say "  DATABRICKS_CLIENT_SECRET, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. Everything"
+    say "  else in the file is optional -- bootstrap derives it and asks only if it must."
+  fi
 else
   say "No env file at $ENV_FILE_ABS (start from docs/bootstrap.env.example); missing inputs will be prompted for."
   say "  Only five values are required: the Databricks host, client id and secret, and the"
   say "  AWS access-key/secret pair. Everything else is optional and derived."
+fi
+
+# The Azure edition (Azure design, section 8): an azuredatabricks.net workspace is installed by its
+# own installer, which takes no AWS value at all, so nothing below this is reached for one. Its
+# inputs are the AZURE_* settings and a Databricks profile; `az login` in the installation's tenant
+# is its Azure identity. It resumes as the AWS path does, from what its manifest last saved.
+if [[ "${DATABRICKS_HOST:-}" == *.azuredatabricks.net* ]]; then
+  [[ "$MODE" == "apply" ]] ||
+    die "the Azure edition installs with --apply (preflight-only runs are the AWS path's)"
+  # "Nothing to do with AWS" is a refusal, not a promise: an AWS value in the env file is
+  # named and refused. One the launching shell exported is simply not handed on.
+  if [[ -f "$ENV_FILE" ]]; then
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+      if [[ "$_line" =~ ^[[:space:]]*(export[[:space:]]+)?(AWS_[A-Z_]+)=(.*)$ ]] &&
+        [[ -n "${BASH_REMATCH[3]//[\"\' ]/}" ]]; then
+        die "an Azure installation takes no AWS setting: remove ${BASH_REMATCH[2]} from $ENV_FILE_ABS"
+      fi
+    done <"$ENV_FILE"
+  fi
+  for _name in $(compgen -v AWS_); do unset "$_name"; done
+  [[ -x .venv/bin/python ]] || uv sync --frozen
+  export DATABRICKS_HOST DATABRICKS_PROFILE DATABRICKS_WAREHOUSE_ID DATABRICKS_APP_NAME \
+    AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_RESOURCE_GROUP AZURE_REGION AZURE_ZONE \
+    AZURE_POLICY_TAGS AZURE_LEASE_DATE_TAG ANTI_DEMO_OWNER ANTI_DEMO_OPERATOR_IP
+  say "Azure workspace: installing the Azure edition (./antidemo azure-setup)"
+  exec ./antidemo azure-setup
 fi
 
 # Name any sibling `.env.bootstrap*` this run is NOT reading, so a change to the

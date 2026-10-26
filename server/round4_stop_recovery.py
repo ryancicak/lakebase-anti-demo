@@ -80,7 +80,8 @@ class InheritedRound4StopRecovery:
         lease_ttl: timedelta = RECOVERY_LEASE_TTL,
     ) -> None:
         installation_id = str(getattr(manifest, "installation_id", "") or "")
-        if manifest.manifest_version != 7 or not installation_id:
+        # A per-round installation: v7 on AWS, v8 on Azure.
+        if getattr(manifest, "manifest_version", 0) not in (7, 8) or not installation_id:
             raise Round4StopRecoveryRefusedError(
                 "Inherited Round 4 stop recovery requires a scoped v7 installation ring"
             )
