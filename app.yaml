@@ -40,13 +40,14 @@ env:
   # the whole deployment and takes the app down with it. Fewer connections and a
   # longer patience trade build minutes for builds that finish.
   #
-  # No interpreter is pinned here on purpose. requires-python = ">=3.12" is the
-  # whole correctness requirement, and uv.lock carries wheels for cp312 through
-  # cp315, so any interpreter uv picks can install and can parse this source.
-  # Pinning one would mean asking the proxy for a managed interpreter it may not
-  # have cached -- more traffic through the component that is already the least
-  # reliable part of the build. docs/DEPLOY.md records what a live deploy would
-  # have to observe before narrowing this.
+  # No interpreter is pinned here: pyproject.toml's requires-python bounds it,
+  # at ">=3.12, <3.15", and uv takes the newest CPython that bound admits. While
+  # the bound was only ">=3.12", that became CPython 3.15 once it shipped, and
+  # every deploy failed (2026-11-02): psycopg-binary 3.3.4 has no cp315 wheel and
+  # no sdist, and pydantic-core, uvloop, httptools and pyyaml have no cp315 wheel
+  # either. Raise the cap only once every compiled package in uv.lock has wheels
+  # for the new version; tests/test_dependency_wheels.py fails until it does.
+  # docs/DEPLOY.md has the rest of the reasoning.
   - name: UV_CONCURRENT_DOWNLOADS
     value: "4"
   - name: UV_HTTP_TIMEOUT

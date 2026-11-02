@@ -547,7 +547,7 @@ fi
 # any other interpreter. A stray one pinning 3.12 already deleted this tree's
 # provisioned 3.14 environment and began rebuilding it mid-incident, which from
 # the outside is indistinguishable from a hang. The deployed tree needs no pin
-# either -- requires-python >= 3.12 in pyproject.toml is what uv honours there.
+# either -- requires-python (>= 3.12, < 3.15) in pyproject.toml is what uv honours there.
 if [[ -f .python-version ]]; then
   die "A .python-version in the repository root pins the interpreter uv builds .venv on,
        and '$(cat .python-version 2>/dev/null | tr -d '\n')' is what it now asks for. If that
@@ -1285,9 +1285,9 @@ fi
 if [[ -x "$PYTHON_ENVIRONMENT/bin/python" ]]; then
   ok "$PYTHON_ENVIRONMENT is runnable"
   # Which interpreter uv built on is reported, not enforced. Nothing pins it:
-  # requires-python in pyproject.toml is a floor (>= 3.12) and there is
+  # requires-python in pyproject.toml is a range (>= 3.12, < 3.15) and there is
   # deliberately no .python-version, so uv takes whatever `python3` resolves to
-  # on this machine. A cold clone therefore builds .venv on one minor version
+  # on this machine, within that range. A cold clone therefore builds .venv on one minor version
   # while the tree that has been serving all along runs another -- which is fine
   # until it is not, and then it is a day of bisecting a difference nobody could
   # see. Printing it makes the divergence a line in the install log. Choosing a
@@ -1299,7 +1299,7 @@ if [[ -x "$PYTHON_ENVIRONMENT/bin/python" ]]; then
     'import sys; print(sys.base_prefix)' 2>/dev/null || true)"
   if [[ -n "$VENV_PYTHON_VERSION" ]]; then
     info "built on $VENV_PYTHON_VERSION (from ${VENV_PYTHON_BASE:-an unknown prefix}).
-        Nothing pins this: pyproject.toml asks only for >= 3.12 and there is no
+        Nothing pins this: pyproject.toml asks only for >= 3.12, < 3.15 and there is no
         .python-version, so another machine can build the same commit on another minor
         version. If a serve behaves differently from this install, compare this line first."
   else
