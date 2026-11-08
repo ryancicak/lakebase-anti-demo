@@ -1306,9 +1306,9 @@ def test_repeated_headings_get_githubs_numeric_suffixes() -> None:
 @pytest.mark.parametrize(
     "relative_path",
     [
-        "frontend/src/ringside-cues/verified-corpus.jsonl",
-        "frontend/src/ringside-cues/outcome-copy.jsonl",
-        "frontend/src/ringside-cues/round5-persona-outcomes.jsonl",
+        "frontend/src/ringside-cues/result-lines.jsonl",
+        "frontend/src/ringside-cues/role-lines.jsonl",
+        "frontend/src/ringside-cues/lens-lines.jsonl",
         "RINGSIDE.md",
     ],
 )
@@ -1339,14 +1339,15 @@ ROUND_FIVE_AUDIENCE_FILES = (
     "server/towel.py",
     "frontend/src/App.tsx",
     "frontend/src/catalog.ts",
+    "frontend/src/commentary.ts",
     "frontend/src/instant-replay.ts",
     "frontend/src/music.ts",
     "frontend/src/recap.ts",
     "frontend/src/round-score.ts",
     "frontend/src/round5.ts",
-    "frontend/src/ringside-cues/verified-corpus.jsonl",
-    "frontend/src/ringside-cues/outcome-copy.jsonl",
-    "frontend/src/ringside-cues/round5-persona-outcomes.jsonl",
+    "frontend/src/ringside-cues/result-lines.jsonl",
+    "frontend/src/ringside-cues/role-lines.jsonl",
+    "frontend/src/ringside-cues/lens-lines.jsonl",
 )
 
 
@@ -1391,21 +1392,19 @@ def test_round_five_audience_numbers_keep_the_measured_boundary(
             f"bounded proof omitted its concurrency cap in {relative_path}: {window}"
         )
 
-    persona_jsonl = {
-        "frontend/src/ringside-cues/verified-corpus.jsonl",
-        "frontend/src/ringside-cues/outcome-copy.jsonl",
-        "frontend/src/ringside-cues/round5-persona-outcomes.jsonl",
-    }
-    if relative_path in persona_jsonl:
+    # A role line that names 10,000 names the product's capability, "up to 10,000 client
+    # connections", and never the bout's protocol. Result and lens lines name the measured
+    # 10,000 ("exactly 10,000 client connections held at once") and are not held to this.
+    if relative_path == "frontend/src/ringside-cues/role-lines.jsonl":
         for line in text.splitlines():
             record = json.loads(line)
-            meaning = record.get("meaning")
-            if isinstance(meaning, str) and "10,000" in meaning:
-                assert re.search(r"\bup to 10,000 client connections\b", meaning, re.I)
+            why = record.get("why")
+            if isinstance(why, str) and "10,000" in why:
+                assert re.search(r"\bup to 10,000 client connections\b", why, re.I)
                 assert not re.search(
                     r"\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|"
                     r"128 attempts?|maximum 64 concurrent)\b",
-                    meaning,
+                    why,
                     re.I,
                 )
             proof = record.get("proof_template")

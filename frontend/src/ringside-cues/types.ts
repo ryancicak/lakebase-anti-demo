@@ -1,18 +1,6 @@
-import type { PersonaId, RoundId } from '../api/types'
-
-export const PRIORITY_KEYS = [
-  'cost',
-  'simplicity',
-  'performance',
-  'cost+simplicity',
-  'cost+performance',
-  'simplicity+performance',
-  'cost+simplicity+performance',
-] as const
-
-export type PriorityKey = typeof PRIORITY_KEYS[number]
-export type CopyDecision = 'KEEP' | 'REWRITE'
-export type CopyMode = 'INHERIT_VERIFIED_CORPUS' | 'OUTCOME_OVERRIDE'
+import type { CustomerCorner, PersonaId, RoundId } from '../api/types'
+import type { CompetitorKind } from '../competitor-kind'
+import type { ContractStatus } from '../outcome'
 
 export const OUTCOME_IDS = [
   'verified_comparison',
@@ -30,55 +18,68 @@ export const OUTCOME_IDS = [
 
 export type RingsideOutcomeId = typeof OUTCOME_IDS[number]
 
-export interface VerifiedCorpusRecord {
-  readonly round_id: RoundId
-  readonly persona_id: PersonaId
-  readonly priority_key: PriorityKey
-  readonly meaning_record_id: string
-  readonly question_record_id: string
-  readonly meaning: string
-  readonly question: string
-  readonly meaning_decision: CopyDecision
-  readonly question_decision: CopyDecision
-}
+/**
+ * Which opponent a line is written for. `*` is the line every bout reads unless a
+ * variant for the bout's competitor kind exists; a variant exists only where the
+ * `*` line names the other side's stack (RDS Proxy, AWS Glue, a replication slot)
+ * and the other edition's stack is a different thing.
+ */
+export type CompetitorScope = '*' | CompetitorKind
 
-export interface OutcomeCopyRecord {
+/**
+ * What happened, for one round and one outcome: a sentence a person would say out
+ * loud, with the bout's numbers in it and the measured boundary at the end. The
+ * `<TOKENS>` are filled from the session; a missing one is an error, never a blank.
+ */
+export interface ResultLineRecord {
   readonly round_id: RoundId
   readonly outcome_id: RingsideOutcomeId
-  readonly persona_id: '*'
-  readonly priority_key: '*'
-  readonly copy_mode: CopyMode
-  readonly meaning_record_id: string | null
-  readonly question_record_id: string | null
-  readonly proof_template_id: string
-  readonly meaning: string | null
-  readonly question: string | null
-  readonly proof_template: string
-  readonly meaning_decision: CopyDecision | null
-  readonly question_decision: CopyDecision | null
-  readonly proof_decision: CopyDecision
-}
-
-export interface RoundFivePersonaOutcomeRecord {
-  readonly outcome_id: RingsideOutcomeId
-  readonly persona_id: PersonaId
-  readonly meaning_record_id: string
-  readonly meaning: string
-  readonly meaning_decision: CopyDecision
-}
-
-export interface AuthoredText {
-  readonly id: string
+  readonly competitor: CompetitorScope
   readonly text: string
-  readonly decision: CopyDecision
 }
 
-export interface RingsideCue {
-  readonly say: string
+/**
+ * Why one round matters to one role, and the one question to put to that role.
+ * Written to the person ("your app", "your runbook"), about the stakes of the round
+ * rather than this bout's result, so it reads true whatever the outcome was.
+ */
+export interface RoleLineRecord {
+  readonly round_id: RoundId
+  readonly persona_id: PersonaId
+  readonly competitor: CompetitorScope
+  readonly why: string
   readonly ask: string
-  readonly show: string
-  readonly sayRecord: AuthoredText
-  readonly askRecord: AuthoredText
-  readonly proofRecord: AuthoredText
-  readonly outcome: OutcomeCopyRecord
+}
+
+/**
+ * One round seen through one priority. Concrete to the round: what is billed and
+ * what stands (cost), what has to be built and owned (simplicity), what the clock
+ * covered and what it left out (performance). Never this bout's verdict.
+ */
+export interface LensLineRecord {
+  readonly round_id: RoundId
+  readonly priority: CustomerCorner
+  readonly competitor: CompetitorScope
+  readonly text: string
+}
+
+export interface RingsideLens {
+  readonly priority: CustomerCorner
+  readonly text: string
+}
+
+/**
+ * The briefing behind "Explain to the room", in the order a presenter reads it:
+ * what happened, why it matters to the person they are facing, the priorities the
+ * room picked, and the question that turns it into a conversation.
+ */
+export interface RingsideBriefing {
+  readonly result: string
+  readonly why: string
+  readonly lenses: readonly RingsideLens[]
+  readonly ask: string
+  readonly outcomeId: RingsideOutcomeId
+  readonly status: ContractStatus
+  /** A winner, a tie, or a capability was declared; false for stoppages without a result. */
+  readonly declared: boolean
 }

@@ -3,8 +3,8 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { InstantReplay, RoundFiveProof, humanDuration, knockoutRatioLabel, linkedInReceipt, receiptPresentation } from './App'
 import type { DemoSession, LaneSnapshot } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
-import { replayStory } from './instant-replay'
-import { buildRingsideCue, classifyOutcome } from './ringside-cues'
+import { replayTape } from './instant-replay'
+import { buildRingsideBriefing, classifyOutcome } from './ringside-cues'
 import { applyRunEventSnapshot, reconcileRunEventSession, selectRound4Session } from './round4'
 import { resetCanvasRecordings } from './test/setup'
 import {
@@ -549,8 +549,8 @@ it('declares the win when the server reset a held client and the runner reconnec
   expect(outcome.status).toBe('declared_comparison')
   expect(linkedInReceipt(session, 5)).toContain(
     '🔴 Lakebase · 10,000 authenticated held clients · 1 held connection reset by the server, reconnected')
-  expect(replayStory(session).beats.map((beat) => beat.body).join(' ')).toContain(
-    'Lakebase: 1 held connection reset by the server, reconnected, and the 30s counted ran with every client held.')
+  expect(replayTape(session).calls.map((call) => `${call.who}: ${call.text}`).join(' ')).toContain(
+    'Lakebase: Held all 10,000 clients for 30 seconds; all 64 checks passed. 1 held connection reset by the server, reconnected.')
 
   // One it did not reconnect fails; so do counts that are not counts.
   expect(lane(1, 0).contractVerified).toBe(false)
@@ -1195,10 +1195,10 @@ it('uses V4 runtime over contradictory setup and lane evidence everywhere', () =
   )
   expect(document.body).not.toHaveTextContent(/Legacy scorecard/i)
   expect(document.body).not.toHaveTextContent(/Verified exact 10,000-client fan-in comparison/i)
-  expect(document.body).toHaveTextContent(/7,020 currently held/i)
+  expect(document.body).toHaveTextContent(/7,020 (?:of 10,000 clients connected|connected and holding)/i)
   expect(document.body).not.toHaveTextContent(/10K GATE \+ HOLD ✓/i)
-  const replay = JSON.stringify(replayStory(session))
-  expect(replay).toContain('7,020')
+  const replay = JSON.stringify(replayTape(session))
+  expect(replay).toContain('Reached 7,020 of 10,000 clients, then the bout stopped.')
   expect(replay).not.toContain('Legacy scorecard')
 })
 
@@ -1239,8 +1239,8 @@ it('renders the running Round 5 race in the canonical two-clock arena', async ()
   const initialLakebaseSeconds = displayedSeconds(lakebase)
   const initialCompetitorSeconds = displayedSeconds(competitor)
   const commentator = screen.getByLabelText('Ringside commentator')
-  expect(commentator).toHaveTextContent(/Live setup call/i)
-  expect(commentator).not.toHaveTextContent(/ON THE WIRE/i)
+  expect(commentator).toHaveTextContent(/Calling it live/i)
+  expect(commentator).not.toHaveTextContent(/On the wire/i)
 
   await act(async () => { await vi.advanceTimersByTimeAsync(96) })
 
@@ -1345,15 +1345,9 @@ it('keeps the shared preflight untimed until the setup clocks actually start', (
   )
 
   const commentator = screen.getByLabelText('Ringside commentator')
-  expect(commentator).toHaveTextContent(
-    /Lakebase · Untimed preparation · Setup clock starts at the bell/i,
-  )
-  expect(commentator).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy · Untimed preparation · Setup clock starts at the bell/i,
-  )
-  expect(commentator).toHaveTextContent(
-    /Untimed preparation in progress · Both setup clocks start at the bell/i,
-  )
+  expect(commentator).toHaveTextContent(/Lakebase: waiting for the bell\./i)
+  expect(commentator).toHaveTextContent(/RDS PostgreSQL \+ RDS Proxy: waiting for the bell\./i)
+  expect(commentator).toHaveTextContent(/Getting ready\. Each side's clock starts at the bell\./i)
   expect(commentator).not.toHaveTextContent(/clock live/i)
   const lakebase = screen.getByLabelText('Lakebase result')
   const competitor = screen.getByLabelText('RDS PostgreSQL + RDS Proxy result')
@@ -1428,22 +1422,19 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
   expect(verdict).toHaveTextContent(
     /No declared winner · comparison incomplete · margin N\/A/i,
   )
-  expect(screen.getByLabelText('Ringside commentator')).toHaveTextContent(/Live setup call/i)
+  expect(screen.getByLabelText('Ringside commentator')).toHaveTextContent(/Final call/i)
 
   fireEvent.click(screen.getByRole('button', { name: /instant replay/i }))
   const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
-  const story = within(replay).getByLabelText('Three-beat replay story')
-  expect(within(story).getAllByRole('heading', { level: 3 }).map((heading) => heading.textContent)).toEqual([
-    'Setup',
-    'Same test',
-    'Takeaway',
-  ])
+  const story = within(replay).getByLabelText('Play-by-play')
   expect(within(story).getByLabelText('Primary measured result')).toHaveTextContent(
     /Lakebase time to 10,000.*1\.23s.*Selected AWS managed pool.*>4\.50s.*Unverified when stopped/i,
   )
-  expect(story).toHaveTextContent(
-    /Lakebase produced exact proof.*RDS PostgreSQL \+ RDS Proxy did not.*no completed comparison or margin/i,
-  )
+  // The tape: the bell, Lakebase's pooled path ready, the opponent's floor, then the final call.
+  expect(story).toHaveTextContent(/Bell\. Both sides race to hold 10,000 client connections at once/i)
+  expect(story).toHaveTextContent(/1\.23s.*Lakebase.*Pooled path ready\./i)
+  expect(story).toHaveTextContent(/4\.50s.*RDS PostgreSQL \+ RDS Proxy.*Still going when the bout stopped\. Its time is a floor, more than 4\.50s\./i)
+  expect(story).toHaveTextContent(/Final call.*Lakebase had its pooled path up in 1\.23s.*RDS PostgreSQL \+ RDS Proxy was still setting up at 4\.50s.*no winner and no margin/i)
   expect(story).not.toHaveTextContent(/neither side verified|neither setup|no verified result/i)
   const evidence = within(replay).getByText(/view full evidence/i).closest('details')
   expect(evidence).not.toHaveAttribute('open')
@@ -1456,7 +1447,9 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
     /stop gate.*not verified/i,
   )
   expect(replay).toHaveTextContent(/Exact setup stop published before the towel.*final expected\/observed gate matrix was not returned/i)
-  expect(replay).toHaveTextContent(/Phase 2 held exactly 10,000 authenticated held clients per lane.*All 20,000 held 30s/i)
+  // The tape never claims a hold that did not happen: the towel came before the 10,000-client test.
+  expect(replay).toHaveTextContent(/Lakebase had its pooled path up in 1\.23s.*We stopped before the 10,000-client test ran/i)
+  expect(replay).not.toHaveTextContent(/Held all 10,000 clients for 30 seconds/i)
   expect(replay).toHaveTextContent(/One server bell starts both independent physical lanes.*30-second hold.*cleanup are exact gates/i)
   expect(replay).not.toHaveTextContent(/Non-executable round · No live fairness or timing contract/i)
   fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
@@ -1465,12 +1458,12 @@ it('shows only exact Round 5 setup evidence after a towel with no false comparis
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
   const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
   expect(explanation).toHaveTextContent(
-    /what this means.*Lakebase includes pooling for up to 10,000 client connections.*application path without a separate pooling handoff/i,
+    /what happened.*Lakebase had its pooled path up in 1\.23s.*RDS PostgreSQL \+ RDS Proxy was still setting up at 4\.50s, so its time is more than that.*stopped before the 10,000-client test ran, so there is no winner and no margin/i,
   )
   expect(explanation).toHaveTextContent(
-    /Lakebase pooled-path setup verified at 1\.23s.*RDS PostgreSQL \+ RDS Proxy exceeded 4\.50s without verification.*10,000-client fan-in never started/i,
+    /why it matters to you.*Jobs and services each open their own connections.*pools up to 10,000 client connections out of the box/i,
   )
-  expect(explanation).toHaveTextContent(/10,000-client fan-in never started/i)
+  expect(explanation).toHaveTextContent(/ask the room.*what happens today when a dozen jobs all connect at the top of the hour/i)
   expect(explanation).not.toHaveTextContent(
     /neither setup|neither readiness|no verified result/i,
   )
@@ -1605,13 +1598,13 @@ it('opens the instant replay, explanation and share receipt from a still-cleanin
   // Instant replay reads the towelled evidence and never declares a win.
   fireEvent.click(screen.getByRole('button', { name: /instant replay/i }))
   const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
-  expect(replay).toHaveTextContent(/no completed comparison or margin/i)
+  expect(replay).toHaveTextContent(/stopped before the 10,000-client test ran, so there is no winner and no margin/i)
   fireEvent.click(within(replay).getByRole('button', { name: /back to the ring/i }))
 
   // Explain to the room works on the incomplete result.
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
   const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
-  expect(explanation).toHaveTextContent(/10,000-client fan-in never started/i)
+  expect(explanation).toHaveTextContent(/stopped before the 10,000-client test ran, so there is no winner and no margin/i)
   fireEvent.click(within(explanation).getByRole('button', { name: /back to the ring/i }))
 
   // Share reuses the receipt mechanism with the honest towel caption.
@@ -1655,11 +1648,12 @@ it('stops Lakebase at its exact setup elapsed while AWS and the commentator cont
 
   const runningCommentary = screen.getByLabelText('Ringside commentator')
   expect(runningCommentary).toHaveTextContent(
-    /Lakebase · Setup clock live · Opening the built-in pooled connection/i,
+    /Lakebase: getting its pooled path ready\. Opening the built-in pooled connection/i,
   )
   expect(runningCommentary).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy · Setup clock live · Creating the RDS Proxy endpoint/i,
+    /RDS PostgreSQL \+ RDS Proxy: getting its pooled path ready\. Creating the RDS Proxy endpoint/i,
   )
+  expect(runningCommentary).toHaveTextContent(/Bell\. Each side is getting a pooled path ready\./i)
 
   await act(async () => { await vi.advanceTimersByTimeAsync(96) })
   rerender(<RoundFiveProof session={stoppedLakebaseSetup(running)} {...props} />)
@@ -1668,11 +1662,9 @@ it('stops Lakebase at its exact setup elapsed while AWS and the commentator cont
   const competitor = screen.getByLabelText('RDS PostgreSQL + RDS Proxy result')
   expect(lakebase).toHaveAttribute('data-state', 'verified')
   expect(lakebase.querySelector('.lane-time')).toHaveTextContent('1.23s')
+  expect(runningCommentary).toHaveTextContent(/Lakebase: pooled path ready at 1\.23s\./i)
   expect(runningCommentary).toHaveTextContent(
-    /Lakebase · Exact setup gate verified · Clock stopped at 1\.23s · Native transaction verified/i,
-  )
-  expect(runningCommentary).toHaveTextContent(
-    /Lakebase reached pooled-path setup at 1\.23s · RDS PostgreSQL \+ RDS Proxy setup clock still running · No comparison yet/i,
+    /Lakebase is ready\. RDS PostgreSQL \+ RDS Proxy is still setting up\./i,
   )
 
   const competitorBefore = displayedSeconds(competitor)
@@ -1722,16 +1714,16 @@ it('keeps both Round 5 clocks running and shows evidence reconnecting when live 
   expect(lakebaseTime).toHaveAttribute('data-evidence-stale', 'true')
   expect(competitorTime).toHaveAttribute('data-evidence-stale', 'true')
   const commentator = screen.getByLabelText('Ringside commentator')
-  expect(commentator).toHaveTextContent(/Live setup call/i)
-  expect(commentator).not.toHaveTextContent(/ON THE WIRE/i)
+  expect(commentator).toHaveTextContent(/Calling it live/i)
+  expect(commentator).not.toHaveTextContent(/On the wire/i)
   expect(commentator).toHaveTextContent(
-    /Lakebase · Live evidence interrupted · Clock continues · evidence stale while reconnecting/i,
+    /Lakebase: the live feed dropped; its clock keeps running on the server\./i,
   )
   expect(commentator).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy · Live evidence interrupted · Clock continues · evidence stale while reconnecting/i,
+    /RDS PostgreSQL \+ RDS Proxy: the live feed dropped; its clock keeps running on the server\./i,
   )
   expect(commentator).toHaveTextContent(
-    /Live evidence interrupted · No new result inferred · Reconnecting/i,
+    /The live feed dropped\. The clocks keep running on the server; reconnecting\./i,
   )
   expect(commentator).not.toHaveTextContent(/setup clock live/i)
 
@@ -1831,13 +1823,10 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   )
 
   const commentator = screen.getByLabelText('Ringside commentator')
-  expect(commentator).toHaveTextContent(/Final verified call/i)
-  expect(commentator).toHaveTextContent(
-    /Lakebase · 10,000 clients held at 3\.11s · Exact 10,000-client fan-in verified/i,
-  )
-  expect(commentator).toHaveTextContent(
-    /RDS PostgreSQL \+ RDS Proxy · 10,000 clients held at 4\.11s · Exact 10,000-client fan-in verified/i,
-  )
+  expect(commentator).toHaveTextContent(/Final call/i)
+  expect(commentator).toHaveTextContent(/Lakebase: 10,000 clients held at 3\.11s\./i)
+  expect(commentator).toHaveTextContent(/RDS PostgreSQL \+ RDS Proxy: 10,000 clients held at 4\.11s\./i)
+  expect(commentator).toHaveTextContent(/Lakebase reached 10,000 clients first, by 1\.00s\. Both held and passed every check\./i)
 
   expect(container.querySelector('.round5-body')).not.toBeInTheDocument()
   expect(container.querySelector('.round5-phase')).not.toBeInTheDocument()
@@ -1855,12 +1844,17 @@ it('renders verified Round 5 as the canonical arena and keeps detailed evidence 
   expect(selectedPriorities.children).toHaveLength(2)
   expect(selectedPriorities).toHaveTextContent(/cost.*performance/i)
   expect(ringsideTake).toHaveTextContent(
-    /what this means.*Lakebase includes pooling for up to 10,000 client connections.*application path without a separate pooling handoff/i,
+    /what happened.*Both paths got exactly 10,000 client connections open and held them for 30 seconds, timed from a shared start once both paths were ready.*Lakebase's built-in pooler: 3\.11s.*RDS PostgreSQL \+ RDS Proxy: 4\.11s.*Getting ready came first and is not in those times: Lakebase's pooled path was ready in 12\.35s; the AWS path needed 24\.00s to build an RDS Proxy before its first client could connect.*client connections, not database backends.*64 test queries.*Not measured: throughput, direct connections, or a Proxy built ahead of time/i,
   )
-  expect(ringsideTake).toHaveTextContent(/question for the room.*when does a missed job window justify keeping a pool ready/i)
   expect(ringsideTake).toHaveTextContent(
-    /what we proved.*Both paths reached and held 10,000 clients, each timed from the same bell.*includes setup.*Lakebase's pooled path was ready in 12\.35s.*AWS path needed 24\.00s to create its RDS Proxy.*at least 30 seconds.*all 64 test queries.*verify-full TLS.*password sent over TLS.*SCRAM challenge-response.*client connections, not database backends.*Not measured:.*transaction throughput/i,
+    /why it matters to you.*Jobs and services each open their own connections.*pools up to 10,000 client connections out of the box.*the other needs a pooler stood up first/i,
   )
+  // One labeled row per priority the room picked, in the order cost, simplicity, performance.
+  const lensRows = ringsideTake.querySelectorAll('.ringside-lenses li')
+  expect([...lensRows].map((row) => row.querySelector('b')?.textContent)).toEqual(['cost', 'performance'])
+  expect(lensRows[0]).toHaveTextContent(/Lakebase's pooling is included.*RDS Proxy and Secrets Manager as billable services/i)
+  expect(lensRows[1]).toHaveTextContent(/from the bell to exactly 10,000 client connections held at once.*Building the Proxy is inside the AWS clock/i)
+  expect(ringsideTake).toHaveTextContent(/ask the room.*what happens today when a dozen jobs all connect at the top of the hour/i)
   expect(ringsideTake.querySelector('details')).toBeNull()
   expect(ringsideTake).not.toHaveTextContent(
     /full verified proof|configured compute|pricing receipt|standing cost|component disclosure/i,
@@ -2179,15 +2173,15 @@ it('keeps Ryan and the play-by-play toggle available on terminal Round 5', () =>
 
   let commentator = screen.getByLabelText('Ringside commentator')
   expect(within(commentator).getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
-  expect(commentator).toHaveTextContent(/Final verified call/i)
-  fireEvent.click(within(commentator).getByRole('button', { name: /hide play-by-play/i }))
+  expect(commentator).toHaveTextContent(/Final call/i)
+  fireEvent.click(within(commentator).getByRole('button', { name: /hide commentary/i }))
   expect(onToggleCommentary).toHaveBeenCalledOnce()
 
   rerender(<RoundFiveProof {...props} commentaryOpen={false} />)
   commentator = screen.getByLabelText('Ringside commentator')
-  expect(within(commentator).getByText(/play-by-play hidden/i)).toBeInTheDocument()
+  expect(within(commentator).getByText(/commentary hidden/i)).toBeInTheDocument()
   expect(within(commentator).queryByRole('img', { name: 'Ryan' })).not.toBeInTheDocument()
-  fireEvent.click(within(commentator).getByRole('button', { name: /show commentator/i }))
+  fireEvent.click(within(commentator).getByRole('button', { name: /show commentary/i }))
   expect(onToggleCommentary).toHaveBeenCalledTimes(2)
 
   rerender(<RoundFiveProof {...props} commentaryOpen />)
@@ -2234,8 +2228,10 @@ it('names Aurora in the canonical Round 5 arena and its on-demand explanation', 
 
   fireEvent.click(screen.getByRole('button', { name: /explain to the room/i }))
   const explanation = screen.getByRole('dialog', { name: /for the data engineer/i })
+  // A legacy fan-in bout: the clocks started at a shared T0 after setup, and the
+  // line says so instead of folding 24 s of setup into a 4 s clock.
   expect(explanation).toHaveTextContent(
-    /what we proved.*Both paths reached and held 10,000 clients, each timed from the same bell.*includes setup.*Lakebase's pooled path was ready in 12\.35s.*AWS path needed 24\.00s to create its RDS Proxy.*at least 30 seconds.*all 64 test queries.*verify-full TLS.*password sent over TLS.*SCRAM challenge-response.*client connections, not database backends.*Not measured:.*transaction throughput/i,
+    /what happened.*Both paths got exactly 10,000 client connections open and held them for 30 seconds, timed from a shared start once both paths were ready.*Lakebase's built-in pooler: 3\.11s.*Aurora Serverless v2 \+ RDS Proxy: 4\.11s.*Getting ready came first and is not in those times: Lakebase's pooled path was ready in 12\.35s; the AWS path needed 24\.00s to build an RDS Proxy before its first client could connect.*client connections, not database backends.*64 test queries.*Not measured: throughput, direct connections, or a Proxy built ahead of time/i,
   )
   expect(explanation.querySelector('details')).toBeNull()
   expect(explanation).not.toHaveTextContent(/full verified proof|component disclosure|supporting changes/i)
@@ -2267,15 +2263,15 @@ it('offers an instant replay with primary fan-in and supporting setup evidence',
   const replay = screen.getByRole('dialog', { name: /ready a pooled application path/i })
   expect(replay).toHaveTextContent(/instant replay · round 5/i)
 
-  // The presenter surface has one three-beat story and one metric treatment.
-  const story = within(replay).getByLabelText('Three-beat replay story')
-  expect(story.querySelectorAll('.replay-beat')).toHaveLength(3)
+  // The presenter surface is one scoreboard, one tape of calls, and one final call.
+  const story = within(replay).getByLabelText('Play-by-play')
   expect(story.querySelectorAll('.replay-primary-metric')).toHaveLength(1)
-  expect(story).toHaveTextContent(/setup.*same test.*takeaway/i)
+  expect(story.querySelectorAll('.replay-tape > li').length).toBeGreaterThanOrEqual(5)
   expect(story).toHaveTextContent(/3\.11s/)
   expect(story).toHaveTextContent(/4\.11s/)
-  expect(story).toHaveTextContent(/Phase 2 held exactly 10,000 authenticated held clients per lane.*all 20,000 held 30s.*64 held-connection checks passed per lane.*proved multiplexing/i)
-  expect(story).toHaveTextContent(/Direct AWS connections and other pools were not tested/i)
+  // A legacy fan-in bout: setup on the bell clock, then a shared start for the 10,000.
+  expect(story).toHaveTextContent(/Bell\. Both sides race to hold 10,000 client connections at once.*Pooled path ready.*Shared start.*Both paths ready\. The clocks restart together.*10,000 clients held 3\.11s after the shared start, then held for 30 seconds with 64 checks passed/i)
+  expect(story).toHaveTextContent(/Final call.*Not measured: throughput, direct connections, or a Proxy built ahead of time/i)
   expect(story).not.toHaveTextContent('N/A')
 
   const evidence = within(replay).getByText(/view full evidence/i).closest('details')!
@@ -2868,18 +2864,20 @@ it('screenshot fixture: caption, replay, and explain all agree with the poster',
   expect(caption).not.toMatch(/not shareable until the round contract completes/i)
   expect(caption).toMatch(/NO EXACT VERIFIED RESULT · NO DECLARED WINNER · MARGIN N\/A/i)
 
-  const replay = JSON.stringify(replayStory(session))
+  const replay = JSON.stringify(replayTape(session))
   expect(replay).toContain('14.15s')
   expect(replay).toMatch(/10,000 clients reached · hold interrupted by towel/i)
-  expect(replay).not.toMatch(/All 20,000 held 30s/i)
+  expect(replay).toMatch(/hold was interrupted by the towel/i)
+  expect(replay).not.toMatch(/Held all 10,000 clients for 30 seconds/i)
   expect(replay).not.toMatch(/0\.01s/)
 
-  const cue = buildRingsideCue(session, 'data_engineer', 'performance')
-  expect(cue.show).toMatch(/reached 10,000 clients at 14\.15s/i)
-  expect(cue.show).toMatch(/hold was interrupted by the towel/i)
-  expect(cue.show).not.toMatch(/fan-in (?:never started|did not run)/i)
-  expect(cue.show).not.toContain('0.01')
-  expect(cue.show).not.toMatch(/·\s*EXACT VERIFIED/)
+  const briefing = buildRingsideBriefing(session, 'data_engineer', ['performance'])
+  expect(briefing.result).toMatch(/reached 10,000 clients at 14\.15s/i)
+  expect(briefing.result).toMatch(/hold was interrupted by the towel/i)
+  expect(briefing.result).not.toMatch(/10,000-client test (?:never|did not) r[au]n/i)
+  expect(briefing.result).not.toContain('0.01')
+  expect(briefing.result).not.toMatch(/·\s*EXACT VERIFIED/)
+  expect(briefing.declared).toBe(false)
 })
 
 // --- Companion: a genuinely verified V4 bout still reads EXACT VERIFIED ---
@@ -3290,7 +3288,7 @@ it('narrates a live bell fan-in in presenter words', () => {
       onHome={vi.fn()}
     />,
   )
-  expect(document.body).toHaveTextContent('10,000-client fan-in live · no winner until both lanes verify')
+  expect(document.body).toHaveTextContent('Bell. Both sides race to hold 10,000 client connections at once. No winner until both verify.')
   expect(document.body).not.toHaveTextContent(ROUND_FIVE_JARGON)
   for (const labelled of container.querySelectorAll('[aria-label]')) {
     expect(labelled.getAttribute('aria-label')).not.toMatch(ROUND_FIVE_JARGON)
@@ -3303,8 +3301,8 @@ it('says a stopped bell fan-in stopped, in presenter words', () => {
   stopped.round5_runtime!.state = 'failed'
   expect(roundFiveStoppedVerdict(stopped)).toMatch(/^Round 5 stopped · /)
   expect(roundFiveStoppedVerdict(stopped)).not.toMatch(ROUND_FIVE_JARGON)
-  const replay = JSON.stringify(replayStory(stopped))
-  expect(replay).toContain('The 10,000-client fan-in stopped before every required check completed.')
+  const replay = JSON.stringify(replayTape(stopped))
+  expect(replay).toContain('The bout stopped before both lanes verified, so there is no winner and no margin.')
   expect(replay).not.toMatch(ROUND_FIVE_JARGON)
 })
 

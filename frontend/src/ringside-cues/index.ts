@@ -1,39 +1,36 @@
 export {
-  buildRingsideCue,
-  buildRingsideShow,
+  buildRingsideBriefing,
+  buildRingsideResult,
   classifyOutcome,
   classifyRingsideOutcome,
   interpolateProof,
-  priorityKeyFor,
+  orderedPriorities,
 } from './classifier'
 export type { ClassifiedSessionOutcome } from './classifier'
 export {
-  OUTCOME_COPY_RECORDS,
-  OUTCOME_COPY_SHA256,
+  COMPETITOR_SCOPES,
+  LENS_LINE_RECORDS,
+  LENS_LINES_SHA256,
   PERSONA_IDS,
-  ROUND_FIVE_PERSONA_OUTCOME_RECORDS,
-  ROUND_FIVE_PERSONA_OUTCOMES_SHA256,
+  PRIORITIES,
+  RESULT_LINE_RECORDS,
+  RESULT_LINES_SHA256,
+  ROLE_LINE_RECORDS,
+  ROLE_LINES_SHA256,
   ROUND_IDS,
-  VERIFIED_CORPUS_RECORDS,
-  VERIFIED_CORPUS_SHA256,
-  getOutcomeRecord,
-  getRoundFivePersonaOutcomeRecord,
-  getVerifiedRecord,
+  getLensLine,
+  getResultLine,
+  getRoleLine,
 } from './corpus'
-export {
-  OUTCOME_IDS,
-  PRIORITY_KEYS,
-} from './types'
+export { OUTCOME_IDS } from './types'
 export type {
-  AuthoredText,
-  CopyDecision,
-  CopyMode,
-  OutcomeCopyRecord,
-  PriorityKey,
-  RoundFivePersonaOutcomeRecord,
-  RingsideCue,
+  CompetitorScope,
+  LensLineRecord,
+  ResultLineRecord,
+  RingsideBriefing,
+  RingsideLens,
   RingsideOutcomeId,
-  VerifiedCorpusRecord,
+  RoleLineRecord,
 } from './types'
 export {
   classifyEvidence,

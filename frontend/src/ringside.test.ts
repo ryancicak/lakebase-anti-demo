@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 
 import type {
   CompetitorId,
+  CustomerCorner,
   DemoSession,
   PersonaId,
   RoundId,
@@ -17,27 +18,40 @@ import {
 } from './App'
 import { FALLBACK_CATALOG } from './catalog'
 import {
-  OUTCOME_COPY_RECORDS,
-  OUTCOME_COPY_SHA256,
+  LENS_LINE_RECORDS,
+  LENS_LINES_SHA256,
   PERSONA_IDS,
-  PRIORITY_KEYS,
-  ROUND_FIVE_PERSONA_OUTCOME_RECORDS,
-  ROUND_FIVE_PERSONA_OUTCOMES_SHA256,
+  PRIORITIES,
+  RESULT_LINE_RECORDS,
+  RESULT_LINES_SHA256,
+  ROLE_LINE_RECORDS,
+  ROLE_LINES_SHA256,
   ROUND_IDS,
-  VERIFIED_CORPUS_RECORDS,
-  VERIFIED_CORPUS_SHA256,
-  buildRingsideCue,
-  buildRingsideShow,
+  buildRingsideBriefing,
+  buildRingsideResult,
   classifyEvidence,
   classifyOutcome,
   classifyRingsideOutcome,
-  getOutcomeRecord,
-  getRoundFivePersonaOutcomeRecord,
-  getVerifiedRecord,
+  getLensLine,
+  getResultLine,
+  getRoleLine,
   interpolateProof,
-  priorityKeyFor,
+  orderedPriorities,
   type RingsideOutcomeId,
 } from './ringside-cues'
+
+/** The seven non-empty priority selections a room can make. */
+const PRIORITY_SETS: readonly (readonly CustomerCorner[])[] = [
+  ['cost'],
+  ['simplicity'],
+  ['performance'],
+  ['cost', 'simplicity'],
+  ['cost', 'performance'],
+  ['simplicity', 'performance'],
+  ['cost', 'simplicity', 'performance'],
+]
+
+const words = (text: string) => text.trim().split(/\s+/).length
 
 const sourcePath = (name: string) => join(import.meta.dirname, 'ringside-cues', name)
 const sourceText = (name: string) => readFileSync(sourcePath(name), 'utf8')
@@ -52,7 +66,14 @@ function verifiedSession(
   competitorId: CompetitorId = 'aurora_serverless_v2',
 ): DemoSession {
   const round = FALLBACK_CATALOG.rounds.find((candidate) => candidate.id === roundId)!
-  const competitor = FALLBACK_CATALOG.competitors.find((candidate) => candidate.id === competitorId)!
+  // The fallback catalog is the AWS edition's; an Azure bout borrows Aurora's shape.
+  const competitor = FALLBACK_CATALOG.competitors.find((candidate) => candidate.id === competitorId)
+    ?? {
+      ...FALLBACK_CATALOG.competitors.find((candidate) => candidate.id === 'aurora_serverless_v2')!,
+      id: competitorId,
+      name: 'Azure Database for PostgreSQL',
+      short_name: 'Azure PostgreSQL',
+    }
   const primary = FALLBACK_CATALOG.personas.find((persona) => persona.id === 'software_engineer')!
   const session: DemoSession = {
     id: `fixture-${roundId}`,
@@ -681,121 +702,169 @@ function cooldownCleanupFailure(roundId: RoundId): DemoSession {
   return session
 }
 
-describe('canonical Ringside sources', () => {
-  it('preserves the exact approved files and hashes', () => {
-    const verified = sourceText('verified-corpus.jsonl')
-    const outcomes = sourceText('outcome-copy.jsonl')
-    const roundFivePersonaOutcomes = sourceText('round5-persona-outcomes.jsonl')
-    expect(sha256(verified)).toBe(VERIFIED_CORPUS_SHA256)
-    expect(sha256(outcomes)).toBe(OUTCOME_COPY_SHA256)
-    expect(sha256(roundFivePersonaOutcomes)).toBe(ROUND_FIVE_PERSONA_OUTCOMES_SHA256)
-    expect(parsedSource('verified-corpus.jsonl')).toHaveLength(420)
-    expect(parsedSource('outcome-copy.jsonl')).toHaveLength(33)
-    expect(parsedSource('round5-persona-outcomes.jsonl')).toHaveLength(50)
+describe('the three files behind Explain to the room', () => {
+  it('are the approved files, pinned, loaded directly with no generated copy layer', () => {
+    expect(sha256(sourceText('result-lines.jsonl'))).toBe(RESULT_LINES_SHA256)
+    expect(sha256(sourceText('role-lines.jsonl'))).toBe(ROLE_LINES_SHA256)
+    expect(sha256(sourceText('lens-lines.jsonl'))).toBe(LENS_LINES_SHA256)
+    expect(RESULT_LINE_RECORDS).toEqual(parsedSource('result-lines.jsonl'))
+    expect(ROLE_LINE_RECORDS).toEqual(parsedSource('role-lines.jsonl'))
+    expect(LENS_LINE_RECORDS).toEqual(parsedSource('lens-lines.jsonl'))
   })
 
-  it('loads the canonical JSONL directly without a generated copy layer', () => {
-    expect(VERIFIED_CORPUS_RECORDS).toEqual(parsedSource('verified-corpus.jsonl'))
-    expect(OUTCOME_COPY_RECORDS).toEqual(parsedSource('outcome-copy.jsonl'))
-    expect(ROUND_FIVE_PERSONA_OUTCOME_RECORDS).toEqual(
-      parsedSource('round5-persona-outcomes.jsonl'),
-    )
-  })
-
-  it('contains the complete 6 × 10 × 7 Cartesian product', () => {
-    const expected = new Set<string>()
+  it('has one shared role line for every round and role, and one lens line for every round and priority', () => {
+    const roles = new Set(ROLE_LINE_RECORDS
+      .filter((record) => record.competitor === '*')
+      .map((record) => `${record.round_id}/${record.persona_id}`))
+    expect(roles.size).toBe(ROUND_IDS.length * PERSONA_IDS.length)
+    const lenses = new Set(LENS_LINE_RECORDS
+      .filter((record) => record.competitor === '*')
+      .map((record) => `${record.round_id}/${record.priority}`))
+    expect(lenses.size).toBe(ROUND_IDS.length * PRIORITIES.length)
     for (const roundId of ROUND_IDS) {
       for (const personaId of PERSONA_IDS) {
-        for (const priorityKey of PRIORITY_KEYS) {
-          expected.add(`${roundId}/${personaId}/${priorityKey}`)
-        }
+        expect(roles.has(`${roundId}/${personaId}`), `${roundId}/${personaId}`).toBe(true)
+        expect(getRoleLine(roundId, personaId).competitor).toBe('*')
+      }
+      for (const priority of PRIORITIES) {
+        expect(lenses.has(`${roundId}/${priority}`), `${roundId}/${priority}`).toBe(true)
+        expect(getLensLine(roundId, priority).competitor).toBe('*')
       }
     }
-    const actual = new Set(VERIFIED_CORPUS_RECORDS.map(
-      (record) => `${record.round_id}/${record.persona_id}/${record.priority_key}`,
-    ))
-    expect(actual).toEqual(expected)
   })
 
-  it('preserves every reviewed record ID, decision, and exact text', () => {
-    for (const record of VERIFIED_CORPUS_RECORDS) {
-      expect(getVerifiedRecord(record.round_id, record.persona_id, record.priority_key)).toBe(record)
-      expect(record.meaning_record_id).toMatch(/^r[1-6]\./)
-      expect(record.question_record_id).toMatch(/^r[1-6]\./)
-      expect(record.meaning_decision).toMatch(/^(KEEP|REWRITE)$/)
-      expect(record.question_decision).toMatch(/^(KEEP|REWRITE)$/)
+  it('keeps every competitor variant attached to a shared line and scoped to a known kind', () => {
+    const scopes = ['*', 'aurora', 'rds', 'azure']
+    const keyed = [
+      ...RESULT_LINE_RECORDS.map((record) => ({ scope: record.competitor, key: `result/${record.round_id}/${record.outcome_id}` })),
+      ...ROLE_LINE_RECORDS.map((record) => ({ scope: record.competitor, key: `role/${record.round_id}/${record.persona_id}` })),
+      ...LENS_LINE_RECORDS.map((record) => ({ scope: record.competitor, key: `lens/${record.round_id}/${record.priority}` })),
+    ]
+    const shared = new Set(keyed.filter((line) => line.scope === '*').map((line) => line.key))
+    for (const line of keyed) {
+      expect(scopes).toContain(line.scope)
+      expect(shared.has(line.key), line.key).toBe(true)
     }
-    expect(getVerifiedRecord('wake_idle_app', 'software_engineer', 'performance')).toMatchObject({
-      meaning_record_id: 'r1.say.software-engineer.performance',
-      question_record_id: 'r1.ask.software-engineer.performance',
-      meaning: 'Your app finished a real transaction after the database woke. That times the database by itself, separate from the rest of startup.',
-      question: 'What timeout does your app enforce while the database wakes up?',
-    })
+    // No two lines claim the same key and scope.
+    expect(new Set(keyed.map((line) => `${line.key}@${line.scope}`)).size).toBe(keyed.length)
   })
 
-  it('preserves the exact 33-record outcome matrix', () => {
+  it('has one shared result line for every round and outcome the classifier can choose', () => {
     // Rounds 4 and 6 race two lanes: a comparison, a one-sided result and a towel with
     // no verified lane, plus the capability case for an installation without its AWS
     // lane. Round 6's separate checkout is the server's to enforce, so it has no row.
-    expect(OUTCOME_COPY_RECORDS.map(({ round_id, outcome_id }) => [round_id, outcome_id])).toEqual([
+    const shared = RESULT_LINE_RECORDS.filter((record) => record.competitor === '*')
+    expect(shared.map(({ round_id, outcome_id }) => [round_id, outcome_id])).toEqual([
       ['wake_idle_app', 'verified_comparison'],
-      ['make_schema_change_safely', 'verified_comparison'],
-      ['recover_deleted_order', 'verified_comparison'],
-      ['put_model_score_in_app', 'verified_comparison'],
-      ['put_model_score_in_app', 'verified_capability_gap'],
-      ['survive_connection_spike', 'verified_comparison'],
-      ['analyze_live_orders_without_slowing_checkout', 'verified_comparison'],
-      ['analyze_live_orders_without_slowing_checkout', 'verified_capability_gap'],
       ['wake_idle_app', 'verified_rds_capability_gap'],
       ['wake_idle_app', 'one_sided_verified'],
-      ['make_schema_change_safely', 'one_sided_verified'],
-      ['recover_deleted_order', 'one_sided_verified'],
-      ['put_model_score_in_app', 'one_sided_verified'],
-      ['analyze_live_orders_without_slowing_checkout', 'one_sided_verified'],
-      ['recover_deleted_order', 'one_sided_towel_lower_bound'],
-      ['survive_connection_spike', 'one_sided_setup_verified_towel'],
       ['wake_idle_app', 'cleanup_failed'],
+      ['wake_idle_app', 'no_result'],
+      ['make_schema_change_safely', 'verified_comparison'],
+      ['make_schema_change_safely', 'one_sided_verified'],
       ['make_schema_change_safely', 'cleanup_failed'],
+      ['make_schema_change_safely', 'no_result'],
+      ['recover_deleted_order', 'verified_comparison'],
+      ['recover_deleted_order', 'one_sided_verified'],
+      ['recover_deleted_order', 'one_sided_towel_lower_bound'],
+      ['recover_deleted_order', 'towel_no_verified_lane'],
       ['recover_deleted_order', 'cleanup_failed'],
+      ['recover_deleted_order', 'no_result'],
+      ['put_model_score_in_app', 'verified_comparison'],
+      ['put_model_score_in_app', 'verified_capability_gap'],
+      ['put_model_score_in_app', 'one_sided_verified'],
+      ['put_model_score_in_app', 'towel_no_verified_lane'],
       ['put_model_score_in_app', 'cleanup_failed'],
+      ['put_model_score_in_app', 'no_result'],
+      ['survive_connection_spike', 'verified_comparison'],
+      ['survive_connection_spike', 'one_sided_setup_verified_towel'],
       ['survive_connection_spike', 'setup_incomplete'],
       ['survive_connection_spike', 'bounded_check_failed'],
       ['survive_connection_spike', 'cleanup_failed'],
-      ['analyze_live_orders_without_slowing_checkout', 'cleanup_failed'],
-      ['wake_idle_app', 'no_result'],
-      ['make_schema_change_safely', 'no_result'],
-      ['recover_deleted_order', 'no_result'],
-      ['put_model_score_in_app', 'no_result'],
       ['survive_connection_spike', 'no_result'],
-      ['analyze_live_orders_without_slowing_checkout', 'no_result'],
-      ['recover_deleted_order', 'towel_no_verified_lane'],
-      ['put_model_score_in_app', 'towel_no_verified_lane'],
+      ['analyze_live_orders_without_slowing_checkout', 'verified_comparison'],
+      ['analyze_live_orders_without_slowing_checkout', 'verified_capability_gap'],
+      ['analyze_live_orders_without_slowing_checkout', 'one_sided_verified'],
       ['analyze_live_orders_without_slowing_checkout', 'towel_no_verified_lane'],
+      ['analyze_live_orders_without_slowing_checkout', 'cleanup_failed'],
+      ['analyze_live_orders_without_slowing_checkout', 'no_result'],
     ])
-    for (const record of OUTCOME_COPY_RECORDS) {
-      expect(getOutcomeRecord(record.round_id, record.outcome_id)).toBe(record)
+    for (const record of shared) {
+      expect(getResultLine(record.round_id, record.outcome_id)).toBe(record)
+    }
+  })
+})
+
+describe('the briefing reads like a person talking', () => {
+  const DASHES = /[–—]/
+  const BRITISH = /\b(?:colour|behaviour|organis(?:e|ed|ation)|recognis(?:e|ed)|optimis(?:e|ed)|favour|centre|analyse|licence)\b/i
+  const MACHINERY = /\b(?:contract test|lane shape|outcome id|copy mode|verified corpus|placeholder|template)\b/i
+  const VERDICT = /\b(?:won|wins|winner|beat|faster|slower|sooner|margin)\b/i
+  const PLACEHOLDER = /<[A-Z0-9_]+>/
+
+  it('keeps every result line short, with its numbers early and its boundary last', () => {
+    for (const record of RESULT_LINE_RECORDS) {
+      // Round 5 has the most to say: two clocks, the setup inside one of them, what
+      // the 10,000 are, and what was not measured.
+      const limit = record.round_id === 'survive_connection_spike' ? 90 : 55
+      expect(words(record.text), record.text).toBeLessThanOrEqual(limit)
+      expect(record.text).not.toMatch(DASHES)
+      expect(record.text).not.toMatch(BRITISH)
+      expect(record.text).not.toMatch(MACHINERY)
+      // A line that declares nothing says so in its first two words.
+      if (['no_result', 'towel_no_verified_lane', 'setup_incomplete'].includes(record.outcome_id)) {
+        expect(record.text).toMatch(/^No result\./)
+      }
     }
   })
 
-  it('contains every Round 5 persona outcome override exactly once', () => {
-    const outcomeIds = [
-      'one_sided_setup_verified_towel',
-      'setup_incomplete',
-      'bounded_check_failed',
-      'cleanup_failed',
-      'no_result',
-    ] as const
-    const expected = new Set(
-      outcomeIds.flatMap((outcomeId) => (
-        PERSONA_IDS.map((personaId) => `${outcomeId}/${personaId}`)
-      )),
-    )
-    const actual = new Set(ROUND_FIVE_PERSONA_OUTCOME_RECORDS.map(
-      (record) => `${record.outcome_id}/${record.persona_id}`,
-    ))
-    expect(actual).toEqual(expected)
-    for (const record of ROUND_FIVE_PERSONA_OUTCOME_RECORDS) {
-      expect(getRoundFivePersonaOutcomeRecord(record.outcome_id, record.persona_id)).toBe(record)
+  it('keeps role lines about the round and the person, never this bout', () => {
+    for (const record of ROLE_LINE_RECORDS) {
+      const label = `${record.round_id}/${record.persona_id}/${record.competitor}`
+      expect(words(record.why), label).toBeLessThanOrEqual(36)
+      expect(words(record.ask), label).toBeLessThanOrEqual(18)
+      expect(record.ask, label).toMatch(/\?$/)
+      expect(record.ask.match(/\?/g), label).toHaveLength(1)
+      const spoken = `${record.why} ${record.ask}`
+      expect(spoken, label).not.toMatch(PLACEHOLDER)
+      expect(spoken, label).not.toMatch(VERDICT)
+      expect(spoken, label).not.toMatch(DASHES)
+      expect(spoken, label).not.toMatch(BRITISH)
+      expect(spoken, label).not.toMatch(MACHINERY)
+      // Round 5's capability is "up to 10,000 client connections"; a role line never
+      // borrows the bout's protocol vocabulary to say so.
+      if (record.why.includes('10,000')) {
+        expect(record.why, label).toMatch(/\bup to 10,000 client connections\b/)
+        expect(record.why, label).not.toMatch(/\b(?:witness|scheduled clients?|terminal clients?|setup stop|128 attempts?|maximum 64 concurrent)\b/i)
+      }
+    }
+    // Every role hears something different about the same round.
+    for (const roundId of ROUND_IDS) {
+      const shared = ROLE_LINE_RECORDS.filter((record) => record.round_id === roundId && record.competitor === '*')
+      expect(new Set(shared.map((record) => record.why)).size).toBe(PERSONA_IDS.length)
+      expect(new Set(shared.map((record) => record.ask)).size).toBe(PERSONA_IDS.length)
+    }
+  })
+
+  it('keeps lens lines concrete to the round and silent on who won', () => {
+    for (const record of LENS_LINE_RECORDS) {
+      const label = `${record.round_id}/${record.priority}/${record.competitor}`
+      expect(words(record.text), label).toBeLessThanOrEqual(40)
+      expect(record.text, label).not.toMatch(PLACEHOLDER)
+      expect(record.text, label).not.toMatch(VERDICT)
+      expect(record.text, label).not.toMatch(DASHES)
+      expect(record.text, label).not.toMatch(BRITISH)
+      expect(record.text, label).not.toMatch(MACHINERY)
+    }
+    // Each priority says a different thing about the same round.
+    for (const roundId of ROUND_IDS) {
+      const shared = LENS_LINE_RECORDS.filter((record) => record.round_id === roundId && record.competitor === '*')
+      expect(new Set(shared.map((record) => record.text)).size).toBe(PRIORITIES.length)
+    }
+    // Performance lines say what the clock covered; cost lines say what is billed.
+    for (const roundId of ROUND_IDS) {
+      expect(getLensLine(roundId, 'performance').text).toMatch(/\bclock\b/i)
+      expect(getLensLine(roundId, 'cost').text).toMatch(/\b(?:bill|bills|billed|billable|paid|cost|expensive)\b/i)
     }
   })
 })
@@ -842,7 +911,7 @@ describe('one generic evidence classifier with six round contracts', () => {
     expect(classifyRingsideOutcome(session).outcome_id).toBe(expected)
   })
 
-  it('cannot give incomplete R4-R6 gates verified meaning or questions', () => {
+  it('cannot give incomplete R4-R6 gates a declared result', () => {
     for (const session of [
       roundFourPartial,
       oneSidedRoundFiveSetupTowel(),
@@ -851,15 +920,31 @@ describe('one generic evidence classifier with six round contracts', () => {
       failedCleanup(),
       roundSixPartial,
     ]) {
-      const cue = buildRingsideCue(session, 'software_engineer', 'performance')
-      expect(cue.outcome.copy_mode).toBe('OUTCOME_OVERRIDE')
-      expect(cue.sayRecord.id).toMatch(/outcome|no-result/)
-      if (session.round.id === 'survive_connection_spike') {
-        expect(cue.askRecord.id).toMatch(/^r5\.ask\./)
-      } else {
-        expect(cue.askRecord.id).toMatch(/outcome|no-result/)
-      }
-      expect(cue.proofRecord.id).toBe(cue.outcome.proof_template_id)
+      const briefing = buildRingsideBriefing(session, 'software_engineer', ['performance'])
+      expect(briefing.declared).toBe(false)
+      expect(briefing.result).toMatch(/no winner|no margin|no result/i)
+      expect(briefing.result).not.toMatch(/<[A-Z0-9_]+>/)
+      // The role and lens lines are the round's, so they still read true here.
+      expect(briefing.why.length).toBeGreaterThan(0)
+      expect(briefing.lenses).toHaveLength(1)
+      expect(briefing.ask).toMatch(/\?$/)
+    }
+  })
+
+  it('reads a Round 1 opponent with no automatic wake as checked before the bell, Azure included', () => {
+    for (const competitorId of ['rds_postgres', 'azure_postgres'] as const) {
+      const session = verifiedSession('wake_idle_app', competitorId)
+      session.lanes.competitor.state = 'not_supported'
+      session.lanes.competitor.elapsed_ms = null
+      session.comparison = { kind: 'capability_gap', winner_lane_id: 'lakebase', margin: null, detail: 'fixture' }
+      const briefing = buildRingsideBriefing(session, 'sre', ['cost', 'simplicity'])
+      expect(briefing.outcomeId).toBe('verified_rds_capability_gap')
+      expect(briefing.declared).toBe(true)
+      expect(briefing.result).toContain(`${session.competitor.short_name} has no automatic wake.`)
+      expect(briefing.result).toContain('Lakebase woke and committed in 1.23s.')
+      expect(briefing.result).not.toMatch(/never finished|did not verify/i)
+      // The lenses name that opponent's rule, not Aurora's floor.
+      expect(briefing.lenses.map((lens) => lens.text).join(' ')).not.toMatch(/Aurora/)
     }
   })
 
@@ -921,11 +1006,11 @@ describe('one generic evidence classifier with six round contracts', () => {
     const unremembered = roundFourWithoutAwsLane()
     unremembered.remembered_result = null
     expect(headline(unremembered)).toBe('LAKEBASE 1.23s · AWS LANE NOT INSTALLED')
-    expect(buildRingsideShow(roundFourTie())).toBe(
-      'Bell to exact app read, both integrations from a cold start: Lakebase 1.23s. AWS Glue → Aurora Serverless v2 1.30s. Model execution was not tested.',
+    expect(buildRingsideResult(roundFourTie())).toBe(
+      'One new score was written to the lakehouse at the bell, with both pipelines starting cold. The app on Lakebase could read it in 1.23s. Through AWS Glue → Aurora Serverless v2: 1.30s. The clock is the hop from lakehouse to app. The model itself wasn\'t run or timed.',
     )
-    expect(buildRingsideShow(roundFourPartial)).toBe(
-      'Bell to exact app read: Lakebase 1.23s. Aurora Serverless v2 did not verify, so no margin was measured.',
+    expect(buildRingsideResult(roundFourPartial)).toBe(
+      'One new score was written to the lakehouse at the bell. Lakebase synced table delivered it to its app in 1.23s. AWS Glue → Aurora Serverless v2 never delivered it, so there is a result but no margin. The model itself wasn\'t run or timed.',
     )
   })
 
@@ -941,20 +1026,20 @@ describe('one generic evidence classifier with six round contracts', () => {
     const unremembered = roundSixWithoutAwsLane()
     unremembered.remembered_result = null
     expect(headline(unremembered)).toBe('LAKEBASE 1.23s · AWS LANE NOT INSTALLED')
-    expect(buildRingsideShow(roundSixTie())).toBe(
-      "Bell to exact Delta read, with AWS DMS and Glue cold starting at the bell and Lakebase's change feed built in: Lakebase 1.23s. AWS DMS + Glue from Aurora Serverless v2 1.30s. A separate checkout committed on each source. Throughput and p99 were not tested.",
+    expect(buildRingsideResult(roundSixTie())).toBe(
+      "The same checkout hit both databases at the bell. Lakebase's built-in change feed, which is always on, had it in the lakehouse in 1.23s. AWS DMS + Glue from Aurora Serverless v2, started cold at the bell, took 1.30s. A second checkout committed on each side meanwhile as a sanity check. Throughput and p99 weren't tested.",
     )
-    expect(buildRingsideShow(roundSixPartial)).toBe(
-      'Bell to exact Delta read: Lakebase 1.23s. Aurora Serverless v2 did not verify, so no margin was measured.',
+    expect(buildRingsideResult(roundSixPartial)).toBe(
+      "The same checkout hit both databases at the bell. Lakebase built-in change feed had it in the lakehouse in 1.23s. AWS DMS + Glue from Aurora Serverless v2 never delivered it, so there is a result but no margin. Throughput and p99 weren't tested.",
     )
-    expect(buildRingsideShow(roundSixWithoutAwsLane())).toBe(
-      'Bell to exact Delta read: Lakebase 1.23s. A separate checkout committed. This installation has no AWS lane, so nothing was compared. Throughput and p99 were not tested.',
+    expect(buildRingsideResult(roundSixWithoutAwsLane())).toBe(
+      "The checkout hit the database at the bell. Lakebase's built-in change feed had it in the lakehouse in 1.23s. This install has no AWS lane, so there is nothing to compare it to. A second checkout committed meanwhile as a sanity check. Throughput and p99 weren't tested.",
     )
     // Lakebase's feed is never called cold, and nothing calls it warm.
     const copy = [roundSixTie(), roundSixStoppage(), roundSixWithoutAwsLane()]
-      .map((session) => buildRingsideShow(session))
+      .map((session) => buildRingsideResult(session))
       .join(' ')
-    expect(copy).not.toMatch(/Lakebase[^.]*cold start|warm/i)
+    expect(copy).not.toMatch(/Lakebase[^.]*cold|warm/i)
   })
 
   it('classifies the generic evidence shapes before applying a round contract', () => {
@@ -1017,7 +1102,7 @@ describe('one generic evidence classifier with six round contracts', () => {
     (roundId) => {
       const session = cooldownCleanupFailure(roundId)
       const classified = classifyOutcome(session)
-      const cue = buildRingsideCue(session, 'software_engineer', 'performance')
+      const briefing = buildRingsideBriefing(session, 'software_engineer', ['performance'])
       const receipt = receiptPresentation(session, 'round')
       const scorecard = scorecardEntry(session)
       const share = linkedInReceipt(session, 5)
@@ -1032,7 +1117,7 @@ describe('one generic evidence classifier with six round contracts', () => {
         expect(classified.outcome.outcome_id).not.toBe('cleanup_failed')
         expect(classified.shareable).toBe(true)
         expect(classified.headline).not.toMatch(/CLEANUP FAILED · SHARING BLOCKED/)
-        expect(cue.outcome.outcome_id).not.toBe('cleanup_failed')
+        expect(briefing.outcomeId).not.toBe('cleanup_failed')
         expect(share).not.toMatch(/sharing (?:is )?blocked/i)
         return
       }
@@ -1040,9 +1125,10 @@ describe('one generic evidence classifier with six round contracts', () => {
       expect(classified.outcome.outcome_id).toBe('cleanup_failed')
       expect(classified.shareable).toBe(false)
       expect(classified.headline).toMatch(/RESULT RETAINED · CLEANUP FAILED · SHARING BLOCKED/)
-      expect(cue.outcome.outcome_id).toBe('cleanup_failed')
-      expect(cue.say).toMatch(/cleanup did not verify.*fenced/i)
-      expect(cue.show).toMatch(/sharing is blocked.*same round remains fenced/i)
+      expect(briefing.outcomeId).toBe('cleanup_failed')
+      expect(briefing.declared).toBe(false)
+      // The result stands and the line says so first, then what the failure costs the room.
+      expect(briefing.result).toMatch(/^Lakebase won the bout\. Then the cleanup after the bout failed at Run-owned cleanup did not verify\. The result stands, sharing is blocked, and this round stays closed until the cleanup succeeds\.$/)
       expect(receipt.verdict).toBe(classified.headline)
       expect(scorecard?.contract_status).toBe('cleanup_failure')
       expect(scorecard?.remembered_result).toBe(classified.headline)
@@ -1069,12 +1155,13 @@ describe('one generic evidence classifier with six round contracts', () => {
 
     for (const session of sessions) {
       const classified = classifyOutcome(session)
-      const cue = buildRingsideCue(session, 'software_engineer', 'performance')
+      const briefing = buildRingsideBriefing(session, 'software_engineer', ['performance'])
       const receipt = receiptPresentation(session, 'round')
       const scorecard = scorecardEntry(session)
       const share = linkedInReceipt(session, 5)
 
-      expect(cue.outcome).toBe(classified.outcome)
+      expect(briefing.outcomeId).toBe(classified.outcome.outcome_id)
+      expect(briefing.status).toBe(classified.status)
       expect(receipt.winner).toBe(classified.formalWinner)
       expect(receipt.verdict).toBe(classified.headline)
       expect(scorecard?.formal_winner).toBe(classified.formalWinner)
@@ -1121,8 +1208,8 @@ describe('one generic evidence classifier with six round contracts', () => {
 
       const allCopy = [
         classified.headline,
-        cue.say,
-        cue.show,
+        briefing.result,
+        briefing.why,
         receipt.verdict,
         scorecard?.remembered_result ?? '',
         share,
@@ -1169,54 +1256,68 @@ describe('one generic evidence classifier with six round contracts', () => {
 })
 
 describe('Ringside output behavior', () => {
-  it('renders the exact approved Software Engineer Round 1 performance copy', () => {
-    const cue = buildRingsideCue(
+  it('reads the Software Engineer a Round 1 bout the way a person would say it', () => {
+    const briefing = buildRingsideBriefing(
       verifiedSession('wake_idle_app'),
       'software_engineer',
-      'performance',
+      ['performance'],
     )
-    expect(cue.say).toBe(
-      'Your app finished a real transaction after the database woke. That times the database by itself, separate from the rest of startup.',
+    expect(briefing.result).toBe(
+      "Both databases were asleep at the bell. Lakebase was awake and committing in 1.23s. Aurora Serverless v2 took 5.68s. That's the database alone: first connection to a committed write, read back.",
     )
-    expect(cue.ask).toBe('What timeout does your app enforce while the database wakes up?')
-    expect(cue.show).toBe(
-      'First committed transaction after idle: Lakebase 1.23s. Aurora Serverless v2 5.68s. Only the database transaction was tested.',
+    expect(briefing.why).toBe(
+      'The first request after idle is the one that times out, retries, and gets the bug filed. That wait is the number your retry logic has to cover.',
     )
+    expect(briefing.lenses).toEqual([{
+      priority: 'performance',
+      text: 'The clock started at the first connection attempt and stopped at a committed write read back, not at available in a console. Everything after that, app startup included, is yours to add.',
+    }])
+    expect(briefing.ask).toBe("What's your app's timeout on the first request after idle?")
+    expect(briefing.outcomeId).toBe('verified_comparison')
+    expect(briefing.declared).toBe(true)
   })
 
-  it('keeps proof invariant across personas while persona copy changes', () => {
+  it('keeps the result invariant across people and priorities while the rest moves with them', () => {
     const session = verifiedSession('make_schema_change_safely')
-    const proof = PERSONA_IDS.map((personaId) => (
-      buildRingsideCue(session, personaId, 'performance').show
-    ))
-    expect(new Set(proof)).toHaveLength(1)
-    expect(
-      buildRingsideCue(session, 'software_engineer', 'performance').ask,
-    ).not.toBe(buildRingsideCue(session, 'executive', 'performance').ask)
+    const results = new Set<string>()
+    const whys = new Set<string>()
+    const asks = new Set<string>()
+    for (const personaId of PERSONA_IDS) {
+      for (const corners of PRIORITY_SETS) {
+        const briefing = buildRingsideBriefing(session, personaId, corners)
+        results.add(briefing.result)
+        whys.add(briefing.why)
+        asks.add(briefing.ask)
+        expect(briefing.lenses.map((lens) => lens.priority)).toEqual(orderedPriorities(corners))
+      }
+    }
+    expect(results.size).toBe(1)
+    expect(whys.size).toBe(PERSONA_IDS.length)
+    expect(asks.size).toBe(PERSONA_IDS.length)
   })
 
-  it('changes meaning and question when priorities change', () => {
+  it('shows one labeled lens per priority the room picked, in reading order', () => {
     const session = verifiedSession('wake_idle_app')
-    const cost = buildRingsideCue(session, 'software_engineer', 'cost')
-    const performance = buildRingsideCue(session, 'software_engineer', 'performance')
-    expect(cost.say).not.toBe(performance.say)
-    expect(cost.ask).not.toBe(performance.ask)
-    expect(cost.show).toBe(performance.show)
+    const briefing = buildRingsideBriefing(session, 'dba', ['performance', 'cost'])
+    expect(briefing.lenses.map((lens) => lens.priority)).toEqual(['cost', 'performance'])
+    expect(briefing.lenses[0].text).toMatch(/Aurora's floor is five times longer/)
+    expect(briefing.lenses[1].text).toMatch(/^The clock started at the first connection attempt/)
+    expect(buildRingsideBriefing(session, 'dba', ['simplicity']).lenses.map((lens) => lens.priority)).toEqual(['simplicity'])
   })
 
-  it('interpolates lower bounds without inventing an exact opponent time', () => {
-    expect(buildRingsideShow(oneSidedTowel())).toBe(
-      'Deletion to exact recovered read: Lakebase 1.23s. Aurora Serverless v2 was still unverified at 90.00s, so its recovery time is greater than 90.00s. Failover was not tested.',
+  it('tells a towel as a floor, never as an opponent time', () => {
+    expect(buildRingsideResult(oneSidedTowel())).toBe(
+      "The same order was deleted from both databases at the same instant. Lakebase had it back and readable in 1.23s. We stopped waiting at 90.00s. Aurora Serverless v2 was still recovering, so its time is more than 90.00s, not a measurement. Failover wasn't tested.",
     )
-    expect(buildRingsideShow(noResultTowel())).toBe(
-      'No verified recovery result at 90.00s. Lakebase exceeded 90.00s. Aurora Serverless v2 exceeded 90.00s. Failover was not tested.',
+    expect(buildRingsideResult(noResultTowel())).toBe(
+      "No result. We stopped at 90.00s with neither side finished: Lakebase was past 90.00s and Aurora Serverless v2 past 90.00s. Those are floors, not recovery times. Failover wasn't tested.",
     )
   })
 
-  it('states a one-sided Round 5 towel consistently for every audience track', () => {
+  it('states a one-sided Round 5 towel consistently for every person in the room', () => {
     const session = oneSidedRoundFiveSetupTowel()
     const classified = classifyOutcome(session)
-    const expectedProof = 'Lakebase pooled-path setup verified at 2.63s. Aurora Serverless v2 + RDS Proxy exceeded 60.84s without verification. The 10,000-client fan-in never started.'
+    const expectedResult = 'Lakebase had its pooled path up in 2.63s. Aurora Serverless v2 + RDS Proxy was still setting up at 60.84s, so its time is more than that. We stopped before the 10,000-client test ran, so there is no winner and no margin.'
     expect(classified.headline).toBe(
       'LAKEBASE SETUP VERIFIED 2.63s · AURORA SERVERLESS V2 + RDS PROXY UNVERIFIED BEYOND 60.84s · BOUNDED CHECK NOT RUN · NO DECLARED WINNER · COMPARISON INCOMPLETE · MARGIN N/A',
     )
@@ -1225,28 +1326,21 @@ describe('Ringside output behavior', () => {
     expect(classified.shareable).toBe(false)
     expect(classified.scorecardEligible).toBe(true)
     for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
-      for (const priorityKey of PRIORITY_KEYS) {
-        const cue = buildRingsideCue(session, personaId, priorityKey)
-        expect(cue.outcome.outcome_id).toBe('one_sided_setup_verified_towel')
-        expect(cue.outcome.copy_mode).toBe('OUTCOME_OVERRIDE')
-        expect(cue.say).toBe(
-          getRoundFivePersonaOutcomeRecord(
-            'one_sided_setup_verified_towel',
-            personaId,
-          ).meaning,
-        )
-        expect(cue.ask).toBe(
-          getVerifiedRecord('survive_connection_spike', personaId, priorityKey).question,
-        )
-        expect(cue.show).toBe(expectedProof)
-        expect(`${cue.say} ${cue.show}`).not.toMatch(
+      for (const corners of PRIORITY_SETS) {
+        const briefing = buildRingsideBriefing(session, personaId, corners)
+        expect(briefing.outcomeId).toBe('one_sided_setup_verified_towel')
+        expect(briefing.declared).toBe(false)
+        expect(briefing.result).toBe(expectedResult)
+        expect(briefing.why).toBe(getRoleLine('survive_connection_spike', personaId).why)
+        expect(briefing.ask).toBe(getRoleLine('survive_connection_spike', personaId).ask)
+        expect(`${briefing.result} ${briefing.why}`).not.toMatch(
           /neither setup|neither readiness|no verified result/i,
         )
       }
     }
   })
 
-  it('keeps every Round 5 persona, priority, competitor, and outcome cue truthful', () => {
+  it('keeps every Round 5 briefing truthful for every person, priority, competitor, and outcome', () => {
     const outcomeSessions = [
       oneSidedRoundFiveSetupTowel(),
       incompleteSetup(),
@@ -1256,139 +1350,171 @@ describe('Ringside output behavior', () => {
     ]
     const forbidden = /\b(?:spike|survive|readiness|contract test)\b|[–—]|customer customer/i
     const bluntTenThousandDisclaimer = /(?:did|does) not (?:load-)?test.{0,32}10,000|10,000.{0,48}(?:not tested|not exercised|were not tested)|not (?:a )?10,000-client/i
-    const sayProofJargon = /\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i
+    const protocolJargon = /\b(?:witness|scheduled clients?|terminal clients?|setup stop|128 attempts?|maximum 64 concurrent)\b/i
 
     for (const competitorId of ['aurora_serverless_v2', 'rds_postgres'] as const) {
       const session = verifiedSession('survive_connection_spike', competitorId)
       for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
-        for (const priorityKey of PRIORITY_KEYS) {
-          const cue = buildRingsideCue(session, personaId, priorityKey)
-          expect(cue.say).toMatch(/\bup to 10,000 client connections\b/i)
-          expect(cue.say).not.toMatch(sayProofJargon)
-          expect(cue.show).toContain(
-            'Both paths reached and held 10,000 clients, each timed from the same bell',
+        for (const corners of PRIORITY_SETS) {
+          const briefing = buildRingsideBriefing(session, personaId, corners)
+          const spoken = [briefing.result, briefing.why, ...briefing.lenses.map((lens) => lens.text), briefing.ask].join(' ')
+          // The fan-in protocol measures exactly 10,000 held clients, so the result
+          // names it; staying silent would be the inaccuracy.
+          // This fixture is a legacy fan-in bout: a shared start after setup, so setup is
+          // told as what came first rather than as part of a clock it was never in.
+          expect(briefing.result).toContain(
+            'Both paths got exactly 10,000 client connections open and held them for 30 seconds, timed from a shared start once both paths were ready.',
           )
-          expect(cue.show).toMatch(/answered all 64 test queries sent over those held connections/i)
-          expect(cue.show).toMatch(/Not measured:.*transaction throughput/i)
-          // Under the bounded protocol the proof line was forbidden from naming
-          // 10,000, because 10,000 was a product limit the bout never approached
-          // and the round measured 128 attempts. The fan-in protocol measures
-          // exactly 10,000 held clients, so naming it is now required and staying
-          // silent would be the inaccuracy.
-          expect(cue.show).toMatch(/\b10,000 clients\b/i)
-          expect(`${cue.say} ${cue.ask}`).not.toMatch(forbidden)
-          expect(`${cue.say} ${cue.ask} ${cue.show}`).not.toMatch(bluntTenThousandDisclaimer)
+          expect(briefing.result).toMatch(/Getting ready came first and is not in those times: Lakebase's pooled path was ready in 12\.35s; the AWS path needed 24\.00s to build an RDS Proxy before its first client could connect\./)
+          expect(briefing.result).toMatch(/client connections, not database backends/)
+          expect(briefing.result).toMatch(/64 test queries/)
+          expect(briefing.result).toMatch(/Not measured: throughput, direct connections, or a Proxy built ahead of time\.$/)
+          expect(briefing.why).not.toMatch(protocolJargon)
+          expect(`${briefing.why} ${briefing.ask}`).not.toMatch(forbidden)
+          expect(spoken).not.toMatch(bluntTenThousandDisclaimer)
+          expect(spoken).not.toMatch(/<[A-Z0-9_]+>/)
         }
       }
     }
 
     for (const session of outcomeSessions) {
       for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
-        for (const priorityKey of PRIORITY_KEYS) {
-          const cue = buildRingsideCue(session, personaId, priorityKey)
-          expect(cue.say).toMatch(/\bup to 10,000 client connections\b/i)
-          expect(cue.say).not.toMatch(sayProofJargon)
-          expect(cue.ask).toMatch(/\?$/)
-          expect(cue.show).not.toBe('')
-          // Inverted with the protocol: the bounded round measured 128 attempts and
-          // was forbidden from naming 10,000, which it never approached. The fan-in
-          // round measures exactly 10,000 held clients, so the proof line must name
-          // that and must not describe the attempt count it no longer runs.
-          // Not every outcome names the target: a bout whose setup never verified
-          // reports that, and inventing a client count for it would be worse than
-          // silence. What holds across all of them is that none may still describe
-          // the attempt count this protocol no longer runs. `cue.say` above already
-          // requires the 10,000-client framing on every cue.
-          expect(cue.show).not.toMatch(/128[- ]attempts?|maximum 64 concurrent/i)
-          expect(`${cue.say} ${cue.ask}`).not.toMatch(forbidden)
-          expect(`${cue.say} ${cue.ask} ${cue.show}`).not.toMatch(bluntTenThousandDisclaimer)
-          expect(cue.say.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
-          expect(cue.ask.trim().split(/\s+/).length).toBeLessThanOrEqual(14)
+        for (const corners of PRIORITY_SETS) {
+          const briefing = buildRingsideBriefing(session, personaId, corners)
+          const spoken = [briefing.result, briefing.why, ...briefing.lenses.map((lens) => lens.text), briefing.ask].join(' ')
+          expect(briefing.declared).toBe(false)
+          expect(briefing.result).not.toBe('')
+          // The bounded round measured 128 attempts and is retired; no outcome may
+          // still describe the attempt count this protocol no longer runs.
+          expect(briefing.result).not.toMatch(/128[- ]attempts?|maximum 64 concurrent/i)
+          expect(briefing.why).not.toMatch(protocolJargon)
+          expect(briefing.ask).toMatch(/\?$/)
+          expect(`${briefing.why} ${briefing.ask}`).not.toMatch(forbidden)
+          expect(spoken).not.toMatch(bluntTenThousandDisclaimer)
+          expect(spoken).not.toMatch(/<[A-Z0-9_]+>/)
         }
       }
     }
   })
 
-  it('keeps Round 5 authored copy concise, natural, distinct, and non-vacuous', () => {
-    const roundFiveVerified = VERIFIED_CORPUS_RECORDS.filter(
-      (record) => record.round_id === 'survive_connection_spike',
+  it('tells a failed Round 5 check and an unready setup in plain words', () => {
+    expect(buildRingsideResult(failedSpike())).toBe(
+      'Both paths reached 10,000 clients from the same bell, but Lakebase and Aurora Serverless v2 both failed a required check, so there is no winner and no margin. The checks: every client held for 30 seconds, 64 of 64 test queries answered, fewer backends than clients, and clean identity, fairness, telemetry, and cleanup.',
     )
-    expect(new Set(roundFiveVerified.map((record) => record.meaning))).toHaveLength(10)
-    expect(new Set(roundFiveVerified.map((record) => record.question))).toHaveLength(70)
-    expect(new Set(
-      ROUND_FIVE_PERSONA_OUTCOME_RECORDS.map((record) => record.meaning),
-    )).toHaveLength(10)
+    expect(buildRingsideResult(incompleteSetup())).toBe(
+      "No result. Neither pooled path was ready, so the 10,000-client test never ran. Lakebase's built-in pooler: Transaction gate did not verify. Aurora Serverless v2: Transaction gate did not verify.",
+    )
+    expect(buildRingsideResult(failedCleanup())).toBe(
+      "The bout declared no winner. Then tearing down the bout's pooling setup failed at proxy deletion verification. The result stands, sharing is blocked, and Round 5 stays closed until the cleanup succeeds.",
+    )
+  })
 
-    for (const record of roundFiveVerified) {
-      expect(record.meaning.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
-      expect(record.question.trim().split(/\s+/).length).toBeLessThanOrEqual(14)
-      expect(record.meaning).toMatch(/\bup to 10,000 client connections\b/i)
-      expect(record.meaning).not.toMatch(
-        /\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i,
-      )
-      expect(record.question).toMatch(/\?$/)
-      expect(record.question).not.toMatch(/^Which .+,.+,\s*(?:and\s+)?(?:which\s+)?owner/i)
-      expect(record.question).not.toMatch(/What tradeoff matters most\?|separately value/i)
-      expect(`${record.meaning} ${record.question}`).not.toMatch(
-        /\b(?:spike|survive|readiness|contract test)\b|[–—]|customer customer/i,
-      )
+  it('tells a bell-protocol Round 5 bout with setup inside the other side’s clock', () => {
+    // Under the bell protocol each clock starts at the bell, so the AWS lane's time
+    // to 10,000 contains building its Proxy, and the line attributes it.
+    const session = verifiedSession('survive_connection_spike')
+    const runtimeLane = (id: 'lakebase' | 'competitor', bellTo10kMs: number, readyMs: number) => ({
+      id,
+      phase: 'verified' as const,
+      elapsed_at_snapshot_ms: bellTo10kMs + 30_000,
+      bell_to_10000_observed_ms: bellTo10kMs,
+      observation_uncertainty_ms: 5,
+      pooled_path_ready_observed_ms: readyMs,
+      ramp_started_observed_ms: readyMs,
+      ramp_time_to_10000_ms: bellTo10kMs - readyMs,
+      clients_initiated: 10_000,
+      clients_authenticated: 10_000,
+      held_clients: 10_000,
+      sampled_queries_succeeded: 64,
+      status: 'Verified',
+    })
+    session.round5_runtime = {
+      protocol: 'round5-bell-to-10k-v4',
+      warm_generation: 7,
+      bell_id: 'bell-one',
+      revision: 9,
+      state: 'verified',
+      bell_at_utc: session.created_at,
+      lanes: {
+        lakebase: runtimeLane('lakebase', 12_350, 400),
+        competitor: runtimeLane('competitor', 36_000, 24_000),
+      },
     }
-    for (const record of ROUND_FIVE_PERSONA_OUTCOME_RECORDS) {
-      expect(record.meaning.trim().split(/\s+/).length).toBeLessThanOrEqual(34)
-      expect(record.meaning).toMatch(/\bup to 10,000 client connections\b/i)
-      expect(record.meaning).not.toMatch(
-        /\b(?:witness|scheduled clients?|terminal clients?|setup stop|contract|128 attempts?|maximum 64 concurrent)\b/i,
-      )
-      expect(record.meaning).not.toMatch(
-        /\b(?:spike|survive|readiness|contract test)\b|[–—]|customer customer/i,
-      )
+    // A bell bout's margin is declared on the bell clock, not the fan-in clock.
+    session.comparison = {
+      kind: 'measured',
+      winner_lane_id: 'lakebase',
+      margin: { spec_id: 'bell_to_10000_observed_ms', value: 23_650, display_value: '23.65s' },
+      detail: 'fixture',
     }
-
-    const roleLeads = new Map(
-      roundFiveVerified.map((record) => [record.persona_id, record.meaning]),
+    const result = buildRingsideResult(session)
+    expect(result).toContain('held them for 30 seconds, timed from one bell.')
+    expect(result).toContain(
+      "Lakebase's built-in pooler: 12.35s. Aurora Serverless v2: 36.00s. Of the AWS path's time, 24.00s went to building an RDS Proxy before its first client could connect.",
     )
-    expect(roleLeads.size).toBe(10)
-    const meaningfulWords = (text: string) => new Set(
-      text.toLowerCase().match(/[a-z]+/g)?.filter(
-        (word) => !['the', 'a', 'an', 'and', 'for', 'to', 'of', 'its', 'with', 'up'].includes(word),
-      ) ?? [],
-    )
-    const entries = [...roleLeads.entries()]
-    for (let left = 0; left < entries.length; left += 1) {
-      for (let right = left + 1; right < entries.length; right += 1) {
-        const leftWords = meaningfulWords(entries[left][1])
-        const rightWords = meaningfulWords(entries[right][1])
-        const overlap = [...leftWords].filter((word) => rightWords.has(word)).length
-        const union = new Set([...leftWords, ...rightWords]).size
-        expect(overlap / union).toBeLessThan(0.5)
-      }
-    }
+    expect(result).not.toMatch(/shared start/)
+    expect(buildRingsideBriefing(session, 'executive', ['cost']).declared).toBe(true)
   })
 
   it('refuses missing placeholders instead of rendering raw tokens', () => {
     expect(() => interpolateProof('Observed <MISSING_VALUE>.', {})).toThrow(/MISSING_VALUE/)
+    // A towel with no recorded floor for the opponent is a one-sided result, not a bound.
     const missingLowerBound = oneSidedTowel()
     missingLowerBound.towel!.censored_lower_bounds_ms = {}
-    expect(buildRingsideShow(missingLowerBound)).toBe(
-      'Deletion to exact recovered read: Lakebase 1.23s. Aurora Serverless v2 did not verify. Source deletion held. Failover was not tested.',
+    expect(buildRingsideResult(missingLowerBound)).toBe(
+      "The same order was deleted from both databases at the same instant. Lakebase had it back and readable in 1.23s. Aurora Serverless v2 never finished, so there is a result but no margin. Failover wasn't tested.",
     )
   })
 
-  it('canonicalizes priority order and rejects an empty selection', () => {
-    expect(priorityKeyFor(['performance', 'cost'])).toBe('cost+performance')
-    expect(priorityKeyFor(['simplicity', 'performance', 'cost'])).toBe('cost+simplicity+performance')
-    expect(() => priorityKeyFor([])).toThrow(/one to three priorities/i)
+  it('reads priorities in one order and rejects an empty selection', () => {
+    expect(orderedPriorities(['performance', 'cost'])).toEqual(['cost', 'performance'])
+    expect(orderedPriorities(['simplicity', 'performance', 'cost'])).toEqual(['cost', 'simplicity', 'performance'])
+    expect(() => orderedPriorities([])).toThrow(/one to three priorities/i)
+    expect(() => buildRingsideBriefing(verifiedSession('wake_idle_app'), 'dba', [])).toThrow(/one to three priorities/i)
   })
 
-  it('resolves every approved audience track into non-empty copy', () => {
-    for (const roundId of ROUND_IDS) {
-      const session = verifiedSession(roundId)
+  it('resolves every round, person, priority set, and outcome into complete copy', () => {
+    const sessions: DemoSession[] = [
+      ...ROUND_IDS.map((roundId) => verifiedSession(roundId)),
+      ...ROUND_IDS.map((roundId) => verifiedSession(roundId, 'rds_postgres')),
+      ...ROUND_IDS.map((roundId) => verifiedSession(roundId, 'azure_postgres')),
+      ...ROUND_IDS.map((roundId) => noResult(roundId)),
+      oneSided('wake_idle_app'),
+      oneSided('make_schema_change_safely'),
+      oneSided('recover_deleted_order'),
+      competitorOnly('make_schema_change_safely'),
+      oneSidedTowel(),
+      noResultTowel(),
+      roundFourWithoutAwsLane(),
+      roundFourTie(),
+      roundFourStoppage(),
+      roundFourErroredLane(),
+      roundFourNoResultTowel(),
+      roundSixWithoutAwsLane(),
+      roundSixTie(),
+      roundSixStoppage(),
+      roundSixErroredLane(),
+      roundSixNoResultTowel(),
+      oneSidedRoundFiveSetupTowel(),
+      noVerifiedRoundFiveSetupTowel(),
+      incompleteSetup(),
+      failedSpike(),
+      failedCleanup(),
+      verifiedCleanupFailure(),
+      ...ROUND_IDS.map((roundId) => cooldownCleanupFailure(roundId)),
+    ]
+    for (const session of sessions) {
       for (const personaId of PERSONA_IDS as readonly PersonaId[]) {
-        for (const priorityKey of PRIORITY_KEYS) {
-          const cue = buildRingsideCue(session, personaId, priorityKey)
-          expect(cue.say).not.toBe('')
-          expect(cue.ask).not.toBe('')
-          expect(cue.show).not.toBe('')
+        for (const corners of PRIORITY_SETS) {
+          const briefing = buildRingsideBriefing(session, personaId, corners)
+          const label = `${session.round.id}/${session.competitor.id}/${briefing.outcomeId}/${personaId}/${corners.join('+')}`
+          expect(briefing.result, label).not.toBe('')
+          expect(briefing.why, label).not.toBe('')
+          expect(briefing.ask, label).toMatch(/\?$/)
+          expect(briefing.lenses, label).toHaveLength(corners.length)
+          const spoken = [briefing.result, briefing.why, ...briefing.lenses.map((lens) => lens.text), briefing.ask].join(' ')
+          expect(spoken, label).not.toMatch(/<[A-Z0-9_]+>/)
+          expect(spoken, label).not.toMatch(/undefined|null|NaN/)
         }
       }
     }

@@ -12,17 +12,26 @@ question that follows it.
 
 ## Explain to the Room
 
-After a round reaches an outcome, choose **Explain to the room**. The briefing
-shows:
+After a round reaches an outcome, choose **Explain to the room**. The briefing is
+a short script, read top to bottom:
 
-- the selected person's portrait, role, and ringside nickname;
-- the priorities chosen for the session;
-- **What this means** for that role;
-- **Question for the room** to connect the proof to the real environment; and
-- **What we proved**, including the exact result and its material boundaries.
+- **For the role**: the selected person's portrait, role, and ringside nickname,
+  with the priorities the room picked as chips.
+- **The clocks**: one tile per lane with its figure, the same figures the
+  instant replay scores, so the two never disagree. A floor such as `>90.00s`
+  says it is a floor on its own tile.
+- **What happened**: one sentence a person would say out loud, with the bout's
+  numbers in it and the measured boundary at the end. This is the only block
+  that changes with the outcome.
+- **Why it matters to you**: one or two sentences to that role about the stakes
+  of the round, in the second person.
+- **Your priorities**: one labeled row per priority the room picked, COST,
+  SIMPLICITY, or PERFORMANCE, each concrete to the round: what is billed and what
+  stands, what has to be built and owned, what the clock covered and left out.
+- **Ask the room**: the one question that turns the proof into a conversation.
 
-When supporting voices were selected, switch between their role tabs. The proof
-line stays fixed while the meaning and question change.
+When supporting voices were selected, switch between their role tabs. What
+happened stays fixed while the other three blocks change with the person.
 
 ## Corner Strategy
 
@@ -267,28 +276,42 @@ proof values must all be present; unresolved placeholders are never shown.
 Use the briefing in this order:
 
 1. **Say who this is for.** “For the Software Engineer…”
-2. **Read What this means.** Do not add a broader claim.
-3. **Ask the room question and pause.** The answer supplies the customer-specific
+2. **Read What happened.** The numbers, then the boundary. Do not add a broader
+   claim.
+3. **Read Why it matters to you**, to that person.
+4. **Read the priority rows** the room picked. They are the round seen through
+   cost, simplicity, and performance, not this bout's verdict.
+5. **Ask the room question and pause.** The answer supplies the customer-specific
    deadline, owner, or cost baseline the proof cannot invent.
-4. **Show What we proved.** Point to the exact measured boundary and its caveat.
-5. **Return to the ring.** Use Instant Replay or the receipt for deeper evidence.
+6. **Return to the ring.** Use Instant Replay or the receipt for deeper evidence.
 
 For a mixed room, let the lead voice frame the decision and use supporting voices
-to expose handoffs. The proof line should remain visibly identical as you switch.
+to expose handoffs. What happened should remain visibly identical as you switch.
 
 ## Content provenance and architecture
 
-The audience copy is a reviewed static corpus: six rounds × ten personas × seven
-non-empty priority selections. Separate reviewed outcome records cover verified
-comparisons, capability gaps, one-sided results, towels, failed cleanup, Round 5's
-setup and bounded-check gates, and no-result states. The frontend loads those
-canonical JSONL sources into typed lookups and uses one round-specific evidence
-classifier for meaning, question, and proof.
+The audience copy is three small reviewed files, rewritten on 2026-11-07 to read
+like a person talking rather than like a measurement boundary:
 
-The public sources are
-[`verified-corpus.jsonl`](frontend/src/ringside-cues/verified-corpus.jsonl),
-[`outcome-copy.jsonl`](frontend/src/ringside-cues/outcome-copy.jsonl), and
-[`round5-persona-outcomes.jsonl`](frontend/src/ringside-cues/round5-persona-outcomes.jsonl). Source
+- [`result-lines.jsonl`](frontend/src/ringside-cues/result-lines.jsonl): what
+  happened, one line per round and outcome, with `<TOKENS>` the session fills.
+  Outcomes cover verified comparisons, capability gaps, one-sided results,
+  towels, failed cleanup, Round 5's setup and bounded-check gates, and no-result
+  states. A missing token is an error, never a blank.
+- [`role-lines.jsonl`](frontend/src/ringside-cues/role-lines.jsonl): why the
+  round matters to each of the ten roles, and the one question to ask them.
+- [`lens-lines.jsonl`](frontend/src/ringside-cues/lens-lines.jsonl): each round
+  through each of the three priorities.
+
+Each record carries a `competitor` scope. `*` is the line every bout reads, and a
+variant for `aurora`, `rds`, or `azure` exists only where the shared line names
+the other side's stack (RDS Proxy, AWS Glue and DMS, a replication slot) and the
+other edition's stack is a different thing. Every key has its `*` line; a variant
+without one is a load error. Role and lens lines are written about the round's
+stakes and never this bout's verdict, so a stopped or failed bout reads them
+without inheriting a result; only the result line changes with the outcome. The
+frontend loads the three files once into typed lookups, pins their hashes, and
+uses one round-specific evidence classifier to choose the outcome. Source
 presentation materials are not linked because they are not publication-safe;
 the methodology and approved public copy are fully represented here and in the
 repository.
