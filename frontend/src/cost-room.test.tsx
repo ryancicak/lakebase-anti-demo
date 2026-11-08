@@ -68,7 +68,26 @@ describe('the cost view idle strip', () => {
     render(<CostRoom session={sessionWith(standingCost.priced)} onClose={() => undefined} />)
     const rds = lanes().find((lane) => lane.getAttribute('data-lane') === 'rds')!
     expect(rds.textContent).toMatch(/never sleeps/i)
-    expect(rds.querySelector('small')?.textContent).toBe('Modelled · sealed shape only')
+    expect(rds.querySelector('small')?.textContent).toBe('Modelled · from the sealed shape, no bill yet')
+  })
+
+  it('opens with the bill in one breath, every figure the payload’s own', () => {
+    render(<CostRoom session={sessionWith(standingCost.priced)} onClose={() => undefined} />)
+    const breath = screen.getByLabelText('The bill in one breath')
+    const rows = [...breath.querySelectorAll('article')]
+    // Only the standing payload is present here, so only its row renders.
+    expect(rows.map((row) => row.getAttribute('data-row'))).toEqual(['standing'])
+    expect(rows[0]).toHaveTextContent(/Right now, with nobody in the ring/i)
+    expect(rows[0].querySelector('b')?.textContent).toBe(standingCost.priced.totals.installation.display)
+    expect(rows[0].querySelector('small')?.textContent).toBe(standingCost.priced.totals.installation.condition)
+    expect(rows[0].querySelector('p')?.textContent).toMatch(/bills every hour, bout or no bout/i)
+    expect(screen.getByText(/What each engine bills while nobody is in the ring/i)).toBeTruthy()
+  })
+
+  it('renders no breath at all when no cost payload is present', () => {
+    render(<CostRoom session={sessionWith(undefined)} onClose={() => undefined} />)
+    expect(screen.queryByLabelText('The bill in one breath')).toBeNull()
+    expect(screen.queryByText(/What each engine bills while nobody is in the ring/i)).toBeNull()
   })
 
   it('prints the word rather than a number when a figure is unavailable', () => {

@@ -1,8 +1,8 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
 import { byCompetitor } from './competitor-kind'
-import { classifyOutcome } from './ringside-cues'
-import { modelScoreEvidence, roundFourLaneLabel } from './round4'
-import { liveOrderEvidence, roundSixLaneLabel } from './round6'
+import { buildRingsideResult, classifyOutcome } from './ringside-cues'
+import { modelScoreEvidence, roundFourLaneLabel, roundFourStackLabel } from './round4'
+import { liveOrderEvidence, roundSixLaneLabel, roundSixStackLabel } from './round6'
 import {
   ROUND_FIVE_BELL_PROTOCOL,
   ROUND_FIVE_FANIN_PROTOCOL,
@@ -11,6 +11,7 @@ import {
   roundFiveLanePresentation,
   roundFiveLaneResult,
   roundFiveServerResetNote,
+  roundFiveSetupLaneResult,
 } from './round5'
 import { preciseDuration } from './time'
 
@@ -19,7 +20,6 @@ function azureOr(session: DemoSession, azure: string, aws: string): string {
   return byCompetitor(session.competitor.id, { aurora: aws, rds: aws, azure })
 }
 
-export type ReplayBeatId = 'setup' | 'same-test' | 'takeaway'
 export type ReplayStoryState = 'verified' | 'partial' | 'no-result'
 
 export interface ReplayMetric {
@@ -29,21 +29,38 @@ export interface ReplayMetric {
   note: string
 }
 
-export interface ReplayBeat {
-  id: ReplayBeatId
-  title: 'Setup' | 'Same test' | 'Takeaway'
-  body: string
+/**
+ * One call on the tape: what happened, who did it, and when on the bout's clock.
+ * `atMs` is milliseconds from the bell, or null for a call that belongs in the
+ * sequence but was not stamped against that clock (a failure with no time, a
+ * legacy Round 5 fan-in that ran from its own shared start). An untimed call keeps
+ * its place in the order it was added; a timed call sorts by its time.
+ */
+export interface ReplayCall {
+  atMs: number | null
+  lane: LaneId | 'bell' | 'shared'
+  who: string
+  text: string
 }
 
-export interface ReplayStory {
+/**
+ * The instant replay as a tape, not a report: the scoreboard figures, then the
+ * calls in the order they happened, then the final call, which is the same
+ * sentence Explain to the Room opens with, so the two doors tell one story.
+ */
+export interface ReplayTape {
   state: ReplayStoryState
   status: string
-  beats: [ReplayBeat, ReplayBeat, ReplayBeat]
-  metricBeat: 'setup' | 'takeaway'
   metrics: ReplayMetric[]
+  calls: ReplayCall[]
+  finalCall: string
 }
 
+const LANE_IDS: readonly LaneId[] = ['lakebase', 'competitor']
+
 function laneName(session: DemoSession, laneId: LaneId): string {
+  if (session.round.id === 'put_model_score_in_app') return roundFourStackLabel(session, laneId)
+  if (session.round.id === 'analyze_live_orders_without_slowing_checkout') return roundSixStackLabel(session, laneId)
   return session.round5_setup?.lanes?.[laneId]?.name || session.lanes[laneId].name
 }
 
@@ -53,6 +70,15 @@ function roundFiveUsesFanIn(session: DemoSession): boolean {
     || protocol === ROUND_FIVE_FANIN_PROTOCOL
     || protocol === 'round5-fanin-v3'
     || protocol === 'round5-fanin-v2'
+}
+
+function finite(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function detail(status: string | null | undefined): string {
+  const trimmed = status?.trim()
+  return trimmed ? ` ${trimmed.replace(/\.?$/, '.')}` : ''
 }
 
 function exactMetric(
@@ -93,7 +119,7 @@ function observedMetrics(
   notes: Record<LaneId, string>,
 ): ReplayMetric[] {
   const metrics: ReplayMetric[] = []
-  for (const laneId of ['lakebase', 'competitor'] as const) {
+  for (const laneId of LANE_IDS) {
     const exact = exactMetric(session, laneId, labels[laneId], notes[laneId])
     if (exact) {
       metrics.push(exact)
@@ -105,7 +131,7 @@ function observedMetrics(
   return metrics
 }
 
-function storyState(session: DemoSession): Pick<ReplayStory, 'state' | 'status'> {
+function storyState(session: DemoSession): Pick<ReplayTape, 'state' | 'status'> {
   const outcome = classifyOutcome(session)
   if (outcome.status === 'cleanup_failure') {
     return outcome.contractComplete
@@ -128,92 +154,91 @@ function storyState(session: DemoSession): Pick<ReplayStory, 'state' | 'status'>
   return { state: 'no-result', status: 'No result' }
 }
 
-function incompleteTakeaway(session: DemoSession): string | null {
-  const outcome = classifyOutcome(session)
-  if (outcome.contractComplete && outcome.status !== 'cleanup_failure' && !session.towel) return null
-  if (outcome.status === 'cleanup_failure') {
-    return outcome.contractComplete
-      ? 'The measured proof still stands, but run-owned cleanup failed. Sharing stays blocked until cleanup is verified.'
-      : 'The proof did not complete, and run-owned cleanup also failed. No winner or margin can be claimed.'
-  }
-  if (outcome.status === 'guardrail_failure') {
-    return 'A timing was observed, but a required check did not verify. No winner or margin can be claimed.'
-  }
-  if (
-    session.round.id === 'survive_connection_spike'
-    && outcome.evidence.laneShape === 'both_exact_verified'
-  ) {
-    return roundFiveUsesFanIn(session)
-      ? 'Both lanes reached exactly 10,000 clients, but a required hold, query check, multiplexing, telemetry, identity, fairness, or cleanup check did not pass. No winner or margin was declared.'
-      : 'Legacy Round 5 scorecard decoded, but the current 10,000-client fan-in result was not recorded. No fan-in result or margin was declared.'
-  }
-  if (
-    session.round.id === 'survive_connection_spike'
-    && session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
-    && session.round5_runtime.state !== 'verified'
-  ) {
-    const observed = (['lakebase', 'competitor'] as const).map((laneId) => {
-      const lane = session.round5_runtime!.lanes[laneId]
-      return `${laneName(session, laneId)}: ${lane.clients_authenticated.toLocaleString('en-US')}/10,000 clients authenticated, ${lane.held_clients.toLocaleString('en-US')} currently held`
-    })
-    return `The 10,000-client fan-in stopped before every required check completed. ${observed.join(' · ')}. No winner or margin was declared.`
-  }
-  if (
-    session.round.id === 'survive_connection_spike'
-    && roundFiveUsesFanIn(session)
-    && Object.values(session.lanes).some(
-      (lane) => lane.evidence?.protocol === ROUND_FIVE_FANIN_PROTOCOL
-        || lane.evidence?.protocol === 'round5-fanin-v3'
-        || lane.evidence?.protocol === 'round5-fanin-v2',
-    )
-  ) {
-    const observed = (['lakebase', 'competitor'] as const).map((laneId) => {
-      const lane = session.lanes[laneId]
-      const raw = lane.evidence?.authenticated_clients ?? lane.evidence?.achieved_clients
-      const count = typeof raw === 'number' && Number.isFinite(raw)
-        ? `${Math.max(0, Math.floor(raw)).toLocaleString('en-US')}/10,000 clients`
-        : 'no trustworthy count recorded'
-      return `${lane.name}: ${count}`
-    })
-    return `The fan-in stopped before every required check completed. ${observed.join(' · ')}. No winner or margin was declared.`
-  }
-  if (outcome.evidence.exactLane) {
-    const exact = laneName(session, outcome.evidence.exactLane)
-    const otherLane: LaneId = outcome.evidence.exactLane === 'lakebase'
-      ? 'competitor'
-      : 'lakebase'
-    return `${exact} produced exact proof. ${laneName(session, otherLane)} did not, so there is no completed comparison or margin.`
-  }
-  return 'The round ended without an exact verified result. No winner or margin can be claimed.'
+const bell = (text: string): ReplayCall => ({ atMs: 0, lane: 'bell', who: 'Bell', text })
+
+function laneCall(session: DemoSession, laneId: LaneId, atMs: number | null, text: string): ReplayCall {
+  return { atMs, lane: laneId, who: laneName(session, laneId), text }
 }
 
-function incompleteTestSuffix(session: DemoSession): string {
-  const outcome = classifyOutcome(session)
-  if (outcome.contractComplete && !session.towel) return ''
-  if (
-    session.round.id === 'survive_connection_spike'
-    && outcome.evidence.exactLane
-  ) {
-    return roundFiveUsesFanIn(session)
-      ? ' The per-lane 10,000-client fan-in did not run, so the primary proof did not complete.'
-      : ' The legacy scorecard did not record the current 10,000-client fan-in contract, so no fan-in proof is shown.'
+/**
+ * A lane's finishing call for the rounds whose clock is the lane's own elapsed
+ * time: the verified sentence with the clock stop, a failure with the server's
+ * reason, or a towel floor. Null for a lane that has nothing to say yet.
+ */
+function laneFinish(session: DemoSession, laneId: LaneId, verifiedText: string): ReplayCall | null {
+  const lane = session.lanes[laneId]
+  const evidence = classifyOutcome(session).evidence[laneId]
+  if (lane.state === 'verified' && evidence.exactMs !== null) {
+    return laneCall(session, laneId, evidence.exactMs, `${verifiedText} Clock stops.`)
   }
-  if (outcome.status === 'guardrail_failure') {
-    return ' A required guardrail did not verify.'
-  }
-  return ' That full proof did not complete.'
-}
-
-function roundOneStory(session: DemoSession): ReplayStory {
-  const state = storyState(session)
-  const unsupported = session.lanes.competitor.state === 'not_supported'
-  const setup = unsupported
-    ? azureOr(
+  if (evidence.lowerBoundMs !== null && lane.state !== 'verified') {
+    return laneCall(
       session,
-      'Lakebase began at scale zero. Azure Database for PostgreSQL cannot automatically scale to zero, so no Azure PostgreSQL clock was started.',
-      'Lakebase began at scale zero. Provisioned RDS cannot automatically scale to zero, so no RDS clock was started.',
+      laneId,
+      evidence.lowerBoundMs,
+      `Still going when the bout stopped. Its time is a floor, more than ${preciseDuration(evidence.lowerBoundMs)}.`,
     )
-    : 'Both databases were confirmed at genuine scale zero before the bell.'
+  }
+  if (lane.state === 'failed') return laneCall(session, laneId, null, `Did not finish.${detail(lane.status)}`)
+  if (lane.state === 'towelled') return laneCall(session, laneId, null, 'Stopped before it finished.')
+  return null
+}
+
+function towelCall(session: DemoSession): ReplayCall | null {
+  const cutoff = finite(session.towel?.cutoff_ms ?? session.towel?.lower_bound_ms)
+  if (!session.towel || cutoff === null) return null
+  const unfinished = LANE_IDS
+    .filter((laneId) => session.lanes[laneId].state !== 'verified' && session.lanes[laneId].state !== 'not_supported')
+    .map((laneId) => laneName(session, laneId))
+  const who = unfinished.length === 0 ? 'Neither lane' : unfinished.join(' and ')
+  return {
+    atMs: cutoff,
+    lane: 'shared',
+    who: 'Towel',
+    text: `Stopped waiting at ${preciseDuration(cutoff)}. ${who} had not finished, so what you see for ${unfinished.length === 1 ? 'it' : 'them'} is a floor, not a result.`,
+  }
+}
+
+function cleanupCall(session: DemoSession): ReplayCall | null {
+  const outcome = classifyOutcome(session)
+  if (outcome.status !== 'cleanup_failure') return null
+  const gate = session.round5_setup?.cleanup_failure?.trim()
+    || session.towel?.cleanup_failure?.trim()
+    || session.cooldown?.failure?.trim()
+    || 'the clean-baseline check'
+  return {
+    atMs: null,
+    lane: 'shared',
+    who: 'After the bell',
+    text: `Cleanup failed at ${gate}. The result above stands, and sharing stays blocked until the cleanup succeeds.`,
+  }
+}
+
+/** Timed calls in clock order; untimed calls keep their place after the timed ones. */
+function inOrder(calls: Array<ReplayCall | null>): ReplayCall[] {
+  const present = calls.filter((call): call is ReplayCall => call !== null)
+  return present
+    .map((call, index) => ({ call, index }))
+    .sort((left, right) => {
+      const leftAt = left.call.atMs ?? Number.POSITIVE_INFINITY
+      const rightAt = right.call.atMs ?? Number.POSITIVE_INFINITY
+      if (leftAt !== rightAt) return leftAt - rightAt
+      return left.index - right.index
+    })
+    .map(({ call }) => call)
+}
+
+function finish(session: DemoSession, metrics: ReplayMetric[], calls: Array<ReplayCall | null>): ReplayTape {
+  return {
+    ...storyState(session),
+    metrics,
+    calls: inOrder([...calls, towelCall(session), cleanupCall(session)]),
+    finalCall: buildRingsideResult(session),
+  }
+}
+
+function roundOneTape(session: DemoSession): ReplayTape {
+  const unsupported = session.lanes.competitor.state === 'not_supported'
   const metrics = observedMetrics(
     session,
     {
@@ -222,164 +247,113 @@ function roundOneStory(session: DemoSession): ReplayStory {
     },
     { lakebase: 'Exact result', competitor: 'Exact result' },
   )
-  return {
-    ...state,
-    metricBeat: 'takeaway',
-    metrics,
-    beats: [
-      { id: 'setup', title: 'Setup', body: setup },
-      {
-        id: 'same-test',
-        title: 'Same test',
-        body: `A fresh connection had to commit and read back the exact run-owned transaction.${incompleteTestSuffix(session)}`,
-      },
-      {
-        id: 'takeaway',
-        title: 'Takeaway',
-        body: incompleteTakeaway(session)
-          ?? (unsupported
-            ? azureOr(
-              session,
-              'Lakebase woke and completed the transaction. This proves the automatic wake path; Azure PostgreSQL did not enter the race.',
-              'Lakebase woke and completed the transaction. This proves the automatic wake path; RDS did not enter the race.',
-            )
-            : 'The clock covers wake through the exact transaction. It does not measure the rest of the application.'),
-      },
-    ],
+  const wakeText = (laneId: LaneId) => {
+    const attempts = session.lanes[laneId].attempts
+    return attempts > 1
+      ? `Awake after ${attempts} connection attempts. The same transaction committed and read back.`
+      : 'Awake. The same transaction committed and read back.'
   }
+  return finish(session, metrics, [
+    bell(unsupported
+      ? `Bell. Lakebase is asleep. ${session.competitor.short_name} can't wake on its own, so it sits this one out, untimed.`
+      : 'Bell. Both databases are asleep, and the same connection goes in on both.'),
+    laneFinish(session, 'lakebase', wakeText('lakebase')),
+    unsupported ? null : laneFinish(session, 'competitor', wakeText('competitor')),
+  ])
 }
 
-function roundTwoStory(session: DemoSession): ReplayStory {
-  const state = storyState(session)
-  const copyKind = byCompetitor(session.competitor.id, {
-    aurora: 'point-in-time clone',
-    rds: 'point-in-time restore',
-    azure: 'point-in-time restore',
-  })
-  const cloud = azureOr(session, 'Azure', 'AWS')
-  return {
-    ...state,
-    metricBeat: 'takeaway',
-    metrics: observedMetrics(
+function roundTwoTape(session: DemoSession): ReplayTape {
+  const copyKind = (laneId: LaneId) => (laneId === 'lakebase'
+    ? 'a branch'
+    : byCompetitor(session.competitor.id, {
+      aurora: 'a point-in-time clone',
+      rds: 'a point-in-time restore',
+      azure: 'a point-in-time restore',
+    }))
+  const metrics = observedMetrics(
+    session,
+    {
+      lakebase: 'Lakebase isolated change',
+      competitor: `${session.competitor.short_name} isolated change`,
+    },
+    { lakebase: 'Exact result', competitor: 'Exact result' },
+  )
+  const done = (laneId: LaneId) =>
+    `Made ${copyKind(laneId)} of the source, ran the schema change on it, committed a real app transaction and read it back, and proved the source untouched.`
+  return finish(session, metrics, [
+    bell('Bell. Both sides start from the same source, and each makes its own copy to test the change on.'),
+    laneFinish(session, 'lakebase', done('lakebase')),
+    laneFinish(session, 'competitor', done('competitor')),
+  ])
+}
+
+function roundThreeTape(session: DemoSession): ReplayTape {
+  const metrics = observedMetrics(
+    session,
+    {
+      lakebase: 'Lakebase recovery',
+      competitor: `${session.competitor.short_name} recovery`,
+    },
+    { lakebase: 'Exact result', competitor: 'Exact result' },
+  )
+  return finish(session, metrics, [
+    bell('Bell. The same order is deleted on both sides at the same instant. The recovery point is one second before.'),
+    laneFinish(
       session,
-      {
-        lakebase: 'Lakebase isolated change',
-        competitor: `${session.competitor.short_name} isolated change`,
-      },
-      { lakebase: 'Exact result', competitor: 'Exact result' },
+      'lakebase',
+      'Opened a branch at the recovery point. A fresh connection read the order back while the source still showed it gone.',
     ),
-    beats: [
-      {
-        id: 'setup',
-        title: 'Setup',
-        body: `Each side created an isolated environment from the same clean source: a Lakebase branch and an ${cloud} ${copyKind}.`,
-      },
-      {
-        id: 'same-test',
-        title: 'Same test',
-        body: `Both ran the same migration, committed and read back the same application row, then proved the source was unchanged.${incompleteTestSuffix(session)}`,
-      },
-      {
-        id: 'takeaway',
-        title: 'Takeaway',
-        body: incompleteTakeaway(session)
-          ?? 'This measures the safe-change path inside isolated copies. Only run-owned copies are removed afterward; production cleanup was not tested.',
-      },
-    ],
-  }
-}
-
-function roundThreeStory(session: DemoSession): ReplayStory {
-  const state = storyState(session)
-  return {
-    ...state,
-    metricBeat: 'takeaway',
-    metrics: observedMetrics(
+    laneFinish(
       session,
-      {
-        lakebase: 'Lakebase recovery',
-        competitor: `${session.competitor.short_name} recovery`,
-      },
-      { lakebase: 'Exact result', competitor: 'Exact result' },
+      'competitor',
+      'Restored a copy to the recovery point. A fresh connection read the order back while the source still showed it gone.',
     ),
-    beats: [
-      {
-        id: 'setup',
-        title: 'Setup',
-        body: 'The same run-owned order was committed, aged to a recovery point, then deleted at one shared barrier.',
-      },
-      {
-        id: 'same-test',
-        title: 'Same test',
-        body: `Each recovery had to return the exact deleted order while a fresh source read still proved it absent.${incompleteTestSuffix(session)}`,
-      },
-      {
-        id: 'takeaway',
-        title: 'Takeaway',
-        body: incompleteTakeaway(session)
-          ?? 'This is recovery timing at the agreed recovery point. It is not a production failover, availability, or high-availability test.',
-      },
-    ],
-  }
+  ])
 }
 
-function roundFourStory(session: DemoSession): ReplayStory {
-  const state = storyState(session)
+function roundFourTape(session: DemoSession): ReplayTape {
   const evidence = modelScoreEvidence(session.lanes.lakebase)
-  const score = evidence.score === '—' ? 'one model score' : `score ${evidence.score}`
+  const score = evidence.score === '—' ? '' : `: ${evidence.score} for ${evidence.primaryKey}`
   const delta = evidence.deltaVersion === '—' ? '' : ` at Delta version ${evidence.deltaVersion}`
   const awsLane = session.lanes.competitor.state !== 'not_supported'
   const cloud = azureOr(session, 'Azure', 'AWS')
-  return {
-    ...state,
-    metricBeat: 'takeaway',
-    metrics: observedMetrics(
-      session,
-      {
-        lakebase: roundFourLaneLabel(session, 'lakebase'),
-        competitor: roundFourLaneLabel(session, 'competitor'),
-      },
-      { lakebase: 'Bell to exact app read', competitor: 'Bell to exact app read' },
-    ),
-    beats: [
-      {
-        id: 'setup',
-        title: 'Setup',
-        body: awsLane
-          ? 'Both integrations were parked before the bell, and both applications read the baseline row.'
-          : `Lakebase’s synced table was parked and its application read the baseline row. This installation has no ${cloud} lane, so no ${cloud} clock started.`,
-      },
-      {
-        id: 'same-test',
-        title: 'Same test',
-        body: `The bell started ${awsLane ? 'both integrations' : 'the synced table'} and committed ${score} to the Delta table${delta}. Each clock stopped at its own first exact read of that row, polled every 250 ms.${incompleteTestSuffix(session)}`,
-      },
-      {
-        id: 'takeaway',
-        title: 'Takeaway',
-        body: incompleteTakeaway(session)
-          ?? (awsLane
-            ? 'Each clock contains its own cold start. Lakebase’s sync figure comes from its own timestamps and is never compared. Model serving was not tested.'
-            : `This proves the Lakebase path. Without the ${cloud} lane there is no race or margin.`),
-      },
-    ],
-  }
+  const metrics = observedMetrics(
+    session,
+    {
+      lakebase: roundFourLaneLabel(session, 'lakebase'),
+      competitor: roundFourLaneLabel(session, 'competitor'),
+    },
+    { lakebase: 'Bell to exact app read', competitor: 'Bell to exact app read' },
+  )
+  const syncMs = finite(session.metrics?.find((metric) => metric.spec_id === 'managed_availability_ms' && metric.lane_id === 'lakebase')?.value)
+  return finish(session, metrics, [
+    bell(`Bell. One new score lands in the lakehouse${score}${delta}. ${awsLane
+      ? 'Both pipelines start cold.'
+      : `Only Lakebase's pipeline is here; this install has no ${cloud} lane.`}`),
+    syncMs === null
+      ? null
+      : laneCall(session, 'lakebase', syncMs, "The synced table reports the row landed. That is Lakebase's own sync timestamp, shown on its own and never compared."),
+    laneFinish(session, 'lakebase', 'The app read the new score.'),
+    awsLane
+      ? laneFinish(session, 'competitor', 'The app read the new score.')
+      : laneCall(session, 'competitor', null, `Not installed here, so there is no ${cloud} clock and nothing to compare.`),
+  ])
 }
 
-function roundFiveStory(session: DemoSession): ReplayStory {
-  const state = storyState(session)
+function roundFiveTape(session: DemoSession): ReplayTape {
   const recurringFanIn = roundFiveUsesFanIn(session)
   const bellRuntime = roundFiveBellRuntime(session)
+  const cloud = azureOr(session, 'Azure', 'AWS')
+  const build = azureOr(session, 'switch on PgBouncer and raise its client limit', 'build an RDS Proxy')
+  const ready = azureOr(session, 'PgBouncer is on and answering.', 'The RDS Proxy is built and answering.')
+
   // Under the V4 bell runtime the primary clock is the observed
   // bell_to_10000_observed_ms, which stays sticky through a hold, a towel, or a
   // failure after 10,000 clients. A lane that only reached 10,000 clients keeps
   // its exact time as timed evidence but is labelled reached/interrupted, never
   // verified; a lane that never reached 10,000 clients shows its lower bound.
   // This is the same canonical view-model the arena and the share receipt read.
-  const bellFanInMetric = (
-    laneId: LaneId,
-    label: string,
-  ): ReplayMetric | null => {
+  const bellFanInMetric = (laneId: LaneId, label: string): ReplayMetric | null => {
     const presentation = roundFiveLanePresentation(session, laneId)
     if (!presentation) return null
     if (presentation.timeMs !== null) {
@@ -402,11 +376,7 @@ function roundFiveStory(session: DemoSession): ReplayStory {
     }
     return null
   }
-  const exactFanInMetric = (
-    laneId: LaneId,
-    label: string,
-    note: string,
-  ): ReplayMetric | null => {
+  const exactFanInMetric = (laneId: LaneId, label: string, note: string): ReplayMetric | null => {
     if (bellRuntime) return bellFanInMetric(laneId, label)
     const legacyLane = roundFiveLaneResult(session.lanes[laneId])
     const milliseconds = legacyLane.contractVerified ? legacyLane.timeToTargetMs : null
@@ -414,10 +384,9 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       ? null
       : { laneId, label, value: preciseDuration(milliseconds), note }
   }
-  // The competitor's pooled path: AWS's new RDS Proxy, or Azure's built-in PgBouncer turned on.
   const pool = azureOr(session, 'Azure built-in PgBouncer', 'Selected AWS managed pool')
   const provisioned = azureOr(session, 'PgBouncer turned on', 'New RDS Proxy provisioned')
-  const setup = [
+  const metrics = [
     exactFanInMetric(
       'lakebase',
       recurringFanIn ? 'Lakebase time to 10,000' : 'Lakebase built-in pool',
@@ -439,123 +408,143 @@ function roundFiveStory(session: DemoSession): ReplayStory {
       recurringFanIn ? 'Exact authenticated held-client gate' : provisioned,
     ) ?? lowerBoundMetric(session, 'competitor', pool),
   ].filter((metric): metric is ReplayMetric => metric !== null)
-  // On the V4 bell runtime a lane can genuinely reach 10,000 clients, so asserting "all
-  // 20,000 held 30s" on a towel/failure is a false completed-hold claim. Only
-  // rewrite that beat for an incomplete bell bout; legacy fan-in keeps its
-  // methodology description (which already appends an "did not complete" suffix).
-  const bellIncomplete = bellRuntime !== null && bellRuntime.state !== 'verified'
-  // A held client the server reset was logged back in (v1.3.0), before the hold or with the
-  // hold started again, so the 30 seconds counted ran with every client held: the replay says
-  // which lane, and how many.
-  const serverResets = (['lakebase', 'competitor'] as const)
-    .map((laneId) => {
-      const note = roundFiveServerResetNote(session.lanes[laneId])
-      return note ? `${laneName(session, laneId)}: ${note}` : ''
-    })
-    .filter(Boolean)
-  const serverResetSentence = serverResets.length
-    ? ` ${serverResets.join('; ')}, and the 30s counted ran with every client held.`
-    : ''
-  const sameTestBody = !recurringFanIn
-    ? `Legacy Round 5 scorecard decoded. The current exact 10,000-client fan-in contract was not recorded, so the replay does not infer fan-in evidence.${incompleteTestSuffix(session)}`
-    : bellIncomplete
-      ? `Phase 2 raced each lane on its own clock to exactly 10,000 authenticated held clients under one verify-full TLS client. The 30-second hold and ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks per lane did not complete before the bout stopped, so no lane is verified.${incompleteTestSuffix(session)}`
-      : `Phase 2 held exactly 10,000 authenticated held clients per lane, each lane on its own clock, under one verify-full TLS client. All 20,000 held 30s; ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks passed per lane; observers proved multiplexing.${serverResetSentence}${incompleteTestSuffix(session)}`
-  return {
-    ...state,
-    metricBeat: 'setup',
-    metrics: setup,
-    beats: [
-      {
-        id: 'setup',
-        title: 'Setup',
-        body: azureOr(
+
+  const opening = bell(
+    `Bell. Both sides race to hold 10,000 client connections at once. Lakebase connects to its built-in pooler; the ${cloud} path has to ${build} first.`,
+  )
+
+  if (bellRuntime) {
+    const calls: Array<ReplayCall | null> = [opening]
+    for (const laneId of LANE_IDS) {
+      const lane = bellRuntime.lanes[laneId]
+      const readyMs = finite(lane.pooled_path_ready_observed_ms)
+      const rampMs = finite(lane.ramp_started_observed_ms)
+      const presentation = roundFiveLanePresentation(session, laneId)
+      const reset = roundFiveServerResetNote(session.lanes[laneId])
+      if (readyMs !== null) {
+        calls.push(laneCall(session, laneId, readyMs, laneId === 'lakebase'
+          ? 'Pooled path ready. The first client is through the built-in pooler.'
+          : `Pooled path ready. ${ready}`))
+      }
+      if (rampMs !== null && (readyMs === null || rampMs - readyMs > 50)) {
+        calls.push(laneCall(session, laneId, rampMs, 'Clients start piling in.'))
+      }
+      if (presentation?.timeMs !== null && presentation?.timeMs !== undefined) {
+        calls.push(laneCall(session, laneId, presentation.timeMs, '10,000 clients connected and held at once. Clock stops.'))
+        // A verified lane passed every check by definition; the live counter on the
+        // runtime lane can lag the verdict, so the tape states the contract, not the counter.
+        const held = presentation.semantic === 'verified'
+          ? `Held all 10,000 clients for 30 seconds; all ${ROUND_FIVE_SAMPLED_QUERIES} checks passed.`
+          : presentation.semantic === 'reached_hold_interrupted'
+            ? 'The 30-second hold was interrupted by the towel before it could verify.'
+            : presentation.semantic === 'reached_hold_failed'
+              ? `The 30-second hold did not verify.${detail(lane.status)}`
+              : 'The 30-second hold is still running.'
+        calls.push(laneCall(session, laneId, null, reset ? `${held} ${reset[0].toUpperCase()}${reset.slice(1)}.` : held))
+      } else if (presentation?.lowerBoundMs !== null && presentation?.lowerBoundMs !== undefined) {
+        calls.push(laneCall(
           session,
-          "Phase 1 timed Lakebase's included pool and Azure's PgBouncer turning on separately.",
-          "Phase 1 timed Lakebase's included pool and new selected RDS Proxy separately.",
-        ),
-      },
-      {
-        id: 'same-test',
-        title: 'Same test',
-        body: sameTestBody,
-      },
-      {
-        id: 'takeaway',
-        title: 'Takeaway',
-        body: incompleteTakeaway(session)
-          ?? (recurringFanIn
-            ? `Fan-in time is primary; setup supports it. Authentication is recorded, not excluded. Client count is not backend count or transaction throughput. Direct ${azureOr(session, 'Azure', 'AWS')} connections and other pools were not tested.`
-            : 'Legacy scorecard fields remain readable, but only the current 10,000-client fan-in contract is presented. No fan-in claim is inferred.'),
-      },
-    ],
+          laneId,
+          presentation.lowerBoundMs,
+          `Never reached 10,000 clients. Still climbing when the bout stopped, so its time is a floor, more than ${preciseDuration(presentation.lowerBoundMs)}.`,
+        ))
+      } else if (lane.phase === 'failed') {
+        calls.push(laneCall(session, laneId, null, `Did not verify.${detail(lane.status)}`))
+      } else if (lane.held_clients > 0 || lane.clients_authenticated > 0) {
+        calls.push(laneCall(
+          session,
+          laneId,
+          null,
+          `Reached ${Math.max(lane.held_clients, lane.clients_authenticated).toLocaleString('en-US')} of 10,000 clients, then the bout stopped.`,
+        ))
+      }
+    }
+    return finish(session, metrics, calls)
   }
+
+  if (!recurringFanIn) {
+    return finish(session, metrics, [
+      opening,
+      { atMs: null, lane: 'shared', who: 'Recording', text: "An older Round 5 recording. The current 10,000-client test isn't in it, so no fan-in call is made." },
+    ])
+  }
+
+  // The retired fan-in protocols: setup on the bell clock, then a shared start.
+  const calls: Array<ReplayCall | null> = [opening]
+  for (const laneId of LANE_IDS) {
+    const setup = roundFiveSetupLaneResult(session, laneId)
+    if (setup.verified && setup.setupElapsedMs !== null) {
+      calls.push(laneCall(session, laneId, setup.setupElapsedMs, laneId === 'lakebase'
+        ? 'Pooled path ready. The first client is through the built-in pooler.'
+        : `Pooled path ready. ${ready}`))
+    } else {
+      calls.push(laneFinish(session, laneId, 'Pooled path ready.'))
+    }
+  }
+  const bothReady = LANE_IDS.every((laneId) => roundFiveSetupLaneResult(session, laneId).verified)
+  if (bothReady) {
+    calls.push({ atMs: null, lane: 'shared', who: 'Shared start', text: 'Both paths ready. The clocks restart together, and 10,000 clients pile in on each side.' })
+    for (const laneId of LANE_IDS) {
+      const result = roundFiveLaneResult(session.lanes[laneId])
+      if (result.contractVerified && result.timeToTargetMs !== null) {
+        calls.push(laneCall(
+          session,
+          laneId,
+          null,
+          `10,000 clients held ${preciseDuration(result.timeToTargetMs)} after the shared start, then held for 30 seconds with ${ROUND_FIVE_SAMPLED_QUERIES} checks passed.`,
+        ))
+      } else {
+        calls.push(laneCall(session, laneId, null, `Did not get 10,000 clients held and checked.${detail(session.lanes[laneId].status)}`))
+      }
+    }
+  }
+  return finish(session, metrics, calls)
 }
 
-function roundSixStory(session: DemoSession): ReplayStory {
-  const state = storyState(session)
+function roundSixTape(session: DemoSession): ReplayTape {
   const total = liveOrderEvidence(session.lanes.lakebase).totalDisplay
-  const checkout = total === '—' ? 'one checkout' : `one ${total} checkout`
+  const checkout = total === '—' ? 'The same checkout' : `The same ${total} checkout`
   const awsLane = session.lanes.competitor.state !== 'not_supported'
   const cloud = azureOr(session, 'Azure', 'AWS')
-  return {
-    ...state,
-    metricBeat: 'takeaway',
-    metrics: observedMetrics(
-      session,
-      {
-        lakebase: roundSixLaneLabel(session, 'lakebase'),
-        competitor: roundSixLaneLabel(session, 'competitor'),
-      },
-      { lakebase: 'Bell to exact Delta read', competitor: 'Bell to exact Delta read' },
-    ),
-    beats: [
-      {
-        id: 'setup',
-        title: 'Setup',
-        body: awsLane
-          ? azureOr(
-            session,
-            'The Azure Data Factory data flow was parked before the bell, Lakebase’s change feed was streaming, and both sources read the baseline order.',
-            'AWS DMS and Glue were parked before the bell, Lakebase’s change feed was streaming, and both sources read the baseline order.',
-          )
-          : `Lakebase’s change feed was streaming and its source read the baseline order. This installation has no ${cloud} lane, so no ${cloud} clock started.`,
-      },
-      {
-        id: 'same-test',
-        title: 'Same test',
-        body: awsLane
-          ? `The bell committed ${checkout} on both sources and started ${azureOr(session, 'the Azure Data Factory data flow', 'AWS DMS and Glue')} cold. Each clock stopped at its own first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`
-          : `The bell committed ${checkout} on Lakebase. Its clock stopped at its first exact Delta read of that order, polled every second.${incompleteTestSuffix(session)}`,
-      },
-      {
-        id: 'takeaway',
-        title: 'Takeaway',
-        body: incompleteTakeaway(session)
-          ?? (awsLane
-            ? `${cloud}’s clock contains its cold start; Lakebase’s feed is built in and always on. A separate checkout committed on each source.`
-            : `This proves the Lakebase path. Without the ${cloud} lane there is no race or margin.`),
-      },
-    ],
-  }
+  const coldStack = azureOr(session, 'The Azure data flow starts cold', 'DMS and Glue start cold')
+  const metrics = observedMetrics(
+    session,
+    {
+      lakebase: roundSixLaneLabel(session, 'lakebase'),
+      competitor: roundSixLaneLabel(session, 'competitor'),
+    },
+    { lakebase: 'Bell to exact Delta read', competitor: 'Bell to exact Delta read' },
+  )
+  const skew = finite(session.metrics?.find((metric) => metric.spec_id === 'commit_skew_ms')?.value)
+  const skewNote = skew === null || !awsLane ? '' : ` The two commits landed ${Math.round(skew)} ms apart.`
+  return finish(session, metrics, [
+    bell(awsLane
+      ? `Bell. ${checkout} commits on both databases. ${coldStack}; Lakebase's feed is already on.${skewNote}`
+      : `Bell. ${checkout} commits on Lakebase, whose feed is already on. This install has no ${cloud} lane.`),
+    laneFinish(session, 'lakebase', 'The order shows up in the lakehouse.'),
+    awsLane
+      ? laneFinish(session, 'competitor', 'The order shows up in the lakehouse.')
+      : laneCall(session, 'competitor', null, `Not installed here, so there is no ${cloud} clock and nothing to compare.`),
+    { atMs: null, lane: 'shared', who: 'Meanwhile', text: 'A second checkout committed on each side as a sanity check, not a load test.' },
+  ])
 }
 
-const STORY_BUILDERS: Record<RoundId, (session: DemoSession) => ReplayStory> = {
-  wake_idle_app: roundOneStory,
-  make_schema_change_safely: roundTwoStory,
-  recover_deleted_order: roundThreeStory,
-  put_model_score_in_app: roundFourStory,
-  survive_connection_spike: roundFiveStory,
-  analyze_live_orders_without_slowing_checkout: roundSixStory,
+const TAPE_BUILDERS: Record<RoundId, (session: DemoSession) => ReplayTape> = {
+  wake_idle_app: roundOneTape,
+  make_schema_change_safely: roundTwoTape,
+  recover_deleted_order: roundThreeTape,
+  put_model_score_in_app: roundFourTape,
+  survive_connection_spike: roundFiveTape,
+  analyze_live_orders_without_slowing_checkout: roundSixTape,
 }
 
-export function replayStory(session: DemoSession): ReplayStory {
-  return STORY_BUILDERS[session.round.id](session)
+export function replayTape(session: DemoSession): ReplayTape {
+  return TAPE_BUILDERS[session.round.id](session)
 }
 
-export function replayStoryWordCount(story: ReplayStory): number {
-  return story.beats
-    .map((beat) => `${beat.title} ${beat.body}`)
+/** Every word the tape puts on screen, for the reading-time budget. */
+export function replayTapeWordCount(tape: ReplayTape): number {
+  return [...tape.calls.map((call) => `${call.who} ${call.text}`), tape.finalCall]
     .join(' ')
     .trim()
     .split(/\s+/)

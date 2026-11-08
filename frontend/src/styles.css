@@ -947,7 +947,8 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .round4-body > .ringside-commentator > header { min-width: 165px; padding-top: .1em; padding-bottom: .1em; }
 .round4-body > .ringside-commentator > header { grid-template-rows: auto; border-right-width: 1px; }
 .round4-body > .ringside-commentator .ringside-announcer { grid-row: auto; }
-.round4-body > .ringside-commentator .ringside-commentary { padding-top: .35em; padding-bottom: .35em; color: #aeb9df; font-size: clamp(7px, .54vw, 10px); }
+.round4-body > .ringside-commentator .ringside-commentary { padding-top: .45em; padding-bottom: .45em; color: #aeb9df; font-size: clamp(10px, .72vw, 13px); }
+.round4-body > .ringside-commentator .ringside-call { font-size: clamp(12px, .9vw, 16px); }
 .round4-body > .ringside-commentator > button { min-width: 165px; border-left-width: 1px; color: #aeb9df; background: #090d21; }
 .round4-body > .ringside-commentator .ringside-announcer-tag { color: #aeb9df; }
 .round4-same-pk { width: min(1520px, 91vw); margin: 0; padding: .45em 1em; border-top: 1px solid var(--yellow); color: var(--yellow); background: #090d21; font-size: clamp(6px, .5vw, 9px); line-height: 1.35; text-align: center; text-transform: uppercase; }
@@ -992,14 +993,18 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
    painting a navy square inside the badge -- the exact tell the sprite was
    drawn to remove -- so the bar's own #02040e shows through instead. */
 .ringside-announcer > img { position: absolute; top: 0; left: 0; width: 54px; height: 54px; border: 3px solid var(--yellow); box-shadow: 3px 3px 0 var(--red), 5px 5px 0 #000; image-rendering: pixelated; }
-.ringside-commentator > header strong { font-size: clamp(6px, .52vw, 10px); line-height: 1.35; }
+.ringside-commentator > header strong { font-size: clamp(7px, .58vw, 11px); line-height: 1.35; }
 .ringside-announcer-tag { display: block; margin-top: .32em; color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(5px, .38vw, 7px); font-style: normal; font-weight: 900; line-height: 1.15; text-transform: uppercase; white-space: nowrap; }
-.ringside-commentator > header small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(7px, .55vw, 10px); font-weight: 900; line-height: 1.25; }
-.ringside-commentary { display: grid; align-content: center; gap: .45em; min-width: 0; padding: .65em 1em; font-family: ui-monospace, monospace; font-size: clamp(8px, .64vw, 12px); font-weight: 900; line-height: 1.3; }
-.ringside-commentary ul { display: grid; gap: .22em; margin: 0; padding: 0; list-style: none; }
+.ringside-commentator > header small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(8px, .6vw, 11px); font-weight: 900; line-height: 1.25; }
+/* The commentary is read from the back of a room: the call is the largest line
+   on the bar, the two fighter lines a step down, and the wire call small and
+   dim, since it is there for the one person who wants to see the SQL. */
+.ringside-commentary { display: grid; align-content: center; gap: .5em; min-width: 0; padding: .75em 1.1em; font-family: ui-monospace, monospace; font-size: clamp(11px, .82vw, 15px); font-weight: 900; line-height: 1.35; }
+.ringside-commentary ul { display: grid; gap: .3em; margin: 0; padding: 0; list-style: none; color: var(--cream); }
 .ringside-commentary li::before { content: "> "; color: var(--yellow); }
 .ringside-commentary p { margin: 0; color: var(--yellow); }
-.ringside-commentary code { color: #6bf39a; font: inherit; overflow-wrap: anywhere; }
+.ringside-commentary .ringside-call { font-size: clamp(13px, 1.05vw, 19px); line-height: 1.3; overflow-wrap: anywhere; }
+.ringside-commentary code { color: #6bf39a; font: inherit; font-size: clamp(9px, .6vw, 11px); opacity: .85; overflow-wrap: anywhere; }
 /* Not an error and not styled like one: the calls below are still exact, some of
    them just never arrived. Amber reads as "read this", which is the whole job. */
 .ringside-commentary code.ringside-missed-calls { color: var(--yellow); opacity: .82; }
@@ -1050,15 +1055,24 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .replay-modal > header > span { flex: none; max-width: 36%; padding: .9em 1em; border: 3px solid #6bf39a; color: #6bf39a; font-size: clamp(6px, .5vw, 9px); line-height: 1.4; text-align: center; text-transform: uppercase; }
 .replay-modal > header > span[data-state="partial"] { border-color: var(--yellow); color: var(--yellow); }
 .replay-modal > header > span[data-state="no-result"] { border-color: #ff9888; color: #ff9888; }
-.replay-story { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(9px, 1vw, 14px); align-items: stretch; }
-.replay-beat { display: flex; flex-direction: column; min-width: 0; padding: clamp(13px, 1.5vw, 18px); border: 3px solid #46527c; border-top: 6px solid var(--yellow); background: #050817; }
-.replay-beat[data-beat="setup"] { border-top-color: var(--blue-light); }
-.replay-beat[data-beat="takeaway"] { border-top-color: #6bf39a; }
-.replay-beat > header { display: flex; align-items: center; gap: 9px; }
-.replay-beat > header span { color: var(--yellow); font-size: clamp(6px, .48vw, 9px); }
-.replay-beat > header h3 { margin: 0; font-size: clamp(9px, .72vw, 13px); line-height: 1.3; text-transform: uppercase; }
-.replay-beat > p { margin: .85em 0 0; color: #d7def6; font-family: ui-monospace, monospace; font-size: clamp(12px, .9vw, 15px); font-weight: 900; line-height: 1.42; overflow-wrap: anywhere; }
-.replay-primary-metric { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-top: auto; padding-top: 12px; }
+/* The replay is one column: the scoreboard, the tape, the final call. The tape is
+   a list of calls, each with its clock reading in the gutter, who made it as a
+   lane-colored chip, and the call itself in the same type Explain to the Room
+   speaks in. The bell and shared calls (towel, cleanup) take the yellow. */
+.replay-story { display: grid; grid-template-columns: minmax(0, 1fr); gap: clamp(10px, 1.2vh, 16px); align-items: start; }
+.replay-tape { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; counter-reset: none; }
+.replay-tape > li { --corner: #46527c; display: grid; grid-template-columns: minmax(64px, auto) auto minmax(0, 1fr); align-items: start; gap: 10px 12px; min-width: 0; padding: 9px 12px; border: 2px solid #2d3759; border-left: 5px solid var(--corner); background: #050817; }
+.replay-tape > li[data-lane="lakebase"] { --corner: var(--red-light); }
+.replay-tape > li[data-lane="competitor"] { --corner: var(--blue-light); }
+.replay-tape > li[data-lane="bell"], .replay-tape > li[data-lane="shared"] { --corner: var(--yellow); }
+.replay-at { color: var(--yellow); font-family: ui-monospace, monospace; font-size: clamp(12px, .9vw, 15px); font-variant-numeric: tabular-nums; font-weight: 900; line-height: 1.5; text-align: right; }
+.replay-tape > li > b { align-self: start; max-width: 220px; padding: 5px 7px 4px; border: 2px solid var(--corner); color: var(--corner); font-size: clamp(7px, .52vw, 9px); line-height: 1.3; text-transform: uppercase; overflow-wrap: anywhere; }
+.replay-call { color: #d7def6; font-family: ui-monospace, monospace; font-size: clamp(12px, .9vw, 15px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
+.replay-final-call { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 12px; margin: 0; padding: 12px 14px; border: 3px solid var(--yellow); background: #0a1130; }
+.replay-final-call > b { padding: 5px 7px 4px; border: 2px solid var(--yellow); color: var(--yellow); font-size: clamp(7px, .52vw, 9px); line-height: 1.3; text-transform: uppercase; white-space: nowrap; }
+.replay-final-call > span { color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(14px, 1.05vw, 18px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
+.replay-final-call em { color: var(--yellow); font-style: normal; }
+.replay-primary-metric { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-top: 0; padding-top: 0; }
 .replay-primary-metric > div { --corner: var(--blue-light); container-type: inline-size; display: grid; align-content: start; min-width: 0; padding: 10px; border: 2px solid #46527c; border-left: 5px solid var(--corner); background: #10183e; }
 .replay-primary-metric > div[data-corner="red"] { --corner: var(--red-light); }
 .replay-primary-metric span, .replay-primary-metric strong, .replay-primary-metric small { display: block; }
@@ -1119,8 +1133,9 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
   .replay-modal > header { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
   .replay-modal > header > span { max-width: 100%; justify-self: start; padding: .7em .8em; }
   .replay-story { grid-template-columns: minmax(0, 1fr); }
-  .replay-beat { padding: 14px; }
-  .replay-beat > p { font-size: 14px; }
+  .replay-tape > li { grid-template-columns: auto minmax(0, 1fr); }
+  .replay-tape > li > .replay-call { grid-column: 1 / -1; }
+  .replay-call, .replay-at { font-size: 14px; }
   .replay-primary-metric { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .replay-primary-metric strong { font-size: clamp(23px, 9vw, 32px); }
   .replay-evidence > summary { align-items: flex-start; flex-direction: column; gap: 4px; min-height: 54px; }
@@ -1151,15 +1166,20 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cooldown-provenance .between-policy-floor, .cooldown-provenance .between-floor-cost { width: 100%; margin: 0; }
 
 /* Explain to the Room is an audience briefing, not an evidence dashboard. The
-   authored engine is large; the projected surface stays deliberately small. */
+   authored engine is large; the projected surface stays deliberately small, and
+   it reads top to bottom in speaking order: what happened, why it matters to the
+   person being addressed, one row per priority the room picked, then the question.
+   The result block is the one with the bout's numbers in it, so it is set a step
+   larger; a result that declared nothing turns its label amber, the same warning
+   pair the towel and the unavailable states use. */
 .ringside-overlay { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; max-width: 100%; padding: 3vh 4vw; overflow: hidden; background: #02040ef2; }
-.ringside-take { display: grid; gap: clamp(12px, 1.8vh, 20px); width: min(900px, 92vw); max-width: 100%; max-height: 94vh; padding: clamp(18px, 2.6vh, 30px) clamp(18px, 2.5vw, 34px); overflow-x: hidden; overflow-y: auto; border: clamp(5px, .5vw, 8px) solid var(--yellow); color: var(--cream); background: #0a1130; box-shadow: inset 0 7px var(--red), .7em .7em #000; text-align: left; }
+.ringside-take { display: grid; gap: clamp(8px, 1.2vh, 16px); width: min(1040px, 92vw); max-width: 100%; max-height: 94vh; padding: clamp(16px, 2vh, 26px) clamp(18px, 2.5vw, 34px); overflow-x: hidden; overflow-y: auto; border: clamp(5px, .5vw, 8px) solid var(--yellow); color: var(--cream); background: #0a1130; box-shadow: inset 0 7px var(--red), .7em .7em #000; text-align: left; }
 .ringside-take > * { min-width: 0; }
 .ringside-take > header { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .ringside-persona-identity { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .ringside-persona-identity > img { flex: none; width: 52px; height: 52px; border: 2px solid var(--yellow); background: #050817; object-fit: cover; image-rendering: pixelated; }
 .ringside-persona-identity > div { min-width: 0; }
-.ringside-take > header h2 { margin: 0; font-size: clamp(18px, 2vw, 32px); line-height: 1.25; overflow-wrap: anywhere; text-transform: uppercase; text-shadow: .1em .1em #000; }
+.ringside-take > header h2 { margin: 0; font-size: clamp(18px, 1.7vw, 28px); line-height: 1.25; overflow-wrap: anywhere; text-transform: uppercase; text-shadow: .1em .1em #000; }
 .ringside-persona-identity small { display: block; margin-top: 4px; color: var(--yellow); font-size: 11px; line-height: 1.2; text-transform: uppercase; }
 .ringside-priority-chips { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .ringside-priority-chips span { min-height: 28px; padding: 7px 9px 6px; border: 2px solid #46527c; color: var(--yellow); background: #050817; font-size: 12px; line-height: 1; text-transform: uppercase; }
@@ -1167,11 +1187,29 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .ringside-take nav button { flex: 1 1 0; min-width: 0; min-height: 44px; padding: 8px 10px; border: 2px solid #46527c; color: #c5cdea; background: #050817; font-size: clamp(11px, .8vw, 13px); line-height: 1.35; overflow-wrap: anywhere; text-align: center; text-transform: uppercase; }
 .ringside-take nav button[aria-selected="true"] { border-color: var(--yellow); color: var(--cream); box-shadow: inset 0 -5px var(--red); }
 .ringside-take nav button:focus-visible { outline: 3px solid var(--blue-light); outline-offset: 2px; }
+/* The two clocks lead. They are the replay's own figures, lane-colored, with a
+   floor (">90.00s") saying what it is on the same tile. Everything under them is
+   the explanation of these two numbers. */
+.ringside-scoreboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.ringside-scoreboard > div { --corner: var(--blue-light); display: grid; align-content: start; gap: 4px; min-width: 0; padding: 10px 14px; border: 2px solid #46527c; border-left: 6px solid var(--corner); background: #050817; }
+.ringside-scoreboard > div[data-corner="red"] { --corner: var(--red-light); }
+.ringside-scoreboard span { color: var(--corner); font-size: clamp(7px, .52vw, 10px); line-height: 1.35; text-transform: uppercase; overflow-wrap: anywhere; }
+.ringside-scoreboard strong { color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(26px, 2.4vw, 42px); font-variant-numeric: tabular-nums; font-weight: 900; line-height: 1; overflow-wrap: anywhere; }
+.ringside-scoreboard > div[data-floor="true"] strong { color: #ffcf87; }
+.ringside-scoreboard small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(9px, .62vw, 11px); font-weight: 900; line-height: 1.3; }
 .ringside-persona-panel { display: grid; min-width: 0; border-top: 2px solid #46527c; }
-.ringside-cue { display: grid; grid-template-columns: minmax(140px, .24fr) minmax(0, 1fr); align-items: start; gap: clamp(12px, 2vw, 24px); min-width: 0; padding: clamp(15px, 2vh, 22px) 0; border-bottom: 2px solid #46527c; }
+.ringside-cue { display: grid; grid-template-columns: minmax(140px, .22fr) minmax(0, 1fr); align-items: start; gap: clamp(12px, 2vw, 24px); min-width: 0; padding: clamp(8px, 1.25vh, 16px) 0; border-bottom: 2px solid #46527c; }
 .ringside-cue h3 { margin: .3em 0 0; color: var(--yellow); font-size: clamp(12px, .8vw, 14px); line-height: 1.3; text-transform: uppercase; }
 .ringside-cue p { margin: 0; font-family: ui-monospace, monospace; font-size: clamp(16px, 1.15vw, 20px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
-.ringside-show p { color: #d7def6; }
+.ringside-result p { font-size: clamp(16px, 1.2vw, 21px); }
+/* The measured times are the reason the room is looking; they take the label color. */
+.ringside-result em { color: var(--yellow); font-style: normal; }
+.ringside-result[data-declared="false"] h3 { color: #ffb95c; }
+.ringside-lenses ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.ringside-lenses li { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 10px; min-width: 0; }
+.ringside-lenses b { min-height: 28px; padding: 7px 9px 6px; border: 2px solid #46527c; color: var(--yellow); background: #050817; font-size: 12px; font-weight: 400; line-height: 1; text-transform: uppercase; white-space: nowrap; }
+.ringside-lenses span { font-family: ui-monospace, monospace; font-size: clamp(15px, 1.05vw, 18px); font-weight: 900; line-height: 1.45; color: #d7def6; overflow-wrap: anywhere; }
+.ringside-ask p { color: var(--yellow); }
 .ringside-close { position: sticky; bottom: 0; min-height: 44px; padding: .9em 1em; border: 3px solid var(--cream); color: #050817; background: var(--red); box-shadow: .3em .3em #000; font-size: clamp(10px, .7vw, 13px); text-transform: uppercase; }
 
 @media (max-width: 700px) {
@@ -1181,10 +1219,31 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
   .ringside-persona-identity > img { width: 44px; height: 44px; }
   .ringside-priority-chips { justify-content: flex-start; }
   .ringside-take nav { gap: 5px; }
-  .ringside-take nav button { padding: 7px 5px; font-size: 11px; }
+  .ringside-take nav button { padding: 7px 3px; font-size: 9px; }
+  .ringside-scoreboard { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .ringside-scoreboard strong { font-size: 24px; }
   .ringside-cue { grid-template-columns: minmax(0, 1fr); gap: 6px; padding: 13px 0; }
   .ringside-cue h3 { margin-top: 0; }
   .ringside-cue p { font-size: 16px; line-height: 1.4; }
+  .ringside-result p { font-size: 17px; }
+  .ringside-lenses li { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .ringside-lenses span { font-size: 15px; }
+}
+
+/* A 720-pixel projector with three priorities and three people in the room is
+   the tightest case the briefing has to fit without scrolling past the question.
+   Vertical rhythm compresses here; type sizes do not. */
+@media (max-height: 780px) and (min-width: 701px) {
+  .ringside-take { gap: 6px; padding-top: 12px; padding-bottom: 12px; }
+  .ringside-take > header { gap: 10px; }
+  .ringside-take > header h2 { font-size: clamp(16px, 1.5vw, 24px); }
+  .ringside-scoreboard > div { gap: 2px; padding: 6px 12px; }
+  .ringside-scoreboard strong { font-size: clamp(22px, 2vw, 32px); }
+  .ringside-take nav button { min-height: 36px; padding: 5px 8px; }
+  .ringside-cue { padding: 6px 0; gap: 12px; }
+  .ringside-cue h3 { margin-top: .2em; }
+  .ringside-lenses ul { gap: 5px; }
+  .ringside-close { min-height: 38px; padding: .6em 1em; }
 }
 
 /* The cost view behind "What it cost".
@@ -1201,6 +1260,17 @@ button:focus-visible, select:focus-visible, summary:focus-visible {
 .cost-room > header p { margin: 0 0 1em; color: var(--yellow); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
 .cost-room > header h2 { margin: 0; font-size: clamp(15px, 1.9vw, 34px); line-height: 1.2; text-shadow: .12em .12em #000; text-transform: uppercase; }
 .cost-room > header > span { flex: none; padding: 1em; border: 3px solid var(--blue-light); color: var(--cream); font-size: clamp(5px, .45vw, 9px); text-transform: uppercase; }
+/* The bill in one breath: three plain questions over the payload's own headline
+   figures and one-sentence summaries, in the type Explain to the Room speaks in.
+   The doors below hold the arithmetic; this is what gets said out loud. */
+.cost-room-breath { display: grid; gap: 8px; }
+.cost-room-breath > h3 { margin: 0 0 2px; color: var(--yellow); font-size: clamp(8px, .62vw, 12px); line-height: 1.3; text-transform: uppercase; }
+.cost-room-breath > article { display: grid; grid-template-columns: minmax(150px, .26fr) minmax(0, 1fr); grid-template-rows: auto auto auto; column-gap: clamp(12px, 1.6vw, 22px); row-gap: 4px; min-width: 0; padding: 12px 14px; border: 3px solid #46527c; border-left-color: var(--yellow); background: #0a1130; }
+.cost-room-breath > article > span { grid-row: 1 / 4; color: var(--yellow); font-size: clamp(8px, .6vw, 11px); line-height: 1.45; text-transform: uppercase; }
+.cost-room-breath > article > b { color: var(--cream); font-family: ui-monospace, monospace; font-size: clamp(15px, 1.2vw, 22px); font-variant-numeric: tabular-nums; font-weight: 900; line-height: 1.35; overflow-wrap: anywhere; }
+.cost-room-breath > article > small { color: #aeb9df; font-family: ui-monospace, monospace; font-size: clamp(9px, .66vw, 12px); font-weight: 900; line-height: 1.4; overflow-wrap: anywhere; }
+.cost-room-breath > article > p { margin: 2px 0 0; color: #d7def6; font-family: ui-monospace, monospace; font-size: clamp(12px, .9vw, 15px); font-weight: 900; line-height: 1.45; overflow-wrap: anywhere; }
+.cost-room-strip-caption { margin: 4px 0 -.6vh; color: var(--yellow); font-size: clamp(7px, .55vw, 10px); line-height: 1.4; text-transform: uppercase; }
 .cost-room-idle { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1vw; }
 .cost-room-idle article { display: grid; align-content: start; gap: .7em; min-width: 0; padding: 1.1em; border: 3px solid #46527c; background: #050817; }
 .cost-room-idle strong { color: var(--cream); font-size: clamp(6px, .55vw, 11px); line-height: 1.4; text-transform: uppercase; }

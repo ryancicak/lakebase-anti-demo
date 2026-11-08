@@ -8,7 +8,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { InstantReplay } from './App'
 import type { DemoSession, RoundId } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
-import { replayStory, replayStoryWordCount } from './instant-replay'
+import { replayTape, replayTapeWordCount } from './instant-replay'
+import { buildRingsideResult } from './ringside-cues'
 
 afterEach(cleanup)
 
@@ -417,32 +418,31 @@ function roundFourWithoutAwsLane(): DemoSession {
   return session
 }
 
-describe('replayStory', () => {
+describe('replayTape', () => {
   it.each([
-    ['wake_idle_app', /genuine scale zero/i, /exact run-owned transaction/i, /does not measure the rest of the application/i],
-    ['make_schema_change_safely', /isolated environment/i, /same migration.*source was unchanged/i, /production cleanup was not tested/i],
-    ['recover_deleted_order', /aged to a recovery point.*deleted/i, /exact deleted order.*source read still proved it absent/i, /not a production failover/i],
-    ['put_model_score_in_app', /both integrations were parked.*both applications read the baseline row/i, /bell started both integrations.*score 0\.81.*Delta version 11.*own first exact read.*250 ms/i, /contains its own cold start.*own timestamps and is never compared/i],
-    // Fan-in: setup is supporting evidence and the shared-T0 time to 10,000 held
-    // clients is the primary result.
-    ['survive_connection_spike', /included pool.*selected RDS Proxy separately/i, /exactly 10,000 authenticated held clients per lane.*own clock.*held 30s.*multiplexing/i, /fan-in time is primary.*setup supports it.*client count is not backend count/i],
-    ['analyze_live_orders_without_slowing_checkout', /AWS DMS and Glue were parked.*change feed was streaming.*both sources read the baseline order/i, /committed one \$84\.50 checkout on both sources.*AWS DMS and Glue cold.*own first exact Delta read.*every second/i, /AWS’s clock contains its cold start.*built in and always on.*separate checkout committed on each source/i],
-  ] as const)(
-    'maps %s to Setup, Same test, and Takeaway',
-    (roundId, setup, sameTest, takeaway) => {
-      const story = replayStory(verifiedSession(roundId))
-      expect(story.state).toBe('verified')
-      expect(story.beats.map((beat) => beat.title)).toEqual(['Setup', 'Same test', 'Takeaway'])
-      expect(story.beats[0].body).toMatch(setup)
-      expect(story.beats[1].body).toMatch(sameTest)
-      expect(story.beats[2].body).toMatch(takeaway)
-    },
-  )
+    ['wake_idle_app', /^Bell\. Both databases are asleep, and the same connection goes in on both\.$/, /Awake\. The same transaction committed and read back\. Clock stops\./],
+    ['make_schema_change_safely', /each makes its own copy to test the change on/, /Made a branch of the source, ran the schema change on it.*proved the source untouched\. Clock stops\./],
+    ['recover_deleted_order', /same order is deleted on both sides at the same instant/, /Opened a branch at the recovery point.*source still showed it gone\. Clock stops\./],
+    ['put_model_score_in_app', /^Bell\. One new score lands in the lakehouse: 0\.81 for customer-42 at Delta version 11\. Both pipelines start cold\.$/, /The app read the new score\. Clock stops\./],
+    ['survive_connection_spike', /race to hold 10,000 client connections at once.*build an RDS Proxy first/, /10,000 clients held 12\.35s after the shared start/],
+    ['analyze_live_orders_without_slowing_checkout', /^Bell\. The same \$84\.50 checkout commits on both databases\. DMS and Glue start cold; Lakebase's feed is already on\./, /The order shows up in the lakehouse\. Clock stops\./],
+  ] as const)('opens %s on the bell and calls each lane in clock order', (roundId, opening, laneCall) => {
+    const session = verifiedSession(roundId)
+    const tape = replayTape(session)
+    expect(tape.state).toBe('verified')
+    expect(tape.calls[0]).toMatchObject({ who: 'Bell', atMs: 0, lane: 'bell' })
+    expect(tape.calls[0].text).toMatch(opening)
+    expect(tape.calls.map((call) => call.text).join(' ')).toMatch(laneCall)
+    // Timed calls read in clock order; untimed ones follow in the order they were made.
+    const timed = tape.calls.flatMap((call) => (call.atMs === null ? [] : [call.atMs]))
+    expect([...timed].sort((left, right) => left - right)).toEqual(timed)
+    // The final call is the one sentence Explain to the Room opens with.
+    expect(tape.finalCall).toBe(buildRingsideResult(session))
+  })
 
-  it('uses the Round 5 receipt values once in one primary treatment', () => {
-    const story = replayStory(verifiedSession('survive_connection_spike'))
-    expect(story.metricBeat).toBe('setup')
-    expect(story.metrics).toEqual([
+  it('uses the Round 5 receipt values once on the scoreboard and keeps a shared start off the bell clock', () => {
+    const tape = replayTape(verifiedSession('survive_connection_spike'))
+    expect(tape.metrics).toEqual([
       {
         laneId: 'lakebase',
         label: 'Lakebase time to 10,000',
@@ -456,79 +456,87 @@ describe('replayStory', () => {
         note: 'Exact authenticated held-client gate',
       },
     ])
-    // The primary metric is the fan-in time, and the takeaway has to say that
-    // setup supports it rather than scoring it.
-    expect(story.beats[1].body).toMatch(/exactly 10,000 authenticated held clients/i)
-    expect(story.beats[2].body).toMatch(/fan-in time is primary.*setup supports it/i)
+    // A legacy fan-in bout ran its 10,000 from a shared start after setup, so those
+    // times are told after the shared start and never placed on the bell clock.
+    const shared = tape.calls.find((call) => call.who === 'Shared start')
+    expect(shared?.atMs).toBeNull()
+    const fanIn = tape.calls.filter((call) => /after the shared start/.test(call.text))
+    expect(fanIn).toHaveLength(2)
+    expect(fanIn.every((call) => call.atMs === null)).toBe(true)
+    expect(tape.calls.indexOf(shared!)).toBeLessThan(tape.calls.indexOf(fanIn[0]))
   })
 
   it('races Round 6 lane against lane, only the AWS clock labeled a cold start', () => {
-    const story = replayStory(verifiedSession('analyze_live_orders_without_slowing_checkout'))
-    expect(story.status).toBe('Result verified')
-    expect(story.metricBeat).toBe('takeaway')
-    expect(story.metrics).toEqual([
+    const tape = replayTape(verifiedSession('analyze_live_orders_without_slowing_checkout'))
+    expect(tape.status).toBe('Result verified')
+    expect(tape.metrics).toEqual([
       { laneId: 'lakebase', label: 'Lakebase built-in change feed', value: '1.23s', note: 'Bell to exact Delta read' },
       { laneId: 'competitor', label: 'AWS DMS + Glue from Aurora Serverless v2 (cold start)', value: '74.10s', note: 'Bell to exact Delta read' },
     ])
-    const copy = story.beats.map((beat) => beat.body).join(' ')
+    const copy = [...tape.calls.map((call) => call.text), tape.finalCall].join(' ')
     expect(copy).not.toMatch(/not built or timed|capability|CDC stack|warm/i)
+    expect(copy).not.toMatch(/Lakebase[^.]*cold/i)
   })
 
   it('tells Round 6 without its AWS lane as Lakebase alone, with no race or margin', () => {
-    const story = replayStory(roundSixWithoutAwsLane())
-    expect(story.status).toBe('Capability proved')
-    expect(story.metrics.map((metric) => metric.laneId)).toEqual(['lakebase'])
-    expect(story.beats[0].body).toMatch(/no AWS lane, so no AWS clock started/i)
-    expect(story.beats[2].body).toMatch(/Without the AWS lane there is no race or margin/i)
+    const tape = replayTape(roundSixWithoutAwsLane())
+    expect(tape.status).toBe('Capability proved')
+    expect(tape.metrics.map((metric) => metric.laneId)).toEqual(['lakebase'])
+    expect(tape.calls[0].text).toMatch(/This install has no AWS lane/)
+    expect(tape.calls.map((call) => call.text).join(' ')).toMatch(/no AWS clock and nothing to compare/)
+    expect(tape.finalCall).toMatch(/nothing to compare it to/)
   })
 
   it('races Round 4 lane against lane, each clock named by its integration', () => {
-    const story = replayStory(verifiedSession('put_model_score_in_app'))
-    expect(story.status).toBe('Result verified')
-    expect(story.metricBeat).toBe('takeaway')
-    expect(story.metrics).toEqual([
+    const tape = replayTape(verifiedSession('put_model_score_in_app'))
+    expect(tape.status).toBe('Result verified')
+    expect(tape.metrics).toEqual([
       { laneId: 'lakebase', label: 'Lakebase synced table (cold start)', value: '31.50s', note: 'Bell to exact app read' },
       { laneId: 'competitor', label: 'AWS Glue → Aurora Serverless v2 (cold start)', value: '77.80s', note: 'Bell to exact app read' },
     ])
-    expect(story.beats.map((beat) => beat.body).join(' ')).not.toMatch(/not built or timed|capability/i)
+    // Lakebase's own sync timestamp is a call of its own, before its app read.
+    const calls = tape.calls.filter((call) => call.lane !== 'bell')
+    expect(calls.map((call) => call.who)).toEqual(['Lakebase synced table', 'Lakebase synced table', 'AWS Glue → Aurora Serverless v2'])
+    expect(calls[0].text).toMatch(/own sync timestamp, shown on its own and never compared/)
+    expect(tape.calls.map((call) => call.text).join(' ')).not.toMatch(/not built or timed|capability/i)
   })
 
   it('tells Round 4 without its AWS lane as Lakebase alone, with no race or margin', () => {
-    const story = replayStory(roundFourWithoutAwsLane())
-    expect(story.status).toBe('Capability proved')
-    expect(story.metrics.map((metric) => metric.laneId)).toEqual(['lakebase'])
-    expect(story.beats[0].body).toMatch(/no AWS lane, so no AWS clock started/i)
-    expect(story.beats[2].body).toMatch(/Without the AWS lane there is no race or margin/i)
+    const tape = replayTape(roundFourWithoutAwsLane())
+    expect(tape.status).toBe('Capability proved')
+    expect(tape.metrics.map((metric) => metric.laneId)).toEqual(['lakebase'])
+    expect(tape.calls[0].text).toMatch(/this install has no AWS lane/)
+    expect(tape.finalCall).toMatch(/nothing to compare it to/)
   })
 
   it.each([
-    ['one exact recovery', partialRecovery(), 'partial', /did not.*no completed comparison or margin/i],
-    ['no-result recovery', noResultRecovery(), 'no-result', /without an exact verified result/i],
-    ['one exact Round 5 setup', partialRoundFive(), 'partial', /per-lane 10,000-client fan-in did not run/i],
-    ['Round 4 errored lane', roundFourErroredLane(), 'partial', /Lakebase produced exact proof.*did not, so there is no completed comparison or margin/i],
-    ['Round 6 errored lane', roundSixErroredLane(), 'partial', /Lakebase produced exact proof.*did not, so there is no completed comparison or margin/i],
+    ['one exact recovery', partialRecovery(), 'partial', /still recovering, so its time is more than .* not a measurement|never finished, so there is a result but no margin/],
+    ['no-result recovery', noResultRecovery(), 'no-result', /^No result\./],
+    ['one exact Round 5 setup', partialRoundFive(), 'partial', /no winner and no margin/],
+    ['Round 4 errored lane', roundFourErroredLane(), 'partial', /never delivered it, so there is a result but no margin/],
+    ['Round 6 errored lane', roundSixErroredLane(), 'partial', /never delivered it, so there is a result but no margin/],
   ] as const)('adapts %s without claiming completed proof', (_name, session, state, copy) => {
-    const story = replayStory(session)
-    expect(story.state).toBe(state)
-    expect(`${story.beats[1].body} ${story.beats[2].body}`).toMatch(copy)
-    expect(story.status).not.toMatch(/^Result verified$|^Capability proved$/)
+    const tape = replayTape(session)
+    expect(tape.state).toBe(state)
+    expect(tape.finalCall).toMatch(copy)
+    expect(tape.status).not.toMatch(/^Result verified$|^Capability proved$/)
+    expect([...tape.calls.map((call) => call.text), tape.finalCall].join(' ')).not.toMatch(/Clock stops\.[^]*Clock stops\.[^]*Clock stops\./)
   })
 
-  it('keeps every presenter story within the ten-second reading budget', () => {
-    const stories = Object.keys(ROUND_NUMBERS).map((roundId) => (
-      replayStory(verifiedSession(roundId as RoundId))
-    ))
-    for (const story of stories) {
-      expect(replayStoryWordCount(story)).toBeLessThanOrEqual(82)
-      const copy = story.beats.map((beat) => beat.body).join(' ')
-      expect(copy).not.toMatch(/persona|test harness|contract test|leverage|delve|game-changer/i)
+  it('keeps every tape inside a reading budget and out of the lab', () => {
+    for (const roundId of Object.keys(ROUND_NUMBERS) as RoundId[]) {
+      const tape = replayTape(verifiedSession(roundId))
+      expect(replayTapeWordCount(tape)).toBeLessThanOrEqual(roundId === 'survive_connection_spike' ? 230 : 160)
+      const copy = [...tape.calls.map((call) => call.text), tape.finalCall].join(' ')
+      expect(copy).not.toMatch(/persona|test harness|contract test|leverage|delve|game-changer|run-owned|verifier|nonce|multiplexing/i)
+      expect(copy).not.toMatch(/[–—]/)
     }
   })
 })
 
 describe('InstantReplay', () => {
   it.each(Object.entries(ROUND_NUMBERS) as Array<[RoundId, number]>)(
-    'renders the clean %s replay through the universal three-beat shell',
+    'renders the clean %s replay as a scoreboard, a tape, and one evidence disclosure',
     (roundId, roundNumber) => {
       const { unmount } = render(
         <InstantReplay
@@ -537,17 +545,17 @@ describe('InstantReplay', () => {
           onClose={() => undefined}
         />,
       )
-      const story = screen.getByLabelText('Three-beat replay story')
-      expect(story.querySelectorAll('.replay-beat')).toHaveLength(3)
-      expect(within(story).getByRole('heading', { name: 'Setup' })).toBeVisible()
-      expect(within(story).getByRole('heading', { name: 'Same test' })).toBeVisible()
-      expect(within(story).getByRole('heading', { name: 'Takeaway' })).toBeVisible()
+      const story = screen.getByLabelText('Play-by-play')
+      expect(story.querySelectorAll('.replay-primary-metric')).toHaveLength(1)
+      expect(story.querySelectorAll('.replay-tape > li').length).toBeGreaterThanOrEqual(3)
+      expect(within(story).getByText('Bell')).toBeVisible()
+      expect(within(story).getByText('Final call')).toBeVisible()
       expect(screen.getAllByText(/view full evidence/i)).toHaveLength(1)
       unmount()
     },
   )
 
-  it('renders three visible beats, one primary metric treatment, and one evidence disclosure', () => {
+  it('renders the scoreboard, the tape, and one evidence disclosure with no nested details', () => {
     render(
       <InstantReplay
         session={verifiedSession('survive_connection_spike')}
@@ -555,11 +563,11 @@ describe('InstantReplay', () => {
         onClose={() => undefined}
       />,
     )
-    const story = screen.getByLabelText('Three-beat replay story')
-    expect(story.querySelectorAll('.replay-beat')).toHaveLength(3)
+    const story = screen.getByLabelText('Play-by-play')
     expect(story.querySelectorAll('.replay-primary-metric')).toHaveLength(1)
-    expect(within(story).getAllByText('12.35s')).toHaveLength(1)
-    expect(within(story).getAllByText('24.00s')).toHaveLength(1)
+    const scoreboard = within(story).getByLabelText('Primary measured result')
+    expect(within(scoreboard).getAllByText('12.35s')).toHaveLength(1)
+    expect(within(scoreboard).getAllByText('24.00s')).toHaveLength(1)
     expect(screen.getAllByText(/view full evidence/i)).toHaveLength(1)
     expect(document.querySelectorAll('details')).toHaveLength(1)
     expect(document.querySelector('details details')).toBeNull()
@@ -577,8 +585,9 @@ describe('InstantReplay', () => {
       />,
     )
 
-    expect(screen.getByText('7.54s')).toHaveAttribute('data-width', 'standard')
-    expect(screen.getByText('700.09s')).toHaveAttribute('data-width', 'long')
+    const scoreboard = screen.getByLabelText('Primary measured result')
+    expect(within(scoreboard).getByText('7.54s')).toHaveAttribute('data-width', 'standard')
+    expect(within(scoreboard).getByText('700.09s')).toHaveAttribute('data-width', 'long')
 
     const css = readFileSync(join(import.meta.dirname, 'styles.css'), 'utf8')
       .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -624,9 +633,7 @@ describe('InstantReplay', () => {
     )
     expect(screen.getByText(status)).toBeVisible()
     expect(screen.queryByText(/^Result verified$|^Capability proved$/i)).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Three-beat replay story')).toHaveTextContent(
-      /did not|without an exact/i,
-    )
+    expect(screen.getByLabelText('Play-by-play')).toHaveTextContent(/no margin|No result|a floor, not a result|not a measurement/i)
   })
 
   it.each([
@@ -684,6 +691,7 @@ describe('InstantReplay', () => {
     const component = source.slice(start, end)
     const visibleStory = component.slice(0, component.indexOf('<details className="replay-evidence">'))
     expect(visibleStory).toContain('className="replay-story"')
+    expect(visibleStory).toContain('className="replay-tape"')
     expect(visibleStory).not.toContain('className="replay-lanes"')
     expect(visibleStory).not.toContain('steps.map')
     expect(component.match(/<details\b/g)).toHaveLength(1)
@@ -698,6 +706,7 @@ describe('InstantReplay', () => {
     const narrow = css.slice(css.indexOf('@media (max-width: 759px)', css.indexOf('.replay-overlay')))
     expect(narrow).toMatch(/\.replay-modal\s*\{[^}]*width:\s*100vw[^}]*height:\s*100dvh[^}]*max-height:\s*100dvh/)
     expect(narrow).toMatch(/\.replay-story\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/)
+    expect(narrow).toMatch(/\.replay-tape > li\s*\{[^}]*grid-template-columns:\s*auto minmax\(0,\s*1fr\)/)
     expect(narrow).toMatch(/\.replay-evidence-step > div\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)/)
   })
 })
