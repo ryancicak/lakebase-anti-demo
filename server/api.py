@@ -812,6 +812,9 @@ class InstallationView(BaseModel):
     #: fields above contain, so a client cannot render operator advice to a
     #: viewer even by ignoring this: `_for_viewer` has already emptied them.
     audience: str = selfheal.AUDIENCE_OPERATOR
+    #: "aws" or "azure": the installation's cloud, which the banner's words follow.
+    #: Defaults to the AWS edition, the shape this view had before the field existed.
+    cloud: str = "aws"
 
 
 class RecoveryRequest(BaseModel):
@@ -951,7 +954,11 @@ async def get_installation(request: Request, recheck: bool = False) -> Installat
     state = selfheal.manifest_state()
     held, holder = selfheal.mutation_in_progress()
     offer = selfheal.build_offer(presence, state)
+    # A test app or a process that has no run manager yet reads as the AWS edition, the
+    # pre-field shape; the frontend treats an absent or "aws" cloud the same way.
+    cloud = getattr(getattr(request.app.state, "run_manager", None), "cloud", "aws")
     view = InstallationView(
+        cloud=cloud,
         state=presence.state,
         detail=presence.detail,
         sealed_resources=presence.sealed,

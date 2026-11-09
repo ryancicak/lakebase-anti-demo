@@ -25,6 +25,7 @@ from databricks.sdk.service.postgres import (
 from psycopg import sql
 
 from .capacity import LAKEBASE_SUSPEND_SECONDS
+from .home_cloud import by_cloud, installation_cloud
 from .manifest import DemoManifest, Round6Resources
 from .model_score_live import WorkspaceStatementRunner
 from .process_registry import state_dir_from_environ
@@ -364,8 +365,11 @@ def _validate_catalog(
 def _installation_catalog(manifest: DemoManifest, catalog: str) -> bool:
     """Whether `catalog` is the Azure installation's own, sealed in its Unity Catalog seal."""
 
-    azure = getattr(manifest, "azure", None)
-    sealed = getattr(azure, "unity_catalog", None)
+    sealed = by_cloud(
+        installation_cloud(manifest),
+        aws=None,  # the AWS edition reads an existing catalog and seals none of its own
+        azure=getattr(getattr(manifest, "azure", None), "unity_catalog", None),
+    )
     return sealed is not None and sealed.catalog == catalog
 
 
@@ -744,7 +748,7 @@ def prepare_round6(
 
     # On AWS, Round 6 is sealed after Round 5's baseline. The Azure edition's Round 6 is its own
     # server and data flow, so it needs Round 4's identities (the setup and App principals) alone.
-    azure = getattr(manifest, "cloud", "aws") == "azure"
+    azure = by_cloud(installation_cloud(manifest), aws=False, azure=True)
     if manifest.round4 is None or not (manifest.round5_ready or azure):
         raise RuntimeError("Round 6 requires the complete manifest v5 baseline")
     names = round6_names(manifest)

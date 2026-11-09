@@ -9,7 +9,8 @@ import type {
   RoundFiveRuntimeSnapshot,
   RoundFiveSetupState,
 } from './api/types'
-import { competitorKind } from './competitor-kind'
+import { byCompetitor } from './competitor-kind'
+import type { CompetitorKind } from './competitor-kind'
 import { roundFivePersonaMeaning } from './ringside-cues/corpus'
 
 export const ROUND_FIVE_ID = 'survive_connection_spike' as const
@@ -435,10 +436,11 @@ const ROUND_FIVE_AZURE_SETUP_TEXT: Record<string, string> = {
 }
 
 function setupCodeText(session: DemoSession, code: string, texts: Record<string, string>): string {
-  const azure = session.competitor?.id === 'azure_postgres'
-    ? ROUND_FIVE_AZURE_SETUP_TEXT[code]
-    : undefined
-  return azure ?? texts[code] ?? code
+  const id = session.competitor?.id
+  const edition = id === undefined
+    ? undefined
+    : byCompetitor(id, { aurora: undefined, rds: undefined, azure: ROUND_FIVE_AZURE_SETUP_TEXT[code] })
+  return edition ?? texts[code] ?? code
 }
 
 /**
@@ -859,17 +861,26 @@ const ROUND_FIVE_PHASE_LABELS: Record<RoundFiveRuntimePhase, string> = {
   cancelled: 'CANCELLED',
 }
 
-/** The Azure edition's pooling phases: its built-in PgBouncer, switched on at the bell. */
-const AZURE_ROUND_FIVE_PHASE_LABELS: Partial<Record<RoundFiveRuntimePhase, string>> = {
-  provisioning_proxy: 'SWITCHING ON PGBOUNCER',
-  verifying_proxy: 'CHECKING PGBOUNCER',
+/**
+ * Each edition's pooling phases. AWS's lane builds an RDS Proxy; Azure's switches on the server's
+ * built-in PgBouncer. A new kind has to say what its two setup phases are called.
+ */
+const ROUND_FIVE_PHASE_LABELS_BY_KIND: Record<CompetitorKind, Record<RoundFiveRuntimePhase, string>> = {
+  aurora: ROUND_FIVE_PHASE_LABELS,
+  rds: ROUND_FIVE_PHASE_LABELS,
+  azure: {
+    ...ROUND_FIVE_PHASE_LABELS,
+    provisioning_proxy: 'SWITCHING ON PGBOUNCER',
+    verifying_proxy: 'CHECKING PGBOUNCER',
+  },
 }
 
 /** An unknown phase from a newer server still reads as words: `some_phase` is "Some Phase". */
 export function roundFivePhaseLabel(phase: string, competitor?: CompetitorId): string {
-  const azure = competitor !== undefined && competitorKind(competitor) === 'azure'
-  const known = (azure ? (AZURE_ROUND_FIVE_PHASE_LABELS as Record<string, string>)[phase] : undefined)
-    ?? (ROUND_FIVE_PHASE_LABELS as Record<string, string>)[phase]
+  const labels = competitor === undefined
+    ? ROUND_FIVE_PHASE_LABELS
+    : byCompetitor(competitor, ROUND_FIVE_PHASE_LABELS_BY_KIND)
+  const known = (labels as Record<string, string>)[phase]
   if (known) return known
   const words = phase.replace(/_+/g, ' ').trim().toLowerCase()
   return words ? words.replace(/\b\w/g, (letter) => letter.toUpperCase()) : 'Unknown'

@@ -41,6 +41,7 @@ from server.generation_lock import (
     lock_is_held,
     transitional_status_recovery,
 )
+from server.home_cloud import by_cloud, installation_cloud
 from server.lease import LeaseKeeper
 from server.lifecycle import (
     OperatorIngressDrift,
@@ -318,7 +319,7 @@ def _bind_deployed_runtime(manifest: DemoManifest) -> None:
     ):
         raise InvalidStateError("Sealed Databricks runtime targets are not exact")
 
-    if getattr(manifest, "azure", None) is not None:
+    if by_cloud(installation_cloud(manifest), aws=False, azure=True):
         _bind_azure_runtime(manifest, sealed_client_id, expected_production, expected_coordination)
         return
     resources = manifest.aws.resources
@@ -526,10 +527,10 @@ def delta_storage_probe_from_manifest(
     if model_score_factory is None:
         return None
     # The Azure edition has one matchup, and its builders refuse AWS's competitors.
-    competitor = (
-        CompetitorId.AZURE_POSTGRES
-        if getattr(manifest, "cloud", "aws") == "azure"
-        else CompetitorId.RDS_POSTGRES
+    competitor = by_cloud(
+        installation_cloud(manifest),
+        aws=CompetitorId.RDS_POSTGRES,
+        azure=CompetitorId.AZURE_POSTGRES,
     )
 
     async def probe() -> None:
@@ -772,7 +773,7 @@ def connection_spike_factory_from_manifest(
         )
 
     def build() -> Callable[[CompetitorId], object] | None:
-        if getattr(manifest, "cloud", "aws") == "azure":
+        if by_cloud(installation_cloud(manifest), aws=False, azure=True):
             return azure_build()
         if not manifest.round5_ready:
             return None
@@ -1356,7 +1357,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
                 # the lease store or RunManager can accept an end-user request.
                 # Reported rather than raised: see `_deployed_credential_preflight`.
                 # The Azure edition holds no AWS credential to ask about.
-                if getattr(manifest, "azure", None) is None:
+                if by_cloud(installation_cloud(manifest), aws=True, azure=False):
                     startup_credential_verdict = _deployed_credential_preflight()
             candidate_store = build_lease_store()
             # A profile-bound localhost process can use the same durable Lakebase
@@ -1501,7 +1502,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             round5_resources = (
                 round5_resource_reader()
                 if callable(round5_resource_reader)
-                and getattr(manifest, "cloud", "aws") != "azure"
+                and by_cloud(installation_cloud(manifest), aws=True, azure=False)
                 else None
             )
             round5_cleanup_delegated = bool(
@@ -1511,7 +1512,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
             ) or bool(
                 # The Azure edition's Round 5 is warm-coordinator owned from the start, as
                 # AWS's v3 is: its cleanup is the coordinator's, never this gate's.
-                getattr(manifest, "cloud", "aws") == "azure"
+                by_cloud(installation_cloud(manifest), aws=False, azure=True)
                 and getattr(manifest, "round5_available", False)
                 and getattr(round5_lease_store, "mode", None) == "lakebase"
             )
@@ -1644,7 +1645,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
                 set_delivery_failure_handler(round5_warm_coordinator.invalidate_readiness)
         elif (
             manifest is not None
-            and getattr(manifest, "cloud", "aws") == "azure"
+            and by_cloud(installation_cloud(manifest), aws=False, azure=True)
             and manifest.round5_available
             and getattr(round5_lease_store, "mode", None) == "lakebase"
             and connection_spike_factory is not None
@@ -1771,7 +1772,7 @@ async def _open_runtime(app: FastAPI, *, deployed: bool) -> _Runtime:
         # dying process is the worst place to run destructive AWS calls.
         # The reaper sweeps AWS's per-bout clones. The Azure edition's copies are settled by
         # each round's own reset, as its readiness gate does at startup.
-        if manifest is not None and getattr(manifest, "azure", None) is not None:
+        if manifest is not None and by_cloud(installation_cloud(manifest), aws=False, azure=True):
             from server.reap import MODE_REPORT, ReapReport
 
             app.state.startup_reap = ReapReport(
@@ -1897,7 +1898,7 @@ def _start_credential_sentry(
     """
 
     app.state.credential_sentry = None
-    if manifest is None or getattr(manifest, "azure", None) is not None:
+    if manifest is None or by_cloud(installation_cloud(manifest), aws=False, azure=True):
         # Nothing to probe: a local start has no manifest, and the Azure edition no AWS credential.
         return None
     gate = getattr(app.state, "readiness_gate", None)
@@ -1935,7 +1936,7 @@ def _start_lease_keeper(
     if manifest is None:
         return None
     try:
-        if getattr(manifest, "azure", None) is not None:
+        if by_cloud(installation_cloud(manifest), aws=False, azure=True):
             from server.azure_lease import AzureLeaseScope, azure_lease_keeper
             from server.azure_runtime import app_arm_client
 

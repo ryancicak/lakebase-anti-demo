@@ -1,5 +1,5 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
-import { byCompetitor, scalesToZero } from '../competitor-kind'
+import { byCompetitor, competitorCloud, scalesToZero } from '../competitor-kind'
 import { modelScoreEvidence, roundFourStackLabel } from '../round4'
 import { roundSixStackLabel } from '../round6'
 import {
@@ -291,7 +291,7 @@ function resultSentence(session: DemoSession, winner: FormalWinner): string {
 
 /** The cloud the competitor lane belongs to, for a line about a lane that is not installed. */
 function cloudName(session: DemoSession): string {
-  return byCompetitor(session.competitor.id, { aurora: 'AWS', rds: 'AWS', azure: 'Azure' })
+  return competitorCloud(session.competitor.id)
 }
 
 /**
@@ -408,7 +408,7 @@ function outcomeHeadline(
       || session.round.id === 'analyze_live_orders_without_slowing_checkout'
     ) {
       return session.remembered_result?.trim()
-        || `LAKEBASE ${elapsed} · AWS LANE NOT INSTALLED`
+        || `LAKEBASE ${elapsed} · ${cloudName(session).toUpperCase()} LANE NOT INSTALLED`
     }
   }
   if (session.remembered_result?.trim()) return session.remembered_result

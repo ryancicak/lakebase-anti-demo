@@ -8,6 +8,7 @@ import pytest
 from server.models import (
     ComparisonKind,
     ComparisonSnapshot,
+    CompetitorId,
     LaneSnapshot,
     LaneState,
     MetricValue,
@@ -506,3 +507,22 @@ def test_towel_snapshot_reads_legacy_round_three_cutoff() -> None:
 
     assert snapshot.cutoff_ms == 12_345.0
     assert snapshot.censored_lower_bounds_ms == {}
+
+
+def test_a_lane_that_is_not_installed_is_named_by_its_own_cloud() -> None:
+    # The Azure edition used to read the AWS words here; a lane is named by the cloud it is in.
+    lanes = {
+        "lakebase": _lane("lakebase", LaneState.VERIFIED, 1_250.0),
+        "competitor": _lane("competitor", LaneState.NOT_SUPPORTED, 2_500.0),
+    }
+    aws = adjudicate_towel(round_id=RoundId.PUT_MODEL_SCORE_IN_APP, lanes=lanes, cutoff_ms=10_000.0)
+    assert "AWS capability lane N/A" in aws.public_result
+    assert "the AWS capability lane remained N/A" in aws.comparison.detail
+    azure = adjudicate_towel(
+        round_id=RoundId.PUT_MODEL_SCORE_IN_APP,
+        lanes=lanes,
+        cutoff_ms=10_000.0,
+        competitor=CompetitorId.AZURE_POSTGRES,
+    )
+    assert "Azure capability lane N/A" in azure.public_result
+    assert "AWS" not in azure.public_result and "AWS" not in azure.comparison.detail

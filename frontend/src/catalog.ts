@@ -8,6 +8,7 @@ import type {
   RoundId,
 } from './api/types'
 import { personaPortraits } from './assets'
+import { byCompetitor, scalesToZero } from './competitor-kind'
 import { ROUND_FIVE_BELL_PROTOCOL, ROUND_FIVE_DISPLAY_TITLE, ROUND_FIVE_MAX_RETRIES } from './round5'
 
 export interface LocalRecommendation {
@@ -235,8 +236,9 @@ export function recommend(
     .find((round) => round?.availability === 'ready' && round.competitors.includes(competitor))
   const baselineId: RoundId = 'wake_idle_app'
   const selected = preferred ?? catalog.rounds.find((round) => round.id === baselineId) ?? catalog.rounds[0]
-  const reason = competitor === 'rds_postgres' && selected.id === 'wake_idle_app'
-    ? 'RDS PostgreSQL has no automatic scale-to-zero wake path; its capability is checked before the bell and only Lakebase is timed.'
+  const competitorName = catalog.competitors.find((candidate) => candidate.id === competitor)?.short_name ?? competitor
+  const reason = !scalesToZero(competitor) && selected.id === 'wake_idle_app'
+    ? `${competitorName} has no automatic scale-to-zero wake path; its capability is checked before the bell and only Lakebase is timed.`
     : preferred
     ? `Recommended for ${persona.role} and executable for this matchup.`
     : `Selected as the strongest honest matchup; the ${persona.role} lens changes the explanation, not the evidence.`
@@ -272,8 +274,9 @@ export function stopCondition(
   competitor?: CompetitorId,
   fanIn = false,
 ): string {
-  if (roundId === 'wake_idle_app' && competitor === 'rds_postgres') {
-    return 'Lakebase stops after commit + read-back; RDS eligibility is checked before the bell and not timed.'
+  if (roundId === 'wake_idle_app' && competitor !== undefined && !scalesToZero(competitor)) {
+    const name = byCompetitor(competitor, { aurora: 'Aurora', rds: 'RDS', azure: 'Azure PostgreSQL' })
+    return `Lakebase stops after commit + read-back; ${name} eligibility is checked before the bell and not timed.`
   }
   if (roundId === 'wake_idle_app') {
     return 'Each clock stops after commit and read-back of its run-unique value.'

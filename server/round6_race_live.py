@@ -30,6 +30,7 @@ import psycopg
 from psycopg import sql
 
 from .aws_auth import runtime_auth_from_environment
+from .home_cloud import by_cloud, installation_cloud
 from .live_orders import (
     LiveOrder,
     LiveOrdersLiveAdapter,
@@ -570,17 +571,22 @@ def build_round6_race_engine(manifest: DemoManifest, competitor: CompetitorId) -
     whose AWS lane is not sealed.
     """
 
-    if getattr(manifest, "azure", None) is not None:
+
+    def aws_engine() -> Round6RaceEngine:
+        v1 = build_live_orders_engine(manifest)
+        adapter = v1.adapter
+        assert isinstance(adapter, LiveOrdersLiveAdapter)
+        baseline = v1.contract.baseline
+        lanes: list[Any] = [LakebaseFeedLane(adapter, baseline)]
+        if manifest.round6_aws is not None:
+            # The same warehouse and client Lakebase's history is read on, so both lanes are
+            # read by one reader.
+            lanes.append(AwsCaptureLane(manifest, competitor, adapter._statements))
+        return Round6RaceEngine(lanes, baseline=baseline)
+
+    def azure_engine() -> Round6RaceEngine:
         from .azure_runtime import build_azure_round6_race_engine
 
         return build_azure_round6_race_engine(manifest, competitor)
-    v1 = build_live_orders_engine(manifest)
-    adapter = v1.adapter
-    assert isinstance(adapter, LiveOrdersLiveAdapter)
-    baseline = v1.contract.baseline
-    lanes: list[Any] = [LakebaseFeedLane(adapter, baseline)]
-    if manifest.round6_aws is not None:
-        # The same warehouse and client Lakebase's history is read on, so both lanes are read
-        # by one reader.
-        lanes.append(AwsCaptureLane(manifest, competitor, adapter._statements))
-    return Round6RaceEngine(lanes, baseline=baseline)
+
+    return by_cloud(installation_cloud(manifest), aws=aws_engine, azure=azure_engine)()

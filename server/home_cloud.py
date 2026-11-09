@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
 
+from .models import InstallationCloud
+
 
 @dataclass(frozen=True)
 class HomeCloud:
@@ -61,3 +63,27 @@ def home_cloud_for_host(host: str, *, default: HomeCloud | None = None) -> HomeC
     if default is not None:
         return default
     raise ValueError(f"{hostname or host!r} is not an AWS or Azure Databricks workspace host")
+
+
+def by_cloud[T](cloud: str, *, aws: T, azure: T) -> T:
+    """One choice per cloud, each a keyword: the server's `byCompetitor`.
+
+    Every place the server decides by cloud goes through here instead of an "azure, else
+    AWS" test, so a third cloud is a third keyword this signature has to grow
+    (`tests/test_cloud_choice.py` holds it to `InstallationCloud`) and every call site then has
+    to supply, rather than a path that reads as AWS in silence. An unknown cloud is a refusal.
+    A branch that must not run for the other cloud is passed as a callable and called by the
+    caller: ``by_cloud(cloud, aws=build_aws, azure=build_azure)()``.
+    """
+
+    if cloud == "aws":
+        return aws
+    if cloud == "azure":
+        return azure
+    raise ValueError(f"unknown installation cloud {cloud!r}")
+
+
+def installation_cloud(manifest: object) -> InstallationCloud:
+    """The cloud a manifest belongs to; a stand-in without the field is the AWS edition's."""
+
+    return getattr(manifest, "cloud", "aws")

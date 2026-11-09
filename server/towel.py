@@ -5,9 +5,11 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel
 
+from .home_cloud import by_cloud
 from .models import (
     ComparisonKind,
     ComparisonSnapshot,
+    CompetitorId,
     LaneActivity,
     LaneSnapshot,
     LaneState,
@@ -15,6 +17,7 @@ from .models import (
     RoundFiveSetupLaneSnapshot,
     RoundFiveSetupState,
     RoundId,
+    competitor_cloud,
 )
 
 _ACTIVE_STATES = {LaneState.CONNECTING, LaneState.VERIFYING}
@@ -345,12 +348,15 @@ def adjudicate_towel(
     lanes: Mapping[str, LaneSnapshot],
     cutoff_ms: float,
     normal_comparison: ComparisonSnapshot | None = None,
+    competitor: str = CompetitorId.RDS_POSTGRES,
 ) -> TowelAdjudication:
     """Adjudicate one two-lane bout at an authoritative monotonic cutoff.
 
     The caller remains responsible for stopping work, cleaning owned artifacts,
     and releasing the ring. This function only freezes truthful public evidence.
-    Its inputs are never mutated.
+    Its inputs are never mutated. `competitor` names the cloud a lane that is not
+    installed belongs to; the AWS edition's words are the default for a caller that
+    does not say.
     """
 
     if not math.isfinite(cutoff_ms) or cutoff_ms < 0:
@@ -399,13 +405,14 @@ def adjudicate_towel(
         and lanes["competitor"].state == LaneState.NOT_SUPPORTED
     )
     if lakebase_verified_with_unsupported_aws:
+        cloud = by_cloud(competitor_cloud(str(competitor)), aws="AWS", azure="Azure")
         detail = (
             normal_comparison.detail
             if normal_comparison is not None
             and normal_comparison.kind == ComparisonKind.CAPABILITY_GAP
             and normal_comparison.winner_lane_id == "lakebase"
             and normal_comparison.margin is None
-            else "Lakebase exact proof verified; the AWS capability lane remained N/A."
+            else f"Lakebase exact proof verified; the {cloud} capability lane remained N/A."
         )
         return TowelAdjudication(
             cutoff_ms=cutoff_ms,
@@ -419,7 +426,7 @@ def adjudicate_towel(
             ),
             public_result=(
                 "Toweled after Lakebase exact proof verified · "
-                "AWS capability lane N/A · Lakebase wins the capability round"
+                f"{cloud} capability lane N/A · Lakebase wins the capability round"
             ),
         )
 

@@ -1,5 +1,5 @@
 import type { CooldownLaneSnapshot, DemoSession, LaneId } from './api/types'
-import { byCompetitor } from './competitor-kind'
+import { byCompetitor, competitorCloud } from './competitor-kind'
 import { classifyOutcome } from './ringside-cues'
 import { isRoundFour, roundFourStackLabel } from './round4'
 import {
@@ -42,7 +42,7 @@ function at(milliseconds: number | null | undefined): string {
 }
 
 function cloudOf(session: DemoSession): string {
-  return byCompetitor(session.competitor.id, { aurora: 'AWS', rds: 'AWS', azure: 'Azure' })
+  return competitorCloud(session.competitor.id)
 }
 
 function detail(status: string | null | undefined): string {
