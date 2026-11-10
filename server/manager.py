@@ -51,6 +51,7 @@ from .coordination import (
 from .cost_identity import ProviderResourceIdentity, capture_bout_cost_identity
 from .cost_ledger import CalibrationKey, CostEstimate, CostLedgerStore
 from .descent_cost import build_descent_cost_disclosure
+from .home_cloud import by_cloud
 from .live_orders import (
     LiveOrder,
     LiveOrdersError,
@@ -780,25 +781,25 @@ _AZURE_ROUND_SIX_CONDITION = (
 
 
 def _round_six_condition(competitor: CompetitorId) -> str:
-    return (
-        _AZURE_ROUND_SIX_CONDITION
-        if competitor_cloud(competitor) == "azure"
-        else _ROUND_SIX_CONDITION
+    return by_cloud(
+        competitor_cloud(competitor), aws=_ROUND_SIX_CONDITION, azure=_AZURE_ROUND_SIX_CONDITION
     )
 
 
 def _lane_not_installed(round_number: int, competitor: CompetitorId) -> tuple[str, str]:
     """A Round 4 or 6 lane this installation lacks: the lane's status, and the reason."""
 
-    if competitor_cloud(competitor) == "azure":
-        return (
+    return by_cloud(
+        competitor_cloud(competitor),
+        aws=(
+            "AWS lane not installed on this installation",
+            _ROUND_FOUR_UNSUPPORTED_REASON if round_number == 4 else _ROUND_SIX_UNSUPPORTED_REASON,
+        ),
+        azure=(
             "Azure lane not installed on this installation",
             f"Round {round_number}'s Azure lane is not installed on this installation, so only "
             "Lakebase ran.",
-        )
-    return (
-        "AWS lane not installed on this installation",
-        _ROUND_FOUR_UNSUPPORTED_REASON if round_number == 4 else _ROUND_SIX_UNSUPPORTED_REASON,
+        ),
     )
 
 #: How long the next Round 6 Prepare waits for the previous bout to finish settling (remove its
@@ -1105,23 +1106,27 @@ def _round_one_cooldown_wire_call(
 ) -> str:
     if lane_id == "lakebase":
         return "databricks postgres get-endpoint"
-    if competitor_id == CompetitorId.AZURE_POSTGRES:
+
+    def aws_call() -> str:
+        if aws_lane(competitor_id) == "aurora":
+            return (
+                "RDS DescribeDBClusters + DescribeDBInstances + DescribeEvents → "
+                "CloudWatch GetMetricStatistics fallback"
+            )
+        return "RDS DescribeDBInstances"
+
+    return by_cloud(
+        competitor_cloud(competitor_id),
+        aws=aws_call,
         # Like RDS, Azure has no scale-to-zero, and Round 1 stands no Azure server up to ask.
-        return "none: Round 1 stands no Azure PostgreSQL server up"
-    if aws_lane(competitor_id) == "aurora":
-        return (
-            "RDS DescribeDBClusters + DescribeDBInstances + DescribeEvents → "
-            "CloudWatch GetMetricStatistics fallback"
-        )
-    return "RDS DescribeDBInstances"
+        azure=lambda: "none: Round 1 stands no Azure PostgreSQL server up",
+    )()
 
 
 def _pooled_path(competitor_id: CompetitorId) -> str:
     """What Round 5's competitor lane turns on to pool: a new RDS Proxy, or Azure's PgBouncer."""
 
-    if competitor_id == CompetitorId.AZURE_POSTGRES:
-        return "PgBouncer"
-    return "RDS Proxy"
+    return by_cloud(competitor_cloud(competitor_id), aws="RDS Proxy", azure="PgBouncer")
 
 
 def _lane_arm_waiting(progress: SafeChangeProgress | RecoveryProgress) -> dict[str, object]:
@@ -2287,17 +2292,19 @@ class RunManager:
         rather than assuming the two agree.
         """
 
-        if self.cloud == "azure":
+        return by_cloud(
+            self.cloud,
+            aws=lambda: build_standing_cost_disclosure(
+                self._cost_manifest,
+                now=datetime.now(UTC),
+                report=self._drift_report() if self._drift_report is not None else None,
+                posted=self._posted_usage() if self._posted_usage is not None else None,
+                observed_rds_instance_class=observed_rds_instance_class(capacity),
+            ),
             # Its arithmetic is the AWS installation's shape and rate card; the Azure edition has
             # none of its own yet, and an empty AWS panel would only explain AWS's billing.
-            return None
-        return build_standing_cost_disclosure(
-            self._cost_manifest,
-            now=datetime.now(UTC),
-            report=self._drift_report() if self._drift_report is not None else None,
-            posted=self._posted_usage() if self._posted_usage is not None else None,
-            observed_rds_instance_class=observed_rds_instance_class(capacity),
-        )
+            azure=lambda: None,
+        )()
 
     @staticmethod
     def _cost_resource_for_line(
@@ -3161,7 +3168,9 @@ class RunManager:
             # between rounds, so every round shows the whole measured table.
             # Aurora's measured table, so the AWS edition's alone: the Azure edition has no
             # measured bouts to tabulate yet.
-            bout_cost=build_bout_cost_disclosure() if self.cloud == "aws" else None,
+            bout_cost=by_cloud(
+                self.cloud, aws=lambda: build_bout_cost_disclosure(), azure=lambda: None
+            )(),
             cost_receipt=build_cost_receipt(selected_round.id, request.competitor),
             round5_setup=round5_setup,
             metric_specs=[item.model_copy(deep=True) for item in selected_round.metric_specs],
@@ -3348,10 +3357,10 @@ class RunManager:
     def _new_round_five_runtime(
         context: BellContext, competitor_id: object = CompetitorId.RDS_POSTGRES
     ) -> RoundFiveRuntimeSnapshot:
-        building = (
-            "Azure is switching on its built-in PgBouncer"
-            if competitor_id == CompetitorId.AZURE_POSTGRES
-            else "AWS is creating the per-bout RDS Proxy"
+        building = by_cloud(
+            competitor_cloud(str(competitor_id)),
+            aws="AWS is creating the per-bout RDS Proxy",
+            azure="Azure is switching on its built-in PgBouncer",
         )
         return RoundFiveRuntimeSnapshot(
             warm_generation=context.warm_generation,
@@ -5129,6 +5138,7 @@ class RunManager:
                     lanes=record.snapshot.lanes,
                     cutoff_ms=cutoff_ms,
                     normal_comparison=normal_comparison,
+                    competitor=record.snapshot.competitor.id,
                 )
             requested_at = datetime.now(UTC)
             restore_started = False
@@ -12323,7 +12333,9 @@ class RunManager:
         lane_id: object, phase: str, competitor_id: object = CompetitorId.RDS_POSTGRES
     ) -> str:
         generic = "Preparing and verifying the per-bout pooling path"
-        if lane_id == "competitor" and competitor_id == CompetitorId.AZURE_POSTGRES:
+        if lane_id == "competitor" and by_cloud(
+            competitor_cloud(str(competitor_id)), aws=False, azure=True
+        ):
             # The Azure edition's timed setup: its built-in PgBouncer, on the server's own host.
             return {
                 "switching_on_pgbouncer": "Azure is switching on its built-in PgBouncer",
@@ -15013,10 +15025,10 @@ class RunManager:
             assert snapshot.lanes["lakebase"].state == LaneState.VERIFIED
             # The AWS edition's words are RDS's, whichever AWS competitor stands; the Azure
             # edition's challenger is named as its card names it.
-            challenger = (
-                snapshot.competitor.short_name.upper()
-                if competitor_cloud(snapshot.competitor.id) == "azure"
-                else "RDS"
+            challenger = by_cloud(
+                competitor_cloud(snapshot.competitor.id),
+                aws="RDS",
+                azure=snapshot.competitor.short_name.upper(),
             )
             return f"LAKEBASE WINS — {challenger} CANNOT ENTER THE ROUND"
         stoppage = snapshot.comparison

@@ -475,3 +475,15 @@ describe('when the banner cannot read its own endpoint', () => {
     }
   })
 })
+
+it('names the installation\u2019s own cloud when the server says which', () => {
+  const copy = bannerCopy(status({ state: 'unverified', checked: true, reason: 'The sweep failed', cloud: 'azure' }))
+  expect(copy?.instead).toContain('az login')
+  expect(copy?.instead).not.toContain('aws sso login')
+  expect(copy?.lede).not.toContain('AWS')
+})
+
+it('reads a server that predates the cloud field as the AWS edition', () => {
+  const copy = bannerCopy(status({ state: 'unverified', checked: true, reason: 'The sweep failed' }))
+  expect(copy?.instead).toContain('aws sso login')
+})

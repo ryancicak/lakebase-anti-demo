@@ -27,7 +27,8 @@ import {
   type ReactNode,
 } from 'react'
 import { brandAssets } from './assets'
-import { competitorKind } from './competitor-kind'
+import { byCompetitor } from './competitor-kind'
+import type { CompetitorKind } from './competitor-kind'
 import contributorsData from './credits-contributors.json'
 import {
   playConfirm,
@@ -53,6 +54,22 @@ import './credits.css'
    audit harness, and without this line the author credit falls back to unstyled
    defaults in exactly those places. Bundlers dedupe the second import. */
 import './credits-entry.css'
+
+/** The names the credits give each edition's stack: what owns the environment, who runs the burst, where it was filmed. */
+const AWS_STACK = {
+  owned: 'Terraform · AWS SDK · Databricks SDK',
+  runners: 'SSM-managed c7i.2xlarge, one per lane',
+  location: 'us-west-2',
+}
+const EDITION_STACK: Record<CompetitorKind, typeof AWS_STACK> = {
+  aurora: AWS_STACK,
+  rds: AWS_STACK,
+  azure: {
+    owned: 'Terraform · Azure Resource Manager · Databricks SDK',
+    runners: 'Run Command-managed Standard_D8ls_v7, one per lane',
+    location: 'westus2',
+  },
+}
 
 /** Reference crawl speed. Only used when there is no cue to sync to. */
 const DESIGN_PX_PER_SECOND = 40
@@ -317,8 +334,8 @@ export function Credits({
     () => competitors.filter((competitor) => tally.competitors.includes(competitor.short_name)),
     [competitors, tally.competitors],
   )
-  // The Azure edition's installation: its own cloud's names in the credits that name one.
-  const azure = competitors.some((competitor) => competitorKind(competitor.id) === 'azure')
+  // The installation's cloud: every competitor in one catalog shares it, so the first names it.
+  const stack = competitors[0] === undefined ? EDITION_STACK.aurora : byCompetitor(competitors[0].id, EDITION_STACK)
 
   return (
     <main
@@ -437,13 +454,13 @@ export function Credits({
 
           <Block kicker="No stunt doubles">
             <Name role="Application and verifier" name="FastAPI · React · psycopg 3" />
-            <Name role="Owned environment" name={azure ? 'Terraform · Azure Resource Manager · Databricks SDK' : 'Terraform · AWS SDK · Databricks SDK'} />
-            <Name role="Neutral burst runners" name={azure ? 'Run Command-managed Standard_D8ls_v7, one per lane' : 'SSM-managed c7i.2xlarge, one per lane'} />
+            <Name role="Owned environment" name={stack.owned} />
+            <Name role="Neutral burst runners" name={stack.runners} />
             <Name role="Ring lease" name="Fenced Lakebase coordination branch" />
           </Block>
 
           <Block kicker="Filmed on location">
-            <Name role="Live infrastructure, one owned run" name={azure ? 'westus2' : 'us-west-2'} />
+            <Name role="Live infrastructure, one owned run" name={stack.location} />
             <Name role="Every database in this picture" name="PostgreSQL 17" />
             <Name role="Every clock in this picture" name="Measured, never simulated" />
           </Block>

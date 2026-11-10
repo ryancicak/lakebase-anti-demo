@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .aws_auth import AwsAuthMode
 from .azure_manifest import AzureManifest
 from .capacity import rds_lane_is_scored
+from .home_cloud import by_cloud
 from .models import InstallationCloud, RoundId
 from .round6_contract import round6_contract_sha256
 
@@ -1331,7 +1332,8 @@ class DemoManifest(BaseModel):
 
     @model_validator(mode="after")
     def require_versioned_resources(self) -> DemoManifest:
-        if self.cloud == "azure":
+        # Exhaustive by cloud: a new edition decides which validation it gets before it exists.
+        if by_cloud(self.cloud, aws=False, azure=True):
             self._validate_azure_installation()
             self._validate_environment_seals()
             return self
@@ -1753,9 +1755,7 @@ class DemoManifest(BaseModel):
         throughout; the App's own Round 5 wiring and readiness gate ask this.
         """
 
-        if self.cloud == "azure":
-            return self.round5_azure is not None
-        return self.round5_ready
+        return by_cloud(self.cloud, aws=self.round5_ready, azure=self.round5_azure is not None)
 
     def require_azure_round5_resources(self) -> Round5AzureResources:
         """The Azure edition's Round 5 seal (`round5_ready` does not answer for it yet)."""
@@ -1766,10 +1766,12 @@ class DemoManifest(BaseModel):
 
     @property
     def round6_ready(self) -> bool:
-        if self.cloud == "azure":
+        return by_cloud(
+            self.cloud,
+            aws=self.manifest_version in (6, 7) and self.round5_ready and self.round6 is not None,
             # Azure's Round 6 needs no Round 5 seal: its lane is its own server and data flow.
-            return self.round6 is not None
-        return self.manifest_version in (6, 7) and self.round5_ready and self.round6 is not None
+            azure=self.round6 is not None,
+        )
 
     # There is deliberately no `assert_not_expired` here, and re-adding one would
     # re-arm a trap rather than restore a safeguard.
@@ -1881,7 +1883,7 @@ def apply_manifest_environment(manifest: DemoManifest) -> None:
     coordination_endpoint = manifest.databricks.coordination_endpoint_name or (
         f"projects/{manifest.databricks.project_id}/branches/coordination/endpoints/primary"
     )
-    if getattr(manifest, "azure", None) is not None:
+    if by_cloud(manifest.cloud, aws=False, azure=True):
         _apply_azure_manifest_environment(manifest, coordination_endpoint)
         return
     assert manifest.aws is not None

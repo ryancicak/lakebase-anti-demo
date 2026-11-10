@@ -1,5 +1,5 @@
 import type { DemoSession, LaneId, RoundId } from './api/types'
-import { byCompetitor } from './competitor-kind'
+import { byCompetitor, competitorCloud } from './competitor-kind'
 import { buildRingsideResult, classifyOutcome } from './ringside-cues'
 import { modelScoreEvidence, roundFourLaneLabel, roundFourStackLabel } from './round4'
 import { liveOrderEvidence, roundSixLaneLabel, roundSixStackLabel } from './round6'
@@ -14,11 +14,6 @@ import {
   roundFiveSetupLaneResult,
 } from './round5'
 import { preciseDuration } from './time'
-
-/** Azure's words where the AWS edition's name AWS's products; the AWS edition's are unchanged. */
-function azureOr(session: DemoSession, azure: string, aws: string): string {
-  return byCompetitor(session.competitor.id, { aurora: aws, rds: aws, azure })
-}
 
 export type ReplayStoryState = 'verified' | 'partial' | 'no-result'
 
@@ -316,7 +311,7 @@ function roundFourTape(session: DemoSession): ReplayTape {
   const score = evidence.score === '—' ? '' : `: ${evidence.score} for ${evidence.primaryKey}`
   const delta = evidence.deltaVersion === '—' ? '' : ` at Delta version ${evidence.deltaVersion}`
   const awsLane = session.lanes.competitor.state !== 'not_supported'
-  const cloud = azureOr(session, 'Azure', 'AWS')
+  const cloud = competitorCloud(session.competitor.id)
   const metrics = observedMetrics(
     session,
     {
@@ -343,9 +338,9 @@ function roundFourTape(session: DemoSession): ReplayTape {
 function roundFiveTape(session: DemoSession): ReplayTape {
   const recurringFanIn = roundFiveUsesFanIn(session)
   const bellRuntime = roundFiveBellRuntime(session)
-  const cloud = azureOr(session, 'Azure', 'AWS')
-  const build = azureOr(session, 'switch on PgBouncer and raise its client limit', 'build an RDS Proxy')
-  const ready = azureOr(session, 'PgBouncer is on and answering.', 'The RDS Proxy is built and answering.')
+  const cloud = competitorCloud(session.competitor.id)
+  const build = byCompetitor(session.competitor.id, { aurora: 'build an RDS Proxy', rds: 'build an RDS Proxy', azure: 'switch on PgBouncer and raise its client limit' })
+  const ready = byCompetitor(session.competitor.id, { aurora: 'The RDS Proxy is built and answering.', rds: 'The RDS Proxy is built and answering.', azure: 'PgBouncer is on and answering.' })
 
   // Under the V4 bell runtime the primary clock is the observed
   // bell_to_10000_observed_ms, which stays sticky through a hold, a towel, or a
@@ -384,8 +379,18 @@ function roundFiveTape(session: DemoSession): ReplayTape {
       ? null
       : { laneId, label, value: preciseDuration(milliseconds), note }
   }
-  const pool = azureOr(session, 'Azure built-in PgBouncer', 'Selected AWS managed pool')
-  const provisioned = azureOr(session, 'PgBouncer turned on', 'New RDS Proxy provisioned')
+  const pool = byCompetitor(session.competitor.id, {
+    aurora: 'Selected AWS managed pool',
+    rds: 'Selected AWS managed pool',
+    azure: 'Azure built-in PgBouncer',
+  })
+  // Each lane's time to the exact 10,000 held-client gate, in the edition's words.
+  const tenThousand = byCompetitor(session.competitor.id, {
+    aurora: 'Selected AWS path time to 10,000', // the held-client gate
+    rds: 'Selected AWS path time to 10,000', // the held-client gate
+    azure: 'Azure PgBouncer time to 10,000', // the held-client gate
+  })
+  const provisioned = byCompetitor(session.competitor.id, { aurora: 'New RDS Proxy provisioned', rds: 'New RDS Proxy provisioned', azure: 'PgBouncer turned on' })
   const metrics = [
     exactFanInMetric(
       'lakebase',
@@ -399,12 +404,12 @@ function roundFiveTape(session: DemoSession): ReplayTape {
     ) ?? lowerBoundMetric(session, 'lakebase', 'Lakebase built-in pool'),
     exactFanInMetric(
       'competitor',
-      recurringFanIn ? azureOr(session, 'Azure PgBouncer time to 10,000', 'Selected AWS path time to 10,000') : pool,
+      recurringFanIn ? tenThousand : pool,
       recurringFanIn ? 'Exact authenticated held-client gate' : provisioned,
     ) ?? exactMetric(
       session,
       'competitor',
-      recurringFanIn ? azureOr(session, 'Azure PgBouncer time to 10,000', 'Selected AWS path time to 10,000') : pool,
+      recurringFanIn ? tenThousand : pool,
       recurringFanIn ? 'Exact authenticated held-client gate' : provisioned,
     ) ?? lowerBoundMetric(session, 'competitor', pool),
   ].filter((metric): metric is ReplayMetric => metric !== null)
@@ -505,8 +510,8 @@ function roundSixTape(session: DemoSession): ReplayTape {
   const total = liveOrderEvidence(session.lanes.lakebase).totalDisplay
   const checkout = total === '—' ? 'The same checkout' : `The same ${total} checkout`
   const awsLane = session.lanes.competitor.state !== 'not_supported'
-  const cloud = azureOr(session, 'Azure', 'AWS')
-  const coldStack = azureOr(session, 'The Azure data flow starts cold', 'DMS and Glue start cold')
+  const cloud = competitorCloud(session.competitor.id)
+  const coldStack = byCompetitor(session.competitor.id, { aurora: 'DMS and Glue start cold', rds: 'DMS and Glue start cold', azure: 'The Azure data flow starts cold' })
   const metrics = observedMetrics(
     session,
     {

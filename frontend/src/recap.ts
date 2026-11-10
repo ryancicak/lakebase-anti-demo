@@ -18,6 +18,7 @@
  */
 
 import type { CompetitorId, LaneState, RoundId } from './api/types'
+import { competitorCloud } from './competitor-kind'
 import { ROUND_FIVE_DISPLAY_TITLE_UPPER } from './round5'
 import {
   classifyEvidence,
@@ -770,7 +771,7 @@ export function ledgerVerdict(result: RoundResult): LedgerVerdict {
         // Rounds 4 and 6 race AWS wherever the lane is installed, so theirs was not
         // installed; the others have no equivalent native path at all.
         laneNote: racesAwsLane(result.roundId)
-          ? 'BLUE CORNER · AWS LANE NOT INSTALLED'
+          ? `BLUE CORNER · ${result.opponentId ? competitorCloud(result.opponentId).toUpperCase() : 'AWS'} LANE NOT INSTALLED`
           : `BLUE CORNER · ${NO_EQUIVALENT_NATIVE_PATH}`,
       }
 

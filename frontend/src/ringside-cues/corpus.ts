@@ -1,5 +1,5 @@
 import type { CompetitorId, CustomerCorner, PersonaId, RoundId } from '../api/types'
-import { competitorKind } from '../competitor-kind'
+import { byCompetitor, competitorKind } from '../competitor-kind'
 import lensSource from './lens-lines.jsonl?raw'
 import resultSource from './result-lines.jsonl?raw'
 import roleSource from './role-lines.jsonl?raw'
@@ -280,8 +280,8 @@ export function roundFivePersonaMeaning(
   personaId: PersonaId,
   competitorId?: CompetitorId,
 ): string | undefined {
-  const azure = competitorId === 'azure_postgres'
-    ? ROUND_FIVE_PERSONA_MEANING_AZURE[personaId]
-    : undefined
-  return azure ?? ROUND_FIVE_PERSONA_MEANING[personaId]
+  const edition = competitorId === undefined
+    ? undefined
+    : byCompetitor(competitorId, { aurora: undefined, rds: undefined, azure: ROUND_FIVE_PERSONA_MEANING_AZURE[personaId] })
+  return edition ?? ROUND_FIVE_PERSONA_MEANING[personaId]
 }

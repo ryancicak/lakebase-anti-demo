@@ -20,13 +20,51 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { ApiError, api } from './api/client'
-import type { InstallationStatus, RecoveryAttempt } from './api/types'
+import type { InstallationCloudName, InstallationStatus, RecoveryAttempt } from './api/types'
 import './installation.css'
 
 /** How often the banner re-asks. Cheap: the server answers from its own cache. */
 const POLL_MS = 15_000
 /** While a recovery is running, progress is worth more than politeness. */
 const ATTEMPT_POLL_MS = 4_000
+
+/**
+ * The words that name the installation's cloud, one entry per cloud. The server says
+ * which (`status.cloud`); a server from before the field is the AWS edition.
+ */
+interface CloudWords {
+  /** "AWS account", as in "The AWS account was read". */
+  account: string
+  /** The banner's title when the sealed resources are gone. */
+  gone: string
+  /** The engines the rounds connect to. */
+  engines: string
+  /** How the operator refreshes what this app reads the account with. */
+  refresh: string
+  /** What a sweep deletes along with the databases, so the read fails rather than finds an absence. */
+  principals: string
+}
+
+const CLOUD_WORDS: Record<InstallationCloudName, CloudWords> = {
+  aws: {
+    account: 'AWS account',
+    gone: 'THE SEALED AWS INFRASTRUCTURE IS GONE',
+    engines: 'Aurora or RDS',
+    refresh: 'Refresh this installation’s AWS credentials; for an SSO session that is:\n\n    aws sso login\n',
+    principals: 'the IAM users',
+  },
+  azure: {
+    account: 'Azure subscription',
+    gone: 'THE SEALED AZURE INFRASTRUCTURE IS GONE',
+    engines: 'Azure Database for PostgreSQL',
+    refresh: 'Refresh this installation’s Azure sign-in; with the Azure CLI that is:\n\n    az login\n',
+    principals: 'its identities',
+  },
+}
+
+function cloudWords(status: InstallationStatus): CloudWords {
+  return CLOUD_WORDS[status.cloud ?? 'aws']
+}
 
 export interface BannerCopy {
   tone: 'gone' | 'blind' | 'unasked' | 'working'
@@ -100,13 +138,13 @@ function deployedLede(status: InstallationStatus): string {
   const card = 'Which rounds can run tonight is decided on the round-select screen, not here.'
   switch (status.state) {
     case 'verified_missing':
-      return `The AWS account was read and ${status.absent_resources} of `
+      return `The ${cloudWords(status).account} was read and ${status.absent_resources} of `
         + `${status.sealed_resources} sealed resources are absent from it. ${card}`
     case 'unverified':
-      return 'This app could not read the AWS account, so it can say nothing either way '
+      return `This app could not read the ${cloudWords(status).account}, so it can say nothing either way `
         + `about the sealed infrastructure. ${card}`
     default:
-      return `Nothing has read the AWS account in this process yet. ${card}`
+      return `Nothing has read the ${cloudWords(status).account} in this process yet. ${card}`
   }
 }
 
@@ -123,11 +161,11 @@ function presenceCopy(status: InstallationStatus): BannerCopy | null {
     case 'verified_missing':
       return {
         tone: 'gone',
-        title: 'THE SEALED AWS INFRASTRUCTURE IS GONE',
+        title: cloudWords(status).gone,
         lede:
           `The account was read and ${status.absent_resources} of `
           + `${status.sealed_resources} sealed resources are absent from it. `
-          + 'Every round that connects to Aurora or RDS will fail until they are '
+          + `Every round that connects to ${cloudWords(status).engines} will fail until they are `
           + 're-created.',
         instead: status.recovery.offered
           ? 'Read what this would create, then confirm it below.'
@@ -144,16 +182,14 @@ function presenceCopy(status: InstallationStatus): BannerCopy | null {
           + `${status.sealed_resources} sealed resources are neither confirmed `
           + 'present nor confirmed gone.',
         instead:
-          'Fix the read, not the infrastructure. Refresh this installation’s AWS '
-          + 'credentials; for an SSO session that is:\n'
-          + '\n'
-          + '    aws sso login\n'
+          'Fix the read, not the infrastructure. '
+          + cloudWords(status).refresh
           + '\n'
           + 'This banner answers itself within about 30 seconds of the credentials '
           + 'coming back, with no restart.\n'
           + '\n'
           + 'One thing to know before reaching for a workaround: if this account has '
-          + 'automation that deletes idle resources, it deletes the IAM users as well '
+          + `automation that deletes idle resources, it deletes ${cloudWords(status).principals} as well `
           + 'as the databases, so a real reap also lands here rather than on a '
           + 'confirmed absence. Where such a sweep exists that makes this the '
           + 'likeliest way a genuine loss shows up — and it still is not proof of '

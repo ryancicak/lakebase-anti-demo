@@ -10,10 +10,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, get_args
 from uuid import uuid4
 
-from .models import CompetitorId
+from .home_cloud import by_cloud
+from .models import CompetitorId, InstallationCloud
 
 LOGGER = logging.getLogger(__name__)
 
@@ -212,16 +213,20 @@ class SafeChangeOwnershipScope:
             or expiry.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") != self.expires_at
         ):
             raise ValueError("expires_at must use canonical RFC 3339 UTC form")
-        if self.cloud == "azure":
-            if self.aws_account_id or self.aws_region:
-                raise ValueError("an Azure ownership scope carries no AWS account or region")
-            if _AZURE_SUBSCRIPTION_ID.fullmatch(self.azure_subscription_id) is None:
-                raise ValueError("azure_subscription_id must be a lowercase GUID")
-            if _AZURE_REGION.fullmatch(self.azure_region) is None:
-                raise ValueError("azure_region is invalid")
-            return
-        if self.cloud != "aws":
-            raise ValueError("cloud must be aws or azure")
+        clouds = get_args(InstallationCloud)
+        if self.cloud not in clouds:
+            raise ValueError(f"cloud must be {' or '.join(clouds)}")
+        by_cloud(self.cloud, aws=self._validate_aws_identity, azure=self._validate_azure_identity)()
+
+    def _validate_azure_identity(self) -> None:
+        if self.aws_account_id or self.aws_region:
+            raise ValueError("an Azure ownership scope carries no AWS account or region")
+        if _AZURE_SUBSCRIPTION_ID.fullmatch(self.azure_subscription_id) is None:
+            raise ValueError("azure_subscription_id must be a lowercase GUID")
+        if _AZURE_REGION.fullmatch(self.azure_region) is None:
+            raise ValueError("azure_region is invalid")
+
+    def _validate_aws_identity(self) -> None:
         if self.azure_subscription_id or self.azure_region:
             raise ValueError("an AWS ownership scope carries no Azure subscription or region")
         if _AWS_ACCOUNT_ID.fullmatch(self.aws_account_id) is None:
@@ -1329,16 +1334,21 @@ class SafeChangeEngine:
             failures.append("run ID")
         if artifact.owner != plan.scope.owner:
             failures.append("owner")
-        if plan.provider != SafeChangeProvider.LAKEBASE and plan.scope.cloud == "azure":
-            if artifact.azure_subscription_id != plan.scope.azure_subscription_id:
-                failures.append("Azure subscription")
-            if artifact.azure_region != plan.scope.azure_region:
-                failures.append("Azure region")
-        elif plan.provider != SafeChangeProvider.LAKEBASE:
-            if artifact.aws_account_id != plan.scope.aws_account_id:
-                failures.append("AWS account")
-            if artifact.aws_region != plan.scope.aws_region:
-                failures.append("AWS region")
+        if plan.provider != SafeChangeProvider.LAKEBASE:
+            # The cloud's own identity fields, compared in its own order.
+            identity = by_cloud(
+                plan.scope.cloud,
+                aws=(
+                    ("AWS account", artifact.aws_account_id, plan.scope.aws_account_id),
+                    ("AWS region", artifact.aws_region, plan.scope.aws_region),
+                ),
+                azure=(
+                    ("Azure subscription", artifact.azure_subscription_id,
+                     plan.scope.azure_subscription_id),
+                    ("Azure region", artifact.azure_region, plan.scope.azure_region),
+                ),
+            )
+            failures.extend(name for name, found, expected in identity if found != expected)
         if failures:
             raise UnsafeCleanupError(
                 f"Artifact ownership mismatch for {plan.artifact_id}: {', '.join(failures)}"

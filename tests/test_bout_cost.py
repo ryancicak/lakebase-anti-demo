@@ -421,7 +421,9 @@ class TestTheWiring:
         construction = source[source.index("snapshot = SessionSnapshot(") :]
         arguments = construction[: construction.index("\n        )")]
         assert "descent_cost=build_descent_cost_disclosure" in arguments
-        assert "bout_cost=build_bout_cost_disclosure()" in arguments
+        # Wired by cloud: AWS's measured table, none for an edition without measured bouts.
+        assert "bout_cost=by_cloud(" in arguments
+        assert "aws=lambda: build_bout_cost_disclosure(), azure=lambda: None" in arguments
         assert "from .bout_cost import build_bout_cost_disclosure" in source
 
     def test_the_field_is_optional_so_a_missing_panel_is_absent_not_empty(self):

@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from .cost_model import AURORA_MAX_ACU, RateCard
+from .home_cloud import by_cloud
 from .manifest import DemoManifest
 from .pricing import rds_instance_hour_usd
 
@@ -441,10 +442,12 @@ class InstallationPresence:
     def _words(self) -> tuple[str, str, str, str]:
         """(cloud, its databases, where they live, the repair command), in the cloud's names."""
 
-        if self.cloud == "azure":
-            return ("Azure", "Azure Database for PostgreSQL", "resource group",
-                    "./antidemo azure-setup")
-        return ("AWS", "Aurora or RDS", "account", INSTALLATION_REPAIR_COMMAND)
+        return by_cloud(
+            self.cloud,
+            aws=("AWS", "Aurora or RDS", "account", INSTALLATION_REPAIR_COMMAND),
+            azure=("Azure", "Azure Database for PostgreSQL", "resource group",
+                   "./antidemo azure-setup"),
+        )
 
     @property
     def verified_missing(self) -> bool:

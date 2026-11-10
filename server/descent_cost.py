@@ -80,11 +80,13 @@ from .capacity import (
     competitor_is_aurora,
 )
 from .cost_model import AURORA_MIN_RUNNING_ACU, LAKEBASE_DBU_PER_CU_HOUR, RateCard
+from .home_cloud import by_cloud
 from .models import (
     CompetitorId,
     DescentCostDisclosure,
     DescentCostLane,
     RoundId,
+    competitor_cloud,
 )
 from .pricing import rds_instance_hour_usd
 
@@ -317,7 +319,7 @@ def build_descent_cost_disclosure(
 
     if round_id is not DESCENT_ROUND:
         return None
-    if competitor_id == CompetitorId.AZURE_POSTGRES:
+    if by_cloud(competitor_cloud(competitor_id), aws=False, azure=True):
         # The comparison is priced from AWS's rate card, and the Azure edition has no card of
         # its own for it yet: no panel, rather than another cloud's figures.
         return None

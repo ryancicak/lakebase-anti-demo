@@ -4,6 +4,7 @@ import type {
   PersonaId,
   RoundId,
 } from './api/types'
+import { COMPETITOR_IDS } from './competitor-kind'
 
 /**
  * `summary` is session-less on purpose. It reads sealed receipts, so it is the one
@@ -33,7 +34,7 @@ export interface SetupProgress {
 const STORAGE_KEY = 'lakebase-anti-demo:setup:v1'
 const HISTORY_KEY = 'lakebaseAntiDemoView'
 
-const competitors = new Set<CompetitorId>(['aurora_serverless_v2', 'rds_postgres', 'azure_postgres'])
+const competitors = new Set<CompetitorId>(COMPETITOR_IDS)
 const corners = new Set<CustomerCorner>(['cost', 'simplicity', 'performance'])
 const personas = new Set<PersonaId>([
   'data_engineer',

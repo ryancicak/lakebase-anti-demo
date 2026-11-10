@@ -7,7 +7,15 @@ from math import isfinite
 from typing import Literal
 
 from .capacity import AZURE_ROUND5_RUNNER_SIZE, RDS_INSTANCE_CLASS
-from .models import CompetitorId, CostLineItem, CostReceiptSnapshot, RoundId, aws_lane
+from .home_cloud import by_cloud
+from .models import (
+    CompetitorId,
+    CostLineItem,
+    CostReceiptSnapshot,
+    RoundId,
+    aws_lane,
+    competitor_cloud,
+)
 
 REGION = "us-west-2"
 DBRICKS_AS_OF = datetime(2026, 8, 20, 3, 45, 20, tzinfo=UTC)
@@ -816,7 +824,7 @@ def build_cost_receipt(
     CDC-to-Delta stack a customer would still have to select.
     """
 
-    if competitor_id == CompetitorId.AZURE_POSTGRES:
+    if by_cloud(competitor_cloud(competitor_id), aws=False, azure=True):
         return _azure_cost_receipt(round_id)
     lines = _lakebase_database_lines()
     round_four_races_aws = round_id == RoundId.PUT_MODEL_SCORE_IN_APP and round4_aws_lane

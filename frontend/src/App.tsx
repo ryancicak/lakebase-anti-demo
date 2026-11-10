@@ -77,7 +77,8 @@ import {
   type FormalWinner,
 } from './ringside-cues'
 import { compactDuration, preciseDuration } from './time'
-import { byCompetitor, competitorKind, fighterLabel, fighterLabelForName, scalesToZero } from './competitor-kind'
+import { byCompetitor, cloudOfKind, competitorCloud, competitorKind, fighterLabel, fighterLabelForName, kindForName, scalesToZero } from './competitor-kind'
+import type { CompetitorCloud } from './competitor-kind'
 import { cooldownCommentary, liveCommentary } from './commentary'
 import { replayTape } from './instant-replay'
 import { loadScorecard, saveScorecard, type ScorecardEntry } from './scorecard-storage'
@@ -184,9 +185,12 @@ const ROUND_CLEANUP_COPY: Record<RoundId, string> = {
   analyze_live_orders_without_slowing_checkout: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
 }
 function roundCleanupCopy(roundId: RoundId, competitor?: CompetitorId): string {
-  return roundId === 'survive_connection_spike' && competitor === 'azure_postgres'
-    ? ROUND_FIVE_AZURE_CLEANUP_COPY
-    : ROUND_CLEANUP_COPY[roundId]
+  if (roundId !== 'survive_connection_spike' || competitor === undefined) return ROUND_CLEANUP_COPY[roundId]
+  return byCompetitor(competitor, {
+    aurora: ROUND_CLEANUP_COPY[roundId],
+    rds: ROUND_CLEANUP_COPY[roundId],
+    azure: ROUND_FIVE_AZURE_CLEANUP_COPY,
+  })
 }
 
 type RoundCardState =
@@ -383,9 +387,30 @@ function opponentLabel(roundId: RoundId, competitorId: CompetitorId, shortName: 
   return `${shortName} + ${byCompetitor(competitorId, { aurora: 'RDS Proxy', rds: 'RDS Proxy', azure: 'PgBouncer' })}`
 }
 
-/** The competitor's cloud, as share cards and receipts name it: AWS, or Azure. */
+/** The competitor's cloud, as share cards and receipts name it. */
 function cloudOf(session: DemoSession): string {
-  return byCompetitor(session.competitor.id, { aurora: 'AWS', rds: 'AWS', azure: 'Azure' })
+  return competitorCloud(session.competitor.id)
+}
+
+/** How a cost line's source names its provider, so the provider's lines get its label. One entry per cloud. */
+const PRICING_SOURCE_PREFIXES: Record<CompetitorCloud, readonly string[]> = { AWS: ['AWS', 'Amazon'], Azure: ['Azure'] }
+
+const ROUND_FIVE_SETUP_SENTENCE_AWS = 'Lakebase uses its included pooled endpoint. The selected AWS managed pooling path adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are sealed before the clock.'
+
+/** Round 5's component disclosure, in the edition's words: what the bout provisioned and what it did not test. */
+function PoolingDisclosure({ session, awsEngineName, v4 }: { session: DemoSession; awsEngineName: string; v4: boolean }) {
+  const aws = <>
+    <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
+    <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+  </>
+  return byCompetitor(session.competitor.id, {
+    aurora: aws,
+    rds: aws,
+    azure: <>
+      <p>{awsEngineName} · selected Azure pooling path · this bout switched on the server’s built-in PgBouncer and raised its client limit to 10,100.</p>
+      <p>Direct connections, a self-managed PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+    </>,
+  })
 }
 
 /** What Round 5 did not test, as its receipt and share text say it, in the edition's words. */
@@ -1103,10 +1128,10 @@ export function CostReceiptDisclosure({ session }: { session: DemoSession }) {
           <div className="cost-receipt-lines">
             {lines.map((line) => {
               const isDatabricksSource = line.source.startsWith('system.billing')
-              const isAwsSource = line.source.startsWith('AWS') || line.source.startsWith('Amazon')
-              const isAzureSource = line.source.startsWith('Azure')
-              const sourceLabel = isDatabricksSource ? 'Databricks list prices' : isAwsSource ? 'AWS published pricing' : isAzureSource ? 'Azure published pricing' : line.status === 'selection_required' ? 'Product selection required' : 'Published pricing'
-              const timestampLabel = isAwsSource || isAzureSource ? 'provider published' : 'checked'
+              const providerCloud = (Object.keys(PRICING_SOURCE_PREFIXES) as CompetitorCloud[])
+                .find((cloud) => PRICING_SOURCE_PREFIXES[cloud].some((prefix) => line.source.startsWith(prefix)))
+              const sourceLabel = isDatabricksSource ? 'Databricks list prices' : providerCloud ? `${providerCloud} published pricing` : line.status === 'selection_required' ? 'Product selection required' : 'Published pricing'
+              const timestampLabel = providerCloud ? 'provider published' : 'checked'
               const timestamp = formatCostTimestamp(line.source_as_of)
               const rate = line.unit_rate_usd
               const rateDisplay = rate == null
@@ -3662,7 +3687,7 @@ export function finaleLaneBars(result: RoundResult | null): FinaleLaneBars {
       return {
         lakebase: lb === null ? empty('UNCONTESTED') : { share: 1, label: summaryDuration(lb) },
         opponent: empty(racesAwsLane(result.roundId)
-          ? `${result.opponentId === 'azure_postgres' ? 'AZURE' : 'AWS'} LANE NOT INSTALLED`
+          ? `${result.opponentId ? competitorCloud(result.opponentId).toUpperCase() : 'AWS'} LANE NOT INSTALLED`
           : 'NO NATIVE PATH'),
       }
     case 'no_result':
@@ -6503,13 +6528,7 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
       <div className="round5-explain-components" aria-label="Managed component disclosure">
         <strong>COMPONENT DISCLOSURE</strong>
         <p>Lakebase · included pooled endpoint · 0 extra per-bout pooling components · 0 per-bout pooling infrastructure changes.</p>
-        {competitorKind(session.competitor.id) === 'azure' ? <>
-          <p>{awsEngineName} · selected Azure pooling path · this bout switched on the server’s built-in PgBouncer and raised its client limit to 10,100.</p>
-          <p>Direct connections, a self-managed PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
-        </> : <>
-          <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
-          <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
-        </>}
+        <PoolingDisclosure session={session} awsEngineName={awsEngineName} v4={v4} />
       </div>
     </section>
   )
@@ -7166,7 +7185,7 @@ export function RoundFiveProof({
         <header className="round5-header">
           <HomeLogo className="home-logo-compact" onHome={onHome} />
           <div>
-            <p>Round {roundNumber} · Built-in pool · {competitorKind(session.competitor.id) === 'azure' ? 'Switched-on PgBouncer' : 'Added RDS Proxy'}</p>
+            <p>Round {roundNumber} · Built-in pool · {byCompetitor(session.competitor.id, { aurora: 'Added RDS Proxy', rds: 'Added RDS Proxy', azure: 'Switched-on PgBouncer' })}</p>
             <h1>{ROUND_FIVE_DISPLAY_TITLE}</h1>
             <p className="round5-matchup"><strong>Lakebase</strong><span>vs</span><strong>{session.lanes.competitor.name}</strong></p>
           </div>
@@ -7187,9 +7206,11 @@ export function RoundFiveProof({
                   <div><dt>{awsEngineName} setup</dt><dd>{setupStateLabel(setupResults.competitor)} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
                   <div><dt>Workflow launch skew</dt><dd>{setupSkew}</dd></div>
                 </dl>
-                <p>{competitorKind(session.competitor.id) === 'azure'
-                  ? 'Lakebase uses its included pooled endpoint. The selected Azure path switches on the server’s built-in PgBouncer and raises its client limit; the client credential is sealed before the clock.'
-                  : 'Lakebase uses its included pooled endpoint. The selected AWS managed pooling path adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are sealed before the clock.'}</p>
+                <p>{byCompetitor(session.competitor.id, {
+                  aurora: ROUND_FIVE_SETUP_SENTENCE_AWS,
+                  rds: ROUND_FIVE_SETUP_SENTENCE_AWS,
+                  azure: 'Lakebase uses its included pooled endpoint. The selected Azure path switches on the server’s built-in PgBouncer and raises its client limit; the client credential is sealed before the clock.',
+                })}</p>
               </details>
               <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
               {!uiReview && (terminal || showCleanupFallback) && (
@@ -7517,7 +7538,7 @@ function TowelProgress({ session, onRetry }: { session: DemoSession; onRetry: ()
     <div className="towel-progress" data-state={towel.state} role={failed ? 'alert' : 'status'} aria-live="polite">
       <strong>{title}</strong>
       <span>{detail}</span>
-      {towel.restore_started && <em>AWS RESTORE ALREADY IN MOTION · SAFE CLEANUP MAY TAKE MINUTES</em>}
+      {towel.restore_started && <em>{competitorCloud(session.competitor.id).toUpperCase()} RESTORE ALREADY IN MOTION · SAFE CLEANUP MAY TAKE MINUTES</em>}
       {failed && <button className="proof-towel-retry" onClick={onRetry}>B · Retry cleanup</button>}
     </div>
   )
@@ -7809,8 +7830,9 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         .join(' / ')
     // The Azure edition's lane: its built-in PgBouncer, switched on at the bell, on the
     // server's own host (6432), from two Standard_D8ls_v7 runners.
-    const azureFive = competitorKind(session.competitor.id) === 'azure'
-    const runnerShape = azureFive ? 'Standard_D8ls_v7' : 'c7i.2xlarge'
+    // Each kind decides whether its lane is the PgBouncer-switch shape or the Proxy-build shape, and names its runner.
+    const azureFive = byCompetitor(session.competitor.id, { aurora: false, rds: false, azure: true })
+    const runnerShape = byCompetitor(session.competitor.id, { aurora: 'c7i.2xlarge', rds: 'c7i.2xlarge', azure: 'Standard_D8ls_v7' })
     const burstContract: ReplayCall[] = legacy
       ? [
           { label: 'Legacy scorecard', code: 'Decoded successfully · current 10,000-client fan-in evidence not recorded', note: 'No current fan-in result is inferred from legacy fields.' },
@@ -7947,7 +7969,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     ]
     const awsLane = competitor.state !== 'not_supported'
     // The Azure edition's lane: one Data Factory data flow, reading one Delta version from ADLS.
-    const azure = competitorKind(session.competitor.id) === 'azure'
+    const azure = byCompetitor(session.competitor.id, { aurora: false, rds: false, azure: true })
     return [
       {
         summary: 'Before the bell both integrations were confirmed parked and both applications read the baseline row, so each clock could only measure this bout’s change.',
@@ -8041,7 +8063,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     ]
     const awsLane = competitor.state !== 'not_supported'
     // The Azure edition's lane: one Data Factory data flow, extracting by a watermark into Delta.
-    const azure = competitorKind(session.competitor.id) === 'azure'
+    const azure = byCompetitor(session.competitor.id, { aurora: false, rds: false, azure: true })
     return [
       {
         summary: `Before the bell ${azure ? 'Azure’s data flow' : 'AWS’s pipeline'} was confirmed parked, Lakebase’s change feed was confirmed streaming, and both sources read the baseline order, so each clock could only measure this bout’s checkout.`,
@@ -8895,12 +8917,15 @@ export function ShareReceipt({
  * Aurora method is being corrected and a total would move.
  */
 export function IdlePolicyFloor({
+  competitorId,
   competitorCannotIdle,
   descentCost,
 }: {
+  competitorId: CompetitorId
   competitorCannotIdle: boolean
   descentCost?: DescentCostSnapshot | null
 }) {
+  const noIdleName = byCompetitor(competitorId, { aurora: 'Aurora', rds: 'Provisioned RDS', azure: 'Azure Database for PostgreSQL' })
   const lakebase = descentCost?.lanes.find((lane) => lane.lane_id === 'lakebase')
   const competitor = descentCost?.lanes.find((lane) => lane.lane_id === 'competitor')
   return (
@@ -8908,7 +8933,7 @@ export function IdlePolicyFloor({
       <p className="between-policy-floor">
         <span>Idle policy · not idle speed</span>
         {competitorCannotIdle
-          ? 'Lakebase is set to its shortest supported timeout, 60s. Provisioned RDS has no automatic idle pause at all, so its lane is not timed here.'
+          ? `Lakebase is set to its shortest supported timeout, 60s. ${noIdleName} has no automatic idle pause at all, so its lane is not timed here.`
           : 'Each side is set to its shortest supported timeout — Lakebase 60s, Aurora 300s. AWS will not accept below 300s, so 240s of any gap is a product floor, not a setting we picked.'}
       </p>
       {lakebase && competitor && (
@@ -9010,7 +9035,7 @@ function CooldownDetails({
               ))}
             </div>
             <p>Polling and delivery lag never extends a frozen result. The server’s first terminal lane snapshot owns the displayed stop value.</p>
-            <IdlePolicyFloor competitorCannotIdle={competitor.state === 'not_supported'} descentCost={session.descent_cost} />
+            <IdlePolicyFloor competitorId={session.competitor.id} competitorCannotIdle={competitor.state === 'not_supported'} descentCost={session.descent_cost} />
           </section>
         )}
         <ol className="cooldown-proof-rules">
@@ -9060,6 +9085,7 @@ export function BetweenRounds({
   const recoveryCleanup = cooldown.mode === 'delete_recovery_environment'
   const shareableIdleProof = isShareableIdleProof(session)
   const competitorCannotIdle = !deleting && cooldown.lanes.competitor.state === 'not_supported'
+  const noIdleShortName = byCompetitor(session.competitor.id, { aurora: 'Aurora', rds: 'RDS', azure: 'Azure PostgreSQL' })
   const resetStatus = deleting
     ? failed
       // The server's own reason, as Round 1 shows it, e.g. that the cleanup lost its
@@ -9074,8 +9100,8 @@ export function BetweenRounds({
       ? `Reset stopped · ${(cooldown.failure ?? 'Return to idle was not confirmed').replace(/\.$/, '')} · Retry cleanup`
     : competitorCannotIdle
       ? ready
-        ? 'Lakebase IDLE · RDS has no automatic scale-to-zero · RING AGAIN is ready'
-        : 'Lakebase clock is live · RDS has no automatic scale-to-zero'
+        ? `Lakebase IDLE · ${noIdleShortName} has no automatic scale-to-zero · RING AGAIN is ready`
+        : `Lakebase clock is live · ${noIdleShortName} has no automatic scale-to-zero`
       : ready
         ? 'Both databases IDLE · RING AGAIN is ready'
         : 'Waiting for each database to become idle'
@@ -9174,7 +9200,9 @@ function FinaleRow({ beat, result, record, latest, opponent, opponentId }: {
   const proofOpponent = result?.opponentId ?? opponentId
   const proof = beat.roundId === 'survive_connection_spike'
     ? '10,000 clients held / lane · multiplexing proved'
-    : beat.azureProof && proofOpponent === 'azure_postgres' ? beat.azureProof : beat.proof
+    : proofOpponent
+      ? byCompetitor(proofOpponent, { aurora: beat.proof, rds: beat.proof, azure: beat.azureProof ?? beat.proof })
+      : beat.proof
   const lane = (side: FinaleLane, corner: 'red' | 'blue', badge: string) => (
     <div className="finale-lane" data-corner={corner} aria-hidden="true">
       <b>{badge}</b>
@@ -9462,7 +9490,7 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
             </dl>
             {entry.competitor_capability_gap && (
               <p className="scorecard-gap">
-                Capability gap, not a race · no {fighterLabelForName(entry.competitor) === 'AZR' ? 'Azure' : 'AWS'} lane
+                Capability gap, not a race · no {cloudOfKind(kindForName(entry.competitor))} lane
                 was built, so nothing was timed against it and there is no margin to report.
               </p>
             )}
@@ -9726,7 +9754,7 @@ function CooldownLane({
       data-state={lane.state}
       aria-label={`${label} ${mode === 'return_to_idle' ? 'return to idle' : mode === 'delete_recovery_environment' ? 'recovery environment reset' : 'isolated environment reset'}`}
     >
-      <div className="cooldown-name"><DatabaseFighter label={corner === 'red' ? 'LB' : label.toLowerCase().includes('aurora') ? 'AUR' : 'RDS'} corner={corner} /><strong>{label}</strong></div>
+      <div className="cooldown-name"><DatabaseFighter label={corner === 'red' ? 'LB' : fighterLabelForName(label)} corner={corner} /><strong>{label}</strong></div>
       <div className="cooldown-time">
         <span aria-label={clockAriaLabel}>{visibleClock}</span>
       </div>

@@ -103,6 +103,9 @@ export interface RecoveryOffer {
  */
 export type InstallationAudience = 'operator' | 'viewer'
 
+/** The clouds an installation can be of, as the server names them. */
+export type InstallationCloudName = 'aws' | 'azure'
+
 export interface InstallationStatus {
   /**
    * Optional so that a browser holding a bundle newer than the server falls
@@ -112,6 +115,11 @@ export interface InstallationStatus {
    * actually been run -- cannot lose its diagnosis to a version skew.
    */
   audience?: InstallationAudience
+  /**
+   * The installation's cloud, which the banner's words follow. Optional for the
+   * same reason as `audience`: a server from before the field is the AWS edition.
+   */
+  cloud?: InstallationCloudName
   state: InstallationState
   detail: string
   sealed_resources: number
@@ -573,7 +581,7 @@ export interface StandingCostFigure {
  */
 export interface StandingCostComponent {
   component: string
-  cloud: 'aws' | 'databricks'
+  cloud: 'aws' | 'azure' | 'databricks'
   kind: 'compute' | 'storage' | 'network' | 'other'
   provenance: 'measured' | 'modeled' | 'assumed' | 'unavailable'
   quantity_basis: string

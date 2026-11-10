@@ -52,7 +52,7 @@ from .capacity import (
 )
 from .connection_fanin import RUNNER_INSTANCE_TYPE as ROUND5_RUNNER_INSTANCE_TYPE
 from .home_cloud import AWS as AWS_HOME
-from .home_cloud import HomeCloud, home_cloud_for_host
+from .home_cloud import HomeCloud, by_cloud, home_cloud_for_host, installation_cloud
 from .manifest import (
     PROJECT_ROOT,
     AuroraEnvironmentSeal,
@@ -274,10 +274,14 @@ def _installation_region(manifest: DemoManifest) -> str:
     spell it). Lakebase's own steps are the same on both clouds, and read only this.
     """
 
-    if getattr(manifest, "azure", None) is not None:
-        return manifest.azure.region
-    assert manifest.aws is not None
-    return manifest.aws.region
+
+    def aws_region() -> str:
+        assert manifest.aws is not None
+        return manifest.aws.region
+
+    return by_cloud(
+        installation_cloud(manifest), aws=aws_region, azure=lambda: manifest.azure.region
+    )()
 
 
 def _round_lakebase_provider(
@@ -960,29 +964,33 @@ def deployed_aws_posture(*, manifest: DemoManifest | None = None) -> DeployedAws
         return cached
     try:
         loaded = manifest or load_manifest()
-        azure = getattr(loaded, "azure", None)
-        if azure is not None:
+
+        def azure_posture() -> DeployedAwsPosture:
             # The Azure edition's: its servers' firewalls admit the sealed egress, and its
             # Round 4 and Round 6 lanes are its data flows. Round 5 has no control role trusting
             # one principal, so none to share: the App reaches its runners (Run Command, Service
             # Bus) through its own UC service credential, granted at install as the operator's
             # login is. A sealed Round 5 is the deployed App's to run.
-            posture = DeployedAwsPosture(
+            azure = loaded.azure
+            return DeployedAwsPosture(
                 egress_prefix_count=len(azure.databricks_egress_cidrs or ()),
                 egress_published_at=azure.databricks_egress_published_at,
                 runtime_role_sealed=getattr(loaded, "round5_azure", None) is not None,
                 round4_aws_sealed=azure.round4 is not None,
                 round6_aws_sealed=azure.round6 is not None,
             )
-        else:
+
+        def aws_posture() -> DeployedAwsPosture:
             aws = loaded.aws
-            posture = DeployedAwsPosture(
+            return DeployedAwsPosture(
                 egress_prefix_count=len(aws.serverless_egress_cidrs or ()),
                 egress_published_at=aws.serverless_egress_published_at,
                 runtime_role_sealed=aws.runtime_role_arn is not None,
                 round4_aws_sealed=getattr(loaded, "round4_aws", None) is not None,
                 round6_aws_sealed=getattr(loaded, "round6_aws", None) is not None,
             )
+
+        posture = by_cloud(installation_cloud(loaded), aws=aws_posture, azure=azure_posture)()
         ttl = OPERATOR_INGRESS_TTL_SECONDS
     except Exception:
         posture = DeployedAwsPosture()
@@ -1106,7 +1114,9 @@ def _observe_operator_ingress(
     except Exception:
         return None, OPERATOR_INGRESS_FAILURE_TTL_SECONDS
     # The operator's /32 is sealed in the installation's own cloud's section.
-    section = loaded.azure if getattr(loaded, "azure", None) is not None else loaded.aws
+    section = by_cloud(
+        installation_cloud(loaded), aws=lambda: loaded.aws, azure=lambda: loaded.azure
+    )()
     sealed = (getattr(section, "operator_cidr", "") or "").strip()
     if not sealed:
         return None, OPERATOR_INGRESS_TTL_SECONDS
@@ -7324,19 +7334,25 @@ def _ensure_round4_source_repair_job(
     folder = notebook_path.rsplit("/", 1)[0]
     table = names["source_table"]
     quoted_table = ".".join(f"`{part.replace('`', '``')}`" for part in table.split("."))
-    properties, readable = "'delta.enableChangeDataFeed' = 'true'", ""
-    if getattr(manifest, "cloud", "aws") == "azure":
+
+    def aws_source_table() -> tuple[str, str]:
+        return "'delta.enableChangeDataFeed' = 'true'", ""
+
+    def azure_source_table() -> tuple[str, str]:
         from .azure_runtime import ADF_UNREADABLE_FEATURES, ROUND4_SOURCE_PROPERTIES
 
         # Rebuilt as the installer first made it, a table Data Factory's Delta 2.4 can read.
-        properties = ROUND4_SOURCE_PROPERTIES
-        readable = (
+        return ROUND4_SOURCE_PROPERTIES, (
             "    present = {row.key for row in "
             'spark.sql(f"SHOW TBLPROPERTIES {TABLE}").collect()}\n'
             f"    for feature in {ADF_UNREADABLE_FEATURES!r}:\n"
             '        if f"delta.feature.{feature}" in present:\n'
             '            spark.sql(f"ALTER TABLE {TABLE} DROP FEATURE {feature}")\n'
         )
+
+    properties, readable = by_cloud(
+        installation_cloud(manifest), aws=aws_source_table, azure=azure_source_table
+    )()
     source = f'''# Databricks notebook source
 # Fixed, no-parameter Round 4 source repair. Do not add widgets or runtime inputs.
 TABLE = {quoted_table!r}
@@ -9947,7 +9963,8 @@ def _ensure_round4(manifest: DemoManifest, *, timeout: float) -> DemoManifest:
 
 
 def _commit_round4_reseal(manifest: DemoManifest, resealed_round4: Round4Resources) -> None:
-    if getattr(manifest, "cloud", "aws") == "azure":
+    # Exhaustive by cloud: an edition whose manifest version never moves takes the short path.
+    if by_cloud(installation_cloud(manifest), aws=False, azure=True):
         # Version 8 is the Azure edition's for life, and its Round 5 and Round 6 seals hold
         # nothing of Round 4's, so a new Round 4 seal leaves them as they are.
         manifest.round4 = resealed_round4
@@ -10911,7 +10928,8 @@ def ensure_coordination(manifest: DemoManifest) -> DemoManifest:
                     VersionStages=["AWSCURRENT"],
                 )
         azure_round5 = getattr(manifest, "round5_azure", None)
-        if azure_round5 is not None and getattr(manifest, "azure", None) is not None:
+        azure_edition = by_cloud(installation_cloud(manifest), aws=False, azure=True)
+        if azure_round5 is not None and azure_edition:
             # The Azure edition's resident logins: the same roles, their DSNs in Key Vault.
             from .azure_identity import az_cli_token_source
             from .azure_key_vault import KEY_VAULT_SCOPE, KeyVault
@@ -11515,11 +11533,11 @@ async def wait_for_scale_zero(manifest: DemoManifest, timeout_seconds: float) ->
     apply_manifest_environment(manifest)
     # Round 1's competitor at zero: Aurora on AWS. The Azure edition stands no Round 1 server, so
     # its lane is the engine's structural refusal, which asks Azure nothing (design 6.1).
-    competitor = (
-        AzurePostgresCredentialProvider()
-        if getattr(manifest, "azure", None) is not None
-        else AuroraCredentialProvider()
-    )
+    competitor = by_cloud(
+        installation_cloud(manifest),
+        aws=AuroraCredentialProvider,
+        azure=AzurePostgresCredentialProvider,
+    )()
     targets = (LakebaseCredentialProvider(), competitor)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
@@ -14014,7 +14032,8 @@ def _prepare_and_reseal_round6(manifest: DemoManifest, *, timeout: float) -> Dem
         ),
     )
     manifest.round6 = sealed
-    if getattr(manifest, "cloud", "aws") != "azure":  # the Azure edition's version is 8 for life
+    # The Azure edition's manifest version is 8 for life; only AWS's moves with its seals.
+    if by_cloud(installation_cloud(manifest), aws=True, azure=False):
         manifest.manifest_version = (
             7
             if manifest.installation_id is not None
