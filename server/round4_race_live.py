@@ -32,6 +32,7 @@ from psycopg import sql
 
 from . import pipeline_power
 from .aws_auth import runtime_auth_from_environment
+from .home_cloud import by_cloud, installation_cloud
 from .manifest import DemoManifest
 from .model_score import DeltaCommit, ModelScoreRow, ModelScoreUpdate
 from .model_score_live import (
@@ -799,15 +800,20 @@ def build_round4_race_engine(
     whose AWS lane is not sealed.
     """
 
-    if getattr(manifest, "azure", None) is not None:
+
+    def aws_engine() -> Round4RaceEngine:
+        v1 = build_model_score_engine(manifest)
+        adapter = v1.adapter
+        assert isinstance(adapter, LiveModelScoreAdapter)
+        source = DeltaSource(adapter)
+        lanes: list[Any] = [LakebaseSyncLane(manifest, adapter, source)]
+        if manifest.round4_aws is not None:
+            lanes.append(GlueWriterLane(manifest, competitor))
+        return Round4RaceEngine(source, lanes, contract=v1.contract)
+
+    def azure_engine() -> Round4RaceEngine:
         from .azure_runtime import build_azure_round4_race_engine
 
         return build_azure_round4_race_engine(manifest, competitor)
-    v1 = build_model_score_engine(manifest)
-    adapter = v1.adapter
-    assert isinstance(adapter, LiveModelScoreAdapter)
-    source = DeltaSource(adapter)
-    lanes: list[Any] = [LakebaseSyncLane(manifest, adapter, source)]
-    if manifest.round4_aws is not None:
-        lanes.append(GlueWriterLane(manifest, competitor))
-    return Round4RaceEngine(source, lanes, contract=v1.contract)
+
+    return by_cloud(installation_cloud(manifest), aws=aws_engine, azure=azure_engine)()

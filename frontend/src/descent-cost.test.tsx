@@ -92,21 +92,21 @@ function sessionWith(descent: DescentCostSnapshot | null): DemoSession {
  */
 describe('IdlePolicyFloor · billed floor line', () => {
   it('says outright that both engines bill the floor', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} descentCost={AURORA} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} descentCost={AURORA} />)
     const copy = screen.getByText(/Both engines bill that floor/)
     expect(copy.textContent).toContain('up to $0.02 a descent on Aurora')
     expect(copy.textContent).toContain('$0.002 on Lakebase')
   })
 
   it('frames the floor as charged per descent rather than per day', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} descentCost={AURORA} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} descentCost={AURORA} />)
     expect(
       screen.getByText(/You pay it on every descent, not once a day/),
     ).toBeTruthy()
   })
 
   it('never implies Lakebase idles free', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} descentCost={AURORA} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} descentCost={AURORA} />)
     const copy = screen.getByText(/Both engines bill that floor/).textContent ?? ''
     // The label may say "not free on either side"; what must never appear is a
     // claim attaching freeness, or an absent charge, to Lakebase itself.
@@ -116,40 +116,40 @@ describe('IdlePolicyFloor · billed floor line', () => {
   })
 
   it('does not claim Aurora burns compute indefinitely while idle', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} descentCost={AURORA} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} descentCost={AURORA} />)
     const copy = screen.getByText(/Both engines bill that floor/).textContent ?? ''
     expect(copy).not.toMatch(/forever|indefinitely|always|never stops|constantly/i)
   })
 
   it('keeps the ratio a ratio and never calls Lakebase faster', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} descentCost={AURORA} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} descentCost={AURORA} />)
     const copy = screen.getByText(/Both engines bill that floor/).textContent ?? ''
     expect(copy).not.toMatch(/faster|quicker|beats|wins/i)
   })
 
   it('states Lakebase pays its own floor even on the RDS variant', () => {
-    render(<IdlePolicyFloor competitorCannotIdle descentCost={RDS} />)
+    render(<IdlePolicyFloor competitorId="rds_postgres" competitorCannotIdle descentCost={RDS} />)
     const copy = screen.getByText(/is billed too/)
     expect(copy.textContent).toContain("Lakebase's 60s is billed too")
     expect(copy.textContent).toContain('$0.002 a descent')
   })
 
   it('gives RDS the unconditional always-billed claim', () => {
-    render(<IdlePolicyFloor competitorCannotIdle descentCost={RDS} />)
+    render(<IdlePolicyFloor competitorId="rds_postgres" competitorCannotIdle descentCost={RDS} />)
     const copy = screen.getByText(/is billed too/)
     expect(copy.textContent).toContain('never descends at all')
     expect(copy.textContent).toContain('$1.56 a day per instance, idle or not')
   })
 
   it('composes with the policy-floor line rather than replacing it', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} descentCost={AURORA} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} descentCost={AURORA} />)
     expect(screen.getByText('Idle policy · not idle speed')).toBeTruthy()
     expect(screen.getByText(/240s of any gap is a product floor/)).toBeTruthy()
     expect(screen.getByText('Floor is billed · not free on either side')).toBeTruthy()
   })
 
   it('omits the cost line rather than guessing when the server sent nothing', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} />)
     expect(screen.getByText('Idle policy · not idle speed')).toBeTruthy()
     expect(screen.queryByText(/Floor is billed/)).toBeNull()
   })

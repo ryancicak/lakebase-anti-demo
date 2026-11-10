@@ -3148,10 +3148,13 @@ describe('backstage setup', () => {
     }
     expect(() => assertMinimal(cue)).not.toThrow()
     expect(cue).toMatch(/<h2[^>]*>For the \{selected\.role\}<\/h2>/)
-    expect(cue).toContain('<h3>What this means</h3>')
-    expect(cue).toContain('<h3>Question for the room</h3>')
-    expect(cue).toContain('<h3>What we proved</h3>')
+    // The four blocks, in the order a presenter speaks them.
+    const blocks = ['What happened', 'Why it matters to you', 'Your priorities', 'Ask the room']
+      .map((label) => cue.indexOf(`<h3>${label}</h3>`))
+    expect(blocks.every((index) => index > -1)).toBe(true)
+    expect([...blocks].sort((left, right) => left - right)).toEqual(blocks)
     expect(cue).toContain('aria-label="Room priorities"')
+    expect(cue).not.toMatch(/<h3>(?:What this means|Question for the room|What we proved)<\/h3>/)
     expect(cue).not.toMatch(/<h3>(?:Say|Ask|Show)<\/h3>|Selected priorities|Explain to ·/)
     const mutant = `${cue}\n<CapacityDisclosure session={session} />`
     expect(() => assertMinimal(mutant)).toThrow(/displaced disclosure UI/i)
@@ -3402,7 +3405,7 @@ describe('backstage setup', () => {
     })
 
     expect(commentator).toHaveTextContent(
-      /MISSED CALLS · 4 calls never reached this screen · The play-by-play picked up after them/i,
+      /Missed calls · 4 calls never reached this screen · The commentary picked up after them/i,
     )
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -4730,11 +4733,14 @@ describe('backstage setup', () => {
     const replayTrigger = screen.getByRole('button', { name: /instant replay/i })
     await user.click(replayTrigger)
     const replay = await screen.findByRole('dialog', { name: /wake this idle app/i })
-    const replayStory = within(replay).getByLabelText('Three-beat replay story')
-    expect(replayStory).toHaveTextContent(/genuine scale zero/i)
-    expect(replayStory).toHaveTextContent(/exact run-owned transaction/i)
-    expect(within(replayStory).getAllByText('0.84s')).toHaveLength(1)
-    expect(within(replayStory).getAllByText('1.29s')).toHaveLength(1)
+    const replayStory = within(replay).getByLabelText('Play-by-play')
+    expect(replayStory).toHaveTextContent(/Bell\. Both databases are asleep, and the same connection goes in on both/i)
+    expect(replayStory).toHaveTextContent(/0\.84s.*Lakebase.*Awake\. The same transaction committed and read back\. Clock stops/i)
+    expect(replayStory).toHaveTextContent(/1\.29s.*Aurora Serverless v2.*Awake\. The same transaction committed and read back\. Clock stops/i)
+    expect(replayStory).toHaveTextContent(/Final call.*Lakebase was awake and committing in 0\.84s/i)
+    // Each figure appears on the scoreboard, in its call's gutter, and highlighted in the final call.
+    expect(within(replayStory).getAllByText('0.84s')).toHaveLength(3)
+    expect(within(replayStory).getAllByText('1.29s')).toHaveLength(3)
     expect(within(replay).getByText(/RDS\.DescribeDBClusters/i)).not.toBeVisible()
     await user.click(within(replay).getByText(/view full evidence/i))
     const startCalls = within(replay).getByText(/both control planes proved genuine scale zero/i).closest('.replay-evidence-step')!
@@ -4754,16 +4760,21 @@ describe('backstage setup', () => {
     const priorities = within(ringsideTake).getByLabelText('Room priorities')
     expect(priorities.children).toHaveLength(3)
     expect(priorities).toHaveTextContent(/cost.*simplicity.*performance/i)
-    expect(ringsideTake.querySelectorAll('.ringside-cue')).toHaveLength(3)
+    expect(ringsideTake.querySelectorAll('.ringside-cue')).toHaveLength(4)
     expect(ringsideTake.querySelector('details')).toBeNull()
     expect(ringsideTake.querySelector('.ringside-priority-grid')).toBeNull()
+    // The result leads, with the bout's numbers in a sentence a person would say.
     expect(ringsideTake).toHaveTextContent(
-      /what this means.*database woke and finished a transaction on its own.*SLO risk.*mitigation effort.*always-on cost/i,
+      /what happened.*both databases were asleep at the bell.*lakebase was awake and committing in 0\.84s.*aurora serverless v2 took 1\.29s.*the database alone/i,
     )
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which services should never wait on a wake/i)
     expect(ringsideTake).toHaveTextContent(
-      /what we proved.*first committed transaction after idle.*lakebase 0\.84s.*aurora serverless v2 1\.29s.*only the database transaction was tested/i,
+      /why it matters to you.*first request after a quiet stretch is the one that trips a timeout alert/i,
     )
+    // All three priorities were picked, so all three rows appear, cost first.
+    const lensLabels = [...ringsideTake.querySelectorAll('.ringside-lenses li b')].map((label) => label.textContent)
+    expect(lensLabels).toEqual(['cost', 'simplicity', 'performance'])
+    expect(ringsideTake).toHaveTextContent(/aurora's floor is five times longer than lakebase's/i)
+    expect(ringsideTake).toHaveTextContent(/ask the room.*what's your alert threshold on that first request/i)
     const sreTab = within(ringsideTake).getByRole('tab', { name: /^sre$/i })
     const close = within(ringsideTake).getByRole('button', { name: /back to the ring/i })
     expect(sreTab).toHaveFocus()
@@ -4775,13 +4786,15 @@ describe('backstage setup', () => {
     await user.click(within(ringsideTake).getByRole('tab', { name: /^data analyst$/i }))
     expect(ringsideTake).toHaveAccessibleName(/for the data analyst/i)
     expect(ringsideTake).toHaveTextContent(
-      /what this means.*first answer arrived without anyone starting the database.*how useful that is depends on timing.*access steps.*always-on cost/i,
+      /why it matters to you.*dashboard that loads slow at 8 AM is usually waiting on a database that went to sleep overnight/i,
     )
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which decision is worth paying to skip wake delay and access handoffs/i)
+    expect(ringsideTake).toHaveTextContent(/ask the room.*how long do people wait on the first query of the morning/i)
+    // The result is the bout's, so it does not move when the person does.
+    expect(ringsideTake).toHaveTextContent(/lakebase was awake and committing in 0\.84s/i)
     await user.click(within(ringsideTake).getByRole('tab', { name: /^executive$/i }))
     expect(ringsideTake).toHaveAccessibleName(/for the executive/i)
-    expect(ringsideTake).toHaveTextContent(/what this means.*first transaction came back on its own.*skipping that delay and the support handoffs.*worth always-on cost/i)
-    expect(ringsideTake).toHaveTextContent(/question for the room.*which deadline makes this delay unacceptable.*who decides on always-on capacity/i)
+    expect(ringsideTake).toHaveTextContent(/why it matters to you.*databases that idle cost less, if they come back fast enough.*24-hour bill/i)
+    expect(ringsideTake).toHaveTextContent(/ask the room.*what's a few seconds of wait worth against paying for an idle database all month\?/i)
     expect(ringsideTake).not.toHaveTextContent(
       /proof scope|success measure|point to the proof|they care about|pricing receipt|configured compute/i,
     )
@@ -5537,15 +5550,16 @@ describe('backstage setup', () => {
       payload: { lane_id: 'competitor', state: 'connecting', elapsed_ms: 0, status: 'Starting AWS Glue → Aurora Serverless v2', activity: { phase: 'starting', wire_call: null } },
     })
     const commentator = () => screen.getByLabelText(/ringside commentator/i)
-    await waitFor(() => expect(commentator()).toHaveTextContent(/Lakebase synced table · Cold start at the bell/))
-    expect(commentator()).toHaveTextContent(/AWS Glue → Aurora Serverless v2 · Cold start at the bell/)
-    expect(commentator()).toHaveTextContent(/Both clocks run from the bell to each lane’s own first exact read · No verdict yet/)
+    await waitFor(() => expect(commentator()).toHaveTextContent(/Lakebase synced table: starting cold\./))
+    expect(commentator()).toHaveTextContent(/AWS Glue → Aurora Serverless v2: starting cold\./)
+    expect(commentator()).toHaveTextContent(/Bell\. One new score just landed in the lakehouse\. Both pipelines start cold\./)
     source.emit({
       sequence: 8, event: 'lane_update', occurred_at: '2026-08-18T00:00:32Z',
       payload: { lane_id: 'lakebase', state: 'verified', elapsed_ms: 31_500, status: 'The exact row is in the application', activity: { phase: 'verified', wire_call: null } },
     })
     await waitFor(() => expect(lakebaseLane).toHaveTextContent('31.50s'))
-    expect(commentator()).toHaveTextContent(/Lakebase has read the exact row · Other lane still running · No verdict yet/)
+    expect(commentator()).toHaveTextContent(/Lakebase synced table is done at 31\.50s\. AWS Glue → Aurora Serverless v2 is still carrying it\./)
+    expect(commentator()).toHaveTextContent(/Lakebase synced table: the app read the new score at 31\.50s\./)
 
     source.emit({
       sequence: 9, event: 'run_finished', occurred_at: '2026-08-18T00:01:18Z',
@@ -5566,7 +5580,7 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
     const ringsideTake = screen.getByRole('dialog', { name: /for the sre/i })
     expect(ringsideTake).toHaveTextContent(
-      /what we proved.*Bell to exact app read, both integrations from a cold start: Lakebase 31\.50s\. AWS Glue → Aurora Serverless v2 77\.80s\. Model execution was not tested\./i,
+      /what happened.*One new score was written to the lakehouse at the bell, with both pipelines starting cold\. The app on Lakebase could read it in 31\.50s\. Through AWS Glue → Aurora Serverless v2: 77\.80s\. The clock is the hop from lakehouse to app\. The model itself wasn't run or timed\./i,
     )
     await user.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
 
@@ -5617,11 +5631,12 @@ describe('backstage setup', () => {
     const replay = screen.getByRole('dialog', { name: /move lakehouse data into live applications/i })
     expect(replay).toHaveTextContent(/instant replay · round 4/i)
 
-    const replayStory = within(replay).getByLabelText('Three-beat replay story')
-    expect(replayStory).toHaveTextContent(/Both integrations were parked before the bell/i)
-    expect(replayStory).toHaveTextContent(/bell started both integrations and committed score 0\.81 to the Delta table at Delta version 11/i)
-    expect(within(replayStory).getAllByText('31.50s')).toHaveLength(1)
-    expect(within(replayStory).getAllByText('77.80s')).toHaveLength(1)
+    const replayStory = within(replay).getByLabelText('Play-by-play')
+    expect(replayStory).toHaveTextContent(/Bell\. One new score lands in the lakehouse: 0\.81 for customer-42 at Delta version 11\. Both pipelines start cold\./i)
+    expect(replayStory).toHaveTextContent(/31\.50s.*Lakebase synced table.*The app read the new score\. Clock stops/i)
+    expect(replayStory).toHaveTextContent(/77\.80s.*AWS Glue → Aurora Serverless v2.*The app read the new score\. Clock stops/i)
+    expect(within(replayStory).getAllByText('31.50s')).toHaveLength(3)
+    expect(within(replayStory).getAllByText('77.80s')).toHaveLength(3)
     expect(replayStory).not.toHaveTextContent(/not built or timed|no AWS race/i)
 
     await user.click(within(replay).getByText(/view full evidence/i))
@@ -5866,20 +5881,21 @@ describe('backstage setup', () => {
       payload: { lane_id: 'competitor', state: 'connecting', elapsed_ms: 0, status: 'Committing the checkout', activity: { phase: 'starting', wire_call: null } },
     })
     const commentator = () => screen.getByLabelText(/ringside commentator/i)
-    await waitFor(() => expect(commentator()).toHaveTextContent(/Lakebase built-in change feed · Committing the checkout · The feed is already streaming/))
-    expect(commentator()).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2 · Committing the checkout · DMS and Glue cold start at the bell/)
-    expect(commentator()).toHaveTextContent(/Both clocks run from the bell to each lane’s own first exact Delta read · No verdict yet/)
+    await waitFor(() => expect(commentator()).toHaveTextContent(/Lakebase built-in change feed: committing the checkout\. The feed is already on\./))
+    expect(commentator()).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2: committing the checkout\. DMS and Glue are starting cold\./)
+    expect(commentator()).toHaveTextContent(/Bell\. The same checkout just hit both databases\. Now they race to the lakehouse\./)
     source.emit({
       sequence: 8, event: 'lane_update', occurred_at: '2026-08-18T00:00:12Z',
       payload: { lane_id: 'competitor', state: 'verifying', elapsed_ms: 1_050, status: 'AWS DMS + Glue from Aurora Serverless v2 is carrying the order', activity: { phase: 'waiting', wire_call: null } },
     })
-    await waitFor(() => expect(commentator()).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2 · Carrying the order · The verifier reads its Delta history every second/))
+    await waitFor(() => expect(commentator()).toHaveTextContent(/AWS DMS \+ Glue from Aurora Serverless v2: carrying the order\. The lakehouse is checked every second\./))
     source.emit({
       sequence: 9, event: 'lane_update', occurred_at: '2026-08-18T00:00:12Z',
       payload: { lane_id: 'lakebase', state: 'verified', elapsed_ms: 11_520, status: 'The exact order is in the lakehouse', activity: { phase: 'verified', wire_call: null } },
     })
     await waitFor(() => expect(lakebaseLane).toHaveTextContent('11.52s'))
-    expect(commentator()).toHaveTextContent(/Lakebase has put the exact order in Delta · Other lane still running · No verdict yet/)
+    expect(commentator()).toHaveTextContent(/Lakebase built-in change feed is done at 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2 is still carrying it\./)
+    expect(commentator()).toHaveTextContent(/Lakebase built-in change feed: the order is in the lakehouse at 11\.52s\./)
 
     source.emit({
       sequence: 10, event: 'run_finished', occurred_at: '2026-08-18T00:01:15Z',
@@ -5900,7 +5916,7 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
     const ringsideTake = screen.getByRole('dialog', { name: /for the sre/i })
     expect(ringsideTake).toHaveTextContent(
-      /what we proved.*Bell to exact Delta read, with AWS DMS and Glue cold starting at the bell and Lakebase's change feed built in: Lakebase 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2 74\.10s\. A separate checkout committed on each source\./i,
+      /what happened.*The same checkout hit both databases at the bell\. Lakebase's built-in change feed, which is always on, had it in the lakehouse in 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2, started cold at the bell, took 74\.10s\. A second checkout committed on each side meanwhile as a sanity check\./i,
     )
     await user.click(within(ringsideTake).getByRole('button', { name: /back to the ring/i }))
 
@@ -5951,11 +5967,13 @@ describe('backstage setup', () => {
     const replay = screen.getByRole('dialog', { name: /move live application data into the lakehouse/i })
     expect(replay).toHaveTextContent(/instant replay · round 6/i)
 
-    const replayStory = within(replay).getByLabelText('Three-beat replay story')
-    expect(replayStory).toHaveTextContent(/AWS DMS and Glue were parked before the bell, Lakebase’s change feed was streaming/i)
-    expect(replayStory).toHaveTextContent(/committed one \$84\.50 checkout on both sources and started AWS DMS and Glue cold/i)
-    expect(within(replayStory).getAllByText('11.52s')).toHaveLength(1)
-    expect(within(replayStory).getAllByText('74.10s')).toHaveLength(1)
+    const replayStory = within(replay).getByLabelText('Play-by-play')
+    expect(replayStory).toHaveTextContent(/Bell\. The same \$84\.50 checkout commits on both databases\. DMS and Glue start cold; Lakebase's feed is already on\./i)
+    expect(replayStory).toHaveTextContent(/11\.52s.*Lakebase built-in change feed.*The order shows up in the lakehouse\. Clock stops/i)
+    expect(replayStory).toHaveTextContent(/74\.10s.*AWS DMS \+ Glue from Aurora Serverless v2.*The order shows up in the lakehouse\. Clock stops/i)
+    expect(replayStory).toHaveTextContent(/Meanwhile.*A second checkout committed on each side as a sanity check/i)
+    expect(within(replayStory).getAllByText('11.52s')).toHaveLength(3)
+    expect(within(replayStory).getAllByText('74.10s')).toHaveLength(3)
     expect(replayStory).not.toHaveTextContent(/not built or timed|no AWS race|CDC stack/i)
 
     await user.click(within(replay).getByText(/view full evidence/i))
@@ -6295,7 +6313,7 @@ describe('backstage setup', () => {
 
       await user.click(screen.getByRole('button', { name: /explain to the room/i }))
       expect(screen.getByRole('dialog', { name: /for the sre/i })).toHaveTextContent(
-        /what we proved.*Bell to exact Delta read.*Lakebase 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2 74\.10s\. A separate checkout committed on each source\./i,
+        /what happened.*Lakebase's built-in change feed, which is always on, had it in the lakehouse in 11\.52s\. AWS DMS \+ Glue from Aurora Serverless v2, started cold at the bell, took 74\.10s\. A second checkout committed on each side meanwhile as a sanity check\./i,
       )
       await user.click(within(screen.getByRole('dialog', { name: /for the sre/i })).getByRole('button', { name: /back to the ring/i }))
       stubReceiptCanvas()
@@ -6493,22 +6511,30 @@ describe('backstage setup', () => {
     expect(identity).toHaveTextContent(`AKA ${analyst.nickname}`)
     const panel = within(take).getByRole('tabpanel')
     expect([...panel.children].map((child) => child.className)).toEqual([
-      'ringside-cue ringside-say',
+      'ringside-cue ringside-result',
+      'ringside-cue ringside-why',
+      'ringside-cue ringside-lenses',
       'ringside-cue ringside-ask',
-      'ringside-cue ringside-show',
     ])
     expect(panel.querySelector('details')).toBeNull()
     expect(panel.querySelector('article')).toBeNull()
     expect(panel.querySelector('img')).toBeNull()
     const fieldText = (label: RegExp) => within(take).getByRole('heading', { name: label }).closest('section')!.textContent!
     const analystFields = {
-      say: fieldText(/^what this means$/i),
-      ask: fieldText(/^question for the room$/i),
-      show: fieldText(/^what we proved$/i),
+      result: fieldText(/^what happened$/i),
+      why: fieldText(/^why it matters to you$/i),
+      ask: fieldText(/^ask the room$/i),
     }
-    expect(analystFields.say).toMatch(/ship only when compatibility checks can head off expensive report rework.*decision deadline/i)
-    expect(analystFields.ask).toMatch(/which report deadline should decide whether this ships/i)
-    expect(analystFields.show).toMatch(/migration, tested transaction, and source check.*lakebase 1\.80s.*aurora serverless v2 9\.80s.*no customer traffic was tested/i)
+    expect(analystFields.result).toMatch(/same source, same schema change.*isolated copy.*proved the source untouched.*lakebase: 1\.80s.*aurora serverless v2: 9\.80s.*rollout and customer traffic weren't tested/i)
+    expect(analystFields.why).toMatch(/column change that would break your reports gets caught here, on a copy/i)
+    expect(analystFields.ask).toMatch(/when a schema change lands, who finds out first: you, or a failed pipeline\?/i)
+    // Every priority the room picked is a labeled row, and nothing else is.
+    const lensRows = [...panel.querySelectorAll('.ringside-lenses li')]
+    expect(lensRows.length).toBeGreaterThan(0)
+    for (const row of lensRows) {
+      expect(row.querySelector('b')?.textContent).toMatch(/^(cost|simplicity|performance)$/)
+      expect(row.querySelector('span')?.textContent?.trim().length).toBeGreaterThan(0)
+    }
     expect(take).not.toHaveTextContent(
       /success measure|proof scope|point to the proof|they care about|shared exact proof|pricing receipt/i,
     )
@@ -6523,15 +6549,15 @@ describe('backstage setup', () => {
     expect(take).toHaveAccessibleName(/for the dba/i)
     expect(identity).toHaveTextContent(`AKA ${dba.nickname}`)
     const dbaFields = {
-      say: fieldText(/^what this means$/i),
-      ask: fieldText(/^question for the room$/i),
-      show: fieldText(/^what we proved$/i),
+      result: fieldText(/^what happened$/i),
+      why: fieldText(/^why it matters to you$/i),
+      ask: fieldText(/^ask the room$/i),
     }
-    expect(dbaFields.say).toMatch(/source stayed intact.*promotion.*restore labor.*runbook effort.*database deadline/i)
-    expect(dbaFields.ask).toMatch(/which database changes should need this isolation before promotion/i)
-    expect(dbaFields.say).not.toBe(analystFields.say)
+    expect(dbaFields.why).toMatch(/copy took the migration and a real transaction while the source stayed exactly as it was, schema and data/i)
+    expect(dbaFields.ask).toMatch(/what does it take you today to hand a team a safe copy of production/i)
+    expect(dbaFields.why).not.toBe(analystFields.why)
     expect(dbaFields.ask).not.toBe(analystFields.ask)
-    expect(dbaFields.show).toBe(analystFields.show)
+    expect(dbaFields.result).toBe(analystFields.result)
 
     await user.keyboard('{ArrowRight}')
     const architectTab = within(take).getByRole('tab', { name: /^architect \/ it$/i })
@@ -6539,9 +6565,9 @@ describe('backstage setup', () => {
     expect(architectTab).toHaveAttribute('aria-selected', 'true')
     expect(take).toHaveAccessibleName(/for the architect \/ it/i)
     expect(identity).toHaveTextContent(`AKA ${architect.nickname}`)
-    expect(fieldText(/^what this means$/i)).toMatch(/standardize this where teams can hit delivery deadlines.*exception or setup cost/i)
-    expect(fieldText(/^question for the room$/i)).toMatch(/which teams adopt first.*what rule leaves out the rest/i)
-    expect(fieldText(/^what we proved$/i)).toBe(analystFields.show)
+    expect(fieldText(/^why it matters to you$/i)).toMatch(/paved path for schema changes needs an isolated copy on demand.*the whole standard, timed/i)
+    expect(fieldText(/^ask the room$/i)).toMatch(/which teams route around your change process because getting a test copy is slow/i)
+    expect(fieldText(/^what happened$/i)).toBe(analystFields.result)
     await user.keyboard('{Home}')
     expect(analystTab).toHaveFocus()
     await user.keyboard('{End}')
@@ -6663,17 +6689,17 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
     await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
     await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    expect(await screen.findByText(/connection proof in progress · no verdict/i)).toBeInTheDocument()
-    expect(screen.getByText(/ON THE WIRE/)).toHaveTextContent(transactionWireCall)
-    const commentaryToggle = screen.getByRole('button', { name: /hide play-by-play/i })
+    expect(await screen.findByText(/both databases are asleep, and the first connection is on its way/i)).toBeInTheDocument()
+    expect(screen.getByText(/On the wire/)).toHaveTextContent(transactionWireCall)
+    const commentaryToggle = screen.getByRole('button', { name: /hide commentary/i })
     expect(commentaryToggle).toHaveAttribute('aria-pressed', 'true')
     await user.click(commentaryToggle)
-    expect(screen.queryByText(/connection proof in progress · no verdict/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/both databases are asleep, and the first connection is on its way/i)).not.toBeInTheDocument()
     const hiddenCommentator = screen.getByLabelText(/ringside commentator/i)
-    expect(within(hiddenCommentator).getByText(/play-by-play hidden/i)).toBeInTheDocument()
+    expect(within(hiddenCommentator).getByText(/commentary hidden/i)).toBeInTheDocument()
     expect(within(hiddenCommentator).queryByRole('img', { name: 'Ryan' })).not.toBeInTheDocument()
     expect(hiddenCommentator.querySelector('header')).toBeNull()
-    const showCommentator = within(hiddenCommentator).getByRole('button', { name: /show commentator/i })
+    const showCommentator = within(hiddenCommentator).getByRole('button', { name: /show commentary/i })
     expect(showCommentator).toHaveAttribute('aria-pressed', 'false')
     expect(showCommentator).toHaveAttribute('aria-controls', 'ringside-commentator-status')
     const source = FakeEventSource.instances.at(-1)!
@@ -6687,11 +6713,11 @@ describe('backstage setup', () => {
     const liveIdleClock = await screen.findByRole('button', { name: /re-do round/i })
     expect(liveIdleClock).toHaveTextContent(/back to idle.*live/i)
     await user.click(liveIdleClock)
-    expect(screen.getByText(/play-by-play hidden/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /show commentator/i })).toHaveAttribute('aria-pressed', 'false')
-    await user.click(screen.getByRole('button', { name: /show commentator/i }))
-    expect(screen.getByText(/waiting for both databases to return to idle/i)).toBeInTheDocument()
-    expect(screen.queryByText(/ON THE WIRE/)).not.toBeInTheDocument()
+    expect(screen.getByText(/commentary hidden/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /show commentary/i })).toHaveAttribute('aria-pressed', 'false')
+    await user.click(screen.getByRole('button', { name: /show commentary/i }))
+    expect(screen.getByText(/waiting for both databases to wind down to idle/i)).toBeInTheDocument()
+    expect(screen.queryByText(/On the wire/)).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /back to idle/i })).toBeInTheDocument()
     expect(screen.getByText(/each timer starts after that database's last connection closes/i)).toBeInTheDocument()
     expect(screen.getByLabelText(/lakebase return to idle/i)).toHaveTextContent('0:00')
@@ -6717,8 +6743,8 @@ describe('backstage setup', () => {
     await user.keyboard('{Escape}')
     expect(screen.queryByRole('dialog', { name: /how the clocks stop/i })).not.toBeInTheDocument()
     await waitFor(() => expect(detailsTrigger).toHaveFocus())
-    await user.click(screen.getByRole('button', { name: /hide play-by-play/i }))
-    expect(screen.getByText(/play-by-play hidden/i)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /hide commentary/i }))
+    expect(screen.getByText(/commentary hidden/i)).toBeInTheDocument()
 
     source.emit({
       sequence: 10,
@@ -6786,7 +6812,7 @@ describe('backstage setup', () => {
 
     await user.click(screen.getByRole('button', { name: /ring again/i }))
     await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    expect(await screen.findByRole('button', { name: /hide play-by-play/i })).toHaveAttribute('aria-pressed', 'true')
+    expect(await screen.findByRole('button', { name: /hide commentary/i })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('img', { name: 'Ryan' })).toBeInTheDocument()
   })
 
@@ -7552,9 +7578,10 @@ describe('backstage setup', () => {
     // would read as a perfect 0.000ms fairness number that nothing earned.
     await user.click(screen.getByRole('button', { name: /instant replay/i }))
     const replay = await screen.findByRole('dialog', { name: /wake this idle app/i })
-    const story = within(replay).getByLabelText('Three-beat replay story')
-    expect(story).toHaveTextContent(/Provisioned RDS cannot automatically scale to zero.*no RDS clock/i)
-    expect(story).toHaveTextContent(/Lakebase woke and completed the transaction/i)
+    const story = within(replay).getByLabelText('Play-by-play')
+    expect(story).toHaveTextContent(/Bell\. Lakebase is asleep\. RDS PostgreSQL can't wake on its own, so it sits this one out, untimed\./i)
+    expect(story).toHaveTextContent(/Lakebase.*Awake\. The same transaction committed and read back\. Clock stops\./i)
+    expect(story).toHaveTextContent(/Final call.*RDS PostgreSQL has no automatic wake/i)
     await user.click(within(replay).getByText(/view full evidence/i))
     expect(replay).toHaveTextContent(/Opponent lane/i)
     expect(replay).toHaveTextContent(/no automatic scale-to-zero or connection-triggered wake/i)
@@ -7684,7 +7711,7 @@ describe('backstage setup', () => {
     const cleaningTake = await screen.findByRole('dialog', { name: /for the sre/i })
     expect(within(cleaningTake).getByLabelText('Room priorities')).toHaveTextContent(/^performance$/i)
     expect(cleaningTake).toHaveTextContent(
-      /what we proved.*deletion to exact recovered read.*Lakebase 14\.38s.*Aurora Serverless v2 was still unverified at 90\.00s.*recovery time is greater than 90\.00s.*failover was not tested/i,
+      /what happened.*same order was deleted from both databases at the same instant.*Lakebase had it back and readable in 14\.38s.*stopped waiting at 90\.00s.*Aurora Serverless v2 was still recovering, so its time is more than 90\.00s, not a measurement.*failover wasn't tested/i,
     )
     expect(cleaningTake.querySelector('details')).toBeNull()
     await user.click(within(cleaningTake).getByRole('button', { name: /back to the ring/i }))
@@ -7706,14 +7733,14 @@ describe('backstage setup', () => {
 
     await user.click(screen.getByRole('button', { name: /explain to the room/i }))
     const towelTake = await screen.findByRole('dialog', { name: /for the sre/i })
-    const towelProof = within(towelTake).getByRole('heading', { name: /^what we proved$/i }).closest('section')!.textContent
-    expect(towelProof).toMatch(
-      /deletion to exact recovered read.*Lakebase 14\.38s.*Aurora Serverless v2 was still unverified at 90\.00s.*recovery time is greater than 90\.00s.*failover was not tested/i,
+    const towelResult = within(towelTake).getByRole('heading', { name: /^what happened$/i }).closest('section')!.textContent
+    expect(towelResult).toMatch(
+      /same order was deleted from both databases at the same instant.*Lakebase had it back and readable in 14\.38s.*stopped waiting at 90\.00s.*Aurora Serverless v2 was still recovering, so its time is more than 90\.00s, not a measurement.*failover wasn't tested/i,
     )
-    expect(towelProof).not.toMatch(/stopped at >/i)
+    expect(towelResult).not.toMatch(/stopped at >/i)
     await user.click(within(towelTake).getByRole('tab', { name: /^executive$/i }))
-    expect(towelTake).toHaveTextContent(/what this means.*order became readable on the clock.*business process recovered/i)
-    expect(within(towelTake).getByRole('heading', { name: /^what we proved$/i }).closest('section')!.textContent).toBe(towelProof)
+    expect(towelTake).toHaveTextContent(/why it matters to you.*data loss is a business interruption clock/i)
+    expect(within(towelTake).getByRole('heading', { name: /^what happened$/i }).closest('section')!.textContent).toBe(towelResult)
     await user.click(within(towelTake).getByRole('button', { name: /back to the ring/i }))
 
     stubReceiptCanvas()
@@ -7957,7 +7984,7 @@ describe('backstage setup', () => {
     await user.click(screen.getByRole('button', { name: /reveal the fight card/i }))
     await user.click(await screen.findByRole('button', { name: /prepare fight card/i }))
     await user.click(await screen.findByRole('button', { name: /ring the bell/i }))
-    expect(await screen.findByText(/point-in-time recovery proof in progress/i)).toBeInTheDocument()
+    expect(await screen.findByText(/the same order was just deleted on both sides/i)).toBeInTheDocument()
     expect(screen.getByText(/on the wire/i)).toHaveTextContent('Lakebase: databricks postgres create-branch')
 
     const source = FakeEventSource.instances.at(-1)!

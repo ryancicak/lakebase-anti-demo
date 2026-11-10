@@ -24,12 +24,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .connection_fanin import TARGET_CLIENTS_PER_LANE
+from .home_cloud import by_cloud
 from .models import (
     CapacityDisclosure,
     CapacityLaneDisclosure,
     CompetitorId,
     RoundId,
     aws_lane,
+    competitor_cloud,
 )
 
 # Lakebase autoscaling range applied by server/lifecycle.py:_configure_lakebase.
@@ -586,7 +588,7 @@ def build_capacity_disclosure(
     told, and Round 6's AWS lane does not race yet.
     """
 
-    if competitor_id == CompetitorId.AZURE_POSTGRES:
+    if by_cloud(competitor_cloud(competitor_id), aws=False, azure=True):
         return _azure_capacity_disclosure(round_id, observed)
     lakebase, lakebase_min_cu, lakebase_max_cu = _lakebase_lane(round_id, observed)
     if not round_has_aws_lane(round_id):

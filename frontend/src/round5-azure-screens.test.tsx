@@ -9,9 +9,8 @@ import type {
   RoundFiveRuntimeLane,
 } from './api/types'
 import { FALLBACK_CATALOG } from './catalog'
-import { buildRingsideCue } from './ringside-cues'
-import { PERSONA_IDS } from './ringside-cues/corpus'
-import { PRIORITY_KEYS } from './ringside-cues/types'
+import { buildRingsideBriefing } from './ringside-cues'
+import { PERSONA_IDS, PRIORITIES } from './ringside-cues/corpus'
 import {
   ROUND_FIVE_AZURE_CLEANUP_COPY,
   roundFiveSchedulingAdvisorySummary,
@@ -216,12 +215,14 @@ describe('the Azure edition’s Round 5 screens', () => {
     expect(container).toBeTruthy()
   })
 
-  it('cue every persona and priority without an AWS product', () => {
+  it('brief every persona and priority without an AWS product', () => {
     const session = azureRoundFiveSession()
     for (const personaId of PERSONA_IDS) {
-      for (const priorityKey of PRIORITY_KEYS) {
-        const cue = buildRingsideCue(session, personaId, priorityKey)
-        expect(`${cue.say} ${cue.ask} ${cue.show}`, `${personaId}/${priorityKey}`).not.toMatch(AWS_WORDS)
+      for (const priority of PRIORITIES) {
+        const briefing = buildRingsideBriefing(session, personaId, [priority])
+        const spoken = [briefing.result, briefing.why, ...briefing.lenses.map((lens) => lens.text), briefing.ask].join(' ')
+        expect(spoken, `${personaId}/${priority}`).not.toMatch(AWS_WORDS)
+        expect(spoken, `${personaId}/${priority}`).not.toMatch(/<[A-Z0-9_]+>/)
       }
     }
   })

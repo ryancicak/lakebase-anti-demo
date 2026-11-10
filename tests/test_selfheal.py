@@ -354,6 +354,8 @@ async def test_a_local_caller_is_always_the_operator(
         rendered = (await client.get("/api/installation")).json()
 
     assert rendered["audience"] == selfheal.AUDIENCE_OPERATOR
+    # A bare test app has no run manager, so the view reads as the AWS edition.
+    assert rendered["cloud"] == "aws"
     # The whole diagnosis, exactly as before: the credential named, the count
     # stated, and the refusal that explains why no button appears.
     assert "SSOTokenLoadError" in rendered["reason"]

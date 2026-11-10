@@ -71,15 +71,16 @@ import {
   moonSprite,
 } from './halloween'
 import {
-  buildRingsideCue,
+  buildRingsideBriefing,
   classifyOutcome,
-  priorityKeyFor,
   type ClassifiedSessionOutcome,
   type FormalWinner,
 } from './ringside-cues'
 import { compactDuration, preciseDuration } from './time'
-import { byCompetitor, competitorKind, fighterLabel, fighterLabelForName, scalesToZero } from './competitor-kind'
-import { replayStory } from './instant-replay'
+import { byCompetitor, cloudOfKind, competitorCloud, competitorKind, fighterLabel, fighterLabelForName, kindForName, scalesToZero } from './competitor-kind'
+import type { CompetitorCloud } from './competitor-kind'
+import { cooldownCommentary, liveCommentary } from './commentary'
+import { replayTape } from './instant-replay'
 import { loadScorecard, saveScorecard, type ScorecardEntry } from './scorecard-storage'
 export type { ScorecardEntry } from './scorecard-storage'
 import {
@@ -115,7 +116,6 @@ import {
   roundFiveServerResetNote,
   roundFiveSetupElapsedDisplay,
   roundFiveSetupLaneResult,
-  roundFiveStoppedVerdict,
   roundFiveFanInMarginDisplay,
   roundFiveUsesFanIn,
   type RoundFiveLanePresentation,
@@ -185,9 +185,12 @@ const ROUND_CLEANUP_COPY: Record<RoundId, string> = {
   analyze_live_orders_without_slowing_checkout: 'This round will reopen when its current cleanup finishes. Other rounds remain available.',
 }
 function roundCleanupCopy(roundId: RoundId, competitor?: CompetitorId): string {
-  return roundId === 'survive_connection_spike' && competitor === 'azure_postgres'
-    ? ROUND_FIVE_AZURE_CLEANUP_COPY
-    : ROUND_CLEANUP_COPY[roundId]
+  if (roundId !== 'survive_connection_spike' || competitor === undefined) return ROUND_CLEANUP_COPY[roundId]
+  return byCompetitor(competitor, {
+    aurora: ROUND_CLEANUP_COPY[roundId],
+    rds: ROUND_CLEANUP_COPY[roundId],
+    azure: ROUND_FIVE_AZURE_CLEANUP_COPY,
+  })
 }
 
 type RoundCardState =
@@ -384,9 +387,30 @@ function opponentLabel(roundId: RoundId, competitorId: CompetitorId, shortName: 
   return `${shortName} + ${byCompetitor(competitorId, { aurora: 'RDS Proxy', rds: 'RDS Proxy', azure: 'PgBouncer' })}`
 }
 
-/** The competitor's cloud, as share cards and receipts name it: AWS, or Azure. */
+/** The competitor's cloud, as share cards and receipts name it. */
 function cloudOf(session: DemoSession): string {
-  return byCompetitor(session.competitor.id, { aurora: 'AWS', rds: 'AWS', azure: 'Azure' })
+  return competitorCloud(session.competitor.id)
+}
+
+/** How a cost line's source names its provider, so the provider's lines get its label. One entry per cloud. */
+const PRICING_SOURCE_PREFIXES: Record<CompetitorCloud, readonly string[]> = { AWS: ['AWS', 'Amazon'], Azure: ['Azure'] }
+
+const ROUND_FIVE_SETUP_SENTENCE_AWS = 'Lakebase uses its included pooled endpoint. The selected AWS managed pooling path adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are sealed before the clock.'
+
+/** Round 5's component disclosure, in the edition's words: what the bout provisioned and what it did not test. */
+function PoolingDisclosure({ session, awsEngineName, v4 }: { session: DemoSession; awsEngineName: string; v4: boolean }) {
+  const aws = <>
+    <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
+    <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+  </>
+  return byCompetitor(session.competitor.id, {
+    aurora: aws,
+    rds: aws,
+    azure: <>
+      <p>{awsEngineName} · selected Azure pooling path · this bout switched on the server’s built-in PgBouncer and raised its client limit to 10,100.</p>
+      <p>Direct connections, a self-managed PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
+    </>,
+  })
 }
 
 /** What Round 5 did not test, as its receipt and share text say it, in the edition's words. */
@@ -1104,10 +1128,10 @@ export function CostReceiptDisclosure({ session }: { session: DemoSession }) {
           <div className="cost-receipt-lines">
             {lines.map((line) => {
               const isDatabricksSource = line.source.startsWith('system.billing')
-              const isAwsSource = line.source.startsWith('AWS') || line.source.startsWith('Amazon')
-              const isAzureSource = line.source.startsWith('Azure')
-              const sourceLabel = isDatabricksSource ? 'Databricks list prices' : isAwsSource ? 'AWS published pricing' : isAzureSource ? 'Azure published pricing' : line.status === 'selection_required' ? 'Product selection required' : 'Published pricing'
-              const timestampLabel = isAwsSource || isAzureSource ? 'provider published' : 'checked'
+              const providerCloud = (Object.keys(PRICING_SOURCE_PREFIXES) as CompetitorCloud[])
+                .find((cloud) => PRICING_SOURCE_PREFIXES[cloud].some((prefix) => line.source.startsWith(prefix)))
+              const sourceLabel = isDatabricksSource ? 'Databricks list prices' : providerCloud ? `${providerCloud} published pricing` : line.status === 'selection_required' ? 'Product selection required' : 'Published pricing'
+              const timestampLabel = providerCloud ? 'provider published' : 'checked'
               const timestamp = formatCostTimestamp(line.source_as_of)
               const rate = line.unit_rate_usd
               const rateDisplay = rate == null
@@ -3663,7 +3687,7 @@ export function finaleLaneBars(result: RoundResult | null): FinaleLaneBars {
       return {
         lakebase: lb === null ? empty('UNCONTESTED') : { share: 1, label: summaryDuration(lb) },
         opponent: empty(racesAwsLane(result.roundId)
-          ? `${result.opponentId === 'azure_postgres' ? 'AZURE' : 'AWS'} LANE NOT INSTALLED`
+          ? `${result.opponentId ? competitorCloud(result.opponentId).toUpperCase() : 'AWS'} LANE NOT INSTALLED`
           : 'NO NATIVE PATH'),
       }
     case 'no_result':
@@ -6504,13 +6528,7 @@ function RoundFiveEvidenceDetails({ session }: { session: DemoSession }) {
       <div className="round5-explain-components" aria-label="Managed component disclosure">
         <strong>COMPONENT DISCLOSURE</strong>
         <p>Lakebase · included pooled endpoint · 0 extra per-bout pooling components · 0 per-bout pooling infrastructure changes.</p>
-        {competitorKind(session.competitor.id) === 'azure' ? <>
-          <p>{awsEngineName} · selected Azure pooling path · this bout switched on the server’s built-in PgBouncer and raised its client limit to 10,100.</p>
-          <p>Direct connections, a self-managed PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
-        </> : <>
-          <p>{awsEngineName} · selected AWS managed pooling path · this bout provisioned a new RDS Proxy{v4 ? ' + target-group configuration + exact target registration' : ' + 8 supporting changes'}.</p>
-          <p>Direct AWS connections, an existing Proxy, PgBouncer, application pooling, and sustained transaction throughput were not tested.</p>
-        </>}
+        <PoolingDisclosure session={session} awsEngineName={awsEngineName} v4={v4} />
       </div>
     </section>
   )
@@ -7167,7 +7185,7 @@ export function RoundFiveProof({
         <header className="round5-header">
           <HomeLogo className="home-logo-compact" onHome={onHome} />
           <div>
-            <p>Round {roundNumber} · Built-in pool · {competitorKind(session.competitor.id) === 'azure' ? 'Switched-on PgBouncer' : 'Added RDS Proxy'}</p>
+            <p>Round {roundNumber} · Built-in pool · {byCompetitor(session.competitor.id, { aurora: 'Added RDS Proxy', rds: 'Added RDS Proxy', azure: 'Switched-on PgBouncer' })}</p>
             <h1>{ROUND_FIVE_DISPLAY_TITLE}</h1>
             <p className="round5-matchup"><strong>Lakebase</strong><span>vs</span><strong>{session.lanes.competitor.name}</strong></p>
           </div>
@@ -7188,9 +7206,11 @@ export function RoundFiveProof({
                   <div><dt>{awsEngineName} setup</dt><dd>{setupStateLabel(setupResults.competitor)} · stop gate {setupResults.competitor.stopGateExact ? 'exact' : 'not verified'}</dd></div>
                   <div><dt>Workflow launch skew</dt><dd>{setupSkew}</dd></div>
                 </dl>
-                <p>{competitorKind(session.competitor.id) === 'azure'
-                  ? 'Lakebase uses its included pooled endpoint. The selected Azure path switches on the server’s built-in PgBouncer and raises its client limit; the client credential is sealed before the clock.'
-                  : 'Lakebase uses its included pooled endpoint. The selected AWS managed pooling path adds a new RDS Proxy and 8 supporting changes; IAM and Proxy credentials are sealed before the clock.'}</p>
+                <p>{byCompetitor(session.competitor.id, {
+                  aurora: ROUND_FIVE_SETUP_SENTENCE_AWS,
+                  rds: ROUND_FIVE_SETUP_SENTENCE_AWS,
+                  azure: 'Lakebase uses its included pooled endpoint. The selected Azure path switches on the server’s built-in PgBouncer and raises its client limit; the client credential is sealed before the clock.',
+                })}</p>
               </details>
               <TowelControl session={session} uiReview={uiReview} onTowel={onTowel} />
               {!uiReview && (terminal || showCleanupFallback) && (
@@ -7518,7 +7538,7 @@ function TowelProgress({ session, onRetry }: { session: DemoSession; onRetry: ()
     <div className="towel-progress" data-state={towel.state} role={failed ? 'alert' : 'status'} aria-live="polite">
       <strong>{title}</strong>
       <span>{detail}</span>
-      {towel.restore_started && <em>AWS RESTORE ALREADY IN MOTION · SAFE CLEANUP MAY TAKE MINUTES</em>}
+      {towel.restore_started && <em>{competitorCloud(session.competitor.id).toUpperCase()} RESTORE ALREADY IN MOTION · SAFE CLEANUP MAY TAKE MINUTES</em>}
       {failed && <button className="proof-towel-retry" onClick={onRetry}>B · Retry cleanup</button>}
     </div>
   )
@@ -7810,8 +7830,9 @@ function replaySteps(session: DemoSession): ReplayStep[] {
         .join(' / ')
     // The Azure edition's lane: its built-in PgBouncer, switched on at the bell, on the
     // server's own host (6432), from two Standard_D8ls_v7 runners.
-    const azureFive = competitorKind(session.competitor.id) === 'azure'
-    const runnerShape = azureFive ? 'Standard_D8ls_v7' : 'c7i.2xlarge'
+    // Each kind decides whether its lane is the PgBouncer-switch shape or the Proxy-build shape, and names its runner.
+    const azureFive = byCompetitor(session.competitor.id, { aurora: false, rds: false, azure: true })
+    const runnerShape = byCompetitor(session.competitor.id, { aurora: 'c7i.2xlarge', rds: 'c7i.2xlarge', azure: 'Standard_D8ls_v7' })
     const burstContract: ReplayCall[] = legacy
       ? [
           { label: 'Legacy scorecard', code: 'Decoded successfully · current 10,000-client fan-in evidence not recorded', note: 'No current fan-in result is inferred from legacy fields.' },
@@ -7948,7 +7969,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     ]
     const awsLane = competitor.state !== 'not_supported'
     // The Azure edition's lane: one Data Factory data flow, reading one Delta version from ADLS.
-    const azure = competitorKind(session.competitor.id) === 'azure'
+    const azure = byCompetitor(session.competitor.id, { aurora: false, rds: false, azure: true })
     return [
       {
         summary: 'Before the bell both integrations were confirmed parked and both applications read the baseline row, so each clock could only measure this bout’s change.',
@@ -8042,7 +8063,7 @@ function replaySteps(session: DemoSession): ReplayStep[] {
     ]
     const awsLane = competitor.state !== 'not_supported'
     // The Azure edition's lane: one Data Factory data flow, extracting by a watermark into Delta.
-    const azure = competitorKind(session.competitor.id) === 'azure'
+    const azure = byCompetitor(session.competitor.id, { aurora: false, rds: false, azure: true })
     return [
       {
         summary: `Before the bell ${azure ? 'Azure’s data flow' : 'AWS’s pipeline'} was confirmed parked, Lakebase’s change feed was confirmed streaming, and both sources read the baseline order, so each clock could only measure this bout’s checkout.`,
@@ -8166,7 +8187,7 @@ function replayCompetitorTitle(session: DemoSession): string {
 export function InstantReplay({ session, roundNumber, onClose }: { session: DemoSession; roundNumber: number; onClose: () => void }) {
   const skew = receiptStartSkewDisplay(session)
   const steps = replaySteps(session)
-  const story = replayStory(session)
+  const tape = replayTape(session)
   // A capability round never releases a second lane, so there is no gap between
   // lane start times to report. Naming the untimed opponent is honest; printing
   // a start gap for a race that did not happen is not.
@@ -8180,34 +8201,39 @@ export function InstantReplay({ session, roundNumber, onClose }: { session: Demo
             <p>Instant replay · Round {roundNumber}</p>
             <h2 id="replay-heading">{session.round.title}</h2>
           </div>
-          <span data-state={story.state}>{story.status}</span>
+          <span data-state={tape.state}>{tape.status}</span>
         </header>
-        <section className="replay-story" aria-label="Three-beat replay story">
-          {story.beats.map((beat, index) => (
-            <article key={beat.id} className="replay-beat" data-beat={beat.id}>
-              <header>
-                <span>{String(index + 1).padStart(2, '0')}</span>
-                <h3>{beat.title}</h3>
-              </header>
-              <p>{beat.body}</p>
-              {story.metricBeat === beat.id && story.metrics.length > 0 && (
-                <div className="replay-primary-metric" aria-label="Primary measured result">
-                  {story.metrics.map((metric) => (
-                    <div key={metric.laneId} data-corner={metric.laneId === 'lakebase' ? 'red' : 'blue'}>
-                      <span>{metric.label}</span>
-                      <strong data-width={metric.value.length >= 7 ? 'long' : 'standard'}>{metric.value}</strong>
-                      <small>{metric.note}</small>
-                    </div>
-                  ))}
+        {/* The replay is a tape, read top to bottom: the scoreboard figures, then
+            every call in the order it happened with its clock reading, then the
+            final call, which is the same sentence Explain to the Room opens with.
+            The evidence that backs each call stays folded below. */}
+        <section className="replay-story" aria-label="Play-by-play">
+          {tape.metrics.length > 0 && (
+            <div className="replay-primary-metric" aria-label="Primary measured result">
+              {tape.metrics.map((metric) => (
+                <div key={metric.laneId} data-corner={metric.laneId === 'lakebase' ? 'red' : 'blue'}>
+                  <span>{metric.label}</span>
+                  <strong data-width={metric.value.length >= 7 ? 'long' : 'standard'}>{metric.value}</strong>
+                  <small>{metric.note}</small>
                 </div>
-              )}
-            </article>
-          ))}
+              ))}
+            </div>
+          )}
+          <ol className="replay-tape" aria-label="The calls, in order">
+            {tape.calls.map((call, index) => (
+              <li key={index} data-lane={call.lane}>
+                <span className="replay-at">{call.atMs === null ? '' : `${(call.atMs / 1000).toFixed(2)}s`}</span>
+                <b>{call.who}</b>
+                <span className="replay-call">{call.text}</span>
+              </li>
+            ))}
+          </ol>
+          <p className="replay-final-call"><b>Final call</b><span>{highlightFigures(tape.finalCall)}</span></p>
         </section>
         <details className="replay-evidence">
           <summary data-dialog-initial-focus>
             <span>View full evidence</span>
-            <small>Calls, gates, matrices, timestamps, and configuration</small>
+            <small>Every call, gate, timestamp, and setting behind the tape</small>
           </summary>
           <div className="replay-evidence-body">
             <section className="replay-evidence-lanes" aria-label="Lane evidence status">
@@ -8227,7 +8253,7 @@ export function InstantReplay({ session, roundNumber, onClose }: { session: Demo
             </section>
             <section className="replay-proof-sequence" aria-label="Exact proof sequence">
               <header>
-                <strong>{story.state === 'verified' ? 'Exact proof sequence' : 'Required proof sequence · Incomplete'}</strong>
+                <strong>{tape.state === 'verified' ? 'Exact proof sequence' : 'Required proof sequence · Incomplete'}</strong>
                 <span>Placeholders shown · No secrets</span>
               </header>
               {steps.map((step, index) => {
@@ -8236,7 +8262,7 @@ export function InstantReplay({ session, roundNumber, onClose }: { session: Demo
                   <article key={step.summary} className="replay-evidence-step">
                     <h3>
                       <span>{stepNumber}</span>
-                      {story.state === 'verified'
+                      {tape.state === 'verified'
                         ? step.summary
                         : `Required proof step ${stepNumber} · not all calls completed`}
                     </h3>
@@ -8305,14 +8331,43 @@ function RingsideMeanings({ session, onExplain }: { session: DemoSession; onExpl
   )
 }
 
-function RingsideTake({ session, onClose }: { session: DemoSession; onClose: () => void }) {
+/**
+ * The measured times in a result line, set apart so they carry on a projector.
+ * Matches the receipt's own figure shape ("1.23s", ">90.00s" is two tokens) and
+ * leaves every other character exactly as authored; the text content is unchanged.
+ */
+function highlightFigures(text: string): React.ReactNode[] {
+  return text.split(/(\d+\.\d{2}s)/).map((part, index) => (
+    index % 2 === 1 ? <em key={index}>{part}</em> : part
+  ))
+}
+
+/**
+ * Explain to the room: the briefing a presenter reads to one person in it.
+ *
+ * It reads top to bottom in speaking order. What happened carries this bout's
+ * numbers and its measured boundary in one sentence a person would say out loud.
+ * Why it matters to you is written to the selected role about the stakes of the
+ * round. Your priorities is one labeled row per priority the room picked, so the
+ * chips in the header visibly produce content. Ask the room is the one question
+ * that turns the proof into a conversation. Only the first block changes with the
+ * outcome; the other three say nothing about who won, so a stopped bout reads them
+ * without inheriting a result. Nothing here re-derives a figure or opens a
+ * disclosure; the evidence lives in Instant Replay and What It Cost.
+ */
+export function RingsideTake({ session, onClose }: { session: DemoSession; onClose: () => void }) {
   const personas = [session.primary_persona, ...session.secondary_personas]
   const [selectedId, setSelectedId] = useState<PersonaId>(session.primary_persona.id)
   const selected = personas.find((persona) => persona.id === selectedId) ?? personas[0]
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
   const surfaceRef = useAccessibleDialog<HTMLElement>(true, onClose)
-  const cue = buildRingsideCue(session, selected.id, priorityKeyFor(session.corners))
+  const briefing = buildRingsideBriefing(session, selected.id, session.corners)
+  // The two clocks, as the replay scores them: the one source for every round's
+  // figure, floors included, so the briefing and the tape can never disagree.
+  const clocks = replayTape(session).metrics
   const selectedTabId = `ringside-persona-${selected.id}-tab`
+  // One person in the room needs no tab strip; a single tab is noise on a projector.
+  const tabbed = personas.length > 1
 
   const selectTabFromKeyboard = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
     let nextIndex: number | null = null
@@ -8347,41 +8402,65 @@ function RingsideTake({ session, onClose }: { session: DemoSession; onClose: () 
             {session.corners.map((corner) => <span key={corner}>{corner}</span>)}
           </div>
         </header>
-        <nav role="tablist" aria-label="People in the room">
-          {personas.map((persona, index) => (
-            <button
-              ref={(node) => { tabRefs.current[index] = node }}
-              id={`ringside-persona-${persona.id}-tab`}
-              role="tab"
-              type="button"
-              aria-selected={selected.id === persona.id}
-              aria-controls="ringside-persona-panel"
-              tabIndex={selected.id === persona.id ? 0 : -1}
-              key={persona.id}
-              onClick={() => setSelectedId(persona.id)}
-              onKeyDown={(event) => selectTabFromKeyboard(event, index)}
-            >
-              {persona.role}
-            </button>
-          ))}
-        </nav>
+        {clocks.length > 0 && (
+          <div className="ringside-scoreboard" aria-label="The clocks">
+            {clocks.map((clock) => (
+              <div key={clock.laneId} data-corner={clock.laneId === 'lakebase' ? 'red' : 'blue'} data-floor={clock.value.startsWith('>')}>
+                <span>{clock.label}</span>
+                <strong>{clock.value}</strong>
+                {clock.value.startsWith('>') && <small>Still going when stopped. A floor, not a result.</small>}
+              </div>
+            ))}
+          </div>
+        )}
+        {tabbed && (
+          <nav role="tablist" aria-label="People in the room">
+            {personas.map((persona, index) => (
+              <button
+                ref={(node) => { tabRefs.current[index] = node }}
+                id={`ringside-persona-${persona.id}-tab`}
+                role="tab"
+                type="button"
+                aria-selected={selected.id === persona.id}
+                aria-controls="ringside-persona-panel"
+                tabIndex={selected.id === persona.id ? 0 : -1}
+                key={persona.id}
+                onClick={() => setSelectedId(persona.id)}
+                onKeyDown={(event) => selectTabFromKeyboard(event, index)}
+              >
+                {persona.role}
+              </button>
+            ))}
+          </nav>
+        )}
         <div
           id="ringside-persona-panel"
           className="ringside-persona-panel"
-          role="tabpanel"
-          aria-labelledby={selectedTabId}
+          role={tabbed ? 'tabpanel' : undefined}
+          aria-labelledby={tabbed ? selectedTabId : undefined}
         >
-          <section className="ringside-cue ringside-say">
-            <h3>What this means</h3>
-            <p>{cue.say}</p>
+          <section className="ringside-cue ringside-result" data-declared={briefing.declared}>
+            <h3>What happened</h3>
+            <p>{highlightFigures(briefing.result)}</p>
+          </section>
+          <section className="ringside-cue ringside-why">
+            <h3>Why it matters to you</h3>
+            <p>{briefing.why}</p>
+          </section>
+          <section className="ringside-cue ringside-lenses">
+            <h3>Your priorities</h3>
+            <ul aria-label="The round through each priority the room picked">
+              {briefing.lenses.map((lens) => (
+                <li key={lens.priority} data-priority={lens.priority}>
+                  <b>{lens.priority}</b>
+                  <span>{lens.text}</span>
+                </li>
+              ))}
+            </ul>
           </section>
           <section className="ringside-cue ringside-ask">
-            <h3>Question for the room</h3>
-            <p>{cue.ask}</p>
-          </section>
-          <section className="ringside-cue ringside-show">
-            <h3>What we proved</h3>
-            <p>{cue.show}</p>
+            <h3>Ask the room</h3>
+            <p>{briefing.ask}</p>
           </section>
         </div>
         <button type="button" className="ringside-close" onClick={onClose}>B · Back to the ring</button>
@@ -8401,10 +8480,10 @@ type StandingLane = NonNullable<DemoSession['standing_cost']>['lanes'][number]
  * read off an invoice. It has to say so on the same element as the figure.
  */
 const COST_ROOM_EVIDENCE: Record<StandingLane['evidence'], string> = {
-  rate_card_derived: 'Modelled · rate-card derived',
-  posted_actual: 'Measured · posted actual',
-  posted_projection: 'Measured · posted projection',
-  sealed_shape_only: 'Modelled · sealed shape only',
+  rate_card_derived: 'Modelled · from the published rate card',
+  posted_actual: 'Measured · from the posted bill',
+  posted_projection: 'Measured · projected from the posted bill',
+  sealed_shape_only: 'Modelled · from the sealed shape, no bill yet',
   unpriced: 'Unpriced',
 }
 
@@ -8433,10 +8512,45 @@ const COST_ROOM_EVIDENCE: Record<StandingLane['evidence'], string> = {
  * same payload and share `NAMED_ENGINE_LANES`.
  */
 export function CostRoom({ session, onClose }: { session: DemoSession; onClose: () => void }) {
-  const lanes = session.standing_cost?.lanes ?? []
+  const standing = session.standing_cost
+  const descent = session.descent_cost
+  const bout = session.bout_cost
+  const lanes = standing?.lanes ?? []
   const engines = NAMED_ENGINE_LANES
     .map((id) => lanes.find((lane) => lane.lane_id === id))
     .filter((lane): lane is StandingLane => lane !== undefined)
+  // The bill in one breath: three plain questions, each answered with the
+  // payload's own headline figure and the payload's own one-sentence summary.
+  // Nothing is derived here; a row with no payload behind it is not rendered.
+  const breath = [
+    standing?.totals
+      ? {
+          id: 'standing',
+          label: 'Right now, with nobody in the ring',
+          figure: standing.totals.installation.display,
+          note: standing.totals.installation.condition,
+          says: 'What the installation bills every hour, bout or no bout. The three engines below are the part people recognize; the Standing cost door has all six lanes.',
+        }
+      : null,
+    descent
+      ? {
+          id: 'descent',
+          label: 'Every time a database winds down to idle',
+          figure: descent.lanes.map((lane) => `${lane.product} ${lane.per_descent_headline}`).join(' · '),
+          note: `Idle floors ${descent.floor_ratio_label} apart`,
+          says: descent.summary,
+        }
+      : null,
+    bout
+      ? {
+          id: 'bout',
+          label: 'What six rounds cost on the other side',
+          figure: bout.total_display,
+          note: bout.summary,
+          says: bout.dearest_claim,
+        }
+      : null,
+  ].filter((row): row is NonNullable<typeof row> => row !== null)
   const dialogRef = useAccessibleDialog<HTMLElement>(true, onClose)
   return (
     <div className="cost-room-overlay" role="presentation" onClick={onClose}>
@@ -8455,6 +8569,22 @@ export function CostRoom({ session, onClose }: { session: DemoSession; onClose: 
           </div>
           <span>{session.competitor.short_name}</span>
         </header>
+        {breath.length > 0 && (
+          <section className="cost-room-breath" aria-label="The bill in one breath">
+            <h3>The bill in one breath</h3>
+            {breath.map((row) => (
+              <article key={row.id} data-row={row.id}>
+                <span>{row.label}</span>
+                <b>{row.figure}</b>
+                <small>{row.note}</small>
+                <p>{row.says}</p>
+              </article>
+            ))}
+          </section>
+        )}
+        {engines.length > 0 && (
+          <p className="cost-room-strip-caption">What each engine bills while nobody is in the ring, and where each number comes from</p>
+        )}
         {engines.length > 0 ? (
           <div className="cost-room-idle" aria-label="What each engine bills while no bout is running">
             {engines.map((lane) => (
@@ -8787,12 +8917,15 @@ export function ShareReceipt({
  * Aurora method is being corrected and a total would move.
  */
 export function IdlePolicyFloor({
+  competitorId,
   competitorCannotIdle,
   descentCost,
 }: {
+  competitorId: CompetitorId
   competitorCannotIdle: boolean
   descentCost?: DescentCostSnapshot | null
 }) {
+  const noIdleName = byCompetitor(competitorId, { aurora: 'Aurora', rds: 'Provisioned RDS', azure: 'Azure Database for PostgreSQL' })
   const lakebase = descentCost?.lanes.find((lane) => lane.lane_id === 'lakebase')
   const competitor = descentCost?.lanes.find((lane) => lane.lane_id === 'competitor')
   return (
@@ -8800,7 +8933,7 @@ export function IdlePolicyFloor({
       <p className="between-policy-floor">
         <span>Idle policy · not idle speed</span>
         {competitorCannotIdle
-          ? 'Lakebase is set to its shortest supported timeout, 60s. Provisioned RDS has no automatic idle pause at all, so its lane is not timed here.'
+          ? `Lakebase is set to its shortest supported timeout, 60s. ${noIdleName} has no automatic idle pause at all, so its lane is not timed here.`
           : 'Each side is set to its shortest supported timeout — Lakebase 60s, Aurora 300s. AWS will not accept below 300s, so 240s of any gap is a product floor, not a setting we picked.'}
       </p>
       {lakebase && competitor && (
@@ -8902,7 +9035,7 @@ function CooldownDetails({
               ))}
             </div>
             <p>Polling and delivery lag never extends a frozen result. The server’s first terminal lane snapshot owns the displayed stop value.</p>
-            <IdlePolicyFloor competitorCannotIdle={competitor.state === 'not_supported'} descentCost={session.descent_cost} />
+            <IdlePolicyFloor competitorId={session.competitor.id} competitorCannotIdle={competitor.state === 'not_supported'} descentCost={session.descent_cost} />
           </section>
         )}
         <ol className="cooldown-proof-rules">
@@ -8952,6 +9085,7 @@ export function BetweenRounds({
   const recoveryCleanup = cooldown.mode === 'delete_recovery_environment'
   const shareableIdleProof = isShareableIdleProof(session)
   const competitorCannotIdle = !deleting && cooldown.lanes.competitor.state === 'not_supported'
+  const noIdleShortName = byCompetitor(session.competitor.id, { aurora: 'Aurora', rds: 'RDS', azure: 'Azure PostgreSQL' })
   const resetStatus = deleting
     ? failed
       // The server's own reason, as Round 1 shows it, e.g. that the cleanup lost its
@@ -8966,8 +9100,8 @@ export function BetweenRounds({
       ? `Reset stopped · ${(cooldown.failure ?? 'Return to idle was not confirmed').replace(/\.$/, '')} · Retry cleanup`
     : competitorCannotIdle
       ? ready
-        ? 'Lakebase IDLE · RDS has no automatic scale-to-zero · RING AGAIN is ready'
-        : 'Lakebase clock is live · RDS has no automatic scale-to-zero'
+        ? `Lakebase IDLE · ${noIdleShortName} has no automatic scale-to-zero · RING AGAIN is ready`
+        : `Lakebase clock is live · ${noIdleShortName} has no automatic scale-to-zero`
       : ready
         ? 'Both databases IDLE · RING AGAIN is ready'
         : 'Waiting for each database to become idle'
@@ -9066,7 +9200,9 @@ function FinaleRow({ beat, result, record, latest, opponent, opponentId }: {
   const proofOpponent = result?.opponentId ?? opponentId
   const proof = beat.roundId === 'survive_connection_spike'
     ? '10,000 clients held / lane · multiplexing proved'
-    : beat.azureProof && proofOpponent === 'azure_postgres' ? beat.azureProof : beat.proof
+    : proofOpponent
+      ? byCompetitor(proofOpponent, { aurora: beat.proof, rds: beat.proof, azure: beat.azureProof ?? beat.proof })
+      : beat.proof
   const lane = (side: FinaleLane, corner: 'red' | 'blue', badge: string) => (
     <div className="finale-lane" data-corner={corner} aria-hidden="true">
       <b>{badge}</b>
@@ -9354,7 +9490,7 @@ export function FinalScorecard({ entries, credits, onBack }: { entries: Scorecar
             </dl>
             {entry.competitor_capability_gap && (
               <p className="scorecard-gap">
-                Capability gap, not a race · no {fighterLabelForName(entry.competitor) === 'AZR' ? 'Azure' : 'AWS'} lane
+                Capability gap, not a race · no {cloudOfKind(kindForName(entry.competitor))} lane
                 was built, so nothing was timed against it and there is no margin to report.
               </p>
             )}
@@ -9618,7 +9754,7 @@ function CooldownLane({
       data-state={lane.state}
       aria-label={`${label} ${mode === 'return_to_idle' ? 'return to idle' : mode === 'delete_recovery_environment' ? 'recovery environment reset' : 'isolated environment reset'}`}
     >
-      <div className="cooldown-name"><DatabaseFighter label={corner === 'red' ? 'LB' : label.toLowerCase().includes('aurora') ? 'AUR' : 'RDS'} corner={corner} /><strong>{label}</strong></div>
+      <div className="cooldown-name"><DatabaseFighter label={corner === 'red' ? 'LB' : fighterLabelForName(label)} corner={corner} /><strong>{label}</strong></div>
       <div className="cooldown-time">
         <span aria-label={clockAriaLabel}>{visibleClock}</span>
       </div>
@@ -9677,12 +9813,15 @@ function RingsideCommentator({
 }) {
   const contentId = 'ringside-commentator-status'
   const conciseFlowRound = isRoundFour(session) || isRoundFive(session) || isRoundSix(session)
-  const subtitle = isRoundFive(session)
-    ? session.state === 'verified' ? 'Final verified call' : 'Live setup call'
-    : conciseFlowRound ? null : 'Live server events'
-  const lines = cooldown
+  // What the bar is, for someone seeing it for the first time: Ryan calling the
+  // bout as it happens, then the final call once the server has declared it.
+  const terminal = session.state === 'verified' || session.state === 'failed' || session.state === 'towelled'
+  const subtitle = cooldown
+    ? 'Between rounds'
+    : terminal ? 'Final call' : 'Calling it live'
+  const commentary = cooldown
     ? cooldownCommentary(session)
-    : proofCommentary(session, liveEvidenceConnected)
+    : liveCommentary(session, liveEvidenceConnected)
   const wireCalls = (cooldown
     ? Object.values(session.cooldown?.lanes ?? {})
     : Object.values(session.lanes))
@@ -9701,20 +9840,24 @@ function RingsideCommentator({
         <strong>Ringside commentator <em className="ringside-announcer-tag">Ryan</em></strong>
         {subtitle && <small>{subtitle}</small>}
       </header>}
-      {!open && <strong className="ringside-hidden-status">Play-by-play hidden</strong>}
+      {!open && <strong className="ringside-hidden-status">Commentary hidden</strong>}
       <div id={contentId} className="ringside-commentary" role="status" aria-live="polite" aria-atomic="true" hidden={!open}>
         {open && (
           <>
+          {/* The call first: where the bout stands, in one sentence. Then one
+              line per fighter. The wire call stays last and small: it is the
+              proof this is a real SQL transaction and not a cloud API, for the
+              one person in the room who wants to see it. */}
+          <p className="ringside-call">{commentary.headline}</p>
+          <ul>
+            {commentary.lanes.map((line, index) => <li key={index}>{line}</li>)}
+          </ul>
           {missedCalls > 0 && (
             <code className="ringside-missed-calls" data-missed-calls={missedCalls}>
-              MISSED CALLS · {missedCalls} {missedCalls === 1 ? 'call' : 'calls'} never reached this screen · The play-by-play picked up after them
+              Missed calls · {missedCalls} {missedCalls === 1 ? 'call' : 'calls'} never reached this screen · The commentary picked up after them
             </code>
           )}
-          <ul>
-            {lines.lanes.map((line, index) => <li key={index}>{line}</li>)}
-          </ul>
-          <p>{lines.verdict}</p>
-          {wireCalls.length > 0 && !conciseFlowRound && !cooldown && <code>ON THE WIRE · {wireCalls.join(' · ')}</code>}
+          {wireCalls.length > 0 && !conciseFlowRound && !cooldown && <code>On the wire · {wireCalls.join(' · ')}</code>}
           </>
         )}
       </div>
@@ -9724,330 +9867,10 @@ function RingsideCommentator({
         aria-controls={contentId}
         onClick={onToggle}
       >
-        {open ? 'Select · Hide play-by-play' : 'Select · Show commentator'}
+        {open ? 'Select · Hide commentary' : 'Select · Show commentary'}
       </button>
     </aside>
   )
-}
-
-function proofCommentary(
-  session: DemoSession,
-  liveEvidenceConnected = true,
-): { lanes: string[]; verdict: string } {
-  if (isRoundFour(session)) {
-    // Two cold integrations and one verifier: each line is that lane's own phase,
-    // read off the engine's progress, and nothing here decides a verdict.
-    const lanes = (['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
-      const lane = session.lanes[laneId]
-      const name = roundFourStackLabel(session, laneId)
-      if (lane.state === 'not_supported') {
-        return `${session.competitor.short_name} · The ${cloudOf(session)} lane is not installed here, so there is no timer`
-      }
-      if (lane.state === 'verified') return `${name} · Exact row read in the app${frozenLaneTime(lane.elapsed_ms)}`
-      if (lane.state === 'failed') return `${name} · ${lane.status}`
-      if (lane.state === 'towelled') return `${name} · ${lane.status}`
-      const phase = lane.activity?.phase
-      if (phase === 'starting') return `${name} · Cold start at the bell`
-      if (phase === 'waiting') return `${name} · Started · The verifier reads the app every 250 ms`
-      return `${name} · ${lane.status}`
-    })
-    const timed = Object.values(session.lanes).filter((lane) => lane.state !== 'not_supported')
-    const verified = timed.filter((lane) => lane.state === 'verified')
-    const verdict = verified.length === 1 && timed.length === 2
-      ? `${verified[0].name} has read the exact row · Other lane still running · No verdict yet`
-      : verified.length === timed.length && timed.length > 0
-        ? 'Every lane read the exact row · Awaiting server verdict'
-        : 'Both clocks run from the bell to each lane’s own first exact read · No verdict yet'
-    return { lanes, verdict }
-  }
-  if (isRoundFive(session)) {
-    const runtime = session.round5_runtime?.protocol === ROUND_FIVE_BELL_PROTOCOL
-      ? session.round5_runtime
-      : null
-    if (runtime) {
-      const lines = (['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
-        const lane = runtime.lanes[laneId]
-        const name = session.round5_setup?.lanes?.[laneId]?.name
-          ?? session.lanes[laneId].name
-        return [
-          `${name} · ${lane.held_clients.toLocaleString('en-US')} currently held · ${lane.sampled_queries_succeeded} of ${ROUND_FIVE_SAMPLED_QUERIES} held-connection checks · ${lane.status}`,
-          roundFiveServerResetNote(session.lanes[laneId]),
-        ].filter(Boolean).join(' · ')
-      })
-      return {
-        lanes: lines,
-        verdict: runtime.state === 'verified'
-          ? roundFiveVerifiedVerdict(session)
-          : runtime.state === 'running'
-            ? '10,000-client fan-in live · no winner until both lanes verify'
-            : roundFiveStoppedVerdict(session),
-      }
-    }
-    const fanInActive = (['lakebase', 'competitor'] as LaneId[]).some(
-      (laneId) => isRoundFiveFanInEvidence(session.lanes[laneId].evidence),
-    )
-    if (fanInActive) {
-      const lines = (['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
-        const lane = session.lanes[laneId]
-        const result = roundFiveLaneResult(lane)
-        if (result.bounded) {
-          return `${lane.name} · Legacy scorecard decoded · current 10,000-client fan-in evidence not recorded`
-        }
-        const held = result.held ?? result.authenticated ?? lane.attempts
-        const target = result.timeToTargetMs === null
-          ? `${held.toLocaleString('en-US')} / ${result.targetClients.toLocaleString('en-US')} clients held`
-          : `${result.targetClients.toLocaleString('en-US')} clients held at ${preciseDuration(result.timeToTargetMs)}`
-        return `${lane.name} · ${target} · ${lane.status}`
-      })
-      const update = session.state === 'verified'
-        ? roundFiveVerifiedVerdict(session)
-        : !liveEvidenceConnected
-          ? 'Live evidence interrupted · Counters stale · clocks continue while reconnecting'
-          : 'Per-lane fan-in live · no winner until both exact gates, hold, held-connection checks, multiplexing, and cleanup verify'
-      return {
-        lanes: lines,
-        verdict: `${update} · Client fan-in is not backend count or transaction throughput`,
-      }
-    }
-    const currentSetup = isRoundFiveSetupEvidence(session.round5_setup)
-      ? session.round5_setup
-      : null
-    const setupLanes = (['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
-      const lane = currentSetup?.lanes?.[laneId]
-      const name = lane?.name || session.lanes[laneId].name
-      const state = lane?.state ?? 'pending'
-      const elapsedMs = typeof lane?.setup_elapsed_ms === 'number'
-        && Number.isFinite(lane.setup_elapsed_ms)
-        && lane.setup_elapsed_ms >= 0
-        ? lane.setup_elapsed_ms
-        : null
-      const status = lane?.status?.trim() || 'Waiting for first timed setup event'
-      let line: string
-      if (state === 'running') {
-        line = liveEvidenceConnected
-          ? `${name} · Setup clock live · ${status}`
-          : `${name} · Live evidence interrupted · Clock continues · evidence stale while reconnecting`
-      } else if (state === 'verified') {
-        line = `${name} · Exact setup gate verified · Clock stopped${elapsedMs === null ? '' : ` at ${preciseDuration(elapsedMs)}`} · ${status}`
-      } else if (state === 'failed') {
-        line = `${name} · Setup stop gate did not verify · ${status}`
-      } else if (state === 'cleanup_failed') {
-        line = `${name} · Backstage cleanup did not verify · ${status}`
-      } else if (state === 'towelled') {
-        line = `${name} · Setup stopped before verification · ${status}`
-      } else {
-        line = `${name} · Untimed preparation · Setup clock starts at the bell`
-      }
-      return { name, state, elapsedMs, line }
-    })
-    const verified = setupLanes.filter((lane) => lane.state === 'verified')
-    const active = setupLanes.filter((lane) => lane.state === 'running')
-    const stopped = verified[0]
-    const other = stopped ? setupLanes.find((lane) => lane !== stopped) : undefined
-    const hasFailure = setupLanes.some((lane) => lane.state === 'failed' || lane.state === 'cleanup_failed' || lane.state === 'towelled')
-    const setupUpdate = !liveEvidenceConnected && active.length > 0
-      ? 'Live evidence interrupted · No new result inferred · Reconnecting'
-      : verified.length === 2 && session.state === 'verified'
-        ? roundFiveVerifiedVerdict(session)
-      : verified.length === 2
-        ? roundFiveUsesFanIn(session)
-          ? 'Both one-bell lane pipelines are in progress · No comparison until every gate verifies'
-          : 'Both pooled-path setup clocks stopped in a legacy scorecard · current 10,000-client fan-in evidence not recorded'
-      : verified.length === 1 && other?.state === 'running'
-        ? `${stopped.name} reached pooled-path setup${stopped.elapsedMs === null ? '' : ` at ${preciseDuration(stopped.elapsedMs)}`} · ${other.name} setup clock still running · No comparison yet`
-      : verified.length === 1
-          ? `${stopped.name} pooled-path setup clock stopped · ${other?.name ?? 'Other lane'} has not verified · No comparison yet`
-          : hasFailure
-            ? 'Pooled-path proof did not complete · No timing comparison'
-            : active.length > 0
-              ? 'Supporting pooled-path setup in progress · Primary fan-in has not started'
-              : 'Untimed preparation in progress · Both setup clocks start at the bell'
-    const verdict = competitorKind(session.competitor.id) === 'azure'
-      ? `${setupUpdate} · Azure’s built-in PgBouncer is the pooling option selected for this reference path; direct connections and a self-managed PgBouncer were not tested`
-      : `${setupUpdate} · RDS Proxy is the AWS managed pooling option selected for this reference path; direct and existing-pool designs were not tested`
-    return {
-      lanes: setupLanes.map((lane) => lane.line),
-      verdict,
-    }
-  }
-  if (isRoundSix(session)) {
-    // AWS cold starts at the bell and Lakebase's feed is already streaming; one
-    // verifier reads both histories. Each line is that lane's own phase, read off
-    // the engine's progress, and nothing here decides a verdict.
-    const lanes = (['lakebase', 'competitor'] as LaneId[]).map((laneId) => {
-      const lane = session.lanes[laneId]
-      const name = roundSixStackLabel(session, laneId)
-      if (lane.state === 'not_supported') {
-        return `${session.competitor.short_name} · The ${cloudOf(session)} lane is not installed here, so there is no timer`
-      }
-      if (lane.state === 'verified') return `${name} · Exact order read in Delta${frozenLaneTime(lane.elapsed_ms)}`
-      if (lane.state === 'failed') return `${name} · ${lane.status}`
-      if (lane.state === 'towelled') return `${name} · ${lane.status}`
-      const phase = lane.activity?.phase
-      if (phase === 'starting') {
-        return laneId === 'lakebase'
-          ? `${name} · Committing the checkout · The feed is already streaming`
-          : `${name} · Committing the checkout · ${byCompetitor(session.competitor.id, {
-            aurora: 'DMS and Glue cold start',
-            rds: 'DMS and Glue cold start',
-            azure: 'Data Factory cold starts',
-          })} at the bell`
-      }
-      if (phase === 'waiting') return `${name} · Carrying the order · The verifier reads its Delta history every second`
-      return `${name} · ${lane.status}`
-    })
-    const timed = Object.values(session.lanes).filter((lane) => lane.state !== 'not_supported')
-    const verified = timed.filter((lane) => lane.state === 'verified')
-    const verdict = verified.length === 1 && timed.length === 2
-      ? `${verified[0].name} has put the exact order in Delta · Other lane still running · No verdict yet`
-      : verified.length === timed.length && timed.length > 0
-        ? 'Every lane put the exact order in Delta · Awaiting server verdict'
-        : 'Both clocks run from the bell to each lane’s own first exact Delta read · No verdict yet'
-    return { lanes, verdict }
-  }
-  if (session.round.id === 'wake_idle_app') {
-    const lanes = ([session.lanes.lakebase, session.lanes.competitor]).map((lane) => {
-      if (lane.state === 'not_supported') {
-        return `${lane.name} · No automatic scale-to-zero wake path, so there is no timer`
-      }
-      if (lane.state === 'verified') {
-        return `${lane.name} · Same transaction committed and read back on the existing endpoint${frozenLaneTime(lane.elapsed_ms)}`
-      }
-      if (lane.state === 'failed') return `${lane.name} · Existing endpoint transaction was not verified`
-      if (lane.state === 'connecting') {
-        const attempts = lane.attempts > 0 ? ` · Attempt ${lane.attempts}` : ''
-        return `${lane.name} · Reconnecting the same transaction to the existing endpoint${attempts}`
-      }
-      return `${lane.name} · Waiting for an authoritative connection event`
-    })
-    const eligible = Object.values(session.lanes).filter((lane) => lane.state !== 'not_supported')
-    const verified = eligible.filter((lane) => lane.state === 'verified')
-    const unsupported = Object.values(session.lanes).find((lane) => lane.state === 'not_supported')
-    const otherLane = verified.length === 1
-      ? eligible.find((lane) => lane.id !== verified[0].id)
-      : undefined
-    const verdict = unsupported
-      ? verified.length === 1
-        ? `${verified[0].name} existing endpoint verified · ${unsupported.name} has no timer · Awaiting server verdict`
-        : `${unsupported.name} has no timer · No verdict`
-      : verified.length === eligible.length && eligible.length > 0
-        ? 'Both existing endpoints verified · Awaiting server verdict'
-        : verified.length === 1 && otherLane?.state === 'connecting'
-          ? `${verified[0].name} verified · Other lane still connecting · No verdict`
-          : verified.length === 1
-            ? `${verified[0].name} verified · Other lane not verified · No verdict`
-            : 'Connection proof in progress · No verdict'
-    return { lanes, verdict }
-  }
-
-  if (session.round.id !== 'make_schema_change_safely' && session.round.id !== 'recover_deleted_order') {
-    return {
-      lanes: [
-        `${session.lanes.lakebase.name} · Non-executable round; no live adapter or timer`,
-        `${session.lanes.competitor.name} · Non-executable round; no live adapter or timer`,
-      ],
-      verdict: 'Preview only · No result can be inferred',
-    }
-  }
-
-  const lanes = ([session.lanes.lakebase, session.lanes.competitor]).map((lane) => (
-    `${lane.name} · ${session.round.id === 'recover_deleted_order' ? recoveryLaneCopy(lane.activity?.phase, lane.status) : safeChangeLaneCopy(lane.activity?.phase, lane.status)}${lane.state === 'verified' ? frozenLaneTime(lane.elapsed_ms) : ''}`
-  ))
-  const verified = Object.values(session.lanes).filter((lane) => lane.activity?.phase === 'verified')
-  const recovery = session.round.id === 'recover_deleted_order'
-  const verdict = verified.length === 2
-    ? recovery
-      ? 'Both recovered orders and source deletions verified · Awaiting server verdict'
-      : 'Both isolated environments verified · Awaiting server verdict'
-    : verified.length === 1
-      ? `${verified[0].name} verified · Other lane remains in its reported phase · No verdict`
-      : recovery
-        ? 'Point-in-time recovery proof in progress · No result until the server verdict'
-        : 'Identical proof contract in progress · No result until the server verdict'
-  return { lanes, verdict }
-}
-
-function safeChangeLaneCopy(phase: string | undefined, status: string): string {
-  const phaseLabel = phase === 'creating'
-    ? 'Owned isolated environment'
-    : phase === 'migrating'
-      ? 'Identical migration'
-      : phase === 'verifying_application'
-        ? 'Commit + readback'
-        : phase === 'verifying_source'
-          ? 'Source unchanged proof'
-          : phase === 'verified'
-            ? 'Verified'
-            : phase === 'failed'
-              ? 'Failed'
-              : 'Awaiting server phase'
-  return status ? `${phaseLabel} · ${status}` : phaseLabel
-}
-
-function recoveryLaneCopy(phase: string | undefined, status: string): string {
-  const phaseLabel = phase === 'preparing_incident'
-    ? 'Exact incident precondition'
-    : phase === 'deleting_incident'
-      ? 'Deleting exact incident'
-      : phase === 'waiting_recovery_point'
-        ? 'Waiting for recovery eligibility'
-        : phase === 'restoring'
-          ? 'Point-in-time recovery'
-          : phase === 'connecting'
-            ? 'Connecting'
-            : phase === 'verifying_recovered_order'
-              ? 'Verifying recovered order'
-              : phase === 'verifying_source'
-                ? 'Verifying source deletion'
-                : phase === 'verified'
-                  ? 'Verified'
-                  : phase === 'failed'
-                    ? 'Failed'
-                    : 'Awaiting server phase'
-  return status ? `${phaseLabel} · ${status}` : phaseLabel
-}
-
-function frozenLaneTime(elapsedMs: number | null): string {
-  return elapsedMs === null ? '' : ` · ${(elapsedMs / 1000).toFixed(2)}s`
-}
-
-function cooldownCommentary(session: DemoSession): { lanes: string[]; verdict: string } {
-  const cooldown = session.cooldown!
-  const recovery = cooldown.mode === 'delete_recovery_environment'
-  if (cooldown.mode === 'return_to_idle') {
-    const lanes = ([cooldown.lanes.lakebase, cooldown.lanes.competitor]).map((lane) => {
-      if (lane.state === 'confirmed_zero') return `${lane.name} · IDLE confirmed`
-      if (lane.state === 'not_supported') return `${lane.name} · No automatic idle`
-      if (lane.state === 'failed') return `${lane.name} · IDLE not verified`
-      if (lane.observed_state === 'IDLE') return `${lane.name} · Confirming IDLE`
-      return `${lane.name} · Waiting for IDLE`
-    })
-    return {
-      lanes,
-      verdict: cooldown.state === 'ready'
-        ? 'Both databases are idle'
-        : 'Waiting for both databases to return to idle',
-    }
-  }
-  const lanes = ([cooldown.lanes.lakebase, cooldown.lanes.competitor]).map((lane) => {
-    const fallback = lane.state === 'confirmed_zero'
-      ? 'Control plane confirmed zero'
-      : lane.state === 'confirmed_deleted'
-        ? `Owned ${recovery ? 'recovery' : 'isolated'} environment confirmed deleted`
-        : lane.state === 'not_supported'
-          ? 'Automatic scale-to-zero is not supported'
-          : lane.state === 'failed'
-            ? cooldown.mode === 'return_to_idle'
-              ? 'Zero was not confirmed'
-              : `Owned ${recovery ? 'recovery' : 'isolated'} environment deletion failed`
-            : `Removing only the owned ${recovery ? 'recovery' : 'isolated'} environment`
-    const current = lane.status || fallback
-    return lane.state === 'watching' && current !== fallback
-      ? `${lane.name} · ${fallback} · ${current}`
-      : `${lane.name} · ${current}`
-  })
-  const verdict = `Cleanup in progress · Only owned ${recovery ? 'recovery' : 'isolated'} environments are targets`
-  return { lanes, verdict }
 }
 
 function scorecardResetValue(

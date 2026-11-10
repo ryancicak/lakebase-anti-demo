@@ -1,5 +1,5 @@
 import type { CustomerCorner, DemoSession, LaneId, PersonaId } from '../api/types'
-import { scalesToZero } from '../competitor-kind'
+import { byCompetitor, competitorCloud, scalesToZero } from '../competitor-kind'
 import { modelScoreEvidence, roundFourStackLabel } from '../round4'
 import { roundSixStackLabel } from '../round6'
 import {
@@ -18,28 +18,30 @@ import {
   type RoundContractDecision,
 } from '../outcome'
 import {
-  getOutcomeRecord,
-  getRoundFivePersonaOutcomeRecord,
-  getVerifiedRecord,
+  PRIORITIES,
+  getLensLine,
+  getResultLine,
+  getRoleLine,
 } from './corpus'
 import type {
-  AuthoredText,
-  OutcomeCopyRecord,
-  PriorityKey,
-  RingsideCue,
+  ResultLineRecord,
+  RingsideBriefing,
+  RingsideLens,
   RingsideOutcomeId,
 } from './types'
-import { PRIORITY_KEYS } from './types'
 
-const PRIORITY_ORDER: CustomerCorner[] = ['cost', 'simplicity', 'performance']
-
-export function priorityKeyFor(corners: readonly CustomerCorner[]): PriorityKey {
+/**
+ * The room's priorities in the order the briefing reads them, cost then simplicity
+ * then performance, whatever order they were picked in. One to three; none is an
+ * error, because a briefing with no lens has nothing to say about the room.
+ */
+export function orderedPriorities(corners: readonly CustomerCorner[]): CustomerCorner[] {
   const selected = new Set(corners)
-  const key = PRIORITY_ORDER.filter((corner) => selected.has(corner)).join('+')
-  if (!PRIORITY_KEYS.includes(key as PriorityKey)) {
-    throw new Error(`Ringside cue requires one to three priorities; received "${key || 'none'}".`)
+  const ordered = PRIORITIES.filter((priority) => selected.has(priority))
+  if (ordered.length === 0) {
+    throw new Error('Ringside briefing requires one to three priorities; received none.')
   }
-  return key as PriorityKey
+  return ordered
 }
 
 function nonNegativeNumber(value: unknown): number | null {
@@ -216,7 +218,10 @@ function outcomeIdFor(
 
   switch (session.round.id) {
     case 'wake_idle_app':
-      return evidence.shape === 'capability_gap' && session.competitor.id === 'rds_postgres'
+      // Any opponent with no connection-triggered wake, not RDS by name: the Azure
+      // server is checked before the bell the same way, and reading its bout as
+      // "did not verify" would blame a lane that was never asked to run.
+      return evidence.shape === 'capability_gap' && !scalesToZero(session.competitor.id)
         ? 'verified_rds_capability_gap'
         : evidence.laneShape === 'both_exact_verified'
           ? 'verified_comparison'
@@ -272,6 +277,33 @@ function winnerName(session: DemoSession, winner: FormalWinner): string | null {
     return (setupName || session.lanes[winner].name).toUpperCase()
   }
   return null
+}
+
+/** The bout's outcome as the opening sentence of a spoken line, not a verdict band. */
+function resultSentence(session: DemoSession, winner: FormalWinner): string {
+  if (winner === 'tie') return 'The bout ended in a tie.'
+  if (winner === 'lakebase' || winner === 'competitor') {
+    const name = session.round5_setup?.lanes?.[winner]?.name || session.lanes[winner].name
+    return `${name} won the bout.`
+  }
+  return 'The bout declared no winner.'
+}
+
+/** The cloud the competitor lane belongs to, for a line about a lane that is not installed. */
+function cloudName(session: DemoSession): string {
+  return competitorCloud(session.competitor.id)
+}
+
+/**
+ * A lane's name as the room should hear it. Rounds 4 and 6 differ by the integration
+ * that moved the row, so their lanes are named for the stack, not the database.
+ */
+function laneDisplayName(session: DemoSession, laneId: LaneId): string {
+  if (session.round.id === 'put_model_score_in_app') return roundFourStackLabel(session, laneId)
+  if (session.round.id === 'analyze_live_orders_without_slowing_checkout') {
+    return roundSixStackLabel(session, laneId)
+  }
+  return session.round5_setup?.lanes?.[laneId]?.name || session.lanes[laneId].name
 }
 
 function oneSidedRoundFiveHeadline(
@@ -376,7 +408,7 @@ function outcomeHeadline(
       || session.round.id === 'analyze_live_orders_without_slowing_checkout'
     ) {
       return session.remembered_result?.trim()
-        || `LAKEBASE ${elapsed} · AWS LANE NOT INSTALLED`
+        || `LAKEBASE ${elapsed} · ${cloudName(session).toUpperCase()} LANE NOT INSTALLED`
     }
   }
   if (session.remembered_result?.trim()) return session.remembered_result
@@ -392,7 +424,7 @@ function outcomeHeadline(
 }
 
 export interface ClassifiedSessionOutcome extends RoundContractDecision {
-  outcome: OutcomeCopyRecord
+  outcome: ResultLineRecord
   headline: string
 }
 
@@ -409,7 +441,7 @@ export function classifyOutcome(session: DemoSession): ClassifiedSessionOutcome 
       || session.state === 'towelled',
     recordNoEvidence: Boolean(session.towel),
   })
-  const outcome = getOutcomeRecord(
+  const outcome = getResultLine(
     session.round.id,
     outcomeIdFor(session, decision),
     session.competitor.id,
@@ -421,7 +453,7 @@ export function classifyOutcome(session: DemoSession): ClassifiedSessionOutcome 
   }
 }
 
-export function classifyRingsideOutcome(session: DemoSession): OutcomeCopyRecord {
+export function classifyRingsideOutcome(session: DemoSession): ResultLineRecord {
   return classifyOutcome(session).outcome
 }
 
@@ -452,17 +484,17 @@ function oneSidedValues(session: DemoSession): Record<string, string> {
   const verifiedLane: LaneId = lakebaseMs !== null ? 'lakebase' : 'competitor'
   const unverifiedLane: LaneId = verifiedLane === 'lakebase' ? 'competitor' : 'lakebase'
   return {
-    VERIFIED_LANE: session.lanes[verifiedLane].name,
+    VERIFIED_LANE: laneDisplayName(session, verifiedLane),
     VERIFIED_SECONDS: required(seconds(verifiedElapsed(session, verifiedLane)), 'VERIFIED_SECONDS'),
-    UNVERIFIED_LANE: session.lanes[unverifiedLane].name,
+    UNVERIFIED_LANE: laneDisplayName(session, unverifiedLane),
   }
 }
 
 function setupStatus(session: DemoSession, laneId: LaneId): string {
   const result = roundFiveSetupLaneResult(session, laneId)
-  if (result.verified) return `verified in ${required(seconds(result.setupElapsedMs), `${laneId} setup time`)}`
+  if (result.verified) return `ready in ${required(seconds(result.setupElapsedMs), `${laneId} setup time`)}`
   const status = session.round5_setup?.lanes?.[laneId]?.status?.trim()
-  return status || 'not verified'
+  return status || 'never ready'
 }
 
 function proofValues(
@@ -470,29 +502,58 @@ function proofValues(
   classified: ClassifiedSessionOutcome,
 ): Record<string, string> {
   const { outcome } = classified
-  const competitorName = session.competitor.short_name
+  const competitorName = laneDisplayName(session, 'competitor')
   switch (outcome.outcome_id) {
     case 'verified_comparison':
       if (session.round.id === 'survive_connection_spike') {
+        // The scored quantity is each lane's time to 10,000 held clients. Under the
+        // bell protocol that clock starts at the bell, so the other side's setup is
+        // inside it and is told as the part that went to building its pooler. Under
+        // the retired fan-in protocols the clock started at a shared T0 after both
+        // setups, so setup is told as what came first and is not in those times.
+        // Saying "of which" on a legacy bout would attribute 24 seconds of setup to
+        // a 4-second clock.
+        const bell = roundFiveBellRuntime(session) !== null
+        const lakebaseSetup = required(
+          seconds(roundFiveSetupLaneResult(session, 'lakebase').setupElapsedMs),
+          'LAKEBASE_SETUP_SECONDS',
+        )
+        const competitorSetup = required(
+          seconds(roundFiveSetupLaneResult(session, 'competitor').setupElapsedMs),
+          'PROXY_SETUP_SECONDS',
+        )
+        const cloud = cloudName(session)
+        const [building, build] = byCompetitor(session.competitor.id, {
+          aurora: ['building an RDS Proxy', 'build an RDS Proxy'],
+          rds: ['building an RDS Proxy', 'build an RDS Proxy'],
+          azure: [
+            'switching on its built-in PgBouncer and raising its client limit',
+            'switch on its built-in PgBouncer and raise its client limit',
+          ],
+        })
         return {
-          LAKEBASE_SETUP_SECONDS: required(
-            seconds(roundFiveSetupLaneResult(session, 'lakebase').setupElapsedMs),
-            'LAKEBASE_SETUP_SECONDS',
+          COMPETITOR_NAME: competitorName,
+          LAKEBASE_TO_10K_SECONDS: required(
+            seconds(roundFiveExactPrimaryMs(session, 'lakebase')),
+            'LAKEBASE_TO_10K_SECONDS',
           ),
-          PROXY_SETUP_SECONDS: required(
-            seconds(roundFiveSetupLaneResult(session, 'competitor').setupElapsedMs),
-            'PROXY_SETUP_SECONDS',
+          COMPETITOR_TO_10K_SECONDS: required(
+            seconds(roundFiveExactPrimaryMs(session, 'competitor')),
+            'COMPETITOR_TO_10K_SECONDS',
           ),
+          LAKEBASE_SETUP_SECONDS: lakebaseSetup,
+          PROXY_SETUP_SECONDS: competitorSetup,
+          TIMING_BASIS: bell
+            ? 'timed from one bell'
+            : 'timed from a shared start once both paths were ready',
+          SETUP_SENTENCE: bell
+            ? `Of the ${cloud} path's time, ${competitorSetup} went to ${building} before its first client could connect.`
+            : `Getting ready came first and is not in those times: Lakebase's pooled path was ready in ${lakebaseSetup}; the ${cloud} path needed ${competitorSetup} to ${build} before its first client could connect.`,
         }
       }
       return {
         LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
-        // Rounds 4 and 6 differ by the integration that moved the row, not by the database.
-        COMPETITOR_NAME: session.round.id === 'put_model_score_in_app'
-          ? roundFourStackLabel(session, 'competitor')
-          : session.round.id === 'analyze_live_orders_without_slowing_checkout'
-            ? roundSixStackLabel(session, 'competitor')
-            : competitorName,
+        COMPETITOR_NAME: competitorName,
         COMPETITOR_SECONDS: required(seconds(verifiedElapsed(session, 'competitor')), 'COMPETITOR_SECONDS'),
       }
     case 'verified_capability_gap':
@@ -502,14 +563,17 @@ function proofValues(
           LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
           PRIMARY_KEY: required(evidence.primaryKey === '—' ? null : evidence.primaryKey, 'PRIMARY_KEY'),
           SCORE: required(evidence.score === '—' ? null : evidence.score, 'SCORE'),
+          CLOUD: cloudName(session),
         }
       }
       return {
         LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
+        CLOUD: cloudName(session),
       }
     case 'verified_rds_capability_gap':
       return {
         LAKEBASE_SECONDS: required(seconds(verifiedElapsed(session, 'lakebase')), 'LAKEBASE_SECONDS'),
+        COMPETITOR_NAME: competitorName,
       }
     case 'one_sided_verified':
       return oneSidedValues(session)
@@ -525,14 +589,12 @@ function proofValues(
         const verifiedLane = classified.evidence.exactLane
         if (!verifiedLane) throw new Error('Round 5 one-sided proof has no exact setup lane.')
         const unverifiedLane: LaneId = verifiedLane === 'lakebase' ? 'competitor' : 'lakebase'
-        const verifiedName = session.round5_setup?.lanes?.[verifiedLane]?.name
-          || session.lanes[verifiedLane].name
-        const unverifiedName = session.round5_setup?.lanes?.[unverifiedLane]?.name
-          || session.lanes[unverifiedLane].name
+        const verifiedName = laneDisplayName(session, verifiedLane)
+        const unverifiedName = laneDisplayName(session, unverifiedLane)
         const lowerBoundMs = classified.evidence[unverifiedLane].lowerBoundMs
         const unverifiedResult = lowerBoundMs === null
-          ? `${unverifiedName} did not verify before the stop; no exact lower bound was available`
-          : `${unverifiedName} exceeded ${required(seconds(lowerBoundMs), 'UNVERIFIED_SETUP_RESULT')} without verification`
+          ? `${unverifiedName} never finished setting up before the stop`
+          : `${unverifiedName} was still setting up at ${required(seconds(lowerBoundMs), 'UNVERIFIED_SETUP_RESULT')}, so its time is more than that`
         return {
           VERIFIED_SETUP_LANE: verifiedName,
           VERIFIED_SETUP_SECONDS: required(
@@ -545,24 +607,25 @@ function proofValues(
       }
     case 'setup_incomplete':
       return {
+        COMPETITOR_NAME: competitorName,
         LAKEBASE_SETUP_STATUS: setupStatus(session, 'lakebase'),
         PROXY_SETUP_STATUS: setupStatus(session, 'competitor'),
       }
     case 'bounded_check_failed': {
       const failed = (['lakebase', 'competitor'] as const)
         .filter((laneId) => !roundFiveLaneResult(session.lanes[laneId]).contractVerified)
-        .map((laneId) => session.lanes[laneId].name)
+        .map((laneId) => laneDisplayName(session, laneId))
       return {
-        FAILED_GATE: failed.length > 0
-          ? `${failed.join(' and ')} bounded-check proof`
-          : 'the shared comparison or fairness gate',
+        FAILED_GATE: failed.length === 0
+          ? 'a shared fairness or telemetry check failed'
+          : failed.length === 1
+            ? `${failed[0]} failed a required check`
+            : `${failed.join(' and ')} both failed a required check`,
       }
     }
     case 'cleanup_failed':
       return {
-        ROUND_RESULT: classified.formalWinner === null
-          ? 'No completed comparison was available.'
-          : `${winnerName(session, classified.formalWinner)} remains the formal result.`,
+        ROUND_RESULT: resultSentence(session, classified.formalWinner),
         CLEANUP_GATE: required(
           session.round5_setup?.cleanup_failure?.trim()
             || session.towel?.cleanup_failure?.trim()
@@ -602,81 +665,53 @@ export function interpolateProof(
   return rendered
 }
 
-function authoredText(id: string, text: string, decision: 'KEEP' | 'REWRITE'): AuthoredText {
-  return { id, text, decision }
-}
-
-export function buildRingsideCue(
+/**
+ * The briefing behind "Explain to the room" for one person in it.
+ *
+ * The result line is this bout's: it comes from the outcome the classifier chose
+ * and carries the bout's numbers and boundary. The role line and the lens lines
+ * are the round's: they say why the round matters to this role and what it looks
+ * like through each priority the room picked, and they claim nothing about who
+ * won, so a stopped or failed bout reads them without inheriting a result.
+ */
+export function buildRingsideBriefing(
   session: DemoSession,
   personaId: PersonaId,
-  priorityKey: PriorityKey,
-): RingsideCue {
+  corners: readonly CustomerCorner[],
+): RingsideBriefing {
   const classified = classifyOutcome(session)
-  const { outcome } = classified
-  const values = proofValues(session, classified)
-  const personaVerified = getVerifiedRecord(
-    session.round.id,
-    personaId,
-    priorityKey,
-    session.competitor.id,
-  )
-  const verified = outcome.copy_mode === 'INHERIT_VERIFIED_CORPUS'
-    ? personaVerified
-    : null
-  const roundFivePersonaOutcome = (
-    session.round.id === 'survive_connection_spike'
-    && outcome.copy_mode === 'OUTCOME_OVERRIDE'
-  )
-    ? getRoundFivePersonaOutcomeRecord(outcome.outcome_id, personaId, session.competitor.id)
-    : null
-  const sayRecord = verified
-    ? authoredText(verified.meaning_record_id, verified.meaning, verified.meaning_decision)
-    : roundFivePersonaOutcome
-      ? authoredText(
-          roundFivePersonaOutcome.meaning_record_id,
-          roundFivePersonaOutcome.meaning,
-          roundFivePersonaOutcome.meaning_decision,
-        )
-    : authoredText(
-        required(outcome.meaning_record_id, 'meaning_record_id'),
-        interpolateProof(required(outcome.meaning, 'meaning'), values),
-        required(outcome.meaning_decision, 'meaning_decision') as 'KEEP' | 'REWRITE',
-      )
-  const askRecord = verified
-    ? authoredText(verified.question_record_id, verified.question, verified.question_decision)
-    : roundFivePersonaOutcome
-      ? authoredText(
-          personaVerified.question_record_id,
-          personaVerified.question,
-          personaVerified.question_decision,
-        )
-    : authoredText(
-        required(outcome.question_record_id, 'question_record_id'),
-        required(outcome.question, 'question'),
-        required(outcome.question_decision, 'question_decision') as 'KEEP' | 'REWRITE',
-      )
-  const proof = roundFiveBellIncompleteProof(session, classified)
-    ?? interpolateProof(outcome.proof_template, values)
+  const role = getRoleLine(session.round.id, personaId, session.competitor.id)
+  const lenses: RingsideLens[] = orderedPriorities(corners).map((priority) => ({
+    priority,
+    text: getLensLine(session.round.id, priority, session.competitor.id).text,
+  }))
   return {
-    say: sayRecord.text,
-    ask: askRecord.text,
-    show: proof,
-    sayRecord,
-    askRecord,
-    proofRecord: authoredText(outcome.proof_template_id, proof, outcome.proof_decision),
-    outcome,
+    result: resultLine(session, classified),
+    why: role.why,
+    lenses,
+    ask: role.ask,
+    outcomeId: classified.outcome.outcome_id,
+    status: classified.status,
+    declared: classified.status === 'declared_comparison'
+      || classified.status === 'declared_capability'
+      || classified.status === 'adjudicated_stoppage',
   }
 }
 
+function resultLine(session: DemoSession, classified: ClassifiedSessionOutcome): string {
+  return roundFiveBellIncompleteResult(session, classified)
+    ?? interpolateProof(classified.outcome.text, proofValues(session, classified))
+}
+
 /**
- * The "what we proved" line for a V4 bell Round 5 bout that did not complete its
- * contract (towelled or failed). It replaces the authored `setup_incomplete` /
- * one-sided proof templates, which say "the 10,000-client fan-in did not run" /
- * "never started" -- false when the runtime proves a lane reached 10,000. Reads
- * the same canonical lane view-model as every other surface. Returns null for
- * verified bouts and every non-bell session so their authored copy is used.
+ * What happened in a V4 bell Round 5 bout that did not complete its contract
+ * (towelled or failed). It replaces the authored `setup_incomplete` / one-sided
+ * lines, which say the 10,000-client test never ran -- false when the runtime
+ * proves a lane reached 10,000. Reads the same canonical lane view-model as every
+ * other surface. Returns null for verified bouts and every non-bell session so
+ * their authored line is used.
  */
-function roundFiveBellIncompleteProof(
+function roundFiveBellIncompleteResult(
   session: DemoSession,
   classified: RoundContractDecision,
 ): string | null {
@@ -685,10 +720,9 @@ function roundFiveBellIncompleteProof(
   if (classified.contractComplete) return null
 
   const clause = (laneId: LaneId): string => {
-    const name = session.round5_setup?.lanes?.[laneId]?.name
-      ?? session.lanes[laneId].name
+    const name = laneDisplayName(session, laneId)
     const presentation = roundFiveLanePresentation(session, laneId)
-    if (!presentation) return `${name} produced no fan-in evidence`
+    if (!presentation) return `${name} produced no evidence`
     switch (presentation.semantic) {
       case 'verified':
         return `${name} verified exactly 10,000 held clients at ${presentation.value}`
@@ -699,7 +733,7 @@ function roundFiveBellIncompleteProof(
       case 'reached_hold_in_progress':
         return `${name} reached 10,000 clients at ${presentation.value} with the hold still running`
       case 'not_reached_lower_bound':
-        return `${name} never reached 10,000 clients (unverified when stopped, ${presentation.value})`
+        return `${name} never reached 10,000 clients (still climbing when stopped, ${presentation.value})`
       case 'not_supported':
         return `${name} was not supported`
       default:
@@ -709,15 +743,11 @@ function roundFiveBellIncompleteProof(
 
   return (
     `${clause('lakebase')}. ${clause('competitor')}. `
-    + 'No exact verified result, no declared winner, comparison incomplete, margin N/A.'
+    + 'The bout stopped before both lanes verified, so there is no winner and no margin.'
   )
 }
 
-export function buildRingsideShow(session: DemoSession): string {
-  const classified = classifyOutcome(session)
-  return roundFiveBellIncompleteProof(session, classified)
-    ?? interpolateProof(
-      classified.outcome.proof_template,
-      proofValues(session, classified),
-    )
+/** The result line alone, for surfaces that show what happened without a role. */
+export function buildRingsideResult(session: DemoSession): string {
+  return resultLine(session, classifyOutcome(session))
 }

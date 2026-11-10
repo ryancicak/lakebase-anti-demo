@@ -522,6 +522,9 @@ async def test_only_the_azure_editions_deployed_start_goes_on_without_a_ready_ro
     manifest.installation_id = "018f6f50-7d3a-7cc1-9d5d-4d9ac8d107a1"
     if cloud == "azure":
         manifest.cloud, manifest.round5_available = "azure", False
+        # The runtime now binds by the manifest's cloud, as the real edition is bound; this stub
+        # carries no Azure section, so the Azure binding itself is not under test here.
+        monkeypatch.setattr(app_module, "_bind_azure_runtime", lambda *_args, **_kwargs: None)
 
     def refuse() -> None:
         raise RuntimeError("Round 5 requires a complete factory-ready manifest v5")

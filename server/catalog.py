@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .capacity import AZURE_ROUND5_RUNNER_SIZE
 from .connection_fanin import MAX_RETRIES
+from .home_cloud import by_cloud
 from .models import (
     Availability,
     CatalogResponse,
@@ -593,13 +594,13 @@ AZURE_ROUNDS = [
 def competitors_for(cloud: InstallationCloud) -> list[Competitor]:
     """The competitors an installation in `cloud` offers."""
 
-    return AZURE_COMPETITORS if cloud == "azure" else COMPETITORS
+    return by_cloud(cloud, aws=COMPETITORS, azure=AZURE_COMPETITORS)
 
 
 def rounds_for(cloud: InstallationCloud) -> list[RoundDefinition]:
     """The round definitions an installation in `cloud` offers."""
 
-    return AZURE_ROUNDS if cloud == "azure" else ROUNDS
+    return by_cloud(cloud, aws=ROUNDS, azure=AZURE_ROUNDS)
 
 
 @lru_cache(maxsize=1)
@@ -621,7 +622,9 @@ def personas_for(cloud: InstallationCloud) -> tuple[Persona, ...]:
     """The personas an installation in `cloud` presents, each naming that cloud's products."""
 
     personas = load_personas()
-    if cloud != "azure":
+    # The file's lines are AWS's own; another cloud's edition overrides the ones that name products.
+    overrides: dict[tuple[str, str], str] = by_cloud(cloud, aws={}, azure=_AZURE_PERSONA_PRESENTER)
+    if not overrides:
         return personas
     return tuple(
         persona.model_copy(
@@ -629,7 +632,7 @@ def personas_for(cloud: InstallationCloud) -> tuple[Persona, ...]:
                 "presenter": persona.presenter.model_copy(
                     update={
                         field: text
-                        for (persona_id, field), text in _AZURE_PERSONA_PRESENTER.items()
+                        for (persona_id, field), text in overrides.items()
                         if persona_id == persona.id
                     }
                 )
@@ -800,7 +803,8 @@ def build_presenter_pack(
         )
 
     discovery_question = primary.questions.get("why") or next(iter(primary.questions.values()))
-    azure = competitor == CompetitorId.AZURE_POSTGRES
+    cloud = competitor_cloud(competitor)
+    azure = by_cloud(cloud, aws=False, azure=True)
     if len(corners) == 1:
         remembered_metric = selected_round.scorecard_by_corner[corners[0]]
     else:
@@ -871,12 +875,16 @@ def build_presenter_pack(
             "250 ms on both lanes."
         )
     elif selected_round.id == RoundId.SURVIVE_CONNECTION_SPIKE:
-        pooled_path = (
-            "Azure's path stops only after its built-in PgBouncer is on and an exact "
-            "transaction verifies through it."
-            if azure
-            else "The selected AWS managed pooling path stops only after its new RDS Proxy and "
-            "exact transaction verify."
+        pooled_path = by_cloud(
+            cloud,
+            aws=(
+                "The selected AWS managed pooling path stops only after its new RDS Proxy and "
+                "exact transaction verify."
+            ),
+            azure=(
+                "Azure's path stops only after its built-in PgBouncer is on and an exact "
+                "transaction verifies through it."
+            ),
         )
         stop_condition = (
             "Lakebase stops after its included pooled endpoint verifies an exact transaction. "
@@ -888,7 +896,9 @@ def build_presenter_pack(
             "winner or margin is declared."
         )
     elif selected_round.id == RoundId.ANALYZE_LIVE_ORDERS:
-        integration = "the Azure Data Factory data flow" if azure else "AWS DMS and Glue"
+        integration = by_cloud(
+            cloud, aws="AWS DMS and Glue", azure="the Azure Data Factory data flow"
+        )
         stop_condition = (
             "The bell commits the same checkout on both sources and cold starts "
             f"{integration}. Each lane's clock stops at its first read of the exact order, "

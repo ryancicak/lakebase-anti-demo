@@ -139,13 +139,13 @@ describe('CapacityDisclosure', () => {
 
 describe('IdlePolicyFloor', () => {
   it('frames the Aurora gap as a product floor, not a speed difference', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} />)
     expect(screen.getByText('Idle policy · not idle speed')).toBeTruthy()
     expect(screen.getByText(/240s of any gap is a product floor/)).toBeTruthy()
   })
 
   it('names both vendor minimums', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} />)
     const copy = screen.getByText(/shortest supported timeout/)
     expect(copy.textContent).toContain('Lakebase 60s')
     expect(copy.textContent).toContain('Aurora 300s')
@@ -153,13 +153,13 @@ describe('IdlePolicyFloor', () => {
   })
 
   it('does not claim Lakebase settles faster', () => {
-    render(<IdlePolicyFloor competitorCannotIdle={false} />)
+    render(<IdlePolicyFloor competitorId="aurora_serverless_v2" competitorCannotIdle={false} />)
     const copy = screen.getByText(/shortest supported timeout/).textContent ?? ''
     expect(copy).not.toMatch(/faster|quicker|beats|wins/i)
   })
 
   it('says the RDS lane is not timed rather than giving it a number', () => {
-    render(<IdlePolicyFloor competitorCannotIdle />)
+    render(<IdlePolicyFloor competitorId="rds_postgres" competitorCannotIdle />)
     const copy = screen.getByText(/Provisioned RDS/)
     expect(copy.textContent).toContain('no automatic idle pause at all')
     expect(copy.textContent).toContain('not timed here')
@@ -314,7 +314,7 @@ describe('wiring', () => {
 
   it('keeps the idle-policy floor in cooldown details', () => {
     const body = extractFunctionBody(source, 'CooldownDetails')
-    expect(body).toContain("<IdlePolicyFloor competitorCannotIdle={competitor.state === 'not_supported'}")
+    expect(body).toContain("<IdlePolicyFloor competitorId={session.competitor.id} competitorCannotIdle={competitor.state === 'not_supported'}")
   })
 
   it('keeps the idle-policy floor off the projected cooldown screen', () => {

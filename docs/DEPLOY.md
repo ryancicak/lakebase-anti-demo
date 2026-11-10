@@ -694,14 +694,25 @@ did so during an incident — presenting as a stalled recovery. `bootstrap.sh`,
 `.gitignore` and `tests/test_deploy_hygiene.py` all refuse it now, the same three
 layers as `requirements.txt`.
 
-`requires-python = ">=3.12"` is the entire correctness requirement, and it is
-satisfied by anything uv can pick: `uv.lock` carries wheels for `cp312` through
-`cp315`, so every candidate interpreter can both install and parse this source.
-Pinning one anyway would mean naming an interpreter the build image may not have,
-and uv's answer to that is to fetch a managed one — more traffic through the
-least reliable component in the build. That trade is only worth making with
-evidence, and the evidence does not exist yet; the next section says exactly what
-would produce it.
+`requires-python = ">=3.12, <3.15"` bounds the interpreter instead of a pin, and
+the upper bound is not optional. uv takes the newest CPython the bound admits, so
+while it was only `">=3.12"`, the deploy moved to CPython 3.15 the day uv could
+fetch it, and from then on every deploy failed (2026-11-02):
+
+```
+error: Distribution `psycopg-binary==3.3.4` can't be installed because it doesn't
+have a source distribution or wheel for the current platform
+hint: You're using CPython 3.15 (`cp315`), but `psycopg-binary` (v3.3.4) only has
+wheels with the following Python ABI tags: `cp312`, `cp313`, `cp314`
+```
+
+`psycopg-binary` was not alone: `pydantic-core`, `uvloop`, `httptools` and
+`pyyaml` had no `cp315` wheel either. A floor alone lets a Python release nobody
+tested decide what the build installs. The cap rises only once every compiled
+package in `uv.lock` has wheels for the new version, and
+`tests/test_dependency_wheels.py` fails until then. Pinning one interpreter
+instead would still mean naming one the build image may not have; the next
+section says what evidence would justify that.
 
 ### The package proxy timeouts — SETTLED 2026-08-22, and it was not the proxy
 
